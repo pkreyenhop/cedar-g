@@ -18,6 +18,7 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
 	"cedarg/internal/cedar"
@@ -59,6 +60,7 @@ type ui struct {
 	rootPath   string
 	builtins   map[string]bool
 	childCache map[string][]string
+	fontScale  float32 // theme text-size multiplier for zoom
 }
 
 // newUI builds all widgets and the layout, and installs them as the window's
@@ -68,6 +70,7 @@ func newUI(w fyne.Window) *ui {
 		win:        w,
 		builtins:   make(map[string]bool, len(builtinList)),
 		childCache: make(map[string][]string),
+		fontScale:  1.0,
 	}
 	for _, b := range builtinList {
 		u.builtins[b] = true
@@ -103,7 +106,8 @@ func main() {
 	u := newUI(w)
 	u.buildMenu(a)
 
-	// Optional command-line argument: a source-tree root or a single file.
+	// A command-line argument selects a source-tree root or a single file.
+	// With no argument, open ./download-src if it exists (the default mirror).
 	if len(os.Args) > 1 {
 		if info, err := os.Stat(os.Args[1]); err == nil {
 			abs, _ := filepath.Abs(os.Args[1])
@@ -112,6 +116,10 @@ func main() {
 			} else {
 				u.openFile(abs)
 			}
+		}
+	} else if info, err := os.Stat("download-src"); err == nil && info.IsDir() {
+		if abs, err := filepath.Abs("download-src"); err == nil {
+			u.setRoot(abs)
 		}
 	}
 
@@ -139,16 +147,73 @@ func (u *ui) buildMenu(a fyne.App) {
 		}, u.win)
 	}
 
+	zoomIn := func() { u.zoomBy(+0.1) }
+	zoomOut := func() { u.zoomBy(-0.1) }
+	zoomReset := func() { u.zoomReset() }
+
+	// Primary shortcuts shown in the menu (Cmd/Super on macOS).
+	miZoomIn := fyne.NewMenuItem("Zoom In", zoomIn)
+	miZoomIn.Shortcut = &desktop.CustomShortcut{KeyName: fyne.KeyEqual, Modifier: fyne.KeyModifierSuper}
+	miZoomOut := fyne.NewMenuItem("Zoom Out", zoomOut)
+	miZoomOut.Shortcut = &desktop.CustomShortcut{KeyName: fyne.KeyMinus, Modifier: fyne.KeyModifierSuper}
+	miZoomReset := fyne.NewMenuItem("Reset Zoom", zoomReset)
+	miZoomReset.Shortcut = &desktop.CustomShortcut{KeyName: fyne.Key0, Modifier: fyne.KeyModifierSuper}
+
 	u.win.SetMainMenu(fyne.NewMainMenu(
 		fyne.NewMenu("File",
 			fyne.NewMenuItem("Open Directory…", openDir),
 			fyne.NewMenuItem("Open File…", openFile),
 		),
+		fyne.NewMenu("View", miZoomIn, miZoomOut, miZoomReset),
 	))
 	u.win.Canvas().AddShortcut(
 		&desktop.CustomShortcut{KeyName: fyne.KeyO, Modifier: fyne.KeyModifierControl},
 		func(fyne.Shortcut) { openDir() },
 	)
+
+	// Register the zoom shortcuts for both Cmd/Super and Alt, and for the "=",
+	// "+" (keypad) and "-" keys, so they work regardless of layout/keypad.
+	for _, mod := range []fyne.KeyModifier{fyne.KeyModifierSuper, fyne.KeyModifierAlt} {
+		for _, k := range []fyne.KeyName{fyne.KeyEqual, fyne.KeyPlus} {
+			u.win.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: k, Modifier: mod}, func(fyne.Shortcut) { zoomIn() })
+		}
+		u.win.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyMinus, Modifier: mod}, func(fyne.Shortcut) { zoomOut() })
+		u.win.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.Key0, Modifier: mod}, func(fyne.Shortcut) { zoomReset() })
+	}
+}
+
+// zoomTheme wraps a base theme and scales every size by a factor, so changing it
+// resizes all text (both viewers, tree and menus) as a whole-UI zoom.
+type zoomTheme struct {
+	base  fyne.Theme
+	scale float32
+}
+
+func (z *zoomTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
+	return z.base.Color(n, v)
+}
+func (z *zoomTheme) Font(s fyne.TextStyle) fyne.Resource     { return z.base.Font(s) }
+func (z *zoomTheme) Icon(n fyne.ThemeIconName) fyne.Resource { return z.base.Icon(n) }
+func (z *zoomTheme) Size(n fyne.ThemeSizeName) float32       { return z.base.Size(n) * z.scale }
+
+func (u *ui) applyZoom() {
+	fyne.CurrentApp().Settings().SetTheme(&zoomTheme{base: theme.DefaultTheme(), scale: u.fontScale})
+}
+
+func (u *ui) zoomBy(delta float32) {
+	u.fontScale += delta
+	if u.fontScale < 0.6 {
+		u.fontScale = 0.6
+	}
+	if u.fontScale > 3.0 {
+		u.fontScale = 3.0
+	}
+	u.applyZoom()
+}
+
+func (u *ui) zoomReset() {
+	u.fontScale = 1.0
+	u.applyZoom()
 }
 
 // ---- file tree ----

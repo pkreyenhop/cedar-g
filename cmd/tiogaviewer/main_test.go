@@ -45,6 +45,32 @@ func TestUISmoke(t *testing.T) {
 	}
 }
 
+func TestZoomClamp(t *testing.T) {
+	test.NewApp()
+	u := newUI(test.NewWindow(nil))
+	if u.fontScale != 1.0 {
+		t.Fatalf("default fontScale = %v, want 1.0", u.fontScale)
+	}
+	// Zoom out far past the floor: must clamp at 0.6.
+	for i := 0; i < 20; i++ {
+		u.zoomBy(-0.1)
+	}
+	if u.fontScale < 0.6-1e-6 {
+		t.Errorf("fontScale under floor: %v", u.fontScale)
+	}
+	// Zoom in far past the ceiling: must clamp at 3.0.
+	for i := 0; i < 60; i++ {
+		u.zoomBy(+0.1)
+	}
+	if u.fontScale > 3.0+1e-6 {
+		t.Errorf("fontScale over ceiling: %v", u.fontScale)
+	}
+	u.zoomReset()
+	if u.fontScale != 1.0 {
+		t.Errorf("after reset fontScale = %v, want 1.0", u.fontScale)
+	}
+}
+
 // TestBlockSegmentsBreakLines guards that heading/quote/paragraph blocks each
 // render on their own line (Inline == false), so a Tioga document's line
 // structure is preserved instead of blocks running together.

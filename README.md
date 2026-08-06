@@ -35,9 +35,15 @@ Run the viewer, optionally passing a source-tree root or a single file:
 go run ./cmd/tiogaviewer /path/to/cedar/source/tree
 ```
 
+With no argument it opens `./download-src` if that directory exists (the mirror
+produced by `xeroxsrc`, see below).
+
 Inside the app use **File → Open Directory** (Ctrl+O) or **Open File**. The tree
 lists `*.tioga`, `*.mesa`, `*.df`, `*.require`, `*.profile`, `*.depends` files
 and their versioned `!N` variants.
+
+**Zoom** (whole-UI font size) via the **View** menu or keyboard — `Cmd`/`Alt`
+plus `+`/`=` to enlarge, `-` to shrink, and `0` to reset.
 
 ## Downloader
 
