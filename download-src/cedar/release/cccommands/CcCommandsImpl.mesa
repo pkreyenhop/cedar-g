@@ -1,0 +1,1073 @@
+
+DIRECTORY
+Args USING [ Arg, ArgRope, Error, GetRope, NArgs ],
+Ascii,
+Basics USING [HighByte, LowByte, LowHalf],
+BasicTime USING [ GMT, Now, Period ],
+Commander USING [ CommandProc, Handle, Register ],
+CommanderOps USING [NextArgument],
+Convert,
+CStrings USING [CString],
+IO,
+PFS, PFSNames, PFSPrefixMap,
+Process USING [ CheckForAbort, EnableAborts, GetCurrent, InitializeCondition, SecondsToTicks ],
+Rope USING [ Cat, Concat, Equal, Fetch, Find, FindBackward, Flatten, Index, Length, ROPE, Substr],
+SimpleFeedback USING [PutFL],
+SymTab,
+SystemVersion USING [GetMachineType, MachineType, release],
+ThisMachine USING [ ProcessorID ],
+UnixErrno,
+UnixSysCalls USING [ GetPID, SymLink, Unlink ],
+UnixSysCallExtensions USING [Spawn],
+UnixTypes USING [CHARPtr, Mode, SysCallResult],
+UserProfile USING [Boolean, CallWhenProfileChanges, ListOfTokens, ProfileChangedProc, Token],
+UXStrings;
+
+CcCommandsImpl: CEDAR MONITOR
+IMPORTS Args, Ascii, Basics, BasicTime, Commander, CommanderOps, Convert, --ExtendADotOut,-- IO, PFS, PFSNames, PFSPrefixMap, Process, Rope, SimpleFeedback, SymTab, SystemVersion, ThisMachine, UnixErrno, UnixSysCalls, UnixSysCallExtensions, UserProfile, UXStrings ~ {
+ROPE: TYPE ~ Rope.ROPE;
+LOR: TYPE ~ LIST OF ROPE;
+
+ShouldNotHappen: ERROR [message: ROPE] ~ CODE;
+ForkTrouble: ERROR ~ CODE;
+NYI: ERROR ~ CODE;
+
+DeleteFiles: BOOL ~ TRUE;
+
+amd29000: SystemVersion.MachineType ~ LOOPHOLE[20, SystemVersion.MachineType];
+rs6000: SystemVersion.MachineType ~ LOOPHOLE[21, SystemVersion.MachineType];
+mipsle: SystemVersion.MachineType ~ LOOPHOLE[22, SystemVersion.MachineType]; -- little endian version of mips r3000 
+mipsbe: SystemVersion.MachineType ~ LOOPHOLE[23, SystemVersion.MachineType]; -- big endian version of mips r3000 
+CommandNames: TYPE = REF CommandNamesRep;
+CommandNamesRep: TYPE = RECORD[target: SystemVersion.MachineType, compiler, loader, move, csh, include, preCName, actualCName, insert: ROPE];
+commandNamesList: LIST OF CommandNames;
+defaultCommandNames: CommandNames;
+uid: CARD32 ¨ 0;
+processID: INT ~ UnixSysCalls.GetPID[];
+processorID: ROPE ~ ThisMachine.ProcessorID[$Octal];
+MACHINECLASS: ROPE ~ "ComplexCc.MachineClass";
+
+NewName: ENTRY PROC [suffix: ROPE ¨ ".o", wDir: ROPE--UXIO name--] RETURNS [ fName: ROPE ] ~ {
+ENABLE { UNWIND => NULL };
+fName ¨ IO.PutFLR["cedarCc%gFrom%gp%g%g", LIST[IO.card[uid], IO.int[processID], IO.rope[processorID], IO.rope[suffix]]];
+IF NOT Rope.Equal[wDir, NIL] THEN {
+IF wDir.Fetch[wDir.Length[]-1] # '/ THEN wDir ¨ Rope.Concat[wDir, "/"];
+fName ¨ Rope.Concat[wDir, fName];
+};
+uid ¨ uid.SUCC;
+};
+
+ViewFix: PROC [cedar, insert: ROPE, isDir, simpleExt, create: BOOL, otherUnlink: LOR, log: IO.STREAM] RETURNS [unix: ROPE ¨ NIL, unlink: LOR ¨ NIL] ~ {
+ENABLE PFS.Error => ERROR ShouldNotHappen[IO.PutFR["Got PFS.Error[%g, %g] while UXifying %g", [atom[error.code]], [rope[error.explanation]], [rope[cedar]] ]];
+
+RETURN RealViewFix[cedar, insert, isDir, simpleExt, create, otherUnlink, log]};
+
+RealViewFix: PROC [cedar, insert: ROPE, isDir, simpleExt, create: BOOL, otherUnlink: LOR, log: IO.STREAM] RETURNS [unix: ROPE ¨ NIL, unlink: LOR ¨ NIL] ~ {
+given: PFS.PATH ~ PFS.PathFromRope[cedar];
+cedarPath: PFS.PATH ¨ PFSPrefixMap.Translate[ PFS.AbsoluteName[given]];
+rawRope: ROPE ¨ PFS.RopeFromPath[cedarPath].Flatten[]; --for debugging
+viewComp: PFSNames.Component ¨ cedarPath.Fetch[0];
+view: ROPE ¨ viewComp.ComponentRope[];
+IF isDir # given.IsADirectory[] THEN ERROR ShouldNotHappen[IO.PutFR1[IF isDir THEN "%g not a directory" ELSE "%g is a directory", [rope[cedar]] ]];
+IF isDir AND (insert#NIL OR create OR simpleExt) THEN ERROR--not implemented because not needed--;
+IF create THEN {
+out: IO.STREAM ~ PFS.StreamOpen[fileName: cedarPath, accessOptions: create, createOptions: [keep~1]];
+file: PFS.OpenFile ~ PFS.OpenFileFromStream[out];
+modeProp: ROPE;
+dm: UnixTypes.Mode;
+cedarPath ¨ PFS.GetInfo[file].fullFName;
+modeProp ¨ PFS.GetClientProperty[file, "UnixMode"];
+dm ¨ LOOPHOLE[Convert.CardFromRope[modeProp]];
+dm.owner.write ¨ true;
+PFS.SetClientProperty[file, "UnixMode", Convert.RopeFromCard[LOOPHOLE[dm, CARD16], 8]];
+out.Close[]
+}
+ELSE cedarPath ¨ PFS.FileInfo[cedarPath].fullFName;
+SELECT TRUE FROM
+view.Equal["-ux", FALSE] => {
+original: ROPE ~ PFS.PFSNameToUnixName[cedarPath];
+IF insert#NIL THEN {
+parent: PFS.PATH ~ cedarPath.Parent[];
+parentRope: ROPE ~ PFS.PFSNameToUnixName[parent];
+last: PFSNames.Component ~ cedarPath.ShortName[];
+lastRope: ROPE ~ last.ComponentRope[--PFS doesn't put in version info--];
+new: ROPE ~ parentRope.Cat[insert, lastRope];
+GetLink[original, new, log];
+RETURN [new, CONS[new, otherUnlink]]};
+RETURN [original, otherUnlink]};
+view.Equal["-vux", FALSE] => {
+fullRope: ROPE;
+unix ¨ PFS.PFSNameToUnixName[cedarPath];
+fullRope ¨ unix.Flatten[]; --for debugging
+IF isDir THEN {
+RETURN [unix, otherUnlink]};
+IF simpleExt OR insert#NIL THEN {
+fullLast: PFSNames.Component ¨ cedarPath.ShortName[];
+verlessLast: ROPE ¨ fullLast.ComponentRope[--PFS doesn't put in version info--];
+parent: PFS.PATH ¨ cedarPath.Parent[];
+parentRope: ROPE ¨ PFS.PFSNameToUnixName[parent];
+uxishRope: ROPE ¨ parentRope.Cat["/", insert, verlessLast];
+IF NOT parent.IsADirectory[] THEN ERROR ShouldNotHappen["PFS shouldn't be crocky!"];
+IF fullLast.version.versionKind # numeric THEN ERROR ShouldNotHappen[
+IO.PutFR1["Didn't expect to find %g in file system (note version!)",
+[rope[PFS.RopeFromPath[cedarPath]]] ]];
+GetLink[unix, uxishRope, log];
+RETURN [uxishRope, CONS[uxishRope, otherUnlink]]}
+ELSE RETURN [unix, otherUnlink];
+};
+ENDCASE => ERROR ShouldNotHappen[
+IO.PutFR1["Can't apply UNIX tools to %g because of its view",
+IO.rope[PFS.RopeFromPath[cedarPath]] ]];
+};
+
+emptyComponent: PFSNames.Component ~ [];
+
+Lower: PROC [old: CHAR] RETURNS [CHAR] ~ {RETURN Ascii.Lower[old]};
+
+LinkData: TYPE ~ REF LinkDataRec;
+LinkDataRec: TYPE ~ RECORD [
+from: ROPE,
+count: NAT,
+aHolder: PROCESS,
+toCP: UnixTypes.CHARPtr ¨ NIL,
+change: CONDITION];
+
+GetLink: ENTRY PROC [from, to: ROPE, log: IO.STREAM] ~ {
+ENABLE UNWIND => NULL;
+err: ROPE ~ InnerGetLink[from, to, log];
+IF err#NIL THEN RETURN WITH ERROR ShouldNotHappen[err];
+RETURN};
+
+InnerGetLink: INTERNAL PROC [from, to: ROPE, log: IO.STREAM] RETURNS [ROPE] ~ {
+start: BasicTime.GMT ~ BasicTime.Now[];
+me: PROCESS ~ Process.GetCurrent[];
+DO
+ld: LinkData ¨ NARROW[linkTab.Fetch[to].val];
+IF ld=NIL THEN {
+ld ¨ NEW [LinkDataRec ¨ [NIL, 0, me]];
+TRUSTED {
+Process.InitializeCondition[@ld.change, Process.SecondsToTicks[10]];
+Process.EnableAborts[@ld.change]};
+IF NOT linkTab.Insert[to, ld] THEN ERROR};
+SELECT TRUE FROM
+ld.count=0 => {
+fromCP: UnixTypes.CHARPtr ~ UXStrings.Create[from];
+toCP: UnixTypes.CHARPtr ¨ ld.toCP ¨ UXStrings.Create[to];
+res: UnixTypes.SysCallResult ¨ UnixSysCalls.SymLink[fromCP, toCP];
+IF res=failure THEN RETURN [IO.PutFR["Link from %g to %g failed; errno is %g", IO.rope[from], IO.rope[to], IO.card[LOOPHOLE[UnixErrno.GetErrno[], CARD]]]];
+ld.count ¨ ld.count.SUCC;
+ld.from ¨ from;
+ld.aHolder ¨ me;
+IF debugLinks AND log#NIL THEN log.PutF["%g -> %g: %g\n", [rope[from]], [rope[to]], [integer[ld.count]]];
+RETURN [NIL]};
+ld.from.Equal[from, TRUE--UNIX is case sensitive--] => {
+ld.count ¨ ld.count.SUCC;
+IF debugLinks AND log#NIL THEN log.PutF["%g -> %g: %g\n", [rope[from]], [rope[to]], [integer[ld.count]]];
+RETURN [NIL]};
+ld.aHolder = me => RETURN [IO.PutFR["Trying to link %g to both %g and %g", [rope[to]], [rope[from]], [rope[ld.from]] ]];
+ENDCASE => {
+now: BasicTime.GMT ~ BasicTime.Now[];
+waited: INT ~ BasicTime.Period[start, now];
+IF waited > linkTimeout THEN RETURN[IO.PutFLR["Unable to link %g -> %g for %gs (timeout is %g) 'cause of conflict with %g", LIST[[rope[to]], [rope[from]], [integer[waited]], [integer[linkTimeout]], [rope[ld.from]]]]];
+WAIT ld.change};
+ENDLOOP;
+};
+
+linkTab: SymTab.Ref ~ SymTab.Create[case: TRUE];
+debugLinks: BOOL ¨ FALSE;
+linkTimeout: NAT ¨ 100;
+
+DropLink: ENTRY PROC [to: ROPE, log: IO.STREAM] ~ {
+ENABLE UNWIND => NULL;
+err: ROPE ~ InnerDropLink[to, log];
+IF err#NIL THEN RETURN WITH ERROR ShouldNotHappen[err];
+RETURN};
+
+InnerDropLink: INTERNAL PROC [to: ROPE, log: IO.STREAM] RETURNS [ROPE] ~ {
+ld: LinkData ¨ NARROW[linkTab.Fetch[to].val];
+IF ld=NIL OR ld.count=0 THEN RETURN [IO.PutFR1["Excess dropping of link to %g", [rope[to]] ]];
+ld.count ¨ ld.count.PRED;
+IF debugLinks AND log#NIL THEN log.PutF["%g: %g\n", [rope[to]], [integer[ld.count]]];
+IF ld.count=0 THEN {
+res: UnixTypes.SysCallResult ~ UnixSysCalls.Unlink[ld.toCP];
+IF NOT linkTab.Delete[to] THEN ERROR;
+IF res = failure THEN RETURN [IO.PutFR["Unlink failed for %g; errno is %g", IO.rope[to], IO.card[LOOPHOLE[UnixErrno.GetErrno[], CARD]]]];
+};
+BROADCAST ld.change;
+RETURN [NIL]};
+
+UnlinkList: PROC [list: LOR, log: IO.STREAM] ~ {
+FOR list ¨ list, list.rest WHILE list#NIL DO
+DropLink[list.first, log];
+ENDLOOP;
+RETURN};
+
+ConsComponent: PROC [name: ROPE, version: PFSNames.Version] RETURNS [PFSNames.Component] ~ {
+RETURN [[name: [base: name, start: 0, len: name.Length[]], version: version]]};
+MachineTypeFromMachineClass: PROC [ machineClass: ROPE ]
+RETURNS [ machineType: SystemVersion.MachineType ] ~ {
+X: INT ¨ 1;		-- for breakpoint for debugging
+SELECT TRUE FROM
+Rope.Equal[machineClass, "sparc", FALSE] => machineType ¨ sun4;
+Rope.Equal[machineClass, "mc68020", FALSE] => machineType ¨ sun3;
+Rope.Equal[machineClass, "sun4", FALSE] => machineType ¨ sun4;
+Rope.Equal[machineClass, "sun3", FALSE] => machineType ¨ sun3;
+Rope.Equal[machineClass, "amd29000", FALSE] => machineType ¨ amd29000;
+Rope.Equal[machineClass, "rs6000", FALSE] => machineType _ rs6000;
+Rope.Equal[machineClass, "mipsl", FALSE] => machineType _ mipsle;
+Rope.Equal[machineClass, "mips", FALSE] => machineType _ mipsbe;
+ENDCASE => {
+FOR list: LIST OF MachinePair ¨ userList, list.rest UNTIL list = NIL DO
+IF Rope.Equal[machineClass, list.first.machineClass, FALSE] THEN RETURN[list.first.machineType];
+ENDLOOP;
+ERROR;
+};
+};
+
+MachineClassFromMachineType: PROC [ machineType: SystemVersion.MachineType ]
+RETURNS [ machineClass: ROPE ] ~ {
+SELECT machineType FROM
+sun4 => machineClass ¨ "sun4";
+sun3 => machineClass ¨ "sun3";
+amd29000 => machineClass ¨ "amd29000";
+rs6000 => machineClass _ "rs6000";
+mipsle => machineClass _ "mipsl";
+mipsbe => machineClass _ "mips";
+ENDCASE => {
+FOR list: LIST OF MachinePair ¨ userList, list.rest UNTIL list = NIL DO
+IF machineType = list.first.machineType THEN RETURN[list.first.machineClass];
+ENDLOOP;
+machineClass _ "I don't know";
+};
+};
+
+GetCommandNames: PROC [host, target: SystemVersion.MachineType] RETURNS[CommandNames] ~ {
+IF host # sun4 THEN ERROR ShouldNotHappen ["host is not a sun4"];
+FOR cnL: LIST OF CommandNames ¨ commandNamesList, cnL.rest UNTIL cnL=NIL DO
+IF target = cnL.first.target THEN RETURN[cnL.first];
+ENDLOOP;
+RETURN[defaultCommandNames];
+};
+
+OnProfileChange: UserProfile.ProfileChangedProc ~ {
+pList: LIST OF ROPE ~ UserProfile.ListOfTokens["MakeDo.UserClasses", NIL];
+compiler, loader, move, csh, include, insertRope, preCName, actualCName: ROPE;
+useLinks: BOOL ¨ TRUE;
+this: CommandNames;
+
+userList ¨ NIL;
+commandNamesList ¨ NIL;
+FOR list: LIST OF ROPE _ pList, list.rest UNTIL list = NIL DO
+userList ¨ CONS[[list.first, nextMachineType], userList];
+nextMachineType ¨ nextMachineType.SUCC;
+ENDLOOP;
+
+compiler ¨ UserProfile.Token["ComplexCc.cc", compilerDefault];
+include ¨ UserProfile.Token["ComplexCc.include", includeDefault];
+loader ¨ UserProfile.Token["ComplexCc.ld", loadDefault];
+move ¨ UserProfile.Token["ComplexCc.mv", moveDefault];
+csh ¨ UserProfile.Token["ComplexCc.csh", cshDefault];
+useLinks ¨ UserProfile.Boolean["ComplexCc.useLinks", useLinks];
+[preCName, actualCName] ¨ ExamineCompilerName[compiler];
+defaultCommandNames ¨ NEW[CommandNamesRep ¨ [
+sun4, compiler, loader, move, csh, include, preCName, actualCName,
+IF useLinks THEN insertRopeDefault ELSE NIL]];
+
+FOR uL: LIST OF ROPE ¨ pList, uL.rest UNTIL uL=NIL DO
+class: ROPE ~ uL.first;
+compiler ¨ UserProfile.Token[Rope.Cat["ComplexCc.", class, ".cc"], defaultCommandNames.compiler];
+include ¨ UserProfile.Token[Rope.Cat["ComplexCc.", class, ".include"], defaultCommandNames.include];
+loader ¨ UserProfile.Token[Rope.Cat["ComplexCc.", class, ".ld"], defaultCommandNames.loader];
+move ¨ UserProfile.Token[Rope.Cat["ComplexCc.", class, ".mv"], defaultCommandNames.move];
+csh ¨ UserProfile.Token[Rope.Cat["ComplexCc.", class, ".csh"], defaultCommandNames.csh];
+useLinks ¨ UserProfile.Boolean[Rope.Cat["ComplexCc.", class, ".useLinks"], TRUE];
+[preCName, actualCName] ¨ ExamineCompilerName[compiler];
+this ¨ NEW[CommandNamesRep ¨ [
+MachineTypeFromMachineClass[class], compiler, loader, move, csh, include, preCName, actualCName, IF useLinks THEN insertRopeDefault ELSE NIL]];
+commandNamesList ¨ CONS[this, commandNamesList];
+ENDLOOP;
+};
+
+ExamineCompilerName: PROC[cName: ROPE]
+RETURNS[preCName, actualCName: ROPE ¨ NIL] ~ {
+pos: INT;
+IF NOT Rope.Find[cName, "rsh ", 0] = 0 THEN RETURN[NIL, cName];
+pos ¨ Rope.FindBackward[cName, " "];
+RETURN[Rope.Substr[cName, 0, pos], Rope.Substr[cName, pos+1]];
+};
+
+UnixNil: UnixTypes.CHARPtr ~ LOOPHOLE[NIL];
+
+MsgFromExitError: PROC [status: INT, command: ROPE] RETURNS [msg: ROPE] ~ {
+lowHalf: CARD16 ~ Basics.LowHalf[LOOPHOLE[status, CARD32]];
+lowByte: BYTE ~ Basics.LowByte[lowHalf];
+nextLowByte: BYTE ~ Basics.HighByte[lowHalf];
+low7: BYTE;
+IF lowByte = 177B THEN {
+msg ¨ IO.PutFR["execution of %g stopped by signal %g\n", IO.rope[command], IO.int[nextLowByte]];
+RETURN [msg];
+};
+IF lowByte = 0 THEN {
+msg ¨ IO.PutFR["execution of %g exited with %g\n", IO.rope[command], IO.int[nextLowByte]];
+RETURN [msg];
+};
+low7 ¨ lowByte MOD 2**7;
+msg ¨ IO.PutFR["execution of %g terminated due to signal %g\n", IO.rope[command], IO.int[low7]];
+};
+
+MsgFromFile: PROC [fileName: ROPE, delete: BOOL ¨ TRUE] RETURNS [msg: ROPE] ~ {
+stream: IO.STREAM;
+path: PFS.PATH ~ PFS.PathFromRope[fileName];
+stream ¨ PFS.StreamOpen[fileName: path
+! PFS.Error => { stream ¨ NIL; CONTINUE }];
+IF stream # NIL THEN {
+msg ¨ stream.GetRope[];
+stream.Close[];
+IF delete THEN PFS.Delete[name: path ! PFS.Error => CONTINUE];
+};
+};
+
+Execute: PROC [command: ROPE, wDir: ROPE ¨ NIL] RETURNS [status: INT, msg: ROPE ¨ NIL] ~ {
+newCommand: ROPE ~ IF wDir.Equal[NIL] THEN command ELSE Rope.Cat["cd ", wDir, " ; ", command];
+string: CStrings.CString ~ UXStrings.Create[from: newCommand];
+ropeStdErr: ROPE ~ NewName[".stderr", wDir];
+stringStdErr: CStrings.CString ~ UXStrings.Create[from: ropeStdErr];
+ropeStdOut: ROPE ~ NewName[".stdout",wDir];
+stringStdOut: CStrings.CString ~ UXStrings.Create[from: ropeStdOut];
+
+status ¨ UnixSysCallExtensions.Spawn[string, UnixNil, stringStdOut, stringStdErr];
+IF status # 0 THEN msg ¨ MsgFromExitError[status: status, command: command];
+msg ¨ Rope.Concat[msg, MsgFromFile[fileName: ropeStdErr, delete: DeleteFiles]];
+msg ¨ Rope.Concat[msg, MsgFromFile[fileName: ropeStdOut, delete: DeleteFiles]];
+};
+
+ExecuteCsh: PROC [hostType, targetType: SystemVersion.MachineType, commandLines: ROPE, wDir: ROPE ¨ NIL] RETURNS [status: INT, msg: ROPE ¨ NIL] ~ {
+cshCommandRope: ROPE ~ GetCommandNames[ host: hostType, target: targetType].csh;
+cshCommandString: UnixTypes.CHARPtr ~ UXStrings.Create[cshCommandRope].string;
+IF cshCommandRope = NIL
+THEN ERROR ShouldNotHappen[IO.PutFR[
+"Cshell execution on target of class %g cannot be done from host of class %g", IO.rope[MachineClassFromMachineType[targetType]],
+IO.rope[MachineClassFromMachineType[hostType]],
+]];
+{
+ropeStdIn: ROPE ~ NewName[".stdin", wDir];
+stringStdIn: CStrings.CString ~ UXStrings.Create[from: ropeStdIn];
+ropeStdErr: ROPE ~ NewName[".stderr", wDir];
+stringStdErr: CStrings.CString ~ UXStrings.Create[from: ropeStdErr];
+ropeStdOut: ROPE ~ NewName[".stdout", wDir];
+stringStdOut: CStrings.CString ~ UXStrings.Create[from: ropeStdOut];
+ropeStdInPath: PFS.PATH ~ PFS.PathFromRope[ropeStdIn];
+streamIn: IO.STREAM ~ PFS.StreamOpen[fileName: ropeStdInPath, accessOptions: $create];
+
+IF NOT wDir.Equal[NIL] THEN streamIn.PutF1["cd %g\n", IO.rope[wDir]];
+streamIn.PutF1["%g\n", IO.rope[commandLines]];
+streamIn.Close[];
+status ¨ UnixSysCallExtensions.Spawn[cshCommandString, stringStdIn, stringStdOut, stringStdErr];
+IF status # 0 THEN msg ¨ MsgFromExitError[status: status, command: cshCommandRope];
+msg ¨ Rope.Concat[msg, MsgFromFile[fileName: ropeStdErr, delete: DeleteFiles]];
+msg ¨ Rope.Concat[msg, MsgFromFile[fileName: ropeStdOut, delete: DeleteFiles]];
+PFS.Delete[name: ropeStdInPath ! PFS.Error => CONTINUE];
+}
+};
+
+OutFilename: PROC [ template: PFS.PATH ] RETURNS [ name: PFS.PATH ] ~ {
+shortName: ROPE ¨ PFSNames.ComponentRope[PFSNames.ShortName[template]];
+name ¨ PFS.PathFromRope[shortName.Concat[".o"]];
+RETURN};
+
+FixPath: PROC [ origName: ROPE ]
+RETURNS [ newName: ROPE ¨ NIL ] ~ {
+IF Rope.Equal[origName, NIL] THEN RETURN;
+newName ¨ PFS.RopeFromPath[PFS.PathFromRope[origName], slashes];
+RETURN};
+
+BaseFromFileName: PROC [name: PFS.PATH] RETURNS [ROPE] ~ {
+short: ROPE ~ PFSNames.ShortNameRope[name];
+RETURN[Rope.Substr[base: short, len: Rope.Index[s1: short, s2: "."]]];
+};
+
+GetDirAndFixPath: PROC [ origDir, origName: PFS.PATH ] RETURNS [ dir, basename: PFS.PATH ¨ NIL ] ~ {
+cc: INT;
+dir ¨ origDir;
+IF origName = NIL THEN RETURN;
+basename ¨ origName;
+IF (cc ¨ PFSNames.ComponentCount[basename]) > 1 THEN
+{
+dir ¨ PFSNames.Cat[dir, PFSNames.SubName[basename, 0, cc-1, FALSE, TRUE]];
+basename ¨ PFSNames.SubName[basename, cc-1, 1, FALSE, FALSE];
+RETURN}
+ELSE RETURN};
+
+CommandSyntaxError: ERROR ~ CODE;
+
+ComplexCCProc: Commander.CommandProc ~ {
+binDir, srcDir: PFS.PATH ¨ NIL;
+ccSwitches, ldSwitches, libSwitches: ROPE ¨ NIL;
+doALoad: BOOL ¨ FALSE;
+xFlag: BOOL ¨ FALSE;
+inFilename, outFilename: PFS.PATH ¨ NIL;
+currentDir: ROPE ¨ NIL;
+intFileList: LIST OF ROPE; -- list of file names for intermediate files
+loadFileList: LIST OF ROPE; -- list of file names for loading
+rloadFileList: LIST OF ROPE; -- list of righteous file names for loading
+targetClass, hostClass: ROPE ¨ NIL;
+{
+ENABLE {
+Args.Error => { msg ¨ ComplexCCUsage; GOTO Failed };
+ShouldNotHappen => { msg ¨ message; GOTO Failed };
+CommandSyntaxError => { msg ¨ ComplexCCUsage; GOTO Failed };
+PFS.Error => { msg ¨ error.explanation; GOTO Failed };
+ABORTED => { msg ¨ "-- Aborted!"; GOTO Failed };
+};
+ProcessCommandLine: PROC ~ {
+nArgs: INT32 ~ Args.NArgs[cmd];
+i: NAT;
+FOR i ¨ 0, i.SUCC WHILE ( i < nArgs ) DO
+NextRope: PROC RETURNS [ r: ROPE ] ~ INLINE {
+ropeArg: Args.Arg ~ Args.ArgRope[cmd, i.SUCC];
+r ¨ ropeArg.rope;
+i ¨ i.SUCC;
+};
+NextList: PROC RETURNS [ l: LIST OF ROPE ¨ NIL ] ~ INLINE {
+FOR j: INT32 ¨ i.SUCC, j.SUCC WHILE ( j < nArgs ) DO
+anArg: ROPE ~ Args.GetRope[cmd, j];
+IF ( anArg.Fetch[0] = '- ) THEN { i ¨ j.PRED; EXIT} ;
+l ¨ CONS[anArg, l];
+REPEAT
+FINISHED => { i ¨ nArgs }
+ENDLOOP;
+};
+x: INT;		-- for breakpoint
+anArg: ROPE ~ Args.GetRope[cmd, i];
+x ¨ 1;		-- for breakpoint
+SELECT TRUE FROM
+anArg.Equal[s2: "-in", case: FALSE] => { inFilename ¨ PFS.PathFromRope[NextRope[]] };
+anArg.Equal[s2: "-out", case: FALSE] => { outFilename ¨ PFS.PathFromRope[NextRope[]] };
+anArg.Equal[s2: "-binDir", case: FALSE] => { binDir ¨ PFS.PathFromRope[NextRope[]] };
+anArg.Equal[s2: "-srcDir", case: FALSE] => { srcDir ¨ PFS.PathFromRope[NextRope[]] };
+anArg.Equal[s2: "-lSwitch", case: FALSE] => { ldSwitches ¨ NextRope[] };
+anArg.Equal[s2: "-cSwitch", case: FALSE] => { ccSwitches ¨ NextRope[] };
+anArg.Equal[s2: "-class", case: FALSE] => { targetClass ¨ NextRope[] };
+anArg.Equal[s2: "-lib", case: FALSE] => { libSwitches ¨ NextRope[] };
+anArg.Equal[s2: "-int", case: FALSE] => { intFileList ¨ NextList[] };
+anArg.Equal[s2: "-X", case: FALSE] => { xFlag ¨ TRUE };
+anArg.Equal[s2: "-load", case: FALSE] =>
+{ doALoad ¨ TRUE; loadFileList ¨ NextList[] };
+anArg.Equal[s2: "-rload", case: FALSE] =>
+{ doALoad ¨ TRUE; rloadFileList ¨ NextList[] };
+ENDCASE => ERROR CommandSyntaxError;
+ENDLOOP; 
+};
+
+currentDir ¨ ViewFix[PFS.RopeFromPath[PFS.GetWDir[]], NIL, TRUE, FALSE, FALSE, NIL, cmd.err].unix; --a UXIO name
+
+targetClass ¨ UserProfile.Token[key: MACHINECLASS, default: "sun4"];
+hostClass ¨ MachineClassFromMachineType[ GetMachineType[] ];
+
+ProcessCommandLine[];
+
+IF binDir#NIL THEN binDir ¨ PFSNames.EnsureDirectory[binDir];
+IF srcDir#NIL THEN srcDir ¨ PFSNames.EnsureDirectory[srcDir];
+
+IF ( outFilename = NIL ) THEN outFilename ¨ OutFilename[inFilename];
+
+[binDir, outFilename] ¨ GetDirAndFixPath[binDir, outFilename];
+
+cmd.err.PutF1["C compiling %g ", IO.rope[BaseFromFileName[inFilename]]];
+cmd.err.Flush[];
+[result, msg] ¨ InnerCcc[PFS.RopeFromPath[binDir], PFS.RopeFromPath[srcDir], ccSwitches, ldSwitches, libSwitches, PFS.RopeFromPath[inFilename], PFS.RopeFromPath[outFilename], currentDir, doALoad, xFlag, intFileList, loadFileList, rloadFileList, MachineTypeFromMachineClass[hostClass], MachineTypeFromMachineClass[targetClass], cmd];
+
+RETURN;
+EXITS
+Failed => { result ¨ $Failure };
+}};
+
+InnerCcc: PROC [binDir, srcDir, ccSwitches, ldSwitches, libSwitches, inFilename, outFilename, currentDir: ROPE, doALoad, xFlag: BOOL, intFileList, loadFileList, rloadFileList: LOR, hostType, targetType: SystemVersion.MachineType, cmd: Commander.Handle] RETURNS [result: REF ANY ¨ NIL, msg: ROPE ¨ NIL] ~ {
+links: LOR ¨ NIL;
+ccSrc, ccOut, intFudge, ldOut, ldOutUX: ROPE;
+ldCommand, failMsg: ROPE ¨ NIL;
+cmdNames: CommandNames;
+
+cmdNames ¨ GetCommandNames[host: hostType, target: targetType];
+IF cmdNames.compiler.Equal[NIL] OR cmdNames.loader.Equal[NIL] THEN {
+msg ¨ IO.PutFR["Compilation from host type %g to target type %g is not valid", IO.rope[MachineClassFromMachineType[hostType]],
+IO.rope[MachineClassFromMachineType[targetType]],
+];
+GOTO Failed;
+};
+{ENABLE UNWIND => UnlinkList[links, cmd.err];
+[ccSrc, links] ¨ ViewFix[Rope.Concat[srcDir, inFilename], NIL, FALSE, TRUE, FALSE, links, cmd.err];
+[ccOut, links] ¨ ViewFix[Rope.Concat[binDir, outFilename], NIL, FALSE, TRUE, TRUE, links, cmd.err];
+IF doALoad THEN {
+inputDir: ROPE ~ Rope.Concat[currentDir, binDir];
+ldOut ¨ binDir.Concat[NewName[".o", NIL]];
+[ldOutUX, links] ¨ ViewFix[ldOut, NIL, FALSE, FALSE, TRUE, links, cmd.err];
+FOR tail: LIST OF ROPE ¨ loadFileList, tail.rest WHILE ( tail # NIL ) DO
+renamed: ROPE;
+[renamed, links] ¨ ViewFix[Rope.Concat[binDir, tail.first], cmdNames.insert, FALSE, FALSE, FALSE, links, cmd.err];
+ldCommand ¨ Rope.Cat[ldCommand, " ", renamed];
+ENDLOOP;
+FOR tail: LIST OF ROPE ¨ rloadFileList, tail.rest WHILE ( tail # NIL ) DO
+renamed: ROPE;
+[renamed, links] ¨ ViewFix[tail.first, cmdNames.insert, FALSE, FALSE, FALSE, links, cmd.err];
+ldCommand ¨ Rope.Cat[ldCommand, " ", renamed];
+ENDLOOP;
+ldCommand ¨ Rope.Cat[ldCommand, " ", libSwitches];
+};
+{
+status: INT;
+localMsg, command: ROPE ¨ NIL;
+includePart: ROPE ~ IF cmdNames.include = NIL THEN NIL ELSE Rope.Concat["-I", cmdNames.include];
+IF cmdNames.preCName#NIL THEN {
+command ¨ IO.PutFLR["%g \" cd %g%g; %g", LIST[[rope[cmdNames.preCName]], [rope[currentDir]], [rope[binDir]], [rope[cmdNames.actualCName]]] ];
+command ¨ IO.PutFLR["%g %g -o %g %g -I./%g %g\"", LIST[[rope[command]], [rope[ccSwitches]], [rope[ccOut]], [rope[ccSrc]], [rope[srcDir]], [rope[includePart]]] ]; 
+}
+ELSE {
+command _ IO.PutFLR["%g %g -o %g %g -I./%g %g", LIST[IO.rope[cmdNames.compiler], IO.rope[ccSwitches], IO.rope[ccOut], IO.rope[ccSrc], IO.rope[srcDir], [rope[includePart]] ] ];
+command ¨ Rope.Cat["cd ", currentDir, " ; ", command];
+};
+
+IF showCcCommand THEN
+SimpleFeedback.PutFL[$ComplexCc, $oneLiner, $info, "\nCC Command: %g\n", LIST[[rope[command]]] ];
+
+[status: status, msg: localMsg] ¨ Execute[command: command, wDir: currentDir];
+
+IF ( NOT localMsg.Equal[NIL] )
+THEN {
+IF ( status # 0 ) THEN {
+msg ¨ IO.PutFR["Compilation failed; error: %g, msg: %g",  IO.int[status], IO.rope[localMsg]];
+UnlinkList[links, cmd.err];
+GOTO Failed;
+};
+msg ¨ IO.PutFR1[".\nCompilation warnings: %g\n", IO.rope[localMsg]];
+}
+ELSE {
+msg ¨ ".";
+};
+cmd.err.PutRope[msg];
+cmd.err.Flush[];
+};
+Process.CheckForAbort[];
+
+
+IF ( doALoad ) THEN {
+status: INT;
+localMsg: ROPE;
+
+[intFudge, links] ¨ ViewFix[Rope.Concat[binDir, outFilename], cmdNames.insert, FALSE, TRUE, FALSE, links, cmd.err];
+ldCommand ¨ IO.PutFLR["%g %g -o %g %g %g", LIST[IO.rope[cmdNames.loader], IO.rope[ldSwitches], IO.rope[ldOutUX], IO.rope[intFudge], IO.rope[ldCommand]]];
+
+IF showCcCommand THEN
+SimpleFeedback.PutFL[$ComplexCc, $oneLiner, $info, "\nld Command: %g\n", LIST[[rope[ldCommand]]] ];
+
+[status: status, msg: localMsg] ¨ Execute[command: ldCommand, wDir: currentDir];
+
+IF ( NOT localMsg.Equal[NIL] )
+THEN {
+IF ( status # 0 ) THEN {
+msg ¨ IO.PutFR["Load failed; error: %g, msg: %g",  IO.int[status], IO.rope[localMsg]];
+UnlinkList[links, cmd.err];
+GOTO Failed;
+};
+msg ¨ IO.PutFR1[".\nLoad warnings: %g\n", IO.rope[localMsg]];
+}
+ELSE {
+msg ¨ ".";
+};
+cmd.err.PutRope[msg];
+cmd.err.Flush[];
+Process.CheckForAbort[];
+};
+
+}; UnlinkList[links, cmd.err];
+
+IF ( doALoad ) THEN {
+PFS.Rename[from: PFS.PathFromRope[ldOut], to: PFS.PathFromRope[binDir.Concat[outFilename]] ! PFS.Error => {
+msg ¨ IO.PutFLR["PFS.Error[%g, %g] while trying to rename %g to %g", LIST[[atom[error.code]], [rope[error.explanation]], [rope[ldOut]], [rope[binDir.Concat[outFilename]]]]];
+GOTO Failed}];
+};
+Process.CheckForAbort[];
+
+msg ¨ " no errors.";
+EXITS
+Failed => { result ¨ $Failure };
+};
+
+GetMachineType: PROC RETURNS [SystemVersion.MachineType] ~ TRUSTED {
+RETURN [SystemVersion.GetMachineType[]]
+};
+
+ComplexRshProc: Commander.CommandProc ~ {
+xFlag: BOOL ¨ FALSE;
+xClassName: ROPE ¨ NIL; -- The name of the class for this action
+srcDir, binDir: PFS.PATH ¨ NIL;
+srcInFileList: LIST OF ROPE; -- Source files that will be transfered FROM Cedar
+binInFileList: LIST OF ROPE; -- Binary files that will be transfered FROM Cedar
+srcOutFileList: LIST OF ROPE; -- Source files that will be copied TO Cedar back
+binOutFileList: LIST OF ROPE; -- Binary files that will be copied TO Cedar back
+rshCmd, currentDir, targetClass, hostClass: ROPE ¨ NIL;
+{
+ENABLE {
+Args.Error => { msg ¨ ComplexRshUsage; GOTO Failed };
+ShouldNotHappen => { msg ¨ message; GOTO Failed };
+CommandSyntaxError => { msg ¨ ComplexRshUsage; GOTO Failed };
+PFS.Error => { msg ¨ error.explanation; GOTO Failed };
+ABORTED => { msg ¨ "-- Aborted!"; GOTO Failed };
+};
+ProcessCommandLine: PROC ~ {
+nArgs: INT32 ~ Args.NArgs[cmd];
+i: NAT;
+FOR i ¨ 0, i.SUCC WHILE ( i < nArgs ) DO
+NextRope: PROC RETURNS [ r: ROPE ] ~ INLINE {
+ropeArg: Args.Arg ~ Args.ArgRope[cmd, i.SUCC];
+r ¨ ropeArg.rope;
+i ¨ i.SUCC;
+};
+FixNextList: PROC RETURNS [ l: LIST OF ROPE ¨ NIL ] ~ INLINE {
+FOR j: INT32 ¨ i.SUCC, j.SUCC WHILE ( j < nArgs ) DO
+anArg: ROPE ~ Args.GetRope[cmd, j];
+IF ( anArg.Fetch[0] = '- ) THEN { i ¨ j.PRED; EXIT} ;
+l ¨ CONS[FixPath[anArg], l];
+REPEAT
+FINISHED => { i ¨ nArgs }
+ENDLOOP;
+};
+anArg: ROPE ~ Args.GetRope[cmd, i];
+SELECT TRUE FROM
+anArg.Equal[s2: "-binIn", case: FALSE] => { binInFileList ¨ FixNextList[] };
+anArg.Equal[s2: "-srcIn", case: FALSE] => { srcInFileList ¨ FixNextList[] };
+anArg.Equal[s2: "-binOut", case: FALSE] => { binOutFileList ¨ FixNextList[] };
+anArg.Equal[s2: "-srcOut", case: FALSE] => { srcOutFileList ¨ FixNextList[] };
+anArg.Equal[s2: "-srcDir", case: FALSE] => { srcDir ¨ PFS.PathFromRope[NextRope[]] };
+anArg.Equal[s2: "-binDir", case: FALSE] => { binDir ¨ PFS.PathFromRope[NextRope[]] };
+anArg.Equal[s2: "-class", case: FALSE] => { targetClass ¨ NextRope[] };
+anArg.Equal[s2: "-cmd", case: FALSE] => { rshCmd ¨ NextRope[] };
+anArg.Equal[s2: "-XClass", case: FALSE] => { xFlag ¨ TRUE; xClassName ¨ NextRope[] };
+ENDCASE => ERROR CommandSyntaxError;
+ENDLOOP; 
+IF binDir.Equal[NIL] THEN binDir ¨ srcDir;
+};
+
+currentDir ¨ ViewFix[PFS.RopeFromPath[PFS.GetWDir[]], NIL, TRUE, FALSE, FALSE, NIL, cmd.err].unix; --a UXIO name
+
+targetClass ¨ UserProfile.Token[key: MACHINECLASS, default: "sun4"];
+hostClass ¨ MachineClassFromMachineType[ GetMachineType[] ];
+
+ProcessCommandLine[];
+
+IF srcDir#NIL THEN srcDir ¨ PFSNames.EnsureDirectory[srcDir];
+IF binDir#NIL THEN binDir ¨ PFSNames.EnsureDirectory[binDir];
+
+cmd.err.PutRope["Starting Rsh"];
+cmd.err.Flush[];
+[result, msg] ¨ InnerCrsh[xClassName, PFS.RopeFromPath[srcDir], PFS.RopeFromPath[binDir], rshCmd, currentDir, xFlag, srcInFileList, binInFileList, srcOutFileList, binOutFileList, MachineTypeFromMachineClass[hostClass], MachineTypeFromMachineClass[targetClass], cmd];
+EXITS
+Failed => { result ¨ $Failure };
+}};
+
+InnerCrsh: PROC [xClassName, srcDir, binDir, rshCmd, currentDir: ROPE, xFlag: BOOL, srcInFileList, binInFileList, srcOutFileList, binOutFileList: LOR, hostType, targetType: SystemVersion.MachineType, cmd: Commander.Handle] RETURNS [result: REF ANY ¨ NIL, msg: ROPE ¨ NIL] ~ {
+unlinkList: LOR ¨ NIL; --files to unlink later
+failMsg: ROPE ¨ NIL;
+{ENABLE UNWIND => UnlinkList[unlinkList, cmd.err];
+
+FOR list: LIST OF ROPE ¨ srcOutFileList, list.rest WHILE list # NIL DO
+fileName: ROPE ~ list.first;
+FOR list2: LIST OF ROPE ¨ srcInFileList, list2.rest WHILE list2 # NIL DO
+fileName2: ROPE ~ list2.first;
+IF Rope.Equal[fileName, fileName2] THEN EXIT; -- if command writes a file that it reads we just let the read fix-up occur
+REPEAT
+FINISHED => [, unlinkList] ¨ ViewFix[Rope.Concat[srcDir, fileName], NIL, FALSE, TRUE, TRUE, unlinkList, cmd.err];
+ENDLOOP;
+ENDLOOP;
+FOR list: LIST OF ROPE ¨ binOutFileList, list.rest WHILE list # NIL DO
+fileName: ROPE ~ list.first;
+FOR list2: LIST OF ROPE ¨ binInFileList, list2.rest WHILE list2 # NIL DO
+fileName2: ROPE ~ list2.first;
+IF Rope.Equal[fileName, fileName2] THEN EXIT; -- if command writes a file that it reads we just let the read fix-up occur
+REPEAT
+FINISHED => [, unlinkList] ¨ ViewFix[Rope.Concat[binDir, fileName], NIL, FALSE, TRUE, TRUE, unlinkList, cmd.err];
+ENDLOOP;
+ENDLOOP;
+FOR list: LIST OF ROPE ¨ srcInFileList, list.rest WHILE list # NIL DO
+fileName: ROPE ~ list.first;
+[, unlinkList] ¨ ViewFix[Rope.Concat[srcDir, fileName], NIL, FALSE, TRUE, FALSE, unlinkList, cmd.err];
+ENDLOOP;
+FOR list: LIST OF ROPE ¨ binInFileList, list.rest WHILE list # NIL DO
+fileName: ROPE ~ list.first;
+[, unlinkList] ¨ ViewFix[Rope.Concat[binDir, fileName], NIL, FALSE, TRUE, FALSE, unlinkList, cmd.err];
+ENDLOOP;
+{
+status: INT;
+localMsg: ROPE ¨ NIL;
+realDir: ROPE ¨ currentDir;
+
+IF NOT srcDir.Equal[NIL]
+THEN
+IF srcDir.Fetch[0] = '/
+THEN realDir ¨ srcDir
+ELSE realDir ¨ Rope.Cat[currentDir, "/", srcDir]
+ELSE
+realDir ¨ currentDir;
+[status: status, msg: localMsg] ¨ ExecuteCsh[hostType: hostType, targetType: targetType, commandLines: rshCmd, wDir: realDir];
+IF ( NOT localMsg.Equal[NIL] )
+THEN {
+IF ( status # 0 ) THEN {
+msg ¨ IO.PutFR["Command failed; error: %g, msg: %g",  IO.int[status], IO.rope[localMsg]];
+UnlinkList[unlinkList, cmd.err];
+GOTO Failed;
+};
+msg ¨ IO.PutFR1[".\nCommand warnings: %g", IO.rope[localMsg]];
+}
+ELSE {
+msg ¨ ".";
+};
+cmd.err.PutRope[msg];
+cmd.err.Flush[];
+};
+Process.CheckForAbort[];
+
+
+}; UnlinkList[unlinkList, cmd.err];
+
+msg ¨ " no errors.";
+EXITS
+Failed => { result ¨ $Failure };
+};
+
+
+ComplexCC: ROPE ~ "ComplexCC";
+ComplexCCDoc: ROPE ~ " - cc with all the frills.  Switches are:
+  -in <file>
+  -out <file>
+  -class <as in SystemVersion.MachineTypes>
+  -host <host>
+  -cSwitch <cc switches>
+  -rload <file list> => load compiled file together with <file list> (rel to cwd)
+  -X => eXtend the resulting binary file with fast symbol and dependecy info
+  -lSwitch <ld switches>
+  -Lib libstring => string with the libraries to load
+  -int <file list> => files to copy to the host before compiling
+  -srcDir <dir> => remote source directory
+  -binDir <dir> => remote object file directory
+    (overridden by directory part specified in -out)
+";
+ComplexCCUsage: ROPE ~ Rope.Concat["Usage: ComplexCC ", ComplexCCDoc];
+
+ComplexRsh: ROPE ~ "ComplexRsh";
+ComplexRshDoc: ROPE ~ " - Rsh with all the frills.  Switches are:
+  -class <as in SystemVersion.MachineTypes>
+  -host <host>
+  -srcIn <file list> => source files to copy to the host before doing Rsh
+  -binIn <file list> => binary files to copy to the host before doing Rsh
+  -srcOut <file list> => source files to copy from the host after doing Rsh
+  -binOut <file list> => binary files to copy from the host after doing Rsh
+  -srcDir <dir> => remote source directory (command will execute in srcDir)
+  -binDir <dir> => remote binary directory (equal to -srcDir by default)
+  -XClass <className> => eXtend the resulting binary files with fast symbol and dependency information; use <className> to identify the action performed.
+  -cmd <command> => command to execute remotely
+ ";
+ComplexRshUsage: ROPE ~ Rope.Concat["Usage: ComplexRsh ", ComplexRshDoc];
+ComplexRshUsageHostMissing: ROPE ~ Rope.Concat["No host has been specified\nUsage: ComplexRsh ", ComplexRshDoc];
+
+ComplexErrorProc: Commander.CommandProc ~ {ERROR};
+ComplexDebugLinksProc: Commander.CommandProc ~ {debugLinks ¨ TRUE};
+ComplexDontDebugLinksProc: Commander.CommandProc ~ {debugLinks ¨ FALSE};
+
+nextMachineType: SystemVersion.MachineType ¨ LOOPHOLE[40];
+
+AddUserClassCmd: Commander.CommandProc ~ {
+arg: ROPE;
+UNTIL ( arg ¨ CommanderOps.NextArgument[cmd] ) = NIL DO
+userList ¨ CONS[[arg, nextMachineType], userList];
+nextMachineType ¨ nextMachineType.SUCC;
+ENDLOOP;
+};
+
+ShowCcCommandCmd: Commander.CommandProc ~ {
+showCcCommand ¨ TRUE;
+};
+
+DontShowCcCommandCmd: Commander.CommandProc ~ {
+showCcCommand ¨ FALSE;
+};
+
+showCcCommand: BOOL ¨ FALSE;
+userList: LIST OF MachinePair ¨ NIL;
+MachinePair: TYPE ~ RECORD[machineClass: ROPE, machineType: SystemVersion.MachineType];
+
+compilerDefault, includeDefault, moveDefault, loadDefault, cshDefault: ROPE;
+insertRopeDefault: ROPE ~ "FILE-";
+
+Init: PROC ~ {
+projectCedar: ROPE ~ IO.PutFR["/project/cedar%g.%g/", [cardinal[SystemVersion.release.major]], [cardinal[SystemVersion.release.minor]] ];
+Commander.Register[ComplexCC, ComplexCCProc, ComplexCCDoc];
+Commander.Register[ComplexRsh, ComplexRshProc, ComplexRshDoc];
+Commander.Register["ComplexError", ComplexErrorProc, "raises ERROR, for debugging"];
+Commander.Register["ComplexDebugLinks", ComplexDebugLinksProc, "turns on debugging printout for links"];
+Commander.Register["ComplexDontDebugLinks", ComplexDontDebugLinksProc, "turns off debugging printout for links"];
+Commander.Register["ComplexCc.AddUserClasses", AddUserClassCmd, "add user classes to ComplexCc; syntax is: name* "];
+Commander.Register["ComplexCc.ShowCcCommand", ShowCcCommandCmd, "turn on printing of cc command to system script"];
+Commander.Register["ComplexCc.DontShowCcCommand", DontShowCcCommandCmd, "turn off printing of cc command to system script"];
+includeDefault ¨ Rope.Concat[projectCedar, "include/"];
+moveDefault ¨ "/bin/mv";
+loadDefault ¨ Rope.Concat[projectCedar, "lang/ld/sparc/ld"];
+cshDefault ¨ "/bin/csh -s";
+compilerDefault ¨ Rope.Concat[projectCedar, "bin/ccc"];
+UserProfile.CallWhenProfileChanges[OnProfileChange];
+};
+
+Init[];
+}.
+
+
+   `  
+CcCommandsImpl.mesa
+Copyright ” 1988, 1991, 1992, 1993 by Xerox Corporation.  All rights reserved.
+Eduardo Pelegri-Llopart, February 7, 1990 9:34:12 am PST
+Carl Hauser, May 23, 1988 2:42:05 pm PDT
+Bill Jackson (bj) July 5, 1988 8:36:20 pm PDT
+Spreitze, May 12, 1993 12:06 pm PDT
+Chauser, February 1, 1991 3:35 pm PST
+Willie-s, May 19, 1993 3:47 pm PDT
+Michael Plass, September 30, 1991 5:45 pm PDT
+Doug Wyatt, January 31, 1992 4:07 pm PST
+The module should be reorganized to be more rational.
+
+ExtendADotOut USING [ ActionID, ActionIDFromAction, DependencyInfo, DependencyInfoRep, Fail, ObjectClassFromFileName, ObjectIDFromFile, ObjectID, PutDependencyInfo, StampFromIDs, VersionStamp, Warning ],
+Temporarily until I change SystemVersion.MachineType;
+mot88000: SystemVersion.MachineType ~ LOOPHOLE[SystemVersion.MachineType[14]];
+r2000: SystemVersion.MachineType ~ LOOPHOLE[SystemVersion.MachineType[30]];
+r3000: SystemVersion.MachineType ~ LOOPHOLE[SystemVersion.MachineType[31]];
+i386: SystemVersion.MachineType ~ LOOPHOLE[SystemVersion.MachineType[40]];
+i486: SystemVersion.MachineType ~ LOOPHOLE[SystemVersion.MachineType[41]];
+i860: SystemVersion.MachineType ~ LOOPHOLE[SystemVersion.MachineType[42]];
+i960: SystemVersion.MachineType ~ LOOPHOLE[SystemVersion.MachineType[43]];
+
+Unique names for temporary (unix-host) files
+Making filenames acceptable to UNIX
+Auxiliary Execution Procs.
+we assume the last token on the list is the actual compiler name if command starts with "rsh "
+SELECT PBasics.endianBitsInBytes FROM
+big => low7 ¨ PBasics.BITAND[lowByte, 077B];
+little => low7 ¨ PBasics.BITAND[lowByte, 176B];
+ENDCASE => ERROR;
+Breaks Cat[origDir, origName] into Directory and ShortName parts.
+Commander Procs.
+anArg.Equal[s2: "-host", case: FALSE] => { userHost _ NextRope[] };
+cmd.err.PutRope[" [localhost] "];
+
+That's all!
+Host is currently unused.
+Step One: tame the file view problems
+
+Step Two: do a Cc
+
+the rs6000 compiler does not honor the -o switch when the -c switch is given; so we insert a cd Concat[currentDir, binDir] after an rsh
+need to look in ./ and ../ for include files
+Step Three: do an Ld (renaming if necessary, after removing links)
+Step Four: process the file adding extra symbols and dependecy info.
+
+IF ( xFlag ) THEN {
+ENABLE {
+ExtendADotOut.Warning => {
+cmd.err.PutRope[Rope.Cat["ExtendADotOut warning: ", msg, "\n"]];
+RESUME};
+ExtendADotOut.Fail => {failMsg _ msg; GOTO EFail};
+};
+self: ExtendADotOut.ObjectID;
+action: ExtendADotOut.ActionID ~ ExtendADotOut.ActionIDFromAction["CC"];
+dependList: LIST OF ExtendADotOut.ObjectID _ NIL;
+deps: ExtendADotOut.DependencyInfo;
+depFileList: LIST OF ROPE _ NIL;
+
+depFileList _ CONS[Rope.Cat[srcDir, inFilename], depFileList];
+FOR list: LIST OF ROPE _ intFileList, list.rest WHILE list # NIL DO
+fileName: ROPE ~ list.first;
+depFileList _ CONS[Rope.Cat[srcDir, fileName], depFileList];
+ENDLOOP;
+FOR list: LIST OF ROPE _ loadFileList, list.rest WHILE list # NIL DO
+fileName: ROPE ~ list.first;
+depFileList _ CONS[Rope.Cat[binDir, fileName], depFileList];
+ENDLOOP;
+FOR list: LIST OF ROPE _ rloadFileList, list.rest WHILE list # NIL DO
+fileName: ROPE ~ list.first;
+depFileList _ CONS[fileName, depFileList];
+ENDLOOP;
+FOR list: LIST OF ROPE _ depFileList, list.rest WHILE list # NIL DO
+fileName: ROPE ~ list.first;
+dependList _ CONS[ExtendADotOut.ObjectIDFromFile[fileName], dependList];
+ENDLOOP;
+
+self.class _ ExtendADotOut.ObjectClassFromFileName[outFilename];
+self.name _ Rope.Cat[binDir, outFilename];
+self.stamp _ ExtendADotOut.StampFromIDs[action, dependList];
+deps _ NEW [ExtendADotOut.DependencyInfoRep _ [
+self: self,
+action: action,
+dependList: dependList
+]];
+
+ExtendADotOut.PutDependencyInfo[PFS.FileInfo[Rope.Cat[binDir, outFilename]].fullFName, deps];
+depFileList _ depFileList;
+
+EXITS EFail => {msg _ failMsg; GOTO Failed}
+};
+
+Warning, Warning!!! create list in reverse order!
+anArg.Equal[s2: "-host", case: FALSE] => { userHost _ NextRope[] };
+That's all!
+Step One: tame the file view mess
+What if the command does something (like mv) that would break links?
+
+Step Two: do the Rsh on host
+
+Step Three: remove the links.
+Step Four: process the file adding extra symbols and dependecy info.
+
+IF ( xFlag ) THEN {
+ENABLE {
+ExtendADotOut.Warning => {
+cmd.err.PutRope[Rope.Cat["ExtendADotOut warning: ", msg, "\n"]];
+RESUME};
+ExtendADotOut.Fail => {failMsg _ msg; GOTO EFail};
+};
+self: ExtendADotOut.ObjectID;
+action: ExtendADotOut.ActionID ~ ExtendADotOut.ActionIDFromAction[xClassName];
+dependList: LIST OF ExtendADotOut.ObjectID _ NIL;
+deps: ExtendADotOut.DependencyInfo;
+depFileList: LIST OF ROPE _ NIL;
+stamp: ExtendADotOut.VersionStamp;
+
+FOR list: LIST OF ROPE _ srcInFileList, list.rest WHILE list # NIL DO
+fileName: ROPE ~ list.first;
+depFileList _ CONS[Rope.Cat[srcDir, fileName], depFileList];
+ENDLOOP;
+FOR list: LIST OF ROPE _ binInFileList, list.rest WHILE list # NIL DO
+fileName: ROPE ~ list.first;
+depFileList _ CONS[Rope.Cat[binDir, fileName], depFileList];
+ENDLOOP;
+FOR list: LIST OF ROPE _ depFileList, list.rest WHILE list # NIL DO
+fileName: ROPE ~ list.first;
+dependList _ CONS[ExtendADotOut.ObjectIDFromFile[fileName], dependList];
+ENDLOOP;
+
+stamp _ ExtendADotOut.StampFromIDs[action, dependList];
+
+FOR list: LIST OF ROPE _ binOutFileList, list.rest WHILE list # NIL DO
+outFilename: ROPE ~ list.first;
+self.class _ ExtendADotOut.ObjectClassFromFileName[outFilename];
+self.stamp _ stamp;
+self.name _ Rope.Cat[binDir, outFilename];
+deps _ NEW [ExtendADotOut.DependencyInfoRep _ [
+self: self,
+action: action,
+dependList: dependList
+]];
+
+ExtendADotOut.PutDependencyInfo[PFS.FileInfo[Rope.Cat[binDir, outFilename]].fullFName, deps];
+ENDLOOP;
+dependList _ dependList;
+
+EXITS EFail => {msg _ failMsg; GOTO Failed}
+};
+
+Documentation
+Changes:
+Added -X and -XClass flags
+Added encoding of dependencies
+Added binDir to ComplexRsh;  note: command still executes in srcDir until I chase clients around.  CC version has not been changed yet.
+
+To Change:
+Encoding of boundaries for Howard
+ù )]  ïNewlineDelimiter
+ñ(cedarcode) styleô codeöúôKöú
+œeúCôNKöœy8ô8Köú%œkô(Köú-ô-Kô#Kô%Kô"Kô-Kô(Kò óô5Kô óöü	ò	Köúüú)ò3KòKöúüúò*Köú
+üúüúò%Köú
+üú#ò2Köúüúò"KòKöú	üúòKöúüú∏ôÀKöüúòKöüúòKöúüúRò_KöúüúJüú
+òbKöúüú	òKòKöúüú(ò;Köúüúò"Köú
+ò
+Köúüúò/Köúüú	ò$Köú
+üú ò/KöúüúLò]Kò
+Kò óöœnúüúüòKöüúCœcúüúüúßòãKöüúüúüúòKö
+üúüúüúüúüúòKò Kö†úüúüúüúò.KöœbúüúüúòKö–bkúüúüúòKò Kö†úüúüúòKò Kô5Köú&üú ôNKöú&üú òNKöú$üú òLKöú$üú!°&úòtKöú$üú!°#úòqKöú#üú ôKKöú#üú ôKKöú"üú ôJKöú"üú ôJKöú"üú ôJöú"üú ôJKô óKöúüúüúò)KöúüúüúiüúòçKöúüúüúò'Kò"headöœz,ô,KöúüúòKöúüúò'Köúüú#ò4Kö£úüúò.Kò ö†úüúüú
+üúü°úüú
+üúò^KöüúüúüúòKöúüú üúüúüúüúüúòxöüúüúüúüúò#Köüú"üúòGKöú!ò!KòóKöú
+üúòKòKò óóö§#ô#ö†úüúüúüúüúüúüúüúüúüú
+üúüúòóKöüúüú
+üúüúròûKò KöüúIòOóKò ö†úüúüúüúüúüúüúüúüúüú
+üúüúòõKöúüúüúüúò*KöúüúüúüúòGKöú	üúüú$°òFKò2Köúüúò&Köüúüúüúüúüúüúüú'òìKöüúüú	üúüúüúüúü°&úòböüúüúòKöúüúüúüúQòeKöúüúüúò1Köú
+üúòKòKöúüúò(Köúüú%ò3Köúüú!ò.KòKöüú:üúüúòWKòKòóKöüúüúò3öüúüúüòöúüúòKöú
+üúüúò2öüúüúüúòKöúüúüúò&Köúüúüúò1Köú1ò1Köú
+üú°#úòIKöúüú$ò-KöúòKöüúüúò&óKöüúò óöúüúòKöú
+üúòKöúüúò(Köú°ò*öüúüúòKöüúòóöüúüúüúüúò!Köú5ò5Köúüú°#úòPKöúüúüúò&Köúüúüúò1Köúüú,ò;Köüúüúüúüú-òTöüú(üúüúòEKöüúIüúòlóKöúòKöüúüúò1óKöüúüúò Kòóöüúüúò!Köüú<üúüúòfóóKòóKò Köú(ò(Kò ö†úüúüúüúüúüúòCKò óKöú
+üúüúò!öúüúüúòKöúüúòKöúüúòKöú	üúòKöúüúòKöúü	úòóKò ö†úüúüúüúüúüúò8KöüúüúüúòKöúüúò(Köüúüúüúüúüúüúò7KöüúòóKò ö†úüúüúüúüúüúüúüúòOKöúüúò'Köúüúò#öüòKöúüúò-öüúüúüúòKöúüúüú
+ò&öüúò	KöúDòDKöú"ò"óKöüúüúüúüúò*óöüúüúüòöúòKöú3ò3Köú9ò9KöúBòBKöüúüúüúüúœtúüúüúüúüúüúòõKöúüúòKòKòKöüúüúüúüúKòiKöüúüúòóöúü°úò8KöúüúòKöüúüúüúüúKòiKöüúüúòóKöúüúüú[òxöüúòKöúüúò%Köúüú ò+Köüúüúüúüú≥òŸKöüúòóóKöüúòóöúòKò óóKöú*üúò0KöúüúüúòKöúüúòKò ö†úüúüúüúüúüúò3KöüúüúüúòKöúüúò#Köüúüúüúüúüúüúò7KöüúòóKò ö†úüúüúüúüúüúüúüúòJKöúüúò-Köüúüúüúüúüúüú7ò^KöúüúòKöüúüúüúüú7òUöüúüúòKò<Köüúüúüúüúò%Köüúüúüúüú,üúüúüúüúòâKòóKöü	úòKöüúüúòóKò ö
+†
+úüúüúüúüúò0öüúüúüúüò,KòKöüúòóKöüúòóKò ö†úüúüúüúò\KöüúIòOóóö§ôö†úüúüúüú/òoKö†úüú°ò,öüúüúüòKöú"üúò?Köú$üúòAKöú!üúò>Köú!üúò>Köú%üúòFKöú#üúòBKöú"üúòAKöú!üúò@öüúòöüúüúüú#üúüúüòGKöüú3üúüúüúò`KöüúòóKöüúòKòóóKòKò óö†úüú,üúüúòoöüúüòKöúòKöúòKöú&ò&Köú"ò"Köú!ò!Köú ò öüúòöüúüúüú#üúüúüòGKöüú&üúüúòMKöüúòóKòKòóóKòKò óö†úüú+üúòYKöüúüúüú(òAöüúüúüú+üúüúüòKKöüúüúüúò4KöüúòóKöüúòKòKò óö†ú"ò3Kö	úüúüúüú2üúòJKöúIüúòNKöú
+üúüúòKòKò KöúüúòKöúüúòöüúüúüúüúüúüúüò=Köúüú*ò9Köú"üúò'KöüúòóKò Kò>KòAKò8Kò6Kò5Kò?Kò8öúüúò-Kö	úCüú
+üúüúüúòqóKò öüúüúüúüúüúüúüò5KöúüúòKòaKòdKò]KòYKòXKöúKüúòQKò8öúüúòKö	úaüú
+üúüúüúòèóKöúüúò0KöüúòóKòKò óö†úüúüúüúüúüúòUKô^Köúüúò	Kö
+üúüú!üúüúüú	ò?Kò$Köüú8ò>KòKò óKö†úüúüúò+Kò ö†úüú
+üúüúüúüúòKKöú	üúüú	üúò;Köú	üúò(Köúüúò-KöúüúòöüúüúòKöúüú1üúüúò`KöüúòKòóöüúüúòKöúüú+üúüúòZKöüúòKòóöüúüô%Köúüúô,Köúüúô/KöüúüúôóKöúüúòKöúüú8üúüúò`KòKò óö†úüúüú
+üúüúüúüúòOKöúüúüòKöúüúüúüúò,Kö	ú	üúüúüúüúòRöüú
+üúüúòKöúòKöúòKö
+üúüúüúüú
+üúò>KöúòóKòKò óö†úüúüúüúüúüú
+üúüúüúòZKöúüúüúüúüú	üú'ò^Köú>ò>Köúüúò,KöúDòDKöúüúò+KöúEòEKöúRòRKöüúüú:òLKöúA†úòOKöúA†úòOòKò óóö†
+úüúAüúüúüúüú
+üúüúüúòìKöúüú<òPKöúNòNöüúüòKö
+üúüúüúWüú0üú1òŸóòKöúüúò*KöúBòBKöúüúò,KöúDòDKöúüúò,KöúDòDKöúüúüúüúò6Köú
+üúüúüú=òVKò Kö
+üúüúüúüúüúòEKöúüúò.KòKöú`ò`KöüúüúAòSKöúA†úòOKöúA†úòOKöüúüú
+üúò8KòóòKò óóö
+†úüúüúüú	üúòGKöúüú8òGKöúüú&ò0KöüúòKò óö†úüúüúüúüúüúòDKöüúüúüúüúò)Köú
+üúüú"ò@KöüúòKò óö
+†úüúüúüúüúò:Köúüú ò+Köüú@òFKòKò óö†úüúüúüúüúüúüúüúòdKôAKöúüúòKòKöüúüúüúüúòKòöüú.üò4KöúòKöú<üúüúòJKöú/üúüúò=KöüúòóKöüúüúòóóö§ôKò Kö†úüúüúò!Kò ö†úò(KöúüúüúòKöú%üúüúò0Köú	üúüúòKöúüúüúòKöúüúüúüúò(KöúüúüúòKöúüúüúüú°,òGKöúüúüúüú°!ò=Köúüúüúüú°+òHKöúüúüúò#KòöüúòKöú&üú
+ò4Köú$üú
+ò2Köú.üú
+ò<Köüú%üú
+ò6Köüúüú
+ò0Köúòóö†úüúòIcedaröúüúòKöúüúòöüú
+üúüúüò(ö
+†úüúüúüúüúò-Köú(üúò.KöúòKöúüúòKòóö†úüúüúüúüúüúüúüúò;öüúüúüúüúüúüò4Köúüúò#Köüúüú	üúüúò5KöúüúòöüòKöüúòóKöüúòóKòóKöúüú°òKöúüúò#Köú°òöüúüúüòKöúüú3òUKöúüú4òWKöú!üú/òUKöú!üú/òUKöú"üú!òHKöú"üú!òHKöû–kyûôCKöú üú"òGKöúüú"òEKöúüú"òEKöúüúüúò7öúüúò(Köúüúò.óöú üúò)Köúüúò/óKöüúüúò$óKöüúò	KöúòKò óóKöúüúüúüúüúüúüúüú°òpKò Möú%£úòDMò<Mò KöúòKò Möüúüúüú+ò=Möüúüúüú+ò=Kò Köüúüúüú'òDKò Köú>ò>Kò Köû!ô!Kô Köú!üú%òHKöúòKòÃKò KöüúòLö¢ôöüòMöú ò óKòKò óö†úüú\üúüú,üúJüú
+üúüúüúüúüúò±KôKöúüúüúòKöú(üúò-KöúüúüúòKòKò Kò?ö
+üúüúüúüúüúòDKöúüúGüú.üú2ò≥KöüúòKöúòóLö–bz%ô%Icoeedarô öúüúüúò-Kö	ú:üúüúüúüúòcKö	ú;üúüúüúüúòcöüú	üúòKöú
+üú#ò1Köú$üúò*Kö	ú"üúüúüúüúòKöüúüúüúüúüú
+üúüòHKöú	üúòKöúMüúüúüúòrKöú.ò.Köüúòóöüúüúüúüúüú
+üúüòIKöú	üúòKöú8üúüúüúò]Köú.ò.KöüúòóKöú2ò2KòóóLößôNô öúòKöúüúòKöúüúüúòKôáKöúüúüúüúüúüúüú%ò`Kô,öüúüúüúòKöú
+üúüú`òçKöú
+üú&üúlò¢KòöüúòKöú
+üú$üúüúüúüúüúüú'òØKò6KòóóKò öüúüúJüúòwKò óKòNKò öüúüúüúòöüúòöüúüúòKöúüú2üúüúò]KöúòKöüúòKòóKöúüú)üúòDKöúòóöüúòKò
+KòóóKöúòKöúòKöúòóKöúòKò LößBôBKò öüúüúòKöúüúòKöú
+üúòKò KöúOüúüúüúòsKöúüúüúüúüúüúüúüúòôKò öüúüúJüúòyKò óKöúPòPKò öüúüúüúòöüúòöüúüúòKöúüú+üúüúòVKöúòKöüúòKòóKöúüú"üúò=KöúòóöüúòKò
+KòóóKöúòKöúòKöúòKöúòóKò KöúòKò öüúüúòöüúüúüú,üúòkKöúüú=üúdò≠Köüú
+òóKòóKöúòKò LößDôDMô öüú
+üúôöüúôöúôKöú@ô@KöüúôóKöú&üúô2KôóKôKôHKöúüúüúüúô1Kô#Kö	úüúüúüúüúô Kô Köúüú,ô>öüúüúüúüúüúüúüôCKöú
+üúôKöúüú*ô<KöüúôóöüúüúüúüúüúüúüôDKöú
+üúôKöúüú*ô<KöüúôóöüúüúüúüúüúüúüôEKöú
+üúôKöúüúô*KöüúôóöüúüúüúüúüúüúüôCKöú
+üúôKöúüú7ôHKöüúôóKô Köú@ô@Köú*ô*Kô<öúüú%ô/KôKôKôKôóKô Köú üú:ô]KöúôKô Köüúüúô+KöúôKô óKöúòöüòMöú ò óKòKò óö†úüúüúüúòDKöüú!ò'KöúòKò óö†úò)MöúüúüúòMöúüúüú°(ò@MöúüúüúüúòMöúüúüúüú°2òOMöúüúüúüú°2òOMöúüúüúüú°1òOMöúüúüúüú°1òOMöú,üúüúò7MòöüúòKöú'üú
+ò5Köú$üú
+ò2Köú/üú
+ò=Köüú%üú
+ò6Köüúüú
+ò0Köúòóö†úüúòMöúüúòKöúüúòöüú
+üúüúüò(ö
+†úüúüúüúüúò-Köú(üúò.KöúòKöúüúòKòóö†úüúüúüúüúüúüúüúò>Kô1öüúüúüúüúüúüò4Köúüúò#Köüúüú	üúüúò5KöúüúòöüòKöüúòóKöüúòóKòóKöúüúò#öüúüúüòKöú üú'òLKöú üú'òLKöú!üú(òNKöú!üú(òNKöú!üú/òUKöú!üú/òUKöû¶ûôCKöú üú"òGKöúüúò@Köú!üúüúòUKöüúüúò$óKöüúò	Köüúüúüúò*KöúòKò óóKöúüúüúüúüúüúüúüú°òpMò Möú%£úòDMò<Mò KöúòKò Mò=Mò=Kò Köú ò KöúòKòäLö¢ôöüòMöú ò óKòKò óö†	úüú2üú	üú@üúJüú
+üúüúüúüúüúòìMöúüúüú°ò.Möú	üúüúòöß!ô!KôDóKô Köúüúüú$ò2Kò öüúüúüúüúüúüúüòFKöú
+üúòöüúüúüúüúüú	üúüòHKöúüúòKöüú!üúüú°KòyöüòKö
+üú<üúüúüúüúòqóKöüúòóKöüúòóöüúüúüúüúüúüúüòFKöú
+üúòöüúüúüúüúüú	üúüòHKöúüúòKöüú!üúüú°KòyöüòKö
+üú<üúüúüúüúòqóKöüúòóKöüúòóöüúüúüúüúüúüúüòEKöú
+üúòKö	ú8üúüúüúüúòfKöüúòóöüúüúüúüúüúüúüòEKöú
+üúòKö	ú8üúüúüúüúòfKöüúòóLößôNô òKöúüúòKöú
+üúüúòKöú	üúòKò öüúüúüúòöüòöüúòKöüúòKöüú,ò0óóöüòKòóóKöú~ò~öüúüúüúòöüúòöüúüúòKöúüú.üúüúòYKöú ò KöüúòKòóKöúüú#üúò>KöúòóöüúòKò
+KòóóKöúòKöúòKöúòóöúòKò óLößôò Köú#ò#óKò LößDôDMô öüú
+üúôöüúôöúôKöú@ô@KöüúôóKöú&üúô2KôóKôKöúNôNKöúüúüúüúô1Kô#Kö	úüúüúüúüúô Köú"ô"Kô öüúüúüúüúüúüúüôEKöú
+üúôKöúüú*ô<KöüúôóöüúüúüúüúüúüúüôEKöú
+üúôKöúüú*ô<KöüúôóöüúüúüúüúüúüúüôCKöú
+üúôKöúüú7ôHKöüúôóKô Kô7Kô öüúüúüúüúüúüúüôFKöúüúôKöú@ô@KôKöú*ô*öúüú%ô/KôKôKôKôóKô Köú üú:ô]KöüúôóKöúôKô Köüúüúô+KöúôKô óKöúòöüòMöú ò óKòKò óKò óö§ôKö†	úüúòKö†úüúﬁòKö†úüú2òFKò Kö†
+úüúò Kö†úüú¯òãKö†úüú4òIKö†úüúPòpóKò Kö†úüúò2Kö†ú(üúòCö†ú(üúòHKò óKöú-üúò:Kò ö†úò*Köúüúò
+öüú,üúüò7Köúüú#ò2Köú"üúò'KöüúòóKòKò óö†úò+KöúüúòKòKò óö†úò/KöúüúòKòKò óKöúüúüúòKöú
+üúüúüúò$öúüúüúüú*òWKò óKöúGüúòLKöúüúò"Kò ö†úüúòKöúüúüúròâKöú,œoúò;Köú.®úò>Köú4®úòTKöú>®ú)òhKöúF®ú*òqKòtKòsKò|Kò7KòKò<KòKò7Kò4KòKò óKòKòKò óôJôJôJôáJô óô
+Jô!óKò ó Öó    Üﬁ  «õ  

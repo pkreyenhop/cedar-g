@@ -1,0 +1,446 @@
+DIRECTORY Atom, Basics, Commander, IO, TonePlay, Process, Real, RealFns, Rope, TuneParse, UnixErrno, UnixTypes, UnixSysCalls, UXIO;
+
+TonePlayImpl: CEDAR PROGRAM
+IMPORTS Atom, IO, Process, Real, RealFns, UXIO, UnixErrno, UnixSysCalls 
+EXPORTS TonePlay
+~ BEGIN
+
+ROPE: TYPE = Rope.ROPE;
+
+ampScale: NAT = 256;
+
+MuLawByte: TYPE = TonePlay.MuLawByte;
+AudioBuf: TYPE = TonePlay.AudioBuf;
+
+pi: REAL ¬ 3.14159;
+
+
+K: CARD = 64*1024;
+L: CARD = 8*1024;
+M: CARD = 8159;
+
+audioDrain: INT = 04000040403B; -- Hex 20004103; ioctl for audio device drain.
+audioFlush: INT = 04000051405B; -- Hex 20005305; ioctl for audio device flush.
+
+decodeArray: REF DecodeArray ¬ InitDecodeArray[];
+DecodeArray: TYPE = ARRAY BYTE OF TonePlay.Scaled;
+
+InitDecodeArray: PROC RETURNS [REF DecodeArray] ~ {
+array: REF DecodeArray ¬ NEW[DecodeArray];
+FOR b: BYTE IN BYTE DO
+m: MuLawByte = [byte[b]];
+i: INT ¬ 0;
+rem: BYTE = m.rem;
+SELECT m.octant FROM
+0 => i ¬ 8159-256*rem;
+1 => i ¬ 4063-128*rem;
+2 => i ¬ 2015-64*rem;
+3 => i ¬ 991-32*rem;
+4 => i ¬ 479-16*rem;
+5 => i ¬ 223-8*rem;
+6 => i ¬ 95-4*rem;
+7 => IF rem # 15 THEN i ¬ 31-2*rem;
+ENDCASE;
+IF NOT m.positive THEN i ¬ -i;
+i ¬ i * (K/L);
+array[b] ¬ [int[i]];
+ENDLOOP;
+RETURN [array];
+};
+
+encodeArray: REF EncodeArray ¬ InitEncodeArray[];
+EncodeArray: TYPE = PACKED ARRAY EncodeArrayIndex OF BYTE;
+EncodeArrayIndex: TYPE = [0..M];
+
+InitEncodeArray: PROC RETURNS [REF EncodeArray] ~ {
+array: REF EncodeArray ¬ NEW[EncodeArray];
+adj: REAL ¬ 1.0/L;
+FOR i: EncodeArrayIndex IN EncodeArrayIndex DO
+array[i] ¬ HeavyEncode[REAL[i]*adj];
+ENDLOOP;
+RETURN [array];
+};
+
+EncodeScaled: --PUBLIC-- PROC [s: TonePlay.Scaled] RETURNS [BYTE] ~ {
+neg: BOOL ¬ FALSE;
+b: BYTE ¬ 0;
+index: EncodeArrayIndex ¬ EncodeArrayIndex.LAST;
+IF s.int < 0 THEN {s.int ¬ -s.int; neg ¬ TRUE};
+s.card ¬ s.card / (K/L);
+IF s.card < index THEN index ¬ LOOPHOLE[s.card, EncodeArrayIndex];
+b ¬ encodeArray[index];
+IF neg THEN b ¬ b MOD 128;
+RETURN [b];
+};
+
+HeavyEncode: --PUBLIC-- PROC [r: REAL] RETURNS [BYTE] ~ {
+hiIndex: BYTE ¬ 255;
+loIndex: BYTE ¬ 0;
+increasing: BOOL ¬ TRUE;
+r ¬ r * K;
+IF r <= 0 THEN hiIndex ¬ 127 ELSE loIndex ¬ 128;
+IF decodeArray[hiIndex].int < decodeArray[loIndex].int THEN increasing ¬ FALSE;
+DO
+IF (hiIndex-loIndex) > 1
+THEN {
+midIndex: BYTE = (hiIndex+loIndex)/2;
+midValue: REAL = REAL[decodeArray[midIndex].int];
+IF increasing
+THEN
+IF r >= midValue THEN loIndex ¬ midIndex ELSE hiIndex ¬ midIndex
+ELSE
+IF r <= midValue THEN loIndex ¬ midIndex ELSE hiIndex ¬ midIndex;
+}
+ELSE {
+hiValue: REAL = REAL[decodeArray[hiIndex].int];
+loValue: REAL = REAL[decodeArray[loIndex].int];
+IF ABS[hiValue-r] < ABS[loValue-r] THEN RETURN [hiIndex] ELSE RETURN [loIndex];
+};
+ENDLOOP;
+};
+
+RealToScaled: PROC [r: REAL] RETURNS [TonePlay.Scaled] ~ {
+RETURN [[int[Real.Floor[r*K+0.5]]]];
+};
+
+ScaledToReal: PROC [s: TonePlay.Scaled] RETURNS [REAL] ~ {
+RETURN [REAL[s.int] / K];
+};
+
+AddScaled: --PUBLIC-- PROC [s1, s2: TonePlay.Scaled] RETURNS [TonePlay.Scaled] ~ {
+RETURN [[int[s1.int+s2.int]]];
+};
+
+SubScaled: PROC [s1, s2: TonePlay.Scaled] RETURNS [TonePlay.Scaled] ~ INLINE {
+RETURN [[int[s1.int-s2.int]]];
+};
+
+MulScaled: PROC [s1, s2: TonePlay.Scaled] RETURNS [TonePlay.Scaled] ~ {
+neg: BOOL ¬ FALSE;
+res: CARD ¬ 0;
+IF s1.int < 0 THEN {s1.int ¬ - s1.int; neg ¬ TRUE};
+IF s2.int < 0 THEN {s2.int ¬ - s2.int; neg ¬ NOT neg};
+IF s1.card > s2.card THEN {t: TonePlay.Scaled ¬ s1; s1 ¬ s2; s2 ¬ t};
+IF s1.card # 0 THEN {
+lo1: CARD = s1.card MOD K;
+lo2: CARD = s2.card MOD K;
+hi1: CARD = s1.card / K;
+hi2: CARD = s2.card / K;
+IF lo2 = 0
+THEN {
+IF hi1 # 0 THEN res ¬ (hi1 * hi2) * K;
+IF lo1 # 0 THEN res ¬ res + (lo1 * hi2);
+}
+ELSE {
+IF hi1 # 0 THEN res ¬ (hi1 * hi2) * K + (lo2 * hi1);
+IF lo1 # 0 THEN res ¬ res + (lo1 * hi2) + (lo1 * lo2) / K;
+};
+IF neg THEN res ¬ 0 - res;
+};
+RETURN [[card[res]]];
+};
+
+SinScaled: PROC [s: TonePlay.Scaled] RETURNS [TonePlay.Scaled] ~ INLINE {
+RETURN [sinScaled[(s.card / (K/L)) MOD L]];
+};
+
+sinScaled: REF ScaledArray ¬ InitSinScaled[];
+ScaledArray: TYPE = ARRAY ScaledArrayIndex OF TonePlay.Scaled;
+ScaledArrayIndex: TYPE = [0..L);
+
+InitSinScaled: PROC [debug: TonePlay.STREAM ¬ NIL] RETURNS [REF ScaledArray] ~ {
+table: REF ScaledArray ¬ NEW[ScaledArray];
+cvt: REAL ¬ 2.0*pi/L;
+FOR i: ScaledArrayIndex IN ScaledArrayIndex DO
+r: REAL = i*cvt;
+sin: REAL = RealFns.Sin[r];
+s: TonePlay.Scaled ¬ RealToScaled[sin];
+table[i] ¬ s;
+IF table[i] # s THEN ERROR;
+IF debug # NIL AND s.int = 0 THEN {
+IO.PutF[debug, "In InitSinScaled, i = %g, i*cvt = %g, sin = %g\n",
+[integer[i]], [real[r]], [real[sin]] ];
+};
+ENDLOOP;
+RETURN [table];
+};
+
+GenTone: PUBLIC PROC [buf: TonePlay.AudioBuf] ~ {
+r1, r2: GenSampleResult ¬ skip;
+sample1, sample2: TonePlay.Scaled;
+buf.toneA.amp ¬ buf.toneB.amp ¬ [int[0]];
+buf.toneA.rem ¬ buf.toneA.fadeInSteps;
+buf.toneB.rem ¬ buf.toneB.fadeInSteps;
+buf.toneA.state ¬ buf.toneB.state ¬ fadeIn;
+DO
+out: TonePlay.Scaled ¬ [int[0]];
+[r1, sample1] ¬ GenSample[buf, buf.toneA];
+[r2, sample2] ¬ GenSample[buf, buf.toneB];
+IF r1=quit AND r2=quit THEN EXIT;
+IF r1=takeSample THEN out ¬ sample1;
+IF r2=takeSample THEN out ¬ AddScaled[out, sample2];
+buf.data[buf.pos] ¬ EncodeScaled[out];
+buf.pos ¬ (buf.pos + 1) MOD TonePlay.audioDataMod;
+IF buf.pos = 0 THEN buf.flush[buf, TonePlay.audioDataMod];
+ENDLOOP;
+};
+
+GenSampleResult: TYPE ~ { skip, takeSample, quit };
+
+GenSample: PROC[buf: TonePlay.AudioBuf, tone: TonePlay.FMToneSpec]
+RETURNS[result: GenSampleResult ¬ skip, out: TonePlay.Scaled ¬ [int[0]]] ~ {
+SELECT tone.state FROM
+fadeIn => {
+tone.amp.int ¬ tone.amp.int + tone.ampFadeIn.int;
+IF tone.amp.int > tone.ampInit.int THEN tone.amp.int ¬ tone.ampInit.int;
+IF tone.rem = 0 THEN {
+tone.state ¬ normal; tone.rem ¬ tone.normalSteps; RETURN[skip, out];};
+};
+normal => {
+tone.amp ¬ tone.ampInit;
+IF tone.rem = 0 THEN {
+tone.state ¬ fadeOut; tone.rem ¬ tone.fadeOutSteps; RETURN[skip, out];};
+};
+fadeOut => {
+tone.amp.int ¬ tone.amp.int - tone.ampFadeOut.int;
+IF tone.amp.int < 0 THEN tone.amp.int ¬ 0;
+IF tone.rem = 0 THEN {
+tone.state ¬ zero; tone.rem ¬ tone.zeroSteps; RETURN[skip, out]; };
+};
+zero => {
+tone.amp.int ¬ 0;
+IF tone.rem = 0 THEN RETURN[quit, out];
+};
+ENDCASE;
+IF tone.amp.int > 0 THEN {
+sin2: TonePlay.Scaled = MulScaled[SinScaled[tone.phase2], tone.phaseRatio];
+temp: TonePlay.Scaled = [int[tone.phase1.int+sin2.int]];
+trueAmp: TonePlay.Scaled = [card[tone.amp.card / ampScale]];
+out ¬ MulScaled[SinScaled[temp], trueAmp];
+};
+IF tone.delaySteps # 0 THEN {
+delayPos: TonePlay.AudioHistoryIndex
+= LOOPHOLE[tone.histPos - tone.delaySteps, CARDINAL] MOD TonePlay.audioHistoryMod;
+delayValue: TonePlay.Scaled ¬ tone.history[delayPos];
+delayValue ¬ MulScaled[delayValue, tone.delayRatio];
+out ¬ [int[out.int + delayValue.int]];
+};
+tone.history[tone.histPos] ¬ out;
+tone.histPos ¬ (tone.histPos + 1) MOD TonePlay.audioHistoryMod;
+tone.phase1.int ¬ tone.phase1.int + tone.phaseStep1.int;
+tone.phase2.int ¬ tone.phase2.int + tone.phaseStep2.int;
+tone.rem ¬ tone.rem - 1;
+RETURN[takeSample, out];
+};
+
+BufFlush: PROC [buf: TonePlay.AudioBuf, len: NAT] ~  TRUSTED {
+ENABLE UXIO.Error => {
+errno: UnixErrno.Errno ¬ GetErrno[];
+IF errno = EINTR OR errno = EABORTED THEN ERROR ABORTED ELSE ERROR;
+};
+Process.CheckForAbort[];
+IF len # 0 AND buf.st # NIL THEN
+IO.UnsafePutBlock[buf.st, [LOOPHOLE[@buf.data], 0, len]];
+buf.pos ¬ 0;
+};
+
+GetErrno: PROC RETURNS [UnixErrno.Errno] ~ {
+RETURN[UnixErrno.GetErrno[]];
+};
+
+OpenAudioDeviceForWrite: PUBLIC PROC[defaultAmplitude: REAL]
+RETURNS [buf: AudioBuf] ~ {
+buf ¬ NEW[TonePlay.AudioBufRep];
+buf.toneA ¬ NEW[TonePlay.FMToneSpecBody];
+buf.toneB ¬ NEW[TonePlay.FMToneSpecBody];
+buf.toneA.ampDefault ¬ buf.toneB.ampDefault ¬ defaultAmplitude;
+buf.flush ¬ BufFlush;
+buf.st ¬ UXIO.CreateFileStream["/dev/audio", write];
+buf.self ¬ Process.GetCurrent[];
+};
+
+CloseWriteAudioDevice:
+PUBLIC PROC[buf: AudioBuf, discardQueued: BOOL¬FALSE]  ~ TRUSTED {
+IF buf.st#NIL THEN {
+fd: UnixTypes.FD;
+res: UnixTypes.RES;
+st: IO.STREAM ¬ buf.st;
+fdRef: REF UnixTypes.FD;
+IF buf.self=NIL THEN RETURN;
+IF buf.self#Process.GetCurrent[] THEN ERROR;
+Process.CheckForAbort[];
+fdRef ¬ NARROW[Atom.GetPropFromList[st.propList, $FD]];
+IF fdRef=NIL THEN RETURN;
+fd ¬ fdRef­;
+IF ~discardQueued THEN res ¬
+UnixSysCalls.IOCtl4[d: fd, request: audioDrain, argp: LOOPHOLE[@res], doInIOP: TRUE]
+ELSE res ¬ 
+UnixSysCalls.IOCtl4[d: fd, request: audioFlush, argp: LOOPHOLE[2], doInIOP: TRUE];
+IO.Close[st];
+};
+buf.st ¬ NIL;
+buf.self ¬ NIL;
+};
+
+PlayTonePair: PUBLIC PROC [buf: AudioBuf, time: REAL, freq1: REAL, freq2: REAL] ~ {
+PlayTonePairReally[buf, time, 0, freq1, freq2];
+BufFlush[buf, buf.pos];
+};
+
+PlayTonePairReally: PROC [buf: AudioBuf, time: REAL, ampAdj: INT, freq1: REAL, freq2: REAL] ~ {
+
+amp: REAL ¬ buf.toneA.ampDefault;
+fadeInTime: REAL ¬ 0.00;
+fadeOutTime: REAL ¬ 0.00;
+phaseRatio: REAL ¬ 1.0;
+delayTime: REAL ¬ 0.0;
+delayRatio: REAL ¬ 0.8;
+pauseTime: REAL ¬ 0.0;
+IF buf.self=NIL THEN RETURN;
+IF buf.self#Process.GetCurrent[] THEN ERROR;
+Process.CheckForAbort[];
+SELECT ampAdj FROM
+< 0 => amp ¬ amp / ampAdj*(-1.4);
+> 0 => amp ¬ amp * ampAdj * 1.4;
+ENDCASE;
+buf.toneA.phaseStep1 ¬ RealToScaled[freq1/L];
+buf.toneB.phaseStep1 ¬ RealToScaled[freq2/L];
+buf.toneA.ampInit ¬ buf.toneB.ampInit ¬ RealToScaled[amp*ampScale];
+buf.toneA.phaseStep2 ¬ buf.toneB.phaseStep2 ¬ RealToScaled[0.0];
+buf.toneA.phaseRatio ¬ buf.toneB.phaseRatio ¬ RealToScaled[phaseRatio];
+buf.toneA.delaySteps ¬ buf.toneB.delaySteps ¬ (RealToScaled[delayTime].card / (K/L)) MOD TonePlay.audioDataMod;
+buf.toneA.delayRatio ¬ buf.toneB.delayRatio ¬ RealToScaled[delayRatio];
+buf.toneA.fadeInSteps ¬ buf.toneB.fadeInSteps ¬ RealToScaled[fadeInTime].int / (K/L);
+buf.toneA.normalSteps ¬ buf.toneB.normalSteps ¬ RealToScaled[time].int / (K/L);
+buf.toneA.fadeOutSteps ¬ buf.toneB.fadeOutSteps ¬ RealToScaled[fadeOutTime].int / (K/L);
+buf.toneA.zeroSteps ¬ buf.toneB.zeroSteps ¬ RealToScaled[pauseTime].int / (K/L);
+IF buf.toneA.fadeInSteps <= 0
+THEN buf.toneA.ampFadeIn.int ¬ buf.toneB.ampFadeIn.int ¬ 0
+ELSE buf.toneA.ampFadeIn.int ¬ buf.toneB.ampFadeIn.int  ¬ buf.toneA.ampInit.int / buf.toneA.fadeInSteps;
+IF buf.toneA.fadeOutSteps <= 0
+THEN buf.toneA.ampFadeOut.int ¬ buf.toneB.ampFadeOut.int ¬ 0
+ELSE buf.toneA.ampFadeOut.int ¬ buf.toneB.ampFadeOut.int ¬ buf.toneA.ampInit.int / buf.toneA.fadeOutSteps;
+GenTone[buf];
+};
+
+PlayRingTune: PUBLIC PROC [buf: AudioBuf, toneSpec: TuneParse.ToneSpec] ~ {
+FOR tones: TuneParse.ToneList ¬ toneSpec.tones, tones.rest WHILE tones#NIL DO
+IF tones.first.on#0 THEN
+PlayTonePairReally[buf, (tones.first.on+0.0)/1000.0, toneSpec.volume, tones.first.f1, tones.first.f2];
+IF tones.first.off#0 THEN
+PlayTonePairReally[buf, (tones.first.off+0.0)/1000.0, 0, 0.0, 0.0];
+ENDLOOP;
+BufFlush[buf, buf.pos];
+};
+
+Stop: PUBLIC PROC [buf: AudioBuf] ~ {
+self: PROCESS;
+IF buf#NIL AND (self¬buf.self)#NIL THEN Process.Abort[self];
+};
+
+END.
+
+readSt: TonePlay.STREAM;
+readFD: UnixTypes.FileDescriptor;
+audioDeviceReadOpen: BOOL ¬ FALSE;
+InitSumArray: --PUBLIC-- PROC RETURNS [REF TonePlay.SumArray] ~ {
+array: REF TonePlay.SumArray ¬ NEW[TonePlay.SumArray];
+FOR a: BYTE IN BYTE DO
+scaledOfa: TonePlay.Scaled ¬ DecodeScaled[LOOPHOLE[a]];
+FOR b: BYTE IN BYTE DO
+scaledOfb: TonePlay.Scaled ¬ DecodeScaled[LOOPHOLE[b]];
+scaledSum: TonePlay.Scaled ¬ AddScaled[scaledOfa, scaledOfb];
+array[a][b] ¬ EncodeScaled[scaledSum];
+ENDLOOP;
+ENDLOOP;
+RETURN[array];
+};
+DecodeScaled: PUBLIC PROC [m: MuLawByte] RETURNS [TonePlay.Scaled] = {
+RETURN [decodeArray[m.byte]];
+};
+
+DecodeReal: PUBLIC PROC [m: MuLawByte] RETURNS [REAL] = {
+RETURN [REAL[decodeArray[m.byte].int] / K];
+};
+
+OpenAudioDeviceForRead: --PUBLIC-- PROC  ~ {
+[readFD, readSt] ¬ UXIOExtras.FileStreamAndFD["/dev/audio", read];
+[] ¬ UnixSysCallExtensions.SetBlocking[readFD, allData];
+audioDeviceReadOpen ¬ TRUE;
+};
+
+CloseReadAudioDevice: --PUBLIC-- PROC  ~ {
+IF audioDeviceReadOpen THEN {
+IO.Close[readSt];
+audioDeviceReadOpen ¬ FALSE;
+};
+};
+
+ReadNextSample: PUBLIC PROC RETURNS [REF TEXT, NAT] ~ {
+nBytesRead: NAT;
+nextBlock: REF TEXT ¬ MemoryAllocate.GetNewAudioSample[];
+[nBytesRead] ¬ IO.GetBlock[self: readSt, block: nextBlock, count: VoiceProtocol.audioSampleSize];
+RETURN [nextBlock, nBytesRead];
+};
+
+WriteToAudioDevice: --PUBLIC-- PROC [buffer: VoiceProtocol.OutputBuffer, startIndex: VoiceProtocol.OutputBufferIndex, length: INT] ~ {
+IF length # 0 AND writeSt # NIL THEN 
+TRUSTED{IO.UnsafePutBlock[writeSt, [LOOPHOLE[@buffer], startIndex, length]];};
+};
+   J  
+TonePlayImpl.mesa
+Copyright Ó 1989, 1990, 1992 by Xerox Corporation.  All rights reserved.
+Michael Plass, October 23, 1989 4:09:32 pm PDT
+Atkinson, April 6, 1990 7:43 pm PDT
+Vin, September 10, 1990 11:55 am PDT
+Swinehar, October 23, 1992 8:35 am PDT
+
+Should worry about Monitors, etc., with all that aborting going on.
+
+Note, amp is kept scaled up by ampScale for better precision
+A power of 2 scale is more efficient
+This information is derived from the data sheet on the Intel 2910A (mu-Law).
+Encodes for s in the range [-1.0 .. 1.0], clipping if s is not in that range.
+Binary search assuming decodeArray is valid, but not using encodeArray.  r is assumed to be in the range [-1.0 .. 1.0].
+Assert: s1 <= s2
+This actually returns Sin[s*twoPi]
+Could check here or somewhere for nothing to do for this frequency.
+Note, amp is kept scaled for better precision
+This generates a fair amount of buffer space that must later be reclaimed.  Consider a way to re-use buf's instead of regenerating them.
+There's now enough concurrency in all this to warrant some monitors.
+None in place at the moment.
+freq1: REAL _ 440.0; -- examples
+freq2: REAL _ 457.0;
+time: REAL _ 1.0;
+What's the write way to right silence into one of these streams?
+Bulk of logic retained for ring tune stuff, but output modified as needed for use with RF mixer. Also modified to create genuine sums of sine waves for freq1 and freq2 in PlayRingTune. DCS August 12, 1992 4:35:44 pm PDT
+
+Name Changed from TonePlayImpl September 29, 1992 5:06:24 pm PDT; generic Cedar access to SPARC audio device.
+
+Stuff that's not used at the moment
+
+
+Ê=  •NewlineDelimiter
+–"cedarcode" style™ code™Kšœ
+Ïeœ=™HK™.K™#K™$K™&K™ K™EK™ —šÏk	œžœ^˜ƒK˜ —šÏnœžœž˜Kšžœžœžœ˜HKšžœ	˜Kšœž˜K˜ Kšžœžœžœ˜K˜ šœ
+žœ˜Kšœ<™<K™$K˜ —K˜%K˜#K˜ Kšœžœ˜K˜ K˜ KšŸœžœ˜KšŸœžœ
+˜KšŸœžœ˜K˜ Kšœžœ?˜NKšœžœ?˜NK˜ Kšœžœ!˜1Kš	œžœžœžœžœ˜2K˜ šŸœžœžœžœ˜3K™LKšœžœžœ˜*š	žœžœžœžœž˜Kšœ˜Kšœžœ˜Kšœžœ	˜šžœ
+ž˜K˜K˜K˜K˜K˜K˜K˜Kšœžœ
+žœ˜#Kšžœ˜—Kšžœžœžœ˜K˜K˜Kšžœ˜—Kšžœ	˜K˜K˜ —šœžœ!˜1Kšœžœžœžœžœžœ˜:Kšœžœ
+˜ K˜ —šŸœžœžœžœ˜3Kšœžœžœ˜*Kšœžœ	˜šžœžœž˜.Kšœžœ	˜$Kšžœ˜—Kšžœ	˜K˜K˜ —šŸœžœžœžœ˜EK™MKšœžœžœ˜Kšœžœ˜Kšœ+žœ˜0Kšžœžœžœ˜/K˜Kšžœžœ	žœ˜BK˜Kšžœžœžœ˜Kšžœ˜K˜K˜ —š
+Ÿœžœžœžœžœ˜9Kšœw™wKšœ	žœ˜Kšœ	žœ˜Kšœžœžœ˜K˜
+Kšžœžœžœ˜0Kšžœ5žœžœ˜Ošž˜šžœ˜šžœ˜Kšœ
+žœ˜%Kšœ
+žœžœ˜1šžœ˜šž˜Kšžœžœžœ˜@—šž˜Kšžœžœžœ˜A——K˜—šžœ˜Kšœ	žœžœ˜/Kšœ	žœžœ˜/Kšžœžœžœžœžœžœžœ˜OK˜——Kšžœ˜—Kšœ˜K˜ —šŸœžœžœžœ˜:Kšžœ˜$K˜K˜ —šŸœžœžœžœ˜:Kšžœžœ˜K˜K˜ —šŸ	œžœžœ˜RKšžœ˜K˜K˜ —šŸ	œžœžœžœ˜NKšžœ˜K˜K˜ —šŸ	œžœžœ˜GKšœžœžœ˜Kšœžœ˜Kšžœžœžœ˜3Kšžœžœžœ˜6šžœžœ,˜EK™—šžœžœ˜Kšœžœžœ˜Kšœžœžœ˜Kšœžœ˜Kšœžœ˜šžœ˜
+šžœ˜Kšžœ	žœ˜&Kšžœ	žœ˜(K˜—šžœ˜Kšžœ	žœ%˜4Kšžœ	žœ+˜:K˜——Kšžœžœ˜K˜—Kšžœ˜K˜K˜ —šŸ	œžœžœžœ˜IK™"Kšžœžœ˜+K˜K˜ —Kšœžœ˜-Kšœžœžœžœ˜>Kšœžœ
+˜ K˜ šŸœžœžœžœžœžœ˜PKšœžœžœ˜*Kšœžœ˜šžœžœž˜.Kšœžœ	˜Kšœžœ˜K˜'K˜Kšžœžœžœ˜šžœ	žœžœžœ˜#Kšžœh˜jKšœ˜—Kšžœ˜—Kšžœ	˜K˜—K˜ šŸœžœžœ˜1K˜K˜"K˜)K˜&K˜&K˜+šž˜K˜ K˜*K˜*Kšžœ	žœ	žœžœ˜!Kšžœžœ˜$Kšžœžœ˜4K˜&Kšœžœ˜2Kšžœžœ'˜:Kšžœ˜—K˜K˜ —Kšœžœ˜3K˜ šŸ	œžœ3˜BKšžœE˜LK™Cšžœž˜˜K˜1Kšžœ!žœ!˜Hšžœžœ˜Kšœ2žœ˜F—K˜—˜K˜šžœžœ˜Kšœ4žœ˜H—K˜—˜K˜2Kšžœžœ˜*šžœžœ˜Kšœ.žœ˜C—K˜—˜	K˜Kšžœžœžœ˜'K˜—Kšžœ˜—šžœžœ˜K˜KK˜8˜<K™-—K˜*K˜—šžœžœ˜Kšœ'žœ!žœžœ˜wK˜5K˜4K˜&K˜—K˜!Kšœ"žœ˜?K˜8K˜8K˜Kšžœ˜Kšœ˜—K˜ šŸœžœžœžœ˜>šžœžœ˜K˜$Kšžœ	žœžœ	žœžœžœžœžœžœ˜CK˜—K˜šžœ	žœ
+žœž˜ Kšžœžœ˜9—K˜K˜K˜ —šŸœžœžœ˜,Kšžœ˜K˜—K˜ K™ˆšŸœžœžœžœ˜<Kšžœ˜Kšœžœ˜ Kšœžœ˜)Kšœžœ˜)K˜?K˜K˜4K˜ K˜—K˜ šŸœ˜Kš
+žœžœžœžœžœ˜BK™ašžœžœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœžœ
+˜Kšœžœžœ˜Kšžœ
+žœžœžœ˜Kšžœžœžœ˜,K˜Kšœžœ)˜7Kšžœžœžœžœ˜K˜šžœžœ˜Kšœ6žœžœ˜T—šžœ˜Kšœ6žœžœ˜R—Kšžœ˜K˜—Kšœ	žœ˜Kšœžœ˜K˜—K˜ šŸœžœžœžœ	žœ	žœ˜SK˜/K˜K˜K˜ —šŸœžœžœ
+žœ	žœ	žœ˜_Kšœžœ™ Kšœžœ	™Kšœžœ™K˜ Kšœžœ˜!Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšžœ
+žœžœžœ˜Kšžœžœžœ˜,K˜šžœž˜K˜!K˜ Kšžœ˜—K˜-K˜-K˜CK˜@K˜GKšœUžœ˜oK˜GK˜UK˜OK˜XK˜Pšžœ˜Kšžœ6˜:Kšžœd˜h—šžœ˜Kšžœ8˜<Kšžœf˜j—Kšœ˜K˜K˜ —šŸœžœžœ2˜KK™@šžœ8žœžœž˜Mšžœž˜K˜f—šžœž˜K˜C—Kšžœ˜—K˜K˜K˜ —šŸœžœžœ˜%Kšœžœ˜Kš
+žœžœžœžœžœ˜<K˜—K˜ —Kšžœ˜K˜ K™ÛK™ K™mK™ ™#Kšœžœ˜K˜!Kšœžœžœ˜"K™ šŸœžœžœžœ˜AKšœžœžœ˜6š	žœžœžœžœž˜Kšœ*žœ˜7š	žœžœžœžœž˜Kšœ*žœ˜7K˜=K˜&Kšžœ˜—Kšžœ˜—Kšžœ˜K˜—K™ šŸœžœžœ˜FKšžœ˜Kšœ˜K˜ —šŸ
+œžœžœžœ˜9Kšžœžœ˜+Kšœ˜K˜ —šŸœžœ˜,K˜BK˜8Kšœžœ˜K˜—K˜ šŸœž
+œžœ˜*šžœžœ˜Kšžœ˜Kšœžœ˜K˜—K˜—K˜ šŸœžœžœžœžœžœžœ˜7Kšœžœ˜Kšœžœžœ&˜9KšœžœP˜aKšžœ˜K˜—K˜ šŸœžœ[žœ˜†šžœžœžœžœ˜%Kšž
+œžœ"˜N—K˜——— …—    02  E¹  

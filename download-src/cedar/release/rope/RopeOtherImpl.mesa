@@ -1,0 +1,335 @@
+
+DIRECTORY
+Basics USING [charsPerWord, RaiseBoundsFault, RawChars],
+Checksum USING [bytesPerHalfWord, ComputeChecksum],
+RefText USING [ErrorCode, line],
+RefTextExtras,
+Rope USING [AppendChars, Size, Fetch, ROPE, Text, TextBound],
+RopeHash USING [PureText],
+RopePrivate USING [NonNeg, QStore],
+SafeStorage;
+
+RopeOtherImpl: CEDAR MONITOR LOCKS pool USING pool: Pool
+IMPORTS Basics, Checksum, RefTextExtras, Rope, RopePrivate, SafeStorage
+EXPORTS RefText, RefTextExtras, RopeHash
+SHARES Rope
+= BEGIN
+
+ROPE: TYPE = Rope.ROPE;
+TextBound: TYPE = Rope.TextBound;
+
+Pool: TYPE = REF PoolObj;
+PoolObj: PUBLIC TYPE = MONITORED RECORD [
+charsPerText: NAT,
+nextAvailable: INT ¨ -1,
+texts: SEQUENCE count: NAT OF REF TEXT
+];
+ReserveChars: PUBLIC PROC [to: REF TEXT, nChars: TextBound] RETURNS [REF TEXT] = {
+newMinLength: INT = INT[to.length] + INT[nChars]; -- ERROR PointerFault if to=NIL
+IF newMinLength <= to.maxLength THEN RETURN [to];
+IF newMinLength > TextBound.LAST OR to.length > to.maxLength THEN Basics.RaiseBoundsFault[];
+{ expandBy: TextBound = MAX[16, to.maxLength, nChars];
+newLength: TextBound =
+IF expandBy > TextBound.LAST-to.maxLength THEN TextBound.LAST ELSE expandBy+to.maxLength;
+newText: REF TEXT = untracedZone.NEW[TEXT[newLength]];
+FOR i: NAT IN [0..to.length) DO newText[i] ¨ to[i] ENDLOOP;
+newText.length ¨ to.length;
+RETURN [newText];
+}
+};
+
+Append: PUBLIC PROC [to: REF TEXT, from: REF READONLY TEXT, start: TextBound, len: TextBound] RETURNS [REF TEXT] = TRUSTED {
+RETURN [AppendRope[to, LOOPHOLE[from], start, len]];
+};
+
+AppendChar: PUBLIC PROC [to: REF TEXT, from: CHAR] RETURNS [REF TEXT] = {
+IF to.length >= to.maxLength THEN { -- ERROR PointerFault if to=NIL
+to ¨ ReserveChars[to, 1];
+};
+to[to.length] ¨ from;
+to.length ¨ to.length + 1;
+RETURN [to];
+};
+
+AppendRope: PUBLIC PROC
+[to: REF TEXT, from: ROPE, start: INT, len: TextBound] RETURNS [REF TEXT] = {
+rem: INT ¨ Rope.Size[from] - start;
+IF start < 0 OR rem < 0 THEN Basics.RaiseBoundsFault[];
+IF len < rem THEN rem ¨ len;
+IF rem > 0 THEN {
+to ¨ ReserveChars[to, rem];
+[] ¨ Rope.AppendChars[to, from, start, rem];
+};
+RETURN [to];
+};
+
+New: PUBLIC PROC [nChars: TextBound] RETURNS [REF TEXT] = {
+text: REF TEXT;
+maxLength: NAT ¨ Basics.charsPerWord*WORDS[Basics.RawChars[nChars]];
+IF maxLength > LAST[NAT15] THEN maxLength ¨ LAST[NAT15];
+text ¨ untracedZone.NEW[TEXT[maxLength]];
+text.length ¨ 0;
+RETURN[text];
+};
+
+Error: PUBLIC ERROR [ec: RefText.ErrorCode] = CODE;
+
+ObtainScratch: PUBLIC PROC [nChars: TextBound ¨ RefText.line] RETURNS [REF TEXT] = {
+IF nChars>512 
+THEN
+IF nChars>8192 
+THEN RETURN [New[nChars]]
+ELSE RETURN [RefTextExtras.ObtainScratch8192[]]
+ELSE
+IF nChars>100 
+THEN RETURN [RefTextExtras.ObtainScratch512[]]
+ELSE RETURN [RefTextExtras.ObtainScratch100[]]
+};
+
+ReleaseScratch: PUBLIC PROC [t: REF TEXT] = {
+SELECT t.maxLength FROM
+16 => RefTextExtras.ReleaseScratch16[t];
+100 => RefTextExtras.ReleaseScratch100[t];
+512 => RefTextExtras.ReleaseScratch512[t];
+8192 => RefTextExtras.ReleaseScratch8192[t];
+ENDCASE; -- otherwise it doesn't belong in any pools.  Let the garbage collector have it.
+};
+
+ObtainInternal: PUBLIC ENTRY PROC [pool: Pool] RETURNS [thisText: REF TEXT] = {
+IF pool.nextAvailable = -1 THEN RETURN[New[pool.charsPerText]] -- pool is empty
+ELSE {
+thisText ¨ pool.texts[pool.nextAvailable];
+pool.nextAvailable ¨ pool.nextAvailable -1;
+IF thisText.length # 0 THEN RETURN WITH ERROR Error[clientModifiedReleasedText];
+};
+};
+
+ReleaseInternal: PUBLIC ENTRY PROC [pool: Pool, t: REF TEXT] = {
+IF t = NIL THEN RETURN;
+t.length ¨ 0;
+IF pool.nextAvailable = pool.count -1 THEN RETURN -- pool is full
+ELSE {
+pool.nextAvailable ¨ pool.nextAvailable + 1;
+pool.texts[pool.nextAvailable] ¨ t;
+};
+};
+
+CreatePool: PUBLIC PROC [charsPerText: CARD, textsInPool: CARD] RETURNS [pool: Pool] = {
+pool ¨ NEW[PoolObj[textsInPool]];
+pool.charsPerText ¨ charsPerText;
+pool.nextAvailable ¨ textsInPool - 1;
+FOR i: NAT IN [0..textsInPool) DO
+pool.texts[i] ¨ New[charsPerText];
+ENDLOOP;
+};
+
+<<OldObtainScratch: PUBLIC PROC [nChars: TextBound] RETURNS [REF TEXT] = {
+RETURN [New[nChars]]
+};
+>>
+
+<<OldReleaseScratch: PUBLIC PROC [t: REF TEXT] = {
+};
+>>
+
+<<
+TextIndex: TYPE = [0..2];
+TextMaxLength: ARRAY TextIndex OF TextBound = [100, 512, 8192];
+NTextsToAllocate: ARRAY TextIndex OF NAT = [8, 2, 2];
+available: ARRAY TextIndex OF LIST OF REF TEXT ¨ ALL[NIL];
+reserved: ARRAY TextIndex OF LIST OF REF TEXT ¨ ALL[NIL];
+
+InterestingQuantity: TYPE = {obtainCalled, nCharsTooLarge, availEmpty};
+Counts: ARRAY InterestingQuantity OF INT ¨ ALL[0];
+Bump: INTERNAL PROC [q: InterestingQuantity] = INLINE { Counts[q] ¨ Counts[q] + 1 };
+>>
+
+<<VeryOldObtainScratch: PUBLIC ENTRY PROC [nChars: TextBound] RETURNS [REF TEXT] = {
+i: TextIndex ¨ 0;
+avail: LIST OF REF TEXT;
+Bump[obtainCalled];
+FOR i IN [0 .. LAST[TextIndex]] DO
+IF nChars <= TextMaxLength[i] THEN EXIT;
+REPEAT FINISHED => {
+Bump[nCharsTooLarge];
+RETURN [New[nChars]];
+};
+ENDLOOP;
+IF (avail ¨ available[i].rest) = NIL THEN {
+r: LIST OF REF TEXT;
+Bump[availEmpty];
+r ¨ reserved[i];
+UNTIL r.rest.rest = NIL DO r ¨ r.rest ENDLOOP;
+avail ¨  r.rest;  r.rest ¨ NIL;  avail.first ¨ New[TextMaxLength[i]] };
+available[i].rest ¨ avail.rest;
+avail.rest ¨ reserved[i].rest;  reserved[i].rest ¨ avail;
+IF avail.first.length # 0 THEN RETURN WITH ERROR Error[clientModifiedReleasedText];
+RETURN [avail.first];
+};
+>>
+
+<<VeryOldReleaseScratch: PUBLIC ENTRY PROC [t: REF TEXT] = {
+i: TextIndex ¨ 0;
+r, l: LIST OF REF TEXT;
+IF t = NIL THEN RETURN;
+FOR i IN [0 .. LAST[TextIndex]] DO
+IF t.maxLength = TextMaxLength[i] THEN EXIT;
+REPEAT FINISHED => RETURN; -- no good for pool
+ENDLOOP;
+r ¨ reserved[i];
+WHILE (l ¨ r.rest) # NIL DO
+IF l.first = t THEN {
+r.rest ¨ l.rest;
+l.rest ¨ available[i].rest;  available[i].rest ¨ l;
+t.length ¨ 0;
+EXIT;
+};
+r ¨ l;
+ENDLOOP;
+};
+>>
+
+<<InitializeScratchPool: PROC [] = {
+FOR i: TextIndex IN TextIndex DO
+reserved[i] ¨ CONS[NIL, NIL];
+FOR j: NAT IN [0..NTextsToAllocate[i]] DO
+l: LIST OF REF TEXT ¨ CONS[NIL, available[i]];
+available[i] ¨ l;
+ENDLOOP;
+ENDLOOP;
+FOR i: TextIndex IN TextIndex DO
+l: LIST OF REF TEXT ¨ available[i].rest;
+WHILE l # NIL DO
+l.first ¨ New[TextMaxLength[i]];
+l ¨ l.rest;
+ENDLOOP;
+ENDLOOP;
+};
+>>
+defaultSeed: CARDINAL = 31415;
+bytesPerHalfWord: NAT ~ Checksum.bytesPerHalfWord; -- = 2
+bufSize: NAT = 128*bytesPerHalfWord;
+
+TextSize: NAT = SIZE[TEXT[0]];
+HalfWordAsChars: TYPE = PACKED ARRAY [0..bytesPerHalfWord) OF CHAR;
+
+--RopeHash.--FromRefText: PUBLIC PROC
+[text: RopeHash.PureText, seed: CARDINAL] RETURNS [hash: CARDINAL] = TRUSTED {
+len: TextBound ¨ text.length;
+nLeft: NAT = len MOD bytesPerHalfWord;
+nWhole: NAT = len - nLeft;
+p: LONG POINTER = LOOPHOLE[text, LONG POINTER] + TextSize;
+hash ¨ seed;
+IF nWhole >= bytesPerHalfWord THEN {
+hash ¨ Checksum.ComputeChecksum[hash, nWhole/bytesPerHalfWord, p];
+};
+IF nLeft # 0 THEN TRUSTED {
+leftovers: HalfWordAsChars ¨ ALL[0C];
+FOR j: NAT IN [0..nLeft) DO
+leftovers[j] ¨ Rope.Fetch[LOOPHOLE[text], nWhole+j];
+ENDLOOP;
+hash ¨ Checksum.ComputeChecksum[hash, BYTES[HalfWordAsChars]/bytesPerHalfWord, @leftovers];
+};
+};
+
+--RopeHash.--FromRope: PUBLIC PROC
+[rope: ROPE, case: BOOL, start: INT, len: INT, seed: CARDINAL]
+RETURNS [hash: CARDINAL] = TRUSTED {
+rem: INT ¨ RopePrivate.NonNeg[Rope.Size[rope] - RopePrivate.NonNeg[start]];
+IF rem < len THEN len ¨ rem;
+IF case AND start = 0 AND rem = len THEN
+WITH rope SELECT FROM
+text: Rope.Text => 
+RETURN[FromRefText[LOOPHOLE[text], seed]];
+ENDCASE;
+{
+buf: REF TEXT ¨ ObtainScratch[bufSize];
+p: LONG POINTER = LOOPHOLE[buf, LONG POINTER] + SIZE[TEXT[0]];
+bytes: NAT ¨ 0;
+hash ¨ seed;
+WHILE len > 0 DO
+buf.length ¨ 0;
+bytes ¨ Rope.AppendChars[buf, rope, start, len];
+IF NOT case THEN
+FOR i: NAT IN [0..bytes) DO
+c: CHAR = Rope.Fetch[LOOPHOLE[buf], i];
+IF c <= 'Z AND c >= 'A THEN RopePrivate.QStore[c + ('a-'A), LOOPHOLE[buf], i];
+ENDLOOP;
+hash ¨ FromRefText[buf, hash];
+start ¨ start + bytes;
+len ¨ len - bytes;
+ENDLOOP;
+ReleaseScratch[buf];
+RETURN [hash];
+};
+};
+
+untracedZone: ZONE ¨ NIL; -- initialized below in Init
+pool16, pool100, pool512, pool8192: PUBLIC Pool;
+
+Init: PROC = {
+TRUSTED {untracedZone ¨ SafeStorage.GetUntracedZone[]};
+pool16 ¨ CreatePool[16, 10];
+pool100 ¨ CreatePool[100, 4];
+pool512 ¨ CreatePool[512, 4];
+pool8192 ¨ CreatePool[8192, 4];
+};
+
+Init[];
+
+END.
+  ™  
+RopeOtherImpl.mesa
+Copyright ” 1985, 1986, 1987, 1988, 1989, 1991, 1992 by Xerox Corporation.  All rights reserved.
+For Portable Cedar
+Russ Atkinson (RRA) October 13, 1989 3:16:10 pm PDT
+Carl Hauser, May 13, 1988 4:39:49 pm PDT
+Willie-s, March 31, 1992 12:31 pm PST
+Doug Wyatt, August 26, 1991 4:53 pm PDT
+Michael Plass, February 21, 1992 4:37 pm PST
+Bier, December 9, 1992 4:39 pm PST
+RefTextImpl: operations on mutable garbage-collected strings
+There are characters to append
+nChars ¨ nChars + (nChars MOD Basics.bytesPerWord);
+maxLength can get rounded to LAST[NAT15]+1, which casues a bounds fault in NEW
+Stuff that was used for VeryOldObtainScratch and VeryOldReleaseScratch:
+Monitored global variables:
+There are 10 overhead words per text (4 in the TEXT, 6 in the LIST), plus
+6 overhead words per TextIndex value.
+too large for pool
+Give last element of reserved[i] to the collector, allocate a new one, and put it in avail.
+Move first element of available[i] to front of reserved[i].
+construct a list of NTextsToAllocate[i]+1 nodes.
+allocate a TEXT of maxLength TextMaxLength[i] for each node but the first.
+RopeHashImpl: hash functions for ROPE and REF TEXT
+Limit len to be at worst the remainder of the string
+If case does not matter, and we have a flat rope, and the whole rope is to be hashed, then we have the fast case.
+In the hard case we have to move the bytes from the rope into a buffer, adjust the buffer for lower case, then perform the checksum on the buffer.  We keep doing this until there are no more chars to be moved.
+Make the buffer lower case.  We avoid bounds checking to speed things up.
+Carl Hauser, January 17, 1988 1:58:48 pm PST
+Used Fetch in place of QFetch for portable Cedar.  Revisit this if performance is a problem
+changes to: FromRefText, FromRope
+Eric A. Bier, December 9, 1992 4:38:32 pm PST
+Added ObtainInternal, ReleaseInternal, and CreatePool and reimplemented ObtainScratch and ReleaseScratch to use them.
+
+ ù ¡  ñ(cedarcode) styleïNewlineDelimiter
+ô codeöúôKöú
+œeúUô`Kö–blôKô3Kô(Kô%Kô'Kô,Kô"óò öœk	ò	Köúüú,ò8Köú	üú%ò3Köúüúò KòKöúüúüúò=Köú	üúòKöúüúò#KöúòKò óóö
+œnúüúüüüúüúò8Köüú@òGKöüú!ò(KöüúòKöúüòKò KöüúüúüúòKöúüúò!Kò óKöúüúüú	òöú	üúüúüúò)KöúüòKöúüúòKö
+úüúüúüúüúüò&Kòóheadöú<ô<ö†úüúüúüúüúüúüúüúòRKöúüúüúüú
+œcòQKöüúüúüúò1Köüúüúüúüúò\öúüúò6öúòKö
+üúüúüúüúüúòYóKö	ú	üúüúüúüúò6Kö
+üúüúüúüúüúò;KòKöüúòKòóKòKò óö†úüúüúüúüúüúüúüú$üúüúüúüúò|Köüúüúò4KòKò óö†
+úüúüúüúüúüúüúüúüúòIöüúüú°òCKòKòóKòKòKöüúòKòKò óö†
+úüúüúüúüúüú	üúüúüúüúòeKöúüúò#Köüúüú	üúò7Köüúüúòöüú	üúòKöúôKöúòKöú,ò,KòóKöüúòKòKò óö†úüúüúüúüúüúò;Köœy–ky¢ô3KöúüúüúòKöúüúüú$üôNKöúüúüúòDKöüúüúüúüúüúüúò8Köúüúüúò)KòKöüúòKöúòKò óKö†úüúüúüúò3Kò ö†úüüüú$üúüúüúòTöüúòöüòöüúòJöüúüúòJöüúüú$ò/óóöüòöüúòJöüúüú#ò.Jöüúüú#ò.óóóJòJò óö
+†úüúüúüúüúò-öüúüòKò(Kò*Kò*Kò,Köüú°PòYóòKò óóö†úüúü
+úüú
+üúüúòOKöüúüúüú°òOöüúòKò*Kò+Kö
+üúüúüúüúüú#òPKòóKòKò óö†úüúüúüúüúüúò@KöüúüúüúüúòKòKöüú$üúüú°òAöüúòKò,Kò#KòóKòKò óö†
+úüúüúüúüúüúòXKöúüúò!Kò!Kò%öüúüúüúüò!Jò"JöüúòóKòKò óö†††úüúüúüúüúüúòJKöüúòKòKö†òKò óö††††úüúüúüúüúò2KòKö†òKò óKôGö†òKôKöúüú
+òKöúüúüúò?öúüúüúüúò5KöúIôIKöú%ô%óKöúüúüúüúüúüúüúüúüúò:Köú
+üúüúüúüúüúüúüúüúò9Kò Köúüú.òGKö	úüúüúüúüúò2Kö†úüúüúüúòTKö†òKò óö††úüúüúüúüúüúüúòTKòKö	úüúüúüúüúòKòöüúüúüúüò"Köüúüúüúò(öüúüúòKöúôKöúòKöüúòKöúòóKöüúòóöüúüúüúò+Köú[ô[Kö	úüúüúüúüúòKòKòKöüúüúüúüúò.Köúüú)òGóKöú;ô;KòKò9Kö
+üúüúüúüúüú#òSKöüúòKöúòKö†òKò óö††úüúüúüúüúüúò<KòKö	úüúüúüúüúòKöüúüúüúüúòöüúüúüúüò"Köüú üúüúò,Köüúüúüú°ò.KöüúòóKòöüúüúüòöüúüúòKòKò3KòKöüúòKöúòóKòKöüúòóKòKö†òKò óö††úüúò$öüúüúüò KöúüúüúüúòKöú0ô0öüúüúüúüò)Köúüúüúüúüúüúüúò.KòKöüúòóKöüúòóöüúüúüò KöúJôJKö	úüúüúüúüúò(öüúüúüòKò KòKöüúòóKöüúòóKòKö†òóóöú2ô2Köúüú	òKöúüú°ò9öú	üúò$Kò óKöú
+üúüúüúòöúüúüúüúüúüúòCKò óö°†úüúüú üúüúüúüúòtKöúòKöúüúüúò&KöúüúòKöúüúüúüúüúüúò:Köúòöüúüúò$KöúBòBKòóöüúüúüúòKöúüúò%öüúüúüúüòKöúüúò4KöüúòóKöú&üú0ò[KòóKöúòKò óö°†úüúüúüúüú	üúüúüúüúüúüúòÜKöúüúCòKöüúüúòKöú4ô4óöüúüúüúüò(öüúüúüòöúòKöúqôqKöüúüúò*óKöüúòóóöúòKöú—ô—Köúüúüúò'Köúüúüúüúüúüúüúüúò>KöúüúòKöúòöüú	üòKöúòKöú0ò0öüúüúüòKöúIôIöüúüúüúüòKöúüúüú
+ò'Köüú	üú	üú!üú
+òNKöüúòóóKöúòKöúòKöúòKöüúòóKöúòKöüúòKöúòóKöúòKò óóKöúüúüú°°°°°°ò6Köú$üúò0Kò ö†úüúòKöüú0ò7KòKòKòKòKòKò óKòKò Köüúòô,Kô[Köúœrô!óô-KôuóKô ó Öó     0  5õ  

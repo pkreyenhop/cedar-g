@@ -1,0 +1,716 @@
+DIRECTORY Basics, BasicTime, Commander, Convert, GlobalRunDefaults, IncrementalLoad, InstallationComforts, IO, LibSearch, List, MesaLoadState, PFS, PFSNames, Process, ProcessProps, RegisterRefLiteral, Rope, SimpleFeedback, SymTab, UXStrings;
+
+RunCommandsImpl: CEDAR PROGRAM
+IMPORTS Basics, BasicTime, Commander, Convert, GlobalRunDefaults, IncrementalLoad, InstallationComforts, IO, LibSearch, List, MesaLoadState, PFS, PFSNames, Process, ProcessProps, RegisterRefLiteral, Rope, SimpleFeedback, SymTab, UXStrings
+= BEGIN OPEN IL: IncrementalLoad;
+
+ROPE: TYPE ~ Rope.ROPE;
+PATH: TYPE = PFSNames.PATH;
+RopeList: TYPE ~ LIST OF ROPE;
+UnixString: TYPE ~ POINTER TO Basics.RawChars;
+InstallFunc: TYPE ~ PROC;
+
+ProcRep: TYPE ~ MACHINE DEPENDENT RECORD [pcStart: IL.CProc, staticLink: CARD32];
+SearchResult: TYPE ~ RECORD [torun: PATH, hacks: RopeList];
+
+unixLag: CARD32 = (365+366)*24*60*60;
+
+workingDirectories: SymTab.Ref ~ SymTab.Create[case: TRUE];
+runInfoTab: SymTab.Ref <<OF REF RunInfo>> ~ SymTab.Create[case: TRUE];
+RunInfo: TYPE ~ PACKED RECORD [unixName: ROPE, torun: PATH, moduleName: ROPE, hasInstall, hasStart: BOOL];
+RunInternal: PROC [cmd: Commander.Handle, name: ROPE, unboundOK: SymTab.Ref, runEvenIfAlreadyRun, runEvenIfUnbound, loadOnly, quote, preferOptimized, printTimings: BOOL, patchByteSize: CARD] RETURNS [error: BOOL ¨ FALSE] ~ TRUSTED {
+given: ROPE ~ PFS.RopeFromPath[PFS.AbsoluteName[PFS.PathFromRope[name]]];
+baseStart: INT ~ given.FindBackward["/"]+1;
+afterBase: INT ~ given.SkipTo[baseStart, ".!"];
+moduleName: ROPE ~ given.Substr[start: baseStart, len: afterBase-baseStart];
+hasExt: BOOL ~ given.Find[".", baseStart] >= 0;
+startFind: CARD ~ BasicTime.GetClockPulses[];
+searchResult: SearchResult ~ FindWithHacks[given, quote, preferOptimized, baseStart, afterBase, Append];
+findPulses: CARD ~ BasicTime.GetClockPulses[] - startFind;
+torun: PATH ~ searchResult.torun;
+unixName: ROPE ~ PFS.PFSNameToUnixName[torun];
+install: IL.SymEntry ¨ NIL;
+start: IL.SymEntry ¨ NIL;
+thisFile: IL.FileEntry ¨ NIL;
+thisTime: BasicTime.GMT ¨ BasicTime.nullGMT;
+thisSize: CARD ¨ 0;
+hasInstall, hasStart: BOOL;
+ilPulses, libPulses, commitPulses, installPulses, runPulses: CARD ¨ 0;
+dont: BOOL ¨ FALSE;
+wasAborted: BOOL ¨ FALSE;
+Append: PROC [err: BOOL, fmt: ROPE, v: LIST OF IO.Value] ~ CHECKED {
+Process.CheckForAbort[];
+IF err OR NOT Basics.IsBound[SimpleFeedback.PutFL]
+THEN {
+s: IO.STREAM ~ IF err THEN cmd.err ELSE cmd.out;
+IO.PutFL[s, fmt, v];
+IO.PutChar[s, '\n];
+error ¨ TRUE;
+}
+ELSE {
+SimpleFeedback.PutFL[routerName: $RunCommands, msgType: oneLiner, msgClass: $Ran, format: fmt, list: v]
+};
+IF err THEN error ¨ TRUE;
+};
+Bitch: PROC [format: ROPE] ~ CHECKED {
+Append[FALSE, format, LIST[[rope[PFS.RopeFromPath[torun]]], [cardinal[thisSize]], [time[thisTime]]] ]
+};
+BitchAsErr: PROC [format: ROPE] ~ CHECKED {
+Append[TRUE, format, LIST[[rope[PFS.RopeFromPath[torun]]], [cardinal[thisSize]], [time[thisTime]]] ]
+};
+TestErr: UNSAFE PROC [ile: IL.Error, from: ROPE] RETURNS [BOOL] ~ {
+IF ile=NIL THEN RETURN [FALSE];
+Append[TRUE, "%g => Error[%g, %g, \"%q\"]", LIST[[rope[from]], [integer[ile.fatal]], [integer[ile.code]], [rope[UXStrings.ToRope[ile.msg]]]]];
+RETURN [TRUE]};
+Seconds: PROC[p: BasicTime.Pulses] RETURNS[REAL] ~ CHECKED INLINE {
+RETURN[BasicTime.PulsesToSeconds[p]];
+};
+Inner: PROC = TRUSTED {
+ENABLE UNWIND => [] ¨ TestErr[IL.AbortIncrementalLoad[], "UNWIND"];
+PatchSizeCProc: PROCEDURE [] RETURNS [IL.CProc] ~ TRUSTED {
+PatchSizeProcAddress: PROCEDURE [] RETURNS [CARD32] ~ 
+TRUSTED MACHINE CODE {
+"PatchSizeProcAddress"
+};
+cProc: IL.CProc ~ [PatchSizeProcAddress[]];
+RETURN [cProc];
+};
+PatchSizeClientData: PROCEDURE [byteSize: CARD] RETURNS [POINTER] ~ 
+TRUSTED {
+clientData: REF CARD ~ NEW[CARD ¨ byteSize];
+RETURN [LOOPHOLE[clientData]];
+};
+uname: UnixString ~ UXStrings.Create[unixName];
+install ¨ LookupText["_XR_install_", moduleName];
+start ¨ LookupText["_XR_run_", moduleName];
+ilPulses ¨ BasicTime.GetClockPulses[];
+IF TestErr[
+ile: IL.IncrementalLoadFile[
+fName: uname, 
+patchSizeProc: PatchSizeCProc[],
+patchSizeClientData: PatchSizeClientData[byteSize: patchByteSize]], 
+from: "Load"] THEN GOTO Abort;
+thisFile ¨ IL.GetPrevFileEntry[NIL];
+thisTime ¨ LOOPHOLE[thisFile.fMTime+unixLag];
+thisSize ¨ thisFile.fSize;
+IF (NOT runEvenIfAlreadyRun) AND (install#NIL AND install.fe#NIL AND install.fe.fMTime=thisFile.fMTime AND install.fe.fSize=thisFile.fSize OR start#NIL AND start.fe#NIL AND start.fe.fMTime=thisFile.fMTime AND start.fe.fSize=thisFile.fSize) THEN {
+BitchAsErr["%g (s=%g m=%g) already loaded"];
+dont ¨ TRUE; GOTO Abort};
+BEGIN
+tmpPulses: CARD;
+ilPulses ¨ (libPulses ¨ commitPulses ¨ BasicTime.GetClockPulses[]) - ilPulses;
+WHILE NOT dont AND IL.CommitIncrementalLoad[] # NIL DO
+missing: LIST OF ROPE ¨ NIL;
+Consumer: IL.UndefinedSymbolProc ~ TRUSTED {
+missing ¨ CONS[UXStrings.ToRope[se.name], missing];
+RETURN [TRUE]};
+consumer: POINTER TO ProcRep ~ LOOPHOLE[Consumer];
+IL.EnumerateUndefinedSymbols[consumer.pcStart, consumer];
+IF missing=NIL THEN EXIT;
+WHILE missing#NIL DO 
+missingU: UnixString ~ UXStrings.Create[missing.first];
+found: LibSearch.Bool;
+libfd: LibSearch.FD;
+liboffset, magic: INT;
+modulenameU: UnixString;
+moduleName: ROPE;
+fileName: ROPE;
+Append[FALSE, "Searching libraries for undefined UNIX symbol %g.", LIST[[rope[missing.first]]]];
+TRUSTED {found ¨ LibSearch.SymFind[missingU, @libfd, @liboffset, @magic, @modulenameU]};
+IF found = LibSearch.False THEN {
+Append[TRUE, "Cannot resolve UNIX-level unbound symbol %g", LIST[[rope[missing.first]]]];
+dont ¨ TRUE;
+}
+ELSE { 
+moduleName ¨ UXStrings.ToRope[modulenameU];
+Append[FALSE, "Loading library module %g.", LIST[[rope[moduleName]]]];
+fileName ¨ moduleName.Substr[len: moduleName.SkipTo[skip: "("]];
+IF TestErr[
+ile: IL.IncrementalLoadFile[
+fName: UXStrings.Create[fileName],
+fOffset: liboffset, 
+patchSizeProc: PatchSizeCProc[],
+patchSizeClientData: PatchSizeClientData[byteSize: patchByteSize]], 
+from: IO.PutFR1["LibLoad[%g]", [rope[moduleName]] ]]
+THEN GOTO Abort;
+};
+missing ¨ missing.rest;
+ENDLOOP;
+commitPulses ¨ BasicTime.GetClockPulses[];
+ENDLOOP;
+libPulses ¨ (tmpPulses ¨ BasicTime.GetClockPulses[]) - libPulses;
+commitPulses ¨ tmpPulses - commitPulses;
+END;
+IF dont THEN {
+Append[TRUE, "%g (s=%g m=%g) not run becaue of unbound UNIX-level symbols", LIST[[rope[PFS.RopeFromPath[torun]]], [cardinal[thisSize]], [time[thisTime]]]];
+GOTO Abort;
+};
+install ¨ LookupText["_XR_install_", moduleName];
+IF loadOnly THEN start ¨ NIL ELSE {
+start ¨ LookupText["_XR_run_", moduleName];
+IF start=NIL THEN start ¨ LookupText["_XR_run", NIL];
+};
+EXITS 
+Abort => {
+ilPulses ¨ commitPulses ¨ 0;
+[] ¨ TestErr[IL.AbortIncrementalLoad[], "Abort"];
+};
+};
+LibSearch.Crock1[];
+IF torun=NIL THEN {
+Append[TRUE, "Hint \"%q\" and patterns %g don't lead to any existing non-empty file", LIST[[rope[given]], [rope[FmtHacks[searchResult.hacks]]]]];
+RETURN[error: TRUE];
+};
+Process.CheckForAbort[];
+IF TestErr[IL.LockIncrementalLoadState[TRUE], "Lock"] THEN RETURN[error: TRUE];
+Inner[ ! UNWIND => [] ¨ TestErr[IL.UnlockIncrementalLoadState[], "UNWIND Unlock"]];
+[] ¨ TestErr[IL.UnlockIncrementalLoadState[], "Unlock"];
+IF error OR dont THEN RETURN;
+hasInstall ¨ install#NIL AND thisFile.seqNum = install.fe.seqNum;
+hasStart ¨ start#NIL AND thisFile.seqNum = start.fe.seqNum;
+IF hasInstall THEN {
+ENABLE UNWIND => MesaLoadState.AbortInstallation[];
+installFn: InstallFunc ~ CProcToCedar[install.value];
+problems: LIST OF MesaLoadState.InstallationProblem ¨ NIL;
+abort: BOOL ¨ FALSE;
+Report: MesaLoadState.ReportProc ~ CHECKED {
+WITH problem SELECT FROM
+ui: MesaLoadState.InstallationProblem.unboundImport => {
+ifName: ROPE ~ MesaLoadState.InterfaceName[ui.interface];
+IF unboundOK.Fetch[ifName].found THEN RETURN;
+};
+re: MesaLoadState.InstallationProblem.reExport => {
+IF runEvenIfAlreadyRun THEN RETURN;
+};
+tc: MesaLoadState.InstallationProblem.typeClash => {
+abort ¨ TRUE;
+};
+ENDCASE => NULL;
+problems ¨ CONS[problem, problems];
+};
+installPulses ¨ BasicTime.GetClockPulses[];
+MesaLoadState.BeginInstallation[];  -- will raise RuntimeError.UnboundProcedureFault if new installation support is not present.
+installFn[ ! RegisterRefLiteral.UnknownType => CHECKED {
+abort ¨ TRUE;
+IO.PutRope[cmd.err, "Unable to load "];
+IO.PutRope[cmd.err, name];
+IO.PutRope[cmd.err, ", probably because of a version mismatch with Rope\n"];
+CONTINUE;
+}];
+IF NOT abort THEN MesaLoadState.CheckInstallation[Report];
+IF problems#NIL THEN {
+InstallationComforts.PutProblems[cmd.err, problems];
+IO.PutChar[cmd.err, '\n];
+};
+IF abort
+THEN { MesaLoadState.AbortInstallation[]; RETURN [error: TRUE] }
+ELSE { MesaLoadState.CommitInstallation[] };
+installPulses ¨ BasicTime.GetClockPulses[] - installPulses;
+hasInstall ¨ hasInstall
+};
+IF hasStart THEN {
+runFn: InstallFunc ~ CProcToCedar[start.value];
+runPulses ¨ BasicTime.GetClockPulses[];
+[] ¨ SymTab.Store[workingDirectories, moduleName, PFS.GetWDir[]]; -- remember working directories of things that get started.
+runFn[ ! ABORTED => {wasAborted ¨ TRUE; CONTINUE}]; -- catch ABORTED so that if there are messages from loading they'll get printed even if starting gets an error (e.g., an unbound procedure fault).
+runPulses ¨ BasicTime.GetClockPulses[] - runPulses;
+hasStart ¨ hasStart;
+};
+[] ¨ SymTab.Store[runInfoTab, unixName, NEW[RunInfo ¨ [unixName: unixName, torun: torun, moduleName: moduleName, hasInstall: hasInstall, hasStart: hasStart]]];
+SELECT TRUE FROM
+hasInstall AND hasStart AND ~loadOnly => Bitch["Ran %g (s=%g m=%g)"];
+hasInstall AND ~hasStart AND ~loadOnly => Bitch["Loaded and installed %g (s=%g m=%g) (it has no start proc)"];
+hasInstall AND loadOnly => Bitch["Loaded and installed %g (s=%g m=%g)"];
+~hasInstall AND hasStart AND ~loadOnly => Bitch["Loaded and started %g (s=%g m=%g) (it has no install proc)"];
+~hasInstall AND ~hasStart AND ~loadOnly => Bitch["Loaded %g (s=%g m=%g) (it has no install or start proc)"];
+~hasInstall AND loadOnly => Bitch["Loaded %g (s=%g m=%g) (it has no install proc)"];
+ENDCASE => ERROR --the above covers all cases--;
+IF printTimings THEN Append[FALSE, "\t(find=%5.2f il=%5.2f lib=%5.2f c=%5.2f inst=%5.2f run=%5.2f)", LIST[ [real[Seconds[findPulses]]], [real[Seconds[ilPulses]]], [real[Seconds[libPulses]]], [real[Seconds[commitPulses]]], [real[Seconds[installPulses]]], [real[Seconds[runPulses]]] ]];
+IF wasAborted THEN ERROR ABORTED; -- propagate abort
+RETURN;
+};
+globalUndefineds: LIST OF ROPE ¨ NIL;
+EachUndefinedSymbol: IL.UndefinedSymbolProc ~ TRUSTED {
+globalUndefineds ¨ CONS[ UXStrings.ToRope[se.name], globalUndefineds ];
+RETURN[TRUE]
+};
+
+LookupText: PROC [prefix, name: ROPE] RETURNS [se: IL.SymEntry] ~ TRUSTED {
+FOR se ¨ IL.LookupSymEntry[UXStrings.Create[Rope.Concat[prefix, name]], FALSE], IL.GetPrevSymEntry[se, FALSE] UNTIL se=NIL DO
+masked: CARD32 ~ Basics.BITAND[se.type, IL.SETypeMask];
+IF masked = IL.SETypeTEXT THEN RETURN;
+ENDLOOP;
+se ¨ se;
+};
+
+centerPat: ROPE ~ "Foo";
+optimizedSearch: RopeList ¨ LIST["sun4/Foo.c2c.o", "sun4/Foo", "Foo.sx.o", "Foo"];
+plainSearch: RopeList ¨ LIST["sun4-debug/Foo.c2c.o", "sun4-debug/Foo", "Foo.sx.o", "Foo", "sun4/Foo.c2c.o", "sun4/Foo"];
+
+FindWithHacks: PROC [given: ROPE, quote, preferOptimized: BOOL, baseStart, afterBase: INT, Msg: PROC [err: BOOL, fmt: ROPE, v: LIST OF IO.Value ¨ NIL] ] RETURNS [SearchResult] ~ {
+all: RopeList ~ IF quote THEN LIST["Foo"] ELSE WITH ProcessProps.GetProp[$RunPatterns] SELECT FROM
+x: RopeList => x,
+x: ROPE => LIST[x],
+ENDCASE => IF preferOptimized THEN optimizedSearch ELSE plainSearch;
+ctrLen: INT ~ Rope.Length[centerPat];
+FOR hackRules: RopeList ¨ all, hackRules.rest WHILE hackRules#NIL DO
+hack: ROPE ~ hackRules.first;
+ctrStart: INT ~ hack.Index[s2: centerPat];
+hackLen: INT ~ hack.Length[];
+IF ctrStart >= hackLen THEN {
+Msg[FALSE, "Hack \"%q\" doesn't contain \"Foo\" as a substring", LIST[[rope[hack]]]];
+LOOP};
+{hacked: ROPE ~ given.Replace[start: afterBase, len: 0, with: hack.Substr[start: ctrStart+ctrLen]].Replace[start: baseStart, len: 0, with: hack.Substr[len: ctrStart]];
+hackedPath: PATH ¨ PFS.PathFromRope[hacked];
+bytes: INT ¨ 0;
+[fullFName: hackedPath, bytes: bytes] ¨ PFS.FileInfo[hackedPath !PFS.Error => LOOP];
+IF bytes>0 THEN RETURN [[hackedPath, all]];
+};
+ENDLOOP;
+RETURN [[NIL, all]];
+};
+
+FmtHacks: PROC [hacks: RopeList] RETURNS [ROPE] ~ {
+buf: IO.STREAM ~ IO.ROS[];
+buf.PutRope["["];
+FOR hacks ¨ hacks, hacks.rest WHILE hacks#NIL DO
+buf.PutRope[" "];
+buf.PutRope[hacks.first];
+ENDLOOP;
+buf.PutRope[" ]"];
+RETURN [buf.RopeFromROS[]];
+};
+
+RunCmd: PROC [cmd: Commander.Handle] RETURNS [result: REF ¨ NIL, msg: ROPE ¨ NIL] --Commander.CommandProc-- = TRUSTED {
+ENABLE QuotedStringError => {msg ¨ "Mismatched quotes"; GO TO Failure};
+dontStartIfUnbound, runAgain, loadOnly, excepting, quote, printTimings: BOOL ¨ FALSE;
+preferOptimized: BOOL ¨ TRUE;
+unboundOK: SymTab.Ref ~ SymTab.Create[case: TRUE]; -- never used!
+something: BOOL ¨ FALSE;
+patchByteSize: CARD ¨ 0;
+cmds: IO.STREAM ¨ NIL;
+defaultSwitches: ROPE ¨ GlobalRunDefaults.GetGlobalRunDefaults[];
+
+WITH ProcessProps.GetProp[$RunDefaultSwitches] SELECT FROM
+rope: ROPE => IF Rope.Size[rope] > 0 AND Rope.Fetch[rope, 0] = '- THEN defaultSwitches ¨ rope;
+ENDCASE => NULL;
+cmds ¨ IO.RIS[Rope.Concat[defaultSwitches, cmd.commandLine]];
+FOR arg: ROPE ¨ GetCmdToken[cmds], GetCmdToken[cmds] UNTIL arg = NIL DO
+error: BOOL ¨ FALSE;
+IF Rope.Size[arg] > 0 AND Rope.Fetch[arg, 0] = '- THEN {
+newsense: BOOL ¨ TRUE;
+FOR j: INT IN [1..Rope.Length[arg]) DO
+sense: BOOL ~ newsense; newsense ¨ TRUE;
+SELECT Rope.Fetch[arg, j] FROM
+'d => dontStartIfUnbound ¨ sense;
+'a => runAgain ¨ sense;
+'l => loadOnly ¨ sense;
+'p => {
+FollowingCARD: PROCEDURE [stream: IO.STREAM] RETURNS [CARD] ~ 
+TRUSTED {
+arg: Rope.ROPE ~ GetCmdToken[stream];
+card: CARD ¨ 0;
+{
+try: CARD ~ Convert.CardFromRope[r: arg
+! Convert.Error => GO TO error];
+
+card ¨ try;
+EXITS
+error => cmd.out.PutF1["Invalid Run switch: -p %g\n", [rope[arg]]];
+};
+RETURN [card];
+};
+patchByteSize ¨ FollowingCARD[stream: cmds];
+};
+'q => quote ¨ sense;
+'t => printTimings ¨ sense;
+'u => excepting ¨ sense;
+'x => excepting ¨ NOT sense;
+'o => preferOptimized ¨ sense;
+'~ => newsense ¨ NOT sense;
+ENDCASE => cmd.out.PutF1["Invalid Run switch: %g\n", [character[Rope.Fetch[arg, j]]]];
+ENDLOOP;
+LOOP;
+};
+IF excepting AND Rope.SkipTo[s: arg, skip: "[]<>/."] < Rope.Length[arg] THEN excepting ¨ FALSE;
+IF excepting THEN { [] ¨ SymTab.Store[unboundOK, arg, $T]; LOOP };
+[error: error] ¨ RunInternal[cmd: cmd, name: arg, unboundOK: unboundOK, runEvenIfAlreadyRun: runAgain, runEvenIfUnbound: NOT dontStartIfUnbound, loadOnly: loadOnly, quote: quote, preferOptimized: preferOptimized, printTimings: printTimings, patchByteSize: patchByteSize];
+IF error THEN GOTO Failure;
+something ¨ TRUE;
+IF NOT Rope.IsEmpty[msg] THEN { IO.PutRope[cmd.err, msg]; msg ¨ NIL };
+ENDLOOP;
+IF excepting THEN { msg ¨ "Looks like you forgot your -x"; GOTO Failure };
+IF NOT something THEN { msg ¨ runUsage; GOTO Failure };
+EXITS Failure => result ¨ $Failure;
+};
+
+RunDefaultsCmd: PROC [cmd: Commander.Handle] RETURNS [result: REF ¨ NIL, msg: ROPE ¨ NIL] --Commander.CommandProc-- = {
+cmds: IO.STREAM ~ IO.RIS[cmd.commandLine];
+switches: ROPE ~ GetCmdToken[cmds];
+IF switches # NIL AND (Rope.Size[switches] = 0 OR Rope.Fetch[switches, 0] = '-) THEN {
+[] ¨ List.PutAssoc[key: $RunDefaultSwitches, val: switches, aList: ProcessProps.GetPropList[]];
+};
+msg ¨ "no local default switches are set for Run";
+WITH ProcessProps.GetProp[$RunDefaultSwitches] SELECT FROM
+rope: ROPE => IF Rope.Size[rope] > 0 AND Rope.Fetch[rope, 0] = '- THEN msg ¨ Rope.Concat["Local default switches for Run are ", rope];
+ENDCASE => NULL;
+};
+
+UXNameCommand: PROC [cmd: Commander.Handle] RETURNS [result: REF ¨ NIL, msg: ROPE ¨ NIL] --Commander.CommandProc-- = {
+ENABLE PFS.Error => {msg ¨ error.explanation; GOTO Failure};
+cmds: IO.STREAM ~ IO.RIS[cmd.commandLine];
+path: PATH ~ PFS.FileInfo[PFS.PathFromRope[GetCmdToken[cmds]]].fullFName;
+IO.PutRope[cmd.out, PFS.PFSNameToUnixName[path]];
+IO.PutChar[cmd.out, '\n];
+EXITS Failure => result ¨ $Failure;
+};
+
+LoadedVersionCmd: PROC [cmd: Commander.Handle] RETURNS [result: REF ¨ NIL, msg: ROPE ¨ NIL] --Commander.CommandProc-- = TRUSTED {
+ENABLE QuotedStringError => {msg ¨ "Mismatched quotes"; GO TO Failure};
+cmds: IO.STREAM ~ IO.RIS[cmd.commandLine];
+FOR target: ROPE ¨ GetCmdToken[cmds], GetCmdToken[cmds] UNTIL target = NIL DO
+pattern: BOOL ~ target.Find["*"] >= 0;
+fe: IL.FileEntry ¨ NIL;
+sep: ROPE ¨ NIL;
+cmd.out.PutF1["Versions of %g:\n", [rope[target]]];
+DO
+fe ¨ IL.GetPrevFileEntry[fe];
+IF fe=NIL THEN EXIT;
+{thisName: ROPE ~ UXStrings.ToRope[fe.fName];
+IF (IF pattern THEN Rope.Match[target, thisName, FALSE] ELSE Rope.Equal[target, thisName, FALSE]) THEN {
+cmd.out.PutFL["%g\n%g (s=%g m=%g)", LIST[[rope[sep]], [rope[thisName]], [cardinal[fe.fSize]], [time[LOOPHOLE[fe.fMTime + unixLag]]]]];
+sep ¨ ","};
+}ENDLOOP;
+cmd.out.PutRope[".\n"];
+ENDLOOP;
+RETURN;
+EXITS
+Failure => result ¨ $Failure;
+};
+
+PathFromUnixName: PROC [name: ROPE] RETURNS [path: PATH] = {
+EachName: PROC [name: PATH] RETURNS [continue: BOOL ¨ FALSE] = { path ¨ name };
+IF Rope.Match["*.~*~", name]
+THEN {
+dot: INT ~ Rope.FindBackward[name, ".~"];
+version: ROPE ~ Rope.Substr[name, dot+2, Rope.Size[name]-1-(dot+2)];
+name ¨ Rope.Cat["/vux", Rope.Substr[name, 0, dot], "!", version];
+}
+ELSE {
+name ¨ Rope.Concat["/ux", name];
+};
+WITH SymTab.Fetch[runInfoTab, name].val SELECT FROM
+r: REF RunInfo => { RETURN [r.torun] };
+ENDCASE;
+path ¨ PFS.PathFromRope[name];
+PFS.EnumerateForNames[pattern: path, proc: EachName];
+};
+
+CasedBase: PROC [name: ROPE] RETURNS [ROPE] = {
+path: PATH ~ PathFromUnixName[name];
+short: PFSNames.Component ~ PFSNames.ShortName[path];
+dot: INT ~ Rope.Index[short.name.base, short.name.start, "."];
+RETURN [Rope.Substr[short.name.base, short.name.start, MIN[short.name.len, dot-short.name.start]]]
+};
+
+GetModuleName: PROC [unixName: ROPE] RETURNS [ROPE] ~ {
+WITH SymTab.Fetch[runInfoTab, unixName].val SELECT FROM
+r: REF RunInfo => {
+RETURN [r.moduleName];
+};
+ENDCASE => {
+IF Rope.Match["*.o", unixName] OR Rope.Match["*.o.~*~", unixName]
+THEN RETURN [CasedBase[unixName]]
+ELSE RETURN [NIL]
+};
+};
+
+loadedFilesUsage: ROPE ~ "Usage: LoadedFiles [-pcr | -command | -names | -ccode | -libs] [-first <pattern>]  [-after <pattern>]  [-before <pattern>]  [-last <pattern>]";
+LoadedFilesCmd: PROC [cmd: Commander.Handle] RETURNS [result: REF ¨ NIL, msg: ROPE ¨ NIL] --Commander.CommandProc-- = {
+ENABLE {
+QuotedStringError => {msg ¨ "Mismatched quotes"; GO TO Failure};
+PFS.Error => IF error.group = user THEN {msg ¨ error.explanation; GO TO Failure};
+};
+cmds: IO.STREAM ~ IO.RIS[cmd.commandLine];
+GetFilePattern: PROC RETURNS [ROPE] ~ {
+RETURN [Rope.Cat["*/", GetCmdToken[cmds], "*"]]
+};
+exceptions: LIST OF ROPE ¨ NIL;
+Exception: PROC [rope: ROPE] RETURNS [BOOL] ~ {
+FOR tail: LIST OF ROPE ¨ exceptions, tail.rest UNTIL tail = NIL DO
+IF Rope.Match[tail.first, rope, FALSE] THEN RETURN [TRUE];
+ENDLOOP;
+RETURN [FALSE];
+};
+format: { pcr, command, names, ccode, libs } ¨ command;
+first: ROPE ¨ NIL;
+after: ROPE ¨ NIL;
+before: ROPE ¨ NIL;
+last: ROPE ¨ NIL;
+list: LIST OF ROPE ¨ NIL;
+something: BOOL ¨ FALSE;
+libTab: SymTab.Ref ¨ NIL;
+FOR target: ROPE ¨ GetCmdToken[cmds], GetCmdToken[cmds] UNTIL target = NIL DO
+Match: PROC [x: ROPE] RETURNS [BOOL] = { RETURN [Rope.Match[x, target, FALSE]] };
+SELECT TRUE FROM
+Match["-pcr"] => format ¨ pcr;
+Match["-command"] => format ¨ command;
+Match["-names"] => format ¨ names;
+Match["-ccode"] => format ¨ ccode;
+Match["-libs"] => format ¨ libs;
+Match["-first"] => first ¨ GetFilePattern[];
+Match["-after"] => after ¨ GetFilePattern[];
+Match["-before"] => before ¨ GetFilePattern[];
+Match["-last"] => last ¨ GetFilePattern[];
+Match["-except"] => exceptions ¨ CONS[GetFilePattern[], exceptions];
+ENDCASE => {msg ¨ loadedFilesUsage; GO TO Failure};
+something ¨ TRUE;
+ENDLOOP;
+IF NOT something THEN {msg ¨ loadedFilesUsage; GO TO Failure};
+IF first = NIL AND after = NIL THEN first ¨ "*";
+IF before = NIL AND last = NIL THEN last ¨ " ";
+TRUSTED {
+FOR fe: IL.FileEntry ¨ IL.GetPrevFileEntry[NIL], IL.GetPrevFileEntry[fe] UNTIL fe = NIL DO
+rope: ROPE ~ UXStrings.ToRope[fe.fName];
+IF Rope.Size[rope] # 0 THEN list ¨ CONS[rope, list];
+ENDLOOP;
+};
+UNTIL list = NIL OR (first # NIL AND Rope.Match[first, list.first, FALSE]) DO
+this: ROPE ¨ list.first;
+list ¨ list.rest;
+IF after # NIL AND Rope.Match[after, this, FALSE] THEN EXIT;
+ENDLOOP;
+IF NOT (before = NIL AND last = NIL) THEN {
+FOR tail: LIST OF ROPE ¨ list, tail.rest UNTIL tail = NIL DO
+SELECT TRUE FROM
+(last # NIL AND Rope.Match[last, tail.first, FALSE]) => {tail.rest ¨ NIL};
+(tail.rest#NIL AND before#NIL AND Rope.Match[before, tail.rest.first, FALSE]) => {tail.rest ¨ NIL};
+ENDCASE => NULL;
+ENDLOOP;
+};
+FOR tail: LIST OF ROPE ¨ list, tail.rest UNTIL tail = NIL DO
+IF NOT Exception[tail.first] THEN SELECT format FROM
+pcr => {
+moduleName: ROPE ~ GetModuleName[tail.first];
+SELECT TRUE FROM
+(moduleName # NIL) => {
+IO.PutRope[cmd.out, "LoadAndRun "];
+IO.PutRope[cmd.out, tail.first];
+IO.PutRope[cmd.out, " "];
+IO.PutRope[cmd.out, moduleName];
+IO.PutRope[cmd.out, "\l"];
+};
+Rope.Match["*.a*", tail.first, TRUE] => {};
+ENDCASE => {
+IO.PutRope[cmd.out, "UnixLoad "];
+IO.PutRope[cmd.out, tail.first];
+IO.PutRope[cmd.out, "\l"];
+};
+};
+command => {
+IO.PutRope[cmd.out, "Run -q "];
+IO.PutRope[cmd.out, PFS.RopeFromPath[PathFromUnixName[tail.first]]];
+IO.PutRope[cmd.out, "\n"];
+};
+names => {
+SELECT TRUE FROM
+Rope.Match["*.a*", tail.first, TRUE] => {};
+ENDCASE => {
+IO.PutRope[cmd.out, tail.first];
+IO.PutRope[cmd.out, " "];
+};
+};
+libs => {
+IF Rope.Match["*.a*", tail.first, TRUE] THEN {
+IF libTab = NIL THEN libTab ¨ SymTab.Create[];
+IF SymTab.Insert[libTab, tail.first, tail.first] THEN {
+IO.PutRope[cmd.out, tail.first];
+IO.PutRope[cmd.out, " "];
+};
+};
+};
+ccode => {
+moduleName: ROPE ~ GetModuleName[tail.first];
+IF moduleName # NIL THEN {
+val: REF ~ SymTab.Fetch[workingDirectories, moduleName].val;
+IF LookupText["_XR_install_", moduleName] # NIL THEN {
+IO.PutF1[cmd.out, "  XR_install_%g();\l", [rope[moduleName]]];
+IO.PutRope[cmd.out, "  XR_CommitInstallation();\l"];
+};
+IF LookupText["_XR_run_", moduleName] # NIL THEN {
+WITH val SELECT FROM
+path: PATH => {
+IO.PutF[cmd.out,
+"  {extern void XR_run_%g(); XR_CallWithPFSWorkingDirectory(XR_run_%g, \"%g\");}\l", [rope[moduleName]], [rope[moduleName]], [rope[PFS.RopeFromPath[path]]]];
+};
+ENDCASE => {
+IO.PutF1[cmd.out, "  XR_run_%g();\l", [rope[moduleName]]];
+};
+};
+};
+};
+ENDCASE => ERROR;
+ENDLOOP;
+EXITS
+Failure => result ¨ $Failure;
+};
+
+CProcToCedar: PROC [pcStart, staticLink: CARD32 ¨ 0] RETURNS [PROC] ~ {
+rep: REF ProcRep ~ NEW [ProcRep ¨ [[pcStart], staticLink]];
+RETURN [LOOPHOLE[rep]]};
+
+QuotedStringError: ERROR = CODE;
+
+CmdTokenBreak: PROC [char: CHAR] RETURNS [IO.CharClass] = {
+IF char = '" THEN RETURN [break];
+IF char = '  OR char = '\t OR char = ', OR char = '\l OR char = '\r THEN RETURN [sepr];
+RETURN [other];
+};
+
+GetCmdToken: PROC [stream: IO.STREAM] RETURNS [token: ROPE ¨ NIL] = {
+token ¨ IO.GetTokenRope[stream, CmdTokenBreak ! IO.EndOfStream => CONTINUE].token;
+IF Rope.Equal[token, "\""] THEN {
+ref: REF;
+IO.Backup[self: stream, char: '"];
+ref ¨ IO.GetRefAny[stream ! IO.Error, IO.EndOfStream => ERROR QuotedStringError];
+WITH ref SELECT FROM
+rope: ROPE => token ¨ rope;
+ENDCASE => ERROR QuotedStringError;
+};
+};
+
+runUsage: ROPE ~ 
+"Run (-d | -a | -l | -p number | -q | -s | -t | -u InterfaceName* -x | ModuleOrFileName)*
+ -d	don't start if unbound
+ -a	run again even if already run
+ -l 	load only
+ -o	prefer optimized code
+ -p number	allocate that number of bytes for patch space 
+ -q 	quote (don't use file searching hacks)
+ -t	print load timing info
+ -u	start unbound exception list
+ -x	end unbound exception list";
+
+Start: PROC ~ {
+Commander.Register["Run", RunCmd, runUsage];
+Commander.Register["RunDefaultSwitches", RunDefaultsCmd, "Set local default switches for the Run command"];
+Commander.Register["LoadedVersionOf", LoadedVersionCmd, "LoadedVersionOf FileNamePattern*"];
+Commander.Register["LoadedFiles", LoadedFilesCmd, Rope.Concat["Format load state for restart\n", loadedFilesUsage]];
+Commander.Register["UXName", UXNameCommand, "For debug of PFSNameToUnixName"];
+};
+
+CallWithPFSWorkingDirectory: UNSAFE PROC [cproc: CARD32, wd: UnixString] ~ UNCHECKED {
+proc: SAFE PROC ~ CProcToCedar[cproc];
+path: PATH ~ PFS.PathFromRope[UXStrings.ToRope[wd]];
+PFS.DoInWDir[path, proc];
+};
+
+ExternalNames: PROC = TRUSTED MACHINE CODE {
+"^ExternalNames\n";
+"CallWithPFSWorkingDirectory XR_CallWithPFSWorkingDirectory\n";
+};
+Start[];
+ExternalNames[];
+
+END.
+  ™  
+RunCommandsImpl.mesa
+Copyright ” 1989, 1990, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Last tweaked by Mike Spreitzer on February 13, 1991 11:12 am PST
+Michael Plass, April 15, 1992 9:48 am PDT
+Chauser, July 24, 1992 3:43 pm PDT
+Peter B. Kessler, August 20, 1990 3:14 pm PDT
+Willie-s, June 25, 1992 12:05 pm PDT
+
+Run
+Run: PUBLIC PROC [bcdName: ROPE, runEvenIfAlreadyRun, runEvenIfUnbound: BOOL _ FALSE] RETURNS [errMsg: ROPE _ NIL, error: BOOL _ FALSE] ~ {
+RETURN RunInternal[bcdName, runEvenIfAlreadyRun, runEvenIfUnbound]};
+
+intermediate attempts to CommitIncrementalLoad accrue to libPulses whereas commitPulses reports only the time for the last CommitIncrementalLoad
+Start of body
+type clashes are unsafe; there should be a switch to allow the the user to proceed 
+We ran this one, so there's a reliable module name.
+This was run early, so we have to guess.
+Command Line Tokenization
+Command Registration
+Startup
+ù ª  ïNewlineDelimiter
+ñ(cedarcode) styleô codeöúôKöú
+œeúCôNKô@Kô)Kô"Kô-Kô$Kô óKöœk	úËòÒKò KöœnúûúûòKöûúbûú"ûú^òÓöúûúûúûúò!Kò KöûúûúûúòKöûúûúûúòKö	ú
+ûúûúûúûúòKöúûúûúûúò.öúûúûúòKò óKöú	ûúûúû	úûúûúûúòQöúûúûú	ûúò;Kò óöú	ûúò%Kò óóheadôöüúûúûúûú)ûúûúûú
+ûúûú	ûúûúôãKöûú>ôDKô óKöú5ûúò;Köúûúûú!ûúòFKöú	ûúûúûú	ûúûúûúòjöüúûúûúpûúûúûú	ûúûúûúòËKö	úûúûúûúûúòIKöúûúò+Köúûú!ò/Köúûú<òLKöúûú#ò/Köúûúò-KöúhòhKöúûú*ò:Köúûúò!Köú
+ûúûúò.Köú	ûúûúòKöúûúûúòKöú
+ûúûúòKöúûúò,Köú
+ûúòKöúûúòKöú=ûúòFKöúûúûúòKöúûúûúòöüúûúûúûúû
+ú
+ûúòDKòöûúûúûú%ò2öûúòKöúûúûúûúûú	ûú	ò0KöûúòKöûúòKöúûúòKöúòóöûúòKöúgògKöúòóóKöûúûú	ûúòKöúòóöüúûú
+ûúûúò&Köúûú
+ûúûúAòeKöúòóöü
+úûú
+ûúûúò+Köúûú
+ûúûúAòdKöúòóöüúûúûúûúûúûúûúòCKö
+ûúûúûúûúûúòKöúûú!ûú^òéKöûúûúòóöüúûúûúûúûúûúòCKöûúò%KöúòóöüúûúûúòKöûúûúûú#òCö
+üúû	úûúûú
+ûúò;öüúû	úûúûúûúûúûúòMKòKòóKöúûú"ò+Köûú	òKòóöüúû	úûúûúûúûúòNKö	úûúûúûúûúò,KöûúûúòKòóKò/Köú1ò1Köú+ò+Köú&ò&öûú	òöúûúòKöúòKöú ò KöúDòDóKöúûúûúòóKöúûúûúò$Köúûúò-Kòöûúûúûú
+ûúûúûúûú#ûú!ûúûúûú
+ûúûú!ûú ûúòˆKò,KöúûúûúòóöûòKöúûûòKòNöûúûúûúûúûúûò6Kö	ú	ûúûúûúûúòöüúûúûúò,Köú
+ûú%ò3KöûúûúòóKöú
+ûúûúûúò2Köûú7ò9Köûú	ûúûúûúòöûú	ûúûúòKò7KòKöúûúòKöúûúòKòKöúûúòKöú
+ûúòKöúûú7ûúò`KöûúQòXöûúûúò!Köúûú1ûúòYKöúûúòKòóöûúòKò+Köúûú ûúòFKöú@ò@öûú	òöúûúòKöú"ò"KöúòKöú ò KöúDòDóKöúûú,ò4KöûúûúòóKòóKòKöûúòóöú*ò*KôêóKöûúòóKòAKò(KöûúòóöûúûúòKöúûúAûúûúAòõKöûúòKöúòóKöú1ò1öûú
+ûú	ûúûúò#Köú+ò+Köûúûúûúûúò5Köúòóöûúòò
+KòKöúûú"ò1KòóóKöúòóKôKòöûúûúûúòKöúûúKûú7òëKöûúûúòKòóKòKöûú	ûúûúûúûúûúòOKöú	ûúûú1òSKöúûú)ò8KöûúûúûúûúòKöúûúûú%òAKöúûúûú#ò;öûúûúòKöûúûú&ò3Köú5ò5Köú
+ûúûú%ûúò:Köúûúûúòöüúûúò,öûú	ûúûòöú8ò8Köúûú-ò9Köûúûúûúò-Kòóò3Köûúûúûúò#Kòóò4KôSKöúûúòKòóKöûúûúòóKöúûúò#KöúòóKò+Köú$œc\òÄöú/ûúò8KöúûúòKöûú%ò'KöûúòKöûúJòLKöûúò	KòóKöûúûúûú)ò:öûú
+ûúûúòKò4KöûúòKòóöûúòKöûú&ûú	ûúò@Köûú(ò,óKò;KöúòKöúòóöûú
+ûúòKöú/ò/Kò'Köú2ûú†;ò}Köú	ûúûúûú†íò∆Kò3KöúòKöúòóKöú(ûútòüöûúûúûòKöúûú
+ûú*òEKöúûúûúRònKöúûú:òHKöúûú
+ûúRònKöúûúûúOòlKöúûúEòTKöûúûú†úò0óKöûúûúûúDûú≥òúKö	ûúûúûúûú†ò4KöûúòKöúòóKö	úûúûúûúûûò%öüúûúûúò7Köúûú0òGKöûúûúòKöúòKò óöü
+úûúûúûúûúûúòKöûúûú=ûúûúûúûúûúûò}Köúûú
+ûú
+ûúò7Köûú
+ûúûúûúò&KöûúòóKòKòKò óKöúûú	òKöúûú2òRöúûú\òxKò óöüúûú	ûúûúûúüúûúûúûúûúûúûú	ûúûúò≥öúûúûúûúûúûú$ûúûòbKòKöúûúûúòKöûúûúûúûúòDóKöúûúò%öûú+ûúûúûòDKöúûúòKöú
+ûúò*Köú	ûúòöûúûúòKöúûú8ûúòUKöûúòóöú	ûúöòßKöúûúûúò,KöúûúòKöú(ûúûú
+ûúòTKöûú	ûúûúò+KöúòóKöûúòóKöûúûúòKöúòKò óöüúûúûúûúò3Kö	úûúûúûúûúòKòöûúûúûúûò0KòKòKöûúòóKòKöûúòKöúòKò óö–bnúûúûú
+ûúûúûúûú†úûúòwKöûú2ûúûú
+òGKöúHûúûúòUKöúûúûúòKöú,ûú†òAKöúûúûúòKöúûúòKöúûúûúûúòKöúûú,òAKò öûú+ûúûò:Kö	úûúûúûúûúò^KöûúûúòóKöúûúûú0ò=ö	ûúûú(ûúûúûòGKöúûúûúòöûúûúûúò8Köú
+ûúûúòöûúûúûúûò&Köúûúûúò(öûúûòKöú!ò!KöúòKöúòöúòöüúû	ú
+ûúûúûúûúûúòHKöú
+ûúò%Köúûúòòöúûúò'Köúûúûúò óKò KòöûòKòCóKòóKöûúòKòóKöú,ò,KöúòóKöúòKòKöúòKöúûúòKöúòKöúûúòKöûúOòVóKöûúòóKöûúòKòóKöûúûú8ûúûúò_Köûúûú*ûúòBKöúyûúìòèKöûúûúûú	òKöúûúòKö
+ûúûúûúûúûúòFKöûúòóKöûúûú*ûúòJKöûúûúûúûúò7Köûúò#KòKò óöüúûúûú
+ûúûúûúûú†úòwKö	úûúûúûúûúò*Köú
+ûúò#ö
+ûúûúûúûúûúòVKöú_ò_KöúòóKöú2ò2öûú+ûúûò:Kö	úûúûúûúûú@òÜKöûúûúòóKòKò óöüúûúûú
+ûúûúûúûú†úòvKöûúûú$ûú
+ò<Kö	úûúûúûúûúò*Köúûúûú
+ûú,òIKöûúûúò1KöûúòKöûúò#KòKò óö°úûúûú
+ûúûúûúûú†úûúòÅKöûú2ûúûú
+òGKö	úûúûúûúûúò*ö	ûú	ûú(ûú
+ûúûòMKöú	ûúò&KöúûúûúòKöúûúûúòKò3öûòKöúûúòKöûúûúûúûúòKöúûúò-öûúûú	ûúûúûúûúûúòhKöú$ûú<ûúòÜKòóKöúûúò	óKòKöûúòóKöûúòöûòKöúòóKòKò óö
+üúûúûúûúûúò<KöüúûúûúûúûúûúòOöûúòöûúòKöúûú!ò)Köú	ûú7òDKöúAòAKöúòóöûúòKöú ò Köúòóóöûú$ûúûò3Köúûúûúò'KöûúòóKöúûúòKöûú2ò5KöúòKò óö
+ü	úûúûúûúûúò/Köúûúò$Köú5ò5Köúûú6ò>Köûú1ûú(òbKöúòKò óö
+üúûúûúûúûúò7öûú(ûúûò7öúûúòKô3KöûúòKòóöûúòKô(öûúûú òAKöûúûúò!KöûúûúûúòóKòóóKöúòKò óKöúûúìò©ö°úûúûú
+ûúûúûúûú†úòwöûúòKöú1ûúûú
+ò@Kö
+ûú
+ûúûúûúûú
+òQKöúòóKö	úûúûúûúûúò*öüúûúûúûúò'Köûú)ò/KöúòóKö	úûúûúûúûúòö
+ü	úûúûúûúûúò/öûúûúûúûúûúûúûòBKö
+ûúûúûúûúûúò:KöûúòóKöûúûúòKöúòóKò7KöúûúûúòKöúûúûúòKöúûúûúòKöúûúûúòKö	úûúûúûúûúòKöúûúûúòKöúûúòö	ûú	ûú(ûú
+ûúûòMKöüúûúûúûúûúûúûúòQöûúûúûòKöúòKöú&ò&Köú"ò"Köú"ò"Köú ò Köú,ò,Köú,ò,Köú.ò.Köú*ò*Köú!ûúòDKöûúûúûú
+ò3óKöúûúòKöûúòóKö
+ûúûúûúûúûú
+ò>Kö
+ûú	ûúûú	ûúûúò0Kö
+ûú
+ûúûúûúûúò/öûúò	öûúûúûúûúûúûúûúûòZKöúûúò(Köûúûúûúò4KöûúòóKöúòóöûúûúûú
+ûúûúûúûòMKöúûúòKöúòKöûú	ûúûúûúûúûúò<Köûúòóöûúûúûúûúûúûúò+öûúûúûúûúûúûúûò<öûúûúûòKö	úûúûúûúûúòJKöúûúûúûúûú%ûúûúòcKöûúûúòóKöûúòóKöúòóöûúûúûúûúûúûúûò<ö	ûúûúûúûúûò4öúòKöúûúò-öûúûúûòöúûúòKöûú!ò#Köûúò KöûúòKöûúò KöûúòKöúòóKöúûúò+öûúòKöûúò!Köûúò KöûúòKöúòóóKöúòóöúòKöûúòKöûúûú-òDKöûúòKöúòóöú
+ò
+öûúûúûòKöúûúò+öûúòKöûúò KöûúòKöúòóóKöúòóöú	ò	öûú ûúûúò.Köûú
+ûúûúò.öûú/ûúò7Köûúò KöûúòKöúòóKöúòóKöúòóöú
+ò
+Köúûúò-öûúûúûúòKöúûú4ò<öûú*ûúûúò6Köûú<ò>Köûú2ò4Köúòóöûú&ûúûúò2öûúûúûòöúûúòöûúòKöúÉûúòùóKöúòóöûúòKöûú8ò:KöúòóóKöúòóKöúòóKöúòóKöûúûúòóKöûúòóöûòKöúòóKòKò óö
+üúûúûúûúûúòGKöúûúûú%ò;KöûúûúòKò óóöúôöüúûúûúò Kò óö
+üúûúûúûúûúò;Köûúûúûú	ò!KöûúûúûúûúûúûúûúòWKöûú	òKòKò óöüúûú
+ûúûúûú	ûúûúòEKöúûú&ûúûúòRïStartOfExpansion6[pattern: ROPE, object: ROPE, case: BOOL _ TRUE]öûúûúò!Köúûúò	Kñ[self: STREAM, char: CHAR]öûú ò"Kö	úûúûúûúûúòQöûúûúûòKöúûúòKöûúûúò#óKöúòóKòKò óóöúôöú
+ûúòKöú3œiœuú¢ú£ú©òÇKò óöüúûúòKöú,ò,KöúkòkKöú\ò\KöútòtKòNKòKò óö
+üúûúûú	ûúû	úòVKöúûúûúò&Köúûúûú$ò4KöûúòKöúòKò óö
+üúûúûúûúûúò,KòKöú?ò?KòóóôKòòKò óóKöûúòó Öó    _®  Ç  

@@ -1,0 +1,675 @@
+
+DIRECTORY
+Buttons, CedarProcess, Containers, Feedback, GGCaret, GGEvent, GGHistory, GGHistoryTypes, GGHistoryTypesOpaque, GGInterfaceTypes, GGModelTypes, GGParent, GGScene, GGSelect, GGSlice, GGSliceOps, GGState, GGUtility, GGWindow, IO, MBQueue, Process, RefTab, Rope, Rules, SlackProcess, TEditOps, ViewerClasses, ViewerOps, ViewerSpecs, ViewerTools;
+
+GGHistoryImpl: CEDAR MONITOR
+IMPORTS GGParent, CedarProcess, Containers, Feedback, GGCaret, GGEvent, GGHistory, GGScene, GGSelect, GGSlice, GGSliceOps, GGState, GGUtility, GGWindow, IO, MBQueue, Process, RefTab, Rope, Rules, SlackProcess, TEditOps, ViewerOps, ViewerSpecs, ViewerTools
+EXPORTS GGHistory, GGHistoryTypes = BEGIN
+
+Change: PUBLIC TYPE = GGHistoryTypesOpaque.Change; -- exported to GGHistoryTypes
+GGData: TYPE = GGInterfaceTypes.GGData;
+HistoryEvent: TYPE = GGHistoryTypes.HistoryEvent;
+HistoryEventObj: TYPE = GGHistoryTypes.HistoryEventObj;
+HistoryTool: TYPE = REF HistoryToolObj;
+HistoryToolObj: PUBLIC TYPE = GGHistory.HistoryToolObj; -- exported to GGHistoryTypes
+HistoryProc: TYPE = GGHistoryTypes.HistoryProc;
+SubEvent: TYPE = GGHistoryTypes.SubEvent;
+SubEventObj: TYPE = GGHistoryTypes.SubEventObj;
+Layout: TYPE = GGHistory.Layout;
+LayoutRec: TYPE = GGHistory.LayoutRec;
+SlackHandle: TYPE = SlackProcess.SlackHandle;
+Slice: TYPE = GGInterfaceTypes.Slice;
+SliceWalkProc: TYPE = GGModelTypes.SliceWalkProc;
+
+DebugHalt: SIGNAL = CODE;
+KillError: SIGNAL = CODE;
+
+noHistory: BOOL ¨ FALSE; -- for performance testing. Eliminates all history activity
+tempCapture: BOOL ¨ TRUE; -- temporarily substitutes captures for currents. Required until slice property Get procs can return multiple values.
+doSelections: BOOL ¨ TRUE;
+doUnlink: BOOL ¨ TRUE;
+debugSlice: Slice ¨ NIL;
+
+NewCurrent: PUBLIC PROC [name: Rope.ROPE, ggData: GGData] RETURNS [HistoryEvent ¨ NIL] = { -- equivalent to SetCurrent[ggData, Create[name] ]
+IF noHistory THEN RETURN ELSE {
+count: INT ¨ GGScene.CountSelectedSlices[ggData.scene, first, normal];
+nameAndCount: Rope.ROPE ¨ IF count=0 THEN IO.PutFR1["%g  no object", [rope[name]]]
+ELSE IO.PutFR["%g  %g object%g", [rope[name]], [integer[count]], [rope[IF count>1 THEN "s" ELSE NIL]] ];
+IF tempCapture THEN {
+SELECT TRUE FROM
+Rope.Equal["Transform", name, FALSE], -- from GGEventImplC
+Rope.Equal["Motion:", Rope.Substr[base: name, start: 0, len: 7], FALSE], -- from GGMouseEventImplA
+Rope.Equal["Undo", Rope.Substr[base: name, start: 0, len: 4], FALSE], -- from UndoN
+Rope.Equal["Set scale unit", name, FALSE] => { -- from GGEventImplB
+KillAdvanceCapture[ggData];-- KillAdvanceCapture synchronizes with already launched AdvanceCapture
+SetCurrent[ggData, Create[nameAndCount]];
+RETURN[GetCurrent[ggData].event];
+};
+ENDCASE => {
+NewCapture[name, ggData]; -- NewCapture synchronizes with already launched AdvanceCapture
+RETURN[NIL];
+};
+}
+ELSE {
+KillAdvanceCapture[ggData];-- KillAdvanceCapture synchronizes with already launched AdvanceCapture
+SetCurrent[ggData, Create[nameAndCount]];
+RETURN[GetCurrent[ggData].event];
+};
+};
+};
+
+PushCurrent: PUBLIC PROC [ggData: GGData] = { -- pushes current event onto history list
+IF noHistory THEN RETURN ELSE {
+event: HistoryEvent ¨ GetCurrent[ggData].event;
+IF GGSliceOps.debugHalt THEN SIGNAL DebugHalt;
+IF event#NIL THEN {
+SetSliceIndex: PROC [slice: Slice] RETURNS [done: BOOL ¨ FALSE] = {
+slice.historyTop ¨ newIndex;
+};
+oldTail, tail: LIST OF HistoryEvent; -- will be list of stale events to dismantle
+newIndex: INT ¨ ggData.history.currentIndex+1; -- get ready for new push
+WalkSlicesInEvent[event, SetSliceIndex]; -- record the newIndex in slice.historyTop in each slice.  slice.historyTop is the index of the latest history event a given slice is a member of
+event.index ¨ newIndex;
+Push[event, GetHistory[ggData] ];
+ggData.history.currentIndex ¨ newIndex; -- record new index after Push succeeded
+
+tail ¨ GetHistory[ggData]; -- get expanded history list
+THROUGH [0..ggData.history.maxSize) DO IF tail=NIL THEN EXIT ELSE {
+oldTail ¨ tail;
+tail ¨ tail.rest;
+};
+ENDLOOP;
+IF tail#NIL AND tail.first#NIL THEN { -- tail may be LIST[NIL]
+MarkSlices: PROC [slice: Slice] RETURNS [done: BOOL ¨ FALSE] = {
+TopHistory: PROC [slice: Slice] RETURNS [done: BOOL ¨ FALSE] = {
+slice.historyTop ¨ newIndex;
+};
+DescendASlice[slice, TopHistory];
+};
+sliceList, ptr: LIST OF Slice;
+[sliceList, ptr] ¨ GGUtility.StartSliceList[];
+
+[] ¨ GGScene.WalkSlices[ggData.scene, first, MarkSlices];
+
+FOR tailEvents: LIST OF HistoryEvent ¨ tail, tailEvents.rest UNTIL tailEvents=NIL DO
+ResetEvent[tailEvents.first, sliceList, ptr];
+ENDLOOP;
+oldTail.rest ¨ NIL; -- this truncates the actual history list
+UnlinkListedSlices[sliceList]; -- do your dirty work
+};
+};
+};
+};
+
+KillAdvanceCapture: PUBLIC ENTRY PROC [ggData: GGData] = {
+ENABLE UNWIND => NULL;
+KillAdvanceCaptureInternal[ggData];
+};
+
+KillAdvanceCaptureInternal: INTERNAL PROC [ggData: GGData] = {
+advanceProcess: CedarProcess.Process ¨ ggData.history.advanceProcess;
+advanceEvent: HistoryEvent ¨ ggData.history.advanceEvent;
+IF GGSliceOps.debugHalt THEN SIGNAL DebugHalt;
+IF ggData.history.advanceProcess#NIL THEN {
+ggData.history.advanceProcess ¨ NIL;
+ggData.history.advanceEvent ¨ NIL;
+IF CedarProcess.GetStatus[advanceProcess]=busy THEN CedarProcess.Abort[advanceProcess];
+[] ¨ CedarProcess.Join[process: advanceProcess, wait: TRUE];
+IF advanceEvent#NIL AND NOT Rope.Equal[advanceEvent.name, "advance", FALSE] THEN SIGNAL KillError; -- debugging check
+IF advanceEvent#NIL THEN [] ¨ CedarProcess.Fork[action: DiscardAction, data: advanceEvent, options: [priority: tryPriority, usePriority: TRUE]];  -- detach process by dropping return value.  Start it in the foreground because of the way CedarProcess works.  DiscardAction can drop to the background.
+};
+};
+
+DiscardAction: CedarProcess.ForkableProc = {
+advanceEvent: HistoryEvent ¨ NARROW[data];
+IF advanceEvent#NIL AND NOT Rope.Equal[advanceEvent.name, "advance", FALSE] THEN SIGNAL KillError; -- debugging check
+IF advanceEvent#NIL THEN {
+CedarProcess.SetPriority[priority: background];
+Process.Yield[];
+GGUtility.UnlinkCapturedScene[advanceEvent];
+};
+};
+
+tryPriority: CedarProcess.Priority ¨ normal;
+DoAdvanceCapture: PUBLIC ENTRY PROC [ggData: GGData] = {
+ENABLE UNWIND => NULL;
+IF noHistory THEN RETURN ELSE {
+IF GGSliceOps.debugHalt THEN SIGNAL DebugHalt;
+IF ggData.history.advanceProcess#NIL THEN KillAdvanceCaptureInternal[ggData]; -- important for synchronization
+ggData.history.advanceEvent ¨ Create["advance"];
+ggData.history.advanceProcess ¨ CedarProcess.Fork[action: CaptureAction, data: ggData, options: [priority: tryPriority, usePriority: TRUE] ]; -- remember the advance process.  Start it in the foreground because of the way CedarProcess works.  CaptureAction can drop to the background.
+};
+};
+
+CaptureAction: CedarProcess.ForkableProc = {
+ggData: GGData ¨ NARROW[data];
+IF GGSliceOps.debugHalt THEN SIGNAL DebugHalt;
+CedarProcess.SetPriority[priority: background];
+Process.Yield[];
+Capture[ggData, ggData.history.advanceEvent, FALSE];
+};
+
+NewCapture: PUBLIC ENTRY PROC [name: Rope.ROPE, ggData: GGData] = {
+ENABLE UNWIND => NULL;
+IF noHistory THEN RETURN ELSE {
+count: INT ¨ GGScene.CountSelectedSlices[ggData.scene, first, normal];
+nameAndCount: Rope.ROPE ¨ IF count=0 THEN IO.PutFR1["%g  no object", [rope[name]]]
+ELSE IO.PutFR["%g  %g object%g", [rope[name]], [integer[count]], [rope[IF count>1 THEN "s" ELSE NIL]] ];
+IF GGSliceOps.debugHalt THEN SIGNAL DebugHalt;
+IF ggData.history.advanceProcess#NIL THEN {
+advanceStatus: CedarProcess.Status ¨ 
+CedarProcess.Join[process: ggData.history.advanceProcess, wait: TRUE].status;
+SELECT advanceStatus FROM
+done => {
+ggData.history.advanceEvent.name ¨ nameAndCount;
+SetCurrent[ggData, ggData.history.advanceEvent]; -- advanceEvent already has capture subevent on it.  PushCurrent will eventually push it onto history list.
+};
+aborted => {
+SetCurrent[ggData, Create[nameAndCount]];
+Capture[ggData, GetCurrent[ggData].event, FALSE];
+};
+ENDCASE => ERROR;
+ggData.history.advanceProcess ¨ NIL;
+ggData.history.advanceEvent ¨ NIL;
+}
+ELSE {  -- no advance
+SetCurrent[ggData, Create[nameAndCount]];
+Capture[ggData, GetCurrent[ggData].event, FALSE];
+};
+};
+};
+
+Capture: PROC [ggData: GGData, currentEvent: HistoryEvent, copyAll: BOOL ¨ FALSE] = {
+IF currentEvent#NIL THEN {
+captureRef: REF Change.capture;
+virginList: LIST OF Slice;
+virginMap: RefTab.Ref;
+[virginList, virginMap] ¨ GGUtility.CopySceneClean[ggData.scene, copyAll];
+captureRef ¨ NEW[Change.capture ¨ [capture[ggData.scene, virginList, virginMap] ] ];
+Note[currentEvent, Uncapture, captureRef];
+};
+};
+
+Uncapture: PROC [historyData: REF Change, currentEvent: HistoryEvent] = {
+IF noHistory THEN RETURN ELSE {
+captureData: REF Change.capture;
+captureData  ¨ NARROW[historyData];
+GGUtility.RestoreSceneClean[captureData.scene, captureData.virginData, captureData.virginMap];
+};
+};
+
+Create: PUBLIC PROC [name: Rope.ROPE] RETURNS [HistoryEvent] = {
+RETURN [IF noHistory THEN NIL ELSE NEW[HistoryEventObj ¨ [name, -1, LIST[NIL]] ]];
+};
+
+SetCurrent: PUBLIC PROC [ggData: GGData, event: HistoryEvent] = { -- sets current event to event
+IF GGSliceOps.debugHalt THEN SIGNAL DebugHalt;
+ggData.history.currentEvent ¨ event;
+};
+
+GetCurrent: PUBLIC PROC [ggData: GGData] RETURNS [event: HistoryEvent, index: INT] = {
+RETURN[ggData.history.currentEvent, ggData.history.currentIndex];
+};
+
+DescendASlice: PROC [slice: Slice, walkProc: SliceWalkProc] = {
+[] ¨ walkProc[slice];
+[] ¨ GGParent.WalkChildren[slice, all, walkProc];
+};
+
+WalkSlicesInEvent: PROC [event: HistoryEvent, walkProc: SliceWalkProc] = {
+IF event#NIL THEN FOR subevents: LIST OF SubEvent ¨ event.subevents, subevents.rest UNTIL subevents=NIL DO
+IF subevents.first#NIL THEN {
+subevent: SubEvent ¨ subevents.first;
+historyData: REF Change ¨ subevent.historyData;
+WITH historyData SELECT FROM
+captureRef: REF Change.capture => {
+FOR capturedSlices: LIST OF Slice ¨ captureRef.virginData, capturedSlices.rest UNTIL capturedSlices=NIL DO
+found: BOOL ¨ FALSE;
+nextVal: REF;
+nextSlice: Slice ¨ capturedSlices.first;
+[found, nextVal] ¨ RefTab.Fetch[captureRef.virginMap, nextSlice];
+IF nextSlice.class#NIL THEN DescendASlice[nextSlice, walkProc];
+IF found THEN {
+nextOriginal: Slice ¨ NARROW[nextVal];
+IF nextOriginal.class#NIL THEN DescendASlice[nextOriginal, walkProc];
+};
+ENDLOOP;
+};
+propsRef: REF Change.changingprops => {
+IF propsRef.slice.class#NIL THEN DescendASlice[propsRef.slice, walkProc];
+};
+stateRef: REF Change.changingstate => NULL;
+ENDCASE => ERROR;
+};
+ENDLOOP;
+};
+
+SetHistory: PUBLIC PROC [ggData: GGData, list: LIST OF HistoryEvent] = {
+IF GGSliceOps.debugHalt THEN SIGNAL DebugHalt;
+ggData.history.list ¨ list;
+};
+
+GetHistory: PUBLIC PROC [ggData: GGData] RETURNS [LIST OF HistoryEvent] = {
+RETURN[ggData.history.list];
+};
+
+Push: PUBLIC PROC [event: HistoryEvent, list: LIST OF HistoryEvent] = {
+IF GGSliceOps.debugHalt THEN SIGNAL DebugHalt;
+IF event#NIL AND event.subevents#NIL THEN {
+tempEvent: HistoryEvent;
+newList: LIST OF HistoryEvent ¨ LIST[event];
+temp: LIST OF HistoryEvent ¨ list.rest;
+list.rest ¨ newList;
+newList.rest ¨ temp;
+
+tempEvent ¨ list.first;
+list.first ¨ list.rest.first;
+list.rest.first ¨ tempEvent;
+};
+};
+
+Note: PUBLIC PROC [event: HistoryEvent, historyProc: HistoryProc, historyData: REF Change] = {
+IF event = NIL THEN RETURN;
+IF GGSliceOps.debugHalt THEN SIGNAL DebugHalt;
+IF GGSliceOps.noteNoMore AND event.subevents#NIL AND event.subevents.first#NIL AND event.subevents.first.historyData.kind=capture THEN RETURN;
+event.subevents ¨ CONS[NEW[SubEventObj ¨
+[historyProc, historyData]], event.subevents];
+};
+
+Undo: PUBLIC PROC [historyEvent: HistoryEvent, currentEvent: HistoryEvent] = {
+IF historyEvent=NIL THEN RETURN;
+IF GGSliceOps.debugHalt THEN SIGNAL DebugHalt;
+FOR nextSubs: LIST OF SubEvent ¨ historyEvent.subevents, nextSubs.rest UNTIL nextSubs=NIL DO
+sub: SubEvent ¨ nextSubs.first;
+IF sub#NIL THEN sub.historyProc[sub.historyData, currentEvent];
+ENDLOOP;
+};
+
+ResetHistory: PUBLIC ENTRY PROC [ggData: GGData] = {
+ENABLE UNWIND => NULL;
+sliceList, ptr: LIST OF Slice;
+[sliceList, ptr] ¨ GGUtility.StartSliceList[];
+KillAdvanceCaptureInternal[ggData];
+FOR historyEventList: LIST OF HistoryEvent ¨ ggData.history.list, historyEventList.rest UNTIL historyEventList=NIL DO
+ResetEvent[historyEventList.first, sliceList, ptr];
+ENDLOOP;
+UnlinkListedSlices[sliceList]; -- do your dirty work
+ggData.history.list ¨ LIST[NIL];
+ggData.history.currentIndex ¨ 0;
+ggData.history.currentEvent ¨ NIL;
+GGHistory.ClearTool[ggData];
+};
+
+ResetEvent:  PROC [event: HistoryEvent, sliceList, ptr: LIST OF Slice] = {
+IF event#NIL THEN {
+AddSliceToUnlink: PROC [slice: Slice] RETURNS [done: BOOL ¨ FALSE] = {
+IF slice.class#NIL AND slice.historyTop<=index THEN [sliceList, ptr] ¨ GGUtility.AddSlice[slice, sliceList, ptr];
+};
+
+index: INT ¨ event.index;
+WalkSlicesInEvent[event, AddSliceToUnlink];
+
+FOR subeventList: LIST OF SubEvent ¨ event.subevents, subeventList.rest UNTIL subeventList=NIL DO
+IF subeventList.first#NIL THEN subeventList.first.historyData ¨ NIL;
+ENDLOOP;
+event.subevents ¨ NIL;
+};
+};
+
+UnlinkListedSlices: PROC [sliceList: LIST OF Slice] = {
+IF doUnlink THEN FOR slices: LIST OF Slice ¨ sliceList, slices.rest UNTIL slices=NIL DO
+GGSlice.UnlinkSlice[slices.first]; -- GGSlice.UnlinkSlice deals with already unlinked slices
+ENDLOOP;
+};
+
+Reset: PUBLIC PROC [event: HistoryEvent] = {
+IF event#NIL THEN {
+event.subevents ¨ NIL;
+event.name ¨ NIL;
+};
+};
+
+Empty: PUBLIC PROC [event: HistoryEvent] RETURNS [BOOL] = { RETURN [event=NIL OR event.subevents=NIL] };
+
+UndoN: PUBLIC PROC [ggData: GGData, N: INT ¨ 0] = {
+IF noHistory THEN RETURN ELSE {
+placeHolder: Rope.ROPE = "UndoN Placeholder";
+title: Rope.ROPE;
+actualCount: INT ¨ 0;
+currentEvent: HistoryEvent;
+list: LIST OF HistoryEvent ¨ GGHistory.GetHistory[ggData];
+IF list#NIL AND list.first#NIL THEN { -- list can be LIST[NIL]
+currentEvent ¨ GGHistory.NewCurrent[placeHolder, ggData];
+Capture[ggData, currentEvent, TRUE]; -- capture the entire scene for Undo of Undo
+THROUGH [0..N) DO
+IF list#NIL AND list.first#NIL THEN {
+GGHistory.Undo[historyEvent: list.first, currentEvent: NIL];
+list ¨ list.rest;
+actualCount ¨ actualCount+1;
+};
+ENDLOOP;
+title ¨ GGHistory.GetCurrent[ggData].event.name ¨ IO.PutFLR["Undo %g event%g.  Actually undid %g event%g.", LIST[[integer[N]], [rope[IF N>1 THEN "s" ELSE NIL ]], [integer[actualCount]], [rope[IF actualCount>1 THEN "s" ELSE NIL ]]] ];
+GGHistory.PushCurrent[ggData];
+GGCaret.SitOn[ggData.caret, NIL]; -- smash the chair
+GGCaret.NoAttractor[ggData.caret]; -- smash the attractor
+GGState.SetSliceToExtend[ggData, NIL]; -- smash the extension
+GGState.SetExtendMode[ggData, none]; -- smash the extension slice
+GGSelect.DeselectAllAllClasses[ggData.scene]; -- smash existing select lists
+BEGIN
+Reselect: PROC [slice: Slice] RETURNS [done: BOOL ¨ FALSE] = {
+GGSelect.ReselectSliceAllClasses[slice: slice, scene: ggData.scene]
+};
+IF doSelections THEN [] ¨ GGScene.WalkSlices[ggData.scene, first, Reselect];
+END;
+Feedback.Append[ggData.router, oneLiner, $Feedback, title];
+GGWindow.RestoreScreenAndInvariants[paintAction: $PaintEntireScene, ggData: ggData, remake: triggerBag, edited: TRUE, okToSkipCapture: FALSE];
+}
+ELSE Feedback.Append[ggData.router, oneLiner, $Complaint, "No entries on the history list to Undo"];
+};
+};
+
+
+BadNumber: SIGNAL = CODE;
+
+CapTool: PUBLIC PROC [caption: Rope.ROPE, ggData: GGData] = {
+tool: HistoryTool ¨ ggData.history.tool;
+IF tool#NIL THEN {
+container: Containers.Container ¨ tool.layout.container;
+container.name ¨ Rope.Concat["GGHistory for ", caption];
+ViewerOps.PaintViewer[viewer: container, hint: caption];
+};
+};
+
+BuildTool:  PUBLIC PROC [caption: Rope.ROPE, ggData: GGData] RETURNS [HistoryTool]= { 
+openHeight: INTEGER ¨ 120;
+viewer: ViewerClasses.Viewer;
+tool: HistoryTool;
+layout: Layout;
+name: Rope.ROPE ¨ Rope.Concat["GGHistory for ", caption];
+viewer ¨ IF ggData.history.tool=NIL THEN NIL ELSE ggData.history.tool.layout.container;
+IF viewer#NIL AND NOT (viewer.destroyed OR viewer.paintingWedged) THEN { -- already have this tool around
+IF viewer.iconic THEN ViewerOps.OpenIcon[viewer];
+Feedback.PutF[ggData.router, oneLiner, $Complaint, "GGHistory tool for %g already exists", [rope[caption]] ];
+RETURN [ggData.history.tool];
+};
+tool ¨ NEW[HistoryToolObj];
+layout ¨ tool.layout ¨ NEW[LayoutRec];
+layout.container ¨ Containers.Create[[name: name, iconic: TRUE, column: right, scrollable: FALSE, data: ggData]];
+[] ¨ BuildButton[layout, "Show", SynchShow, ggData];
+[] ¨ BuildButton[layout, "Undo", SynchUndo, ggData];
+[ ----, tool.eventNumArg] ¨
+BuildDataFieldPair[layout, "since Gargoyle event number: ", EventNumberButton, ggData, 1];
+layout.heightSoFar ¨ layout.heightSoFar + layout.entryVSpace/2;
+[] ¨ BuildButton[layout, "Get", SynchGetSize, ggData];
+[] ¨ BuildButton[layout, "Set", SynchSetSize, ggData];
+[ ----, tool.sizeArg] ¨
+BuildDataFieldPair[layout, "history size: ", HistorySizeButton, ggData, 1];
+HRule[layout];
+tool.textField ¨ ViewerOps.CreateViewer[flavor: $Text, info: [parent: layout.container,
+wx: layout.entryLeft, wy: layout.heightSoFar, wh: 700, ww: 200, border: FALSE, scrollable: TRUE],
+paint: FALSE];
+Containers.ChildYBound[layout.container, tool.textField];
+Containers.ChildXBound[layout.container, tool.textField];
+ViewerOps.SetOpenHeight[layout.container, openHeight];
+RETURN [tool];
+};
+
+EventNumberButton: Buttons.ButtonProc = {
+ggData: GGData ¨ NARROW[clientData];
+tool: HistoryTool ¨ ggData.history.tool;
+DataFieldButton[tool.eventNumArg, mouseButton#red];
+};
+
+HistorySizeButton: Buttons.ButtonProc = {
+ggData: GGData ¨ NARROW[clientData];
+tool: HistoryTool ¨ ggData.history.tool;
+DataFieldButton[tool.sizeArg, mouseButton#red];
+};
+
+SynchShow: Buttons.ButtonProc = {
+ggData: GGData ¨ NARROW[clientData];
+handle: SlackHandle ¨ ggData.slackHandle;
+event: LIST OF REF ¨ LIST[$HistoryShow];
+GGEvent.PrintAllInput[ggData, event]; -- KAP
+SlackProcess.QueueAction[handle, DoShow, event, ggData, NIL];
+};
+
+DoShow: PROC [clientData: REF ANY, inputAction: REF] = {
+ggData: GGData ¨ NARROW[clientData];
+tool: HistoryTool ¨ ggData.history.tool;
+num, stop: INT ¨ 0;
+h: IO.STREAM ¨ IO.ROS[];
+list: LIST OF HistoryEvent ¨ GGHistory.GetHistory[ggData];
+num ¨ GGHistory.GetCurrent[ggData].index; -- current event number
+stop ¨ GetInt[tool.eventNumArg ! BadNumber => { stop ¨ 0; CONTINUE }]; -- "since event number" argument. Used for Show and Undo
+WHILE num > stop AND list#NIL AND list.first#NIL DO
+h.PutF["%g\t%g\n", [integer[num]], [rope[list.first.name]] ];
+num ¨ num-1;
+list ¨ list.rest;
+ENDLOOP;
+TEditOps.SetTextContents[tool.textField, IO.RopeFromROS[h]];
+};
+
+SynchUndo: Buttons.ButtonProc = {
+ggData: GGData ¨ NARROW[clientData];
+handle: SlackHandle ¨ ggData.slackHandle;
+event: LIST OF REF ¨ LIST[$HistoryUndo];
+GGEvent.PrintAllInput[ggData, event]; -- KAP
+SlackProcess.QueueAction[handle, DoUndo, event, ggData, NIL];
+};
+
+DoUndo: PROC [clientData: REF ANY, inputAction: REF] = {
+ggData: GGData ¨ NARROW[clientData];
+{
+tool: HistoryTool ¨ ggData.history.tool;
+num: INT ¨ GGHistory.GetCurrent[ggData].index; -- current event number
+stop: INT ¨ GetInt[tool.eventNumArg ! BadNumber => GOTO Bad]; -- since event number" argument. Used for Show and Undo
+back: INT _ num-stop;
+IF back > 0 THEN GGHistory.UndoN[ggData, back];
+EXITS
+Bad => Feedback.Append[ggData.router, oneLiner, $Complaint, "Please fill in the \"since Gargoyle event number\" field with a positive integer event number"];
+};
+};
+
+SynchGetSize: Buttons.ButtonProc = {
+ggData: GGData ¨ NARROW[clientData];
+handle: SlackHandle ¨ ggData.slackHandle;
+event: LIST OF REF ¨ LIST[$HistoryGetSize];
+GGEvent.PrintAllInput[ggData, event]; -- KAP
+SlackProcess.QueueAction[handle, DoGetSize, event, ggData, NIL];
+};
+
+DoGetSize: PROC [clientData: REF ANY, inputAction: REF] = {
+ggData: GGData ¨ NARROW[clientData];
+tool: HistoryTool ¨ ggData.history.tool;
+SetInt[tool.sizeArg, ggData.history.maxSize];
+};
+
+SynchSetSize: Buttons.ButtonProc = {
+ggData: GGData ¨ NARROW[clientData];
+handle: SlackHandle ¨ ggData.slackHandle;
+event: LIST OF REF ¨ LIST[$HistorySetSize];
+GGEvent.PrintAllInput[ggData, event]; -- KAP
+SlackProcess.QueueAction[handle, DoSetSize, event, ggData, NIL];
+};
+
+DoSetSize: PROC [clientData: REF ANY, inputAction: REF] = {
+ggData: GGData ¨ NARROW[clientData];
+{
+tool: HistoryTool ¨ ggData.history.tool;
+num: INT ¨ GetInt[tool.sizeArg ! BadNumber => GOTO Bad];
+ggData.history.maxSize ¨ IF num<=0 THEN 1 ELSE num;
+SetInt[tool.sizeArg, ggData.history.maxSize];
+EXITS
+Bad => Feedback.Append[ggData.router, oneLiner, $Complaint, "Please fill in the \"history size\" field with a positive integer size"];
+};
+};
+
+ClearTool: PUBLIC PROC [ggData: GGData] = {
+tool:  HistoryTool ¨ ggData.history.tool;
+IF tool#NIL THEN {
+TEditOps.SetTextContents[tool.textField, NIL];
+TEditOps.SetTextContents[tool.eventNumArg, NIL];
+};
+};
+
+
+BuildButton: PROC [info: Layout, name: Rope.ROPE, proc: Buttons.ButtonProc, clientData: REF ANY ¨ NIL, fork: BOOL ¨ FALSE, gapAfter: BOOL ¨ TRUE, border: BOOL ¨ FALSE] RETURNS [button: Buttons.Button] = {
+button ¨ MBQueue.CreateButton[q: queue, 
+info: [name: name, parent: info.container, wx: info.entryLeft, wy: info.heightSoFar, border: border],
+proc: proc, clientData: clientData, paint: FALSE];
+info.entryLeft ¨ info.entryLeft + button.ww;
+IF gapAfter THEN info.entryLeft ¨ info.entryLeft + info.gapSize;
+RETURN[ button ];
+};
+
+DataFieldButton: PROC [arg: ViewerClasses.Viewer, clear: BOOL] = {
+IF clear THEN ViewerTools.SetContents[arg, NIL]; -- clear contents of field
+ViewerTools.SetSelection[arg, NIL]; -- make pending delete selection of field contents
+};
+
+BuildDataFieldPair: PROC [info: Layout, buttonRope: Rope.ROPE, buttonProc: Buttons.ButtonProc, clientData: REF ANY ¨ NIL, lines: CARDINAL ¨ 2] RETURNS [button: Buttons.Button, arg: ViewerClasses.Viewer] = {
+fudge: CARDINAL = 1;
+button ¨ BuildButton[info: info, name: buttonRope, proc: buttonProc, clientData: clientData,
+fork: FALSE, gapAfter: FALSE];
+arg ¨ ViewerOps.CreateViewer[flavor: $Text, info: [parent: info.container,
+wx: info.entryLeft, wy: info.heightSoFar+fudge,
+ww: ViewerSpecs.openRightWidth-info.entryLeft-5,
+wh: info.entryHeight*lines,
+border: FALSE, scrollable: FALSE], paint: FALSE];
+info.heightSoFar ¨ info.heightSoFar + info.entryHeight*lines;
+info.entryLeft ¨ info.initLeft;
+Containers.ChildXBound[info.container, arg];
+};
+
+GetInt: PROC [arg: ViewerClasses.Viewer] RETURNS [num: INT] = {
+rope: Rope.ROPE ~ TEditOps.GetTextContents[arg];
+h: IO.STREAM ~ IO.RIS[rope];
+num ¨ IO.GetInt[h ! IO.Error, IO.EndOfStream => GOTO BadNum];
+EXITS BadNum => SIGNAL BadNumber;
+};
+
+SetInt: PROC [arg: ViewerClasses.Viewer, num: INT] = {
+h: IO.STREAM ~ IO.ROS[];
+IO.Put1[h, IO.int[num]];
+TEditOps.SetTextContents[arg, IO.RopeFromROS[h]];
+};
+
+HRule: PROC [info: Layout, thickness: CARDINAL ¨ 1, gapAbove, gapBelow: BOOL ¨ TRUE] = {
+rule: Rules.Rule;
+IF gapAbove THEN info.heightSoFar ¨ info.heightSoFar + info.entryVSpace*2;
+rule ¨ Rules.Create[info: [parent: info.container, wx: 0, wy: info.heightSoFar, ww: ViewerSpecs.openRightWidth, wh: thickness], paint: FALSE];
+Containers.ChildXBound[container: info.container, child: rule];
+info.heightSoFar ¨ info.heightSoFar + thickness;
+IF gapBelow THEN info.heightSoFar ¨ info.heightSoFar + info.entryVSpace*2;
+};
+
+queue: MBQueue.Queue ¨ MBQueue.Create[]; -- single queue, just for synchronization
+
+END.
+  p  
+GGHistoryImpl.mesa
+Copyright ” 1988, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Pier, February 25, 1991 7:19 pm PST
+Bier, March 13, 1991 5:44 pm PST
+Doug Wyatt, April 16, 1992 5:38 pm PDT
+
+Booleans which control tricky spots to aid in bug tracking
+temporarily do a capture instead of a NewCurrent for all operations except
+transforms, interactive motion, undo, and set scale unit
+temporary capture
+SetCurrent[ggData, Create[nameAndCount]];
+Capture[ggData, GetCurrent[ggData].event, FALSE];
+Maintain the maximum size of the history list
+Here's a neat trick.  Mark all the slices in the scene with the new Index by setting every historyTop value to the new index.  Then, for every event in the tail, unlink any slices that do not appear in higher numbered history events.  Objects in the scene will never be unlinked because they have just been marked with the highest possible number, the new index.
+PROC [data: REF] RETURNS [results: REF _ NIL];
+new Advance stuff
+PROC [data: REF] RETURNS [results: REF _ NIL];
+synchronize this process with the advance capture procces via a JOIN.  If that process status=done, a new legit capture has completed.  If advanceProcess=NIL, need to do a capture from scratch.  Advance capture process is ABORTED (KillAdvanceCapture) by DoAdvanceCapture or NewCurrent before a new advance capture is started.
+a legitimate advance may be available
+Whoppee!! Advance worked
+Bah!! Advance failed.  This is a rare case not covered by KillAdvanceCapture
+currentEvent: HistoryEvent _ NewCurrent[name, ggData];
+Capture[ggData, currentEvent, FALSE];
+currentEvent: HistoryEvent _ NewCurrent[name, ggData];
+Capture[ggData, currentEvent, FALSE];
+adds a subevent which captures the scene list, making copies of objects that are likely to change (selected objects).  Actions performed during the current operation should not add more subevents to this event.
+GGHistoryTypes.HistoryProc
+This proc is called by the Undo mechanism.  Caller should have done a global capture to cover this undo/uncapture operation, making undo of Uncapture possible.
+RETURN [NEW[HistoryEventObj _ [name, -1, LIST[NIL]] ]];
+call the walkProc for every Slice found in the event, including shadow slices and their original storage
+
+manipulates some pointers to change list in place
+
+splice the new list element between the first and second list elements
+exchange the contents of the first and (new) second list elements
+Refuse to append any more subevents to a capture type subevent
+calls historyProc[historyRef] for each subevent 
+in reverse order that subevents originally happened
+ResetEvent appends unlinkable slices to sliceList.  It does not do its own unlinking.  Callers should gather up all the unlinkable slices for all resettable events by iterative calls to ResetEvent, then walk the list, WHICH WILL CONTAIN DUPLICATE SLICES, and unlink each slice INDIVIDUALLY using GGSlice.UnlinkSlice and NOT GGSliceOps.Unlink.  This is necessary since some slices may appear multiple times in a history, having been first a child slice and then subsequently made top level or reparented numerous times.
+This proc pays NO ATTENTION to whether slices in the event are in the scene, but only to the value of slice.historyTop.  Caller must protect slices in scene if the scene is not to be trashed.
+IF doUnlink THEN FOR nextVictims: LIST OF Slice _ victims, nextVictims.rest UNTIL nextVictims=NIL DO GGSlice.UnlinkSlice[nextVictims.first] ENDLOOP;
+
+Take apart the subevent list and the event reference to the subevent.
+don't call NewCapture, because have to capture all independent of selection
+The following smashes are done because Undo has made bogus slice descriptors all over the place
+Following taken from GGHistoryToolImpl.mesa on September 1, 1988
+... builds a GG history tool.
+-- make the textField grow as the container grows
+ViewerOps.OpenIcon[icon: layout.container, closeOthers: FALSE, bottom: TRUE, paint: TRUE];
+ButtonProc: TYPE = PROC [parent: Viewer, clientData: REF ANY _ NIL, 
+mouseButton: MouseButton _ red, shift, control: BOOL _ FALSE];
+new maxSize takes effect on next operation
+Clear the history tool viewers
+Following excerpted from EditToolBuilderImpl.mesa on August 31, 1988
+ù  ^  ïNewlineDelimiter
+ñ(cedarcode) styleô codeöúôKöú
+œeú=ôHKöú#ô#Köú ô Kô&óKò öœk	ò	Köú‡ûútò÷óKò öœnúûúûòKöûúíûúdòˇKöûúûò)óKò Köúûúûú œcòPKöúûúò'Köúûúò1Köúûú"ò7Köúûúûúò'Köúûúûú†òUKöúûúò/Köú
+ûúò)Köúûúò/Köúûúò Köúûúò&Köúûúò-Köúûúò%Köúûúò1Kò Köü	úûúûúòKöü	úûúûúòKò Köúûúûú†;òTKöúûú–bkú†uòèKô Kô:KöúûúûúòKöú
+ûúûúòKöúûúòKò öü
+úûúûúûúûúûú†2òçöûúûúûúûúòKöúûú<òFö	úûúûú	ûúûú&òRKöûúûú@ûú	ûúûúûúòhóöûúûúòöúJôJKô8óöûúûúûòKöúûú†ò:KïStartOfExpansion9[base: ROPE, start: INT _ 0, len: INT _ 2147483647]öúAûú†òbKöú>ûú†òSöú#ûú†òCKöú†GòbKöú)ò)Köûúò!KòóöûúòKöúôKöú)ô)Köú*ûúô1Köú†?òYKöûúûúòKòóóKòóöûúòKöú†GòbKöú)ò)Köûúò!KòóKòóKòKò óöüúûúûú†)òWöûúûúûúûúòKò/Köûúûúûúò.öûúûúûúòö
+üúûúûúûúûúòCKòKòóKöúûúûú†,òQKöú
+ûú"†òHKöú)†ëò∫KòKöú!ò!Köú(†(òPò Kô-óKöú†ò7öûúûúûúûúûúûúûúòCKòKòKòKöûúòóöûúûúûúûúûú†ò>ö
+ü
+úûúûúûúûúò@ö
+ü
+úûúûúûúûúò@KòKòóKöú!ò!KòóKöúûúûúòKò.Kò KöúÍôÍKò9Kò öûúûúûú&ûúûúûòTKöú-ò-KöûúòóKöúûú†)ò=Köú†ò4KòóKòóKòóKòóKò öüúûúûúûúò:KöûúûúûúòKöú#ò#KòKò óöüúûúûúò>KòEKò9Köûúûúûúò.öûúûúûúò+Köú ûúò$Köúûúò"Köûú-ûú$òWKöú6ûúò<Köûúûúûúûú*ûúûúûú†òuKö	ûúûúûúqûú†ôò´KòóKòKò óöüúò,Kö
+ûúûúûúûúûúô.Köúûúò*Köûúûúûúûú*ûúûúûú†òuöûúûúûúòKñ#[priority: CedarProcess.Priority]ò/KòKöú,ò,KòóKòKò óKöú%œbúò,öüúûúûúûúò8Köûúûúûúòöûúûúûúûúòöûúûúûúò.KöúôóKöûúûúûú%† ònKò0KöúÖûú†éòúKòóKòKò óöüúò,Kö
+ûúûúûúûúûúô.KöúûúòKöûúûúûúò.Kò/KòKöú-ûúò4KòKò óö
+ü
+úûúûúûúûúòCKöú@ûúVûúAûú`ô≈KöûúûúûúòöûúûúûúûúòKöúûú<òFö	úûúûú	ûúûú&òRKöûúûú@ûú	ûúûúûúòhóKöûúûúûúò.öûúûúûúò+Kô%ò%Köú@ûú	òMóöûúûòò	KôKò0Köú1†kòúKòóòKöúLôLKöú6ô6Köúûúô%Köú)ò)Köú*ûúò1KòóKöûúûúòóKöú ûúò$Köúûúò"Kòóöûú†òKöú6ô6Köúûúô%Köú)ò)Köú*ûúò1KòóKöúòóKòKò óöüúûú7ûúûúòUKô“öûúûúûúòKöúûúòKöúûúûúòKöúòKòJKöúûúDòTKöú*ò*KòóKòKò óöü	úûúûú(òIKöúôKöúüôüöûúûúûúûúòKöúûúò Köúûúò#Köú^ò^KöúòóKöúòóKò ö
+üúûúûúûúûúò@Köûúûúûúûúô7KöûúûúûúûúûúûúûúûúòRKöúòKò óöü
+úûúûú+†ò`Köûúûúûúò.Kò$KöúòKò óö
+ü
+úûúûúûúûúòVKöûú;òAKòKò óöüúûú,ò?KòKò1KòKò óöüúûú3òJKöúhôhöûúûúûúûúûúûú,ûúûúûòjöûúûúûúòKò%Köúûúò/öûúûúûòöúûúò#öûúûúûú4ûúûúûòjKöúûúûúòKöú	ûúòKò(KòAKöûúûúûú$ò?öûúûúòKöúûú
+ò&Köûúûúûú'òEKòóKöûúòóKöúòóöú
+ûúò'Köûúûúûú)òIKöúòóKöú
+ûúûúò+KöûúûúòóKòóKöûúòóKòKò óö
+ü
+úûúûúûúûúòHKöûúûúûúò.KòKòKò óöü
+úûúûúûúûúûúòKKöûúòKòKò óö
+üúûúûúûúûúòGKöûúûúûúò.ö
+ûúûúûúûúûúò+Kô Kô1KöúòKöú	ûúûúûúò,Kô KôFKöúûúûúò'KòKòKò KôAKòKòKòKöúòóKòKò óöüúûúûú>ûúò^Köûú	ûúûúûúòKöûúûúûúò.Kô>Köûúûúûúûúûúûú0ûúûúòéöúûúûúò(Köú.ò.óöúòKò óóöüúûúûú=òNKöú0ô0Köú3ô3Köûúûúûúûúò Köûúûúûúò.öûúûúûú2ûú
+ûúûò\KòKöûúûúûú0ò?KöûúòóKöúòKò óöüúûúûúûúò4KöûúûúûúòKöúûúûúòKò.Köú#ò#öûúûúûú;ûúûúûòuKöú3ò3KöûúòóKöú†ò4Köúûúûúò Kò Köúûúò"KòKöúòKò óöü
+úûú'ûúûúòJKöü
+ú∞ü
+úûúûúûúû	úûúûúûú√ôÜöûúûúûúòKöúûúû	ú§ôøö
+üúûúûúûúûúòFKöûúûúûúûú>òqKòKò óKöúûúòKöú+ò+Kò Köûú
+ûúûúûúûú#ûúûúûú(ûúôîKô KôEöûúûúûú/ûúûúûòaKöûúûúûú"ûúòDKöûúòóKöúûúòKöúòóKöúòKò óöüúûúûúûúò7öûú
+ûúûú	ûúûú ûúûúûòWKöú#†9ò\KöûúòóKöúòKò óöüúûúûúò,öûúûúûúòKöúûúòKöúûúòKöúòóKöúòóKò öüúûúûúûúûúûúûúûúûúòhKò óö
+üúûúûúüúûú	ò3öûúûúûúûúòKñù[format: ROPE _ NIL, v1: IO.Value _ [null[]], v2: IO.Value _ [null[]], v3: IO.Value _ [null[]], v4: IO.Value _ [null[]], v5: IO.Value _ [null[]]]öúûúò-Kñù[format: ROPE _ NIL, v1: IO.Value _ [null[]], v2: IO.Value _ [null[]], v3: IO.Value _ [null[]], v4: IO.Value _ [null[]], v5: IO.Value _ [null[]]]öúûúòKöúûúòKöúòKöúûúûú-ò:ñK[undoEvent: GGUndoEvent.UndoEvent, currentEvent: GGUndoEvent.UndoEvent]öûúûúûúûúûú†ò>KôKKò9Kñ1[name: ROPE, ggData: GGInterfaceTypes.GGData]öúûú†,òQöûúûòñK[undoEvent: GGUndoEvent.UndoEvent, currentEvent: GGUndoEvent.UndoEvent]ö
+ûúûúûúûúûúò%Köú7ûúò<KòKòKòóKöûúòóKöú2ûú8ûúûúûúûúûú#ûúûúûúûúòÈKöúòKñ›[feedback: Feedback.FeedbackData, msgType: Feedback.MsgType, format: ROPE _ NIL, v1: IO.Value _ [null[]], v2: IO.Value _ [null[]], v3: IO.Value _ [null[]], v4: IO.Value _ [null[]], v5: IO.Value _ [null[]]]öú_ô_Köúûú†ò4Köú#†ò9Köú!ûú†ò=Köú%†òAKñ[scene: GGModelTypes.Scene]öú.†òLöûòö
+üúûúûúûúûúò>Kñ:[slice: GGModelTypes.Slice, scene: GGModelTypes.Scene]öúCòCKòóKöûúûú8òLKöûúòóKñ›[feedback: Feedback.FeedbackData, msgType: Feedback.MsgType, format: ROPE _ NIL, v1: IO.Value _ [null[]], v2: IO.Value _ [null[]], v3: IO.Value _ [null[]], v4: IO.Value _ [null[]], v5: IO.Value _ [null[]]]öú;ò;KöúpûúûúòéKòóKñ0[feedback: Feedback.FeedbackData, msg: ROPE]öûú`òdKòóKòóKò Jô@Kò Köü	úûúûúòKò öüúûúûúûúò=Kò(öûúûúûúòKò8Kò8Kñ{[viewer: ViewerClasses.Viewer, hint: ViewerClasses.PaintHint, clearClient: BOOL _ TRUE, whatChanged: REF ANY _ NIL]öú8ò8KòóKòKò óö
+ü	úûúûúûúûúòVKöúûúôKöúûúòKöúòKöúòKöúòKöúûú*ò9Köú	ûúûúûúûúûú&òWöûúûúûúûúûúûú† òiKöûúûúò1KöúmòmKöûúòKöúòóKöúûúòKöúûúò&Köú:ûúûúòqKò4Kò4öú†úòKöúZòZóKò?Kò6Kò6öú†úòKöúKòKóKöúòòWKöúHûúûúòaKöúûúòóKö†1ô1Köú9ò9Köú9ò9Köú6ò6Köú8ûú
+ûú	ûúôZKöûúòòKò óóöüúò)Köúûúûúûúûúûú3ûúûúôÉKöúûúò$Kò(Köú3ò3KöúòKò óöüúò)Köúûúò$Kò(Köú/ò/KöúòKò óöü	úò!Köúûúò$Kò)Kö	úûúûúûúûúò(Köú&†ò,Köú8ûúò=KòKò óö
+üúûúûúûúûúò8Köúûúò$Kò(KöúûúòKö	úûúûúûúûúòKöúûúûú-ò:Köú*†òAKöú:ûú†8òöûúûúûúûúûúûò3KñØ[stream: STREAM, format: ROPE _ NIL, v1: IO.Value _ [null[]], v2: IO.Value _ [null[]], v3: IO.Value _ [null[]], v4: IO.Value _ [null[]], v5: IO.Value _ [null[]]]ò=KòKòKöûúòóKöú)ûúò<KöúòKò óöü	úò!Köúûúò$Kò)Kö	úûúûúûúûúò(Köú&†ò,Köú8ûúò=KòKò óö
+üúûúûúûúûúò8Köúûúò$òKò(Köúûú'†òFKöúûú*ûú†7òuKöúûúòKöûú
+ûúò/öûòKöúùòùóKöúòóöúòKò óóöüúò$Köúûúò$Kò)Kö	úûúûúûúûúò+Köú&†ò,Köú;ûúò@KòKò óö
+ü	úûúûúûúûúò;Köúûúò$Kò(Köú-ò-KöúòKò óöüúò$Köúûúò$Kò)Kö	úûúûúûúûúò+Köú&†ò,Köú;ûúò@KòKò óö
+ü	úûúûúûúûúò;Köúûúò$öúòKò(Köúûú&ûúò8Köúûúûúûúò3Köú-ò-Kô*öûòKöúÜòÜóKöúòóKöúòKò óöü	úûúûúò+JôKò)öûúûúûúòKöú)ûúò.Köú+ûúò0KòóKòóKò KöúDôDKò öüúûúûú(ûúûúûúûúûúûúûú
+ûúûúûúòÃò(KöúeòeKöú+ûúò2óKò,Köûú
+ûú0ò@KöûúòKòKò óöüúûú$ûúòBKöûúûúûú†òKKöúûú†2òVKòKò óöüúûú!ûú.ûúûúûú	ûúûú8òŒKöúûúòò\KöúûúûúòóòJKöú/ò/Köú0ò0KöúòKöúûúûú
+ûúò1óKò=KòKöú,ò,KòKò óöüúûúûúûúò?Köúûú!ò0Kö	úûúûúûúûúòKö	úûúûúûúûú	ò=Köûúûúò!KòKò óöüúûú"ûúò6Kö	úûúûúûúûúòKöûú	ûúòKöúûúò1KòKò óö
+üúûúûúûúûúòXKöúòKöûú
+ûú:òJKöúáûúòéKñB[container: Containers.Container, child: ViewerClasses.Viewer]öú?ò?Kò0Köûú
+ûú:òJKòóKò öú)†)òRKò óKöûúòó Öó    Z‡  ãÆ  

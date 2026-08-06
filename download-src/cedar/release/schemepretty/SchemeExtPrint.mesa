@@ -1,0 +1,1237 @@
+
+
+DIRECTORY Atom, BasicTime, Commander, Feedback, FeedbackClasses, IntToIntTab, IO, PFS, Process, RefTab, Rope, Scheme, SchemePrettyRead, SchemePrinting, SimpleFeedback, StructuredStreams, TextEditBogus, TextNode, UnparserBuffer, UserProfile;
+
+SchemeExtPrint: CEDAR PROGRAM
+IMPORTS Atom, Commander, Feedback, FeedbackClasses, IntToIntTab, IO, PFS, Process, RefTab, Rope, Scheme, SchemePrettyRead, SimpleFeedback, StructuredStreams, TextEditBogus, UnparserBuffer, UserProfile
+EXPORTS SchemePrinting
+=
+
+BEGIN OPEN Scheme, SchemePrettyRead, SchemePrinting, SS:StructuredStreams, UB:UnparserBuffer;
+
+PPState: TYPE ~ REF PPStateRep;
+PPStateRep: TYPE ~ RECORD [
+buffHead, buffTail: BuffList ¨ NIL,
+bufferedLineWithBreak: BOOL ¨ FALSE,
+wantSep: BOOL ¨ FALSE,
+do0: BOOL ¨ FALSE, --default offset = 0 or sia?
+emitStack, emitFree: EmitStack ¨ NIL,
+steplenLimit: INTEGER ¨ 100,
+srcIdx: INT ¨ noIdx,
+how: How,
+rules: RefTab.Ref--context:ATOM -> CtxStuff--,
+formDefaultRules, listDefaultRules: CtxStuff,
+posns: FormToSource,
+quit: REF BOOL,
+to, log: IO.STREAM];
+
+BuffList: TYPE ~ REF BuffCons;
+BuffdLine: TYPE ~ REF BuffCons[line];
+BuffdBreak: TYPE ~ REF BuffCons[break];
+BuffdObj: TYPE ~ REF BuffCons[obj];
+BuffCons: TYPE ~ RECORD [rest: BuffList, first: SELECT kind: * FROM
+line => [chars, looks, unlooks: ROPE, break, space: BOOL, node: TextNode.Ref],
+break => [cond: UB.XBreakCondition, offset: INTEGER, sep: ROPE],
+obj => [begin: BOOL],
+ENDCASE];
+
+BreakMetaSpec: TYPE ~ RECORD [cond: UB.XBreakCondition, sia: BOOL];
+
+CtxStuff: TYPE ~ REF CtxStuffPrivate;
+CtxStuffPrivate: TYPE ~ RECORD [
+ntv, bcv: SCVar,
+nRules: INT ¨ 0,
+rsHead, rsTail: RuleSpecList ¨ NIL];
+
+RuleSpecList: TYPE ~ LIST OF RuleSpec;
+RuleSpec: TYPE ~ RECORD [depth: INT ¨ anyDepth, ntv, bcv: SCVar, me: Any, tc: TestClosure, ec: EmitClosure];
+
+NT: TYPE ~ {form, list};
+
+SCVar: TYPE ~ REF SCCell;
+SCCell: TYPE ~ RECORD [
+descr: ROPE,
+val, defined, free: BOOL ¨ FALSE,
+un: SCVar ¨ NIL, --NIL or pointer 'round ring of unified variables
+ur: SCVar ¨ NIL --NIL or representative of this set of unified variables
+];
+
+constFree: SCVar ~ NEW [SCCell ¨ ["unconstrained", FALSE, TRUE, TRUE]];
+constForm: SCVar ~ NEW [SCCell ¨ ["Form", FALSE, TRUE]];
+constList: SCVar ~ NEW [SCCell ¨ ["Tail", TRUE, TRUE]];
+constWhite: SCVar ~ NEW [SCCell ¨ ["White", TRUE, TRUE]];
+constBlack: SCVar ~ NEW [SCCell ¨ ["Black", FALSE, TRUE]];
+
+TestClosure: TYPE ~ REF TestClosureRep;
+TestClosureRep: TYPE ~ RECORD [test: TestProc, rest: TestClosure, data, rule: Any];
+TestProc: TYPE ~ PROC [subject: Any, pps: PPState, tc: TestClosure] RETURNS [BOOL];
+
+EmitClosure: TYPE ~ REF EmitClosureRep;
+EmitClosureRep: TYPE ~ RECORD [emit: EmitProc, rest: EmitClosure, data, rule: Any];
+EmitProc: TYPE ~ PROC [pps: PPState, ec: EmitClosure, subject: Any, context: ATOM, depth, steplen: INTEGER, srcIdx: INT, es: EmitStack] RETURNS [EmitStackFrame, EmitStack];
+
+EmitStack: TYPE ~ LIST OF EmitStackFrame;
+EmitStackFrame: TYPE ~ RECORD [ec: EmitClosure, subject: Any, context: ATOM, depth, steplen: INTEGER, srcIdx: INT];
+
+Classification: TYPE ~ {leaf, atom, simple, complex};
+
+CommentTest: TYPE ~ RECORD [noPre, noPost: BOOL];
+CD: TYPE ~ RECORD [context: ATOM, depth: INTEGER];
+
+noRule: RuleSpec ~ [me: NIL, tc: noTest, ec: noEmit, ntv: NIL, bcv: NIL];
+noTest: TestClosure ~ NIL;
+noEmit: EmitClosure ~ NIL;
+anyDepth: INTEGER ~ INTEGER.FIRST;
+noIdx: INT ~ INT.FIRST;
+emptyList: Pair ~ NIL;
+formDefault: ATOM ~ Atom.MakeAtom["form-default"];
+listDefault: ATOM ~ Atom.MakeAtom["list-default"];
+beginObj: ATOM ~ Atom.MakeAtom["begin-obj"];
+endObj: ATOM ~ Atom.MakeAtom["end-obj"];
+stripObj: ATOM ~ Atom.MakeAtom["strip-list"];
+closeParenRope: ROPE ~ ")";
+stop: EmitClosure ~ ae[$endofstack, stopEmit];
+closeParen: EmitClosure ~ ae[closeParenRope, ropeEmit, NIL, closeParenRope];
+closeObjAndNaught: EmitClosure ~ ae[endObj, cobEmit];
+closeObjAndParen: EmitClosure ~ ae[$endlob, clobEmit];
+improperTailIntroEC: EmitClosure ~ ae[$improperTailIntro, improperTailIntroEmit];
+commentsEC: EmitClosure ~ ae[$comments, commentsEmit];
+neverMatchTC: TestClosure ~ at[$neverMatch, neverMatchTest];
+defLooks: ROPE ¨ "n";
+defUnlooks: ROPE ¨ "N";
+argLooks: ROPE ¨ "c";
+argUnlooks: ROPE ¨ "C";
+kwdLooks: ROPE ¨ "k";
+kwdUnlooks: ROPE ¨ "K";
+defaultHow: How ¨ [];
+defaultMargin: INT ¨ 80;
+rules: RefTab.Ref ~ RefTab.Create[];
+formDefaultRules, listDefaultRules: CtxStuff ¨ NIL;
+debugRules: BOOL ¨ FALSE;
+
+PrettyPrint: PUBLIC PROC [to: IO.STREAM, val: Any, how: How, context: ATOM, posns: FormToSource ¨ NIL, debugLog: IO.STREAM ¨ NIL, quit: REF BOOL ¨ NIL] ~ {
+pps: PPState ~ NEW [PPStateRep ¨ [how: how, rules: rules, formDefaultRules: formDefaultRules, listDefaultRules: listDefaultRules, posns: posns, to: to, log: debugLog, quit: quit]];
+IF pps.quit=NIL THEN pps.quit ¨ NEW [BOOL ¨ FALSE];
+IF pps.rules.GetSize[] = 0 THEN Complain[NIL, "can't pretty-print for lack of rules"];
+EmitBreak[pps, never, 0, NIL];
+EnterEmit[pps, val, context, 0, 0];
+Flush[pps];
+RETURN};
+
+at: PROC [me: Any, test: TestProc, rest: TestClosure ¨ NIL, data: REF ANY ¨ NIL] RETURNS [TestClosure]
+~ {RETURN [NEW [TestClosureRep ¨ [test, rest, data, me]]]};
+
+ae: PROC [me: Any, emit: EmitProc, rest: EmitClosure ¨ NIL, data: REF ANY ¨ NIL] RETURNS [EmitClosure]
+~ {RETURN [NEW [EmitClosureRep ¨ [emit, rest, data, me]]]};
+
+Compile: PROC [context: ATOM, recNT, recBC: SCVar, depth: INT, me: Any, tsx: BOOL] RETURNS [RuleSpec] ~ {
+tc: TestClosure; ec: EmitClosure; ntv, bcv: SCVar;
+[tc, ec, ntv, bcv] ¨ CompileWork[context, recNT, recBC, depth, me, tsx];
+RETURN [[depth, ntv, bcv, me, tc, ec]]};
+
+CompileWork: PROC [context: ATOM, recNT, recBC: SCVar, depth: INT, me: Any, tsx: BOOL] RETURNS [TestClosure, EmitClosure, SCVar, SCVar] ~ {
+IF me=emptyList THEN RETURN [at[me, emptyTest], ae[me, emptyEmit, NIL, NIL], constList, constFree];
+WITH me SELECT FROM
+s: Symbol => SELECT s FROM
+$any => RETURN [at[me, anyTest], ae[me, EmitByEnter], recNT, recBC];
+$leaf => RETURN [at[me, leafTest], ae[me, EmitDirectly], constForm, constBlack];
+$definee => RETURN [at[me, leafTest], ae[me, EmitDefinee], constForm, constBlack];
+$argument => RETURN [at[me, leafTest], ae[me, EmitArgument], constForm, constBlack];
+$atom => RETURN [at[me, atomTest], ae[me, EmitByEnter], recNT, recBC];
+$simple => RETURN [at[me, simpleTest], ae[me, EmitByEnter], recNT, recBC];
+$complex => RETURN [at[me, complexTest], ae[me, EmitByEnter], recNT, recBC];
+ENDCASE => RETURN [at[me, anyTest], ae[me, EmitByEnterContext, NIL, s], GetCtxNtv[s], GetCtxBcv[s]];
+p: Pair => {
+WITH p.car SELECT FROM
+a: ATOM => SELECT a FROM
+$precommentless, $postcommentless, $commentless => {
+subR: Any ~ Scheme.Car[p.cdr];
+subRS: RuleSpec ~ Compile[context, recNT, recBC, depth, subR, tsx];
+data: REF ANY ~ NEW [CommentTest ¨ [a#$postcommentless, a#$precommentless]];
+RETURN [at[me, commentTest, subRS.tc, data], subRS.ec, subRS.ntv, subRS.bcv]};
+$enter => {e1: Any ~ Scheme.Car[p.cdr]; t1: Any ~ Scheme.Cdr[p.cdr];
+e2: Any ~ Scheme.Car[t1];
+newc: Symbol ~ NarrowToSymbol[e1];
+newd: INTEGER ~ TheINT[e2];
+cd: REF CD ~ NEW [CD ¨ [newc, newd]];
+RETURN [at[me, anyTest], ae[me, EmitByEnterContextAndDepth, NIL, cd], GetCtxNtv[newc], GetCtxBcv[newc]]};
+$inc, $dec => {newc: Symbol ~ NarrowToSymbol[Scheme.Car[p.cdr]];
+cd: REF CD ~ NEW [CD ¨ [newc, IF a=$inc THEN 1 ELSE -1]];
+RETURN [at[me, anyTest], ae[me, EmitByEnterContextAndDelta, NIL, cd], GetCtxNtv[newc], GetCtxBcv[newc]]};
+$me => {
+subr1: Any ~ Scheme.Car[p.cdr]; t1: Pair ~ NarrowToPair[Scheme.Cdr[p.cdr]];
+subr2: Any ~ t1.car;
+rs1: RuleSpec ~ Compile[context, recNT, recBC, depth, subr1, FALSE];
+rs2: RuleSpec ~ Compile[context, recNT, recBC, depth, subr2, tsx];
+RETURN [rs1.tc, rs2.ec, rs2.ntv, rs2.bcv]};
+$mei, $med => {
+pat: Any ~ Scheme.Car[p.cdr]; t1: Pair ~ NarrowToPair[Scheme.Cdr[p.cdr]];
+ctx: Symbol ~ NarrowToSymbol[t1.car];
+rsp: RuleSpec ~ Compile[context, recNT, recBC, depth, pat, FALSE];
+cd: REF CD ~ NEW [CD ¨ [ctx, IF a=$mei THEN 1 ELSE -1]];
+RETURN [rsp.tc, ae[me, EmitByEnterContextAndDelta, NIL, cd], GetCtxNtv[ctx], GetCtxBcv[ctx]]};
+$quote => {s: Any ~ Scheme.Car[p.cdr];
+WITH s SELECT FROM
+x: Symbol => NULL;
+x: String => NULL;
+ENDCASE => ERROR Complain[a, "not a symbol or string"];
+RETURN [at[me, quoteTest, NIL, s], ae[me, quoteEmit, NIL, s], constForm, constBlack]};
+$quasiquote => {s: Symbol ~ NarrowToSymbol[Scheme.Car[p.cdr]];
+RETURN [at[me, quoteTest, NIL, s], ae[me, quasiquoteEmit, NIL, s], constForm, constBlack]};
+$lb => {subRS: RuleSpec ~ Compile[context, recNT, recBC, depth, Scheme.Car[p.cdr], tsx];
+IF tsx THEN Unify[subRS.ntv, constList];
+RETURN [at[me, listTest, subRS.tc], ae[me, lbEmit, subRS.ec, NIL], constForm, constBlack]};
+$ob => {subRS: RuleSpec ~ Compile[context, recNT, recBC, depth, Scheme.Car[p.cdr], tsx];
+RETURN [subRS.tc, ae[me, obEmit, subRS.ec, NIL], subRS.ntv, subRS.bcv]};
+beginObj => {subRS: RuleSpec ~ Compile[context, recNT, recBC, depth, p.cdr, tsx];
+RETURN [subRS.tc, ae[me, bobEmit, subRS.ec, NIL], subRS.ntv, subRS.bcv]};
+endObj => {subRS: RuleSpec ~ Compile[context, recNT, recBC, depth, p.cdr, tsx];
+RETURN [subRS.tc, ae[me, eobEmit, subRS.ec, NIL], subRS.ntv, subRS.bcv]};
+$lob => {subRS: RuleSpec ~ Compile[context, recNT, recBC, depth, Scheme.Car[p.cdr], tsx];
+IF tsx THEN Unify[subRS.ntv, constList];
+RETURN [at[me, listTest, subRS.tc], ae[me, lobEmit, subRS.ec, NIL], constForm, constBlack]};
+$vp => {subRS: RuleSpec ~ Compile[context, recNT, recBC, depth, Scheme.Car[p.cdr], tsx];
+IF tsx THEN {Unify[subRS.ntv, constForm]; Unify[subRS.bcv, constBlack]};
+RETURN [at[me, vpTest, subRS.tc], ae[me, vpEmit, subRS.ec, NIL], constForm, constBlack]};
+stripObj => {subRS: RuleSpec ~ Compile[context, recNT, recBC, depth, Scheme.Car[p.cdr], tsx];
+IF tsx THEN Unify[subRS.ntv, constList];
+RETURN [at[me, listTest, subRS.tc], ae[me, striplistEmit, subRS.ec, NIL], constForm, constBlack]};
+$or => {
+meTail: Any ¨ p.cdr;
+rsl: RuleSpecList ¨ LIST[noRule];
+rslTail: RuleSpecList ¨ rsl;
+lastNTV, lastBCV: SCVar ¨ NIL;
+FOR meTail: Any ¨ p.cdr, Cdr[meTail] WHILE meTail#emptyList DO
+this: RuleSpecList ~ LIST[Compile[context, recNT, recBC, depth, Scheme.Car[meTail], tsx]];
+IF tsx AND lastNTV#NIL
+THEN {Unify[lastNTV, this.first.ntv]; Unify[lastBCV, this.first.bcv]};
+lastNTV ¨ this.first.ntv; lastBCV ¨ this.first.bcv; 
+rslTail.rest ¨ this; rslTail ¨ this;
+ENDLOOP;
+IF lastNTV=NIL THEN Complain[NIL, "empty (or) rule"];
+RETURN [at[me, orTest, NIL, rsl.rest], ae[me, orEmit, NIL, rsl.rest], lastNTV, lastBCV]};
+$n0 => RETURN CompileBreak[context, recNT, recBC, depth, never, FALSE, p, tsx];
+$ns => RETURN CompileBreak[context, recNT, recBC, depth, never, TRUE, p, tsx];
+$m0 => RETURN CompileBreak[context, recNT, recBC, depth, miser, FALSE, p, tsx];
+$ms => RETURN CompileBreak[context, recNT, recBC, depth, miser, TRUE, p, tsx];
+$l0 => RETURN CompileBreak[context, recNT, recBC, depth, lookLeft, FALSE, p, tsx];
+$ls => RETURN CompileBreak[context, recNT, recBC, depth, lookLeft, TRUE, p, tsx];
+$u0 => RETURN CompileBreak[context, recNT, recBC, depth, united, FALSE, p, tsx];
+$us => RETURN CompileBreak[context, recNT, recBC, depth, united, TRUE, p, tsx];
+$a0 => RETURN CompileBreak[context, recNT, recBC, depth, always, FALSE, p, tsx];
+$as => RETURN CompileBreak[context, recNT, recBC, depth, always, TRUE, p, tsx];	
+$readermacro => {str: String ~ TheString[Scheme.Car[p.cdr]];
+t1: Pair ~ NarrowToPair[Scheme.Cdr[p.cdr]]; y: Any ~ t1.car;
+rsy: RuleSpec ~ Compile[context, recNT, recBC, depth, y, tsx];
+IF tsx THEN Unify[rsy.ntv, constForm];
+RETURN [neverMatchTC, ae[me, rmEmit, rsy.ec, RopeFromString[str]], constForm, constBlack]};
+$dotform => {y: Any ~ Scheme.Car[p.cdr];
+rsy: RuleSpec ~ Compile[context, recNT, recBC, depth, y, tsx];
+IF tsx THEN Unify[rsy.ntv, constForm];
+RETURN [neverMatchTC, ae[me, dfEmit, rsy.ec, NIL], constList, constBlack]};
+$skip => {
+t1: Pair ~ NarrowToPair[p.cdr];
+subCar: RuleSpec ~ Compile[context, recNT, recBC, depth, t1.car, tsx];
+subCdr: RuleSpec ~ Compile[context, recNT, recBC, depth, t1.cdr, tsx];
+RETURN [at[me, pairTest, subCdr.tc, subCar.tc], ae[me, skipEmit, subCdr.ec], subCdr.ntv, subCdr.bcv]};
+$insert => {str: String ~ TheString[Scheme.Car[p.cdr]];
+t1: Pair ~ NarrowToPair[Scheme.Cdr[p.cdr]]; y: Any ~ t1.car;
+rsy: RuleSpec ~ Compile[context, recNT, recBC, depth, y, tsx];
+RETURN [rsy.tc, ae[me, insertEmit, rsy.ec, RopeFromString[str]], rsy.ntv, constWhite]};
+ENDCASE => NULL;
+ENDCASE => NULL;
+{subCar: RuleSpec ~ Compile[context, constForm, recBC, depth, p.car, tsx];
+subCdr: RuleSpec ~ Compile[context, constList, recBC, depth, p.cdr, tsx];
+IF tsx THEN {
+Unify[subCar.ntv, constForm];
+Unify[subCdr.ntv, constList];
+Unify[subCdr.bcv, constWhite]};
+RETURN [at[me, pairTest, subCdr.tc, subCar.tc], ae[me, pairEmit, subCdr.ec, subCar.ec], constList, subCar.bcv]}};
+ENDCASE => ERROR;
+};
+
+CompileBreak: PROC [context: ATOM, recNT, recBC: SCVar, depth: INT, cond: UB.XBreakCondition, sia: BOOL, p: Pair, tsx: BOOL] RETURNS [TestClosure, EmitClosure, SCVar, SCVar] ~ {
+bms: REF BreakMetaSpec ¨ NEW [BreakMetaSpec ¨ [cond, sia]];
+rest: RuleSpec ~ Compile[context, recNT, recBC, depth, p.cdr, tsx];
+RETURN [rest.tc, ae[p, breakEmit, rest.ec, bms], rest.ntv, constWhite]};
+
+Unify: PROC [a, b: SCVar] ~ {
+IF a.defined AND a.free OR b.defined AND b.free THEN RETURN;
+IF b.defined AND NOT a.defined THEN {c: SCVar ~ a; a ¨ b; b ¨ c};
+IF NOT a.defined THEN {
+ura: SCVar ~ Ur[a];
+urb: SCVar ~ Ur[b];
+IF b.defined THEN ERROR;
+IF ura = urb THEN RETURN;
+IF debugRules THEN SimpleFeedback.PutFL[$SchemePretty, oneLiner, $DebugRules, "Unify[%g, %g]", LIST[ [rope[Descr[a]]], [rope[Descr[b]]] ]];
+urb.ur ¨ ura;
+IF a.un=NIL
+THEN IF b.un=NIL
+THEN {a.un ¨ b; b.un ¨ a}
+ELSE {a.un ¨ b.un; b.un ¨ a}
+ELSE IF b.un=NIL
+THEN {b.un ¨ a.un; a.un ¨ b}
+ELSE {c: SCVar ~ a.un; a.un ¨ b.un; b.un ¨ c};
+RETURN};
+IF NOT b.defined THEN {
+c: SCVar ¨ b;
+IF debugRules THEN SimpleFeedback.PutFL[$SchemePretty, oneLiner, $DebugRules, "%g _ %g", LIST[ [rope[Descr[b]]], [rope[Descr[a]]] ]];
+DO d: SCVar ¨ c.un;
+c.defined ¨ TRUE; c.val ¨ a.val;
+c.un ¨ c.ur ¨ NIL; c ¨ d;
+IF c=b OR c=NIL THEN EXIT;
+ENDLOOP;
+RETURN};
+IF a.val # b.val THEN Complain[NIL, IO.PutFR["static inconsistency in rules (%g # %g)", [rope[Descr[a]]], [rope[Descr[b]]] ]];
+RETURN};
+
+Ur: PROC [ntv: SCVar] RETURNS [SCVar] ~ {
+IF ntv.ur=NIL OR ntv.ur=ntv THEN RETURN [ntv];
+ntv.ur ¨ Ur[ntv.ur];
+RETURN [ntv.ur]};
+
+Descr: PROC [scv: SCVar] RETURNS [ROPE] ~ {
+IF scv.un=NIL THEN RETURN [scv.descr];
+{ans: ROPE ¨ scv.descr.Concat["("];
+FOR t: SCVar ¨ scv.un, t.un WHILE t#scv DO
+ans ¨ ans.Cat["=", t.descr];
+ENDLOOP;
+RETURN [ans.Concat[")"]]}};
+
+GetCtxNtv: PROC [ctx: Symbol] RETURNS [SCVar]
+~ {RETURN [GetCtxStuff[ctx].ntv]};
+
+GetCtxBcv: PROC [ctx: Symbol] RETURNS [SCVar]
+~ {RETURN [GetCtxStuff[ctx].bcv]};
+
+GetCtxStuff: PROC [ctx: Symbol] RETURNS [cs: CtxStuff] ~ {
+cs ¨ NARROW[rules.Fetch[ctx].val];
+IF cs=NIL THEN IF NOT rules.Insert[ctx, cs ¨ NEW [CtxStuffPrivate ¨ [
+ntv: NEW [SCCell ¨ [Rope.Concat[Atom.GetPName[ctx], ".NT"] ]],
+bcv: NEW [SCCell ¨ [Rope.Concat[Atom.GetPName[ctx], ".BC"] ]]
+]]] THEN ERROR;
+RETURN};
+
+NarrowToSymbol: PROC [a: Any] RETURNS [Symbol] ~ {
+WITH a SELECT FROM
+x: Symbol => RETURN [x];
+ENDCASE => ERROR Complain[a, "not a symbol"]};
+
+NarrowToPair: PROC [a: Any] RETURNS [Pair] ~ {
+WITH a SELECT FROM
+x: Pair => RETURN [x];
+ENDCASE => ERROR Complain[a, "not a pair"]};
+
+LogTest: PROC [pps: PPState, rule, subject: Any] ~ {
+IF pps.log#NIL THEN {
+srcIdx: INT ~ SeekSrc[pps, subject, noIdx];
+pps.log.PutRope["Test "];
+Scheme.Print[rule, pps.log];
+pps.log.PutRope[" "];
+InfoPrint[pps.log, subject];
+pps.log.PutRope[FmtIdx[srcIdx]];
+pps.log.PutRope["\n"]};
+};
+
+commentTest: TestProc ~ {
+ct: REF CommentTest ~ NARROW[tc.data];
+LogTest[pps, tc.rule, subject];
+WITH subject SELECT FROM
+ctd: Commented => {
+IF ctd.prefix.length#0 AND ct.noPre THEN RETURN [FALSE];
+IF ctd.postfix.length#0 AND ct.noPost THEN RETURN [FALSE]};
+ENDCASE => NULL;
+RETURN tc.rest.test[subject, pps, tc.rest]};
+
+emptyTest: TestProc ~ {
+LogTest[pps, tc.rule, subject];
+RETURN [subject = emptyList]};
+
+emptyEmit: EmitProc ~ {RETURN ESPop[pps, es]};
+
+anyTest: TestProc ~ {
+LogTest[pps, tc.rule, subject];
+RETURN [TRUE]};
+
+neverMatchTest: TestProc ~ {
+LogTest[pps, tc.rule, subject];
+RETURN [FALSE]};
+
+EmitByEnter: EmitProc ~ {RETURN EntrySearch[pps, subject, context, depth, steplen.SUCC, srcIdx, es]};
+
+EmitByEnterContext: EmitProc ~ {RETURN EntrySearch[pps, subject, NARROW[ec.data], depth, steplen.SUCC, srcIdx, es]};
+
+leafTest: TestProc ~ {
+LogTest[pps, tc.rule, subject];
+RETURN IsLeaf[subject]};
+
+EmitDirectly: EmitProc ~ {
+WITH subject SELECT FROM
+x: FakeAtom => EmitRope[pps, x];
+s: Symbol => EmitRope[pps, Atom.GetPName[s]];
+ENDCASE => {Flush[pps]; Print[subject, pps.to]; pps.do0 ¨ NOT (pps.wantSep ¨ TRUE)};
+RETURN ESPop[pps, es]};
+
+EmitDefinee: EmitProc ~ {
+WITH subject SELECT FROM
+x: FakeAtom => EmitRope[pps, x, defLooks, defUnlooks];
+s: Symbol => EmitRope[pps, Atom.GetPName[s], defLooks, defUnlooks];
+ENDCASE => PrintWithLooks[pps, subject, defLooks, defUnlooks];
+RETURN ESPop[pps, es]};
+
+EmitArgument: EmitProc ~ {
+WITH subject SELECT FROM
+x: FakeAtom => EmitRope[pps, x, argLooks, argUnlooks];
+s: Symbol => EmitRope[pps, Atom.GetPName[s], argLooks, argUnlooks];
+ENDCASE => PrintWithLooks[pps, subject, argLooks, argUnlooks];
+RETURN ESPop[pps, es]};
+
+atomTest: TestProc ~ {
+LogTest[pps, tc.rule, subject];
+RETURN Atomic[subject, pps.how, TRUE]};
+
+simpleTest: TestProc ~ {
+LogTest[pps, tc.rule, subject];
+RETURN [Classify[subject, pps.how] < complex]};
+
+complexTest: TestProc ~ {
+LogTest[pps, tc.rule, subject];
+RETURN [Classify[subject, pps.how] = complex]};
+
+EmitByEnterContextAndDepth: EmitProc ~ {
+cd: REF CD ~ NARROW[ec.data];
+RETURN EntrySearch[pps, subject, cd.context, cd.depth, steplen.SUCC, srcIdx, es]};
+
+EmitByEnterContextAndDelta: EmitProc ~ {
+cd: REF CD ~ NARROW[ec.data];
+RETURN EntrySearch[pps, subject, cd.context, depth+cd.depth, steplen.SUCC, srcIdx, es]};
+
+obEmit: EmitProc ~ {
+EmitObj[pps, TRUE];
+es ¨ ESPush[pps, [closeObjAndNaught, emptyList, context, depth, steplen.SUCC, srcIdx], es];
+RETURN [[ec.rest, subject, context, depth, steplen.SUCC, srcIdx], es]};
+
+bobEmit: EmitProc ~ {
+EmitObj[pps, TRUE];
+RETURN [[ec.rest, subject, context, depth, steplen.SUCC, srcIdx], es]};
+
+eobEmit: EmitProc ~ {
+EmitObj[pps, FALSE];
+RETURN [[ec.rest, subject, context, depth, steplen.SUCC, srcIdx], es]};
+
+cobEmit: EmitProc ~ {
+EmitObj[pps, FALSE];
+RETURN ESPop[pps, es]};
+
+listTest: TestProc ~ {
+LogTest[pps, tc.rule, subject];
+subject ¨ StripComment[subject];
+IF subject#emptyList THEN WITH subject SELECT FROM
+p: Pair => NULL;
+ENDCASE => RETURN [FALSE];
+RETURN tc.rest.test[subject, pps, tc.rest]};
+
+striplistEmit: EmitProc ~ {
+RETURN [[ec.rest, subject, context, depth, steplen.SUCC, srcIdx], es]};
+
+lbEmit: EmitProc ~ {
+EmitRope[pps, "("];
+es ¨ ESPush[pps, [closeParen, NIL, context, depth, steplen.SUCC, srcIdx], es];
+RETURN [[ec.rest, subject, context, depth, steplen.SUCC, srcIdx], es]};
+
+lobEmit: EmitProc ~ {
+EmitRope[pps, "("];
+EmitObj[pps, TRUE];
+es ¨ ESPush[pps, [closeObjAndParen, NIL, context, depth, steplen.SUCC, srcIdx], es];
+RETURN [[ec.rest, subject, context, depth, steplen.SUCC, srcIdx], es]};
+
+clobEmit: EmitProc ~ {
+EmitObj[pps, FALSE];
+EmitRope[pps, ")"];
+RETURN ESPop[pps, es]};
+
+vpTest: TestProc ~ {
+LogTest[pps, tc.rule, subject];
+subject ¨ StripComment[subject];
+WITH subject SELECT FROM
+vl: VectorAsList => RETURN tc.rest.test[vl.list, pps, tc.rest];
+ENDCASE => RETURN [FALSE]};
+
+vpEmit: EmitProc ~ {
+WITH subject SELECT FROM
+vl: VectorAsList => {
+EmitRope[pps, "#"];
+RETURN [[ec.rest, vl.list, context, depth, 0, SeekSrc[pps, subject, srcIdx]], es]};
+ENDCASE => ERROR Complain[subject, IO.PutFR1["trying to emit non-vector%g like vector (rule bug?)", [rope[FmtIdx[srcIdx]]]]]};
+
+quoteTest: TestProc ~ {
+p: Any ~ tc.data;
+s: Any ~ StripComment[subject];
+LogTest[pps, tc.rule, subject];
+WITH p SELECT FROM
+px: Symbol => RETURN [s=px];
+px: String => WITH s SELECT FROM
+r: ROPE => RETURN [r.Length[]>0 AND r.Fetch[0]='"];
+sx: String => RETURN RopeFromString[px].Equal[RopeFromString[sx]];
+ENDCASE => RETURN [FALSE];
+ENDCASE => ERROR};
+
+quoteEmit: EmitProc ~ {
+WITH subject SELECT FROM
+aSymbol: Symbol => {
+EmitRope[pps, Atom.GetPName[aSymbol], kwdLooks, kwdUnlooks];
+RETURN ESPop[pps, es]};
+aString: ROPE => {
+EmitRope[pps, aString, kwdLooks, kwdUnlooks];
+RETURN ESPop[pps, es]};
+aString: String => {
+PrintWithLooks[pps, aString, kwdLooks, kwdUnlooks];
+RETURN ESPop[pps, es]};
+ENDCASE => ERROR Complain[subject, IO.PutFR1["trying to emit non-symbol%g like symbol (rule bug?)", [rope[FmtIdx[srcIdx]]]]]};
+
+quasiquoteEmit: EmitProc ~ {
+WITH subject SELECT FROM
+aSymbol: Symbol => {
+EmitRope[pps, Atom.GetPName[aSymbol]];
+RETURN ESPop[pps, es]};
+ENDCASE => ERROR Complain[subject, IO.PutFR1["trying to emit non-symbol%g like symbol (rule bug?)", [rope[FmtIdx[srcIdx]]]]]};
+
+orTest: TestProc ~ {
+rsl: RuleSpecList ~ NARROW[tc.data];
+found: BOOL; rs: RuleSpec;
+LogTest[pps, tc.rule, subject];
+[found, rs] ¨ Seek[rsl, subject, pps];
+RETURN [found]};
+
+orEmit: EmitProc ~ {
+rsl: RuleSpecList ~ NARROW[ec.data];
+found: BOOL; rs: RuleSpec;
+[found, rs] ¨ Seek[rsl, subject, pps];
+IF NOT found THEN ERROR--we shouldn't get here unless Seek already found it in Test--;
+RETURN [[rs.ec, subject, context, depth, steplen.SUCC, srcIdx], es]};
+
+breakEmit: EmitProc ~ {
+bms: REF BreakMetaSpec ~ NARROW[ec.data];
+EmitBreak[pps, bms.cond, IF bms.sia THEN pps.how.sia ELSE 0, " "];
+RETURN [[ec.rest, subject, context, depth, steplen.SUCC, srcIdx], es]};
+
+pairTest: TestProc ~ {
+LogTest[pps, tc.rule, subject];
+subject ¨ StripComment[subject];
+WITH subject SELECT FROM
+q: Pair => {
+car: TestClosure ~ NARROW[tc.data];
+IF NOT car.test[q.car, pps, car] THEN RETURN [FALSE];
+{tail: Any ~ IF q.cdr#emptyList
+THEN WITH q.cdr SELECT FROM x: Pair => x, ENDCASE => Cons[q.cdr, emptyList]
+ELSE emptyList;
+RETURN tc.rest.test[tail, pps, tc.rest]}};
+ENDCASE => RETURN [FALSE]};
+
+pairEmit: EmitProc ~ {
+car: EmitClosure ~ NARROW[ec.data];
+WITH subject SELECT FROM
+q: Pair => {
+cdrIdx: INT ~ SeekSrc[pps, q.cdr, srcIdx];
+carIdx: INT ~ SeekSrc[pps, q.car, srcIdx];
+IF q.cdr=emptyList THEN es ¨ ESPush[pps, [ec.rest, q.cdr, context, depth, 0, cdrIdx], es]
+ELSE WITH q.cdr SELECT FROM
+x: Pair => es ¨ ESPush[pps, [ec.rest, x, context, depth, 0, cdrIdx], es];
+ENDCASE => {tail: Pair ~ Cons[q.cdr, emptyList];
+es ¨ ESPush[pps, [ec.rest, tail, context, depth, steplen.SUCC--not quite right, but it catches another kind of bug--, cdrIdx], es];
+es ¨ ESPush[pps, [improperTailIntroEC, NIL, context, depth, steplen.SUCC, cdrIdx], es]};
+RETURN [[car, q.car, context, depth, 0, carIdx], es]};
+ENDCASE => ERROR Complain[subject, IO.PutFR1["trying to emit non-pair%g like pair (rule bug?)", [rope[FmtIdx[srcIdx]]]]]};
+
+ropeEmit: EmitProc ~ {
+rope: ROPE ~ NARROW[ec.data];
+EmitRope[pps, rope];
+RETURN ESPop[pps, es]};
+
+kwdRopeEmit: EmitProc ~ {
+rope: ROPE ~ NARROW[ec.data];
+EmitRope[pps, rope, kwdLooks, kwdUnlooks];
+RETURN ESPop[pps, es]};
+
+rmEmit: EmitProc ~ {
+rope: ROPE ~ NARROW[ec.data];
+EmitRope[pps, rope];
+WITH subject SELECT FROM
+p1: Pair => WITH p1.cdr SELECT FROM
+p2: Pair => IF p2.cdr = emptyList
+THEN RETURN [[ec.rest, p2.car, context, depth, 0, srcIdx], es];
+ENDCASE => NULL;
+ENDCASE => NULL;
+Complain[subject, IO.PutFR1["trying to emit non-reader-macro%g like (quote form) - rule bug?", [rope[FmtIdx[srcIdx]]] ]]};
+
+insertEmit: EmitProc ~ {
+rope: ROPE ~ NARROW[ec.data];
+EmitRope[pps, rope];
+RETURN [[ec.rest, subject, context, depth, 0, srcIdx], es]};
+
+skipEmit: EmitProc ~ {
+WITH subject SELECT FROM
+p: Pair => RETURN [[ec.rest, p.cdr, context, depth, 0, srcIdx], es];
+ENDCASE => Complain[subject, IO.PutFR1["trying to emit non-pair%g via skip - rule bug?", [rope[FmtIdx[srcIdx]]] ]]};
+
+dfEmit: EmitProc ~ {
+BufferRope[pps, ".", NIL, NIL, TRUE];
+RETURN [[ec.rest, subject, context, depth, steplen.SUCC, srcIdx], es]};
+
+improperTailIntroEmit: EmitProc ~ {
+BufferRope[pps, ".", NIL, NIL, TRUE];
+RETURN ESPop[pps, es]};
+
+commentsEmit: EmitProc ~ {
+v: Vector ~ NARROW[subject];
+Emitfix[pps, v];
+RETURN ESPop[pps, es]};
+
+stopEmit: EmitProc ~ {ERROR--shouldn't ever be called--};
+
+Seek: PROC [rsl: RuleSpecList, subject: Any, pps: PPState] RETURNS [found: BOOL, rs: RuleSpec] ~ {
+DO
+IF rsl=NIL THEN RETURN [FALSE, noRule];
+IF rsl.first.tc.test[subject, pps, rsl.first.tc] THEN RETURN [TRUE, rsl.first];
+rsl ¨ rsl.rest;
+ENDLOOP};
+
+EnterEmit: PROC [pps: PPState, subject: Any, context: ATOM, depth, steplen: INTEGER] ~ {
+sf0: EmitStackFrame;
+srcIdx: INT ~ SeekSrc[pps, subject, 0];
+es: EmitStack ¨ ESPush[pps, [stop, NIL, NIL, 0, 0, INT.LAST.PRED], NIL];
+[sf0, es] ¨ EntrySearch[pps, subject, context, depth, steplen, srcIdx, es];
+Emit[pps, sf0, es !
+UB.BogusInput => Complain[NIL, IO.PutFR["Internal error%g (rules ok?) %g", [rope[FmtIdx[pps.srcIdx]]], [rope[msg]] ]]
+];
+RETURN};
+
+EntrySearch: PROC [pps: PPState, subject: Any, context: ATOM, depth, steplen: INTEGER, srcIdx: INT, es: EmitStack] RETURNS [EmitStackFrame, EmitStack] ~ {
+cs: CtxStuff ¨ NARROW[pps.rules.Fetch[context].val];
+rsl: RuleSpecList ¨ cs.rsHead;
+defaultsTried: BOOL ¨ FALSE;
+WITH subject SELECT FROM
+ctd: Commented => {
+IF ctd.nonComment # endOfFile THEN {tmp: EmitStackFrame;
+IF ctd.postfix.length#0 THEN es ¨ ESPush[pps, [commentsEC, ctd.postfix, context, depth, steplen.SUCC, srcIdx], es];
+[tmp, es] ¨ EntrySearch[pps, ctd.nonComment, context, depth, 0, SeekSrc[pps, ctd.nonComment, srcIdx], es];
+es ¨ ESPush[pps, tmp, es]};
+RETURN [[commentsEC, ctd.prefix, context, depth, steplen.SUCC, srcIdx], es]};
+ENDCASE => NULL;
+DO
+IF rsl=NIL THEN {
+IF defaultsTried THEN ERROR Complain[NIL, IO.PutFR1["default rules couldn't handle %g", [rope[FmtInfo[subject]]] ]];
+defaultsTried ¨ TRUE;
+IF NOT cs.ntv.defined THEN ERROR;
+rsl ¨ (SELECT cs.ntv.val FROM constForm.val => pps.formDefaultRules, constList.val => pps.listDefaultRules, ENDCASE => ERROR).rsHead;
+LOOP};
+IF rsl.first.depth = depth OR rsl.first.depth = anyDepth THEN {
+IF rsl.first.tc.test[subject, pps, rsl.first.tc] THEN RETURN [[rsl.first.ec, subject, context, depth, steplen.SUCC, srcIdx], es];
+};
+rsl ¨ rsl.rest;
+ENDLOOP;
+};
+
+Emit: PROC [pps: PPState, esf: EmitStackFrame, es: EmitStack] ~ {
+WHILE esf.ec.emit # stopEmit DO
+Process.CheckForAbort[];
+IF pps.quit≠ THEN ERROR ABORTED;
+IF esf.steplen > pps.steplenLimit THEN Complain[NIL, IO.PutFLR["took more than %g steps to format %g (currently at rule %g in %g %g) - suspect rules or internal bug", LIST[ [integer[pps.steplenLimit]], [rope[FmtInfo[esf.subject]]], [rope[FmtScheme[esf.ec.rule]]], [atom[esf.context]], [integer[esf.depth]] ]]];
+pps.srcIdx ¨ esf.srcIdx;
+IF pps.log#NIL THEN {pps.log.PutRope["Emit "]; Scheme.Print[esf.ec.rule, pps.log]; pps.log.PutRope[" "]; InfoPrint[pps.log, esf.subject]; pps.log.PutF[" %g %g %g\n", [atom[esf.context]], [integer[esf.depth]], [integer[esf.srcIdx]] ]};
+WITH esf.subject SELECT FROM
+ctd: Commented => {
+IF ctd.postfix.length#0 THEN es ¨ ESPush[pps, [commentsEC, ctd.postfix, esf.context, esf.depth, esf.steplen.SUCC, esf.srcIdx], es];
+Emitfix[pps, ctd.prefix];
+IF ctd.nonComment = endOfFile
+THEN [esf, es] ¨ ESPop[pps, es]
+ELSE esf ¨ [esf.ec, ctd.nonComment, esf.context, esf.depth, 0, SeekSrc[pps, ctd.nonComment, esf.srcIdx]];
+};
+ENDCASE => [esf, es] ¨ esf.ec.emit[pps, esf.ec, esf.subject, esf.context, esf.depth, esf.steplen, esf.srcIdx, es];
+ENDLOOP;
+RETURN};
+
+SeekSrc: PROC [pps: PPState, form: Any, default: INT] RETURNS [INT] ~ {
+found: BOOL; new: INT;
+IF pps.posns=NIL THEN RETURN [default];
+[found, new] ¨ pps.posns.Fetch[LOOPHOLE[form]];
+IF found THEN RETURN [new];
+RETURN [default]};
+
+Emitfix: PROC [pps: PPState, v: Vector] ~ {
+FOR i: INT IN [0 .. v.length) DO
+elt: Any ~ VectorRef[v, i];
+WITH elt SELECT FROM
+lbs: Linebreaks => FOR j: INT IN [1 .. lbs.num] DO
+BufferRope[pps, "\n"];
+ENDLOOP;
+c: Comment => BufferRope[pps, c, "c", "C"];
+cn: CommentNode => BufferCommentNode[pps, cn];
+ENDCASE => ERROR;
+ENDLOOP;
+RETURN};
+
+BufferCommentNode: PROC [pps: PPState, cn: CommentNode] ~ {
+this: BuffList ~ NEW [BuffCons ¨ [NIL, line[NIL, NIL, NIL, TRUE, FALSE, cn]]];
+IF pps.buffTail=NIL THEN pps.buffHead ¨ pps.buffTail ¨ this
+ELSE pps.buffTail ¨ pps.buffTail.rest ¨ this;
+pps.bufferedLineWithBreak ¨ TRUE};
+
+BufferRope: PROC [pps: PPState, r: ROPE, looks, unlooks: ROPE ¨ NIL, space: BOOL ¨ FALSE] ~ {
+lm1: INT ~ r.Length[]-1;
+lc: CHAR ~ r.Fetch[lm1];
+brk: BOOL ~ lc='\r OR lc='\l OR lc='\n;
+this: BuffList ~ NEW [BuffCons ¨ [NIL,
+line[IF brk THEN r.Substr[len: lm1] ELSE r, looks, unlooks, brk, space, NIL]]];
+IF pps.buffTail=NIL THEN pps.buffHead ¨ pps.buffTail ¨ this
+ELSE pps.buffTail ¨ pps.buffTail.rest ¨ this;
+pps.bufferedLineWithBreak ¨ pps.bufferedLineWithBreak OR brk};
+
+EmitRope: PROC [pps: PPState, r: ROPE, looks, unlooks: ROPE ¨ NIL] ~ {
+Flush[pps];
+IF looks#NIL THEN pps.to.PutF1["%l", [rope[looks]]];
+pps.to.PutRope[r];
+IF looks#NIL THEN pps.to.PutF1["%l", [rope[unlooks]]];
+pps.do0 ¨ FALSE; pps.wantSep ¨ TRUE};
+
+PrintWithLooks: PROC [pps: PPState, a: Any, looks, unlooks: ROPE] ~ {
+Flush[pps];
+IF looks#NIL THEN pps.to.PutF1["%l", [rope[looks]]];
+Print[a, pps.to];
+IF looks#NIL THEN pps.to.PutF1["%l", [rope[unlooks]]];
+pps.do0 ¨ FALSE; pps.wantSep ¨ TRUE};
+
+EmitBreak: PROC [pps: PPState, cond: UB.XBreakCondition, offset: INTEGER, sep: ROPE] ~ {
+this: BuffList ~ NEW [BuffCons ¨ [NIL, break[cond, offset, sep]]];
+IF pps.buffTail=NIL THEN pps.buffHead ¨ this ELSE pps.buffTail.rest ¨ this;
+pps.buffTail ¨ this;
+RETURN};
+
+EmitObj: PROC [pps: PPState, begin: BOOL] ~ {
+this: BuffList ~ NEW [BuffCons ¨ [NIL, obj[begin]]];
+pps.buffTail ¨ (IF pps.buffTail=NIL THEN pps.buffHead ¨ this ELSE pps.buffTail.rest ¨ this);
+RETURN};
+
+FindOffset: PROC [pps: PPState, from: BuffList] RETURNS [offset: INT] ~ {
+offset ¨ <<IF pps.do0 THEN 0 ELSE pps.how.sia>>0;
+FOR bl: BuffList ¨ from, bl.rest WHILE bl#NIL DO
+WITH bl SELECT FROM
+x: BuffdBreak => {offset ¨ x.offset; EXIT};
+x: BuffdObj => EXIT;
+ENDCASE => NULL;
+ENDLOOP;
+RETURN};
+
+Flush: PROC [pps: PPState] ~ {
+IF pps.bufferedLineWithBreak THEN {
+offset: INT ¨ FindOffset[pps, pps.buffHead];
+WHILE pps.buffHead#NIL DO
+WITH pps.buffHead SELECT FROM
+x: BuffdLine => {
+IF x.node#NIL THEN {
+IF pps.wantSep THEN Complain[NIL, "SchemePretty bug: comment node doesn't begin on new line"];
+PutNode[pps.to, x.node, offset]}
+ELSE IF x.chars.Length[]#0 THEN {
+IF pps.wantSep THEN pps.to.PutChar[' ] ELSE pps.wantSep ¨ TRUE;
+IF x.looks#NIL THEN pps.to.PutF1["%l", [rope[x.looks]]];
+pps.to.PutRope[x.chars];
+IF x.looks#NIL THEN pps.to.PutF1["%l", [rope[x.unlooks]]];
+IF x.space THEN {pps.to.PutChar[' ]; pps.wantSep ¨ FALSE};
+};
+IF x.break AND x.node=NIL --PutNode outputs the break-- THEN {
+SS.XBp[pps.to, always, offset, " "];
+pps.wantSep ¨ FALSE};
+};
+x: BuffdBreak => {
+FOR l: BuffList ¨ pps.buffHead.rest, l.rest WHILE l#NIL DO
+WITH l SELECT FROM
+y: BuffdLine => {
+IF y.node#NIL OR y.chars.Length[]#0 THEN EXIT;
+IF y.break THEN {
+SS.XBp[pps.to, always, offset, " "];
+pps.wantSep ¨ y.break ¨ FALSE;
+EXIT};
+};
+ENDCASE => NULL;
+ENDLOOP;
+};
+x: BuffdObj => {
+(IF x.begin THEN SS.Begin ELSE SS.End)[pps.to];
+pps.do0 ¨ x.begin;
+offset ¨ FindOffset[pps, pps.buffHead.rest]};
+ENDCASE => ERROR;
+pps.buffHead ¨ pps.buffHead.rest;
+ENDLOOP;
+pps.buffTail ¨ NIL;
+pps.bufferedLineWithBreak ¨ FALSE}
+ELSE {
+WHILE pps.buffHead#NIL DO
+WITH pps.buffHead SELECT FROM
+x: BuffdLine => {
+IF x.node#NIL THEN ERROR;
+IF x.chars.Length[]=0 THEN ERROR;
+IF x.break THEN ERROR;
+IF pps.wantSep THEN pps.to.PutChar[' ] ELSE pps.wantSep ¨ TRUE;
+IF x.looks#NIL THEN pps.to.PutF1["%l", [rope[x.looks]]];
+pps.to.PutRope[x.chars];
+IF x.looks#NIL THEN pps.to.PutF1["%l", [rope[x.unlooks]]];
+IF x.space THEN {pps.to.PutChar[' ]; pps.wantSep ¨ FALSE};
+pps.do0 ¨ FALSE};
+x: BuffdBreak => {pps.wantSep ¨ FALSE; SS.XBp[pps.to, x.cond, x.offset, x.sep]};
+x: BuffdObj => {(IF x.begin THEN SS.Begin ELSE SS.End)[pps.to]; pps.do0 ¨ x.begin};
+ENDCASE => ERROR;
+pps.buffHead ¨ pps.buffHead.rest;
+ENDLOOP;
+pps.buffTail ¨ NIL};
+RETURN};
+
+PutNode: PROC [to: IO.STREAM, n: TextNode.Ref, offset: INT] ~ {
+r: ROPE ~ TextEditBogus.GetRope[n];
+to.PutRope[r];
+to.PutF1["%n", [boolean[TRUE]] ];
+SS.XBp[to, always, offset, " "];
+to.PutF1["%n", [boolean[FALSE]] ];
+RETURN};
+
+ESPush: PROC [pps: PPState, esf: EmitStackFrame, es: EmitStack] RETURNS [nes: EmitStack] ~ {
+IF pps.emitFree=NIL THEN pps.emitFree ¨ LIST[[noEmit, NIL, NIL, 0, 0, 0]];
+nes ¨ pps.emitFree;
+pps.emitFree ¨ nes.rest;
+nes.first ¨ esf;
+nes.rest ¨ es;
+RETURN};
+
+ESPop: PROC [pps: PPState, es: EmitStack] RETURNS [esf: EmitStackFrame, nes: EmitStack] ~ {
+esf ¨ es.first;
+nes ¨ es.rest;
+es.rest ¨ pps.emitFree;
+pps.emitFree ¨ es;
+RETURN};
+
+Classify: PROC [val: Any, how: How, mayCo: BOOL ¨ TRUE] RETURNS [Classification] ~ {
+IF val=emptyList THEN RETURN [simple];
+WITH val SELECT FROM
+p: Pair => {
+len: Nat ¨ 1;
+car: Any ¨ p.car;
+rest: Any ¨ p.cdr;
+IF how.simpleQuote AND IsQuote[car]
+THEN WITH rest SELECT FROM
+q: Pair => IF q.cdr=NIL THEN RETURN [MAX[Classify[q.car, how, FALSE], atom]];
+ENDCASE => len ¨ len;
+DO
+IF len>how.simpleLen THEN RETURN [complex];
+IF NOT Atomic[car, how, FALSE] THEN RETURN [complex];
+IF rest=NIL THEN RETURN [simple];
+WITH rest SELECT FROM
+q: Pair => {car ¨ q.car; rest ¨ q.cdr; len ¨ len.SUCC};
+ENDCASE => RETURN [IF len<how.simpleLen AND Atomic[rest, how, FALSE] THEN simple ELSE complex];
+ENDLOOP};
+v: Vector => {
+IF v.length > how.simpleLen THEN RETURN [complex];
+FOR i: INT IN [0 .. v.length) DO
+elt: Any ~ v.ref[v, i];
+IF NOT Atomic[elt, how, FALSE] THEN RETURN [complex];
+ENDLOOP;
+RETURN [simple]};
+sv: SimpleVector => {
+IF sv.length > how.simpleLen THEN RETURN [complex];
+FOR i: NAT IN [0 .. sv.length) DO
+elt: Any ~ sv[i];
+IF NOT Atomic[elt, how, FALSE] THEN RETURN [complex];
+ENDLOOP;
+RETURN [simple]};
+vl: VectorAsList => RETURN Classify[vl.list, how];
+ctd: Commented => IF mayCo AND CommentlessLeaf[ctd.nonComment] THEN RETURN [leaf] ELSE RETURN [complex];
+ENDCASE => RETURN [leaf]};
+
+Atomic: PROC [val: Any, how: How, mayCo: BOOL] RETURNS [BOOL] ~ INLINE {
+WITH val SELECT FROM
+ctd: Commented => RETURN [mayCo AND CommentlessLeaf[ctd.nonComment]];
+ENDCASE => NULL;
+IF val=emptyList THEN RETURN [FALSE];
+WITH val SELECT FROM
+p: Pair => IF how.simpleQuote AND IsQuote[p.car]
+THEN WITH p.cdr SELECT FROM
+q: Pair => RETURN [q.cdr=NIL AND CommentlessLeaf[q.car]];
+ENDCASE => RETURN [FALSE]
+ELSE RETURN [FALSE];
+sv: Vector => RETURN [FALSE];
+v: Vector => RETURN [FALSE];
+vl: VectorAsList => RETURN [FALSE];
+ENDCASE => RETURN [TRUE]};
+
+IsLeaf: PROC [val: Any] RETURNS [BOOL] ~ INLINE {
+WITH val SELECT FROM
+ctd: Commented => RETURN CommentlessLeaf[ctd.nonComment];
+ENDCASE => RETURN CommentlessLeaf[val]};
+
+CommentlessLeaf: PROC [val: Any] RETURNS [BOOL] ~ INLINE {
+IF val=emptyList THEN RETURN [FALSE];
+WITH val SELECT FROM
+p: Pair => RETURN [FALSE];
+ctd: Commented => RETURN [FALSE];
+sv: Vector => RETURN [FALSE];
+v: Vector => RETURN [FALSE];
+vl: VectorAsList => RETURN [FALSE];
+ENDCASE => RETURN [TRUE]};
+
+IsQuote: PROC [val: Any] RETURNS [BOOL] ~ INLINE {
+RETURN [val=$quote OR val=$quasiquote]};
+
+StripComment: PROC [val: Any] RETURNS [Any] ~ {
+WITH val SELECT FROM
+ctd: Commented => RETURN [ctd.nonComment];
+ENDCASE => RETURN [val]};
+
+ReadRulesFromFile: PROC [name: PFS.PATH, errlog: IO.STREAM] ~ {
+from: IO.STREAM ~ PFS.StreamOpen[name];
+ReadRulesFromStream[from, errlog];
+from.Close[];
+RETURN};
+
+ReadRulesFromStream: PROC [from, errlog: IO.STREAM] ~ {
+InnerReadRules[from, errlog !
+Complain => {
+errlog.PutRope[msg];
+errlog.PutRope[" while reading rules.\n"];
+rules.Erase[];
+formDefaultRules ¨ listDefaultRules ¨ NIL;
+CONTINUE}];
+RETURN};
+
+InnerReadRules: PROC [from, errlog: IO.STREAM] ~ {--some implementations of Mesa signals aren't quite correct
+rules.Erase[];
+formDefaultRules ¨ listDefaultRules ¨ NIL;
+DO
+a1: Any ¨ Scheme.Read[from];
+context: ATOM;
+depth: INT ¨ anyDepth;
+this: RuleSpecList ¨ NIL;
+rule: Any;
+cs: CtxStuff;
+IF a1 = endOfFile THEN EXIT;
+WITH a1 SELECT FROM
+s: Symbol => context ¨ s;
+ENDCASE => {t1: Any ~ Cdr[a1];
+context ¨ NarrowToSymbol[Scheme.Car[a1]];
+depth ¨ TheINT[Scheme.Car[t1]]};
+cs ¨ GetCtxStuff[context];
+rule ¨ Scheme.Read[from];
+{ENABLE Complain => {
+errlog.PutF1["%g while compiling rule ", [rope[msg]] ];
+IF depth#anyDepth THEN errlog.PutF1["%g ", [integer[depth]] ];
+errlog.PutF["%g %g\n", [atom[context]], [rope[FmtScheme[rule]]] ];
+GOTO AbortRules};
+this ¨ LIST[Compile[context, cs.ntv, cs.bcv, depth, rule, TRUE]];
+Unify[this.first.ntv, cs.ntv];
+Unify[this.first.bcv, cs.bcv];
+};
+cs.rsTail ¨ (IF cs.rsTail#NIL THEN cs.rsTail.rest ¨ this ELSE cs.rsHead ¨ this);
+cs.nRules ¨ cs.nRules.SUCC;
+ENDLOOP;
+IF rules.Pairs[CheckRule] THEN ERROR;
+formDefaultRules ¨ NARROW[rules.Fetch[formDefault].val];
+listDefaultRules ¨ NARROW[rules.Fetch[listDefault].val];
+Unify[formDefaultRules.ntv, constForm];
+Unify[listDefaultRules.ntv, constList];
+RETURN;
+EXITS AbortRules => {
+rules.Erase[];
+formDefaultRules ¨ listDefaultRules ¨ NIL}
+};
+
+CheckRule: PROC [key, val: REF ANY] RETURNS [quit: BOOL ¨ FALSE] ~ {
+context: ATOM ~ NARROW[key];
+cs: CtxStuff ~ NARROW[val];
+IF NOT cs.ntv.defined THEN Complain[context, IO.PutFR1["syntactic category for context %g unclear", [atom[context]] ]];
+IF NOT cs.bcv.defined THEN Complain[context, IO.PutFR1["color category for context %g unclear", [atom[context]] ]];
+RETURN [FALSE]};
+
+PrintRulesToStream: PROC [to: IO.STREAM] ~ {
+PerContext: PROC [key, val: REF ANY] RETURNS [quit: BOOL ¨ FALSE] ~ {
+context: ATOM ~ NARROW[key];
+rsl: RuleSpecList ¨ NARROW[val];
+FOR rsl: RuleSpecList ¨ NARROW[val], rsl.rest WHILE rsl#NIL DO
+IF rsl.first.depth # anyDepth THEN to.PutF1["%g ", [integer[rsl.first.depth]]];
+to.PutF1["%g ", [atom[context]]];
+Scheme.Print[rsl.first.me, to];
+to.PutRope["\n"];
+ENDLOOP;
+RETURN [FALSE]};
+IF rules.Pairs[PerContext] THEN ERROR;
+RETURN};
+
+PrettyPrintCmd: PROC [cmd: Commander.Handle] RETURNS [result: REF ANY ¨ NIL, msg: ROPE ¨ NIL] --Commander.CommandProc-- ~ {
+Car: PROC [a: Any] RETURNS [Any] ~ {
+WITH a SELECT FROM
+p: Pair => RETURN[p.car];
+ENDCASE => Complain[a, "spec must be of form (name val)"]};
+specIn: IO.STREAM ~ IO.RIS[cmd.commandLine];
+how: How ¨ defaultHow;
+margin: INT ¨ defaultMargin;
+barfum: ROPE ¨ NIL;
+context: ATOM ¨ NARROW[cmd.procData.clientData];
+debugSS: BOOL ¨ FALSE;
+debugLog: IO.STREAM ¨ NIL;
+msg ¨ NIL;
+DO
+ENABLE Complain => {
+barfum ¨ Rope.Concat["Scheme err on command line: ", msg];
+GOTO Abort};
+spec: Any ¨ Scheme.Read[specIn];
+IF spec=endOfFile THEN EXIT;
+WITH spec SELECT FROM
+p: Pair => SELECT p.car FROM
+$margin => margin ¨ TheINT[Car[p.cdr]];
+$sia => how.sia ¨ TheINT[Car[p.cdr]];
+$simplelen => how.simpleLen ¨ TheINT[Car[p.cdr]];
+$simplequote => how.simpleQuote ¨ True[Car[p.cdr]];
+$debug => debugLog ¨ IF True[Car[p.cdr]] THEN cmd.err ELSE NIL;
+$debugss => debugSS ¨ True[Car[p.cdr]];
+$context => WITH Car[p.cdr] SELECT FROM
+a: ATOM => context ¨ a;
+ENDCASE => RETURN [$Failure, Rope.Concat["unrecognized spec: ", Fmt[spec]]];
+ENDCASE => RETURN [$Failure, Rope.Concat["unrecognized spec: ", Fmt[spec]]];
+ENDCASE => RETURN [$Failure, Rope.Concat["unrecognized spec: ", Fmt[spec]]];
+REPEAT
+Abort => RETURN [$Failure, barfum];
+ENDLOOP;
+{h: UB.Handle ~ UB.Create[publics: [margin: margin, output: [stream[cmd.out]]], debug: debugSS];
+out: IO.STREAM ~ SS.Create[h];
+cmd.out.PutF1["%l", [rope["f"]]];
+DO
+ENABLE {
+Complain => {barfum ¨ msg; GOTO AbortRPP};
+Warning => {cmd.err.PutRope[message.Concat["\n"]]; RESUME}};
+arg, anc: Any;
+posns: FormToSource;
+[arg, anc, posns] ¨ Read[cmd.in, GetStackAddr[]];
+IF arg=endOfFile THEN EXIT;
+PrettyPrint[out, arg, how, context, posns, debugLog];
+out.PutRope["\n"];
+IF anc=endOfFile THEN EXIT;
+ENDLOOP;
+EXITS AbortRPP => {result ¨ $Failure; msg ¨ barfum}
+};
+cmd.out.PutF1["%l", [rope[" "]]];
+RETURN};
+
+ReadRulesCmd: Commander.CommandProc ~ {
+ReadRulesFromStream[cmd.in, cmd.err];
+RETURN};
+
+PrintRulesCmd: Commander.CommandProc ~ {
+PrintRulesToStream[cmd.out];
+RETURN};
+
+DoProfile: Commander.CommandProc ~ {NoteProfile[edit]};
+
+Fmt: PROC [a: Any] RETURNS [ROPE] ~ {
+buf: IO.STREAM ~ IO.ROS[];
+Print[a, buf];
+RETURN buf.RopeFromROS[]};
+
+FmtScheme: PROC [a: Any] RETURNS [ROPE] ~ {
+buf: IO.STREAM ~ IO.ROS[];
+Print[a, buf !Complain => GOTO Abort];
+RETURN buf.RopeFromROS[];
+EXITS Abort => RETURN ["(can't print)"]};
+
+FmtInfo: PROC [a: Any] RETURNS [ROPE] ~ {
+buf: IO.STREAM ~ IO.ROS[];
+InfoPrint[buf, a !Complain => GOTO Abort];
+RETURN buf.RopeFromROS[];
+EXITS Abort => RETURN ["(can't print)"]};
+
+AnaLooks: PROC [raw: ROPE] RETURNS [pos, neg: ROPE] ~ {
+Add: PROC [pc: CHAR] ~ {
+pos ¨ pos.Concat[Rope.FromChar[pc]];
+neg ¨ neg.Concat[Rope.FromChar[pc-'a+'A]]};
+pos ¨ neg ¨ NIL;
+FOR i: INT IN [0 .. raw.Length) DO
+c: CHAR ~ raw.Fetch[i];
+SELECT c FROM
+IN ['a .. 'a+31] => Add[c];
+IN ['A .. 'A+31] => Add[c-'A+'a];
+ENDCASE => NULL;
+ENDLOOP;
+RETURN};
+
+NoteProfile: PROC [reason: UserProfile.ProfileChangeReason] --UserProfile.ProfileChangedProc--~ {
+profileRules: ROPE ~ UserProfile.Token["SchemePretty.rules", defaultRulesName];
+defaultMargin ¨ UserProfile.Number["SchemePretty.margin", 80];
+defaultHow ¨ [
+sia: UserProfile.Number["SchemePretty.sia", 2],
+simpleLen: UserProfile.Number["SchemePretty.simpleLen", 2],
+simpleQuote: UserProfile.Boolean["SchemePretty.simpleQuote", TRUE]
+];
+[defLooks, defUnlooks] ¨ AnaLooks[UserProfile.Token["SchemePretty.defineeLooks", "n"]];
+[argLooks, argUnlooks] ¨ AnaLooks[UserProfile.Token["SchemePretty.argumentLooks", "c"]];
+[kwdLooks, kwdUnlooks] ¨ AnaLooks[UserProfile.Token["SchemePretty.keywordLooks", "k"]];
+IF NOT TryRead[profileRules] THEN [] ¨ TryRead[defaultRulesName];
+};
+defaultRulesName: ROPE ¨ "SchemePretty.rules";
+
+TryRead: PROC [given: ROPE] RETURNS [BOOL] ~ {
+givenPath: PFS.PATH ~ ParsePath[given];
+IF givenPath=NIL THEN RETURN [FALSE];
+{full: PFS.PATH ~ PFS.FileSearch[givenPath, famousPath];
+IF full=NIL THEN RETURN [FALSE];
+{myRouter: Feedback.MsgRouter ~ Feedback.EnsureRouter[$SchemePretty];
+errbuf: IO.STREAM ~ FeedbackClasses.CreateStreamOnRouter[myRouter, $RuleError];
+ReadRulesFromFile[full, errbuf];
+RETURN [TRUE]}}};
+
+ParsePath: PROC [rope: ROPE] RETURNS [path: PFS.PATH] ~ {
+path ¨ NIL;
+path ¨ PFS.PathFromRope[rope !PFS.Error => CONTINUE];
+RETURN};
+
+FmtIdx: PROC [idx: INT] RETURNS [ROPE] ~ {
+IF idx=noIdx THEN RETURN [NIL];
+RETURN IO.PutFR1[" at %g", [integer[idx]]]};
+
+GetStackAddr: PROC RETURNS [INT] ~ TRUSTED INLINE {
+local: INT ¨ 3;
+lp: LONG POINTER ¨ @local;
+RETURN [LOOPHOLE[lp]]};
+
+DebugRulesCmd: Commander.CommandProc ~ {
+cmd.out.PutF1["SchemePrety.debugRules = %g\n", [boolean[debugRules ¨ NOT debugRules]]];
+RETURN};
+
+famousPath: LIST OF PFS.PATH ~ LIST[
+PFS.GetWDir[],
+PFS.PathFromRope["/PCedar/FamousFiles/"],
+PFS.PathFromRope["/CedarCommon/FamousFiles/"]];
+
+UserProfile.CallWhenProfileChanges[NoteProfile];
+
+Commander.Register[key: "SchemePrettyPrintRules", proc: PrintRulesCmd, doc: "write rules to stdout"];
+Commander.Register[key: "SchemePrettyReadRules", proc: ReadRulesCmd, doc: "read rules from stdin"];
+Commander.Register[key: "SchemePrettyPrintExpr", proc: PrettyPrintCmd, doc: "Pretty prints stdin to stdout", clientData: $expr];
+Commander.Register[key: "SchemePrettyPrintData", proc: PrettyPrintCmd, doc: "Pretty prints stdin to stdout", clientData: $data];
+Commander.Register[key: "SchemePrettyPrintDoProfile", proc: DoProfile, doc: "do profile processing again"];
+Commander.Register[key: "SchemePrettyDebugRules", proc: DebugRulesCmd, doc: "toggle rule static checking debugging"];
+
+END.
+    ∏  SchemeExtPrint.mesa
+Copyright ” 1992 by Xerox Corporation.  All rights reserved.
+Spreitze, April 9, 1990 3:12 pm PDT
+Last tweaked by Mike Spreitzer on May 12, 1992 12:59 pm PDT
+ ù 0«  ïNewlineDelimiter
+ñ(cedarcode) styleò codeôKöú
+œeú1ô<Kô#Kô;óKò Köœk	úEûúûúõòKò öœnúûúûòKöûú:ûúûúÄò»KöûúòKòóKò Köûúûú+ûúûúò]Kò Köú	ûúûúòöúûúûúòKöúûúò#Köúûúûúò$Köú	ûúûúòKöúûúûúœcò/Köú!ûúò%KöúûúòKöúûú	òKöú	ò	Köú†úò.Köú-ò-KöúòKöúûúûúòKöú	ûúûúòóKò Köú
+ûúûú
+òKöúûúûúò%Köúûúûúò'Köú
+ûúûúò#öú
+ûúûúûú	ûòCKöú ûúûúòNKöúûúûúûúò@KöúûúòKöûúò	óKò Kö	úûúûúûúûúòCKò Köú
+ûúûúò%öúûúûúò KòKöúûúòKöúûúò$óKò Köúûúûúûú
+ò&Köú
+ûúûú	ûúIòlKò KöûúûúòKò KöúûúûúòöúûúûúòKöúûúòKöúûúûúò!Köúûú†1òBKöúûú†8òHKöúòóKò Kö	úûúûúûúûúòGKöúûúûúûúò8Köúûúûúûúò7Köúûúûúûúò9Köúûúûúûúò:Kò Köúûúûúò'Köúûúûú6òSKö	ú
+ûúûú/ûúûúòSKò Köúûúûúò'Köúûúûú6òSKöú
+ûúûú8ûúûú
+ûúûúò¨Kò Köúûúûúûúò)Köúûúûú*ûúûú
+ûúòsKò Köúûú!ò5Kò Köúûúûúûúò1Kö
+ûúûúûúûú	ûúò2Kò KöúûúûúûúòIKöúûúòKöúûúòKöú
+ûúûúûúò"KöúûúûúûúòKöúûúòKöúûú!ò2Köúûú!ò2Köú
+ûúò,Köúûúò(Köú
+ûúò-KöúûúòKöú.ò.Köú7ûúòLKöú5ò5Köú6ò6KöúQòQKöú6ò6Kò<Köú
+ûúòKöúûúòKöú
+ûúòKöúûúòKöú
+ûúòKöúûúòKòKöúûúòKöú$ò$Köú/ûúò3KöúûúûúòKò öüúûúûúûúûúûúûúûúûúûúûúûúûúòõKöúûú¢ò¥Köûú
+ûúûúûúûúûúò3Köûúûú
+ûú*òVKöúûúòKò#KòKöûúòóKò öúûú/ûúûúûúûúûúòfKöúûúûú-ò;óKò öúûú/ûúûúûúûúûúòfKöúûúûú-ò;óKò öüúûúûúûúûúûúòiKöú2ò2KòHKöûú"ò(óKò öüúûúûúûúûúûú-òãKö
+ûúûúûú'ûúûúòcöûúûúûòöúûúûòKöúûú6òDKöú	ûúAòPKöúûú@òRKöúûúAòTKöú	ûú7òFKöúûú9òJKöúûú:òLKöûúûú.ûú"òdóöúòöûúûúûòöúûúûúûòöú4ò4KöúòKòCKöúûúûúûú9òLKöûúHòNóöúDòDKòKöú"ò"KöúûúòKö	úûúûúûúûúò%Köûú6ûú*òióöú@ò@Köúûúûúûúûú
+ûúûúûúò9Köûú6ûú*òióòKöúKòKKòKöú=ûúòDKòBKöûú%ò+óòKöúIòIKöú%ò%Köú;ûúòBKöúûúûúûúûú	ûúûúûúò8Köûú-ûú(ò^óöú&ò&öûúûúûòKöúûúòKöúûúòKöûúûú'ò7óKöûúûúûúòVóöú>ò>Köûúûúûúò[óòXKöûúûúò(Köûú7ûúò[óòXKöûú%ûúòHóöúQòQKöûú&ûúòIóöúOòOKöûú&ûúòIóòYKöûúûúò(Köûú8ûúò\óòXKöûúûú=òHKöûú5ûúòYóò]Köûúûúò(Köûú>ûúòbóòKòKöúûú	ò!KòKöúûúòöûú"ûúûò>KöúûúAòZöûúûú	ûòKöûúBòFóKò4Kò$KöûúòóKöûú	ûúûú
+ûúò5Köûúûúûú òYóKöúûú3ûú
+òOKöúûú3ûú
+òNKöúûú3ûú
+òOKöúûú3ûú
+òNKöúûú6ûú
+òRKöúûú6ûú
+òQKöúûú4ûú
+òPKöúûú4ûú
+òOKöúûú4ûú
+òPKöúûú4ûúòPöú<ò<Köú<ò<Kò>Köûúûúò&KöûúUò[óöú(ò(Kò>Köûúûúò&Köûú'ûúòKóò
+KöúòKòFKòFKöûú`òfóöú7ò7Köú<ò<Kò>KöûúQòWóKöûúûúòóKöûúûúòóKöúJòJKòIöûúûúòKöúòKöúòKöúòóKöûúkòqóKöûúûúòóKöúòóKò öüúûúûúûúûúûúûúûú-ò±Köúûúûúò;KòCKöûúBòHóKò öüúûúòKöûúûúûúûúûúûúò<KöûúûúûúûúòAöûúûúûúòKòKòKöûúûúûúòKöûúûúûúòKöûúûúMûú(òãKòöûúûòöûúûúûòKöûúòKöûúòóöûúûúûòKöûúòKöûú*ò.óóKöûúòóöûúûúûúòKòKöûúûúGûú(òÖöûúòKöúûúò KöúûúòKö
+ûúûúûúûúûúòKöûúòóKöûúòóKöûúûú
+ûúûúXò~KöûúòóKò öüúûúûúò)Kö
+ûúûúûúûúûúò.KòKöûúòóKò öüúûúûúûúò+Köûúûúûúûúò&Köúûúò#öûúûúûò*KòKöûúòóKöûúòóKò öü	úûúûúò-Köúûúò"óKò öü	úûúûúò-Köúûúò"óKò öüúûúûúò:Köúûúò"öûúûúûúûúûúûúòEKöúûú6ò>Köúûú5ò=KöúûúûúòóKöûúòóKò öüúûú
+ûúò2öûúûúûòKöúûúòKöûúûúò.óóKò öüúûú
+ûúò.öûúûúûòKöúûúòKöûúûúò,óóKò öüúûú'ò4öûú	ûúûúòKöúûú ò+KöúòKöúòKöúòKöúòKò KöúòóKòóKò öúòKöúûúûú
+ò&Kòöûú	ûúûòòKö
+ûúûú
+ûúûúûúò8Kö
+ûúûúûúûúûúò;óKöûúûúòóKöûú&ò,óKò öúòKòKöûúòóKò Köúûúò.Kò òKòKöûúûúòóKò òKòKöûúûúòóKò Köüúûú3ûúòeKò KöüúûúûúûúòtKò òKòKöûúòóKò öüúòöûú	ûúûòKöú ò Kò-Köûú3ûúûúòTóKöûúòóKò öüúòöûú	ûúûòKöú6ò6KòCKöûú7ò>óKöûúòóKò öüúòöûú	ûúûòKöú6ò6KòCKöûú7ò>óKöûúòóKò òKòKöûúûúò'óKò öúòKòKöûú)ò/óKò öúòKòKöûú)ò/óKò öüúò(Köúûúûúûú
+òKöûú9ûúòRóKò öüúò(Köúûúûúûú
+òKöûú?ûúòXóKò öúòKöúûúòKöúHûúò[Köûú-ûúòGóKò òKöúûúòKöûú-ûúòGóKò òKöúûúòKöûú-ûúòGóKò òKöúûúòKöûúòóKò òKòKò ö	ûúûúûú	ûúûò2KöúûúòKöûúûúûúòóKöûú&ò,óKò òKöûú-ûúòGóKò òKòKöúûúûúòNKöûú-ûúòGóKò òKòKöúûúòKöú$ûúûúòTKöûú-ûúòGóKò öúòKöúûúòKòKöûúòóKò òKòKò öûú	ûúûòKöúûú%ò?KöûúûúûúòóóKò òöûú	ûúûòöúòKöúòKöûúMòSóKöûúûúûúYò~óóKò òKöúòKöúòKòöûúûúûòKöúûúòöúûúûúûò Köúûúûúûúò3Köúûú.òBKöûúûúûúòóKöûúûúòóóKò òöûú	ûúûòöúòKöú<ò<Köûúòóöú	ûúòKöú-ò-KöûúòóöúòKöú3ò3KöûúòóKöûúûúûúYò~óóKò òöûú	ûúûòöúòKöú&ò&KöûúòóKöûúûúûúYò~óóKò òKöúûú
+ò$KöúûúòKòKò&Köûú
+òóKò òKöúûú
+ò$KöúûúòKò&Kö	ûúûúûúû†>úòVKöûú+ûúòEóKò òKöúûúûú
+ò)Köúûú	ûúûú	òBKöûú-ûúòGóKò òKòKò öûú	ûúûòòKöúûú
+ò#Kö
+ûúûúûúûúûúò5öúûúòKö
+ûúûúûúûúûúòKKöûúòóKöûú$ò*óKöûúûúûúòóóKò òKöúûú
+ò#öûú	ûúûòöúòKöúûúò*Köúûúò*KöûúûúBòYöûúûúûúûòKòIöûú)ò0Köú9û†7úòÉKöú'ûúûúòXóóKöûú0ò6óKöûúûúûúUòzóóKò òKöúûúûú
+òKòKöûúòóKò òKöúûúûú
+òKò*KöûúòóKò öúòKöúûúûú
+òKöúòöûú	ûúûòöúûúûúûò#öúûúò!Köûúûú4ò?óKöûúûúòóKöûúûúòóKöúûúfòzóKò öúòKöúûúûú
+òKöúòKöûú6ò<óKò òöûú	ûúûòKöúûú3òDKöûúûúUòtóóKò öúòKöúûúûúûúò%Köûú-ûúòGóKò öú#ò#Köúûúûúûúò%KöûúòóKò öúòKöúûú
+òKòKöûúòóKò Köúû†úò9Kò öüúûú1ûú	ûúòböûòKö
+ûúûúûúûúûú
+ò'Köûú/ûúûúûúòOKòKöûúò	óóKò öü	úûú'ûúûúòXKòKöúûúò'Köú#ûúûúûúûúûúûúòHKòKòKöûúûúûúTòuKòóKöûúòóKò öüúûú'ûúûú
+ûúûú òöKöúûúò4KòKöúûúûúòöûú	ûúûòòöûúûúò8KöûúûúDûúòsKòjKòóKöûú3ûúòMóKöûúûúòóöûòöûúûúûúòKö
+ûúûúûú
+ûúûúHòtKöúûúòKöûúûúûúûúò!Kö	úûúûúOûúûú	òÖKöûúòóöûúûúûúò?Köûú/ûúûú2ûúòÅKòóKòKöûúòóKòóKò öüúûú7òAöûúûòKöúòKöûúûúûúûúò Kö
+ûú ûú
+ûúûúpûúãò∂KòKöûú	ûúûú◊òÍöûúûúûòòKöûúûúPûúòÉKöúòöûúòKöûúòKöûúeòióKöúòóKöûúkòróKöûúòóKöûúòóKò ö
+üúûú$ûúûúûúòGKöúûúûúòKöûúûúûúûúò'Köúûúò/KöûúûúûúòKöûúòóKò öüúûúò+öûúûúûúûò Kòöûúûúûòöúûúûúûúûò2KöúòKöûúòóKöú+ò+Kò.KöûúûúòóKöûúòóKöûúòóKò öüúûú$ò;KöúûúûúûúûúûúûúûúòNKöûúûúûú#ò;Köûú)ò-Köúûúò"óKò öü
+úûúûúûúûú	ûúûúò]KöúûúòKöúûúòKöúûú
+ûúûúò'öúûúûúò&Kö	úûúûúûú ûúòOóKöûúûúûú#ò;Köûú)ò-Köú6ûúò>óKò ö
+üúûúûúûúûúòFKöúòKöûúûúûú#ò4KöúòKöûúûúûú%ò6Köú
+ûúûúò%óKò öüúûú(ûúòEKöúòKöûúûúûú#ò4KòKöûúûúûú%ò6Köú
+ûúûúò%óKò ö
+ü	úûúûúûúûúòXKöúûúûúòBKöûúûúûúûúòKKòKöûúòóKò öüúûúûúò-Köúûúûúò4Kö	úûúûúûúûúò\KöûúòóKò öü
+úûú ûú
+ûúòIKò1öûúûúûúûò0öûúûúûòKöú%ûúò+KöúûúòKöûúûúòóKöûúòóKöûúòóKò öüúûúòöûúûúò#Köúûú!ò,öûúûúûòöûúûúûòöúòöûúûúûúòKöûúûú
+ûú>ò^Köú ò óöûúûúûúò!Köûúûúûúûúò?Köûú	ûúûú%ò8KöúòKöûú	ûúûú'ò:Köûú	ûú$ûúò:Köúòóö
+ûú	ûúûú†úûúò>Köûú"ò$KöúûúòóKòóöúòöûú)ûúûúûò:öûúûúûòöúòKö
+ûúûúûúûúûúò.öûú	ûúòKöûú"ò$KöúûúòKöûúòóKòóKöûúûúòóKöûúòóKòóöúòKöúûú	ûúûúûúûúò/KòKò-óKöûúûúòóKò!KöûúòóKöúûúòKöúûúò"óöûúòöûúûúûòöûúûúûòöúòKöûúûúûúûúòKöûúûúûúò!Köûú	ûúûúòKöûúûúûúûúò?Köûú	ûúûú%ò8KöúòKöûú	ûúûú'ò:Köûú	ûú$ûúò:Köú
+ûúòóKöú ûúûú'òPKöúûú	ûúûúûúûú"òSKöûúûúòóKò!KöûúòóKöúûúòóKöûúòóKò ö
+üúûúûúûúûúò?Köúûúò#KòKöúûúò!Köûúò Köúûúò"KöûúòóKò öüúûú4ûúò\Köûúûúûúûú
+ûúûúòJKòKòKòKòKöûúòóKò öüúûúûú*ò[KòKòKòKòKöûúòóKò ö
+üúûúûúûúûúòTKöûúûúûú
+ò&öûúûúûòöúòKòKòKòöûúûúò#öûúûúûúûòKöúûúûúûúûúûúûú
+òMKöûúòóóöûòKöûúûúûúò+Kö
+ûúûúûúûúûúò5Köûúûúûúûú
+ò!öûúûúûòKöú1ûúò7Köûúûúûúûúûúûúûú
+ò_óKöûúò	óóòKöûúûúûúò2öûúûúûúûò KòKö
+ûúûúûúûúûúò5KöûúòóKöûúòóòKöûúûúûúò3öûúûúûúûò!KòKö
+ûúûúûúûúûúò5KöûúòóKöûúòóKöúûúò2Köúûúûú!ûúûúûúûúòhKöûúûú	òóóKò öüúûúûúûúûúûúòHöûúûúûòKöúûúûú"òEKöûúûúòóKöûúûúûúûúò%öûúûúûòöúûúûúò0öûúûúûúûòKöúûúûúûúò9KöûúûúûúòóKöûúûúûúòóKöúûúûúòKöúûúûúòKöúûúûúò#KöûúûúûúòóóKò ö
+üúûúûúûúûúò1öûúûúûòKöúûú!ò9Köûúûúò(óóKò ö
+üúûúûúûúûúò:Köûúûúûúûúò%öûúûúûòKöúûúûúòKöúûúûúò!KöúûúûúòKöúûúûúòKöúûúûúò#KöûúûúûúòóóKò ö
+üúûúûúûúûúò2Köûúûúò(óKò öüúûúûú
+ò/öûúûúûòKöúûúò*KöûúûúòóóKò öüúûúûúûú
+ûúûúò?Köúûúûúûúò'Köú"ò"KòKöûúòóKò öüúûúûúûúò7öúòöúòKòKò*KòKöú&ûúò*KöûúòóóKöûúòóKò ö	üúûúûúûú†;òmKòKöú&ûúò*öûòKòKöú	ûúòKöúûúòKöúûúòKò
+KòKöûúûúûúòöûúûúûòKòöûúòKò)Kò óóKòKòöúûúòKò7Köûúûú(ò>KöúBòBKöûúòóKöúûú/ûúòAKòKòKòKö	úûúûúûúûúòPKöúûúòKöûúòóKöûúûúûúò%Köúûúò8Köúûúò8Köú'ò'Köú'ò'KöûúòöûúòKòKöú&ûúò*óKòóKò öü	úûúûúûúûúûúûúòDKöú	ûúûúòKöúûúòKöûúûúûúûúHòwKöûúûúûúûúDòsKöûúûúòóKò öüúûúûúûúò,öü
+úûúûúûúûúûúûúòEKöú	ûúûúòKöúûúò ö	ûúûúûúûúûò>Köûúûú-òOKò!KöúòKöúòKöûúòóKöûúûúòóKöûúûúûúò&KöûúòóKò öüúûúûú
+ûúûúûúûúûú†úò{öüúûú
+ûú
+ò$öûúûúûòKöúûúòKöûú4ò;óóKö	úûúûúûúûúò,KòKöúûúòKöúûúûúòKöú	ûúûúò0Köú	ûúûúòKöú
+ûúûúûúòKöúûúò
+öûòöûúòKò:KöûúòóKò KöûúûúûúòöûúûúûòöúûúûòKò'Kò%Kò1Kò3Kö	úûúûú	ûúûúò?Kò'öúûúûúûò'KöúûúòKöûúûú;òLóKöûúûú;òLóKöûúûú;òLóöûòKöú	ûúò#óKöûúòóKöúûú
+ûúNò`KöúûúûúûúòKò!öûòöûúòKöúûúò*Köú3ûúò<óKòKòKò1KöûúûúûúòKöú5ò5KòKöûúûúûúòKöûúòóKöûú.ò3KöúòKò!KöûúòóKò öüúò'Kò%KöûúòóKò öüúò(KöúòKöûúòóKò Köü	ú.ò7Kò öüúûú
+ûúûúò%Kö	úûúûúûúûúòKòKöûúòóKò öü	úûú
+ûúûúò+Kö	úûúûúûúûúòKöúûúò&KöûúòKöûú
+ûúò)óKò öüúûú
+ûúûúò)Kö	úûúûúûúûúòKöúûúò*KöûúòKöûú
+ûúò)óKò ö
+üúûúûúûúûúò7öüúûúûúòKò$Kò+óKöúûúòöûúûúûúûò"KöúûúòöûúûòKöûúòKöûúò!KöûúûúòóKöûúòóKöûúòóKò öüúûú+†"úòaKöúûú=òOKò>òKöú/ò/Köú;ò;Köú=ûúòBKòóKòWKòXKòWKöûúûúûú òAKòKöúûúò.óKò ö
+üúûú	ûúûúûúò.Köúûúûúò'Kö
+ûúûúûúûúûúò%Köúûúûúûú#ò8Kö
+ûúûúûúûúûúò KöúEòEKöúûúûú>òOKöú ò KöûúûúòóKò öü	úûúûúûúûúûúò9KöúûúòKöúûúûú
+ûúò5KöûúòóKò ö
+üúûúûúûúûúò*KöûúûúûúûúòKöûúûú#ò,óKò öüúûúûúûúûúûúò3KöúûúòKöúûúûú
+òKöûúûúòóKò öüúò(KöúEûúòWKöûúòóKò öúûúûúûúûúûúò$KöûúòKöûú&ò)Köûú,ò/óKò Köú0ò0Kò KöúeòeKöúcòcKöúÄòÄKöúÄòÄKöúkòkKöúuòuKò Köûúòó Öó    ©  ⁄É  

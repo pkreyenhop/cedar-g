@@ -1,0 +1,526 @@
+
+DIRECTORY Basics, BasicTime, Commander, CommandTool, FileNames, FileViewerOps, FS, IO, MakeDo, RedBlackTree, Process, Rope, TimeStamp, ViewerIO;
+
+MakeDoSimpleImpl: CEDAR MONITOR
+IMPORTS CommandTool, FileNames, FileViewerOps, FS, IO, RedBlackTree, Process, Rope, ViewerIO
+EXPORTS MakeDo =
+
+BEGIN OPEN MakeDo;
+
+Warning: PUBLIC SIGNAL [message: ROPE] = CODE;
+
+Error: PUBLIC ERROR [message: ROPE] = CODE;
+
+NodeList: TYPE = LIST OF Node;
+Node: TYPE = REF NodeRep;
+NodeRep: PUBLIC TYPE = RECORD [
+name: ROPE,
+producer: Command ¨ NIL,
+derivedCmds, consumers: CommandList ¨ NIL,
+props: PropList ¨ NIL,
+missed: BOOL ¨ FALSE,
+explained: BOOLEAN ¨ FALSE,
+timeValid: BOOLEAN ¨ FALSE,
+needed: BOOL ¨ FALSE,
+modifiable: BOOL ¨ FALSE,
+rooted: BOOL ¨ FALSE,
+inStack: BOOL ¨ FALSE,
+latest: BasicTime.GMT ¨ BasicTime.nullGMT
+];
+
+Command: TYPE = REF CommandRep;
+CommandRep: PUBLIC TYPE = RECORD [
+cmd: ROPE,
+makes, from, missedSources, missedResults: NodeList,
+outdated, needsToBeDone: BOOLEAN ¨ FALSE,
+class: CommandClass,
+foundData: REF ANY,
+initialized: BOOLEAN ¨ FALSE,
+canBeDone: BOOLEAN ¨ TRUE,
+failed: BOOLEAN ¨ FALSE,
+makesACertainlyModifiable: BOOL ¨ FALSE
+];
+
+nodes: RedBlackTree.Table ¨ RedBlackTree.Create[GetKey, CompareNodes];
+
+depth: INT ¨ 0;
+debugging: BOOLEAN ¨ FALSE;
+log, in: IO.STREAM ¨ NIL;
+boundaryKnown: BOOL ¨ FALSE;
+
+Log: PUBLIC PROC [fmt: ROPE, v1, v2, v3, v4, v5: IO.Value ¨ [null[]]] =
+BEGIN
+FOR i: INT IN [0 .. depth) DO log.PutChar['\t] ENDLOOP;
+log.PutF[fmt, v1, v2, v3, v4, v5];
+log.PutChar['\n];
+END;
+
+Confirm: PROC [action: ROPE] =
+BEGIN
+FOR i: INT IN [0 .. depth) DO log.PutChar['\t] ENDLOOP;
+log.PutF["Ready to %g ? ", IO.rope[action]];
+WHILE in.GetChar[] # '\n DO NULL ENDLOOP;
+END;
+
+PublicPartsOfNode: PUBLIC PROC [n: Node] RETURNS [name: ROPE, producer: Command, derivedCmds, consumers: CommandList, props: PropList] = {
+RETURN [
+name: n.name,
+producer: n.producer,
+derivedCmds: n.derivedCmds,
+consumers: n.consumers,
+props: n.props
+];
+};
+
+SetProps: PUBLIC PROC [node: Node, props: PropList] = {node.props ¨ props};
+
+SetLatest: PUBLIC PROC [node: Node, latest: BasicTime.GMT] = {
+IF node.timeValid THEN ERROR;
+node.timeValid ¨ TRUE; node.latest ¨ latest};
+
+Needed: PUBLIC PROC [node: Node] RETURNS [needed: BOOL] =
+{needed ¨ node.needed};
+
+PublicPartsOfCommand: PUBLIC PROC [c: Command] RETURNS [cmd: ROPE, makes, from: NodeList, foundData: REF ANY, needsToBeDone, failed: BOOL] = {
+RETURN [
+cmd: c.cmd,
+makes: c.makes,
+from: c.from,
+foundData: c.foundData,
+needsToBeDone: c.needsToBeDone,
+failed: c.failed
+];
+};
+
+GetNode: PUBLIC PROC [name: ROPE] RETURNS [node: Node] = {
+IF (node ¨ NARROW[nodes.Lookup[name]]) = NIL
+THEN nodes.Insert[node ¨ NEW [NodeRep ¨ [name: name]], node]};
+
+GetKey: PROC [data: REF ANY] RETURNS [REF ANY] --RedBlackTree.GetKey--  =
+{RETURN[data]};
+
+CompareNodes: PROC [k, data: REF ANY] RETURNS [Basics.Comparison]  --RedBlackTree.Compare-- =
+BEGIN
+GetKey: PROC [ra: REF] RETURNS[r: ROPE] = {
+r ¨ WITH ra SELECT FROM
+n: Node => n.name,
+x: ROPE => x,
+ENDCASE => ERROR};
+k1: ROPE ¨ GetKey[k];
+k2: ROPE ¨ GetKey[data];
+RETURN [k1.Compare[s2: k2, case: FALSE]];
+END;
+
+
+FileTime: PUBLIC PROC [n: Node] --UpdateTimeProc-- =
+BEGIN
+FileViewerOps.WaitUntilSaved[fileName: n.name, feedBack: currentCommanderHandle.err];
+[created: n.latest] ¨ FS.FileInfo[n.name !FS.Error =>
+{n.latest ¨ BasicTime.nullGMT; CONTINUE}];
+n.timeValid ¨ TRUE;
+END;
+
+finders: LIST OF Finder ¨ NIL;
+
+AddFinder: PUBLIC PROC [finder: Finder, end: End] =
+BEGIN
+SELECT end FROM
+front => finders ¨ CONS[finder, finders];
+back => {fl: LIST OF Finder;
+IF finders = NIL THEN {finders ¨ LIST[finder]; RETURN};
+FOR fl ¨ finders, fl.rest WHILE fl.rest # NIL DO NULL ENDLOOP;
+fl.rest ¨ LIST[finder]};
+ENDCASE => ERROR;
+END;
+
+GetLeaf: PROC [name: ROPE] RETURNS [node: Node] = {
+node ¨ GetNode[name];
+IF node.producer # NIL THEN ERROR;
+node.producer ¨ leaf};
+
+EnsureNodeProduced: PROC [node: Node] =
+BEGIN
+n: Node;
+IF node.producer # NIL THEN RETURN;
+n ¨ EnsureProduced[node.name, FALSE];
+IF node # n THEN ERROR Error[IO.PutFR["Disagreement on cannonical name for %g or %g", IO.rope[node.name], IO.rope[n.name]]];
+END;
+
+EnsureProduced: PROC [resultName: ROPE, makeModifiable: BOOL] RETURNS [sought: Node] =
+BEGIN
+FOR fl: LIST OF Finder ¨ finders, fl.rest WHILE fl # NIL DO
+found: BOOLEAN;
+makes, from, why: NodeList;
+cmd: ROPE;
+class: CommandClass;
+foundData: REF ANY;
+Process.CheckForAbort[];
+[found, sought, makes, from, why, cmd, class, foundData] ¨ fl.first.finderProc[resultName: resultName, finderData: fl.first.finderData];
+IF found THEN {
+c: Command;
+first: BOOLEAN ¨ TRUE;
+soughtIn: BOOL ¨ FALSE;
+already: Command ¨ NIL;
+sought.modifiable ¨ sought.modifiable OR makeModifiable;
+IF (NOT sought.modifiable) AND boundaryKnown THEN RETURN [GetLeaf[resultName]];
+FOR ml: NodeList ¨ makes, ml.rest WHILE ml # NIL DO
+soughtIn ¨ soughtIn OR (sought = ml.first);
+IF first
+THEN {already ¨ ml.first.producer; first ¨ FALSE}
+ELSE {IF ml.first.producer # already
+THEN ERROR Error[IO.PutFR[
+"Command %g doesn't precisely cover command %g (e.g., at %g)",
+IO.refAny[cmd],
+IO.refAny[IF already # NIL THEN already.cmd ELSE NIL],
+IO.rope[ml.first.name]]]};
+ENDLOOP;
+IF NOT soughtIn THEN ERROR Error["Finder blew it"];
+IF already # NIL THEN RETURN [sought];
+c ¨ NEW [CommandRep ¨
+[cmd: cmd, makes: makes, from: from, missedResults: NIL, class: class, foundData: foundData]];
+FOR ml: NodeList ¨ c.makes, ml.rest WHILE ml # NIL DO
+IF ml.first.producer # NIL THEN ERROR;
+ml.first.producer ¨ c;
+ENDLOOP;
+FOR wl: NodeList ¨ why, wl.rest WHILE wl # NIL DO
+wl.first.derivedCmds ¨ CONS[c, wl.first.derivedCmds];
+ENDLOOP;
+RETURN};
+ENDLOOP;
+sought ¨ GetLeaf[resultName];
+END;
+
+leafClass: CommandClass ¨ NEW [CommandClassRep ¨ [UpdateTime: FileTime, Explain: ExplainLeaf]];
+
+root: Command ¨ NEW [CommandRep ¨ [cmd: "-- root"]];
+leaf: Command ¨ NEW [CommandRep ¨ [cmd: "-- leaf", class: leafClass]];
+
+ExplainLeaf: ExplainProc = {to.PutRope[" OOPS! Internal inconsistency (#3)\n"]};
+
+Explain: PUBLIC PROC [ch: Commander.Handle, what: RopeList] =
+BEGIN
+to: IO.STREAM ¨ ch.out;
+cwd: ROPE ¨ ConvertFromSlashFormat[FileNames.CurrentWorkingDirectory[]];
+currentCommanderHandle ¨ ch;
+FOR wl: RopeList ¨ what, wl.rest WHILE wl # NIL DO
+node: Node ¨ NIL;
+Try: PROC [name: ROPE] RETURNS [found: BOOL] = {
+IF node # NIL THEN ERROR;
+node ¨ NARROW[nodes.Lookup[name]];
+IF found ¨ (node # NIL) THEN wl.first ¨ name};
+IF
+Try[wl.first] OR
+Try[cwd.Cat[wl.first]] OR
+Try[wl.first.Cat[".BCD"]] OR
+Try[cwd.Cat[wl.first, ".BCD"]]
+THEN node.explained ¨ FALSE;
+ENDLOOP;
+FOR wl: RopeList ¨ what, wl.rest WHILE wl # NIL DO
+node: Node ¨ NARROW[nodes.Lookup[wl.first]];
+IF node = NIL THEN to.PutF["There was no %g\n\n", IO.rope[wl.first]]
+ELSE BEGIN
+to.PutF["%g needed by: {", IO.rope[node.name]];
+IF node.rooted THEN to.PutRope["\n\troot"];
+FOR cl: CommandList ¨ node.consumers, cl.rest WHILE cl # NIL DO
+cc: Command ¨ NARROW[cl.first];
+to.PutF["\n\t%g", IO.rope[cc.cmd]];
+ENDLOOP;
+to.PutRope["}\n"];
+IF NOT node.explained THEN {
+c: Command ¨ node.producer;
+IF c = NIL THEN to.PutF["Nothing knew how to make %g\n\n", IO.rope[wl.first]]
+ELSE IF c = leaf THEN to.PutF["%g was a source\n\n", IO.rope[wl.first]]
+ELSE BEGIN
+to.PutF["%g:\n\tMakes:\n", IO.rope[c.cmd]];
+FOR ml: NodeList ¨ c.makes, ml.rest WHILE ml # NIL DO
+to.PutF["\t\t%g\n", IO.rope[ml.first.name]];
+ml.first.explained ¨ TRUE;
+ENDLOOP;
+to.PutRope["\tFrom:\n"];
+FOR ml: NodeList ¨ c.from, ml.rest WHILE ml # NIL DO
+to.PutF["\t\t%g\n", IO.rope[ml.first.name]];
+ENDLOOP;
+IF c.needsToBeDone # (c.outdated OR (c.missedResults # NIL)) THEN ERROR;
+IF c.outdated THEN {
+to.PutRope["\tneeded to be done because of inconsistency:\n"];
+c.class.Explain[c, to];
+};
+IF c.missedResults # NIL THEN to.PutF["\tneeded to be done because result(s) %g missing\n", IO.rope[EnglishList[c.missedResults].el]];
+IF NOT c.needsToBeDone THEN {
+to.PutRope["\tdid not need to be done\n"];
+c.class.Explain[c, to];
+};
+IF (c.needsToBeDone OR c.makesACertainlyModifiable) AND NOT c.canBeDone THEN
+BEGIN
+misses: ROPE;
+missCount: CARDINAL ¨ 0;
+[misses, missCount] ¨ EnglishList[c.missedSources, TRUE];
+SELECT missCount FROM
+= 0 => to.PutRope[" OOPS! Internal inconsistency (#1)!\n"];
+> 0 => to.PutF["\tcouldn't be done because %g couldn't be made.\n", IO.rope[misses]];
+ENDCASE => ERROR;
+END;
+to.PutRope["\n"];
+END;
+};
+END;
+ENDLOOP;
+currentCommanderHandle ¨ NIL;
+END;
+
+ConvertFromSlashFormat: PROC [slashy: ROPE] RETURNS [squigly: ROPE] =
+BEGIN
+cp: FS.ComponentPositions;
+full: ROPE;
+[fullFName: full, cp: cp] ¨ FS.ExpandName[slashy.Concat["foo"]];
+squigly ¨ full.Substr[start: 0, len: cp.base.start];
+END;
+
+EnglishList: PROC [nl: NodeList, all: BOOLEAN ¨ TRUE] RETURNS [el: ROPE, ec: CARDINAL] =
+BEGIN
+twoOfMany: ROPE;
+ec ¨ 0;
+FOR nl ¨ nl, nl.rest WHILE nl # NIL DO
+IF (NOT all) AND Exists[nl.first] THEN LOOP;
+SELECT ec FROM
+=0 => el ¨ nl.first.name;
+=1 => {
+twoOfMany ¨ nl.first.name.Cat[", and ", el];
+el ¨ nl.first.name.Cat[" and ", el];
+};
+=2 => el ¨ nl.first.name.Cat[", ", twoOfMany];
+>2 => el ¨ nl.first.name.Cat[", ", el];
+ENDCASE => ERROR;
+ec ¨ ec + 1;
+ENDLOOP;
+END;
+
+DestroyNode: PROC [a: REF ANY] RETURNS [stop: BOOLEAN] = {
+n: Node ¨ NARROW[a];
+stop ¨ FALSE;
+n.props ¨ NIL;
+n.derivedCmds ¨ NIL;
+n.producer ¨ NIL};
+
+Ensure: PUBLIC ENTRY PROC [ch: Commander.Handle, what, otherModifiable: RopeList, guessBoundary, dontDo, assumeAllInconsistent: BOOL] RETURNS [nFailed, nSucceeded, nSteps: NAT, failedSteps: CommandList, cmds: ROPE] =
+BEGIN ENABLE UNWIND => {};
+goals: NodeList ¨ NIL;
+nFailed ¨ nSucceeded ¨ 0;
+IF debugging AND log = NIL THEN [in: in, out: log] ¨ ViewerIO.CreateViewerStreams["MakeDo Log"];
+nodes.EnumerateIncreasing[DestroyNode];
+nodes.DestroyTable[];
+currentCommanderHandle ¨ ch;
+boundaryKnown ¨ NOT guessBoundary;
+depth ¨ 0;
+stepCount ¨ 0;
+failedCmds ¨ NIL;
+cmds ¨ NIL;
+FOR rl: RopeList ¨ otherModifiable, rl.rest WHILE rl # NIL DO
+n: Node ¨ EnsureProduced[rl.first, TRUE];
+n ¨ n;
+ENDLOOP;
+FOR rl: RopeList ¨ what, rl.rest WHILE rl # NIL DO
+n: Node ¨ EnsureProduced[rl.first, TRUE];
+n.rooted ¨ TRUE;
+goals ¨ CONS[n, goals];
+ENDLOOP;
+FOR goals ¨ goals, goals.rest WHILE goals # NIL DO
+p: Command ¨ goals.first.producer;
+cmds ¨ EnsureWork[p, goals.first, dontDo, assumeAllInconsistent, cmds];
+IF p.failed OR NOT p.canBeDone THEN nFailed ¨ nFailed + 1 ELSE nSucceeded ¨ nSucceeded + 1;
+ENDLOOP;
+currentCommanderHandle ¨ NIL;
+IF debugging THEN Log["\n"];
+nSteps ¨ stepCount;
+failedSteps ¨ failedCmds;
+END;
+
+failedCmds: CommandList;
+stepCount: INT;
+currentCommanderHandle: PUBLIC Commander.Handle;
+
+EnsureWork: PROC [c: Command, goal: Node, dontDo, assumeAllInconsistent: BOOL, prevCmds: ROPE] RETURNS [allCmds: ROPE] =
+BEGIN
+already: BOOL ¨ c.initialized;
+PostAmble: PROC = {
+goal.inStack ¨ FALSE;
+IF debugging THEN Log["EW <- %g", IO.rope[c.cmd]];
+depth ¨ depth - 1};
+allCmds ¨ prevCmds;
+IF c # goal.producer THEN ERROR;
+IF goal.inStack THEN {
+SIGNAL Warning[IO.PutFR["Found dependency cycle containing %g", IO.rope[goal.name]]];
+RETURN;
+};
+depth ¨ depth + 1;
+IF debugging THEN Log["EW -> %g ", IO.rope[c.cmd]];
+goal.inStack ¨ TRUE;
+{ENABLE UNWIND => PostAmble[];
+goal.needed ¨ TRUE;
+IF (c = leaf) OR (c.initialized AND c.needsToBeDone) THEN {PostAmble[]; RETURN};
+WHILE NOT c.initialized DO
+c.initialized ¨ TRUE;
+c.outdated ¨ FALSE;
+c.makesACertainlyModifiable ¨ FALSE;
+FOR ml: NodeList ¨ c.makes, ml.rest WHILE ml # NIL DO
+IF ml.first.modifiable THEN {c.makesACertainlyModifiable ¨ TRUE; EXIT};
+ENDLOOP;
+FOR mrl: NodeList ¨ c.missedResults, mrl.rest WHILE mrl # NIL DO
+mrl.first.missed ¨ FALSE;
+ENDLOOP;
+c.missedResults ¨ NIL;
+FOR sl: NodeList ¨ c.from, sl.rest WHILE sl # NIL DO
+Process.CheckForAbort[];
+sl.first.consumers ¨ CONS[c, sl.first.consumers];
+EnsureNodeProduced[sl.first];
+allCmds ¨ EnsureWork[sl.first.producer, sl.first, dontDo, assumeAllInconsistent, allCmds];
+ENDLOOP;
+ENDLOOP;
+Process.CheckForAbort[];
+IF (NOT goal.missed) AND (NOT Exists[goal]) THEN {
+c.missedResults ¨ CONS[goal, c.missedResults];
+goal.missed ¨ TRUE};
+c.needsToBeDone ¨ c.outdated OR (c.missedResults # NIL);
+IF (NOT c.needsToBeDone) AND (NOT already) AND (assumeAllInconsistent OR c.class.NotCurrent[c]) THEN c.outdated ¨ c.needsToBeDone ¨ TRUE;
+IF c.needsToBeDone OR (c.makesACertainlyModifiable AND NOT already) THEN {
+missedBitches: NodeList ¨ NIL;
+c.missedSources ¨ NIL;
+FOR sl: NodeList ¨ c.from, sl.rest WHILE sl # NIL DO
+p: Command ¨ sl.first.producer;
+SELECT p FROM
+leaf => IF NOT Exists[sl.first] THEN {
+c.missedSources ¨ CONS[sl.first, c.missedSources];
+missedBitches ¨ CONS[sl.first, missedBitches]};
+ENDCASE => IF p.needsToBeDone AND (p.failed OR NOT p.canBeDone) THEN {
+c.missedSources ¨ CONS[sl.first, c.missedSources];
+IF NOT sl.first.modifiable THEN missedBitches ¨ CONS[sl.first, missedBitches];
+};
+ENDLOOP;
+c.canBeDone ¨ c.missedSources = NIL;
+IF c.needsToBeDone AND c.canBeDone THEN {
+IF dontDo THEN {
+allCmds ¨ allCmds.Cat[c.cmd, "\n"];
+}
+ELSE {
+IF debugging THEN Confirm[c.cmd];
+stepCount ¨ stepCount + 1;
+c.failed ¨ (doans ¨ CommandTool.DoCommand[commandLine: c.cmd, parent: currentCommanderHandle]) = $Failure;
+IF c.failed THEN failedCmds ¨ CONS[c, failedCmds];
+FOR ml: NodeList ¨ c.makes, ml.rest WHILE ml # NIL DO
+ml.first.timeValid ¨ FALSE;
+ENDLOOP;
+FOR ml: NodeList ¨ c.makes, ml.rest WHILE ml # NIL DO
+FOR cl: CommandList ¨ ml.first.derivedCmds, cl.rest WHILE cl # NIL DO
+RederiveCommand[cl.first];
+ENDLOOP;
+ENDLOOP;
+};
+};
+IF missedBitches # NIL AND c.makesACertainlyModifiable THEN {
+SIGNAL Warning[IO.PutFR[
+"Couldn't %g%g because %g missing or unmakeable.\n",
+IO.rope[IF NOT c.needsToBeDone THEN "check consistency of " ELSE ""],
+IO.rope[c.cmd],
+IO.rope[EnglishList[c.missedSources].el]]];
+};
+};
+};
+PostAmble[];
+END;
+
+doans: REF ANY;
+
+RederiveCommand: PROC [c: Command] =
+BEGIN
+[c.from, c.cmd] ¨ c.class.Rederive[c];
+c.initialized ¨ FALSE;
+END;
+
+Exists: PUBLIC PROC [n: Node, u: UpdateTimeProc ¨ NIL] RETURNS [exists: BOOL] =
+{exists ¨ Latest[n, u] # BasicTime.nullGMT};
+
+Latest: PUBLIC PROC [n: Node, u: UpdateTimeProc ¨ NIL] RETURNS [t: BasicTime.GMT] = {
+IF n.timeValid THEN RETURN [n.latest];
+(IF u = NIL THEN n.producer.class.UpdateTime ELSE u)[n];
+IF NOT n.timeValid THEN ERROR;
+t ¨ n.latest};
+
+END. 
+   æ  
+MakeDoImpl.Mesa
+Copyright ” 1991 by Xerox Corporation.  All rights reserved.
+Last Edited by: Spreitzer, May 20, 1985 11:44:42 am PDT
+Carl Hauser, April 11, 1985 3:43:34 pm PST
+IF A is needed & C makes A from B THEN B is needed.
+
+IF A is needed & A doesn't exist & C makes A THEN C needs to be done
+
+IF A is needed & A is out-of-date & C makes A THEN C needs to be done
+
+IF C needs to be done & (ForAll B used by C: B exists) THEN C can be done
+
+IF C needs to be done & C can't be done THEN C fails
+
+IF C succeeded & C makes A THEN A may have changed
+
+IF C failed & C makes A THEN A doesn't exist
+
+IF C derived from D & D changed THEN {B| C uses B} may have changed
+
+IF A is needed & A is certainly modifiable & C makes A from B & B doesn't exist THEN Complain (actually, don't complain if complaint was already given for a recursive ingredient)
+
+BasicTime.nullGMT means does not exist.
+c.missedSources that are likely to be the source of the problem:
+ù "  ïNewlineDelimiter
+ñ(cedarcode) styleô codeôKöú
+œeú1ô<Jô7Kô*óKò Kô3Kô KôDKô KôEKô KôIKô Kô4Kô Köú2ô2Kô Kô,Kô KôCKô Kô≤Kô Köœk	úFûúûú;òêKò ö–bxúûúûòKöûú(ûúûú'ò\Köûú	òóKò KöûúûúòKò Kö
+–blúûúûúûúûúò.Kò Kö
+†úûúûúûúûúò+Kò Köú
+ûúûúûúòKöúûúûú	òöú	ûúûúûúòKöúûúòKöúûúòKöú&ûúò*KöúûúòKöúûúûúòKöúûúûúòKöúûúûúòKöúûúûúòKöúûúûúòKöúûúûúòKöú	ûúûúòöúûúò)Köú'ô'óKòóKò Köú	ûúûúòöúûúûúûúò"Köúûúò
+Kò4Köúûúûúò)KòKöúûúûúòKöúûúûúòKöúûúûúòKöúûúûúòKöúûúûò'KöúòKò óKöúFòFKò KöúûúòKöúûúûúòKöú	ûúûúûúòKöúûúûúòKò ö
+œnúûúûúûúûúòGKöûòKö
+ûúûúûúûúûúò7Kò"KòKöûúòóKò ö°úûú
+ûúòKöûòKö
+ûúûúûúûúûúò7Köúûúò,Köûúûúûúûúò)KöûúòóKò ö
+°úûúûúûúûúNòäöûúòKòKòKöúòKöúòKöúòKöúòóKòóKò Kö°úûúûú6òKKò ö°	úûúûú ûúò>KöûúûúûúòKöúûúò-óKò ö
+°úûúûúûú
+ûúò9KòóKò ö°úûúûúûúûú$ûúûúûúòéöûúòKòKòKòKòKöúòKöúòKòóKöúòóKò ö
+°úûúûúûúûúò:öûú	ûúûò,Köûúûú"ò>Kò óóö°úûúûúûúûúûúûúœcúòIKöúûúòóKò ïStartOfExpansion[]ö°úûúûúûúûú¢úò]Köûòö
+°úûúûúûúûúò+öúûúûúûòKòKöúûúòKöûúûúòóóKöúûúòKöúûúòKöûúûúò)KöûúòóKò Kò ö°úûúûú¢úò4KöûòKòUöúûúûú	ò5Köúûúò*óKöúûúòKöûúòóKò Köú	ûúûú
+ûúòKò ö°	úûúûúò3KöûòöûúûòKöúûúò)öúûúûúòKö
+ûúûúûúûú
+ûúò7Köûúûúûúûúûúûúò>Köú
+ûú
+òóKöûúûúòóKöûúòóKò ö°úûúûúûúò3KòKöûúûúûúûúò"KòóKò ö°úûúò'KöûòKòKöûúûúûúûúò#Köúûúò%Köûú
+ûúûúûú7ûúûúò|KöûúòóKò ö
+°úûúûúûúûúòVKöûòöûúûúûúûúûúûò;KöúûúòKòKöúûúò
+KòKöúûúûúòKòKöúàòàöûúûúòKöúòKöúûúûúòKöú
+ûúûúòKöúûúòKöú&ûúò8Kö
+ûúûúûúûúûúòOöûúûúûúûò3Köúûúò+öûúòKöûú'ûúò1öûúûúò$öûúûúûúòKöú>ò>KöûúòKöûúûúûúûúûúûúò6KöûúòóóóKöûúòóKöûúûú
+ûúûúò3Köûúûúûúûú
+ò&öúûúòKöú4ûú'ò^óöûú!ûúûúûò5Köûúûúûúûúò&KöúòKöûúòóöûúûúûúûò1Köúûúò5KöûúòóKöûúòóKöûúòóKöúòKöûúòóKò KöúûúBò_Kò Köúûú!ò4Köúûú3òFKò Kö°úEòPKò ö°úûúûú)ò=KöûòKöúûúûú
+òKöúûú?òHKöúòöûúûúûúûò2Köúûúòö
+°úûúûúûú	ûúò0KöûúûúûúûúòKöúûúò"Köûúûúûúò.óöûòKöúûòKöúûòKöúûòKöúòKöûúûúòóKöûúòóöûúûúûúûò2Köúûúò,Köûúûúûú ûúòDöûúûò
+Köúûúò/Köûúûúò+öûú+ûúûúûò?KöúûúòKöúûúò#KöûúòóKòöûúûúûúòKòKöûúûúûú,ûúòMKöûúûú
+ûú ûúòGöûúûò
+Köúûúò+öûú!ûúûúûò5Köúûúò,KöúûúòKöûúòóKòöûú ûúûúûò4Köúûúò,KöûúòóKö
+ûúûúûúûúûúòHöûúûúòKöú>ò>KöúòKöúòóKöûúûúûú?ûú(òÜöûúûúûúòKöú*ò*KöúòKòóö	ûúûúûúûúûòLKöûòKöúûúòKöúûúòKöú3ûúò9öûúûòKöú;ò;KöúDûúòUKöûúûúòóKöûúòóKòKöûúòóKöúòóKöûúòóKöûúòóKöúûúòKöûúòóKò ö
+°úûú
+ûúûúûúòEKöûòKöúûúòKöúûúòKöúûú"ò@Kò4KöûúòóKò ö°úûúûúûúûúûúûúòXKöûòKöúûúòKöúòöûúûúûúûò&Kö
+ûúûúûúûúûúò,öûúûòKöúòöúòKöú,ò,Köú$ò$KöúòóKöú.ò.Köú'ò'KöûúûúòóKòKöûúòóKöûúòóKò ö°úûúûúûúûúûúò:Köú
+ûúòKöúûúòKöú
+ûúòKöúûúòKöúûúòóKò ö°úûúûúûúgûúûúûú"ûúòÿKöûúûúûúòKöúûúòKöúòKöûúûúûúûúAò`Kò'KöúòKöúòKöúûúò"Kò
+KòKöúûúòKöúûúòöûú)ûúûúûò=Köú#ûúò)KòKöûúòóöûúûúûúûò2Köú#ûúò)KöúûúòKöúûúòKöûúòóöûúûú	ûúûò2Kò"KöúGòGKö
+ûú
+ûúûúûúûúò[KöûúòóKöúûúòKöûúûúòKòKòKöûúòóKò KöúòKöúûúòKöúûúò0Kò ö°
+úûú9ûúûúûúûúòxKöûòKöú	ûúòö°	úûúòKöúûúòKöûúûúûúò2KöúòóKöúòKöûúûúûúò öûúûúòKöûú	ûú/ûúòUKöûúòKòóKòKöûúûúûúò3KöúûúòKöúûúûúòKöúûúòKö
+ûúûúûúûúûúòPöûúûúûòKöúûúòKöúûúòKöúûúò$öûú!ûúûúûò5Köûúûú ûúûúòGKöûúòóöûú+ûúûúûò@KöúûúòKöûúòóKöúûúòöûú ûúûúûò4KòKöúûúò1KòKöúZòZKöûúòóKöûúòóKòö
+ûúûúûúûúûúò2Köúûúò.KöúûúòóKöúûúûúò8Köûúûúûúûú
+ûúûúûú ûúòâö
+ûúûúûúûú
+ûúòJô@KöúûúòóKöúûúòöûú ûúûúûò4Kòöûúûòöúûúûúûúò&Köúûúò2Köúûúò/óöûúûúûúûúûúûúòFKöúûúò2KöûúûúûúûúòNKòóóKöûúòóKöú ûúò$öûúûúûúò)öûúûúòKöú#ò#KòóöûúòKöûúûúò!KòKöújòjKöûú
+ûúûúò2öûú!ûúûúûò5KöúûúòKöûúòóöûú!ûúûúûò5öûú1ûúûúûòEKöúòKöûúòóKöûúòóKòóKòóöûúûúûúûúò=öûú	ûúòKöú4ò4Kö
+ûúûúûúûúûúòEKöûúòKöûú)ò+óKòóKòóKòKòKöûúòóKò KöúûúûúòKò ö°úûúò$KöûòKò&KöúûúòKöûúòóKò ö
+°úûúûúûú
+ûúòOKöú,ò,óKò ö°úûúûúûúûúûúòUKöûúûúûúò&Kö	úûúûúûúûúò8KöûúûúûúûúòKöûú
+òóKò Köûúòó Öó    72  P  

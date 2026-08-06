@@ -1,0 +1,1092 @@
+DIRECTORY
+Ascii USING [CR, LF],
+Carets USING [StartCaret, StopCaret],
+Char USING [XCHAR, Set, Narrow],
+Convert,
+EditSpan USING [CompareNodeOrder],
+Imager USING [Color, Context, MaskRectangleI, SetColor],
+ImagerBackdoor USING [MakeStipple],
+InputFocus USING [GetInputFocus, SetInputFocus],
+MessageWindow USING [Append, Blink, Clear],
+Process USING [Detach, GetCurrent],
+Rope,
+TEditDocument USING [LineTable, maxClip, Selection, SelectionId, SelectionPoint, SelectionRec, TEditDocumentData],
+TEditInput,
+TEditInputOps,
+TEditLocks USING [LockDocAndTdd, LockRef, Unlock, UnlockDocAndTdd],
+TEditOps,
+TEditProfile USING [selectionCaret],
+TEditRefresh USING [ScrollToEndOfSel],
+TEditSelection USING [FindWhere, ForceDown, InsertionPoint, IsDown, SetSelLooks],
+TEditSelectionOps USING [],
+TEditSelectionOpsExtras USING [],
+TEditSelectionPrivate USING [CharPositionInCachedLine],
+TEditSelectionPrivateExtras USING [],
+TEditTouchup USING [LockAfterRefresh, UnlockAfterRefresh],
+TextEdit,
+TextEditExtras,
+TextNode,
+Tioga,
+TiogaFind,
+ViewerClasses USING [ModifyProc, Viewer],
+ViewerLocks USING [CallUnderWriteLock],
+ViewerOps USING [AddProp, BlinkDisplay, FetchProp, PaintViewer];
+
+TEditSelectionImpl: CEDAR MONITOR
+IMPORTS Carets, Char, Convert, EditSpan, Imager, ImagerBackdoor, InputFocus, MessageWindow, Process, Rope, TEditInput, TEditLocks, TEditInputOps, TEditOps, TEditProfile, TEditRefresh, TEditSelection, TEditSelectionPrivate, TEditTouchup, TextEdit, TextEditExtras, TextNode, TiogaFind, ViewerLocks, ViewerOps
+EXPORTS TEditSelection, TEditSelectionOps, TEditSelectionOpsExtras
+= BEGIN
+
+ROPE: TYPE ~ Rope.ROPE;
+Node: TYPE ~ Tioga.Node;
+Location: TYPE ~ Tioga.Location;
+Selection: TYPE ~ TEditDocument.Selection;
+SelectionId: TYPE ~ TEditDocument.SelectionId;
+FindWhere: TYPE ~ TEditSelection.FindWhere;
+Viewer: TYPE = ViewerClasses.Viewer;
+LockRec: TYPE = RECORD [
+process: PROCESS ¬ NIL, -- the process holding the lock
+whoLast, whoFirst: ROPE, -- the last lockers
+count, maxCount: [0..255] ¬ 0 -- number of times inside the lock
+];
+LockRef: TYPE = REF LockRec;
+
+selLock: ARRAY SelectionId OF LockRef ¬ [NEW[LockRec], NEW[LockRec], NEW[LockRec]];
+unlocked: CONDITION;
+
+UnlockDocAndPSel: PUBLIC PROC [root: Node] = {
+TEditLocks.Unlock[root]; UnlockSel[primary] 
+};
+
+LockBothSelections: PUBLIC PROC [who: ROPE] = {
+LockSel[primary, who]; LockSel[secondary, who] 
+};
+
+UnlockBothSelections: PUBLIC PROC = { UnlockSel[primary]; UnlockSel[secondary] };
+
+LockSel: PUBLIC ENTRY PROC [selection: SelectionId, who: ROPE] = {
+ENABLE UNWIND => NULL;
+myProcess: PROCESS;
+lock: LockRef = selLock[selection];
+TRUSTED {myProcess ¬ LOOPHOLE[Process.GetCurrent[]]};
+IF myProcess#lock.process THEN {
+WHILE lock.count>0 DO WAIT unlocked; ENDLOOP;
+lock.process ¬ myProcess;
+};
+IF lock.count=0 THEN lock.whoFirst ¬ who ELSE lock.whoLast ¬ who;
+lock.count ¬ lock.count+1;
+lock.maxCount ¬ MAX[lock.maxCount, lock.count];
+};
+
+UnlockSel: PUBLIC ENTRY PROC [selection: SelectionId ¬ primary] = {
+ENABLE UNWIND => NULL;
+lock: LockRef = selLock[selection];
+TRUSTED { IF lock.process # Process.GetCurrent[] THEN ERROR };
+IF (lock.count ¬ lock.count-1) > 0 THEN RETURN;
+lock.whoLast ¬ lock.whoFirst ¬ NIL;
+BROADCAST unlocked 
+};
+pSel: PUBLIC Selection ¬ Create[];
+sSel: PUBLIC Selection ¬ Create[];
+fSel: PUBLIC Selection ¬ Create[];
+oldSel: PUBLIC Selection ¬ Create[];
+nilSel: PUBLIC Selection ¬ Create[];
+tSel1, tSel2, tSel3: Selection ¬ NIL; -- cache of temporary selection records
+Create: PUBLIC PROC RETURNS [Selection] = {
+RETURN [NEW[TEditDocument.SelectionRec]] 
+};
+
+Alloc: PUBLIC ENTRY PROC RETURNS [tSel: Selection] = {
+ENABLE UNWIND => NULL;
+tSel ¬ tSel3; IF tSel # NIL THEN {tSel3 ¬ NIL; RETURN};
+tSel ¬ tSel2; IF tSel # NIL THEN {tSel2 ¬ NIL; RETURN};
+tSel ¬ tSel1; IF tSel # NIL THEN {tSel1 ¬ NIL; RETURN};
+tSel ¬ Create[];
+};
+
+Free: PUBLIC PROC [tSel: Selection] = {
+IF tSel3 = tSel OR tSel2 = tSel OR tSel1 = tSel THEN ERROR;
+IF tSel3 = NIL THEN tSel3 ¬ tSel
+ELSE IF tSel2 = NIL THEN tSel2 ¬ tSel
+ELSE IF tSel1 = NIL THEN tSel1 ¬ tSel;
+};
+
+Copy: PUBLIC ENTRY PROC [source, dest: Selection] = {
+ENABLE UNWIND => NULL;
+dest­ ¬ source­;
+};
+MakePointSelection: PUBLIC PROC [selection: Selection, pos: Location] = {
+tSel: Selection ¬ Alloc[];
+Copy[source: selection, dest: tSel];
+tSel.start.pos ¬ tSel.end.pos ¬ pos;
+tSel.granularity ¬ point;
+tSel.pendingDelete ¬ FALSE;
+tSel.insertion ¬ before;
+MakeSelection[selection: primary, new: tSel];
+Free[tSel];
+};
+
+ChangeSelections: PROC [proc: PROC [tSel: Selection], sel: Selection] = {
+tSel: Selection ¬ Alloc[];
+LockBothSelections["ChangeBothSelections"];
+{ ENABLE UNWIND => UnlockBothSelections[]; 
+Copy[source: sel, dest: tSel]; proc[tSel] 
+};
+UnlockBothSelections[]; Free[tSel] 
+};
+
+PushOrExchangeSelections: PUBLIC PROC = {
+DoPush: PROC [tSel: Selection] = {
+MakeSelection[IF sSel.viewer=NIL THEN NIL ELSE sSel, primary];
+MakeSelection[IF tSel.viewer=NIL THEN NIL ELSE tSel, secondary] 
+};
+ChangeSelections[DoPush, pSel] 
+};
+
+MakePrimary: PUBLIC PROC = {
+DoMakePrimary: PROC [tSel: Selection] = {
+Deselect[secondary]; MakeSelection[tSel, primary] 
+};
+ChangeSelections[DoMakePrimary, sSel] 
+};
+
+MakeSecondary: PUBLIC PROC = {
+DoMakeSecondary: PROC [tSel: Selection] = {
+Deselect[primary];
+MakeSelection[tSel, secondary] ;
+};
+ChangeSelections[DoMakeSecondary, pSel] 
+};
+
+CancelPrimary: PUBLIC PROC = {
+MakeSelection[NIL, primary];
+};
+
+CancelSecondary: PUBLIC PROC = {
+MakeSelection[NIL, secondary];
+};
+
+CancelFeedback: PUBLIC PROC = {
+MakeSelection[NIL, feedback];
+};
+
+FakeSecondary: PUBLIC PROC [sel: Selection] = {
+inner: PROC = {
+IF sSel.viewer # NIL THEN Deselect[secondary];
+Copy[source: sel, dest: sSel];
+};
+WithLockedSelection[secondary, inner, "FakeSecondary"];
+};
+
+Deselect: PUBLIC PROC [selection: SelectionId ¬ primary] = {
+inner: PROC = {
+sel: Selection = SELECT selection FROM
+primary => pSel, secondary => sSel, feedback => fSel, ENDCASE => ERROR;
+viewer: Viewer = sel.viewer;
+op: ATOM = SELECT selection FROM
+primary => $TakeDownPSel,
+secondary => $TakeDownSSel,
+feedback => $TakeDownFSel,
+ENDCASE => ERROR;
+down: BOOL = TEditSelection.IsDown[selection];
+Copy[source: nilSel, dest: sel];
+IF viewer#NIL AND NOT down THEN {
+ViewerOps.PaintViewer[viewer, client, FALSE, op];
+IF NOT TEditSelection.IsDown[selection] THEN TEditSelection.ForceDown[selection];
+}
+};
+WithLockedSelection[selection, inner, "Deselect"];
+};
+
+MakeSelection: PUBLIC PROC [new: Selection ¬ NIL, selection: SelectionId ¬ primary, startValid, endValid: BOOL ¬ FALSE, forkPaint: BOOL ¬ TRUE] = {
+inner: PROC = {
+sel: Selection;
+op: ATOM;
+SELECT selection FROM
+primary => {
+if: Viewer = InputFocus.GetInputFocus[].owner;
+sel ¬ pSel;
+op ¬ $ShowPSel;
+IF new=NIL
+THEN {IF if#NIL THEN InputFocus.SetInputFocus[NIL]}
+ELSE {IF if#new.viewer THEN InputFocus.SetInputFocus[new.viewer]};
+};
+feedback => {
+sel ¬ fSel;
+op ¬ $ShowFSel;
+};
+secondary => {
+sel ¬ sSel;
+op ¬ $ShowSSel;
+};
+ENDCASE => ERROR;
+IF new=NIL OR new.viewer # sel.viewer THEN Deselect[selection];
+IF new#NIL THEN {
+IF selection#feedback AND fSel.viewer=new.viewer THEN Deselect[feedback];
+Copy[source: new, dest: sel];
+sel.start.metricsValid ¬ startValid;
+sel.end.metricsValid ¬ endValid;
+IF sel.granularity=point THEN sel.pendingDelete ¬ FALSE;
+IF forkPaint
+THEN {
+showSel: REF ShowSelRec = SELECT selection FROM
+primary => showPSel, secondary => showSSel, ENDCASE => showFSel;
+IF ~showSel.processRunning THEN {
+showSel.processRunning ¬ TRUE;
+TRUSTED { Process.Detach[FORK ShowSel[showSel, op]] }
+} 
+}
+ELSE ViewerOps.PaintViewer[sel.viewer, client, FALSE, op];
+};
+};
+WithLockedSelection[selection, inner, "MakeSelection"];
+};
+
+ShowSelRec: TYPE = RECORD [ processRunning: BOOL ¬ FALSE, selection: SelectionId ];
+showPSel: REF ShowSelRec ¬ NEW[ShowSelRec ¬ [FALSE, primary]];
+showSSel: REF ShowSelRec ¬ NEW[ShowSelRec ¬ [FALSE, secondary]];
+showFSel: REF ShowSelRec ¬ NEW[ShowSelRec ¬ [FALSE, feedback]];
+ShowSel: PROC [my: REF ShowSelRec, op: ATOM] = {
+selection: TEditDocument.SelectionId ¬ my.selection;
+sel: Selection ¬ SELECT selection FROM
+primary => pSel, secondary => sSel, feedback => fSel, ENDCASE => ERROR;
+inner: PROC = {
+viewer: Viewer ¬ sel.viewer;
+inner: PROC = {
+WITH viewer.data SELECT FROM
+tdd: TEditDocument.TEditDocumentData => {
+IF NOT TEditTouchup.LockAfterRefresh[tdd, "ShowSel"] THEN RETURN;
+ViewerOps.PaintViewer[viewer, client, FALSE, op
+! UNWIND => TEditTouchup.UnlockAfterRefresh[tdd]];
+TEditTouchup.UnlockAfterRefresh[tdd];
+};
+ENDCASE;
+};
+IF viewer#NIL THEN ViewerLocks.CallUnderWriteLock[inner, viewer];
+my.processRunning ¬ FALSE;
+};
+WithLockedSelection[selection, inner, "ShowSel"];
+};
+
+
+lightGrey: Imager.Color ¬ ImagerBackdoor.MakeStipple[stipple: 0208H, xor: TRUE];
+darkGrey: Imager.Color ¬ ImagerBackdoor.MakeStipple[stipple: 0A5A5H, xor: TRUE];
+veryDarkGrey: Imager.Color ¬ ImagerBackdoor.MakeStipple[stipple: 0EBEBH, xor: TRUE];
+black: Imager.Color ¬ ImagerBackdoor.MakeStipple[stipple: 0FFFFH, xor: TRUE];
+SelColor: TYPE = {black, lightGrey, darkGrey, veryDarkGrey} ¬ black;
+SelBound: TYPE = {solid, line} ¬ solid;
+selectionLineWidth: NAT ¬ 2;
+feedbackLineWidth: NAT ¬ 4;
+feedbackLineRaise: INTEGER ¬ 1;
+
+selectionDescentLimit: NAT ¬ 7;
+
+MarkSelection: PUBLIC PROC [dc: Imager.Context, viewer: Viewer, selection: Selection, id: SelectionId] = {
+WITH viewer.data SELECT FROM
+tdd: TEditDocument.TEditDocumentData => {
+lines: TEditDocument.LineTable = tdd.lineTable;
+vHeight: INTEGER = selection.viewer.ch;
+selBound: SelBound = IF selection.pendingDelete AND id#feedback THEN solid ELSE line;
+selColor: SelColor = IF id=primary THEN black ELSE IF id=feedback THEN veryDarkGrey  ELSE IF selection.pendingDelete THEN lightGrey ELSE darkGrey;
+EffectSelect: PROC [x, y, w, h: INTEGER] = {
+lineHeight: NAT ¬ selectionLineWidth;
+bottom: INTEGER ¬ vHeight-y-h;
+IF id=feedback THEN { lineHeight ¬ feedbackLineWidth; bottom ¬ bottom - feedbackLineRaise };
+SELECT selBound FROM
+line => Imager.MaskRectangleI[dc, x, bottom, w, lineHeight];
+solid => Imager.MaskRectangleI[dc, x, bottom, w, vHeight-y-bottom];
+ENDCASE => ERROR;
+};
+IF selection.end.line<0 OR selection.start.line=LAST[INTEGER] OR (selection.start.line=selection.end.line AND selection.end.clipped) THEN RETURN; -- not visible
+SELECT selColor FROM
+black => Imager.SetColor[dc, black];
+lightGrey => Imager.SetColor[dc, lightGrey];
+darkGrey => Imager.SetColor[dc, darkGrey];
+veryDarkGrey=> Imager.SetColor[dc, veryDarkGrey];
+ENDCASE => ERROR;
+SELECT TRUE FROM
+selection.start.line = selection.end.line OR (selection.start.line < 0 AND selection.end.line = 0) => {
+x, y: INTEGER;
+IF selection.start.line < 0 OR selection.start.clipped
+THEN {
+line: INTEGER ¬ MAX[0, selection.start.line];
+x ¬ lines[line].xOffset;
+y ¬ lines[line].yOffset-lines[line].ascent;
+}
+ELSE { x ¬ selection.start.x; y ¬ selection.start.y };
+IF selection.end.clipped THEN ERROR; -- previous tests imply NOT end.clipped
+EffectSelect[x, y, selection.end.x-x+selection.end.w, selection.end.h]
+};
+selection.start.line=lines.lastLine AND selection.end.line>lines.lastLine => {
+EffectSelect[selection.start.x, selection.start.y, lines[selection.start.line].width + lines[selection.start.line].xOffset - selection.start.x, selection.start.h]
+};
+ENDCASE => {
+sl: INTEGER = MAX[0, MIN[lines.lastLine, selection.start.line]];
+el: INTEGER = MAX[0, MIN[lines.lastLine, selection.end.line]];
+EffectSelAll: PROC [n: INTEGER] = {
+EffectSelect[lines[n].xOffset, lines[n].yOffset-lines[n].ascent, lines[n].width,
+lines[n].ascent+lines[n].descent] 
+};
+IF sl=selection.start.line AND NOT selection.start.clipped
+THEN {
+EffectSelect[selection.start.x, selection.start.y, (lines[sl].width + lines[sl].xOffset - selection.start.x), selection.start.h]
+}
+ELSE {
+EffectSelAll[sl];
+};
+FOR n: INTEGER IN (sl..el) DO
+EffectSelAll[n];
+ENDLOOP;
+SELECT TRUE FROM
+selection.end.clipped => {}; -- end.line is not actually part of the selection
+el=selection.end.line => {
+EffectSelect[lines[el].xOffset, selection.end.y, selection.end.x - lines[el].xOffset + selection.end.w, selection.end.h];
+};
+ENDCASE => {
+EffectSelAll[el];-- end.line is off screen, so select all of el
+};
+};
+};
+ENDCASE;
+};
+
+ExtendSelection: PUBLIC PROC [dc: Imager.Context, viewer: Viewer, old, new: Selection, id: SelectionId, updateEnd: BOOL] = {
+TooHard: PROC = {
+MarkSelection[dc, viewer, old, id]; -- take it down
+FixupSelection[new, viewer]; -- get position info about the new selection
+MarkSelection[dc, viewer, new, id]; -- put it up
+Copy[source: new, dest: old];
+};
+IF updateEnd
+THEN {
+BumpLoc: PROC [loc: Location] RETURNS [Location] = {
+n: Node = loc.node;
+where: INT ¬ loc.where+1;
+IF where >= TextEdit.Size[n] THEN RETURN [[TextNode.StepForward[n],0]];
+RETURN [[n,where]];
+};
+tooHard: BOOL = old.end.line NOT IN [0..LAST[INTEGER]);
+sameNode: BOOL = (new.end.pos.node = old.end.pos.node);
+IF tooHard THEN {TooHard; RETURN};
+SELECT TRUE FROM
+new.end.pos=old.end.pos => {};
+(sameNode AND new.end.pos.where>old.end.pos.where) OR (NOT sameNode AND EditSpan.CompareNodeOrder[new.end.pos.node, old.end.pos.node]=after) => {
+new.start ¬ old.end;
+new.start.pos ¬ BumpLoc[new.start.pos];
+IF sameNode AND new.start.pos.node # new.end.pos.node THEN
+new.start.pos ¬ new.end.pos;
+FixupSelection[new, viewer];
+MarkSelection[dc, viewer, new, id];
+old.end ¬ new.end;
+}
+ENDCASE => {
+save: Location = new.end.pos;
+new.start ¬ new.end;
+new.start.pos ¬ BumpLoc[save];
+IF sameNode AND new.start.pos.node # new.end.pos.node THEN
+new.start.pos ¬ old.end.pos;
+new.end ¬ old.end;
+FixupSelection[new, viewer, TRUE, FALSE]; -- fix start
+MarkSelection[dc, viewer, new, id];
+old.end ¬ new.start;
+old.end.pos ¬ save;
+FixupSelection[old, viewer, FALSE, TRUE];
+};
+}
+ELSE {
+DecLoc: PROC [loc: Location] RETURNS [Location] = {
+n: Node;
+IF loc.where > 0 THEN RETURN [[loc.node, loc.where-1]];
+n ¬ TextNode.StepBackward[loc.node];
+RETURN [[n,MAX[TextEdit.Size[n],1]-1]] 
+};
+tooHard: BOOL = old.start.line NOT IN [0..LAST[INTEGER]);
+sameNode: BOOL = (new.start.pos.node = old.start.pos.node);
+IF tooHard THEN {TooHard; RETURN};
+SELECT TRUE FROM
+new.start.pos=old.start.pos => {};
+(sameNode AND new.start.pos.where<old.start.pos.where) OR (NOT sameNode AND EditSpan.CompareNodeOrder[new.start.pos.node, old.start.pos.node]=before) => {
+new.end.pos ¬ DecLoc[old.start.pos];
+FixupSelection[new, viewer];
+MarkSelection[dc, viewer, new, id];
+old.start ¬ new.start;
+}
+ENDCASE => {
+save: Location = new.start.pos;
+new.end.pos ¬ DecLoc[save];
+new.start ¬ old.start;
+FixupSelection[new, viewer, FALSE, TRUE];
+MarkSelection[dc, viewer, new, id];
+old.start.pos ¬ save;
+FixupSelection[old, viewer, TRUE, FALSE];
+};
+};
+Copy[source: old, dest: new];
+};
+
+CannotFindIt: PUBLIC ERROR = CODE;
+ComputeSpanLines: PUBLIC PROC [viewer: Viewer, span: Tioga.Span] RETURNS [start, end: INTEGER, startClipped, endClipped: BOOL] = {
+[start, startClipped] ¬ ComputePosLine[viewer, span.start];
+SELECT TRUE FROM
+span.start=span.end => { end ¬ start; endClipped ¬ startClipped };
+start=LAST[INTEGER] => end ¬ LAST[INTEGER]; -- scrolled off bottom
+ENDCASE => {
+firstLine: INTEGER = IF start<=0 THEN 0 ELSE IF startClipped THEN start-1 ELSE start;
+[end, endClipped] ¬ ComputePosLine[viewer, span.end, firstLine];
+};
+};
+
+ComputePosLine: PUBLIC PROC [viewer: Viewer, pos: Location, firstLine: INTEGER ¬ 0] RETURNS [line: INTEGER, clipped: BOOL] = {
+sp: TEditDocument.SelectionPoint ¬ ComputePosPoint[viewer, pos, firstLine, TRUE];
+RETURN [sp.line, sp.clipped];
+};
+
+ComputePosPoint: PUBLIC PROC [viewer: Viewer, pos: Location, firstLine: INTEGER ¬ 0, lineOnly: BOOL ¬ FALSE] RETURNS [sp: TEditDocument.SelectionPoint] = {
+WITH viewer.data SELECT FROM
+tdd: TEditDocument.TEditDocumentData => {
+foundPos: BOOL ¬ FALSE;
+IsPosPastLine: PROC [pos: Location, line: INTEGER] RETURNS [BOOL] = {
+next: INT;
+next ¬ lines[line].pos.where+lines[line].nChars;
+IF pos.where >= next AND lines[line].end # eon THEN RETURN [TRUE]; -- it is past this line
+RETURN [FALSE] 
+};
+FindPos: PROC [pos: Location] RETURNS [found: BOOL, line: INTEGER] = {
+found ¬ FALSE;
+FOR n: INTEGER IN [firstLine..lines.lastLine] DO
+SELECT TRUE FROM
+lines[n].pos.node=pos.node => {
+IF pos.where < lines[n].pos.where THEN EXIT; -- have gone past it
+found ¬ TRUE;
+line ¬ n 
+};
+found => EXIT;
+ENDCASE;
+ENDLOOP
+};
+lines: TEditDocument.LineTable ¬ tdd.lineTable;
+sp.pos ¬ pos;
+IF lines[0].pos.node = pos.node THEN {
+IF lines[0].pos.where > pos.where THEN {
+sp.y ¬ sp.line ¬ -LAST[INTEGER];
+RETURN;
+};
+};
+IF lines[lines.lastLine].pos.node=pos.node AND IsPosPastLine[pos,lines.lastLine] THEN {
+sp.y ¬ sp.line ¬ LAST[INTEGER]; -- after end of text
+RETURN;
+};
+firstLine ¬ MIN[lines.lastLine,MAX[firstLine,0]];
+[foundPos, sp.line] ¬ FindPos[pos]; sp.clipped ¬ FALSE;
+IF NOT foundPos THEN
+SELECT EditSpan.CompareNodeOrder[pos.node, lines[0].pos.node] FROM
+same, before => { sp.line ¬ sp.y ¬ -LAST[INTEGER]; RETURN }; -- before beginning
+disjoint => ERROR CannotFindIt;
+ENDCASE => {
+-- pos.node comes after first line node
+IF tdd.clipLevel = TEditDocument.maxClip AND tdd.commentFilter=includeComments
+THEN {
+sp.line ¬ sp.y ¬ LAST[INTEGER];
+RETURN 
+} -- after end
+ELSE {
+SELECT EditSpan.CompareNodeOrder[pos.node, lines[lines.lastLine].pos.node] FROM
+same, after => {
+sp.line ¬ sp.y ¬ LAST[INTEGER];
+RETURN 
+};
+disjoint => ERROR CannotFindIt; -- may have been deleted or moved
+ENDCASE => { -- it got clipped
+n: Node ¬ pos.node;
+delta: INTEGER ¬  TextNode.Level[n]-tdd.clipLevel;
+firstLine ¬ 0; -- need to let FindPos look at all the previous lines
+FOR i:INTEGER IN [0..delta) DO n ¬ TextNode.Parent[n]; ENDLOOP;
+n ¬ TextNode.ForwardClipped[n,tdd.clipLevel].nx;
+[foundPos, sp.line] ¬ FindPos[[n,0]];
+IF NOT foundPos THEN ERROR CannotFindIt;
+sp.clipped ¬ TRUE;
+};
+};
+};
+IF lineOnly OR sp.clipped THEN RETURN; -- otherwise, compute metrics
+sp.y ¬ lines[sp.line].yOffset-lines[sp.line].ascent;
+sp.h ¬ lines[sp.line].ascent+MIN[lines[sp.line].descent, selectionDescentLimit];
+[sp.x, sp.w] ¬ TEditSelectionPrivate.CharPositionInCachedLine[viewer, sp.line, pos];
+IF sp.x = LAST[INTEGER] THEN {
+IF sp.line=lines.lastLine
+THEN {sp.line ¬ sp.y ¬ LAST[INTEGER]}
+ELSE {sp.x ¬ lines[sp.line].width; sp.w ¬ 0};
+};
+sp.metricsValid ¬ TRUE;
+};
+ENDCASE;
+};
+
+FixupSelection: PUBLIC PROC [selection: Selection, viewer: Viewer, start, end: BOOL ¬ TRUE] = {
+IF start THEN selection.start ¬ ComputePosPoint[viewer, selection.start.pos];
+IF end THEN
+SELECT TRUE FROM
+selection.start.pos=selection.end.pos => {
+selection.end ¬ selection.start;
+};
+selection.start.line=LAST[INTEGER] => {
+selection.end.line ¬ LAST[INTEGER];
+selection.end.metricsValid ¬ TRUE;
+};
+ENDCASE => {
+firstLine: INTEGER = (
+IF selection.start.line<=0 THEN 0 ELSE IF selection.start.clipped THEN selection.start.line-1 ELSE selection.start.line
+);
+selection.end ¬ ComputePosPoint[viewer, selection.end.pos, firstLine];
+};
+};
+
+FixupCaret: PUBLIC PROC [selection: Selection] = {
+lines: TEditDocument.LineTable = selection.data.lineTable;
+node: Node ¬ selection.end.pos.node;
+size: INT ¬ TextEdit.Size[node];
+IsEOL: PROC [node: Node, index: INT] RETURNS [BOOL] ~ INLINE {
+char: Char.XCHAR ~ TextEdit.FetchChar[node, index];
+IF Char.Set[char]=0 THEN SELECT Char.Narrow[char] FROM
+Ascii.CR, Ascii.LF => RETURN[TRUE];
+ENDCASE;
+RETURN[FALSE];
+};
+PutCaretOnNextLine: PROC = {
+SELECT selection.end.line FROM
+IN [0..lines.lastLine) => {
+nextLine: INTEGER ¬ selection.end.line+1;
+selection.caretX ¬ lines[nextLine].xOffset;
+selection.caretY ¬ selection.viewer.ch - lines[nextLine].yOffset - lines[nextLine].descent;
+};
+= lines.lastLine => {
+selection.caretX ¬ lines[selection.end.line].xOffset;
+selection.caretY ¬ selection.viewer.ch - selection.end.y - selection.end.h - selection.end.h;
+};
+ENDCASE => ERROR;
+};
+IF selection.insertion=before
+THEN {
+IF selection.start.clipped
+THEN selection.caretY ¬ LAST[INTEGER] -- caret not visible
+ELSE {
+selection.caretX ¬ selection.start.x;
+selection.caretY ¬ IF selection.start.line NOT IN [0..lines.lastLine] THEN LAST[INTEGER] ELSE selection.viewer.ch - selection.start.y - selection.start.h;
+};
+}
+ELSE {
+SELECT TRUE FROM
+selection.end.clipped => {
+selection.caretY ¬ LAST[INTEGER];
+};
+selection.end.pos.where IN [0..size) AND selection.end.line IN [0..lines.lastLine] AND IsEOL[node, selection.end.pos.where] => {
+PutCaretOnNextLine[];
+};
+ENDCASE => {
+selection.caretX ¬ selection.end.x+selection.end.w;
+selection.caretY ¬ (
+IF selection.end.line NOT IN [0..lines.lastLine]
+THEN LAST[INTEGER]
+ELSE selection.viewer.ch - selection.end.y - selection.end.h
+);
+};
+};
+};
+
+KillSelection: PUBLIC PROC = {
+IF InputFocus.GetInputFocus[]#NIL THEN InputFocus.SetInputFocus[];
+};
+
+ModifyPSel: PUBLIC PROC [proc: PROC [root: Node, tSel: Selection]] = {
+inner: PROC = {
+root: Node ¬ SelectionRoot[pSel];
+IF root#NIL THEN {
+tSel: Selection ¬ Alloc[];
+Copy[source: pSel, dest: tSel];
+proc[root, tSel ! UNWIND => Free[tSel]];
+MakeSelection[new: tSel];
+Free[tSel];
+};
+};
+WithLockedSelection[primary, inner, "CallWithSelLock"];
+};
+
+SelectEverything: PUBLIC PROC = {
+DoSelEverything: PROC [root: Node, tSel: Selection] = {
+root ¬ TextNode.Root[tSel.start.pos.node];
+tSel.start.pos ¬ [TextNode.FirstChild[root], 0];
+tSel.end.pos.node ¬ TextNode.LastWithin[root];
+tSel.end.pos.where ¬ TextEdit.Size[tSel.end.pos.node]-1;
+tSel.granularity ¬ branch;
+};
+ModifyPSel[DoSelEverything] 
+};
+
+PendingDeleteSelection: PUBLIC PROC = {
+DoPDel: PROC [root: Node, tSel: Selection] = { tSel.pendingDelete ¬ TRUE };
+ModifyPSel[DoPDel] 
+};
+
+NotPendingDeleteSelection: PUBLIC PROC = {
+DoNotPDel: PROC [root: Node, tSel: Selection] = { tSel.pendingDelete ¬ FALSE  };
+ModifyPSel[DoNotPDel] 
+};
+
+CaretBeforeSelection: PUBLIC PROC = {
+DoCaretBeforeSelection: PROC [root: Node, tSel: Selection] = {tSel.insertion ¬ before };
+ModifyPSel[DoCaretBeforeSelection] 
+};
+
+CaretAfterSelection: PUBLIC PROC = {
+DoCaretAfterSelection: PROC [root: Node, tSel: Selection] = { IF tSel.granularity # point THEN tSel.insertion ¬ after };
+ModifyPSel[DoCaretAfterSelection] 
+};
+
+
+WithLockedSelection: PROC [which: SelectionId, inner: PROC, why: ROPE] = {
+LockSel[which, why];
+inner[ ! UNWIND => UnlockSel[which]];
+UnlockSel[which];
+};
+
+SelectionRoot: PUBLIC PROC [s: Selection ¬ pSel] RETURNS [root: Node] = {
+IF s.viewer=NIL THEN RETURN [TextNode.Root[s.start.pos.node]];
+WITH s.viewer.data SELECT FROM
+tdd: TEditDocument.TEditDocumentData => RETURN [tdd.text];
+ENDCASE => RETURN [NIL];
+};
+
+InputModify: PUBLIC ViewerClasses.ModifyProc = {
+WITH self.data SELECT FROM
+tdd: TEditDocument.TEditDocumentData => {
+SELECT change FROM
+set, pop => Carets.StartCaret[self, pSel.caretX, pSel.caretY, primary];
+kill => {
+inner: PROC = {Copy[source: pSel, dest: prop]; Deselect[primary]};
+prop: Selection ¬ NARROW[ViewerOps.FetchProp[self, $SelectionHistory]];
+Carets.StopCaret[primary];
+IF prop=NIL THEN ViewerOps.AddProp[self, $SelectionHistory, prop ¬ Create[]];
+WithLockedSelection[primary, inner, "InputModify"];
+};
+push => Carets.StopCaret[primary];
+ENDCASE => ERROR;
+};
+ENDCASE;
+};
+
+CallWithSelAndDocAndTddLocks: PUBLIC PROC [viewer: Viewer, id: SelectionId ¬ primary, 
+proc: PROC [tdd: TEditDocument.TEditDocumentData, tSel: Selection]] = {
+IF viewer # NIL THEN WITH viewer.data SELECT FROM
+tdd: TEditDocument.TEditDocumentData => {
+tSel: Selection ¬ NIL;
+lockRef: TEditLocks.LockRef ¬ NIL;
+Cleanup: PROC = {
+UnlockSel[id];
+IF lockRef # NIL THEN TEditLocks.UnlockDocAndTdd[tdd];
+IF tSel # NIL THEN Free[tSel] 
+};
+IF tdd # NIL THEN {
+ENABLE UNWIND => Cleanup[];
+LockSel[id, "CallWithSelAndDocAndTddLocks"];
+lockRef ¬ TEditLocks.LockDocAndTdd[tdd, "CallWithSelAndDocAndTddLocks", read];
+IF lockRef#NIL THEN {
+sel: Selection = SELECT id FROM
+primary => pSel, secondary => sSel, feedback => fSel, ENDCASE => ERROR;
+tSel ¬ Alloc[];
+Copy[source: sel, dest: tSel];
+proc[tdd, tSel] 
+};
+Cleanup[];
+};
+};
+ENDCASE;
+};
+
+ShowPosition: PUBLIC PROC [viewer: Viewer, skipCommentNodes: BOOL ¬ TRUE] = {
+countI, countF: INT ¬ -1;
+sel: ROPE = TEditOps.GetSelContents[];
+selLen: INT = Rope.Size[sel];
+sepStart: INT = Rope.Index[s1: sel, s2: ".."];
+
+countI ¬ Convert.IntFromRope[sel.Substr[len: sepStart] ! Convert.Error => GOTO Bitch];
+IF countI < 0 THEN GOTO Bitch;
+IF sepStart < selLen
+THEN countF ¬ Convert.IntFromRope[sel.Substr[sepStart+2] ! Convert.Error => GOTO Bitch]
+ELSE countF ¬ countI + 3;
+IF countF < 0 THEN GOTO Bitch;
+ShowGivenPositionRange[viewer, feedback, countI, countF, skipCommentNodes, FALSE];
+EXITS
+Bitch => {OPEN MessageWindow;
+Append["Select character count or count..count for position.", TRUE];
+Blink[];
+};
+};
+
+
+Position: PUBLIC PROC[viewer: Viewer] ~ {
+ShowPosition[viewer: viewer, skipCommentNodes: TRUE];
+};
+
+Range: TYPE = RECORD [start, end: INT];
+
+FmtRange: PROC [r: Range, skipCommentNodes: BOOL] RETURNS [rope: ROPE] = {
+IF r.start = r.end
+THEN rope ¬ Convert.RopeFromInt[r.start]
+ELSE rope ¬ Rope.Cat[
+Convert.RopeFromInt[r.start],
+"..",
+Convert.RopeFromInt[r.end]];
+rope ¬ rope.Concat[IF skipCommentNodes THEN " (excluding comment nodes)" ELSE " (including comment nodes)"];
+RETURN
+};
+
+CurrentPositionMessage: PUBLIC PROC [viewer: Viewer, skipCommentNodes: BOOL]  RETURNS [ROPE]= {
+tSel: Selection = TEditOps.GetSelData[];
+pos: Range ¬ [
+start: TextNode.LocNumber[at: tSel.start.pos, skipCommentNodes: skipCommentNodes],
+end: TextNode.LocNumber[at: tSel.end.pos, skipCommentNodes: skipCommentNodes]];
+RETURN [FmtRange[pos, skipCommentNodes]];
+};
+
+ShowGivenPosition: PUBLIC PROC [viewer: Viewer, pos: INT, skipCommentNodes: BOOL ¬ TRUE] = {
+DoPosition: PROC [tdd: TEditDocument.TEditDocumentData, tSel: Selection] = {
+first: TextNode.Location ~ [TextNode.FirstChild[tdd.text], 0];
+pos ¬ MAX[pos, TextNode.LocNumber[first, 1, skipCommentNodes]];
+tSel.start.pos ¬ tSel.end.pos ¬ TextNode.LocWithin[tdd.text, pos, 1, skipCommentNodes];
+tSel.end.pos.where ¬ MIN[tSel.end.pos.where+3, TextNode.EndPos[tSel.end.pos.node]];
+tSel.start.pos.where ¬ MIN[tSel.end.pos.where, tSel.start.pos.where];
+IF tSel.start.pos.where=tSel.end.pos.where AND tSel.start.pos.where > 0 THEN
+tSel.start.pos.where ¬ tSel.start.pos.where-1;
+tSel.granularity ¬ char;
+tSel.viewer ¬ viewer;
+tSel.data ¬ tdd;
+tSel.pendingDelete ¬ FALSE;
+tSel.insertion ¬ IF TEditProfile.selectionCaret=before THEN before ELSE after;
+TEditOps.RememberCurrentPosition[viewer];
+TEditSelection.SetSelLooks[tSel];
+MakeSelection[new: tSel, selection: feedback];
+TEditRefresh.ScrollToEndOfSel[viewer, FALSE, feedback];
+};
+CallWithSelAndDocAndTddLocks[viewer, feedback, DoPosition];
+};
+
+ShowGivenPositionRange: PUBLIC PROC [viewer: Viewer, selectionId: SelectionId, posI, posF: INT, skipCommentNodes, pendingDelete: BOOL] = {
+DoPosition: PROC [tdd: TEditDocument.TEditDocumentData, tSel: Selection] = {
+pos0: INT ~ TextNode.LocNumber[[TextNode.FirstChild[tdd.text], 0], 1, skipCommentNodes];
+IF posF < posI THEN { p: INT ~ posI; posI ¬ posF; posF ¬ p };
+tSel.start.pos ¬ TextNode.LocWithin[tdd.text, MAX[pos0, posI], 1, skipCommentNodes];
+tSel.end.pos ¬ TextNode.LocWithin[tdd.text, MAX[pos0, posF], 1, skipCommentNodes];
+tSel.granularity ¬ char;
+tSel.viewer ¬ viewer;
+tSel.data ¬ tdd;
+tSel.pendingDelete ¬ pendingDelete;
+tSel.insertion ¬ IF TEditProfile.selectionCaret=before THEN before ELSE after;
+TEditOps.RememberCurrentPosition[viewer];
+TEditSelection.SetSelLooks[tSel];
+MakeSelection[new: tSel, selection: selectionId];
+TEditRefresh.ScrollToEndOfSel[viewer, FALSE, selectionId];
+};
+CallWithSelAndDocAndTddLocks[viewer, selectionId, DoPosition];
+};
+
+GoToEndOfNode: PUBLIC PROC [n: INT ¬ 1] ~ {
+DoIt: PROC [root: Node, tSel: TEditDocument.Selection] = {
+pointSel: BOOL ¬ tSel.granularity=point;
+pos: Location ¬ TEditSelection.InsertionPoint[tSel];
+WHILE pos.node # NIL AND n # 0 DO
+IF n > 0
+THEN {
+IF pointSel AND pos.where = Rope.Size[pos.node.rope] THEN {
+node: Node ~ TextNode.StepForward[pos.node];
+IF node = NIL OR TextNode.Parent[node]=NIL THEN EXIT;
+pos.node ¬ node;
+};
+pos.where ¬ Rope.Size[pos.node.rope];
+pointSel ¬ TRUE;
+n ¬ n - 1;
+}
+ELSE {
+IF pointSel AND pos.where = 0 THEN {
+node: Node ~ TextNode.StepBackward[pos.node];
+IF node = NIL OR TextNode.Parent[node]=NIL THEN EXIT;
+pos.node ¬ node;
+};
+pos.where ¬ 0;
+pointSel ¬ TRUE;
+n ¬ n + 1;
+};
+ENDLOOP;
+MakePointSelection[tSel, pos];
+TEditRefresh.ScrollToEndOfSel[tSel.viewer, TRUE];
+};
+IF n # 0 THEN TEditInputOps.CallWithLocks[DoIt, read];
+};
+
+TargetFromSel: PROC [tSel: Selection] RETURNS [target: Node ¬ NIL] ~ {
+loc1, loc2: Location;
+[loc1, loc2] ¬ LocationsFromSelection[tSel];
+IF loc1=loc2 THEN RETURN[NIL] ELSE target ¬ TextNode.NewTextNode[];
+FOR node: Node _ loc1.node, TextNode.StepForward[node] UNTIL node=NIL DO
+i0: INT ~ IF node=loc1.node THEN loc1.where ELSE 0;
+i1: INT ~ IF node=loc2.node THEN loc2.where ELSE TextEdit.Size[node];
+IF node#loc1.node THEN [] ¬ TextEdit.ReplaceByRope[root: NIL, 
+dest: target, start: TextEdit.Size[target], len: 0, 
+rope: TextEdit.GetNewlineDelimiter[TextNode.Root[node]]];
+IF i1>i0 THEN [] ¬ TextEdit.ReplaceText[destRoot: NIL, sourceRoot: NIL, 
+dest: target, destStart: TextEdit.Size[target], destLen: 0, 
+source: node, sourceStart: i0, sourceLen: i1-i0];
+IF node=loc2.node THEN EXIT;
+ENDLOOP;
+
+};
+
+targetOfLastSearch: Node ¬ NIL;
+FindFeedback: PROC [found: BOOL, rope: ROPE] ~ {
+IF found THEN MessageWindow.Clear[]
+ELSE IF Rope.Size[rope]=0 THEN {
+MessageWindow.Append["Select target for search.", TRUE];
+MessageWindow.Blink[];
+}
+ELSE {
+IF Rope.Size[rope]>50 THEN rope ¬ Rope.Concat[Rope.Substr[rope, 0, 47], "..."];
+MessageWindow.Append[Rope.Concat[rope, " not found."], TRUE];
+ViewerOps.BlinkDisplay[];
+};
+};
+
+Find: PUBLIC PROC [viewer: Viewer, 
+findWhere: FindWhere ¬ anywhere, 
+def, word: BOOL ¬ FALSE, 
+id: SelectionId ¬ primary, 
+case: BOOL ¬ TRUE -- case => case of characters is significant --
+] ~ {
+found: BOOL ¬ FALSE;
+target: Node ¬ NIL;
+LockedFind: PROC [tdd: TEditDocument.TEditDocumentData, tSel: Selection] = {
+target ¬ TargetFromSel[tSel];
+IF target=NIL THEN target ¬ targetOfLastSearch ELSE targetOfLastSearch ¬ target;
+IF target#NIL THEN found ¬ FindTarget[viewer: viewer, tdd: tdd, 
+tSel: tSel, id: id, findWhere: findWhere, target: target, 
+def: def, word: word, case: case];
+};
+CallWithSelAndDocAndTddLocks[viewer, id, LockedFind];
+FindFeedback[found, TextEditExtras.GetString[target]];
+};
+FindRope: PUBLIC PROC [viewer: Viewer, rope: ROPE, 
+findWhere: FindWhere ¬ anywhere, 
+def, word: BOOL ¬ FALSE, 
+id: SelectionId ¬ primary, 
+case: BOOL ¬ TRUE -- case => case of characters is significant --
+] = {
+found: BOOL ~ DoFind[viewer, rope, findWhere, def, word, id, case];
+FindFeedback[found, rope];
+};
+DoFind: PUBLIC PROC [viewer: Viewer, rope: ROPE, 
+findWhere: FindWhere ¬ anywhere, 
+def, word: BOOL ¬ FALSE, 
+id: SelectionId ¬ primary, 
+case: BOOL ¬ TRUE -- case => case of characters is significant --
+] RETURNS [found: BOOL ¬ FALSE] = {
+LockedDoFind: PROC [tdd: TEditDocument.TEditDocumentData, tSel: Selection] = {
+target: Node ~ TextEdit.FromRope[rope];
+found ¬ FindTarget[viewer: viewer, tdd: tdd, 
+tSel: tSel, id: id, findWhere: findWhere, 
+target: target, def: def, word: word, case: case];
+};
+CallWithSelAndDocAndTddLocks[viewer, id, LockedDoFind];
+};
+
+LocationsFromSelection: PROC [tSel: Selection] RETURNS [loc1, loc2: Location] ~ {
+loc1 ¬ tSel.start.pos; loc2 ¬ tSel.end.pos;
+IF loc1.node=NIL OR loc2.node=NIL THEN RETURN[[NIL, 0], [NIL, 0]];
+IF loc1.where=Tioga.NodeItself THEN loc1.where ¬ 0;
+IF tSel.granularity=point THEN loc2 ¬ loc1
+ELSE IF loc2.where=Tioga.NodeItself THEN loc2.where ¬ TextEdit.Size[loc2.node]
+ELSE loc2.where ¬ loc2.where+1;
+};
+
+FindTarget: PROC [viewer: Viewer, tdd: TEditDocument.TEditDocumentData, 
+tSel: Selection, id: SelectionId, findWhere: FindWhere, 
+target: Node, targetStart: INT ¬ 0, targetLen: INT ¬ INT.LAST, 
+def, word, case: BOOL] RETURNS [found: BOOL ¬ FALSE] ~ {
+match: TiogaFind.Match ~ IF def THEN def ELSE IF word THEN word ELSE any;
+visible: BOOL ~ tSel.viewer=viewer AND tSel.end.line IN [0..tdd.lineTable.lastLine];
+viewPos: Location ~ tdd.lineTable.lines[0].pos;
+interrupt: REF BOOL ~ TEditInput.interrupt;
+loc1, loc2: Location;
+where: Node; at, atEnd: INT ¬ 0;
+[loc1, loc2] ¬ LocationsFromSelection[tSel];
+interrupt­ ¬ FALSE;
+SELECT findWhere FROM
+forwards, anywhere => {
+pos: Location ~ IF visible THEN loc2 ELSE viewPos;
+[where, at, atEnd] ¬ TiogaFind.LiteralSearch[
+direction: forward, loc1: pos, loc2: [NIL, 0], 
+target: target, targetStart: targetStart, targetLen: targetLen, 
+case: case, match: match, interrupt: interrupt];
+};
+backwards => {
+pos: Location ~ IF visible THEN loc1 ELSE viewPos;
+[where, at, atEnd] ¬ TiogaFind.LiteralSearch[
+direction: backward, loc1: [NIL, 0], loc2: pos, 
+target: target, targetStart: targetStart, targetLen: targetLen, 
+case: case, match: match, interrupt: interrupt];
+};
+ENDCASE;
+IF where=NIL AND findWhere=anywhere AND NOT interrupt­ THEN {
+pos: Location ~ [TextNode.FirstChild[tdd.text], 0];
+[where, at, atEnd] ¬ TiogaFind.LiteralSearch[
+direction: forward, loc1: pos, loc2: [NIL, 0], 
+target: target, targetStart: targetStart, targetLen: targetLen, 
+case: case, match: match, interrupt: interrupt];
+};
+found ¬ (where#NIL);
+IF found THEN {
+tSel.start.pos ¬ [where,at];
+tSel.end.pos ¬ [where,MAX[0,atEnd-1]];
+tSel.granularity ¬ IF word THEN word ELSE char;
+tSel.viewer ¬ viewer;
+tSel.data ¬ tdd;
+tSel.insertion ¬ after;
+tSel.pendingDelete ¬ FALSE;
+TEditOps.RememberCurrentPosition[viewer];
+TEditSelection.SetSelLooks[tSel];
+MakeSelection[new: tSel, selection: id];
+TEditInput.CloseEvent[];
+TEditRefresh.ScrollToEndOfSel[viewer, FALSE, id];
+};
+};
+
+END.
+  
+b  
+TEditSelectionImpl.mesa
+Copyright Ó 1985, 1987, 1988, 1989, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Russ Atkinson (RRA) June 10, 1985 11:52:15 pm PDT
+Michael Plass, March 23, 1989 2:49:09 pm PST
+Christian Jacobi, May 2, 1989 5:41:02 pm PDT
+Doug Wyatt, November 3, 1992 12:27 pm PST
+
+Selection Locks 
+lock the selection so that no other process can change it
+give up lock on the selection
+Selection Allocation 
+Selection Display and Control 
+make a point selection at pos out the the current primary selection
+make secondary selection be the primary
+make secondary selection be the primary
+Take down the selection without changing the input focus.
+take the selection down from the screen
+If the selection was not in a visible viewer, PaintViewer didn't call our paint proc, so the state didn't change.  Force change directly.
+Changes input focus as well as the selection.
+When called to make a non-feedback selection is the viewer containing the feedback selection, automatically cancel the feedback selection.
+N.B. Also in TEditSelection
+one liner
+select from beginning of line
+select end portion of sl
+select all of sl
+select all of the intermediate lines
+when done, old is valid (it's = pSel, e.g.) and new^ = old^
+update right end
+new end after old end
+This weird case can happen if old ended with final CR of node and new is in the null line displayed after the CR.
+new end before old end
+old ended in null line after final CR, new ends with the final CR
+update start
+new start comes before old start
+new start comes after old start
+this must work correctly even if the node was filtered out for some reason
+if pos was filtered, return line where it would have been and set clipped=TRUE
+before beginning of text
+nothing special going on, so would have found it if not after end
+must think about this harder
+it really is after the end
+may have been restored by Undo
+past this line
+recompute the xywh fields in the selection
+fixes selection screen info assuming start.pos and end.pos are correct
+no need to re-compute
+scrolled off bottom
+recompute the xy fields in the caret
+caret not visible
+selection actually get taken down in our InputModify Proc
+expand to include everything
+Misc functions 
+SelectionOps 
+Exported to TEditSelectionOps (new for 6.0)
+sets bit to cause scroll after refresh
+Should join or replace ShowGivenPosition, which is currently in TEditSelectionOps
+sets bit to cause scroll after refresh
+Move caret to end of node, or if already there, go forward one node.  The argument is the repeat count; Negative arguments go backward.
+
+
+
+tSel.insertion ¬ IF TEditProfile.selectionCaret=before THEN before ELSE after;
+
+ Ê%Â  –"cedarcode" style•NewlineDelimiter
+™ codešœ™Kšœ
+ÏeœO™ZKšœ1™1Kšœ,™,Kšœ,™,K™)K™ —šÏk	˜	Kšœžœžœžœ˜Kšœžœ˜%Kšœžœžœ˜ Kšœ˜Kšœ	žœ˜"Kšœžœ,˜8Kšœžœ˜#Kšœžœ ˜0Kšœžœ˜+Kšœžœ˜#Kšœ˜Kšœžœ_˜rKšœ˜Kšœ˜Kšœžœ3˜CKšœ	˜	Kšœžœ˜$Kšœžœ˜&Kšœžœ=˜QKšœžœ˜Kšœžœ˜!Kšœžœ˜7Kšœžœ˜%Kšœžœ(˜:Kšœ	˜	K˜Kšœ	˜	Kšœ˜Kšœ
+˜
+Kšœžœ˜)Kšœžœ˜'Kšœ
+žœ1˜@—K˜ KšÏnœžœž˜!Kšžœ«˜²Kšžœ;˜Bšœž˜K˜ Kšžœžœžœ˜Kšœžœ˜Kšœ
+žœ˜ Kšœžœ˜*Kšœžœ˜.Kšœžœ˜+Kšœžœ˜$—headšœ™šœ	žœžœ˜šœ	žœžœÏc˜7Kšœžœ ˜,Kšœ "˜@K˜——šœ	žœžœ	˜K˜ —Kšœ	žœžœžœžœžœ˜Sšœ
+ž	œ˜K˜ —šŸœžœžœ˜.K˜,K˜—K˜ šŸœžœžœžœ˜/K˜/K˜—K˜ KšŸœžœžœ0˜QK˜ š
+Ÿœžœžœžœžœ˜BKšœ9™9Kšžœžœžœ˜Kšœžœ˜Kšœ#˜#Kšžœžœ˜5šžœžœ˜ Kšžœžœžœžœ˜-K˜K˜—Kšžœžœžœ˜AK˜Kšœžœ˜/K˜K˜ —šŸ	œžœžœžœ'˜CKšœ™Kšžœžœžœ˜Kšœ#˜#Kšžœžœ%žœžœ˜>Kšžœ!žœžœ˜/Kšœžœ˜#Kšž	œ
+˜K˜——šœ™Kšœžœ˜"Kšœžœ˜"Kšœžœ˜"Kšœžœ˜$Kšœžœ˜$Kšœ!žœ '˜MšŸœžœžœžœ˜+Kšžœžœ˜)K˜K˜ —š
+Ÿœžœžœžœžœ˜6Kšžœžœžœ˜Kšœžœžœžœ	žœžœ˜7Kšœžœžœžœ	žœžœ˜7Kšœžœžœžœ	žœžœ˜7Kšœ˜K˜K˜ —šŸœžœžœ˜'Kš
+žœžœžœžœžœ˜;šžœ	žœžœ˜ Kšžœžœ	žœžœ˜%Kšžœžœ	žœžœ˜&—K˜K˜ —šŸœžœžœžœ˜5Kšžœžœžœ˜K˜K˜——šœ™šŸœžœžœ*˜IKšœC™CK˜K˜$K˜$K˜Kšœžœ˜K˜K˜-K˜K˜—K˜ šŸœžœžœ'˜IK˜K˜+šœžœžœ˜+K˜*K˜—K˜#K˜—K˜ šŸœžœžœ˜)šŸœžœ˜"Kšœžœžœžœžœžœ˜>Kšœžœžœžœžœžœ˜@K˜—K˜K˜—K˜ šŸœžœžœ˜Kšœ'™'šŸœžœ˜)K˜2K˜—K˜&K˜—K˜ šŸœžœžœ˜Kšœ'™'šŸœžœ˜+K˜K˜ K˜—K˜(K˜—K˜ šŸœžœžœ˜Kšœžœ˜K˜—K˜ šŸœžœžœ˜ Kšœžœ˜K˜—K˜ šŸœžœžœ˜Kšœžœ˜K˜—K˜ šŸœžœžœ˜/šœžœ˜Kšžœžœžœ˜.K˜K˜—K˜7K˜—K˜ šŸœžœžœ'˜<Kšœ9™9šœžœ˜šœžœž˜&Kšœ6žœžœ˜G—K˜šœžœžœž˜ K˜K˜K˜Kšžœžœ˜—Kšœžœ$˜.K˜ š
+žœžœžœžœžœ˜!Kšœ'™'Kšœ&žœ˜1Kšžœžœ"žœ%˜QKšœ‰™‰K˜—K˜—K˜2K˜—K˜ šŸœžœžœžœ:žœžœžœžœ˜“Kšœ-™-šœžœ˜K˜Kšœžœ˜	šžœž˜˜K˜.K˜K˜šžœž˜
+Kš
+žœžœžœžœžœ˜3Kšžœžœžœ'˜B—K˜—˜K˜K˜K˜—˜K˜K˜K˜—Kšžœžœ˜—Kšžœžœžœžœ˜?šžœžœžœ˜Kšžœžœžœ˜IKšœŠ™ŠK˜K˜$K˜ Kšžœžœžœ˜8šžœ
+˜šžœ˜šœ	žœžœž˜/Kšœ,žœ˜@—šžœžœ˜!Kšœžœ˜Kšžœžœ˜5K˜—K˜—Kšžœ+žœ˜:—K˜—K˜—K˜7K˜—K˜ Kš	œžœžœžœžœ˜SKšœ
+žœžœžœ˜>Kšœ
+žœžœžœ˜@Kšœ
+žœžœžœ˜?šŸœžœžœžœ˜0K˜4šœžœž˜&Kšœ6žœžœ˜G—šœžœ˜K˜šœžœ˜šžœžœž˜˜)Kšžœžœ/žœžœ˜Ašœ&žœ˜/Kšœžœ*˜2—K˜%K˜—Kšžœ˜—K˜—Kšžœžœžœ/˜AKšœžœ˜K˜—K˜1K˜K˜ —K˜ KšœJžœ˜PKšœJžœ˜PKšœNžœ˜TKšœGžœ˜MKšœ
+žœ6˜DKšœ
+žœ˜'Kšœžœ˜Kšœžœ˜Kšœžœ˜K˜ Kšœžœ˜KšÏbœ™K˜ šŸœžœžœP˜jšžœžœž˜˜)K˜/Kšœ	žœ˜'Kš	œžœžœžœžœ˜UKšœžœžœžœžœžœžœžœžœžœ
+˜’šŸœžœžœ˜,Kšœžœ˜%Kšœžœ˜KšžœžœI˜\šžœ
+ž˜K˜<K˜CKšžœžœ˜—K˜—Kšžœžœžœžœžœ*žœžœžœ ˜ šžœ
+ž˜K˜$K˜,K˜*K˜1Kšžœžœ˜—šžœžœž˜šœ*žœžœ˜gKšœ	™	Kšœžœ˜Kšžœžœ˜6šžœ˜Kšœ™Kšœžœžœ˜-K˜K˜+K˜—Kšžœ2˜6Kšžœžœžœ '˜LK˜FK˜—šœ$žœ'˜NK˜¢K˜—šžœ˜Kšœžœžœžœ(˜@Kšœžœžœžœ&˜>šŸœžœžœ˜#˜PK˜"—K˜—šžœžœžœ˜:šžœ˜Kšœ™K˜€K˜—šžœ˜Kšœ™K˜K˜——šžœžœžœ
+ž˜Kšœ$™$K˜Kšžœ˜—šžœžœž˜Kšœ 1˜N˜K˜yK˜—šžœ˜Kšœ .˜?K˜——K˜——K˜—Kšžœ˜—K˜—K˜ šŸœžœžœWžœ˜|Kšœ;™;šŸœžœ˜Kšœ$ ˜3Kšœ ,˜IKšœ$ ˜0K˜K˜—šžœ
+˜šžœ˜Kšœ™šŸœžœžœ˜4K˜Kšœžœ˜Kšžœžœžœ˜GKšžœ˜K˜—Kšœ	žœžœžœžœžœ˜7Kšœ
+žœ)˜7Kšžœ	žœžœ˜"šžœžœž˜K˜š	œ
+žœ&žœžœ
+žœJ˜‘Kšœ™K˜K˜'Kšžœ
+žœ'ž˜:K˜Kšœq™qK˜K˜#K˜K˜—šžœ˜Kšœ™K˜K˜K˜Kšžœ
+žœ'ž˜:K˜KšœA™AK˜Kšœžœžœ ˜6K˜#K˜K˜Kšœžœžœ˜)K˜——K˜—šžœ˜Kšœ™šŸœžœžœ˜3K˜Kšžœžœžœ˜7K˜$Kšžœžœ˜'K˜—Kšœ	žœžœžœžœžœ˜9Kšœ
+žœ-˜;Kšžœ	žœžœ˜"šžœžœž˜K˜"š	œ
+žœ*žœžœ
+žœO˜šKšœ ™ K˜$K˜K˜#K˜K˜—šžœ˜Kšœ™K˜K˜K˜Kšœžœžœ˜)K˜#K˜Kšœžœžœ˜)K˜——K˜——K˜K˜—K˜ KšŸœžœžœžœ˜"šŸœžœžœ$žœžœžœ˜‚K˜;šžœžœž˜K˜BKš
+œžœžœžœžœ ˜Bšžœ˜Kšœžœžœ
+žœžœžœžœ	žœ˜UK˜@K˜——K˜—K˜ šŸœžœžœ,žœžœžœžœ˜~KšœKžœ˜QKšžœ˜K˜—K˜ šŸœžœžœ,žœžœžœžœ'˜›KšœJ™JKšœN™Nšžœžœž˜˜)Kšœ
+žœžœ˜š
+Ÿœžœžœžœžœ˜EKšœžœ˜
+K˜0Kšžœžœžœžœžœ ˜ZKšžœžœ˜K˜—š
+Ÿœžœžœ	žœžœ˜FKšœžœ˜šžœžœžœž˜0šžœžœž˜˜Kšžœ žœžœ ˜AKšœžœ˜˜	K˜——Kšœ	žœ˜Kšžœ˜—Kšž˜—K˜—K˜/K˜šžœžœ˜&šžœ žœ˜(Kšœ™Kšœžœžœ˜ Kšžœ˜K˜—K˜—šžœ)žœ#žœ˜WKšœžœžœ ˜4Kšžœ˜K˜—Kšœžœžœ˜1Kšœ1žœ˜7Kšžœžœ
+ž˜šžœ8ž˜BKšœ$žœžœžœ ˜PKšœžœ˜šžœ˜Kš '˜'šžœ'žœ"˜Nšžœ˜KšœA™AKšœžœžœ˜Kšžœ˜Kšœ ˜—šžœ˜Kšœ™šžœEž˜O˜Kšœ™Kšœžœžœ˜Kšžœ˜K˜—Kšœžœ !˜Ašžœ ˜K˜Kšœžœ$˜2Kšœ 5˜DKš
+žœžœžœžœžœ˜?K˜0K˜%Kšžœžœ
+žœžœ˜(Kšœ™Kšœžœ˜K˜——K˜—Kšœ˜———Kš	žœ
+žœžœžœ ˜DK˜4Kšœžœ0˜PK˜Tšžœžœžœžœ˜Kšœ™šžœ˜Kšžœžœžœ˜%Kšžœ)˜-—K˜—Kšœžœ˜K˜—Kšžœ˜—K˜—K˜ š
+Ÿœžœžœ4žœžœ˜_Kšœ*™*KšœF™FKšžœžœ@˜MKšžœž˜šžœžœž˜šœ*˜*Kšœ™K˜ Kšœ˜—šœžœžœ˜'Kšœ™Kšœžœžœ˜#Kšœžœ˜"K˜—šžœ˜šœžœ˜Kšžœžœžœžœžœžœ˜wK˜—K˜FK˜——K˜—K˜ šŸ
+œžœžœ˜2Kšœ$™$K˜:K˜$Kšœžœ˜ šŸœžœžœžœžœžœ˜>Kšœžœ#˜3šžœžœžœž˜6Kš	œžœžœžœžœ˜#Kšžœ˜—Kšžœžœ˜K˜—šŸœžœ˜šžœž˜šžœ˜Kšœ
+žœ˜)K˜+K˜[K˜—˜K˜5K˜]K˜—Kšžœžœ˜—K˜—šžœ˜šžœ˜Kšžœ˜šžœžœžœ ˜:šžœ˜K˜%—Kšœžœžœžœžœžœžœžœ=˜šK˜—K˜—šžœ˜šžœžœž˜šœ˜Kšœ™Kšœžœžœ˜!Kšœ˜—š	œžœžœžœžœ*˜€Kšœ˜Kšœ˜—šžœ˜K˜3˜šžœžœžœ˜0Kšžœžœžœ˜Kšžœ8˜<—K˜—K˜——K˜——K˜—K˜ šŸœžœžœ˜Kšœ9™9Kšžœžœžœ˜BK˜—K˜ šŸ
+œžœžœžœ#˜Fšœžœ˜K˜!šžœžœžœ˜K˜K˜Kšœžœ˜(K˜K˜K˜—K˜—K˜7K˜—K˜ šŸœžœžœ˜!Kšœ™šŸœžœ"˜7K˜*K˜0K˜.K˜8K˜K˜—K˜K˜—K˜ šŸœžœžœ˜'KšŸœžœ8žœ˜KK˜K˜—K˜ šŸœžœžœ˜*KšŸ	œžœ8žœ˜PK˜K˜—K˜ šŸœžœžœ˜%KšŸœžœ<˜XK˜#K˜—K˜ šŸœžœžœ˜$KšŸœžœ#žœžœ˜xK˜"K˜—K˜ —šœ™K˜ šŸœžœžœžœ˜JK˜Kšœ	žœ˜%K˜K˜—K˜ šŸœžœžœžœ˜IKšžœ
+žœžœžœ#˜>šžœžœž˜Kšœ(žœ˜:Kšžœžœžœ˜—K˜—K˜ šŸœžœ˜0šžœžœž˜˜)šžœž˜K˜G˜	Kšœžœ7˜BKšœžœ/˜GK˜Kšžœžœžœ=˜MK˜3K˜—K˜"Kšžœžœ˜—K˜—Kšžœ˜—K˜—K˜ —šœ™šŸœžœžœ4žœ=˜žšžœ
+žœžœžœžœž˜1šœ)˜)Kšœžœ˜Kšœžœ˜"šŸœžœ˜K˜Kšžœžœžœ!˜6Kšžœžœžœ˜K˜—šžœžœžœ˜Kšžœžœ˜K˜,K˜Nšžœ	žœžœ˜šœžœž˜Kšœ6žœžœ˜G—K˜K˜K˜K˜—K˜
+K˜—K˜—Kšžœ˜—K˜—K˜ šŸœžœ$žœžœ˜MKšœžœ˜Kšœžœ˜&Kšœžœ˜Kšœ
+žœ!˜.K˜ KšœJžœ˜VKšžœžœžœ˜šžœ˜KšžœHžœ˜WKšžœ˜—Kšžœžœžœ˜KšœKžœ˜Ršž˜šœ
+žœ˜Kšœ?žœ˜EKšœ˜Kšœ˜——Kšœ˜K˜ —K˜ šŸœžœžœ˜)Kšœ/žœ˜5K˜K˜ —šœžœžœžœ˜'K˜ —š
+Ÿœžœžœžœžœ˜Jšžœ˜Kšžœ$˜(šžœ˜Kšœ˜Kšœ˜Kšœ˜——Kšœžœžœžœ˜lKšž˜Kšœ˜K˜ —šŸœžœžœ$žœžœžœ˜_Kšœ(˜(šœ˜KšœR˜RKšœO˜O—Kšžœ#˜)Kšœ˜K˜ —šŸœžœžœžœžœžœ˜\Kšœ+™+šŸ
+œžœ<˜LK˜>Kšœžœ6˜?K˜WKšœžœ;˜SKšœžœ+˜EKšžœ)žœž˜LK˜.K˜K˜K˜Kšœžœ˜Kšœžœ$žœžœ˜NK˜)Kšœ!˜!K˜.Kšœ&žœ˜7Kšœ&™&K˜—K˜;K˜K˜ —š
+Ÿœžœžœ8žœ#žœ˜ŠKšœQ™QšŸ
+œžœ<˜LKšœžœO˜XKšžœžœžœ!˜=Kšœ.žœ#˜TKšœ,žœ#˜RK˜K˜K˜Kšœ#˜#Kšœžœ$žœžœ˜NK˜)Kšœ!˜!Kšœ1˜1Kšœ&žœ˜:Kšœ&™&K˜—Kšœ>˜>K˜K˜ —šŸœžœžœžœ	˜+šŸœžœ0˜:Kšœ‡™‡Kšœ
+žœ˜(Kšœ4˜4šžœžœžœž˜!šžœ˜šžœ˜šžœ
+žœ&žœ˜;Kšœ,˜,Kšžœžœžœžœžœžœ˜5Kšœ˜Kšœ˜—Kšœ%˜%Kšœžœ˜Kšœ
+˜
+Kšœ˜—šžœ˜šžœ
+žœžœ˜$Kšœ-˜-Kšžœžœžœžœžœžœ˜5Kšœ˜Kšœ˜—Kšœ˜Kšœžœ˜Kšœ
+˜
+Kšœ˜——Kšžœ˜—Kšœ˜Kšœ+žœ˜1Kšœ˜—Kšžœžœ)˜6Kšœ˜K˜ —šŸœžœžœžœ˜FK˜Kšœ,˜,Kš
+žœžœžœžœžœ!˜Cšžœ4žœžœž˜HKš	œžœžœžœžœ˜3Kš	œžœžœžœžœ˜EKšžœžœ#žœq˜­Kšžœžœ%žœžœq˜·Kšžœžœžœ˜Kšžœ˜—K˜ K˜K˜ —šœžœ˜K™ —šŸœžœ	žœžœ˜0Kšžœžœ˜#šžœžœžœ˜ Kšœ2žœ˜8K˜K˜—šžœ˜Kšžœžœ5˜OKšœ7žœ˜=K˜K˜—Kšœ˜K˜ —šŸœžœžœ@žœžœ%žœžœ 0œ˜ÃKšœžœžœ˜Kšœžœ˜šŸ
+œžœ<˜LKšœ˜Kšžœžœžœžœ˜PKšžœžœžœŒ˜žKšœ˜—Kšœ5˜5K˜6K˜K™ —šŸœžœžœžœ0žœžœ%žœžœ 0œ˜ÓKšœžœ8˜CKšœ˜K˜K™ —šŸœžœžœžœ0žœžœ%žœžœ /œžœ	žœžœ˜ïšŸœžœ<˜NKšœ'˜'Kšœ‹˜‹Kšœ˜—Kšœ7˜7K˜K˜ —šŸœžœžœ˜QKšœ+˜+Kšžœžœžœžœžœžœžœžœ˜BKšžœžœ˜3Kšžœžœ˜*Kšžœžœžœ&˜NKšžœ˜K˜K˜ —šŸ
+œžœžœžœžœžœžœžœ	žœžœ˜úKšœžœžœžœžœžœžœ˜IKšœ	žœžœžœ˜TKšœ/˜/Kšœžœžœ˜+K˜Kšœžœ˜ Kšœ,˜,Kšœžœ˜šžœž˜šœ˜Kšœžœ	žœžœ	˜2KšœTžœx˜ÏK˜—šœ˜Kšœžœ	žœžœ	˜2KšœJžœƒ˜ÐK˜—Kšžœ˜—šžœžœžœžœžœžœ˜=Kšœ3˜3KšœTžœx˜ÏK˜—Kšœžœ˜šžœžœ˜Kšœ˜Kšœžœ˜&Kšœžœžœžœ˜/Kšœ˜Kšœ˜Kšœžœ$žœžœ™NKšœ˜Kšœžœ˜Kšœ)˜)Kšœ!˜!Kšœ(˜(Kšœ˜Kšœ&žœ˜1K˜—K˜K™ ——K˜ Kšžœ˜— …—    ‚   ²D  

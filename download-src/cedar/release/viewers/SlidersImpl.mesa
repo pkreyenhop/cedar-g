@@ -1,0 +1,315 @@
+
+DIRECTORY
+Imager USING [Color, MakeGray, MaskRectangle, MaskRectangleI, SetColor],
+InputFocus USING [CaptureButtons, ReleaseButtons],
+Process USING [Detach, Milliseconds, MsecToTicks, SetTimeout],
+Sliders,
+TIPUser USING [InstantiateNewTIPTable, TIPScreenCoords, TIPScreenCoordsRec],
+ViewerClasses USING [GetProc, NotifyProc, PaintProc, PaintRectangle, SetProc, Viewer, ViewerRec, ViewerClass, ViewerClassRec],
+ViewerOps USING [CreateViewer, DestroyViewer, GetViewer, MouseInViewer, PaintViewer, RegisterViewerClass, SetViewer, UserToScreenCoords],
+WindowManager USING [RestoreCursor];
+
+SlidersImpl: CEDAR MONITOR
+IMPORTS Imager, InputFocus, Process, TIPUser, ViewerOps, WindowManager
+EXPORTS Sliders
+= BEGIN OPEN Sliders;
+
+SliderState: TYPE = {inputDisabled, inputEnabled};
+SliderValue: TYPE = REAL; -- in range [0.0, 1.0]
+SliderData: TYPE = REF SliderDataRec; 
+SliderDataRec: TYPE = RECORD [
+sliderProc: SliderProc ¬ NIL, -- client procedure called when slider value changed
+filterProc: FilterProc ¬ NIL, -- client procedure for filtering slider updates
+orientation: SliderOrientation, -- orientation of slider image (horizontal or vertical)
+foreground: Imager.Color, -- color of slider foreground
+background: Imager.Color, -- color of slider background
+normalizedSliderValue: NormalizedSliderValue ¬ 0.0, -- in range [0.0, 1.0]
+mouseValue: SliderValue ¬ 0.0, -- mouse position in slider
+sliderValue: SliderValue ¬ 0.0, -- slider value in viewer screen coordinates
+maxSliderValue: SliderValue ¬ 0.0, -- maximum slider value in viewer screen coordinates
+oldSliderValue: SliderValue ¬ 0.0, -- previous value in viewer screen coordinates
+savedSliderValue: SliderValue ¬ 0.0, -- value to rollback to if operation aborted
+reason: Reason ¬ move, -- reason for calling client proc
+oldReason: Reason ¬ move, -- reason for calling client proc the last time
+state: SliderState ¬ inputDisabled, -- indicates whether mouse input is being accepted
+clientData: REF ANY
+];
+
+defaultForeground: Imager.Color ~ Imager.MakeGray[0.6]; -- gray
+defaultBackground: Imager.Color ~ Imager.MakeGray[0.0]; -- white
+
+Create: PUBLIC PROC [info: ViewerClasses.ViewerRec ¬ [], sliderProc: SliderProc ¬ NIL, filterProc: FilterProc ¬ NIL, orientation: SliderOrientation ¬ vertical, foreground: Imager.Color ¬ NIL, background: Imager.Color ¬ NIL, value: NormalizedSliderValue ¬ 0.0, clientData: REF ANY ¬ NIL, paint: BOOL ¬ TRUE] RETURNS [slider: Slider] = {
+sliderData: SliderData ¬ NEW[SliderDataRec ¬ [
+sliderProc: sliderProc, filterProc: filterProc, orientation: orientation, 
+foreground: IF foreground=NIL THEN defaultForeground ELSE foreground, 
+background: IF background=NIL THEN defaultBackground ELSE background, 
+normalizedSliderValue: value, clientData: clientData]];
+info.data ¬ sliderData;
+info.scrollable ¬ FALSE;
+RETURN[ViewerOps.CreateViewer[flavor: $Slider, info: info, paint: paint]];
+};
+
+GetContents: PUBLIC PROC [slider: Slider] RETURNS [contents: NormalizedSliderValue] = {
+RETURN[NARROW[ViewerOps.GetViewer[viewer: slider], REF NormalizedSliderValue]­];
+};
+
+SetContents: PUBLIC PROC [slider: Slider, contents: NormalizedSliderValue] = {
+value: REF NormalizedSliderValue ¬ NEW[NormalizedSliderValue ¬ contents];
+ViewerOps.SetViewer[viewer: slider, data: value];
+};
+
+Destroy: PUBLIC PROC [slider: Slider] = {ViewerOps.DestroyViewer[slider]};
+
+SlidersPaint: ViewerClasses.PaintProc = {
+sliderData: SliderData ~ NARROW[self.data];
+min, max: REAL;
+xmin: REAL ¬ 0;
+ymin: REAL ¬ 0;
+xmax: REAL ¬ self.cw;
+ymax: REAL ¬ self.ch;
+WITH whatChanged SELECT FROM
+rect: ViewerClasses.PaintRectangle => whatChanged ¬ NIL;
+ENDCASE;
+SELECT whatChanged FROM
+NIL => {
+Imager.SetColor[context, sliderData.background];
+Imager.MaskRectangleI[context, 0, 0, self.cw, self.ch]; 
+SetMaxSliderValue[self];
+SetSliderValue[sliderData, sliderData.normalizedSliderValue];
+min ¬ 0.0;
+max ¬ sliderData.sliderValue;
+Imager.SetColor[context, sliderData.foreground];
+};
+$sliderValue => {
+IF sliderData.oldSliderValue <= sliderData.sliderValue THEN {
+min ¬ sliderData.oldSliderValue;
+max ¬ sliderData.sliderValue;
+Imager.SetColor[context, sliderData.foreground];
+}
+ELSE {
+min ¬ sliderData.sliderValue;
+max ¬ sliderData.oldSliderValue;
+Imager.SetColor[context, sliderData.background];
+};
+};
+ENDCASE => NULL;
+IF sliderData.orientation = horizontal THEN { xmin ¬ min; xmax ¬ max }
+ELSE { ymin ¬ min; ymax ¬ max };
+Imager.MaskRectangle[context, [x: xmin, y: ymin, w: xmax-xmin, h: ymax-ymin]];
+sliderData.oldSliderValue ¬ sliderData.sliderValue;
+};
+
+SetMaxSliderValue: PROC [slider: Slider] = {
+sliderData: SliderData ¬ NARROW[slider.data];
+sliderData.maxSliderValue ¬ IF sliderData.orientation = horizontal THEN slider.cw ELSE slider.ch;
+IF sliderData.maxSliderValue < 1.0 THEN sliderData.maxSliderValue ¬ 1.0;
+};
+
+SlidersGet: ViewerClasses.GetProc = {
+sliderData: SliderData ¬ NARROW[self.data];
+RETURN[NEW[NormalizedSliderValue ¬ sliderData.normalizedSliderValue]];
+};
+
+SlidersSet: ENTRY ViewerClasses.SetProc = {
+dataValue: REF NormalizedSliderValue ¬ NARROW[data];
+sliderData: SliderData ¬ NARROW[self.data];
+SetSliderValue[sliderData, dataValue­];
+ViewerOps.PaintViewer[viewer: self, hint: client, clearClient: FALSE, whatChanged: $sliderValue];
+};
+
+SetSliderValue: PRIVATE PROC [sliderData: SliderData, normalizedValue: NormalizedSliderValue] = {
+SELECT normalizedValue FROM
+< 0.0 => normalizedValue ¬ 0.0;
+> 1.0 => normalizedValue ¬ 1.0;
+ENDCASE;
+sliderData.normalizedSliderValue ¬ normalizedValue;
+sliderData.sliderValue ¬ sliderData.normalizedSliderValue * sliderData.maxSliderValue;
+};
+
+SlidersNotify: ViewerClasses.NotifyProc = TRUSTED {
+ENABLE UNWIND => { InputFocus.ReleaseButtons[]; WindowManager.RestoreCursor[] };
+v: ViewerClasses.Viewer;
+c: BOOL;
+mouse: TIPUser.TIPScreenCoords;
+mouseValue: SliderValue;
+mouseScreenCoords: TIPUser.TIPScreenCoords ¬ NEW[TIPUser.TIPScreenCoordsRec];
+sliderData: SliderData ¬ NARROW[self.data];
+FOR list: LIST OF REF ANY ¬ input, list.rest UNTIL list = NIL DO
+WITH list.first SELECT FROM
+x: ATOM => SELECT x FROM
+$Enable => {
+InputFocus.CaptureButtons[proc: SlidersNotify, tip: slidersClass.tipTable, viewer: self];
+sliderData.state ¬ inputEnabled;
+sliderData.savedSliderValue ¬ sliderData.sliderValue;
+mouseValue ¬ IF sliderData.orientation = horizontal THEN mouse.mouseX ELSE mouse.mouseY;
+SetNewSliderValue[sliderData: sliderData, value: mouseValue, reason: move];
+CreateSliderProcess[self];
+};
+$Abort => {
+InputFocus.ReleaseButtons[];
+sliderData.state ¬ inputDisabled;
+SetNewSliderValue[sliderData: sliderData, value: sliderData.savedSliderValue, reason: abort];
+sliderProcessData.state ¬ dying;
+};
+$Move => IF sliderData.state = inputEnabled THEN {
+mouseScreenCoords­ ¬ mouse­;
+[v, c] ¬ ViewerOps.MouseInViewer[mouse];
+IF v = self AND c THEN
+ mouseValue ¬ 
+ IF sliderData.orientation = horizontal THEN mouse.mouseX ELSE mouse.mouseY
+ELSE IF MouseAboveSlider[self: self, coords: mouseScreenCoords] THEN
+ mouseValue ¬ sliderData.maxSliderValue
+ELSE IF MouseBelowSlider[self: self, coords: mouseScreenCoords] THEN
+ mouseValue ¬ 0.0
+ELSE mouseValue ¬ sliderData.mouseValue;
+SetNewSliderValue[sliderData: sliderData, value: mouseValue, reason: move];
+};
+$Set => IF sliderData.state = inputEnabled THEN {
+reason: Reason ¬ set;
+InputFocus.ReleaseButtons[];
+sliderData.state ¬ inputDisabled;
+mouseScreenCoords­ ¬ mouse­;
+[v, c] ¬ ViewerOps.MouseInViewer[mouse];
+IF v = self AND c THEN
+ mouseValue ¬ 
+ IF sliderData.orientation = horizontal THEN mouse.mouseX ELSE mouse.mouseY
+ELSE IF MouseAboveSlider[self: self, coords: mouseScreenCoords] THEN
+ mouseValue ¬ sliderData.maxSliderValue
+ELSE IF MouseBelowSlider[self: self, coords: mouseScreenCoords] THEN
+ mouseValue ¬ 0.0
+ELSE {
+mouseValue ¬ sliderData.savedSliderValue;
+reason ¬ abort;
+};
+SetNewSliderValue[sliderData: sliderData, value: mouseValue, reason: reason];
+sliderProcessData.state ¬ dying;
+};
+ENDCASE => NULL;
+z: TIPUser.TIPScreenCoords => mouse ¬ z;
+ENDCASE => ERROR;
+ENDLOOP;
+};
+SetNewSliderValue: PRIVATE ENTRY PROC [sliderData: SliderData, value: SliderValue, reason: Reason] = {
+sliderData.mouseValue ¬ value;
+sliderData.reason ¬ reason;
+};
+
+MouseAboveSlider: PRIVATE PROC [self: Slider, coords: TIPUser.TIPScreenCoords] RETURNS [above: BOOL] = {
+cornerX, cornerY: INTEGER;
+sliderData: SliderData ¬ NARROW[self.data];
+IF sliderData.orientation = horizontal THEN {
+[cornerX, cornerY] ¬ ViewerOps.UserToScreenCoords[self: self, vx: self.ww-2, vy: 0];
+IF coords.mouseX > cornerX AND coords.mouseY >= cornerY AND coords.mouseY < cornerY + self.wh THEN RETURN[TRUE];
+}
+ELSE {
+[cornerX, cornerY] ¬ ViewerOps.UserToScreenCoords[self: self, vx: 0, vy: self.wh-2];
+IF coords.mouseY > cornerY AND coords.mouseX >= cornerX AND coords.mouseX < cornerX + self.ww THEN RETURN[TRUE];
+};
+RETURN[FALSE];
+};
+
+MouseBelowSlider: PRIVATE PROC [self: Slider, coords: TIPUser.TIPScreenCoords] RETURNS [below: BOOL] = {
+cornerX, cornerY: INTEGER;
+sliderData: SliderData ¬ NARROW[self.data];
+[cornerX, cornerY] ¬ ViewerOps.UserToScreenCoords[self: self, vx: 0, vy: 0];
+IF sliderData.orientation = horizontal THEN {
+IF coords.mouseX < cornerX AND coords.mouseY >= cornerY AND coords.mouseY < cornerY + self.wh THEN RETURN[TRUE];
+}
+ELSE {
+IF coords.mouseY < cornerY AND coords.mouseX >= cornerX AND coords.mouseX < cornerX + self.ww THEN RETURN[TRUE];
+};
+RETURN[FALSE];
+};
+
+SliderProcessData: TYPE = REF SliderProcessDataRec;
+SliderProcessDataRec: TYPE = RECORD [
+slider: Slider ¬ NIL,
+timerCondition: CONDITION,
+state: SliderProcessState ¬ alive
+];
+SliderProcessState: TYPE = {alive, dying};
+
+sliderProcessData: SliderProcessData ¬ NIL;
+
+CreateSliderProcess: PRIVATE PROC [slider: Slider] = {
+sliderProcessData ¬ NEW[SliderProcessDataRec];
+sliderProcessData.slider ¬ slider;
+TRUSTED {Process.Detach[FORK SliderProcess[sliderProcessData]]};
+};
+
+SliderProcess: PRIVATE PROC [myData: SliderProcessData] = {
+UpdateSliderValue: PROC [self: Slider] = {
+sliderData: SliderData ¬ NARROW[self.data];
+notifyClient: BOOL;
+reason: Reason;
+normalizedValue: NormalizedSliderValue;
+[notifyClient, reason, normalizedValue] ¬ UpdateSlider[self];
+IF sliderData.sliderProc # NIL AND notifyClient THEN sliderData.sliderProc[slider: self, reason: reason, value: normalizedValue, clientData: sliderData.clientData];
+};
+timerPeriod: Process.Milliseconds = 40;
+WHILE myData.state = alive DO
+UpdateSliderValue[myData.slider];
+Wait[myData, timerPeriod];
+ENDLOOP;
+UpdateSliderValue[myData.slider];
+};
+
+UpdateSlider: PRIVATE ENTRY PROC [self: Slider] RETURNS [notifyClient: BOOL, reason: Reason, normalizedValue: NormalizedSliderValue] = {
+sliderData: SliderData ¬ NARROW[self.data];
+value: NormalizedSliderValue;
+notifyClient ¬ FALSE;
+IF sliderData.mouseValue # sliderData.oldSliderValue THEN {
+notifyClient ¬ TRUE;
+value ¬ sliderData.mouseValue / sliderData.maxSliderValue;
+IF sliderData.filterProc # NIL THEN value ¬ sliderData.filterProc[value, sliderData.clientData];
+SetSliderValue[sliderData, value];
+IF sliderData.sliderValue # sliderData.oldSliderValue THEN {
+notifyClient ¬ TRUE;
+ViewerOps.PaintViewer[viewer: self, hint: client, clearClient: FALSE, whatChanged: $sliderValue];
+};
+};
+IF sliderData.reason # sliderData.oldReason THEN notifyClient ¬ TRUE;
+sliderData.oldReason ¬ sliderData.reason;
+RETURN[notifyClient, sliderData.reason, sliderData.normalizedSliderValue];
+};
+
+Wait: PRIVATE ENTRY PROC [data: SliderProcessData, milliseconds: Process.Milliseconds] = {
+TRUSTED {Process.SetTimeout[@data.timerCondition, Process.MsecToTicks[milliseconds]]};
+WAIT data.timerCondition;
+};
+slidersClass: ViewerClasses.ViewerClass ¬ NEW[ViewerClasses.ViewerClassRec ¬ [
+paint: SlidersPaint,
+get: SlidersGet,
+set: SlidersSet,
+notify: SlidersNotify,
+tipTable: TIPUser.InstantiateNewTIPTable["Slider.tip"],
+cursor: crossHairsCircle
+]];
+
+ViewerOps.RegisterViewerClass[$Slider, slidersClass];
+
+END.
+   0  
+SlidersImpl.mesa
+Copyright Ó 1985, 1986, 1987, 1991 by Xerox Corporation.  All rights reserved.
+Written by Darlene Plebon on June 22, 1983 1:16 pm
+Last Edited by: Beach, June 22, 1983 6:15 pm
+Bier, November 30, 1988 12:53:54 pm PST
+Doug Wyatt, January 19, 1987 11:59:53 pm PST
+
+
+Initialization
+
+
+ Êå  •NewlineDelimiter
+–(cedarcode) style™ code–"Cedar" stylešœ™K–"Cedar" stylešœ
+ÏeœC™NK–"Cedar" stylešœ2™2K™,K™'K™,—K˜ šÏk	˜	Kšœžœ<˜HKšœžœ"˜2Kšœžœ1˜>Kšœ˜Kšœžœ?˜LKšœžœk˜~Kšœ
+žœz˜‰Kšœžœ˜$—K˜ KšÐblœžœž˜Kšžœ?˜FKšžœ˜Kšœžœžœ	˜K˜ Kšœžœ!˜2KšœžœžœÏc˜0Kšœžœžœ˜&šœžœžœ˜Kšœžœ 4˜RKšœžœ 0˜NKšœ  7˜WKšœ ˜7Kšœ ˜7Kšœ4 ˜JKšœ ˜:Kšœ  ,˜LKšœ# 4˜WKšœ# .˜QKšœ% ,˜QKšœ !˜8Kšœ /˜IKšœ$ 2˜VKšœžœž˜Kšœ˜—K˜ Kšœ8 ˜?Kšœ8 ˜@K˜ šÏnœžœžœ?žœžœHžœžœ2žœžœžœ	žœžœžœ˜ÏKšœžœjžœžœžœžœžœžœžœžœE˜¿Kšœ˜Kšœžœ˜KšžœD˜JKšœ˜—K˜ š¡œžœžœžœ&˜WKšžœžœ&žœ˜PK˜—K˜ š¡œžœžœ6˜NKšœžœžœ#˜IKšœ1˜1K˜—K˜ Kš¡œžœžœ6˜JK˜ š¡œ˜)Kšœžœ˜+Kšœ
+žœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜šžœžœž˜Kšœ4žœ˜8Kšžœ˜—šžœž˜šžœ˜Kšœ0˜0Kšœ8˜8K˜Kšœ=˜=K˜
+Kšœ˜Kšœ0˜0Kšœ˜—šœ˜šžœ5žœ˜=Kšœ ˜ Kšœ˜Kšœ0˜0Kšœ˜—šžœ˜Kšœ˜Kšœ ˜ Kšœ0˜0Kšœ˜—K˜—Kšžœžœ˜—Kšžœ%žœ˜FKšžœ˜ KšœN˜NKšœ3˜3Kšœ˜—K˜ š¡œžœ˜,Kšœžœ˜-Kšœžœ%žœžœ˜aKšžœ!žœ!˜HK˜—K˜ š¡
+œ˜%Kšœžœ˜+Kšžœžœ<˜FKšœ˜K˜ —š¡
+œžœ˜+Kšœžœžœ˜4Kšœžœ˜+Kšœ'˜'Kšœ?žœ˜aKšœ˜K˜ —š¡œžœžœE˜ašžœž˜K˜K˜Kšžœ˜—Kšœ3˜3KšœV˜VK˜—K˜ š¡œžœ˜3KšžœžœC˜PK˜Kšœžœ˜Kšœ˜K˜Kšœ-žœ˜MKšœžœ˜+šžœžœžœžœžœžœžœž˜@šžœžœž˜šœžœžœž˜šœ˜K•StartOfExpansionc[proc: ViewerClasses.NotifyProc, tip: TIPTables.TIPTable, viewer: ViewerClasses.Viewer _ NIL]šœY˜YKšœ ˜ Kšœ5˜5Kšœžœ%žœžœ˜XKšœK˜KKšœ˜Kšœ˜—šœ˜K˜Kšœ!˜!Kšœ]˜]Kšœ ˜ Kšœ˜—šœ	žœ!žœ˜2Kšœ˜K˜(Kšžœ
+žœžœžœ%žœžœ˜qKšžœžœ9žœ'˜lKšžœžœ9žœ˜VKšžœ$˜(KšœK˜KKšœ˜—šœžœ!žœ˜1K˜Kšœ˜Kšœ!˜!Kšœ˜K˜(Kšžœ
+žœžœžœ%žœžœ˜qKšžœžœ9žœ'˜lKšžœžœ9žœ˜Všžœ˜Kšœ)˜)K˜K˜—KšœM˜MKšœ ˜ Kšœ˜—Kšžœžœ˜—Kšœ(˜(Kšžœžœ˜—Kšžœ˜—Kšœ˜—K™ š¡œžœžœžœA˜fKšœ˜Kšœ˜K˜—K˜ š
+¡œžœžœ1žœ	žœ˜hKšœžœ˜Kšœžœ˜+šžœ%žœ˜-KšœT˜TKšžœžœžœ#žœžœžœ˜pKšœ˜—šžœ˜KšœT˜TKšžœžœžœ#žœžœžœ˜pKšœ˜—Kšžœžœ˜K˜—K˜ š
+¡œžœžœ1žœ	žœ˜hKšœžœ˜Kšœžœ˜+KšœL˜Lšžœ%žœ˜-Kšžœžœžœ#žœžœžœ˜pKšœ˜—šžœ˜Kšžœžœžœ#žœžœžœ˜pKšœ˜—Kšžœžœ˜K˜—K˜ Kšœžœžœ˜3šœžœžœ˜%Kšœžœ˜Kšœž	œ˜K˜!K˜—Kšœžœ˜*K˜ Kšœ'žœ˜+K˜ š¡œžœžœ˜6Kšœžœ˜.Kšœ"˜"Kšžœžœ$˜@K˜—K˜ š¡œžœžœ ˜;š¡œžœ˜*Kšœžœ˜+Kšœžœ˜Kšœ˜Kšœ'˜'Kšœ=˜=Kšžœžœžœžœp˜¤K˜—Kšœ'˜'šžœž˜Kšœ!˜!K˜—Kšžœ˜Kšœ!˜!K˜—K˜ š¡œžœžœžœžœžœ=˜ˆKšœžœ˜+Kšœ˜Kšœžœ˜šžœ3žœ˜;Kšœžœ˜Kšœ:˜:Kšžœžœžœ=˜`Kšœ"˜"šžœ4žœ˜<Kšœžœ˜Kšœ?žœ˜aK˜—K˜—Kšžœ*žœžœ˜EKšœ)˜)KšžœD˜JK˜—K˜ š¡œžœžœžœB˜ZKšžœO˜VKšžœ˜K˜—K™ K™K™ šœ*žœ!˜NK˜K˜K˜K˜K˜7Kšœ˜K˜K˜ —Kšœ5˜5K˜ Kšžœ˜K™ — …—    .  ;/  

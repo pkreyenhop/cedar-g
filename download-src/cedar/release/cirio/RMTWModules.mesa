@@ -1,0 +1,1997 @@
+
+DIRECTORY
+Basics USING[BITXOR, Comparison, LongNumber],
+BasicTime USING[earliestGMT, GMT, Now, Period],
+CirioNubAccess USING[CreateRemoteNub, DestroyNub, Handle],
+Commander USING[CommandProc, Register],
+CommanderOps USING[ArgumentVector, NextArgument, NumArgs, Parse],
+Convert USING[CardFromRope, Error],
+ObjectFiles USING[BracketNest, BracketPair, CreateParsed, FileSegmentPC, FindVersionStamp, GetBracketNestForPC, GetLineNumForPC, GetModuleInfo, GetObjectFile, GetPCForLineNum, GetPCRange, Module, ModuleFromParsedAndPC, ModuleInfo, Parsed, PCRange, VersionStampInfo],
+IO,
+List USING[Sort],
+LoadStateAccess USING[BasicPCInfo, CreateLoadStateHandle, GetBasicPCInfo, GetLoadedModuleInfoFromAbsPC, GetLoadedModuleInfoFromStemName, GetRopeForBasicPCInfo, GetRopeListForBasicPCInfo, GetRopeListForLoadedModuleInfo, LoadedModuleInfo, LoadStateHandle],
+MobAccess USING[ComputeSourceVersionStamp, CreateMobCookie, MobCookie, MobError, ReadMobVersionStamp, ReadSourceVersionStamp],
+MobDefs USING[NullVersion, VersionStamp],
+MobObjectFiles USING[CreateJointMobParsedInfo, JointMobParsedInfo],
+MorePfsNames,
+NewRMTW USING[CedarBreakAddress, CedarSourcePosition, LoadedModuleInfo],
+PFS,
+PFSNames,
+RMTWBackdoor,
+RMTWPrivate USING [NameParts],
+RefTab USING[Create, Fetch, Key, Ref, Store],
+Rope,
+RopeParts,
+RuntimeError USING[BoundsFault],
+SourceFileOps,
+SystemInterface USING[CirioFile, CirioFileInfo, CloseFileSet, CreateFileSet, FileSet, GenCirioFilesForInfo, GenVersionMapFilesForInfo, GetCirioFile, GetFileInfo, GetNameOfFile, GetStreamForFile, ReleaseStreamForFile, ShowReport, VersionStampToUniqueID],
+UserProfile USING [Token];
+
+
+RMTWModules: CEDAR MONITOR
+LOCKS modules USING modules: CedarModuleSet
+IMPORTS Basics, BasicTime, CirioNubAccess, Commander, CommanderOps, Convert, IO, List, LoadStateAccess, MobAccess, MobObjectFiles, MorePfsNames, ObjectFiles, PFS, PFSNames, RefTab, Rope, RopeParts, RuntimeError, SourceFileOps, SystemInterface, UserProfile
+EXPORTS NewRMTW, RMTWBackdoor, RMTWPrivate =
+BEGIN OPEN LSA:LoadStateAccess, ObjF:ObjectFiles, MA:MobAccess, MOF:MobObjectFiles, MPfsN:MorePfsNames, RMTWPrivate;
+
+ROPE: TYPE ~ Rope.ROPE;
+PATH: TYPE ~ PFSNames.PATH;
+CirioFile: TYPE = SystemInterface.CirioFile;
+
+CedarModuleSet: TYPE = REF CedarModuleSetBody;
+CedarModuleSetBody: PUBLIC TYPE = MONITORED RECORD[
+fileSet: SystemInterface.FileSet,
+searchPaths: LIST OF PATH,
+otherDirectories: LIST OF PATH,
+remoteServer: Rope.ROPE,
+table: RefTab.Ref,
+loadedTable: RefTab.Ref,
+flushTime: BasicTime.GMT,
+vsHash: VSHashTable,
+defMobs: VSHashTable];
+
+CedarModule: TYPE = REF CedarModuleHandle;
+CedarModuleHandle: TYPE = REF CedarModuleBody;
+CedarModuleBody: TYPE = RECORD[
+moduleSet: CedarModuleSet,
+mobStamp: REF MobDefs.VersionStamp,
+sourceStamp: REF MobDefs.VersionStamp,
+possiblePrincipalDirectories: LIST OF PATH,
+originalPossibleNameStems: LIST OF PATH,
+possibleNameStems: LIST OF PATH,
+failureTime: BasicTime.GMT,
+mesaSourceFailed: BOOLEAN,
+mobFileFailed: BOOLEAN,
+mobFailed: BOOLEAN,
+cSourceFailed: BOOLEAN,
+jmpiFailed: BOOLEAN,
+moduleFailed: BOOLEAN,
+wholeFailed: BOOLEAN,
+loadedJmpiFailed: BOOLEAN,
+mesaSource: CirioFile,
+jmpi: MOF.JointMobParsedInfo,
+mobFile: CirioFile,
+mob: MA.MobCookie,
+cInfo: CFileInfo,
+module: ObjF.Module,
+whole: ObjF.Parsed,
+loadedJmpi: MOF.JointMobParsedInfo,
+loadedModule: ObjF.Module,
+loadedWhole: ObjF.Parsed,
+loadedModuleInfo: REF LoadStateAccess.LoadedModuleInfo];
+
+CreateCedarModuleSet: PUBLIC PROC[fileSet: SystemInterface.FileSet, remoteServer: Rope.ROPE ¨ NIL] RETURNS[CedarModuleSet] =
+BEGIN
+table: RefTab.Ref ¨ RefTab.Create[];
+loadedTable: RefTab.Ref ¨ RefTab.Create[];
+vsHash: VSHashTable ¨ CreateVSHashTable[];
+defMobs: VSHashTable ¨ CreateVSHashTable[];
+RETURN[NEW[CedarModuleSetBody¨[ , fileSet, NIL, NIL, remoteServer, table, loadedTable, BasicTime.Now[], vsHash, defMobs]]];
+END;
+
+ResetSearchPaths: PUBLIC ENTRY PROC[modules: CedarModuleSet, searchPaths: LIST OF PATH, flushTime: BasicTime.GMT] =
+BEGIN
+ENABLE UNWIND => NULL;
+modules.searchPaths ¨ searchPaths;
+modules.flushTime ¨ flushTime;
+END;
+
+FlushUnknownFileCache: PUBLIC ENTRY PROC[modules: CedarModuleSet, flushTime: BasicTime.GMT] =
+BEGIN
+ENABLE UNWIND => NULL;
+modules.flushTime ¨ flushTime;
+END;
+
+CedarSourcePosition: TYPE = NewRMTW.CedarSourcePosition;
+
+GetCedarSourcePosition: PUBLIC ENTRY PROC[modules: CedarModuleSet, loadedModule: REF LoadStateAccess.LoadedModuleInfo, absPC: CARD] RETURNS[REF CedarSourcePosition] ~ {
+ENABLE UNWIND => NULL;
+module: CedarModule ~ GetCedarModuleForLoadedModule[modules, loadedModule];
+moduleRelativePC: CARD ~ IF loadedModule # NIL THEN absPC - (loadedModule.lsi[text].base + loadedModule.moduleRelativeBaseAddr) ELSE 0;
+RETURN[ComputeCedarSourcePosition[module, [[0, ""], moduleRelativePC]]]};
+
+ComputeCedarSourcePosition: PROC[module: CedarModule, spc: ObjF.FileSegmentPC] RETURNS[REF CedarSourcePosition] =
+BEGIN
+IF module = NIL THEN RETURN[NEW[CedarSourcePosition¨[spc.relPC, NIL, 0, NIL, 0, "unknown mesa module"]]]
+  ELSE
+BEGIN
+embeddedModule: ObjF.Module ¨ GetModule[module];
+moduleInfo: REF ObjF.ModuleInfo ¨ IF embeddedModule # NIL THEN ObjF.GetModuleInfo[embeddedModule] ELSE NIL;
+parsedRelativePC: ObjF.FileSegmentPC ¨ [[0, ""], IF moduleInfo # NIL THEN 0--pj moduleInfo.startPC--+spc.relPC ELSE 0];
+cLine: CARD ¨ IF moduleInfo # NIL THEN ObjF.GetLineNumForPC[embeddedModule, parsedRelativePC] ELSE 0;
+cInfo: CFileInfo ¨ GetCFileInfo[module];
+cFile: CirioFile ¨ IF cInfo # NIL THEN cInfo.file ELSE NIL;
+mesaPosition: CARD ¨ IF cInfo # NIL THEN LookupCLineNum[cInfo, cLine] ELSE 0;
+remarks: Rope.ROPE ¨ NIL;
+IF embeddedModule # NIL AND cInfo # NIL THEN -- check back with parsed
+BEGIN
+correspondingcLine: CARD ¨ LookupMesaSourcePos[cInfo, mesaPosition];
+correspondingPC: ObjF.FileSegmentPC ¨ ObjF.GetPCForLineNum[embeddedModule, correspondingcLine];
+originalNest: ObjF.BracketNest ¨ ObjF.GetBracketNestForPC[embeddedModule, correspondingPC];
+originalPair: ObjF.BracketPair ¨ IF originalNest = NIL THEN NIL ELSE originalNest.rest.first;
+pcRange: ObjF.PCRange ¨ IF originalPair = NIL THEN [0, 0] ELSE ObjF.GetPCRange[originalPair]; 
+IF originalPair = NIL OR correspondingPC.relPC < pcRange.first OR pcRange.limit <= correspondingPC.relPC THEN remarks ¨ IO.PutFR["Source location is potentially erroneous (because it corresponds to c line number %g as well as %g, and the two are in distinct C blocks).", [cardinal[correspondingcLine]], [cardinal[cLine]]];
+END;
+RETURN[NEW[CedarSourcePosition¨[spc.relPC, GetMesaFile[module], mesaPosition, cFile, cLine, remarks]]];
+END
+END;
+
+GetRopesForSourcePosInfo: PUBLIC PROC[info: REF CedarSourcePosition] RETURNS[LIST OF Rope.ROPE] =
+BEGIN
+ropes: LIST OF Rope.ROPE ¨ NIL;
+mesaName: PATH ¨ IF info.mesa = NIL THEN PFSNames.EmptyPath ELSE SystemInterface.GetNameOfFile[info.mesa];
+cName: PATH ¨ IF info.cFile = NIL THEN PFSNames.EmptyPath ELSE SystemInterface.GetNameOfFile[info.cFile];
+
+IF info.remarks # NIL THEN ropes ¨ CONS[info.remarks, ropes];
+ropes ¨ CONS[IO.PutFR["  line in %g is %g", IO.rope[PFS.RopeFromPath[cName]], IO.card[info.cLineNum]], ropes];
+IF info.mesaPosition # 0 THEN ropes ¨ CONS[IO.PutFR["  position in %g is %g", IO.rope[PFS.RopeFromPath[mesaName]], IO.card[info.mesaPosition]], ropes];
+IF info.mesaPosition = 0 THEN ropes ¨ CONS[IO.PutFR1["  position is somewhere in %g", IO.rope[PFS.RopeFromPath[mesaName]]], ropes];
+ropes ¨ CONS[IO.PutFR1["for relative pc: %g", IO.card[info.relativePC]], ropes];
+RETURN[ropes]
+END;
+
+LoadedModuleInfo: TYPE = NewRMTW.LoadedModuleInfo;
+LoadedModule: TYPE = REF LoadedModuleBody;
+LoadedModuleBody: TYPE = RECORD[
+module: CedarModule,
+loadedModule: REF LoadStateAccess.LoadedModuleInfo,
+loadedModuleFailedTime: BasicTime.GMT];
+
+
+GetLoadedModuleInfo: PUBLIC ENTRY PROC[modules: CedarModuleSet, loadedModule: REF LoadStateAccess.LoadedModuleInfo] RETURNS[REF LoadedModuleInfo] =
+BEGIN
+ENABLE UNWIND => NULL;
+module: CedarModule ¨ GetCedarModuleForLoadedModule[modules, loadedModule];
+IF module = NIL THEN RETURN[NIL]
+ ELSE RETURN[NEW[LoadedModuleInfo¨[
+jmpi: GetLoadedJMPI[module],
+mob: GetMob[module],
+loadedModule: loadedModule]]];
+END;
+
+CedarBreakAddress: TYPE = NewRMTW.CedarBreakAddress;
+
+
+GetAbsAddressForBreak: PUBLIC ENTRY PROC[modules: CedarModuleSet, mesa: CirioFile, loadState: LoadStateAccess.LoadStateHandle, sourcePos: CARD] RETURNS[REF CedarBreakAddress] =
+BEGIN
+ENABLE UNWIND => NULL;
+lm: LoadedModule ¨ GetLoadedModuleForMesa[modules, mesa, loadState];
+IF lm = NIL OR lm.module = NIL OR lm.loadedModule = NIL THEN RETURN[NIL]
+ ELSE
+BEGIN
+cInfo: CFileInfo ¨ GetCFileInfo[lm.module];
+IF cInfo = NIL THEN RETURN[NIL]
+ ELSE
+BEGIN
+cLineNum: CARD ¨ LookupMesaSourcePos[cInfo, sourcePos];
+parsedRelativePC: ObjF.FileSegmentPC ¨ ObjF.GetPCForLineNum[lm.loadedModule.module, cLineNum];
+correspondingCLineNum: CARD ¨ ObjF.GetLineNumForPC[lm.loadedModule.module, parsedRelativePC];
+correspondingMesaPos: CARD ¨ LookupCLineNum[cInfo, correspondingCLineNum];
+moduleRelPC: CARD ¨ parsedRelativePC.relPC - lm.loadedModule.moduleRelativeBaseAddr;
+absPC: CARD ¨ lm.loadedModule.lsi[text].base+parsedRelativePC.relPC;
+RETURN[NEW[CedarBreakAddress¨[mesa, sourcePos, cInfo.file, cLineNum, [[0, ""], moduleRelPC], correspondingCLineNum, correspondingMesaPos, lm.loadedModule, absPC]]];
+END;
+END
+END;
+
+GetRopesForCedarBreakAddress: PUBLIC PROC[addr: REF CedarBreakAddress] RETURNS[LIST OF Rope.ROPE] =
+BEGIN
+IF addr = NIL THEN RETURN[LIST["failed to set break"]]
+ ELSE
+BEGIN
+mesa: PATH ¨ SystemInterface.GetNameOfFile[addr.mesa];
+cname: PATH ¨ SystemInterface.GetNameOfFile[addr.cFile];
+rope1: Rope.ROPE ¨ IO.PutFR["setting break in %g at source pos = %g", IO.rope[PFS.RopeFromPath[mesa]], IO.card[addr.mesaPosition]];
+rope2: Rope.ROPE ¨ IO.PutFR["  C line num = %g in %g", IO.card[addr.cLineNum], IO.rope[PFS.RopeFromPath[cname]]];
+rope3: Rope.ROPE ¨ IO.PutFR1["  module relative pos = %g", IO.card[addr.moduleRelativePC.relPC]];
+rope4: Rope.ROPE ¨ IO.PutFR1["  corresponding C line num = %g", IO.card[addr.correspondingCLineNum]];
+rope5: Rope.ROPE ¨ IO.PutFR1["  resulting mesa source pos = %g", IO.card[addr.correspondingMesaPosition]];
+rope6: Rope.ROPE ¨ IO.PutFR1["  abs pos = %g", IO.card[addr.absPC]];
+RETURN[LIST[rope1, rope2, rope3, rope4, rope5, rope6]];
+END;
+END;
+
+
+DefMobHolder: TYPE = RECORD[failureTime: BasicTime.GMT, mob: MA.MobCookie];
+
+
+GetDefinitionMob: PUBLIC ENTRY PROC[modules: CedarModuleSet, vs: MobDefs.VersionStamp, stem: PATH ¨ NIL] RETURNS[MA.MobCookie] =
+BEGIN
+ENABLE UNWIND => NULL;
+vsKey: RefTab.Key ¨ CreateVSKey[vs, emptyRopePart];
+mobRef: REF DefMobHolder ¨ NARROW[RefTab.Fetch[modules.defMobs.table, vsKey].val];
+IF mobRef = NIL THEN
+BEGIN
+mobRef ¨ NEW[DefMobHolder¨[modules.flushTime, NIL]];
+IF NOT RefTab.Store[modules.defMobs.table, vsKey, mobRef] THEN ERROR;
+END;
+IF mobRef.mob = NIL AND BasicTime.Period[mobRef.failureTime, modules.flushTime] >= 0 THEN
+BEGIN
+foundMob: MA.MobCookie ¨ NIL; -- tentative
+foundPossibleFile: CirioFile ¨ NIL; -- tentative
+foundCreateTime: BasicTime.GMT ¨ BasicTime.earliestGMT; -- tentative
+
+AcceptOneFile: PROC [info: SystemInterface.CirioFileInfo] RETURNS[thisIsIt: BOOLEAN ¨ FALSE] = {
+possibleFile: CirioFile;
+mob: MA.MobCookie;
+mobStamp: MobDefs.VersionStamp;
+possibleFile ¨ SystemInterface.GetCirioFile[modules.fileSet, info.fullName, info.uniqueID];
+mob ¨ MA.CreateMobCookie[possibleFile ! MobAccess.MobError => {
+SystemInterface.ShowReport[IO.PutFR1["\tbad mob %g", [rope[PFS.RopeFromPath[info.fullName]]] ], IF debugSearch THEN $urgent ELSE $debug];
+GOTO failure}];
+mobStamp ¨ MA.ReadMobVersionStamp[mob];
+IF debugSearch THEN SystemInterface.ShowReport[IO.PutFR["\t?name=%g,\n\tmobStamp=%08x%08x.", [rope[PFS.RopeFromPath[info.fullName]]], [cardinal[mobStamp[0]]], [cardinal[mobStamp[1]]] ], $urgent];
+foundMob ¨ mob;
+foundPossibleFile ¨ possibleFile;
+foundCreateTime ¨ info.uniqueID.egmt.gmt;
+RETURN[TRUE];
+EXITS failure => RETURN [FALSE]};
+
+TryOneFile: PROC[info: SystemInterface.CirioFileInfo] RETURNS[thisIsIt: BOOLEAN ¨ FALSE] = {
+possibleFile: CirioFile;
+mob: MA.MobCookie;
+mobStamp: MobDefs.VersionStamp;
+possibleFile ¨ SystemInterface.GetCirioFile[modules.fileSet, info.fullName, info.uniqueID];
+mob ¨ MA.CreateMobCookie[possibleFile ! MobAccess.MobError => {
+SystemInterface.ShowReport[IO.PutFR1["\tbad mob %g", [rope[PFS.RopeFromPath[info.fullName]]] ], IF debugSearch THEN $urgent ELSE $debug];
+GOTO failure}];
+mobStamp ¨ MA.ReadMobVersionStamp[mob];
+IF debugSearch THEN SystemInterface.ShowReport[IO.PutFR["\t?name=%g,\n\tmobStamp=%08x%08x.", [rope[PFS.RopeFromPath[info.fullName]]], [cardinal[mobStamp[0]]], [cardinal[mobStamp[1]]] ], $urgent];
+IF vs = mobStamp THEN {
+foundMob ¨ mob;
+foundPossibleFile ¨ possibleFile;
+foundCreateTime ¨ info.uniqueID.egmt.gmt;
+RETURN[TRUE]};
+RETURN[FALSE];
+EXITS failure => RETURN [FALSE]};
+
+TryOneDir: PROC[dir: PATH] =
+BEGIN
+mobFileNamePattern: PATH ¨ PFS.PathFromRope[Rope.Cat[PFS.RopeFromPath[stem], ".mob", "*"]].ExpandName[dir];
+IF debugSearch THEN SystemInterface.ShowReport[IO.PutFR1["\tSearching file pattern %g.", [rope[PFS.RopeFromPath[mobFileNamePattern]]] ], $urgent];
+[] ¨ SystemInterface.GenCirioFilesForInfo[modules.fileSet, mobFileNamePattern, TryOneFile];
+END;
+
+SystemInterface.ShowReport[Rope.Concat["searching for mob for ", IF stem#NIL THEN PFS.RopeFromPath[stem] ELSE "???"], $normal];
+IF stem=NIL THEN SystemInterface.ShowReport[IO.PutFR["\twith mobStamp=%08x%08x.", [cardinal[vs[0]]], [cardinal[vs[1]]] ], IF debugSearch THEN $urgent ELSE $normal];
+
+
+IF stem#NIL THEN FOR dirs: LIST OF PATH ¨ modules.searchPaths, dirs.rest WHILE dirs # NIL AND foundPossibleFile = NIL DO
+IF debugSearch THEN SystemInterface.ShowReport[IO.PutFR1["\tSearching search dir %g.", [rope[PFS.RopeFromPath[dirs.first]]] ], $urgent];
+TryOneDir[dirs.first];
+ENDLOOP;
+
+IF foundPossibleFile = NIL THEN {
+IF debugSearch THEN SystemInterface.ShowReport["\tSearching version maps.", $urgent];
+IF stem#NIL
+THEN foundPossibleFile ¨ SystemInterface.GenVersionMapFilesForInfo[modules.fileSet, $Intermediate, vs, LIST[stem], LIST[".mob"], TRUE, AcceptOneFile]
+ELSE foundPossibleFile ¨ SystemInterface.GenVersionMapFilesForInfo[modules.fileSet, $Intermediate, vs, LIST[MPfsN.Cons1[MPfsN.ConstructComponent[["*"], [none]]]], LIST[".mob"], TRUE, AcceptOneFile];
+};
+
+IF stem#NIL THEN FOR dirs: LIST OF PATH ¨ modules.otherDirectories, dirs.rest WHILE dirs # NIL AND foundPossibleFile = NIL DO
+IF debugSearch THEN SystemInterface.ShowReport[IO.PutFR1["\tSearching other dir %g.", [rope[PFS.RopeFromPath[dirs.first]]] ], $urgent];
+TryOneDir[dirs.first];
+ENDLOOP;
+
+IF foundPossibleFile = NIL THEN
+BEGIN
+mobRef.failureTime ¨ BasicTime.Now[];
+SystemInterface.ShowReport[Rope.Concat["unable to find mob for ", IF stem#NIL THEN PFS.RopeFromPath[stem] ELSE "???"], $urgent];
+END
+ ELSE
+BEGIN
+mobName: PATH ¨ SystemInterface.GetNameOfFile[foundPossibleFile];
+mobRef.mob ¨ foundMob;
+SystemInterface.ShowReport[Rope.Concat["   found ", PFS.RopeFromPath[mobName]], $normal];
+END;
+
+END;
+RETURN[mobRef.mob];
+END;
+
+GetLoadedModuleForMesa: PROC[modules: CedarModuleSet, mesa: CirioFile, loadState: LoadStateAccess.LoadStateHandle] RETURNS[LoadedModule] =
+BEGIN
+lm: LoadedModule ¨ NARROW[RefTab.Fetch[modules.loadedTable, mesa].val];
+IF lm = NIL THEN
+BEGIN
+lm ¨ NEW[LoadedModuleBody¨[NIL, NIL, modules.flushTime]];
+IF NOT RefTab.Store[modules.loadedTable, mesa, lm] THEN ERROR;
+END;
+IF lm.loadedModule = NIL AND (BasicTime.Period[lm.loadedModuleFailedTime, modules.flushTime] >= 0) THEN
+BEGIN
+mesaName: PATH ¨ SystemInterface.GetNameOfFile[mesa];
+givenSourceStamp: MobDefs.VersionStamp ¨ MA.ComputeSourceVersionStamp[mesa];
+parts: NameParts ¨ GetNamePartsFromFullPathName[mesaName];
+stemRope: Rope.ROPE ¨ parts.nameStem;
+module: CedarModule ¨ NIL;
+lm.loadedModuleFailedTime ¨ BasicTime.Now[]; -- if needed
+SystemInterface.ShowReport[IO.PutFR["Searching for loaded module %g created at %g (source stamp=%g).", [rope[stemRope]], [time[SystemInterface.GetFileInfo[mesa].uniqueID.egmt.gmt]], [rope[FmtStamp[givenSourceStamp]]] ], $normal];
+IF parts.principalDirectory # PFSNames.EmptyPath THEN modules.otherDirectories ¨ AddAName[parts.principalDirectory, modules.otherDirectories];
+FOR skip: CARD ¨ 1--despite comment under CirioNubAccess.LookupMatchingSymEntryByName, which is inconsistent with the general pattern, 0 and 1 find the same thing(MJS thinks at June 8, 1991)--, skip+1 DO
+loadedModule: REF LoadStateAccess.LoadedModuleInfo ¨ LoadStateAccess.GetLoadedModuleInfoFromStemName[loadState, parts.nameStem, skip, modules];
+IF loadedModule=NIL THEN {
+SystemInterface.ShowReport[IO.PutFR["Giving up search for loaded module %g at skip=%g.", [rope[stemRope]], [cardinal[skip]] ], $normal];
+EXIT};
+module ¨ GetCedarModuleForLoadedModule[modules, loadedModule];
+IF module#NIL THEN {
+ldoPath: PATH ~ loadedModule.loadedFile.GetNameOfFile[];
+ldoRope: Rope.ROPE ~ PFS.RopeFromPath[ldoPath];
+[] ¨ GetMob[module];
+IF module.sourceStamp=NIL THEN SystemInterface.ShowReport[IO.PutFR["Rejecting the one in %g of %g (found at skip=%g) for lack of source version stamp.", [rope[ldoRope]], [time[loadedModule.createTimeOfLoadedFile]], [cardinal[skip]] ], $normal]
+ELSE IF module.sourceStamp≠ = givenSourceStamp THEN {
+lm.module ¨ module;
+lm.loadedModule ¨ loadedModule;
+SystemInterface.ShowReport[IO.PutFR["Accepting the one in %g of %g (found at skip=%g).", [rope[ldoRope]], [time[loadedModule.createTimeOfLoadedFile]], [cardinal[skip]] ], $normal];
+RETURN [lm]}
+ELSE SystemInterface.ShowReport[IO.PutFLR["Rejecting the one in %g of %g (found at skip=%g) because source version stamp (%g) isn't right.", LIST[[rope[ldoRope]], [time[loadedModule.createTimeOfLoadedFile]], [cardinal[skip]], [rope[FmtStamp[module.sourceStamp≠]]]] ], $normal]
+};
+ENDLOOP;
+END;
+RETURN[lm];
+END;
+
+FmtStamp: PROC [stamp: MobDefs.VersionStamp] RETURNS [Rope.ROPE]
+~ {RETURN IO.PutFR["%08x%08x", [cardinal[stamp[0]]], [cardinal[stamp[1]]] ]};
+
+GetCedarModuleForLoadedModule: PROC[modules: CedarModuleSet, info: REF LoadStateAccess.LoadedModuleInfo] RETURNS[CedarModule] =
+BEGIN
+IF info = NIL THEN RETURN[NIL] ELSE
+BEGIN
+tentative: CedarModule ¨ CreateCedarModuleFromModule[modules, info.parsed, info.module, info.possibleModuleFileNames];
+IF tentative#NIL AND tentative.loadedModuleInfo=NIL THEN
+tentative.loadedModuleInfo ¨ info;
+RETURN[tentative];
+END
+END;
+
+
+CreateCedarModuleFromMesa: PROC[modules: CedarModuleSet, mesa: CirioFile] RETURNS[CedarModule] =
+BEGIN
+sourceStamp: REF MobDefs.VersionStamp ¨ NEW[MobDefs.VersionStamp¨MA.ComputeSourceVersionStamp[mesa]];
+mesaName: PATH ¨ SystemInterface.GetNameOfFile[mesa];
+parts: NameParts ¨ GetNamePartsFromFullPathName[mesaName];
+
+base: RopeParts.RopePart ¨ RopeParts.InlineMake[parts.nameStem];
+vsKey: RefTab.Key ¨ CreateVSKey[sourceStamp≠, base];
+module: CedarModule ¨ NARROW[RefTab.Fetch[modules.vsHash.table, vsKey].val];
+IF module = NIL THEN
+BEGIN
+
+module ¨ CreateEmptyCedarModule[modules];
+
+module.possiblePrincipalDirectories ¨ LIST[parts.principalDirectory];
+module.originalPossibleNameStems ¨ LIST[PFS.PathFromRope[parts.nameStem]];
+module.possibleNameStems ¨ module.originalPossibleNameStems;
+
+module.mesaSource ¨ mesa;
+module.sourceStamp ¨ sourceStamp;
+
+IF NOT RefTab.Store[modules.vsHash.table, vsKey, module] THEN ERROR;
+END;
+RETURN[module];
+END;
+
+CreateCedarModuleFromModule: PROC[modules: CedarModuleSet, whole: ObjF.Parsed, embeddedModule: ObjF.Module, possibleModuleFileNames: LIST OF PATH] RETURNS[CedarModule] =
+BEGIN
+vsInfo: REF ObjF.VersionStampInfo ¨ ObjF.FindVersionStamp[embeddedModule];
+recoveredStamp: REF RecoveredVersionStamp ¨ IF vsInfo = NIL OR Rope.IsEmpty[vsInfo.contents] THEN NIL ELSE ConvertDotOFormatVersionStampToMobFormat[vsInfo.contents];
+mobStamp: REF MobDefs.VersionStamp ¨ IF recoveredStamp = NIL THEN NIL ELSE NEW[MobDefs.VersionStamp¨recoveredStamp.mobStamp];
+vsKey: RefTab.Key ¨ IF mobStamp = NIL THEN NIL ELSE CreateVSKey[mobStamp≠, emptyRopePart];
+module: CedarModule ¨ IF mobStamp = NIL THEN NIL ELSE NARROW[RefTab.Fetch[modules.vsHash.table, vsKey].val];
+
+IF module = NIL THEN
+BEGIN
+moduleInfo: REF ObjF.ModuleInfo ¨ ObjF.GetModuleInfo[embeddedModule]; -- for SunOS5.x
+IF mobStamp = NIL THEN RETURN[NIL];
+module ¨ CreateEmptyCedarModule[modules];
+
+module.module ¨ embeddedModule;
+module.whole ¨ whole;
+module.mobStamp ¨ mobStamp;
+
+IF whole = moduleInfo.whole THEN -- normal case
+BEGIN
+FOR names: LIST OF PATH ¨ possibleModuleFileNames, names.rest WHILE names # NIL DO
+parts: NameParts ¨ GetNamePartsFromFullPathName[names.first];
+IF parts.nameStem.Length[] # 0 THEN module.originalPossibleNameStems ¨ AddAName[PFS.PathFromRope[parts.nameStem], module.originalPossibleNameStems];
+IF parts.principalDirectory # PFSNames.EmptyPath THEN module.possiblePrincipalDirectories ¨ AddAName[parts.principalDirectory, module.possiblePrincipalDirectories];
+ENDLOOP;
+
+BEGIN
+wholeFileName: PATH ¨ SystemInterface.GetNameOfFile[ObjF.GetObjectFile[whole]];
+parts: NameParts ¨ GetNamePartsFromFullPathName[wholeFileName];
+IF parts.principalDirectory # PFSNames.EmptyPath THEN
+BEGIN
+modules.otherDirectories ¨ AddAName[parts.principalDirectory, modules.otherDirectories];
+modules.flushTime ¨ BasicTime.Now[];
+END;
+END;
+END
+ELSE -- SunOS 5.x - couldn't obtain debug information from loaded object module
+BEGIN
+parts: NameParts ¨ GetNamePartsFromFullPathName[moduleInfo.fileName];
+IF parts.nameStem.Length[] # 0 THEN module.originalPossibleNameStems ¨ AddAName[PFS.PathFromRope[parts.nameStem], module.originalPossibleNameStems];
+IF parts.principalDirectory # PFSNames.EmptyPath THEN module.possiblePrincipalDirectories ¨ AddAName[parts.principalDirectory, module.possiblePrincipalDirectories];
+
+BEGIN
+wholeFileName: PATH ¨ SystemInterface.GetNameOfFile[ObjF.GetObjectFile[moduleInfo.whole]];
+parts: NameParts ¨ GetNamePartsFromFullPathName[wholeFileName];
+IF parts.principalDirectory # PFSNames.EmptyPath THEN
+BEGIN
+modules.otherDirectories ¨ AddAName[parts.principalDirectory, modules.otherDirectories];
+modules.flushTime ¨ BasicTime.Now[];
+END;
+END;
+END;
+
+IF NOT RefTab.Store[modules.vsHash.table, vsKey, module] THEN ERROR;
+END;
+IF module # NIL THEN -- just in case
+BEGIN
+IF module.module = NIL THEN module.module ¨ embeddedModule;
+IF module.whole = NIL THEN  module.whole ¨ whole;
+END;
+RETURN[module];
+END;
+
+
+
+CreateEmptyCedarModule: PROC[modules: CedarModuleSet] RETURNS[CedarModule] =
+{RETURN[NEW[CedarModuleHandle¨NEW[CedarModuleBody¨[modules, NIL, NIL, NIL, NIL, NIL, BasicTime.Now[], FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, NIL, NIL, NIL, NIL, NIL, NIL, NIL]]]]};
+
+
+
+
+
+GetLoadedJMPI: PROC[module: CedarModule] RETURNS[MOF.JointMobParsedInfo] =
+BEGIN
+IF module.loadedJmpi = NIL AND NOT (module.loadedJmpiFailed AND BasicTime.Period[module.failureTime, module.moduleSet.flushTime] < 0) THEN
+BEGIN
+mob: MA.MobCookie ¨ GetMob[module];
+loadedModule: ObjF.Module ¨ GetLoadedModule[module];
+loadedDotO: ObjF.Parsed ¨ GetLoadedParsed[module];
+IF mob # NIL AND loadedModule # NIL AND loadedDotO # NIL THEN
+module.loadedJmpi ¨ MOF.CreateJointMobParsedInfo[mob, loadedDotO, loadedModule];
+IF module.loadedJmpi = NIL THEN
+{module.loadedJmpiFailed ¨ TRUE; module.failureTime ¨ BasicTime.Now[]}
+END;
+RETURN[module.loadedJmpi];
+END;
+
+GetLoadedParsed: PROC[module: CedarModule] RETURNS[ObjF.Parsed] =
+BEGIN
+IF module.loadedWhole = NIL AND module.loadedModuleInfo # NIL THEN
+module.loadedWhole ¨ module.loadedModuleInfo.parsed;
+RETURN[module.loadedWhole];
+END;
+
+GetLoadedModule: PROC[module: CedarModule] RETURNS[ObjF.Module] =
+BEGIN
+IF module.loadedModule = NIL AND module.loadedModuleInfo # NIL THEN
+module.loadedModule ¨ module.loadedModuleInfo.module;
+RETURN[module.loadedModule];
+END;
+
+SeekCSource: PUBLIC PROC [cms: CedarModuleSet, basicInfo: REF LSA.BasicPCInfo, ledo: REF LSA.LoadedModuleInfo] RETURNS [foundFile: SystemInterface.CirioFile ¨ NIL] ~ {
+TryOneFile: PROC[info: SystemInterface.CirioFileInfo] RETURNS[thisIsIt: BOOLEAN] = {RETURN[TRUE]};
+TryOneDir: PROC[dir: PATH] = {
+IF debugSearch THEN SystemInterface.ShowReport[IO.PutFR1["\tSearching directory %g.", [rope[PFS.RopeFromPath[dir]]] ], $urgent];
+FOR spats: LIST OF ROPE ¨ pats, spats.rest WHILE spats#NIL AND foundFile=NIL DO
+mesaPathName: PATH ¨ PFS.PathFromRope[spats.first];
+mesaPathNamePattern: PATH ¨ mesaPathName.ExpandName[dir];
+foundFile ¨ SystemInterface.GenCirioFilesForInfo[cms.fileSet, mesaPathNamePattern, TryOneFile];
+ENDLOOP;
+RETURN};
+pats: LIST OF ROPE ¨ NIL;
+paths: LIST OF PATH ¨ NIL;
+descr: ROPE ¨ NIL;
+FOR pmns: LIST OF PATH ¨ basicInfo.possibleModuleNames, pmns.rest WHILE pmns#NIL DO
+short: ROPE ¨ PFS.RopeFromPath[pmns.first];
+sl: INT ¨ short.Length;
+this: ROPE;
+IF sl>2 AND short.EqualSubstrs[start1: sl-2, s2: ".o"]
+THEN this ¨ short.Replace[sl-1, 1, "c"]
+ELSE this ¨ short.Concat[".c"];
+IF descr=NIL THEN descr ¨ this ELSE descr ¨ Rope.Cat[descr, " or ", this];
+pats ¨ CONS[this, pats];
+paths ¨ CONS[PFS.PathFromRope[this], paths];
+ENDLOOP;
+SystemInterface.ShowReport[Rope.Concat["Searching for C source in ", descr], $normal];
+FOR dirs: LIST OF PATH ¨ cms.searchPaths, dirs.rest WHILE dirs # NIL AND foundFile = NIL DO
+TryOneDir[dirs.first];
+ENDLOOP;
+IF foundFile = NIL THEN {
+IF debugSearch THEN SystemInterface.ShowReport["\tTrying version maps.", $urgent];
+foundFile ¨ SystemInterface.GenVersionMapFilesForInfo[cms.fileSet, $Source, MobDefs.NullVersion, paths, LIST[""], TRUE, TryOneFile]};
+FOR dirs: LIST OF PATH ¨ cms.otherDirectories, dirs.rest WHILE dirs # NIL AND foundFile = NIL DO
+TryOneDir[dirs.first];
+ENDLOOP;
+
+IF foundFile # NIL THEN {
+nameRope: PATH ¨ SystemInterface.GetNameOfFile[foundFile];
+SystemInterface.ShowReport[Rope.Concat["   found ", PFS.RopeFromPath[nameRope]], $normal];
+}
+ ELSE {
+SystemInterface.ShowReport[" failed", $normal];
+};
+RETURN};
+
+GetMesaFile: PROC[module: CedarModule] RETURNS[CirioFile] =
+BEGIN
+IF module.mesaSource = NIL AND NOT (module.mesaSourceFailed AND BasicTime.Period[module.failureTime, module.moduleSet.flushTime] < 0) THEN
+BEGIN
+foundFile: CirioFile ¨ NIL; -- tentative
+mob: MA.MobCookie ¨ GetMob[module];
+sourceUnique: PFS.UniqueID;
+
+TryOneFile: PROC[info: SystemInterface.CirioFileInfo] RETURNS[thisIsIt: BOOLEAN] = {RETURN[info.uniqueID = sourceUnique]};
+
+TryOneDir: PROC[dir: PATH] =
+BEGIN
+FOR stems: LIST OF PATH ¨ module.possibleNameStems, stems.rest WHILE stems # NIL AND foundFile = NIL DO
+mesaPathName: PATH ¨ PFS.PathFromRope [Rope.Concat [PFS.RopeFromPath[stems.first], ".mesa*"]];
+mesaPathNamePattern: PATH ¨ mesaPathName.ExpandName[dir];
+foundFile ¨ SystemInterface.GenCirioFilesForInfo[module.moduleSet.fileSet, mesaPathNamePattern, TryOneFile];
+ENDLOOP;
+END;
+
+IF module.sourceStamp#NIL THEN sourceUnique ¨ SystemInterface.VersionStampToUniqueID[module.sourceStamp≠]
+ELSE IF mob#NIL THEN sourceUnique ¨ SystemInterface.VersionStampToUniqueID[MA.ReadSourceVersionStamp[mob]]
+ELSE RETURN[NIL];
+
+ShowSearchReport["mesa source", module];
+
+FOR dirs: LIST OF PATH ¨ module.moduleSet.searchPaths, dirs.rest WHILE dirs # NIL AND foundFile = NIL DO
+TryOneDir[dirs.first];
+ENDLOOP;
+
+IF foundFile = NIL THEN foundFile ¨ SystemInterface.GenVersionMapFilesForInfo[module.moduleSet.fileSet, $Source, MobDefs.NullVersion, module.possibleNameStems, LIST[".mesa"], TRUE, TryOneFile, sourceUnique];
+
+FOR dirs: LIST OF PATH ¨ module.possiblePrincipalDirectories, dirs.rest WHILE dirs # NIL AND foundFile = NIL DO
+TryOneDir[dirs.first];
+ENDLOOP;
+
+FOR dirs: LIST OF PATH ¨ module.moduleSet.otherDirectories, dirs.rest WHILE dirs # NIL AND foundFile = NIL DO
+TryOneDir[dirs.first];
+ENDLOOP;
+
+IF foundFile # NIL THEN
+BEGIN
+mesaName: PATH ¨ SystemInterface.GetNameOfFile[foundFile];
+parts: NameParts ¨ GetNamePartsFromFullPathName[mesaName];
+module.possiblePrincipalDirectories ¨ AddAName[parts.principalDirectory, module.possiblePrincipalDirectories];
+module.possibleNameStems ¨ LIST[PFS.PathFromRope[parts.nameStem]];
+module.mesaSource ¨ foundFile;
+module.mesaSourceFailed ¨ FALSE;
+SystemInterface.ShowReport[Rope.Concat["   found ", PFS.RopeFromPath[mesaName]], $normal];
+END
+ ELSE
+BEGIN
+module.mesaSourceFailed ¨ TRUE;
+module.failureTime ¨ BasicTime.Now[];
+ShowFailureReport["mesa source", module];
+END;
+END;
+RETURN[module.mesaSource];
+END;
+
+GetCFileInfo: PROC[module: CedarModule] RETURNS[CFileInfo] =
+BEGIN
+IF module.cInfo = NIL AND NOT (module.cSourceFailed AND BasicTime.Period[module.failureTime, module.moduleSet.flushTime] < 0) THEN
+BEGIN
+[] ¨ GetMob[module];  -- always get the mob first. Thus, if we have a mesa source, then the corresponding mob will give us the mob version
+IF module.possibleNameStems # NIL THEN
+BEGIN
+foundFile: CirioFile ¨ NIL; -- tentative
+foundCInfo: CFileInfo ¨ NIL; -- tentative
+foundPossibleFile: CirioFile ¨ NIL; -- tentative
+
+TryOneFile: PROC[info: SystemInterface.CirioFileInfo] RETURNS[thisIsIt: BOOLEAN ¨ FALSE] =
+BEGIN
+IF module.mobStamp = NIL THEN
+BEGIN
+possibleFile: CirioFile ¨ SystemInterface.GetCirioFile[module.moduleSet.fileSet, info.fullName, info.uniqueID];
+cInfo: CFileInfo ¨ CreateCFileInfo[possibleFile];
+foundCInfo ¨ cInfo;
+foundPossibleFile ¨ possibleFile;
+SystemInterface.ShowReport[Rope.Cat["accepting ", PFS.RopeFromPath[info.fullName], " without checking version stamp"], $normal];
+RETURN[TRUE]
+END
+ ELSE
+BEGIN
+possibleFile: CirioFile ¨ SystemInterface.GetCirioFile[module.moduleSet.fileSet, info.fullName, info.uniqueID];
+vsRope: Rope.ROPE ¨ ScanCFileForVersionStamp[possibleFile];
+IF vsRope # NIL THEN
+BEGIN
+recoveredStamp: REF RecoveredVersionStamp ¨ ConvertDotOFormatVersionStampToMobFormat[vsRope];
+IF recoveredStamp # NIL AND module.mobStamp # NIL AND module.mobStamp≠ = recoveredStamp.mobStamp THEN
+BEGIN
+foundCInfo ¨ CreateCFileInfo[possibleFile];
+foundPossibleFile ¨ possibleFile;
+RETURN[TRUE]
+END
+END;
+RETURN[FALSE];
+END;
+END;
+
+TryOneDir: PROC[dir: PATH] =
+BEGIN
+FOR stems: LIST OF PATH ¨ module.possibleNameStems, stems.rest WHILE stems # NIL AND foundFile = NIL DO
+cFileNamePattern1: PATH ¨ PFS.PathFromRope[Rope.Cat[PFS.RopeFromPath[stems.first], ".c2c.c", "*"]];
+cFileNamePattern2: PATH ¨ PFS.PathFromRope[Rope.Cat[PFS.RopeFromPath[stems.first], ".c", "*"]]; -- perhaps the conventions aren't being followed
+cFileNamePattern1 ¨ cFileNamePattern1.ExpandName[dir];
+cFileNamePattern1 ¨ cFileNamePattern2.ExpandName[dir];
+
+foundFile ¨ SystemInterface.GenCirioFilesForInfo[module.moduleSet.fileSet, cFileNamePattern1, TryOneFile];
+IF foundFile = NIL THEN
+foundFile ¨ SystemInterface.GenCirioFilesForInfo[module.moduleSet.fileSet, cFileNamePattern2, TryOneFile]
+ENDLOOP;
+END;
+
+ShowSearchReport["c source", module];
+
+FOR dirs: LIST OF PATH ¨ module.moduleSet.searchPaths, dirs.rest WHILE dirs # NIL AND foundFile = NIL DO
+TryOneDir[dirs.first];
+ENDLOOP;
+
+IF foundFile = NIL THEN foundFile ¨ SystemInterface.GenVersionMapFilesForInfo[module.moduleSet.fileSet, $Intermediate, MobDefs.NullVersion, module.possibleNameStems, LIST[".c2c.c"], TRUE, TryOneFile];
+IF foundFile = NIL THEN foundFile ¨ SystemInterface.GenVersionMapFilesForInfo[module.moduleSet.fileSet, $Source, MobDefs.NullVersion, module.possibleNameStems, LIST[".c"], TRUE, TryOneFile];
+
+FOR dirs: LIST OF PATH ¨ module.possiblePrincipalDirectories, dirs.rest WHILE dirs # NIL AND foundFile = NIL DO
+TryOneDir[dirs.first];
+ENDLOOP;
+
+FOR dirs: LIST OF PATH ¨ module.moduleSet.otherDirectories, dirs.rest WHILE dirs # NIL AND foundFile = NIL DO
+TryOneDir[dirs.first];
+ENDLOOP;
+
+IF foundFile = NIL THEN
+BEGIN
+module.cSourceFailed ¨ TRUE;
+module.failureTime ¨ BasicTime.Now[];
+ShowFailureReport["c source", module];
+END
+ ELSE
+BEGIN
+cName: PATH ¨ SystemInterface.GetNameOfFile[foundFile];
+parts: NameParts ¨ GetNamePartsFromFullPathName[cName];
+IF foundFile # foundPossibleFile THEN ERROR;
+module.cInfo ¨ foundCInfo;
+module.possiblePrincipalDirectories ¨ AddAName[parts.principalDirectory, module.possiblePrincipalDirectories];
+module.cSourceFailed ¨ FALSE;
+SystemInterface.ShowReport[Rope.Concat["   found ", PFS.RopeFromPath[cName]], $normal];
+END;
+
+END;
+
+END;
+RETURN[module.cInfo];
+END;
+
+GetJMPI: PROC[module: CedarModule] RETURNS[MOF.JointMobParsedInfo] =
+BEGIN
+IF module.jmpi = NIL AND NOT (module.jmpiFailed AND BasicTime.Period[module.failureTime, module.moduleSet.flushTime] < 0) THEN
+BEGIN
+mob: MA.MobCookie ¨ GetMob[module];
+embeddedModule: ObjF.Module ¨ GetModule[module];
+whole: ObjF.Parsed ¨ GetParsed[module];
+IF mob # NIL AND embeddedModule # NIL AND whole # NIL THEN
+module.jmpi ¨ MOF.CreateJointMobParsedInfo[mob, whole, embeddedModule];
+IF module.jmpi = NIL THEN
+{module.jmpiFailed ¨ TRUE; module.failureTime ¨ BasicTime.Now[]}
+END;
+RETURN[module.jmpi];
+END;
+
+GetParsed: PROC[module: CedarModule] RETURNS[ObjF.Parsed] =
+BEGIN
+IF module.whole = NIL AND NOT (module.wholeFailed AND BasicTime.Period[module.failureTime, module.moduleSet.flushTime] < 0) THEN
+BEGIN
+[] ¨ GetModule[module];
+IF module.whole = NIL THEN
+BEGIN
+module.wholeFailed ¨ TRUE;
+module.failureTime ¨ BasicTime.Now[];
+ShowFailureReport["whole", module];
+END;
+END;
+RETURN[module.whole];
+END;
+
+GetModule: PROC[module: CedarModule] RETURNS[ObjF.Module] =
+BEGIN
+IF module.module = NIL AND NOT (module.moduleFailed AND BasicTime.Period[module.failureTime, module.moduleSet.flushTime] < 0) THEN
+BEGIN
+[] ¨ GetMob[module];
+
+
+IF module.possibleNameStems # NIL AND module.mob # NIL THEN
+BEGIN
+foundFile: CirioFile ¨ NIL; -- tentative
+foundDotO: ObjF.Parsed ¨ NIL; -- tentative
+foundModule: ObjF.Module ¨ NIL; -- tentative
+foundPossibleFile: CirioFile ¨ NIL; -- tentative
+
+
+TryOneFile: PROC[info: SystemInterface.CirioFileInfo] RETURNS[thisIsIt: BOOLEAN ¨ FALSE] =
+BEGIN
+IF module.mobStamp = NIL THEN
+ERROR
+ ELSE
+BEGIN
+possibleFile: CirioFile ¨ SystemInterface.GetCirioFile[module.moduleSet.fileSet, info.fullName, info.uniqueID];
+possibleDotO: ObjF.Parsed ¨ ObjF.CreateParsed[possibleFile];
+possibleModule: ObjF.Module ¨ FallBackFindModule[possibleDotO, 0];
+vsInfo: REF ObjF.VersionStampInfo ¨ ObjF.FindVersionStamp[possibleModule];
+recoveredStamp: REF RecoveredVersionStamp ¨ IF vsInfo = NIL OR vsInfo.contents = NIL THEN NIL ELSE ConvertDotOFormatVersionStampToMobFormat[vsInfo.contents];
+
+IF recoveredStamp # NIL AND module.mobStamp # NIL AND recoveredStamp.mobStamp = module.mobStamp≠ THEN
+BEGIN
+foundDotO ¨ possibleDotO;
+foundModule ¨ possibleModule;
+foundPossibleFile ¨ possibleFile;
+RETURN[TRUE]
+END
+ ELSE RETURN[FALSE];
+END;
+END;
+
+TryOneDir: PROC[dir: PATH] =
+BEGIN
+rdir: Rope.ROPE ¨ PFS.RopeFromPath[PFSNames.EnsureDirectory[dir]];
+FOR stems: LIST OF PATH ¨ module.possibleNameStems, stems.rest WHILE stems # NIL AND foundFile = NIL DO
+patterns: LIST OF PATH ¨ LIST[
+PFS.PathFromRope[Rope.Cat[rdir, "debug/", PFS.RopeFromPath[stems.first], ".c2c.o"]],
+PFS.PathFromRope[Rope.Cat[rdir, "debug/", PFS.RopeFromPath[stems.first], ".o"]],
+PFS.PathFromRope[Rope.Cat[rdir, "debug/", PFS.RopeFromPath[stems.first]]],
+PFS.PathFromRope[Rope.Cat[rdir, "sun4-debug/", PFS.RopeFromPath[stems.first], ".c2c.o", "*"]],
+PFS.PathFromRope[Rope.Cat[rdir, "sun4-debug/", PFS.RopeFromPath[stems.first], ".o", "*"]],
+PFS.PathFromRope[Rope.Cat[rdir, "sun4-debug/", PFS.RopeFromPath[stems.first], "*"]],
+PFS.PathFromRope[Rope.Cat[rdir, "sun4/", PFS.RopeFromPath[stems.first], ".c2c.o", "*"]],
+PFS.PathFromRope[Rope.Cat[rdir, "sun4/", PFS.RopeFromPath[stems.first], ".o", "*"]],
+PFS.PathFromRope[Rope.Cat[rdir, "sun4/", PFS.RopeFromPath[stems.first], "*"]],
+PFS.PathFromRope[Rope.Cat[rdir, PFS.RopeFromPath[stems.first], ".c2c.o", "*"]],
+PFS.PathFromRope[Rope.Cat[rdir, PFS.RopeFromPath[stems.first], ".o", "*"]],
+PFS.PathFromRope[Rope.Cat[rdir, PFS.RopeFromPath[stems.first], "*"]]];
+
+FOR ps: LIST OF PATH ¨ patterns, ps.rest WHILE ps # NIL AND foundFile = NIL DO
+foundFile ¨ SystemInterface.GenCirioFilesForInfo[module.moduleSet.fileSet, ps.first, TryOneFile];
+ENDLOOP;
+ENDLOOP;
+END;
+
+ShowSearchReport["module", module];
+
+FOR dirs: LIST OF PATH ¨ module.moduleSet.searchPaths, dirs.rest WHILE dirs # NIL AND foundFile = NIL DO
+TryOneDir[dirs.first];
+ENDLOOP;
+
+IF foundFile = NIL THEN [] ¨ SystemInterface.GenVersionMapFilesForInfo[module.moduleSet.fileSet, $Executable, <<IF module.mobStamp # NIL THEN module.mobStamp≠ ELSE >>MobDefs.NullVersion, module.possibleNameStems, LIST[".c2c.o", ".o", ""], TRUE, TryOneFile];
+
+FOR dirs: LIST OF PATH ¨ module.possiblePrincipalDirectories, dirs.rest WHILE dirs # NIL AND foundFile = NIL DO
+TryOneDir[dirs.first];
+ENDLOOP;
+
+FOR dirs: LIST OF PATH ¨ module.moduleSet.otherDirectories, dirs.rest WHILE dirs # NIL AND foundFile = NIL DO
+TryOneDir[dirs.first];
+ENDLOOP;
+
+IF foundFile = NIL THEN
+BEGIN
+module.moduleFailed ¨ TRUE;
+module.failureTime ¨ BasicTime.Now[];
+ShowFailureReport["module", module];
+END
+ ELSE
+BEGIN
+moduleName: PATH ¨ SystemInterface.GetNameOfFile[foundFile];
+parts: NameParts ¨ GetNamePartsFromFullPathName[moduleName];
+IF foundFile # foundPossibleFile THEN ERROR;
+module.module ¨ foundModule;
+module.whole ¨ foundDotO;
+module.possiblePrincipalDirectories ¨ AddAName[parts.principalDirectory, module.possiblePrincipalDirectories];
+module.moduleFailed ¨ FALSE;
+SystemInterface.ShowReport[Rope.Concat["   found ", PFS.RopeFromPath[moduleName]], $normal];
+END;
+
+END;
+
+END;
+RETURN[module.module];
+END;
+
+GetMob: PROC[module: CedarModule] RETURNS[MA.MobCookie] =
+BEGIN
+modules: CedarModuleSet ¨ module.moduleSet;
+
+IF module.mobStamp = NIL AND module.sourceStamp = NIL THEN ERROR;
+IF module.mob = NIL AND NOT (module.mobFailed AND BasicTime.Period[module.failureTime, modules.flushTime] < 0) THEN
+BEGIN
+  otherModule: CedarModule;
+  base: RopeParts.RopePart ¨ emptyRopePart;
+  mobKey, srcKey: RefTab.Key;
+
+IF module.mobStamp#NIL THEN {
+mobKey ¨ CreateVSKey[module.mobStamp≠, emptyRopePart];
+otherModule ¨ NARROW[RefTab.Fetch[modules.vsHash.table, mobKey].val];
+mobKey ¨ mobKey};
+
+IF otherModule=NIL AND module.sourceStamp#NIL THEN {
+nameStems: LIST OF PATH ¨ IF module.possibleNameStems # NIL THEN module.possibleNameStems ELSE module.originalPossibleNameStems;
+baseComponent: PFSNames.Component;
+FOR stems: LIST OF PATH ¨ nameStems, stems.rest WHILE stems#NIL AND otherModule=NIL DO
+baseComponent ¨ PFSNames.ShortName[stems.first];
+base ¨ [baseComponent.name.base, baseComponent.name.start, baseComponent.name.len];
+srcKey ¨ CreateVSKey[module.sourceStamp≠, base];
+otherModule ¨ NARROW[RefTab.Fetch[modules.vsHash.table, srcKey].val];
+ENDLOOP;
+};
+
+IF otherModule # NIL AND otherModule # module THEN -- good, lets combine info
+BEGIN -- we must produce a single module, while checking for inconsistencies
+incompatible: BOOLEAN ¨ FALSE; -- tentative
+IF module.moduleSet # otherModule.moduleSet THEN ERROR;
+
+IF module.mobStamp = NIL THEN module.mobStamp ¨ otherModule.mobStamp;
+IF otherModule.mobStamp = NIL THEN otherModule.mobStamp ¨ module.mobStamp;
+IF module.mobStamp # NIL AND module.mobStamp≠ # otherModule.mobStamp≠ THEN ERROR;
+
+IF module.sourceStamp = NIL THEN module.sourceStamp ¨ otherModule.sourceStamp;
+IF otherModule.sourceStamp = NIL THEN otherModule.sourceStamp ¨ module.sourceStamp;
+IF module.sourceStamp # NIL AND module.sourceStamp≠ # otherModule.sourceStamp≠ THEN ERROR;
+
+FOR ppds: LIST OF PATH ¨ otherModule.possiblePrincipalDirectories, ppds.rest WHILE ppds # NIL DO
+module.possiblePrincipalDirectories ¨ AddAName[ppds.first, module.possiblePrincipalDirectories];
+ENDLOOP;
+FOR ppds: LIST OF PATH ¨ module.possiblePrincipalDirectories, ppds.rest WHILE ppds # NIL DO
+otherModule.possiblePrincipalDirectories ¨ AddAName[ppds.first, otherModule.possiblePrincipalDirectories];
+ENDLOOP;
+
+FOR pns: LIST OF PATH ¨ otherModule.possibleNameStems, pns.rest WHILE pns # NIL DO
+module.possibleNameStems ¨ AddAName[pns.first, module.possibleNameStems];
+ENDLOOP;
+FOR pns: LIST OF PATH ¨ module.possibleNameStems, pns.rest WHILE pns # NIL DO
+otherModule.possibleNameStems ¨ AddAName[pns.first, otherModule.possibleNameStems];
+ENDLOOP;
+
+IF BasicTime.Period[module.failureTime, otherModule.failureTime] > 0 THEN
+otherModule.failureTime ¨ module.failureTime
+ELSE module.failureTime ¨ otherModule.failureTime; -- (earliest failure time to both)
+
+IF NOT module.mesaSourceFailed OR NOT otherModule.mesaSourceFailed THEN
+module.mesaSourceFailed ¨ otherModule.mesaSourceFailed ¨ FALSE;
+IF NOT module.mobFileFailed OR NOT otherModule.mobFileFailed THEN
+module.mobFileFailed ¨ otherModule.mobFileFailed ¨ FALSE;
+IF NOT module.mobFailed OR NOT otherModule.mobFailed THEN
+module.mobFailed ¨ otherModule.mobFailed ¨ FALSE;
+IF NOT module.cSourceFailed OR NOT otherModule.cSourceFailed THEN
+module.cSourceFailed ¨ otherModule.cSourceFailed ¨ FALSE;
+IF NOT module.jmpiFailed OR NOT otherModule.jmpiFailed THEN
+module.jmpiFailed ¨ otherModule.jmpiFailed ¨ FALSE;
+IF NOT module.moduleFailed OR NOT otherModule.moduleFailed THEN
+module.moduleFailed ¨ otherModule.moduleFailed ¨ FALSE;
+IF NOT module.wholeFailed OR NOT otherModule.wholeFailed THEN
+module.wholeFailed ¨ otherModule.wholeFailed ¨ FALSE;
+
+IF module.mesaSource # NIL AND otherModule.mesaSource # NIL THEN
+incompatible ¨ module.mesaSource # otherModule.mesaSource;
+IF module.mesaSource = NIL THEN module.mesaSource ¨ otherModule.mesaSource;
+IF otherModule.mesaSource = NIL THEN otherModule.mesaSource ¨ module.mesaSource;
+
+IF module.jmpi # NIL AND otherModule.jmpi # NIL THEN
+incompatible ¨ module.jmpi # otherModule.jmpi;
+IF module.jmpi = NIL THEN module.jmpi ¨ otherModule.jmpi;
+IF otherModule.jmpi = NIL THEN otherModule.jmpi ¨ module.jmpi;
+
+IF module.mobFile # NIL AND otherModule.mobFile # NIL THEN
+incompatible ¨ module.mobFile # otherModule.mobFile;
+IF module.mobFile = NIL THEN module.mobFile ¨ otherModule.mobFile;
+IF otherModule.mobFile = NIL THEN otherModule.mobFile ¨ module.mobFile;
+
+IF module.mob # NIL AND otherModule.mob # NIL THEN
+incompatible ¨ module.mob # otherModule.mob;
+IF module.mob = NIL THEN module.mob ¨ otherModule.mob;
+IF otherModule.mob = NIL THEN otherModule.mob ¨ module.mob;
+
+IF module.cInfo # NIL AND otherModule.cInfo # NIL THEN
+incompatible ¨ module.cInfo # otherModule.cInfo;
+IF module.cInfo = NIL THEN module.cInfo ¨ otherModule.cInfo;
+IF otherModule.cInfo = NIL THEN otherModule.cInfo ¨ module.cInfo;
+
+IF module.module # NIL AND otherModule.module # NIL THEN
+incompatible ¨ module.module # otherModule.module;
+IF module.module = NIL THEN module.module ¨ otherModule.module;
+IF otherModule.module = NIL THEN otherModule.module ¨ module.module;
+
+IF module.whole # NIL AND otherModule.whole # NIL THEN
+incompatible ¨ module.whole # otherModule.whole;
+IF module.whole = NIL THEN module.whole ¨ otherModule.whole;
+IF otherModule.whole = NIL THEN otherModule.whole ¨ module.whole;
+
+IF NOT incompatible THEN module≠ ¨ otherModule≠;
+END;
+
+IF module.mob = NIL THEN -- we still have to find the mob
+BEGIN
+nameStems: LIST OF PATH ¨ IF module.possibleNameStems # NIL THEN module.possibleNameStems ELSE module.originalPossibleNameStems;
+IF nameStems # NIL THEN
+BEGIN
+foundMob: MA.MobCookie ¨ NIL; -- tentative
+foundPossibleFile: CirioFile ¨ NIL; -- tentative
+foundCreateTime: BasicTime.GMT ¨ BasicTime.earliestGMT; -- tentative
+
+TryOneFile: PROC[info: SystemInterface.CirioFileInfo] RETURNS[thisIsIt: BOOLEAN ¨ FALSE] =
+BEGIN
+possibleFile: CirioFile ¨ SystemInterface.GetCirioFile[modules.fileSet, info.fullName, info.uniqueID];
+IF module.mobStamp = NIL AND module.sourceStamp = NIL THEN
+BEGIN
+mob: MA.MobCookie ¨ MA.CreateMobCookie[possibleFile ! MobAccess.MobError => {
+SystemInterface.ShowReport[IO.PutFR1["\tbad mob %g", [rope[PFS.RopeFromPath[info.fullName]]] ], IF debugSearch THEN $urgent ELSE $debug];
+GOTO failure}];
+SystemInterface.ShowReport[Rope.Cat["accepting ", PFS.RopeFromPath[info.fullName], " without any version checking"], $normal];
+IF foundPossibleFile = NIL OR (BasicTime.Period[foundCreateTime, info.uniqueID.egmt.gmt] > 0) THEN
+BEGIN
+foundMob ¨ mob;
+foundPossibleFile ¨ possibleFile;
+foundCreateTime ¨ info.uniqueID.egmt.gmt;
+RETURN[TRUE]
+END;
+RETURN[FALSE]
+END
+ ELSE
+BEGIN
+mob: MA.MobCookie ¨ MA.CreateMobCookie[possibleFile ! MobAccess.MobError => {
+SystemInterface.ShowReport[IO.PutFR1["\tbad mob %g", [rope[PFS.RopeFromPath[info.fullName]]] ], IF debugSearch THEN $urgent ELSE $debug];
+GOTO failure}];
+mobStamp: MobDefs.VersionStamp ¨ MA.ReadMobVersionStamp[mob];
+mobSourceStamp: MobDefs.VersionStamp ¨ MA.ReadSourceVersionStamp[mob];
+ok: BOOLEAN ¨ FALSE; -- tentative;
+IF module.mobStamp # NIL AND module.mobStamp≠ = mobStamp THEN ok ¨ TRUE;
+IF module.sourceStamp # NIL AND module.sourceStamp≠ = mobSourceStamp THEN ok ¨ TRUE;
+ok ¨ ok AND (foundPossibleFile = NIL OR (BasicTime.Period[foundCreateTime, info.uniqueID.egmt.gmt] > 0));
+IF debugSearch THEN SystemInterface.ShowReport[IO.PutFLR["\t?name=%g,\n\tmobStamp=%08x%08x, sourceStamp=%08x%08x,\n\tcreate=%g, ok=%g.", LIST[ [rope[PFS.RopeFromPath[info.fullName]]], [cardinal[mobStamp[0]]], [cardinal[mobStamp[1]]], [cardinal[mobSourceStamp[0]]], [cardinal[mobSourceStamp[1]]], [time[info.uniqueID.egmt.gmt]], [boolean[ok]] ]], $urgent];
+IF ok THEN
+BEGIN
+foundMob ¨ mob;
+foundPossibleFile ¨ possibleFile;
+foundCreateTime ¨ info.uniqueID.egmt.gmt;
+RETURN[TRUE];
+END;
+ RETURN[FALSE];
+END;
+EXITS failure => RETURN[FALSE];
+END;
+
+TryOneDir: PROC[dir: PATH] =
+BEGIN
+FOR stems: LIST OF PATH ¨ nameStems, stems.rest WHILE stems # NIL AND foundPossibleFile = NIL DO
+mobFileNamePattern: PATH ¨ PFS.PathFromRope[Rope.Cat[PFS.RopeFromPath[stems.first], ".mob", "*"]];
+mobFileNamePattern ¨ mobFileNamePattern.ExpandName[dir];
+IF debugSearch THEN SystemInterface.ShowReport[IO.PutFR1["\tSearching file pattern %g.", [rope[PFS.RopeFromPath[mobFileNamePattern]]] ], $urgent];
+[] ¨ SystemInterface.GenCirioFilesForInfo[modules.fileSet, mobFileNamePattern, TryOneFile];
+ENDLOOP;
+END;
+
+ShowSearchReport["mob", module];
+IF debugSearch THEN SystemInterface.ShowReport[IO.PutFR["\twith mob stamp %g and source stamp %g.", [rope[DescribeRefStamp[module.mobStamp]]], [rope[DescribeRefStamp[module.sourceStamp]]] ], $urgent];
+
+FOR dirs: LIST OF PATH ¨ modules.searchPaths, dirs.rest WHILE dirs # NIL AND foundPossibleFile = NIL DO
+IF debugSearch THEN SystemInterface.ShowReport[IO.PutFR1["\tSearching search dir %g.", [rope[PFS.RopeFromPath[dirs.first]]] ], $urgent];
+TryOneDir[dirs.first];
+ENDLOOP;
+
+IF foundPossibleFile = NIL THEN {
+IF debugSearch THEN SystemInterface.ShowReport["\tSearching version maps.", $urgent];
+foundPossibleFile ¨ SystemInterface.GenVersionMapFilesForInfo[modules.fileSet, $Intermediate, MobDefs.NullVersion, nameStems, LIST[".mob"], TRUE, TryOneFile]};
+
+FOR dirs: LIST OF PATH ¨ module.possiblePrincipalDirectories, dirs.rest WHILE dirs # NIL AND foundPossibleFile = NIL DO
+IF debugSearch THEN SystemInterface.ShowReport[IO.PutFR1["\tSearching possible principle dir %g.", [rope[PFS.RopeFromPath[dirs.first]]] ], $urgent];
+TryOneDir[dirs.first];
+ENDLOOP;
+
+FOR dirs: LIST OF PATH ¨ modules.otherDirectories, dirs.rest WHILE dirs # NIL AND foundPossibleFile = NIL DO
+IF debugSearch THEN SystemInterface.ShowReport[IO.PutFR1["\tSearching other dir %g.", [rope[PFS.RopeFromPath[dirs.first]]] ], $urgent];
+TryOneDir[dirs.first];
+ENDLOOP;
+
+
+IF foundPossibleFile = NIL THEN
+BEGIN
+module.mobFailed ¨ TRUE;
+module.failureTime ¨ BasicTime.Now[];
+ShowFailureReport["mob", module];
+END
+ ELSE
+BEGIN
+mobName: PATH ¨ SystemInterface.GetNameOfFile[foundPossibleFile];
+parts: NameParts ¨ GetNamePartsFromFullPathName[mobName];
+module.mob ¨ foundMob;
+module.possiblePrincipalDirectories ¨ AddAName[parts.principalDirectory, module.possiblePrincipalDirectories];
+module.mobStamp ¨ NEW[MobDefs.VersionStamp ¨ MA.ReadMobVersionStamp[module.mob]];
+IF module.sourceStamp = NIL THEN {
+module.sourceStamp ¨ NEW[MobDefs.VersionStamp ¨ MA.ReadSourceVersionStamp[module.mob]];
+base ¨ RopeParts.InlineMake[parts.nameStem];
+
+srcKey ¨ CreateVSKey[module.sourceStamp≠, base];
+
+[] ¨ RefTab.Store[modules.vsHash.table, srcKey, module];
+};
+IF module.possibleNameStems = NIL THEN module.possibleNameStems ¨ LIST[PFS.PathFromRope[parts.nameStem]];
+module.mobFailed ¨ FALSE;
+mobKey ¨ CreateVSKey[module.mobStamp≠, emptyRopePart];
+
+IF RefTab.Fetch[modules.vsHash.table, mobKey].val = NIL THEN
+{IF NOT RefTab.Store[modules.vsHash.table, mobKey, module] THEN ERROR};
+SystemInterface.ShowReport[Rope.Concat["   found ", PFS.RopeFromPath[mobName]], $normal];
+END;
+
+END;
+
+END;
+
+END;
+RETURN[module.mob];
+END;
+
+GetDotO: PUBLIC PROC [targetData: REF ANY, dotOPathRope, dotORope: Rope.ROPE, dotOId: CARD, getDotOId: PROC [ObjF.Parsed] RETURNS [CARD]] RETURNS [ObjF.Parsed] = {
+modules: CedarModuleSet ¨ NARROW[targetData];
+RETURN [GetDotOInner[modules, dotOPathRope, dotORope, dotOId, getDotOId]];
+};
+
+GetDotOInner: PROC [moduleSet: CedarModuleSet, dotOPathRope, dotORope: Rope.ROPE, dotOId: CARD, getDotOId: PROC [ObjF.Parsed] RETURNS [CARD]] RETURNS [ObjF.Parsed] = {
+foundFile: CirioFile ¨ NIL; -- tentative
+foundDotO: ObjF.Parsed ¨ NIL; -- tentative
+foundPossibleFile: CirioFile ¨ NIL; -- tentative
+
+TryOneFile: PROC [info: SystemInterface.CirioFileInfo] RETURNS [thisIsIt: BOOLEAN ¨ FALSE] = {
+possibleFile: CirioFile ¨ SystemInterface.GetCirioFile[moduleSet.fileSet, info.fullName, info.uniqueID];
+possibleDotO: ObjF.Parsed ¨ ObjF.CreateParsed[possibleFile];
+
+IF getDotOId[possibleDotO] = dotOId THEN {
+foundDotO ¨ possibleDotO;
+foundPossibleFile ¨ possibleFile;
+RETURN[TRUE]
+};
+RETURN[FALSE];
+};
+
+TryOneDir: PROC [dir: PATH] = {
+rdir: Rope.ROPE ¨ PFS.RopeFromPath[PFSNames.EnsureDirectory[dir]];
+patterns: LIST OF PATH ¨ LIST[
+PFS.PathFromRope[Rope.Concat[rdir, dotORope]],
+PFS.PathFromRope[Rope.Cat[rdir, "debug/", dotORope]],
+PFS.PathFromRope[Rope.Cat[rdir, "sun4-debug/", dotORope, "*"]],
+PFS.PathFromRope[Rope.Cat[rdir, "sun4/", dotORope, "*"]]
+];
+FOR ps: LIST OF PATH ¨ patterns, ps.rest WHILE ps # NIL AND foundFile = NIL DO
+foundFile ¨ SystemInterface.GenCirioFilesForInfo[moduleSet.fileSet, ps.first, TryOneFile];
+ENDLOOP;
+};
+
+SystemInterface.ShowReport[Rope.Concat["searching for ", dotORope], $normal];
+
+FOR dirs: LIST OF PATH ¨ moduleSet.searchPaths, dirs.rest WHILE dirs # NIL AND foundFile = NIL DO
+TryOneDir[dirs.first];
+ENDLOOP;
+
+IF foundFile = NIL THEN [] ¨ SystemInterface.GenVersionMapFilesForInfo[moduleSet.fileSet, $Executable, MobDefs.NullVersion, LIST[PFS.PathFromRope[dotORope]], NIL, TRUE, TryOneFile];
+
+FOR dirs: LIST OF PATH ¨ moduleSet.otherDirectories, dirs.rest WHILE dirs # NIL AND foundFile = NIL DO
+TryOneDir[dirs.first];
+ENDLOOP;
+
+IF foundFile = NIL THEN SystemInterface.ShowReport[Rope.Concat["unable to find module for ", dotORope], $normal]
+ELSE {
+moduleName: PATH ¨ SystemInterface.GetNameOfFile[foundFile];
+IF foundFile # foundPossibleFile THEN ERROR;
+SystemInterface.ShowReport[Rope.Concat["   found ", PFS.RopeFromPath[moduleName]], $normal];
+};
+RETURN [foundDotO];
+};
+
+
+
+
+
+FallBackFindModule: PROC[whole: ObjF.Parsed, relativePC: CARD] RETURNS[ObjF.Module] =
+BEGIN
+RETURN[ObjF.ModuleFromParsedAndPC[whole, [[0,""], relativePC]]]
+END;
+
+
+
+
+VSHashTable: TYPE = REF VSHashTableBody;
+VSHashTableBody: TYPE = RECORD[table: RefTab.Ref];
+VSHashEntryKey: TYPE = RECORD[versionStamp: MobDefs.VersionStamp, base: RopeParts.RopePart];
+emptyRopePart: RopeParts.RopePart ¨ [base: "", start: 0, len: 0];
+
+CreateVSHashTable: PROC RETURNS[VSHashTable] =
+{RETURN[NEW[VSHashTableBody ¨ [table: RefTab.Create[equal: VSKeyEqualProc, hash: VSKeyHashProc]]]]};
+
+
+CreateVSKey: PROC[stamp: MobDefs.VersionStamp, base: RopeParts.RopePart] RETURNS[RefTab.Key] =
+{RETURN[NEW[VSHashEntryKey ¨ [versionStamp: stamp, base: base]]]};
+
+VSKeyEqualProc: PROC[key1, key2: RefTab.Key] RETURNS[BOOL] =
+BEGIN
+vs1: REF VSHashEntryKey ¨ NARROW[key1];
+vs2: REF VSHashEntryKey ¨ NARROW[key2];
+RETURN[(vs1≠.versionStamp = vs2≠.versionStamp) AND (RopeParts.Equal[vs1≠.base, vs2≠.base])];
+END;
+
+VSKeyHashProc: PROC[key: RefTab.Key] RETURNS[CARDINAL] =
+BEGIN
+vs: REF VSHashEntryKey ¨ NARROW[key];
+word0: Basics.LongNumber ¨ LOOPHOLE[vs≠.versionStamp[0]];
+word1: Basics.LongNumber ¨ LOOPHOLE[vs≠.versionStamp[1]];
+RETURN[RopeParts.Hash[base: vs≠.base, seed: Basics.BITXOR[Basics.BITXOR[word0.lo, word0.hi], Basics.BITXOR[word1.lo, word1.hi]]]];
+END;
+
+GetNamePartsFromFullPathName: PUBLIC PROC [fullPathName: PATH] RETURNS [NameParts] = {
+principalDirectory: PATH;
+sun4: PATH ¨ PFSNames.EmptyPath; -- tentative
+c2c: PATH ¨ PFSNames.EmptyPath; -- tentative
+shortComp: PFSNames.Component ¨ fullPathName.ShortName;
+shortName: ROPE ¨ shortComp.ComponentRope;
+directoryPath: PATH ¨ fullPathName.Directory;
+IF directoryPath # PFSNames.EmptyPath AND directoryPath # NIL AND directoryPath.ComponentCount # 0 THEN
+BEGIN
+lastDirectory: PFSNames.Component ¨ directoryPath.Fetch[directoryPath.ComponentCount - 1];
+lastDirectoryRope: Rope.ROPE ¨ lastDirectory.ComponentRope;
+IF Rope.Equal["sun4", lastDirectoryRope] OR Rope.Equal["sun4-o3", lastDirectoryRope] OR Rope.Equal["sun4o3", lastDirectoryRope, FALSE] THEN
+directoryPath ¨ directoryPath.Parent;
+END;
+
+principalDirectory ¨ directoryPath;
+
+{lastDot: INT ¨ Rope.FindBackward[shortName, "."];
+IF lastDot > -1 AND lastDot+1 < Rope.Length[shortName] AND Rope.Fetch[shortName, lastDot+1] = '~ THEN -- remove the version
+shortName ¨ Rope.Substr[shortName, 0, lastDot];
+};
+
+{lastDot: INT ¨ Rope.FindBackward[shortName, "."];
+secondToLastDot: INT ¨ IF lastDot <= 0 THEN -1 ELSE Rope.FindBackward[shortName, ".", lastDot-1];
+IF secondToLastDot > -1 AND Rope.Equal["c2c", Rope.Substr[shortName, secondToLastDot+1, lastDot-1-secondToLastDot]] THEN {
+shortName ¨ Rope.Replace[shortName, secondToLastDot, 4, ""];
+c2c ¨ PFS.PathFromRope[".c2c"]};
+};
+
+{lastDot: INT ¨ Rope.FindBackward[shortName, "."];
+IF lastDot > -1 THEN
+shortName ¨  Rope.Substr[shortName, 0, lastDot];
+};
+
+RETURN[[
+principalDirectory,
+shortName
+]];
+};
+
+CFileInfo: TYPE = REF CFileInfoBody;
+CFileInfoBody: TYPE = RECORD[
+file: CirioFile,
+sourcePosSeq: SourcePosSeq,
+lineNumSeq: LineNumSeq,
+versionStamp: Rope.ROPE];
+
+SourcePosSeq: TYPE = REF SourcePosSeqBody;
+SourcePosSeqBody: TYPE = RECORD[
+SEQUENCE nSourceMacros: CARDINAL OF SourcePosMacro];
+
+LineNumSeq: TYPE = REF LineNumSeqBody;
+LineNumSeqBody: TYPE = RECORD[
+SEQUENCE nSourceMacros: CARDINAL OF SourcePosMacro];
+
+SourcePosMacro: TYPE = RECORD[pos: CARD, nChars: CARD, lineNum: CARD];
+
+LookupMesaSourcePos: PROC[info: CFileInfo, pos: CARD] RETURNS[cLineNum: CARD] =
+BEGIN
+FOR I: CARDINAL DECREASING IN [0..info.sourcePosSeq.nSourceMacros) DO
+IF info.sourcePosSeq[I].pos <= pos THEN
+RETURN[info.sourcePosSeq[I].lineNum]
+ENDLOOP;
+IF info.sourcePosSeq.nSourceMacros = 0 THEN RETURN[0];
+RETURN[info.sourcePosSeq[0].lineNum]
+END;
+LookupCLineNum: PROC[info: CFileInfo, cLineNum: CARD] RETURNS[pos: CARD] =
+BEGIN
+FOR I: CARDINAL DECREASING IN [0..info.lineNumSeq.nSourceMacros) DO
+IF info.lineNumSeq[I].lineNum <= cLineNum THEN
+RETURN[info.lineNumSeq[I].pos]
+ENDLOOP;
+IF info.lineNumSeq.nSourceMacros = 0 THEN RETURN[0];
+RETURN[info.lineNumSeq[0].pos]
+END;
+
+CompareSourceMacrosByPos: PROC[ref1: REF ANY, ref2: REF ANY] RETURNS [Basics.Comparison] =
+BEGIN
+sm1: REF SourcePosMacro ¨ NARROW[ref1];
+sm2: REF SourcePosMacro ¨ NARROW[ref2];
+IF sm1.pos < sm2.pos THEN RETURN[less];
+IF sm1.pos > sm2.pos THEN RETURN[greater];
+IF sm1.lineNum < sm2.lineNum THEN RETURN[less];
+IF sm1.lineNum > sm2.lineNum THEN RETURN[greater];
+RETURN[equal];
+END;
+
+CompareSourceMacrosByCLineNum: PROC[ref1: REF ANY, ref2: REF ANY] RETURNS [Basics.Comparison] =
+BEGIN
+sm1: REF SourcePosMacro ¨ NARROW[ref1];
+sm2: REF SourcePosMacro ¨ NARROW[ref2];
+IF sm1.lineNum < sm2.lineNum THEN RETURN[less];
+IF sm1.lineNum > sm2.lineNum THEN RETURN[greater];
+IF sm1.pos < sm2.pos THEN RETURN[less];
+IF sm1.pos > sm2.pos THEN RETURN[greater];
+RETURN[equal];
+END;
+
+
+ScanCFileForVersionStamp: PROC[cFile: CirioFile] RETURNS[versionStamp: Rope.ROPE ¨ NIL] =
+BEGIN
+source: IO.STREAM ¨ SystemInterface.GetStreamForFile[cFile];
+BEGIN ENABLE UNWIND => SystemInterface.ReleaseStreamForFile[cFile, source];
+buffer: REF TEXT ¨ NIL;
+smKey: Rope.ROPE ¨ "SOURCE(";
+smKeyLength: CARD ¨ Rope.Length[smKey];
+vsKey: Rope.ROPE ¨ Rope.Cat["static char versionStamp[] = \"@", "(#)", "mob_version ["];
+vsKeyLength: CARD ¨ Rope.Length[vsKey];
+
+FOR ln: CARD ¨ 1, ln+1 WHILE NOT IO.EndOf[source] DO
+buffer ¨ IO.GetLine[source, buffer];
+IF buffer[0] = 's THEN  -- possible version stamp hit
+BEGIN
+line: Rope.ROPE ¨ Rope.FromRefText[buffer];
+IF Rope.Equal[vsKey, Rope.Substr[line, 0, vsKeyLength]] THEN -- we have a hit
+BEGIN
+quote1: INT ¨ Rope.Index[line, 0, "\""];
+quote2: INT ¨ Rope.Index[line, quote1+1, "\""];
+IF quote2 = Rope.Length[line]-2 THEN -- a final consistency check
+versionStamp ¨ Rope.Substr[line, quote1+1, quote2-quote1-1];
+END
+END;
+IF versionStamp # NIL THEN EXIT;
+ENDLOOP;
+END;
+SystemInterface.ReleaseStreamForFile[cFile, source];
+END;
+
+CreateCFileInfo: PROC[cFile: CirioFile] RETURNS[CFileInfo] =
+BEGIN
+list1: LIST OF REF ANY ¨ NIL;
+list2: LIST OF REF ANY ¨ NIL;
+nMacros: INTEGER ¨ 0;
+sortedList: LIST OF REF ANY ¨ NIL;
+sourcePosSeq: SourcePosSeq;
+lineNumSeq: LineNumSeq;
+versionStamp: Rope.ROPE ¨ NIL;
+
+
+SeeOnePosition: PROC[sp: CARD, nChars: CARD, ln: CARD] =
+BEGIN
+list1 ¨ CONS[NEW[SourcePosMacro¨[sp, nChars, ln]], list1];
+list2 ¨ CONS[NEW[SourcePosMacro¨[sp, nChars, ln]], list2];
+nMacros ¨ nMacros+1;
+END;
+
+
+versionStamp ¨ GenMesaSourcePositionMacros[cFile, SeeOnePosition];
+
+sortedList ¨ List.Sort[list1, CompareSourceMacrosByPos];
+sourcePosSeq ¨ NEW[SourcePosSeqBody[nMacros]];
+FOR I: INTEGER IN [0..nMacros) DO
+macro: REF SourcePosMacro ¨ NARROW[sortedList.first];
+sourcePosSeq[I] ¨ macro≠;
+sortedList ¨ sortedList.rest;
+ENDLOOP;
+
+sortedList ¨ List.Sort[list2, CompareSourceMacrosByCLineNum];
+lineNumSeq ¨ NEW[LineNumSeqBody[nMacros]];
+FOR I: INTEGER IN [0..nMacros) DO
+macro: REF SourcePosMacro ¨ NARROW[sortedList.first];
+lineNumSeq[I] ¨ macro≠;
+sortedList ¨ sortedList.rest;
+ENDLOOP;
+
+RETURN[NEW[CFileInfoBody¨[cFile, sourcePosSeq, lineNumSeq, versionStamp]]]
+END;
+GetCFileVersionStamp: PROC[info: CFileInfo] RETURNS[Rope.ROPE] =
+{RETURN[info.versionStamp]};
+
+
+GenMesaSourcePositionMacros: PROC[cFile: CirioFile, SeeOnePosition: PROC[sp: CARD, nChars: CARD, ln: CARD]] RETURNS[versionStamp: Rope.ROPE ¨ NIL] =
+BEGIN
+source: IO.STREAM ¨ SystemInterface.GetStreamForFile[cFile];
+BEGIN ENABLE UNWIND => SystemInterface.ReleaseStreamForFile[cFile, source];
+buffer: REF TEXT ¨ NIL;
+smKey: Rope.ROPE ¨ "SOURCE(";
+smKeyLength: CARD ¨ Rope.Length[smKey];
+vsKey: Rope.ROPE ¨ Rope.Cat["static char versionStamp[] = \"@", "(#)", "mob_version ["];
+vsKeyLength: CARD ¨ Rope.Length[vsKey];
+
+FOR ln: CARD ¨ 1, ln+1 WHILE NOT IO.EndOf[source] DO
+buffer ¨ IO.GetLine[source, buffer];
+IF buffer[0] = 'S THEN -- possible SourcePositionMacro hit
+BEGIN
+line: Rope.ROPE ¨ Rope.FromRefText[buffer];
+IF Rope.Equal[smKey, Rope.Substr[line, 0, smKeyLength]] THEN -- we have a hit
+BEGIN
+x: CARD ¨ smKeyLength;
+sp: CARD ¨ 0;
+nChars: CARD ¨ 0;
+DO
+IF buffer[x] = ', THEN EXIT;
+sp ¨ sp*10 + ORD[buffer[x]] - ORD['0];
+x ¨ x+1;
+ENDLOOP;
+WHILE buffer[x] = ', OR buffer[x] = '  DO x ¨ x+1 ENDLOOP;
+DO
+IF buffer[x] = ') THEN EXIT;
+nChars ¨ nChars*10 + ORD[buffer[x]] - ORD['0];
+x ¨ x+1;
+ENDLOOP;
+SeeOnePosition[sp, nChars, ln];
+END;
+END;
+IF buffer[0] = 's THEN  -- possible version stamp hit
+BEGIN
+line: Rope.ROPE ¨ Rope.FromRefText[buffer];
+IF Rope.Equal[vsKey, Rope.Substr[line, 0, vsKeyLength]] THEN -- we have a hit
+BEGIN
+quote1: INT ¨ Rope.Index[line, 0, "\""];
+quote2: INT ¨ Rope.Index[line, quote1+1, "\""];
+IF quote2 = Rope.Length[line]-2 THEN -- a final consistency check
+versionStamp ¨ Rope.Substr[line, quote1+1, quote2-quote1-1];
+END
+END;
+ENDLOOP;
+END;
+SystemInterface.ReleaseStreamForFile[cFile, source];
+END;
+
+
+
+AddAName: PROC[newName: PATH, names: LIST OF PATH] RETURNS[LIST OF PATH] =
+BEGIN
+FOR nms: LIST OF PATH ¨ names, nms.rest WHILE nms # NIL DO
+IF nms.first.Equal[newName] THEN RETURN[names];
+ENDLOOP;
+RETURN[CONS[newName, names]];
+END;
+
+ShowSearchReport: PROC[target: Rope.ROPE, module: CedarModule] =
+BEGIN
+names: Rope.ROPE ¨ NIL;
+FOR stems: LIST OF PATH ¨ IF module.possibleNameStems # NIL THEN module.possibleNameStems ELSE module.originalPossibleNameStems, stems.rest WHILE stems # NIL DO
+IF names # NIL THEN names ¨ Rope.Concat[names, " or "];
+names ¨ Rope.Concat[names, PFS.RopeFromPath[stems.first]];
+ENDLOOP;
+SystemInterface.ShowReport[Rope.Cat["searching for ", target, " for ", names], $normal];
+END;
+
+ShowFailureReport: PROC[target: Rope.ROPE, module: CedarModule] =
+BEGIN
+names: Rope.ROPE ¨ NIL;
+FOR stems: LIST OF PATH ¨ IF module.possibleNameStems # NIL THEN module.possibleNameStems ELSE module.originalPossibleNameStems, stems.rest WHILE stems # NIL DO
+IF names # NIL THEN names ¨ Rope.Concat[names, " or"];
+names ¨ Rope.Cat[names, " ", PFS.RopeFromPath[stems.first]];
+ENDLOOP;
+SystemInterface.ShowReport[Rope.Cat["unable to find ", target, " for ", names], $normal];
+END;
+
+RecoveredVersionStamp: TYPE = RECORD[
+mobStamp: MobDefs.VersionStamp,
+stem: PATH];
+
+ConvertDotOFormatVersionStampToMobFormat: PROC[wholeVersionStamp: Rope.ROPE] RETURNS[REF RecoveredVersionStamp] =
+BEGIN
+ENABLE
+BEGIN
+RuntimeError.BoundsFault => GOTO fails;
+Convert.Error => GOTO fails;
+CantConvert => GOTO fails;
+END;
+
+expectedPreamble: Rope.ROPE ¨ Rope.Cat["@", "(#)", "mob_version ["];
+stemStart: INT ¨ Rope.Index[wholeVersionStamp, 0, "] "]+2;
+stampLength: INT ¨ Rope.Length[wholeVersionStamp];
+preambleLength: INT ¨  Rope.Length[expectedPreamble];
+stemLength: INT ¨ Rope.Length[wholeVersionStamp]-stemStart;
+stem: Rope.ROPE ¨ IF stemLength > 0 THEN Rope.Substr[wholeVersionStamp, stemStart, stemLength] ELSE NIL;
+preamble: Rope.ROPE ¨ Rope.Substr[wholeVersionStamp, 0, preambleLength];
+digits: Rope.ROPE ¨ Rope.Substr[wholeVersionStamp, preambleLength, stampLength-preambleLength-stemLength-2];
+comma: INT ¨ Rope.Find[digits, ","];
+digits1: Rope.ROPE ¨ Rope.Substr[digits, 0, comma];
+digits2: Rope.ROPE ¨ Rope.Substr[digits, comma+1, Rope.Length[digits]-comma-1];
+stamp: MobDefs.VersionStamp ¨ [Convert.CardFromRope[digits1], Convert.CardFromRope[digits2]];
+
+IF NOT Rope.Equal[preamble, expectedPreamble] THEN RaiseCantConvert[];
+IF stem = NIL THEN RaiseCantConvert[];
+
+RETURN[NEW[RecoveredVersionStamp ¨ [stamp, PFS.PathFromRope[stem]]]];
+
+EXITS
+fails => RETURN[NIL];
+END;
+
+CantConvert: ERROR = CODE;
+
+RaiseCantConvert: PROC = {CantConvert[]};
+
+
+DescribeRefStamp: PROC [rs: REF MobDefs.VersionStamp] RETURNS [Rope.ROPE]
+~ {IF rs=NIL THEN RETURN ["NIL"] ELSE RETURN IO.PutFR["%08x%08x", [cardinal[rs[0]]], [cardinal[rs[1]]] ]};
+TestGenMesaSourcePositionMacros: Commander.CommandProc =
+BEGIN
+args: CommanderOps.ArgumentVector ¨ CommanderOps.Parse[cmd];
+fileName: PATH ¨ PFS.PathFromRope[args[1]];
+fileSet: SystemInterface.FileSet ¨ SystemInterface.CreateFileSet[];
+BEGIN ENABLE UNWIND => SystemInterface.CloseFileSet[fileSet];
+file: CirioFile ¨ SystemInterface.GetCirioFile[fileSet, fileName];
+versionStamp: Rope.ROPE ¨ NIL;
+SeeOnePosition: PROC[sp: CARD, nChars: CARD, ln: CARD] =
+{IO.PutF[cmd.out, "sp: %g..%g, ln: %g\N", IO.card[sp], IO.card[sp+nChars], IO.card[ln]]};
+versionStamp ¨ GenMesaSourcePositionMacros[file, SeeOnePosition];
+IO.PutF1[cmd.out, "\NversionStamp = %g\N", IO.rope[versionStamp]];
+END;
+SystemInterface.CloseFileSet[fileSet];
+END;
+
+
+TestCreateCFileInfo: Commander.CommandProc =
+BEGIN
+args: CommanderOps.ArgumentVector ¨ CommanderOps.Parse[cmd];
+fileName: PATH ¨ PFS.PathFromRope[args[1]];
+fileSet: SystemInterface.FileSet ¨ SystemInterface.CreateFileSet[];
+BEGIN ENABLE UNWIND => SystemInterface.CloseFileSet[fileSet];
+file: SystemInterface.CirioFile ¨ SystemInterface.GetCirioFile[fileSet, fileName];
+info: CFileInfo ¨ CreateCFileInfo[file];
+ss: SourcePosSeq ¨ info.sourcePosSeq;
+lns: LineNumSeq ¨ info.lineNumSeq;
+IO.PutF1[cmd.out, "versionStamp: %g\N", IO.rope[info.versionStamp]];
+IO.PutF1[cmd.out, "nSourcePosMacros = %g\n", IO.card[ss.nSourceMacros]];
+FOR I: CARD IN [0..ss.nSourceMacros) DO
+IO.PutF[cmd.out, "\T%g..%g   CLine: %g\N", IO.card[ss[I].pos], IO.card[ss[I].pos+ss[I].nChars], IO.card[ss[I].lineNum]]; 
+ENDLOOP;
+IO.PutRope[cmd.out, "\N"];
+FOR I: CARD IN [0..lns.nSourceMacros) DO
+IO.PutF[cmd.out, "\T CLine: %g   %g..%g\N", IO.card[lns[I].lineNum], IO.card[lns[I].pos], IO.card[lns[I].pos+lns[I].nChars]]; 
+ENDLOOP;
+END;
+SystemInterface.CloseFileSet[fileSet];
+END;
+
+TestSetBreak: Commander.CommandProc =
+BEGIN
+args: CommanderOps.ArgumentVector ¨ CommanderOps.Parse[cmd];
+cFileName: PATH ¨ PFS.PathFromRope[args[1]];
+fileSet: SystemInterface.FileSet ¨ SystemInterface.CreateFileSet[];
+BEGIN ENABLE UNWIND => SystemInterface.CloseFileSet[fileSet];
+file: SystemInterface.CirioFile ¨ SystemInterface.GetCirioFile[fileSet, cFileName];
+info: CFileInfo ¨ CreateCFileInfo[file];
+pos: SourceFileOps.Position ¨ SourceFileOps.noPosition;
+cLineNum: CARD;
+newMesaCharIdx: CARD;
+
+IO.PutF1[cmd.out, "versionStamp: %g\N", IO.rope[info.versionStamp]];
+pos ¨ SourceFileOps.GetSelection[primary].pos;
+IO.PutF[cmd.out, "%g in %g selected\N", IO.card[pos.index[char].first], IO.rope[PFS.RopeFromPath[pos.fileName]]];
+cLineNum ¨ LookupMesaSourcePos[info, pos.index[char].first];
+IO.PutF[cmd.out, "pointing to line %g in %g\N", IO.card[cLineNum], IO.rope[PFS.RopeFromPath[cFileName]]];
+newMesaCharIdx ¨ LookupCLineNum[info, cLineNum];
+IO.PutF[cmd.out, "pointing back to pos %g in %g\N", IO.card[newMesaCharIdx], IO.rope[PFS.RopeFromPath[pos.fileName]]];
+SourceFileOps.OpenSource[desc: "Break set at ", pos: [fileName: pos.fileName, uniqueID: SourceFileOps.nullUniqueID, index: [char: [newMesaCharIdx] ] ], feedBack: cmd.out];
+IO.PutRope[cmd.out, "\N"];
+END;
+SystemInterface.CloseFileSet[fileSet];
+END;
+
+TestFromMesa: Commander.CommandProc =
+BEGIN
+args: CommanderOps.ArgumentVector ¨ CommanderOps.Parse[cmd];
+mesaName: PATH ¨ PFS.PathFromRope[args[1]];
+fileSet: SystemInterface.FileSet ¨ SystemInterface.CreateFileSet[];
+BEGIN ENABLE
+BEGIN
+UNWIND => SystemInterface.CloseFileSet[fileSet];
+SystemInterface.ShowReport =>
+{ShowReportByLevel[cmd.out, msgText, priority];
+RESUME};
+END;
+
+modules: CedarModuleSet ¨ CreateCedarModuleSet[fileSet];
+mesaFile: CirioFile ¨ SystemInterface.GetCirioFile[fileSet, mesaName];
+module: CedarModule ¨ CreateCedarModuleFromMesa[modules, mesaFile];
+[] ¨ GetParsed[module];
+[] ¨ GetCFileInfo[module];
+[] ¨ GetMesaFile[module];
+[] ¨ GetJMPI[module];
+[] ¨ GetMob[module];
+[] ¨ GetModule[module];
+END;
+SystemInterface.CloseFileSet[fileSet];
+END;
+
+TestFromDotO: Commander.CommandProc =
+BEGIN
+args: CommanderOps.ArgumentVector ¨ CommanderOps.Parse[cmd];
+wholeName: PATH ¨ PFS.PathFromRope[args[1]];
+pc: CARD ¨ Convert.CardFromRope[args[2]];
+fileSet: SystemInterface.FileSet ¨ SystemInterface.CreateFileSet[];
+BEGIN ENABLE
+BEGIN
+UNWIND => SystemInterface.CloseFileSet[fileSet];
+SystemInterface.ShowReport =>
+{ShowReportByLevel[cmd.out, msgText, priority];
+RESUME};
+END;
+
+modules: CedarModuleSet ¨ CreateCedarModuleSet[fileSet];
+wholeFile: CirioFile ¨ SystemInterface.GetCirioFile[fileSet, wholeName];
+whole: ObjF.Parsed ¨ ObjF.CreateParsed[wholeFile];
+embeddedModule: ObjF.Module ¨ FallBackFindModule[whole, pc];
+module: CedarModule ¨ CreateCedarModuleFromModule[modules, whole, embeddedModule, LIST[wholeName]];
+sourcePos: REF CedarSourcePosition ¨ ComputeCedarSourcePosition[module, [[0, ""], pc]];
+IF module # NIL THEN {
+[] ¨ GetMesaFile[module];
+[] ¨ GetCFileInfo[module];
+[] ¨ GetMesaFile[module];
+[] ¨ GetJMPI[module];
+[] ¨ GetMob[module];
+[] ¨ GetModule[module];
+};
+ShowIndentedRopes[GetRopesForSourcePosInfo[sourcePos], cmd.out, 5];
+END;
+SystemInterface.CloseFileSet[fileSet];
+END;
+
+
+ShowIndentedRopes: PROC[ropes: LIST OF Rope.ROPE, on: IO.STREAM, indent: CARD] =
+BEGIN
+FOR rps: LIST OF Rope.ROPE ¨ ropes, rps.rest WHILE rps # NIL DO
+FOR I: CARD IN [0..indent] DO
+IO.PutRope[on, " "];
+ENDLOOP;
+IO.PutF1[on, "%g\N", IO.rope[rps.first]];
+ENDLOOP;
+END;
+
+CrudeExp: Commander.CommandProc =
+BEGIN
+args: CommanderOps.ArgumentVector ¨ CommanderOps.Parse[cmd];
+mesaName: PATH ¨ PFS.PathFromRope[args[1]];
+mobName: PATH ¨ PFS.PathFromRope[args[2]];
+fileSet: SystemInterface.FileSet ¨ SystemInterface.CreateFileSet[];
+BEGIN ENABLE
+BEGIN
+UNWIND => SystemInterface.CloseFileSet[fileSet];
+SystemInterface.ShowReport =>
+{ShowReportByLevel[cmd.out, msgText, priority];
+RESUME};
+END;
+
+mesaFile: CirioFile ¨ SystemInterface.GetCirioFile[fileSet, mesaName];
+mobFile: CirioFile ¨ SystemInterface.GetCirioFile[fileSet, mobName];
+mob: MA.MobCookie ¨ MA.CreateMobCookie[mobFile];
+mobVersion: MobDefs.VersionStamp ¨ MA.ReadMobVersionStamp[mob];
+mobSourceVersion: MobDefs.VersionStamp ¨ MA.ReadSourceVersionStamp[mob];
+possibleSourceVersion: MobDefs.VersionStamp ¨ MA.ComputeSourceVersionStamp[mesaFile];
+ERROR -- for inspection
+END;
+END; 
+
+NewTestSetBreak: Commander.CommandProc =
+BEGIN
+args: CommanderOps.ArgumentVector ¨ CommanderOps.Parse[cmd];
+remoteName: Rope.ROPE ¨ args[1];
+portNum: CARD ¨ Convert.CardFromRope[args[2]];
+nub: CirioNubAccess.Handle ¨ CirioNubAccess.CreateRemoteNub[debuggee: remoteName, port: portNum, timeoutMsec: 10000];
+fileSet: SystemInterface.FileSet ¨ SystemInterface.CreateFileSet[];
+BEGIN ENABLE
+BEGIN
+UNWIND => {SystemInterface.CloseFileSet[fileSet]; CirioNubAccess.DestroyNub[nub]};
+SystemInterface.ShowReport =>
+{ShowReportByLevel[cmd.out, msgText, priority];
+RESUME};
+END;
+modules: CedarModuleSet ¨ CreateCedarModuleSet[fileSet];
+loadState: LoadStateAccess.LoadStateHandle ¨ LoadStateAccess.CreateLoadStateHandle[remoteName, nub, fileSet];
+pos: SourceFileOps.Position;
+pos ¨ SourceFileOps.GetSelection[].pos;
+IF pos.fileName # NIL THEN
+BEGIN
+mesaFileName: PATH ~ pos.fileName;
+mesaSourcePosition: INT ~ pos.index[char].first;
+mesaFile: CirioFile ¨ SystemInterface.GetCirioFile[fileSet, mesaFileName];
+addr: REF CedarBreakAddress ¨ GetAbsAddressForBreak[modules, mesaFile, loadState, mesaSourcePosition];
+ropes: LIST OF Rope.ROPE ¨ GetRopesForCedarBreakAddress[addr];
+ShowIndentedRopes[ropes, cmd.out, 0];
+IF addr # NIL THEN
+BEGIN
+basicInfo: REF LoadStateAccess.BasicPCInfo ¨ LoadStateAccess.GetBasicPCInfo[loadState, addr.absPC];
+moreInfo: REF LoadStateAccess.LoadedModuleInfo ¨ LoadStateAccess.GetLoadedModuleInfoFromAbsPC[loadState, addr.absPC];
+
+rope1: Rope.ROPE ¨ LoadStateAccess.GetRopeForBasicPCInfo[basicInfo, addr.absPC, TRUE, TRUE, TRUE, TRUE];
+ropes2: LIST OF Rope.ROPE ¨ LoadStateAccess.GetRopeListForBasicPCInfo[basicInfo];
+ropes3: LIST OF Rope.ROPE ¨ LoadStateAccess.GetRopeListForLoadedModuleInfo[moreInfo];
+ShowIndentedRopes[LIST[rope1], cmd.out, 0];
+ShowIndentedRopes[ropes2, cmd.out, 0];
+ShowIndentedRopes[ropes3, cmd.out, 0];
+BEGIN
+mesaParts: NameParts ¨ GetNamePartsFromFullPathName[mesaFileName];
+ResetSearchPaths[modules, LIST[mesaParts.principalDirectory], BasicTime.Now[]];
+BEGIN
+resultingModule: CedarModule ¨ GetCedarModuleForLoadedModule[modules, moreInfo];
+moduleRelativeAddr: CARD ¨ addr.absPC-(moreInfo.lsi[text].base+moreInfo.moduleRelativeBaseAddr);
+resultingSourcePos: REF CedarSourcePosition ¨ ComputeCedarSourcePosition[resultingModule, [[0, ""], moduleRelativeAddr]];
+ropes4: LIST OF Rope.ROPE ¨ GetRopesForSourcePosInfo[resultingSourcePos];
+ShowIndentedRopes[ropes4, cmd.out, 0];
+IF resultingSourcePos.mesaPosition # addr.correspondingMesaPosition THEN ERROR;
+END;
+END;
+END;
+END;
+END;
+CirioNubAccess.DestroyNub[nub];
+SystemInterface.CloseFileSet[fileSet];
+END;
+
+SetDebugSearch: Commander.CommandProc ~ {
+debugSearch ¨ cmd.procData.clientData = $True;
+msg ¨ IO.PutFR1["debugSearch=%g", [boolean[debugSearch]] ]};
+
+ShowReportByLevel: PUBLIC PROC [s: IO.STREAM, r: Rope.ROPE, level: ATOM] ~ {
+SELECT messagesDesired FROM
+$debug => IO.PutF1[s, "%g\N", IO.rope[r]];
+$normal => SELECT level FROM
+$debug => {};
+$normal, 
+$urgent => IO.PutF1[s, "%g\N", IO.rope[r]];
+ENDCASE => IO.PutF1[s, "Bad level for message: %g\N", IO.rope[r]];
+$urgent => SELECT level FROM
+$debug => {};
+$normal => {};
+$urgent => IO.PutF1[s, "%g\N", IO.rope[r]];
+ENDCASE => IO.PutF1[s, "Bad level for message: %g\N", IO.rope[r]];
+ENDCASE => IO.PutF1[s, "Bad desired level for message: %g\N", IO.rope[r]];
+};
+
+LevelFromRope: PROC [r: Rope.ROPE] RETURNS [ATOM] ~ {
+SELECT TRUE FROM
+Rope.Equal[r, "normal", FALSE] => RETURN[$normal];
+Rope.Equal[r, "debug", FALSE] => RETURN[$debug];
+Rope.Equal[r, "urgent", FALSE] => RETURN[$urgent];
+ENDCASE => RETURN[$error];
+};
+
+RopeFromLevel: PROC [l: ATOM] RETURNS [Rope.ROPE ¨ "ERROR"] ~ {
+SELECT l FROM
+$normal => RETURN["normal"];
+$debug => RETURN["debug"];
+$urgent => RETURN["urgent"];
+ENDCASE => RETURN["ERROR"];
+};
+
+MessageLevel: PROC [] RETURNS [ATOM ¨ $error] ~ {
+levelRope: Rope.ROPE ¨ UserProfile.Token[key: "Cirio.MessageLevel", default: "normal"];
+level: ATOM ¨ LevelFromRope[levelRope];
+IF level = $error THEN
+level ¨ $normal;
+RETURN [level];
+};
+
+ChangeLevel: Commander.CommandProc ~ {
+numArgs:CARD ¨ CommanderOps.NumArgs[cmd];
+newLevel: ATOM ¨ NIL;
+newLevelRope: Rope.ROPE ¨ NIL;
+IF numArgs > 1 THEN {
+newLevelRope ¨ CommanderOps.NextArgument[cmd];
+newLevel ¨ LevelFromRope[newLevelRope];
+SELECT newLevel FROM
+$error => IO.PutF1[cmd.out, "level %g is not a valid message level\nValid levels are normal, urgent, and debug.\n", IO.rope[newLevelRope]];
+messagesDesired => IO.PutF1[cmd.out, "level %g was already the message level.\n", IO.rope[newLevelRope]];
+ENDCASE => {
+IO.PutF[cmd.out, "level changed from %g to %g.\n", IO.rope[RopeFromLevel[messagesDesired]], IO.rope[newLevelRope]];
+messagesDesired ¨ newLevel;
+}
+} 
+ELSE 
+IO.PutF1[cmd.out, "Current level: %g\n", IO.rope[RopeFromLevel[messagesDesired]]];
+};
+
+
+messagesDesired: ATOM ¨ MessageLevel[];
+
+debugSearch: BOOL ¨ FALSE;
+
+Commander.Register["ChangeCirioMessageLevel", ChangeLevel, "Change the verbosity level of the messages that Cirio prints out.\n\tUsage: ChangeCirioMessageLevel [level]\n\tValid levels:\n\t\turgent:\tMessages that should always be seen.\n\t\tnormal:\tInformative messages.\n\t\tdebug:\tMore informatation than you want to see.\n\t<none>\tPrint the current setting.\n"];
+Commander.Register["TestGenMesaSourcePositionMacros", TestGenMesaSourcePositionMacros];
+Commander.Register["TestCreateCFileInfo", TestCreateCFileInfo];
+Commander.Register["TestSetBreak", TestSetBreak];
+
+Commander.Register["TestFromMesa", TestFromMesa];
+Commander.Register["TestFromDotO", TestFromDotO, "file.o file-rel-pc"];
+Commander.Register["CrudeExp", CrudeExp];
+Commander.Register["NewTestSetBreak", NewTestSetBreak];
+
+Commander.Register["Cirio.DebugSearch", SetDebugSearch, "RMTWModules.debugSearch _ TRUE", $True];
+
+Commander.Register["Cirio.DontDebugSearch", SetDebugSearch, "RMTWModules.debugSearch _ FALSE", $False];
+
+END.
+  ˙  
+RMTWModules.mesa
+Copyright ” 1990, 1991, 1992, 1993 by Xerox Corporation.  All rights reserved.
+Sturgis, April 1, 1990 2:58 pm PDT
+Last tweaked by Mike Spreitzer on April 10, 1992 7:28 pm PDT
+Last changed by Theimer on November 29, 1989 4:07:25 am PST
+Linda Howe December 28, 1989 8:25:20 am PST
+Coolidge, August 15, 1990 9:35 am PDT
+Laurie Horton, February 25, 1993 4:24 pm PST
+Philip James, January 6, 1992 10:47 am PST
+Katsuyuki Komatsu January 2, 1993 5:50 pm PST
+Willie-s, March 2, 1993 4:17 pm PST
+In this module we tackle the issue of mesa modules.  A mesa module is (roughly) a quintuple: 
+mesa file, mob file, C file, object file (perhaps component), and memory locations.
+These files must satisfy certain consistency conditions with respect to version stamps.
+
+Using a module one can compute the absolute address at which to set a break point and one can compute a source position.
+
+An issue not resolved in current implementation: there may be more than one mob with the same source version stamp.  I simply take the first one I find.
+
+STILL NEED loaded version of this stuff and the action routines
+
+
+NOTE: November 10, 1989 10:42:22 am PST.  heavy changes underway.  Pervious implementation got mesaSOurce => dotO working.  New implementation recognizes source version stamps, and I am editing in GetMesa.  Must repair getMob to either check source version stamp, or mob versoin stamp, depending on which is present.
+
+Note: April 9, 1990 3:40:24 pm PDT.  more heavy changes underway.  Issue is the inability to set breakpoints starting from a mesa file for a previously unvisited module.  This frequntly results in long serach times involving finding embedded dot Os that always seem to fail.  In the past, the searces were short, always seemed to fail, but the breakpoint succeeded.  Now the searches are long, and breakpoints fail to be planted.  First step: reorder procedures so that all calls go "down" and all public procs are at top.
+the following extra level of indirection allows for the discovery that two partially built modules are actually the same.
+These modules will be looked up starting from a mesaSource or starting from a Module.
+no need for entry as this is a create proc
+
+no need for ENTRY because info^ is a constant
+NIL means failure to compute
+no need for ENTRY because addr^ is constant
+returns nil if can't be found
+one should try later if search paths change
+FIX: Use the PFS extension options when they're available.
+parts: NameParts _ GetNamePartsFromFullPathName[mobName];
+here we start assorted procedures that get loaded modules given various starts
+
+here we have the procedures that get a module from various starts
+base: RopeParts.RopePart _ RopeSequence.Fetch[RopeSequence.ParsePartToSeq[RopeParts.RopePart _ NARROW[parts], '.], 0];
+mesaName: PATH _ SystemInterface.GetNameOfFile[mesa];
+parts: NameParts _ GetNamePartsFromFullPathName[mesaName];
+now, lets see if we can learn anything about the dotO location that might be helpful later.
+now, lets see if we can learn anything about the dotO location that might be helpful later.
+here are the procedures that get loaded components of modules
+
+
+here are the procedures that get (non loaded) components of modules
+this computation of vs is designed to be equivalent to MobAccessImpl.ComputeSourceVersionStamp.
+our only effective criterion is the version stamp, if we have one.
+no version stamp, so accept any file with the right name
+parts: NameParts _ GetNamePartsFromFullPathName[info.fullName];
+(this depends on the file caching mechanism in FileSet, to that we get only one file for each name.)
+module must have been created from a mesa file
+our only effective criterion is the version stamp, if we have one.
+parts: NameParts _ GetNamePartsFromFullPathName[info.fullName];
+FIX: Use the PFS Extentions stuff when available.
+(this depends on the file caching mechanism in FileSet, to that we get only one file for each name.)
+if one is not present and we succeed in finding one, it will be the singleton.
+try to find a name for the hash key.
+maybe we already have a module with this mob that started from a different direction
+now, lets look again
+our only effective criterion is the version stamp, if we have one.
+no version stamp, so accept last created file with the right name
+we take the latest created acceptable mob in the same directory
+parts: NameParts _ GetNamePartsFromFullPathName[info.fullName];
+we take the latest created acceptable mob in the same directory
+FIX: Use the PFS Extentions stuff when available.
+(this depends on the file caching mechanism in FileSet, to that we get only one file for each name.)
+Some other procedures
+version stamp hashing
+
+name parts
+
+check for and remove sun4 and sun4-o3
+Do the comparisons as ropes. Should be safe, and it's easier.
+Yup, sun4 or sun4-o3 found. Cut it off.
+check for and remove twiddle version
+check for and remove c2c (which must have a following extension)
+check for and remove extension
+sun4, 
+c2c
+
+Handle C files
+At the time of this writing, Christian was not around to answer questions, but Peter was.  Peter says that the pair of numbers in a SOURCE macro are a source position and a char count.  They represent nested regions. (However, experiment shows that they do not represent nested regions.)  They may not be in monotonic increasing order.
+
+As a starting point, I take a very crude position.  I shall map a source position to the line number holding the SOURCE macro containing the largest source position less than or equal to the given source position.
+
+Similarly, given a cLineNum, I shall map to a SOURCE macro containing the largest cLineNum less than or equal to the given cLineNum. (Note that there can only be one source macro per c line.)
+
+probably should make this a binary search, oh well
+no need to be monitor locked because nothing modifies contents of info
+
+no need to be monitor locked because nothing modifies contents of info
+if starting positions are equal, then sort by CLine number
+(however, I don't believe that this can happen)
+If c line numbers are the same, then sort by increasing start source position
+(I don't believe that this can happen)
+note: the version stamp key is broken into pieces so that it won't look like a version stamp in the various files.
+no need for ENTRY because this is a create routine and doesnt examine modules
+
+no need for ENTRY because info^ is constant
+note: the version stamp key is broken into pieces so that it won't look like a version stamp in the various files.
+definition files
+
+misc
+
+FIX: Figure this out and use PFS Extensions instead of ROPEs
+note: the version stamp key is broken into pieces so that it won't look like a version stamp in the various files.
+needed in Dorado land
+
+test code
+
+This is used with
+CreateButton c TestSetBreak Test.c
+for example, when we have Test.mesa open and Test.c available.
+IO.PutF[cmd.out, "%g\N", IO.rope[msgText]]; 
+IO.PutF[cmd.out, "%g\N", IO.rope[msgText]]; 
+IO.PutF[cmd.out, "%g\N", IO.rope[msgText]]; 
+SystemInterface.CloseFileSet[fileSet];
+this is to be used with
+CreateButton tsb NewTestSetBreak menhir 4816
+IO.PutF[cmd.out, "%g\N", IO.rope[msgText]]; 
+cludge, mechanism should have noticed this added principal directory
+main code
+TestFromMesa /pixel1/pcedar2.0/sunterminal/sunterminalimpl.mesa.~23~
+
+TestFromDotO /pixel1/pcedar2.0/sunterminal/sun4/sunterminalimpl.c2c.o.~23~ 50
+
+CrudeExp /pixel1/pcedar2.0//sunterminal/sunterminalimpl.mesa.~23~ /pixel1/pcedar2.0//sunterminal/sunterminalimpl.mob.~23~
+
+this is to be used with
+CreateButton tsb NewTestSetBreak menhir 4816
+after selecting a position in some mesa file, e.g.,
+[palain-ux]<palain>sturgis>Cedar>2.0>System>PlumberImpl.mesa
+ ù O)  ñ"cedarcode" styleïNewlineDelimiter
+ô codeöúôKöú
+œeúCôNKöú"ô"Kô<Kô;Kô+Kô%Kô,Kô*Kô-Kô#óKò öœk	ò	Köúûúûúò-Köú
+ûúûúò/Köúûú&ò:Köú
+ûúò'Köúûú/òAKöúûúò#Köúûú˘òäKöûúòKöúûúòKöúûúÈò˛Köú
+ûúoò~Köúûúò)Köúûú/òCKòKöúûú;òHKöûúòKöú	ò	KöúòKöúûúòKöúûú!ò-KöúòKöú
+ò
+Köúûúò KòKöúûúËò˝Köúûú	òóò ô]KôSKôWóKô KôxKô KôòKô Kô?Kô Kô KôºKô KôäóKò ö–bnúûúûòKöûú	ûúò+KöûúFûúOûú^òˇKöûú%ò,óKöûúûúûúœnúûúûú†úòtKò KöûúûúûúòKöûúûúûúòKöúûúò,Kò Köúûúûúò.ö	úûúûúû	úûúò3Kò!KöúûúûúûúòKöúûúûúûúòKöúûúòKòKòKöúûúòKöúòKöúòóò KôyKôUóKöúûúûúò*Köúûúûúò.öúûúûúòKòKöú
+ûúò#Köúûúò&Köúûúûúûúò+Köúûúûúûúò(Köúûúûúûúò KöúûúòKöúûúòKöúûúòKöúûúòKöúûúòKöúûúòKöúûúòKöúûúòKöúûúòKòKöúûúòKòKöúûúòKöúòKöúòKöúòKöúûúò#KöúòKöúòKöúûú#ò8óò Kô*óö†úûúûú6ûúûúûúò|KöûòKò$Kò*Kò*Kò+Köûúûú!ûúûúHò{KöûúòóKò ö†úûúûúûú'ûúûúûúûúòsKöûòKöûúûúûúòKò"KòKöûúòóKò ö
+†úûúûúûú/ûúò]KöûòKöûúûúûúòKòKöûúòóKò Köúûú ò9ö†úûúûúûú(ûú*ûúûúûúò®KöûúûúûúòKöúKòKKöúûúûúûúûúMûúòáKöûúCòIóKò ö†úûú/ûúûúòqKöûòKöûú
+ûúûúûúûú!ûúûúòhöúûòKöûòKò0Köúûúûúûúûú$ûúûúòkKöú1ûúûúûúœcúûúòwKöúûúûúûúûú8ûúòeKò(Köúûú	ûúûúûúûúò;Köúûúûú	ûúûúûúòMKöúûúûúòöûúûúûú	ûúûú°òFKöûòKöúûú,òDKò_Kò[Köú!ûúûúûúûúûúò]Kö	úûúûúûúûú ò^Köûúûúûú'ûú(ûúûú»ò¬KöûúòóKöûúûú]ògKöûòóKöûúòóò Kô Kô-óö†úûúûúûúûúûúûúûúòaKöûòKö	úûúûúûúûúòKöú
+ûúûúûúûúûú*òjKöúûúûúûúûúûú+òiKò Köûúûúûú	ûúò=KöúûúûúûúûúûúònKöûúûú	ûúûú!ûúûúûú"òóKöûúûú	ûúûú)ûúûú"òÉKöúûúûúûú òPKöûúòKöûúòóKò Köúûúò2Köúûúûúò*öúûúûúò KöúòKöúûú"ò3Köú"ûúò'óKò Kò ö†úûúûúûú(ûú#ûúûúòìKöûòKöûúûúûúòKòKKö
+ûú
+ûúûúûúûúò öúûúûúûúò#KòKöúòKöúòóKöûúòóKò Köúûúò5ò Kôóö†úûúûúûúbûúûúûúò∞KöûòKöûúûúûúòKòDKöûúûúûúûúûúûúûúûúûúòHöúûòKöûòKò+Kö
+ûú	ûúûúûúûúòöúûòKöûòKöú
+ûú)ò7Kò^KöúûúBò]Köúûú0òJKöúûúCòTKöúûú9òDKöûúûúöò§KöûúòóKöûòóKöûúòóò Kô+óö†úûúûúûúûúûúûúûúòcKöûòKö
+ûúûúûúûúûúò6öúûòKöûòKöúûú,ò6Köúûú-ò8Köúûúûú1ûúûúûúòÉKöúûúûú"ûúûúûúòqKöúûúûú&ûú$òaKöúûúûú+ûú#òeKöúûúûú,ûú'òjKöúûúûúûúòDKöûúûú,ò7KöûúòóKöûúòóKò Kò Kö	úûúûúûúûúòKKò ò KôKô+óö†úûúûúûú:ûúûúûúûúòÄKöûòKöûúûúûúòKò3Köúûúûú1òRöûú
+ûúûòKöûòKöú	ûú"ûúò4Köûúûú4ûúûúòEKöûúòóöûúûúûú>ûòYKöûòKöú
+ûúûú°ò*Köúûú°ò0Köúûú°òDKò ö
+†úûú'ûúûúûúò`KöúòKöúûúòKöúòKò[öúûú7ò?Köúûúûú"ûúûú	ûú	òâKöûúòóKöúûúò'Köûúûúûú2ûú]ò√KòKò!Kò)KöûúûúòKöûúûúûúò!óKò ö
+†
+úûú&ûúûúûúò\KöúòKöúûúòKöúòKò[öúûú7ò?Köúûúûú"ûúûú	ûú	òâKöûúòóKöúûúò'Köûúûúûú2ûú]ò√öûúûúòKòKò!Kò)KöûúûúòóKöûúûúòKöûúûúûúò!óKò ö†	úûúûúòKöûòKô:Köúûúûúûú3òkKöûúûúûú.ûú0òíKò[KöûúòóKò KöúAûúûúûúûúûúòKöûúûúûúûúLûúûú	ûú
+ò§Kò Kò öûúûúûúûúûúûúûú"ûúûúûúûúûòxKöûúûúûú,ûú(òàKòKöûúòKò óöûúûúûúò!KöûúûúBòUKöûúûòKöûúcûúûú
+ûúòïKöûúcûú8ûú
+ûúò∆KöúòKò óöûúûúûúûúûúûúûú'ûúûúûúûúûò}Köûúûúûú+ûú(òáKòKöûúòKò óöûúûúûòKöûòKò%KöúBûúûúûúûúûúòÄKöûòóöúûòKöûòKöú	ûú4òAKöú9ô9KòKöú4ûú"òYKöûúòKò óKöûúòóKöûúòKöûúòóKò KôNKô ö†úûúWûúòäKöûòKöúûú.òGöûúûúûòKöûòKöúûúûúûúò9Köûúûú-ûúûúò>KöûúòóöûúûúûúGûògKöûòKöú
+ûú'ò5Köú)ûú!òLKò:Köúûúò%KöúûúòKöú-°ò9Köúûú»òÂKöûú/ûúYòéöûúûú°Æú	ûòÀKöúûú~òèöûúûúûúòKöúûúkòàKöûúòóKò>öûúûúûúòKöú	ûú+ò8Köúûúûúò/KòKöûúûúûúûú∑òÛöûúûú(ûúò5KòKòKöúûúóò¥KöûúòóKöûúûúkûúÉòîKòóKöûúòóKöûúòóKöûúòKöûúòóKò ö†úûúûúûúò@KöúûúûúAòMóKò ö†úûú ûú#ûúòKöûòöûúûúûúûúûúûò#KöûòKòvö	ûúûúûúûúûò8Kò"óKöûúòKöûòóKöûúòóKò ôAKò óö†úûú+ûúò`öûòKöúûúûúûú"òeKöú
+ûú'ò5Kò:Köú_ûúôvKò Kò@Kò4Köúûú0òLöûú
+ûúûòKöûòKöú
+ûú'ô5Köú:ô:Kò Kò)Kò Köú&ûúòEKöú#ûúûúòJKò<Kò KòKò!Kò Köûúûú3ûúûúòDKöûúòóKöûú	òKöûúòóóKò ö†úûúdûúûúûúûúò©KöûòKöúûú?òJKöúûúûú
+ûúûúûúûúûú;ò•Köú
+ûúûúûúûúûúûúûú/ò}Köúûúûúûúûúûú'òZKöúûúûúûúûúûúûú0òlKò öûú
+ûúûòKöûòKöúûú7°òUKö
+ûúûúûúûúûúò#Kò)Kò KòKòKòKò öûúûú°ò/Köûòöûúûúûúûú'ûú	ûúûòRKò=Köûúûú-ûúAòîKöûú/ûúoò§öûúòKò óóô[KöûòKöúûú<òOKò?öûú/ûò5KöûòKòXKò$KöûúòóKöûúòóKöûòóöûú°JòOKöûòKòEKöûúûú-ûúAòîKöûú/ûúoò§Kò ô[KöûòKöúûúGòZKò?öûú/ûò5KöûòKòXKò$KöûúòóKöûúòóKöûúòKò óKöûúûú3ûúûúòDKöûúòóöûú
+ûúûú°ò$KöûòKöûúûúûú ò;Köûúûúûúò1KöûúòóKöûú	òKöûúòóKò Kò Kò ö†úûúûúòLKö/úûúûúûúûúûúûúûúûúûúûúûúûúûúûúûúûúûúûúûúûúûúûúûúò≈óKò Kò Kò Kò Kô=Kò ö†úûúûúûúòJKöûòöûúûúûúûúûúGûòäKöûòKöúûúò#Kò4Kò2öûúûúûúûúûúûúûò=Köúûú9òPóöûúûúûòKöúûú'òFóKöûúòóKöûúòKöûúòóKò ö†úûúûúòAKöûòö	ûúûúûúûúûòBKò4óKöûúòKöûúòKò óö†úûúûúòAKöûòö	ûúûúûúûúûòCKò5óKöûúòKöûúòóKô Kô KôCKò ö†úûúûú"ûúûúûúûúûú)ûúòßKö†
+úûú&ûúûúûúûúòbö†	úûúûúòKöûúûúûú+ûú!òÄöûúûúûúûúûúûúûúûúûòOKöúûúûúò3Köúûú ò9Kò_KöûúòóKöûúòóKö	úûúûúûúûúòKö	úûúûúûúûúòKöúûúûúòöûúûúûúûú,ûúûúûòSKöúûúûúò+KöúûúòKöúûúòöûúûú+ò6Köûú#ò'KöûúòóKöûúûúûúûú'òJKöúûúòKöúûúûúò,KöûúòóKöúVòVöûúûúûúûúûúûúûúûúûò[KòKöûúòóöûúûúûúòKöûúûú?òRKöúhûúûúòÖóöûúûúûúûú#ûúûúûúûúûò`KòKöûúòKò óöûúûúûúòKöú
+ûú,ò:Köú4ûú#òZKöúòóöúûúòKöú/ò/KöúòóKöûúòóKò ö†úûúûúò;KöûòöûúûúûúûúûúGûòäKöûòKöúûú°ò(Köúûúò#Köúûú
+òò Kô_óKö
+†
+úûú&ûúûúûú òzKò ö†	úûúûúòKöûòöûúûúûúûú(ûú	ûúûúûúûògKöúûúûúûú'ò^Köúûú ò9KòlKöûúòóKöûúòóKò KöûúûúûúKòiKö
+ûúûúûúûú7ûúòjKöûúûúûúòKò Köú(ò(Kò öûúûúûúûú+ûúûúûúûúûòhKòKöûúòKò óö
+ûúûúûúâûúûúòœKò óöûúûúûúûú2ûúûúûúûúûòoKòöûúòKò óóöûúûúûúûú0ûúûúûúûúûòmKòKöûúòKò óöûúûúûòKöûòKöú
+ûú,ò:Kò:KònKöúûúûúòBKòKöúûúò Köú4ûú#òZKöûòóöúûòKöûòKöúûúòKò%Köú)ò)KöûúòóKöûúòóKöûúòKöûúòóKò ö†úûúûúò<KöûòöûúûúûúûúûúGûòÇKöûòKöú°tòäöûúûúûò&KöûòKöúûú°ò(Köúûú°ò)Köúûú°ò0ò KôBóö
+†
+úûú&ûúûúûúòZKöûòöûúûúûòKô8KöûòKòoKò1KòKò!Köú2ûúKòÄKöûúûúòKöûòóöúûòKöûòKòoKöúûú*ò;öûú
+ûúûòKöûòKöú?ô?KöúûúJò]öûúûúûúûúûú,ûòeKöûòKò+Kò!KöûúûúòKöûòóKöûúòóKöûúûúòKöûúòóKöûúòóKò ö†	úûúûúòKöûòöûúûúûúûú(ûú	ûúûúûúûògKöúûúûúûú,òcKöúûúûúûú)°0òêKò6Kò6Kò KòjöûúûúûòKòióKöûúòóKöûúòóKò Köú%ò%Kò öûúûúûúûú+ûúûúûúûúûòhKòKöûúòKò óKö
+ûúûúûúèûúûúò»ö
+ûúûúûúâûúûúòæKò óöûúûúûúûú2ûúûúûúûúûòoKòKöûúòKò óöûúûúûúûú0ûúûúûúûúûòmKòKöûúòKò óöûúûúûòKöûòKöúûúòKò%Köú&ò&KöûòóöúûòKöûòKöúûú,ò7Kò7öûúûúûúò,KôdóKòKònKöúûúòKöú4ûú òWKöûúòóKò KöûúòKò óKöûúòóKöûúòKöûúòóKò ö†úûúûúûúòDKöûòöûúûúûúûúûúGûò~KöûòKöúûúò#Kò0Kò'öûúûúûúûúûú	ûúûò:Köúûú6òGóöûúûúûòKöúûú'ò@óKöûúòóKöûúòKöûúòóKò ö†	úûúûúò;KöûòöûúûúûúûúûúGûòÄKöûòKòöûúûúûòKöûòKöúûúòKò%Köú#ò#KöûúòóKöûúòóKöûúòKöûúòKò óö†	úûúûúò;öûòöûúûúûúûúûúGûòÇKöûòòKô.Kò Kò óö	ûúûúûúûúûò;KöûòKöúûú°ò(Köúûú°ò*Köúûú°ò,Köúûú°ò0Kò ò KôBóö
+†
+úûú&ûúûúûúòZKöûòöûúûúûòKöûòóöúûòKöûòKòoKò<Köú?ô?KòBKöúûú?òJKöúûúûú
+ûúûúûúûúûúûú;òùKò öûúûúûúûúûú,ûòeKöûòKòKòKò!KöûúûúòKöûòóKöúûúûúûúòKöûúòóKöûúòóKò ö†	úûúûúòKöûòKöúûúûú-òBöûúûúûúûú(ûú	ûúûúûúûògKô1ö	ú
+ûúûúûúûúòKöûú'ûú'òTKöûú'ûú#òPKöûú'ûúòJKöûú,ûú,ò^Köûú,ûú(òZKöûú,ûú"òTKöûú&ûú,òXKöûú&ûú(òTKöûú&ûú"òNKöûúûú,òOKöûúûú(òKKöûúûú#òFóKò öûúûúûúûúûúûúûúûúûòNKòaKöûúòóKöûúòóKöûúòóKò Köú#ò#Kò öûúûúûúûú+ûúûúûúûúûòhKòKöûúòKò óö
+ûúûúûúæûúûúòÅKò óöûúûúûúûú2ûúûúûúûúûòoKòKöûúòKò óöûúûúûúûú0ûúûúûúûúûòmKòKöûúòKò óöûúûúûòKöûòKöúûúòKò%Köú$ò$KöûòóöúûòKöûòKöúûú,ò<Kò<öûúûúûúò,KôdóKòKòKònKöúûúòKöú4ûú%ò\KöûúòóKò KöûúòóKò KöûúòóKöûúòKöûúòóKò óö†úûúûúûúò9KôNKöûòKò+Kò KöûúûúûúûúûúûúòAöûúûúûúûúûú>ûòsKöûòKöú$ô$KöúòKò+KöúòKò öûúûúûúòKò6Köúûú1òEKòóKò ö
+ûúûúûúûúûúò4Köúûúûúûúûúûúûúûú"òÄKöú"ò"öûúûúûúûúûúûúûúûúûòVKò0KòSKò0Köúûú1òEKöûúòóKòóKò KôTö	ûúûúûúûú°òMKöûú°FòLKöúûúûú°ò+Köûú*ûúûúò7Kò Köûúûúûú(òEKöûúûúûú(òJKö
+ûúûúûú*ûúûúòQKò Köûúûúûú.òNKöûúûúûú.òSKö
+ûúûúûú0ûúûúòZKò öûúûúûúûú7ûúûúûò`Kò`Köûúòóöûúûúûúûú2ûúûúûò[KòjKöûúòóKò öûúûúûúûú+ûúûúûòRKòIKöûúòóöûúûúûúûú&ûúûúûòMKòSKöûúòóKò öûúCûòIKò,Köûú/°"òUóKò ö	ûúûúûúûúûòGKöú9ûúò?óö	ûúûúûúûúûòAKöú3ûúò9óö	ûúûúûúûúûò9Köú+ûúò1óö	ûúûúûúûúûòAKöú3ûúò9óö	ûúûúûúûúûò;Köú-ûúò3óö	ûúûúûúûúûò?Köú1ûúò7óö	ûúûúûúûúûò=Köú/ûúò5Kò óö	ûúûúûúûúûò@Kò:óKöûúûúûú,òKKöûúûúûú,òPKò ö	ûúûúûúûúûò4Kò.óKöûúûúûú ò9Köûúûúûú ò>Kò ö	ûúûúûúûúûò:Kò4óKöûúûúûú&òBKöûúûúûú&òGKò ö	ûúûúûúûúûò2Kò,óKöûúûúûúò6Köûúûúûúò;Kò ö	ûúûúûúûúûò6Kò0óKöûúûúûú"ò<Köûúûúûú"òAKò ö	ûúûúûúûúûò8Kò2óKöûúûúûú$ò?Köûúûúûú$òDKò ö	ûúûúûúûúûò6Kò0óKöûúûúûú"ò<Köûúûúûú"òAKò Köûúûúûúò0KöûúòóKò Kôöûúûúûú° ò9KöûòKöúûúûúûúûúûúûúûú"òÄöûúûúûòKöûòKöú
+ûúûú°ò*Köúûú°ò0Köúûú°òDò KôBóö
+†
+úûú&ûúûúûúòZKöûòKòfö	ûúûúûúûúûò:KôAKöûòöúûúûú7òMKöúûúûú"ûúûú	ûú	òâKöûúòóKöú2ûúIò~öûúûúûúAûòbKô?KöûòKòKò!Kò)KöûúûúòKöûúòóKöûúûúòKöûòóöúûòKöûòöúûúûú7òMKöúûúûú"ûúûú	ûú	òâKöûúòóKöú?ô?Köú!ûúò=Köú'ûúòFKöúûúûú°ò"Kö
+ûúûúûúûúûúòHKö
+ûúûúûú&ûúûúòTöúûúûúûúBòiKô?óKö
+ûúûúûúXûúûúÀò„öûúûò
+KöûòKòKò!Kò)KöûúûúòKöûúòóKöúûúûúòKöûúòóKöûúûúûúòKöûúòóKò ö†	úûúûúòKöûòöûúûúûúûúûú	ûúûúûúûò`Köúûúûúûú*òbKò8Köûúûúûú.ûú0òíKò[KöûúòóKöûúòóKò Köú ò Köûúûúûúóò»Kò öûúûúûúûú"ûúûúûúûúûògKöûúûúûú,ûú(òàKòKöûúòKò óöûúûúûúò!KöûúûúBòUKöú~ûú
+ûúòüóKò öûúûúûúûú2ûúûúûúûúûòwKöûúûúûú8ûú(òîKòKöûúòóKò öûúûúûúûú'ûúûúûúûúûòlKöûúûúûú+ûú(òáKòKöûúòKò óKò öûúûúûòKöûòKöúûúòKò%Köú!ò!KöûòóöúûòKöûòKöú	ûú4òAKò9KòKònKöúûúûú"òQöûúûúûúò"Köúûúûú%òWKò,Kò Kò1Kò8KöúòóKö
+ûúûúûúûúûúòiKöúûúòKò7öûú2ûúûò<Kö	úûúûú4ûúûúòGóKöú4ûú"òYKöûúòóKò KöûúòóKò KöûúòóKò KöûúòóKöûúòKöûúòóKò ö†úûúûúûúûúûú
+ûúûúûúûúûúò£Köúûúò-KöûúDòJKòKò óö†úûú:ûú
+ûúûúûúûúûúòßKöúûú°ò(Köúûú°ò*Köúûú°ò0Kò ö
+†
+úûú'ûúûúûúò^KòhKò<Kò öûú"ûúò*KòKò!KöûúûúòKöúòóKöûúûúòKöúòóKò ö†	úûúûúòKöúûúûú-òBKô1ö	ú
+ûúûúûúûúòKöûú+ò.Köûú2ò5Köûú<ò?Köûú5ò8KöúòóöûúûúûúûúûúûúûúûúûòNKòZKöûúòóKöúòóKò KöúMòMKò öûúûúûúûú$ûúûúûúûúûòaKòKöûúòKò óöûúûúûúeûúûúûúûúòµKò óöûúûúûúûú)ûúûúûúûúûòfKòKöûúòKò óKöûúûúûúYòpöûúòKöúûú,ò<öûúûúûúò,KôdóKöú4ûú%ò\KöúòóKöûúòKöúòóKò Kò Kò Kò ôKò ö†úûú!ûúûúòUKöûòKöûú9ò?KöûúòóKò Kò óKò Kôò Köúûúûúò(Köúûúûúò2Köúûúûú?ò\KòAKò ö†úûúûúò.KöúûúûúYòdKò óKò ö†úûú8ûúò^Köúûúûú7òBóKò ö†úûúûúûúò<KöûòKöúûúûúò'Köúûúûúò'Köûú)ûú*ò\KöûúòKò óö†úûúûúûúò8KöûòKöúûúûúò%Köúûúò9Köúûúò9Köûú-ûúûúûúòÇKöûúòóóKô ô
+Kò ö
+†úûúûúûúûúòVKöúûúòKöúûú°ò-Köúûú°ò,Kò7Köúûúò*Köúûúò-Kô Kô%ö	ûú$ûúûúûú"ûògKöûòKòZKô=Köúûúò;ö	ûú'ûú*ûú)ûúûòãKô'Kò%óöûúòKò óóò#Kò óô$Köú
+ûú%ò2ö	ûúûú$ûú'ûú°ò{Kò/óKöúòóKò ô@Köú
+ûú%ò2Kö	úûúûúûúûú.òaöûúûúYûúòzKò<Köúûúò óKöúòKò óôKöú
+ûú%ò2öûúûòKò0óKöúòóKò öûúòKöúòKöúôKöú	ò	KôKòóKöúòóóKô ôò Köúûúûúò$öúûúûúòKöúòKöúòKöúòKöúûúòóKò Köúûúûúò*öúûúûúò Köûúûúûúò4Kò óKöúûúûúò&öúûúûúòKöûúûúûúò4Kò óKöúûúûúûú
+ûúûúòFKò KôœKô Kô’Kô Kôøóô Kô2KöúFôFóö
+†úûúûúûúûúòOKöûòöûú†úûúû
+úûú&ûòEöûú!ûò'Köûúò$óKöûúòóKöûú%ûúûúò6Köûúò$KöûúòKô KöúFôFóö
+†úûúûúûúûúòJKöûòöûú†úûúû
+úûú$ûòCöûú(ûò.KöûúòóKöûúòóKöûú#ûúûúò4KöûúòKöûúòóKò ö†úûúûúûúûúûúûúòZKöûòKöúûúûúò'Köúûúûúò'Köûúûúûúò'Köûúûúûú
+ò*ô:Kô/óKöûúûúûúò/Köûúûúûú
+ò2KöûúòKöûúòóKò ö†úûúûúûúûúûúûúò_KöûòKöúûúûúò'Köúûúûúò'Köûúûúûúò/Köûúûúûú
+ò2ôMKô&óKöûúûúûúò'Köûúûúûú
+ò*KöûúòKöûúòKò óKò ö
+†úûúûúûúûúòYKöûòöúûúûú+ò<Köûúûúûú8òKKöúûúûúûúòKöúûúòKöúûúò'öúûúHòXKôróKöúûúò'Kò öûúûúûúûúûúûò4Köú	ûúò$öûúûú°ò5KöûòKöúûúò+öûú6ûú°òMKöûòKöúûúò(Köúûú$ò/öûúûú°òAKò<óKöûòóKöûúòóKöûúûúûúûúò KöûúòóKöûúòóKöú4ò4Köûúòóò KôMóöü†	úûúûúò<KöûòKöúûúûúûúûúûúòKöúûúûúûúûúûúòKöú	ûúòKöúûúûúûúûúûúò"KöúòKöúòKöúûúûúòKò Kò ö
+†úûúûú
+ûúûúò8KöûòKöúûúûú*ò:Köúûúûú*ò:KòKöûúòóKò Kò KòBKò Kò8Köúûúò.ö	ûú†úûúûúûò!Köúûúûúò5KòKòKöûúòóKò Kò=Köúûúò*ö	ûú†úûúûúûò!Köúûúûúò5KòKòKöûúòóKò Köûúûú@òJöûúòKô Kô+óóö†úûúûúûúò@KöúûúòKò Kò óö†úûú†úûúûú
+ûúûúûúûúûúòîKöûòöúûúûú+ò<Köûúûúûú8òKKöúûúûúûúòKöúûúòKöúûúò'öúûúHòXKôróKöúûúò'Kò öûúûúûúûúûúûò4Köú	ûúò$öûúûú°#ò:KöûòKöúûúò+öûú6ûú°òMKöûòKöúûúòKöúûúòKöúûúòöûòKöûúûúûúòKöúûúûúò&KòKöûúòóKöûúûúûú	ûúò:öûòKöûúûúûúòKöúûúûúò.KòKöûúòóKòKöûúòóKöûúòóöûúûú°ò5KöûòKöúûúò+öûú6ûú°òMKöûòKöúûúò(Köúûú$ò/öûúûú°òAKò<óKöûòóKöûúòóKöûúòóKöûúòóKöú4ò4KöûúòóKò ôKò óKô ôKô Kò ö†úûú
+ûú	ûúûúûúûúûúûúûúòJKöûòöûúûúûúûúûúûúûò:Köûúûúûúò/KöûúòóKöûúûúòKöûúòóKò ö†úûúûúò@KöûòKöúûúûúòöûúûúûúûúûúûúûúûú.ûú	ûúûò†Köûú	ûúûú$ò7Köúûúò:KöûúòóKöúXòXKöûúòKò óö†úûúûúòAKöûòKöúûúûúòöûúûúûúûúûúûúûúûú.ûú	ûúûò†Köûú	ûúûú#ò6Köúûúò<KöûúòóKöúYòYKöûúòóKò öúûúûúò%KöúòKöúûúòKò óKô<ö
+†(úûúûúûúûúòqKöûòöûòKöûòKöúûúò'KöúûúòKöúûúòKöûúòóKò öúûú)òDKôróKöúûú,ò:Köúûú"ò2Köúûú"ò5Köúûú,ò;Köúûúûúûú7ûúûúòhKöúûú5òHKöúûú[òlKöúûúò$Köúûú!ò3Köúûú=òOKò]Kò Köûúûú(ûúòFKöûúûúûúò&Kò Köûúûú!ûúòEKò öûòKöú	ûúûúòóKöûúòóKò Kö†úûúûúòò KôóKö†úûúò)Kò Kò ö
+†úûúûúûúûúòIKöúûúûúûúûú	ûúûúûú;òjóóKô ô	Kô ö†úò8KöûòKò<Köú
+ûúûúò+òCKöûúûúûú*ò=KòBKöúûúûúòö
+†úûúûú
+ûúûúò8Kö	úûú'ûúûúûúòYóKòAKöûú)ûúòBKöûúòóKöú&ò&öûúòKò óóKò ö†úò,KöûòKò<Köú
+ûúûúò+òCKöûúûúûú*ò=KòRKò(Kò%Kò"Köûú&ûúòDKöûú+ûúòHö	ûú†úûúûúûò'Köûú)ûúûúûúòyKöûúòóKöûúòö	ûú†úûúûúûò(Köûú*ûúûúûú"ò~KöûúòóKöûúòóKöú&ò&Köûúòóò öúôKöú"ô"Kô>óóö†úò%KöûòKò<Köúûúûúò,òCKöûúûúûú*ò=KòSKò(Kò7Köú
+ûúòKöúûúòKò Köûú&ûúòDKò.Köûú&ûúûúûúòqKò<Köûú.ûúûúûúòiKò0Köûú2ûúûúûúòvKò´KöûúòKöûúòóKò&KöûúòóKò ö†úò%KöûòKò<Köú
+ûúûúò+òCöûúûòKöûòKöûú*ò0òKöú/ò/Köûúûúô,KöûúòóKöûúòKò óKò8KòFKòCKòKòKòKòKòKòKöûúòóKöú&ò&KöûúòóKò ö†úò%KöûòKò<Köúûúûúò,Köúûú!ò)òCöûúûòKöûòKöûú*ò0òKöú/ò/Köûúûúô,KöûúòóKöûúòKò óKò8KòHKò2Kò<KöúRûúòcKöúûúIòWöûú
+ûúûúòKòKòKòKòKòKòKòóKòCKöûúòóKöú&ò&KöûúòKò óKò ö†úûúûúûúûúûúûú
+ûúòPKöûòöûúûúûúûúûúûúûò?ö	ûú†úûúûúûòKöûúòKöûúòóKöûúûúò)KöûúòóKöûúòóKò ö†úò!KöûòKò<Köú
+ûúûúò+Köú	ûúûúò*òCöûúûòKöûòKöûú*ò0òKöú/ò/Köûúûúô,KöûúòóKöûúòKò óKòFKòDKöúûúûúò0Köú#ûúò?Köú)ûúòHKöú.ûú%òUKöûú°òKöûúòóKöú&ô&Köûúòóò ôKöú,ô,óóö†úò(KöûòKò<Köúûúò Köú	ûú!ò.KòuòCöûúûòKöûòKöûúLòRòKöú/ò/Köûúûúô,KöûúòóKöûúòóKò8KòmKòKò'öûúûúûòKöûòKöúûúò"Köúûúò0KòJKöúûú]òfKöúûúûúûú&ò>Kò%öûúûúûòKöûòKöúûúUòcKöú
+ûúhòuKò Köúûú@ûúûúûúûúòhKöúûúûúûú8òQKöúûúûúûú<òUKöúûúò+Köú&ò&öú&ò&KöûòKòBöúûú1òOKôDKöûòKòPKöúûúHò`KöúûúbòyKöúûúûúûú0òIKöú&ò&KöûúBûúûúòOKöûúòóKöûúòóKöûúòóKöûúòóKöûúòóKöúòKöú&ò&KöûúòóóKò ö†úò)Kò.Köúûú4ò<óKò ö†úûúûúûúûú
+ûú	ûúòLöûúûòKöú
+ûúûú
+ò*öúûúûòKòKöú	ò	Köúûúûú
+ò+Köûúûú)ûú
+òBóöúûúûòKòKòKöúûúûú
+ò+Köûúûú)ûú
+òBóKöûúûú1ûú
+òJóKòKò óö
+†úûú
+ûúûúûúò5öûúûúûòKöúûúûú
+ò2Köúûúûú	ò0Köúûúûú
+ò2Köûúûú	òóKòKò óö
+†úûúûúûúûúò?öûúûòKöúûúòKöú
+ûú
+òKöúûúòKöûúûú
+òóKòKò óö†úûúûúûúò1KöúûúCòWKöúûúò'öûúûòKòóKöûú	òKòóKò ö†úò&Köúûúò)Köú
+ûúûúòKöúûúûúòöûúûúòKò.Kò'öûú
+ûòKöú
+ûúhûúòãKöúûú=ûúòiöûúòKöûú1ûú'ûúòsKòKòóóKòóöûúòKöûú'ûú'òRóKòKò óóô	Kò Köúûúò'Kò KöúûúûúòKò KöúòKöúWòWKöú?ò?Köú1ò1Kò öú1ò1KöúDôDKô óöúGòGKöúMôMóKô öú)ò)KöúyôyóKô öú7ò7ôKöú,ô,Kô3Köú<ô<óóKò KöúaòaKò KöúgògKò óKöûúòó Öó     ‡ é 

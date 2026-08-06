@@ -1,0 +1,417 @@
+
+DIRECTORY
+   Arpa USING [MyAddress],
+Ascii USING [Lower],
+BasicTime USING [GetClockPulses],
+Convert USING [CardFromRope, Error, RopeFromArpaAddress],
+RefText USING [New, TrustTextAsRope],
+Rope USING [Equal, FromRefText, Index, Length, ROPE, Substr, Translate],
+SunAuthUnix USING [Groups, GroupsObject],
+SunRPC USING [Destroy, Error, GetCard32, GetRope, Handle, PutCard32, PutRope],
+SunRPCOnUDP USING [OpenReader, OpenWriter, TextFromWriter],
+SunRPCAuth USING [AuthenticateProc, CheckReplyVerifierProc, Conversation, ConversationObject, Error, GetCredentialsAndNextVerifierProc, InitiateProc, NoShortcutProc, nullFlavor, Procs, ProcsObject, Register, shortFlavor, SweepProc, TerminateProc, unixFlavor],
+SunYPAgent USING [Error, First, Handle, Match, Next, ObtainHandle, ReleaseHandle, TextSeq, Tokenize, TokenizeUsingSeparator]
+;
+
+SunAuthUnixImpl: CEDAR MONITOR
+LOCKS lock USING lock: Lock
+IMPORTS Arpa, Ascii, BasicTime, Convert, RefText, Rope, SunRPC, SunRPCAuth, SunRPCOnUDP, SunYPAgent
+EXPORTS SunAuthUnix
+~ {
+ROPE: TYPE ~ Rope.ROPE;
+
+Conversation: TYPE ~ SunRPCAuth.Conversation;
+ConversationObject: TYPE ~ SunRPCAuth.ConversationObject;
+
+Lock: TYPE ~ REF LockObject;
+LockObject: TYPE ~ MONITORED RECORD [];
+initialTTL: CARDINAL ¨ 3600;
+rollbackTTL: CARD ¨ LONG[24]*LONG[3600];	-- sweep time longer than this is treated as rollback
+
+passwordMapName: ROPE ¨ "passwd.byname";
+passwordPos: CARDINAL ~ 1;
+uidPos: CARDINAL ~ 2;
+gidPos: CARDINAL ~ 3;
+
+cedarGuestName: ROPE ¨ "cedarguest";
+cedarGuestPassword: ROPE ¨ NIL;
+
+groupMapName: ROPE ¨ "group.byname";
+grpNamePos: CARDINAL ~ 0;
+grpNumPos: CARDINAL ~ 2;
+grpMembersPos: CARDINAL ~ 3;
+
+gvUnixMapName: ROPE ¨ "gvToUnix.byname";
+unixNamePos: CARDINAL ~ 1;
+
+hostsMapName: ROPE ¨ "hosts.byaddr";
+hostNamePos: CARDINAL ~ 1;
+
+
+maxCredentialsBytes: CARDINAL ¨ 350;
+maxGroups: CARDINAL ~ 9;	-- the 0th slot is filled with gid from passwd file, leaving 9
+maxUnixNameLen: INT ¨ 8;
+
+nullVerifier: REF TEXT ¨ RefText.New[0];
+Sweep: SunRPCAuth.SweepProc -- [registrationData, secondsSinceLastSweep] -- ~ {
+SweepConversationCache[secondsSinceLastSweep];
+SweepUserNameCache[secondsSinceLastSweep];
+SweepMachineNameCache[secondsSinceLastSweep];
+};
+ConversationData: TYPE ~ REF ConversationDataObject;
+ConversationDataObject: TYPE ~ RECORD [
+next: ConversationData,
+conversation: Conversation,
+ttl: CARDINAL ¨ initialTTL,
+name, password: ROPE,
+credentials: REF TEXT,
+shortCredentials: REF TEXT
+];
+
+conversationDataCache: ConversationData ¨ NIL;
+conversationCacheLock: Lock ¨ NEW[LockObject];
+
+GetConversationFromCache: ENTRY PROC [name, password: ROPE, lock: Lock ¨ conversationCacheLock] RETURNS [c: Conversation] ~ {
+p, prev: ConversationData;
+p ¨ conversationDataCache;
+WHILE p # NIL DO
+IF Rope.Equal[p.name, name] AND Rope.Equal[p.password, password] THEN EXIT; 
+prev ¨ p; p ¨ p.next;
+ENDLOOP;
+IF p = NIL THEN RETURN [NIL];
+IF prev = NIL THEN conversationDataCache ¨ p.next ELSE prev.next ¨ p.next;
+RETURN [p.conversation];
+};
+
+PutConversationIntoCache: ENTRY PROC [c: Conversation, lock: Lock ¨ conversationCacheLock] ~ {
+cD: ConversationData ~ NARROW[c.conversationData];
+cD.next ¨ conversationDataCache;
+conversationDataCache ¨ cD;
+};
+
+SweepConversationCache: ENTRY PROC [secs: CARD, lock: Lock ¨ conversationCacheLock] ~ {
+p, prev: ConversationData;
+p ¨ conversationDataCache;
+WHILE p # NIL DO
+IF p.ttl > secs
+THEN {
+p.ttl ¨ p.ttl - secs;
+prev ¨ p;
+}
+ELSE {
+IF prev = NIL THEN conversationDataCache ¨ p.next ELSE prev.next ¨ p.next;
+};
+p ¨ p.next;
+ENDLOOP;
+};
+UnixPasswordMatches: PROC [uid: CARD, name, password, encryptedPassword: ROPE]
+RETURNS [matches: BOOL] ~ {
+RETURN [TRUE];
+};
+userNameCacheLock: Lock ¨ NEW[LockObject];
+
+cachedName: ROPE ¨ NIL;
+cachedFixedName: ROPE ¨ NIL;
+
+GetUserNameFromCache: ENTRY PROC [name: ROPE, lock: Lock ¨ userNameCacheLock] RETURNS [fixedName: ROPE ¨ NIL] ~ {
+IF Rope.Equal[name, cachedName, TRUE] THEN fixedName ¨ cachedFixedName;
+};
+
+PutUserNameIntoCache: ENTRY PROC [name, fixedName: ROPE, lock: Lock ¨ userNameCacheLock] ~ {
+cachedName ¨ name;
+cachedFixedName ¨ fixedName;
+};
+
+SweepUserNameCache: ENTRY PROC [secs: CARD, lock: Lock ¨ userNameCacheLock] ~ {
+IF secs >= rollbackTTL THEN cachedName ¨ cachedFixedName ¨ NIL;
+};
+
+FixNameForUnix: PUBLIC PROC [name: ROPE] RETURNS [fixedName: ROPE ¨ NIL] ~ {
+h: SunYPAgent.Handle ¨ NIL;
+ToLowerTranslator: PROC [old: CHAR] RETURNS [new: CHAR]
+~ { new ¨ Ascii.Lower[old] };
+name ¨ Rope.Translate[base~name, translator~ToLowerTranslator];
+IF Rope.Equal[name, cachedName, TRUE] THEN RETURN[cachedFixedName];
+IF (fixedName ¨ GetUserNameFromCache[name]) # NIL THEN RETURN;
+{
+ENABLE SunYPAgent.Error => GOTO NoYP;
+val: REF TEXT;
+seq: SunYPAgent.TextSeq;
+h ¨ SunYPAgent.ObtainHandle[];
+val ¨ SunYPAgent.Match[h, gvUnixMapName, name];
+seq ¨ SunYPAgent.TokenizeUsingSeparator[val, ':];
+IF seq.length <= unixNamePos THEN GOTO NoYP;
+fixedName ¨ Rope.FromRefText[seq.refText[unixNamePos]];
+EXITS
+NoYP => fixedName ¨
+Rope.Substr[name, 0, MIN[maxUnixNameLen, Rope.Index[name, 0, "."]]];
+};
+IF h # NIL THEN { SunYPAgent.ReleaseHandle[h]; h ¨ NIL };
+PutUserNameIntoCache[name, fixedName];
+};
+
+cachedMachineName: ROPE ¨ NIL;
+
+SweepMachineNameCache: PROC [secs: CARD] ~ {
+IF secs >= rollbackTTL THEN cachedMachineName ¨ NIL;
+};
+
+FullyQualified: PROC [nameP: REF TEXT] RETURNS [BOOL] ~ {
+FOR i: CARDINAL IN [0 .. nameP.length) DO
+IF nameP[i] = '. THEN RETURN[TRUE];
+ENDLOOP;
+RETURN[FALSE];
+};
+
+GetThisMachineName: PROC RETURNS [name: ROPE] ~ {
+h: SunYPAgent.Handle ¨ NIL;
+IF (name ¨ cachedMachineName) = NIL THEN {
+ENABLE SunYPAgent.Error => GOTO NoYP;
+addressRope, unbracketedAddressRope: ROPE;
+hostsEntry: REF TEXT;
+seq: SunYPAgent.TextSeq;
+h ¨ SunYPAgent.ObtainHandle[];
+addressRope ¨ Convert.RopeFromArpaAddress[Arpa.MyAddress[]];
+unbracketedAddressRope ¨ Rope.Substr[addressRope, 1, Rope.Length[addressRope]-2];
+hostsEntry ¨ SunYPAgent.Match[h, hostsMapName, unbracketedAddressRope];
+seq ¨ SunYPAgent.Tokenize[hostsEntry];
+IF seq.length > hostNamePos THEN {
+pos: CARDINAL ¨ seq.length-1;
+WHILE (pos > hostNamePos) AND (NOT FullyQualified[seq.refText[pos]])
+DO pos ¨ pos - 1 ENDLOOP;
+cachedMachineName ¨ name ¨ Rope.FromRefText[seq.refText[pos]];
+};
+EXITS
+NoYP => NULL;
+};
+IF h # NIL THEN SunYPAgent.ReleaseHandle[h];
+};
+
+stamp: CARD ¨ BasicTime.GetClockPulses[];
+stampLock: Lock ¨ NEW[LockObject];
+
+GetStamp: PROC [lock: Lock ¨ stampLock] RETURNS [CARD] ~ {
+RETURN [stamp ¨ stamp + 1];
+};
+
+Groups: TYPE ~ REF GroupsObject;
+GroupsObject: TYPE ~ RECORD [
+nGroups: CARDINAL ¨ 0,
+groups: ARRAY [0..maxGroups) OF CARD
+];
+
+GetGroupsWithGivenMember: PROC [h: SunYPAgent.Handle, name: ROPE]
+RETURNS [g: Groups] ~ {
+g ¨ NEW[GroupsObject];
+{ ENABLE SunYPAgent.Error, Convert.Error => GOTO GiveUp;
+keyBefore: ROPE;
+val: REF TEXT;
+[keyBefore, val] ¨ SunYPAgent.First[h, groupMapName];
+DO
+seq: SunYPAgent.TextSeq;
+gid: CARD;
+seq ¨ SunYPAgent.TokenizeUsingSeparator[val, ':];
+IF seq.length <= grpNumPos THEN GOTO GiveUp;
+gid ¨ Convert.CardFromRope[RefText.TrustTextAsRope[seq.refText[grpNumPos]]];
+IF seq.length <= grpMembersPos THEN GOTO GiveUp;
+seq ¨ SunYPAgent.TokenizeUsingSeparator[seq.refText[grpMembersPos], ',];
+FOR i: CARDINAL IN [0 .. seq.length) DO
+IF Rope.Equal[RefText.TrustTextAsRope[seq.refText[i]], name, TRUE] THEN {
+g.groups[g.nGroups] ¨ gid;
+g.nGroups ¨ g.nGroups + 1;
+EXIT;
+};
+ENDLOOP;
+IF g.nGroups >= maxGroups THEN EXIT;
+[keyBefore, val] ¨ SunYPAgent.Next[h, groupMapName, keyBefore];
+ENDLOOP;
+EXITS
+GiveUp => NULL;
+};
+};
+
+GetConversationByContactingYPServer: PROC [name, password: ROPE]
+RETURNS [c: Conversation] ~ {
+credentials, val: REF TEXT;
+seq: SunYPAgent.TextSeq;
+uid, gid: CARD;
+h: SunYPAgent.Handle;
+hW: SunRPC.Handle;
+errorCode: ATOM ¨ NIL;
+{
+ENABLE {
+SunYPAgent.Error => {
+errorCode ¨ (SELECT code FROM
+$noYP, $domainNotFound, $timeout => $timeout,
+$keyNotFound => $wrongUserPassword,
+ENDCASE => $protocol);
+GOTO Cant;
+};
+Convert.Error => {
+errorCode ¨ $protocol;
+GOTO Cant;
+};
+};
+h ¨ SunYPAgent.ObtainHandle[];
+val ¨ SunYPAgent.Match[h, passwordMapName, name];
+seq ¨ SunYPAgent.TokenizeUsingSeparator[val, ':];
+IF seq.length <= gidPos THEN { errorCode ¨ $protocol; GOTO Cant };
+uid ¨ Convert.CardFromRope[RefText.TrustTextAsRope[seq.refText[uidPos]]];
+gid ¨ Convert.CardFromRope[RefText.TrustTextAsRope[seq.refText[gidPos]]];
+IF NOT UnixPasswordMatches[uid, name, password, RefText.TrustTextAsRope[seq.refText[passwordPos]]]
+THEN { errorCode ¨ $wrongUserPassword; GOTO Cant };
+
+hW ¨ SunRPCOnUDP.OpenWriter[maxCredentialsBytes];
+SunRPC.PutCard32[hW, GetStamp[]];
+SunRPC.PutRope[hW, GetThisMachineName[]];
+SunRPC.PutCard32[hW, uid];
+SunRPC.PutCard32[hW, gid];
+{ g: Groups ¨ GetGroupsWithGivenMember[h, name];
+SunRPC.PutCard32[hW, g.nGroups + 1];
+SunRPC.PutCard32[hW, gid];
+FOR i: CARDINAL IN [0 .. g.nGroups) DO
+SunRPC.PutCard32[hW, g.groups[i]];
+ENDLOOP;
+};
+credentials ¨ SunRPCOnUDP.TextFromWriter[hW];
+SunRPC.Destroy[hW];  hW ¨ NIL;
+EXITS
+Cant => NULL;
+};
+IF h # NIL THEN { SunYPAgent.ReleaseHandle[h]; h ¨ NIL };
+IF hW # NIL THEN { [] ¨ SunRPC.Destroy[hW];  hW ¨ NIL };
+
+IF errorCode # NIL THEN ERROR SunRPCAuth.Error[errorCode];
+
+c ¨ NEW[ConversationObject ¨ [SunRPCAuth.unixFlavor, myProcs, NIL]];
+c.conversationData ¨ NEW[ConversationDataObject ¨ [conversation~c, name~name, password~password, credentials~credentials]];
+};
+Initiate: SunRPCAuth.InitiateProc -- [flavor, myName, myPassword, hisName, registrationData] RETURNS [c] -- ~ {
+IF flavor # SunRPCAuth.unixFlavor THEN ERROR;
+
+c ¨ GetConversationFromCache[myName, myPassword];
+IF c # NIL THEN RETURN;
+
+c ¨ GetConversationByContactingYPServer[myName, myPassword
+! SunRPCAuth.Error => IF code # $wrongUserPassword THEN REJECT ELSE CONTINUE];
+IF c # NIL THEN RETURN;
+
+c ¨ GetConversationFromCache[cedarGuestName, cedarGuestPassword];
+IF c # NIL THEN RETURN;
+
+c ¨ GetConversationByContactingYPServer[cedarGuestName, cedarGuestPassword];
+};
+
+Authenticate: SunRPCAuth.AuthenticateProc -- [cFlavor, credentials, vFlavor, verifier, registrationData] RETURNS [result, replyFlavor, replyVerifier, c] -- ~ {
+replyFlavor ¨ SunRPCAuth.nullFlavor;
+replyVerifier ¨ nullVerifier;
+IF cFlavor # SunRPCAuth.unixFlavor THEN ERROR;
+IF vFlavor # SunRPCAuth.nullFlavor THEN { result ¨ wrongVerifier; RETURN };
+c ¨ NEW[ConversationObject ¨ [SunRPCAuth.unixFlavor, myProcs, NIL]];
+c.conversationData ¨ NEW[ConversationDataObject ¨ [credentials~credentials]];
+result ¨ ok;
+};
+
+ExtractConversationDetails: PUBLIC PROC [c: Conversation]
+RETURNS [machineName: ROPE, uid, gid: CARD, groups: SunAuthUnix.Groups] ~ {
+cD: ConversationData ¨ NARROW[c.conversationData];
+hR: SunRPC.Handle ¨ SunRPCOnUDP.OpenReader[cD.credentials];
+{
+ENABLE {
+SunRPC.Error => { ERROR SunRPCAuth.Error[$badCredentials] };
+UNWIND => { SunRPC.Destroy[hR] };
+};
+numIDs: CARDINAL;
+[] ¨ SunRPC.GetCard32[hR]; -- stamp
+machineName ¨ SunRPC.GetRope[hR]; -- machineName
+uid ¨ SunRPC.GetCard32[hR];
+gid ¨ SunRPC.GetCard32[hR];
+numIDs ¨ SunRPC.GetCard32[hR];
+groups ¨ NEW[SunAuthUnix.GroupsObject[numIDs]];
+FOR i: CARDINAL IN [0 .. numIDs) DO
+groups.group[i] ¨ SunRPC.GetCard32[hR];
+ENDLOOP;
+};
+SunRPC.Destroy[hR];
+};
+GetCredentialsAndNextVerifier: SunRPCAuth.GetCredentialsAndNextVerifierProc -- [c] RETURNS [cFlavor, credentials, vFlavor, verifier] -- ~ {
+cD: ConversationData ~ NARROW[c.conversationData];
+RETURN [SunRPCAuth.unixFlavor, cD.credentials, SunRPCAuth.nullFlavor, nullVerifier];
+};
+
+CheckReplyVerifier: SunRPCAuth.CheckReplyVerifierProc -- [c, flavor, verifier] RETURNS [result: SunRPCAuth.AuthenticateResult] -- ~ {
+IF flavor = SunRPCAuth.nullFlavor THEN RETURN [ok];
+IF flavor = SunRPCAuth.shortFlavor THEN {
+cD: ConversationData ~ NARROW[c.conversationData];
+cD.shortCredentials ¨ verifier;
+RETURN [ok];
+};
+RETURN [wrongVerifier];
+};
+
+NoShortcut: SunRPCAuth.NoShortcutProc -- [c] RETURNS [wasShortcut] -- ~ {
+cD: ConversationData ~ NARROW[c.conversationData];
+wasShortcut ¨ (cD.shortCredentials # NIL);
+cD.shortCredentials ¨ NIL;
+};
+
+Terminate: SunRPCAuth.TerminateProc -- [c] -- ~ {
+cD: ConversationData ~ NARROW[c.conversationData];
+cD.shortCredentials ¨ NIL;
+PutConversationIntoCache[c];
+};
+
+myProcs: SunRPCAuth.Procs ¨ NEW[SunRPCAuth.ProcsObject ¨ [GetCredentialsAndNextVerifier, CheckReplyVerifier, NoShortcut, Terminate]];
+SunRPCAuth.Register[SunRPCAuth.unixFlavor, Initiate, Authenticate, Sweep, NIL];
+
+}...
+  `  
+SunAuthUnixImpl.mesa
+Copyright ” 1992 by Xerox Corporation.  All rights reserved.
+Demers, January 17, 1989 5:54:34 pm PST
+Xerox3, January 15, 1988 2:53:27 pm PST
+JKF October 26, 1988 2:47:42 pm PDT
+Alan Ishigo December 5, 1988 6:09:44 pm PST
+Willie-s, May 5, 1992 3:12 pm PDT
+-- ThisMachine USING [Name]
+Types
+Parameters
+Cache Sweeping
+Conversation Cache
+Unix Password Checking (NYI)
+Unix User Name Cache
+This Machine Name
+The relation between this and ThisMachineImpl is not clear ...
+<< Eventually the above proc will be replaced by the code below, but for now we leave the old stuff in
+
+GetThisMachineName: PROC RETURNS [name: ROPE] ~ {
+IF (name _ cachedMachineName) = NIL THEN {
+ENABLE SunYPAgent.Error => GOTO NoYP;
+cachedMachineName _ name _ ThisMachine.Name[$ip];
+EXITS
+NoYP => NULL;
+};
+};>>
+
+Retrieving Unix UID and GIDs From YP, Constructing AUTH_UNIX Credentials
+Note gid (from passwd line) is put into credentials twice.  I don't know why this should be necessary, but the Sun code does it ...
+Registered Procedures
+This is grossly inefficient, but Cedar servers shouldn't use Unix-flavor authentication anyway, since it's so awful ...
+Client Procs Object
+THE FOLLOWING IS COMMENTED OUT TO AVOID A BUG IN SHORT AUTH!
+IF cD.shortCredentials # NIL THEN RETURN [SunRPCAuth.shortFlavor, cD.shortCredentials, SunRPCAuth.nullFlavor, nullVerifier];
+Initialization
+ ù <  ïNewlineDelimiter
+ñ(cedarcode) styleô codeöúôKöú
+œeú1ô<Kô'Kô'Kô#Kô+Kô!Kò óKöœk	ò	öúûúòKöúûú	òKöú
+ûúò!Köúûú,ò9Köúûúò%Köúûú%ûúòHKöúûúò)KöúûúBòNKöúûú*ò;KöúûúÛòÉKöúûúlò|KöúûúôKòKò óöœnúûúûòKöûúûúòKöûú\òcKöûúòKòheadôKöûúûúûúòKò Köúûúò-Köúûú!ò9Kò KöúûúûúòKöúûúû	úûúò'óô
+KöúûúòKöúûúûúûúœc5ò^Kò öúûúò(KöúûúòKöúûúòKöúûúòKò Köúûúò$KöúûúûúòKò óöúûúò$KöúûúòKöúûúòKöúûúòKò óöúûúò(KöúûúòKò óöúûúò$KöúûúòKò óKò Köúûúò$Köúûú†>òWKöúûúòKò Köúûúûúò(óôöüú†/úòOKò.Kò*Kò-KòóóôKöúûúûúò4öúûúûúò'KöúòKòKöúû	úûúòKöúûúòKöúûúûòKöúûúûòKòKò óKöú*ûúò.öúûúò.Kò óö
+üúûúûúûú&ûúò}KòKòöûúûúûòKöûúûú"ûúûúòLKòKöûúòóKö
+ûúûúûúûúûúòKöûúûúûú ûúòJKöûúòKòKò óöüúûúûú:ò^Köúûúò2Kò KòKòKò óöüúûúûúûú)òWKòKòöûúûúûòöûúòöûúòKòKò	KòóöûúòKöûúûúûú ûúòJKòóóKòKöûúòóKòóóôöüúûúûú%ûúûúûúòjKöûúûúòKòóóôKöúûúò*Kò KöúûúûúòKöúûúûúòKò öüúûúûúûú"ûúûúûúòqKöûúûúûúòGKòKò óöüúûúûúûú%ò\KòKòKòKò óöüúûúûúûú%òOKöûúûú ûúò?KòóKò öüúûúûúûúûúûúûúòLKöúûúòKö
+üúûúûúûúûúòUKò?KöûúûúûúûúòCKöûú,ûúûúûúò>öúòKöûúûúò%KöúûúûúòKòKòKò/Kò1Köûúûúûúò,Kò7öûòKöú)ûú,òXóKòóKöûúûúûú$ûúò9Köú&ò&KòóóôKô>Kò KöúûúûúòKò öüúûúûúò,Köûúûúûúò4KòKò óöüúûú	ûúûúûúûúò9öûúûúûúûò)Köûúûúûúûúò#KöûúòóKöûúûúòKòKò óöüúûúûúûúò1Köúûúòöûúûúûúò*Köûúûúò%Köú%ûúò*KöúûúûúòKòKòKò<KòQKòGKò&öûúûúò"Köúûúòöûúûúûú"òDKöûúûúòóKò>KòóöûòKöúûúòóKòóKöûúûúûúò,KòKò óKöúfôfKô öüúûúûúûúô1öûúûúûúô*Köûúûúô%Köú1ô1öûôKöúûúôóKôóKôKô óóôHKöúûúò)Köúûúò"Kò öüúûúûúûúò:KöûúòKöúòóKò Köúûúûúò öúûúûúòKöú	ûúòKöúûúûúûò$KòKò óöüúûúûúûúòYKöúûúòöúûú$ûúò8KöúûúòKöúûúûúòKò5öûòKòKöúûúò
+Kò1Köûúûúûúò,KòLKöûúûúûúò0KòHöûúûúûúûò'öûú;ûúûúòIKòKòKöûúòKòóKöûúòóKöûúûúûúò$Kò?KöûúòóöûòKöú
+ûúòóKòóKòKò óöü#úûúûúûúò^KöúûúûúòKòKöú
+ûúòKòKòKöúûúûúòöúòöûúòöúòöúûúûòKò-Kò#KöûúòóKöûúò
+KòóöúòKòKöûúò
+KöúòóKòóKòKò1Kò1KöûúûúûúòBKòIKòIKöûúûú]ûú#ûúòñKò Kò1Kò!Köú)ò)KòKòò0KôÉKöú$ò$Köúòöûúûúûúûò&Köú"ò"KöûúòóKòóKò-KöúûúòöûòKöúûúòóKòóKöûúûúûú$ûúò9Köûúûúûú"ûúò8Kò Köûúûúûúûúò:Kò Köúûú7ûúòDKöúûúcò{Kòóóôöüú†Iúòoöûú ûúûúò-Kò óKò1öûúûúûúûúòKò óò:KöúûúûúûúòNóöûúûúûúûúòKò óKòAöûúûúûúûúòKò óKòLKòKò óöüú†qúòüKôwKò$KòKöûú!ûúûúò.Köûú!ûúûúòKKöúûú7ûúòDKöúûú5òMKòKòKò óöüúûúûúò9Köûúûúûú!òKKöúûúò2Kò;òöûúòKöúûú%ò<Köûúò!KòóKöúûúòKöú†ò#Köú"†ò0KòKòKòKöú	ûú#ò/öûúûúûúûò#Kò'KöûúòóKòóKòKòóóôöüú/†;úòãKöúûúò2ô<KöûúûúûúûúTô|óKöûúNòTKòKò óöüú$†KúòÖKöûú ûúûúò3öûú!ûúò)Köúûúò2KòKöûúòKòóKöûúòKòKò óöü
+ú†úòIKöúûúò2Köú%ûúò*KöúûúòKòKò óöü	ú†	úò1Köúûúò2KöúûúòKòKòKò óKöúûúfòÖóôKöúJûúòOóKò Köúòóó Öó    /Ë  CÑ  

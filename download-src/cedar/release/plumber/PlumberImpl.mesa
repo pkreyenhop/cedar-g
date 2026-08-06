@@ -1,0 +1,394 @@
+DIRECTORY 
+Ascii, Commander, IO, MessageWindow, Plumber, Process, PseudoTerminal, RefText, Rope, SimpleFeedback, UnixErrno, UnixSysCallExtensions, UnixSysCalls, UnixTypes, UXStrings;
+
+PlumberImpl: CEDAR MONITOR
+LOCKS c USING c: Conduit
+IMPORTS Commander, IO, Process, PseudoTerminal, RefText, Rope, UnixErrno, UnixSysCallExtensions, UnixSysCalls, UXStrings, SimpleFeedback -- MessageWindow
+EXPORTS Plumber 
+~ BEGIN 
+OPEN Plumber;
+
+ROPE: TYPE ~ Rope.ROPE;
+
+Error: PUBLIC ERROR [code: ATOM, msg: ROPE] ~ CODE;
+
+CHARPtrFromRefText: PROCEDURE [refText: REF TEXT] RETURNS [UnixTypes.CHARPtr] 
+~ TRUSTED {
+charPtr: UnixTypes.CHARPtr ~ 
+LOOPHOLE[LOOPHOLE[refText, LONG POINTER]+SIZE[TEXT[0]]];
+RETURN [charPtr];
+};
+
+CopyFDToStream: PROC [in: UnixTypes.FileDescriptor, out:IO.STREAM, wire:Wire, noisy:BOOL] ~{
+
+buffer: REF TEXT ~ RefText.ObtainScratch[256];
+bufPtr: UnixTypes.CHARPtr ~ CHARPtrFromRefText[refText: buffer];
+
+Inner: PROC [in: UnixTypes.FileDescriptor, out: IO.STREAM, wire: Wire] ~ {
+retryOnReadError: BOOLEAN ¬ TRUE;
+
+WHILE wire.active DO  {
+res: INT;
+
+TRUSTED { res ¬ UnixSysCalls.Read[d: in, buf: bufPtr, nBytes: buffer.maxLength]; };
+IF NOT wire.active THEN {
+out.PutBlock[" Wire not active! (retry - please note non-zero error code in System Script\n "];
+EXIT;
+};
+
+IF res <= 0 THEN {
+err: UnixErrno.Errno = UnixErrno.GetErrno[];
+wire.result ¬ LIST[$uioerror, NEW[INT ¬ ORD[err]]];
+ 
+IF retryOnReadError AND (err = UnixErrno.Errno.EIO) THEN {
+retryOnReadError ¬ FALSE;
+IF noisy THEN {
+out.PutBlock["Plumb waiting for connection...\n"]; 
+out.Flush[];
+};
+Process.Pause[Process.SecondsToTicks[1]];
+LOOP;
+};
+RETURN;
+};
+
+retryOnReadError ¬ FALSE;
+buffer.length ¬ res;
+out.PutBlock[buffer];
+Process.CheckForAbort[];
+} ENDLOOP;
+wire.result ¬ $terminated;
+};
+Inner[in: in, out: out, wire: wire ! 
+IO.Error => {
+wire.result ¬ LIST[$ioerror, NEW[INT ¬ ORD[ec]]];
+CONTINUE;
+};
+ABORTED => {
+wire.result ¬ $aborted;
+CONTINUE;
+};
+];
+RefText.ReleaseScratch[buffer];
+IF noisy THEN out.PutBlock["Plumb disconnected. " ! IO.Error => CONTINUE];
+IO.Flush[out ! IO.Error => CONTINUE];
+};
+
+CopyStreamToFD: PROC [in: IO.STREAM, out: UnixTypes.FileDescriptor, wire: Wire] = {
+buffer: REF TEXT ~ NEW[TEXT[1]];
+bufPtr: UnixTypes.CHARPtr ~ CHARPtrFromRefText[refText: buffer];
+Inner: PROC [in: IO.STREAM, out: UnixTypes.FileDescriptor, wire: Wire] ~ {
+WHILE wire.active DO {
+res: INT;
+nBytes: INT ~ IO.GetBlock[in, buffer];
+
+IF NOT wire.active THEN EXIT;
+IF nBytes = 0 THEN ERROR IO.EndOfStream[in];
+res ¬ UnixSysCalls.Write[d: out, buf: bufPtr, nBytes: nBytes];
+IF res <= 0 THEN {
+wire.result ¬ LIST[$uioerror, NEW[INT ¬ ORD[UnixErrno.GetErrno[]]]];
+EXIT;
+};
+Process.CheckForAbort[];
+} ENDLOOP;
+wire.result ¬ $terminated;
+};
+
+Inner[in: in, out: out, wire: wire ! 
+IO.Error => {
+wire.result ¬ LIST[$ioerror, NEW[INT ¬ ORD[ec]]];
+CONTINUE;
+};
+IO.EndOfStream => {
+wire.result ¬ $eof;
+CONTINUE;
+};
+ABORTED => {
+wire.result ¬ $aborted;
+CONTINUE;
+};
+];
+RefText.ReleaseScratch[buffer];
+};
+
+SetConduitClosing: ENTRY PROC [c: Conduit] RETURNS [BOOLEAN] ~ {
+IF c.closing THEN RETURN[TRUE];
+c.closing ¬ TRUE;
+RETURN[FALSE];
+};
+
+MakeConduit: PUBLIC PROC [stdin, stdout, stderr: REF, debug:BOOL¬FALSE, noisy:BOOL¬ TRUE] 
+RETURNS [Conduit] ~ {
+
+conduit: Conduit ¬ NEW[ConduitRep ¬ [
+stdin: NEW[WireRep ¬ [active: TRUE]], 
+stdout: NEW[WireRep ¬ [active: TRUE]], 
+stderr: NIL,
+message: IF debug THEN stderr ELSE NIL
+]];
+
+WITH stdin SELECT FROM
+rope: ROPE => conduit.stdin.connectedTo ¬ rope;
+refText: REF TEXT => conduit.stdin.connectedTo ¬ Rope.FromRefText[s: refText];
+stream: IO.STREAM => {
+IF conduit.pty = NIL THEN {
+conduit.pty ¬ PseudoTerminal.Allocate[];
+};
+conduit.stdin.connectedTo ¬ conduit.pty.slaveName;
+TRUSTED {
+conduit.stdin.process ¬ FORK CopyStreamToFD[
+in: stream, out: conduit.pty.controllerFD, wire: conduit.stdin];
+Process.Detach[conduit.stdin.process];
+};
+};
+ENDCASE => ERROR;
+WITH stdout SELECT FROM
+rope: ROPE => conduit.stdout.connectedTo ¬ rope;
+refText: REF TEXT => conduit.stdout.connectedTo ¬ Rope.FromRefText[s: refText];
+stream: IO.STREAM => {
+IF conduit.pty = NIL THEN {
+conduit.pty ¬ PseudoTerminal.Allocate[];
+};
+conduit.stdout.connectedTo ¬ conduit.pty.slaveName;
+TRUSTED {
+conduit.stdout.process ¬ FORK CopyFDToStream[
+in: conduit.pty.controllerFD, out: stream, wire: conduit.stdout, noisy:noisy];
+Process.Detach[conduit.stdout.process];
+};
+};
+ENDCASE => ERROR;
+IF stderr = stdout THEN { 
+conduit.stderr ¬ conduit.stdout 
+} ELSE {
+conduit.stderr ¬ NEW[WireRep ¬ [active: TRUE]];
+WITH stderr SELECT FROM
+rope: ROPE => conduit.stderr.connectedTo ¬ rope;
+refText: REF TEXT => conduit.stderr.connectedTo ¬ Rope.FromRefText[s: refText];
+stream: IO.STREAM => {
+IF conduit.pty = NIL THEN {
+conduit.pty ¬ PseudoTerminal.Allocate[];
+};
+conduit.stderr.connectedTo ¬ conduit.pty.slaveName;
+IF NOT Rope.Equal[conduit.stderr.connectedTo, conduit.stdout.connectedTo] THEN {
+TRUSTED {
+conduit.stderr.process ¬ FORK CopyFDToStream[
+in: conduit.pty.controllerFD, out: stream, wire: conduit.stderr, noisy:noisy];
+Process.Detach[conduit.stderr.process];
+};
+}
+};
+ENDCASE => ERROR;
+};
+RETURN [conduit];
+};
+DebugPrint: PROC [conduit: Conduit, rope: ROPE] ~ {
+WITH conduit.message SELECT FROM
+stream: IO.STREAM => {
+IO.PutF[stream, "%l%g%l", [rope["sb"]], [rope[rope]], [rope["SB"]]];
+};
+ENDCASE => NULL;
+};
+
+
+Terminate: PUBLIC PROC [conduit: Conduit, reason: ATOM ¬ $Normal] ~ {
+
+BreakWire: PROCEDURE [wire: Wire] ~ {
+wire.active ¬ FALSE;
+IF wire.process # NIL THEN {
+Process.Abort[wire.process 
+! Process.InvalidProcess => {
+CONTINUE;
+};
+];
+wire.process ¬ NIL;
+};
+};
+
+IF SetConduitClosing[conduit] THEN RETURN;
+BreakWire[wire: conduit.stdin];
+BreakWire[wire: conduit.stdout];
+BreakWire[wire: conduit.stderr];
+IF conduit.pty # NIL AND reason = $Poisoned THEN PseudoTerminal.Close[conduit.pty];
+IF conduit.pty # NIL THEN PseudoTerminal.Close[conduit.pty];
+
+};
+
+Spawn: PUBLIC PROC [
+command: ROPE, wd: ROPE, 
+stdin: REF, stdout: REF, stderr: REF,
+exec: BOOL, tty: BOOL, debug: BOOL ¬ FALSE, noisy: BOOL ¬ FALSE,
+reportSourceFD: PROC[fd: UnixTypes.FileDescriptor] ¬ NIL
+] 
+RETURNS [Plumber.SpawnResult] ~ {
+
+conduit: Conduit ~ 
+MakeConduit[ stdin: stdin, stdout: stdout, stderr: stderr, debug: debug, noisy: noisy ];
+RETURN 
+SpawnWithConduit[conduit: conduit, command: command, wd: wd, exec: exec, tty: tty, reportSourceFD: reportSourceFD];
+};
+
+SpawnWithConduit: PUBLIC PROC [
+conduit: Conduit, 
+command: ROPE, wd: ROPE, 
+exec: BOOLEAN, tty: BOOLEAN,
+reportSourceFD: PROC[fd: UnixTypes.FileDescriptor] ¬ NIL
+] 
+RETURNS [Plumber.SpawnResult] ~ {
+
+res: INT;
+reason: ATOM;
+completeCommand: ROPE ¬ command;
+
+Cleanup: PROC [conduit: Conduit, msg: ROPE, reason: ATOM] ~ {
+in: ROPE ~ conduit.stdin.connectedTo;
+out: ROPE ~ conduit.stdout.connectedTo;
+err: ROPE ~ conduit.stderr.connectedTo;
+IF plumberDebugMsgs THEN SimpleFeedback.PutFL[$Plumber, oneLiner, $Debug, 
+"Plumber: [[%g]] Terminating %g (in=%g, out=%g, err=%g)\n", 
+LIST[[rope[msg]],
+[rope[completeCommand]], 
+[rope[in]], 
+[rope[out]], 
+[rope[err]]]
+];
+Terminate[conduit: conduit, reason: reason];
+};
+
+FOR i: INT DECREASING IN [0..Rope.Size[completeCommand]) WHILE Rope.Fetch[completeCommand, i] = '\n DO
+completeCommand ¬ Rope.Substr[completeCommand, 0, i];
+ENDLOOP;
+
+IF exec THEN {
+completeCommand ¬ Rope.Concat[base: "exec ", rest: completeCommand];
+};
+
+IF tty AND (conduit.pty # NIL) THEN {
+completeCommand ¬ Rope.Cat[
+r1: completeCommand,
+r2: " -t ", r3: conduit.pty.slaveName,
+r4: " -p ", r5: conduit.pty.controllerName];
+};
+
+DebugPrint[
+conduit: conduit,
+rope: IO.PutFLR["
+Spawning %g (in=%g, out=%g, err=%g, wd=%g)\n", 
+LIST[[rope[completeCommand]], 
+[rope[conduit.stdin.connectedTo]], 
+[rope[conduit.stdout.connectedTo]], 
+[rope[conduit.stderr.connectedTo]],
+[rope[wd]]]
+]
+];
+
+IF reportSourceFD # NIL THEN reportSourceFD[ conduit.pty.controllerFD ];
+
+res ¬ UnixSysCallExtensions.CDSpawn[
+cmd: UXStrings.Create[completeCommand], 
+wd: UXStrings.Create[wd], 
+stdin: UXStrings.Create[conduit.stdin.connectedTo], 
+stdout: UXStrings.Create[conduit.stdout.connectedTo], 
+stderr: UXStrings.Create[conduit.stderr.connectedTo] 
+! UNWIND => Cleanup[conduit: conduit, msg: "Spawn!UNWIND", reason: $Poisoned]];
+
+IF res # 0 THEN {
+SimpleFeedback.PutF[$Plumber, oneLiner, $Debug, 
+"Plumber: non-zero exit status %xH\n", [integer[res]] ];
+reason ¬ $Poisoned;
+} ELSE {
+reason ¬ $Normal;
+};
+
+Cleanup[conduit: conduit, msg: "Cleanup", reason: reason
+! UNWIND => Cleanup[conduit: conduit, msg: "Cleanup!UNWIND", reason: $Normal]];
+
+
+RETURN [[
+res: res,
+errno: UnixErrno.GetErrno[].ORD,
+details: LIST[
+NEW[INT ¬ res], 
+NEW[INT ¬ UnixErrno.GetErrno[].ORD], 
+conduit.stdin.result, conduit.stdout.result, conduit.stderr.result
+]
+]]
+};
+
+plumberDebugMsgs: BOOL ¬ FALSE;
+
+DebugMsgsOn: Commander.CommandProc ~ { plumberDebugMsgs ¬ TRUE };
+
+DebugMsgsOff: Commander.CommandProc ~ { plumberDebugMsgs ¬ FALSE };
+
+Commander.Register["PlumberDebugMsgsOn", DebugMsgsOn];
+
+Commander.Register["PlumberDebugMsgsOff", DebugMsgsOff];
+
+END.
+
+
+  à  
+PlumberImpl.mesa
+Copyright Ó 1989, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Michael Plass, September 25, 1989 3:54:40 pm PDT
+Peter B. Kessler, January 16, 1990 10:32:25 am PST
+Norman Adams, June 8, 1990 4:25 pm PDT
+Welch, March 8, 1991 6:44 pm PST
+Willie-s, June 12, 1992 2:39 pm PDT
+
+SimpleFeedback.PutF[$Plumber, oneLiner, $Debug, 
+"Plumb: Unix error = %g", IO.int[ORD[err]]];
+
+SimpleFeedback.Append[$Plumber, oneLiner, $Debug, "CopyFDToStream IO.error"];
+out.PutBlock[" CopyFDToStream IO.error\n "];
+SimpleFeedback.Append[$Plumber, oneLiner, $Debug, "CopyFDToStream aborted"];
+out.PutBlock[" CopyFDToStream aborted\n "];
+SimpleFeedback.Append[$Plumber, oneLiner, $Debug, "CopyFDToStream ending"];
+SimpleFeedback.Append[$Plumber, oneLiner, $Debug, "CopyStreamToFD IO.error"];
+SimpleFeedback.Append[$Plumber, oneLiner, $Debug, "CopyStreamToFD IO.eos"];
+SimpleFeedback.Append[$Plumber, oneLiner, $Debug, "CopyStreamToFD aborted"];
+SimpleFeedback.Append[$Plumber, oneLiner, $Debug, "CopyStreamToFD ending"];
+-- Atomically set closing field of the conduit and return previous value
+If stdout is already reading from the pty, stderr shouldn't.
+A pity that stdout and stderr are merged into the output of a pty.
+SimpleFeedback.Append[$Plumber, oneLiner, $Debug, "Plumb:Invalid Process"];
+MessageWindow.Append["..Terminating.."];
+-- Execute this code at most once.
+SimpleFeedback.Append[$Plumber, oneLiner, $Debug, "Plumb:In Terminate"];
+SimpleFeedback.Append[$Plumber, oneLiner, $Debug, "Plumb:Start breaking"];
+SimpleFeedback.Append[$Plumber, oneLiner, $Debug, "Plumb:All broken"];
+Hopefully we go through this loop just once!
+SimpleFeedback.PutF[$Plumber, oneLiner, $Debug, 
+"Spawning %g (in=%g, out=%g, err=%g, wd=%g)\n", 
+[rope[completeCommand]], 
+[rope[conduit.stdin.connectedTo]], 
+[rope[conduit.stdout.connectedTo]], 
+[rope[conduit.stderr.connectedTo]],
+[rope[wd]]
+];
+
+MessageWindow.Append["Plumb:CDSpawn returned"];
+
+This is a big hammer.  If the shell exits badly (for any reason), we don't use the PseudoTerminal any more.  This is to hack around the Wire not active problem, but is overly concervative. If all the PseudoTerminals get marked bad and we run out, then PseudoTerminal.Allocate clears the inuse symtab and we'll try them all again
+ Ê´  •NewlineDelimiter
+–(cedarcode) style™ codešœ™Kšœ
+Ðerœ=™HKšœ0™0K™2K™&K™ K™#K™ —šÏk	œ˜
+K–0 bp restIndentšœžœ—˜«—K˜ KšÏnœžœž˜Kšžœžœ˜KšžœžœtÏc˜™Kšžœ	˜šœž˜Kšžœ	˜—˜ Kšžœžœžœ˜K˜ šŸœžœžœžœžœžœ˜3K˜ —šŸœž	œžœžœžœžœ˜Zšœ˜Kšžœžœ
+žœžœžœžœ˜8—Kšžœ˜K˜K˜ —š
+Ÿœžœ$žœžœžœ˜]Kšœžœžœ˜.Kšœ@˜@K˜ šŸœžœ%žœžœ˜JKšœžœžœ˜!K˜ šžœžœ˜K•StartOfExpansionP[self: STREAM, block: REF TEXT, startIndex: NAT _ 0, count: NAT _ 32767]šœžœ˜
+KšžœL˜Sšžœžœžœ˜Kšœ_˜_Kšžœ˜K˜—K˜ šžœ
+žœ˜Kšœ,˜,Kš	œžœžœžœžœ
+˜5KšœKžœžœ	™^šžœžœžœžœ˜:Kšœžœ˜šžœžœ˜Kšœ3˜3Kšœ˜K˜—Kšœ)˜)Kšžœ˜K˜—Kšžœ˜Kšœ˜K˜ —Kšœžœ˜K˜Kšœ˜Kšœ˜Kšœžœ˜
+—K˜Kšœ˜—šœ%˜%šžœ˜Kš	œžœžœžœžœ˜1KšœM™MKšœ,™,Kšžœ˜	Kšœ˜—šžœ˜K˜KšœL™LKšœ+™+Kšžœ˜	Kšœ˜—K˜—KšœK™KKšœ˜Kšžœžœ'žœ
+žœ˜JKšžœžœ
+žœ˜%—˜K˜ —šŸœžœžœžœ0˜SKš	œžœžœžœžœ˜ Kšœ@˜@šŸœžœžœžœ0˜Jšžœžœ˜K–P[self: STREAM, block: REF TEXT, startIndex: NAT _ 0, count: NAT _ 32767]šœžœ˜	Kšœžœžœ˜&K˜ Kšžœžœžœžœ˜Kšžœžœžœžœ˜,K–Y[self: STREAM, block: REF READONLY TEXT, startIndex: NAT _ 0, count: NAT _ 32767]˜>šžœ
+žœ˜Kš	œžœžœžœžœ˜DKšžœ˜Kšœ˜—Kšœ˜Kšœžœ˜
+—K˜Kšœ˜K˜ —šœ%˜%šžœ˜Kš	œžœžœžœžœ˜1KšœM™MKšžœ˜	Kšœ˜—šžœ˜K˜KšœK™KKšžœ˜	Kšœ˜—šžœ˜K˜KšœL™LKšžœ˜	Kšœ˜—K˜—KšœK™KKšœ˜K˜—K˜ KšœH™Hš
+Ÿœžœžœžœžœ˜@Kšžœžœžœž˜Kšœžœ˜Kšžœžœ˜K˜—K˜ šŸœžœžœžœžœžœžœžœ˜ZKšžœ˜—˜ šœžœ˜%Kšœžœžœ˜&Kšœžœžœ˜'Kšœžœ˜Kšœ	žœžœžœž˜&Kšœ˜—K˜ šžœžœž˜Kšœžœ%˜/Kšœ	žœžœ=˜Nšœžœžœ˜šžœžœžœ˜K˜(K˜—K˜2šžœ˜	šœžœ˜,Kšœ@˜@—Kšœ&˜&K˜—Kšœ˜—Kšžœžœ˜—šžœžœž˜Kšœžœ&˜0Kšœ	žœžœ>˜Ošœžœžœ˜šžœžœžœ˜K˜(K˜—K˜3šžœ˜	šœžœ˜-KšœN˜N—Kšœ'˜'K˜—Kšœ˜—Kšžœžœ˜—šžœžœ˜K˜ —šœžœ˜Kšœžœžœ˜/šžœžœž˜Kšœžœ&˜0Kšœ	žœžœ>˜Ošœžœžœ˜šžœžœžœ˜K˜(K˜—K˜3šžœžœDžœ˜P™<K™B—šžœ˜	šœžœ˜-KšœN˜N—Kšœ'˜'K˜—K˜—Kšœ˜—Kšžœžœ˜—K˜—Kšžœ˜Kšœ˜—šŸ
+œžœžœ˜3šžœžœž˜ šœžœžœ˜KšžœB˜DKšœ˜—Kšžœžœ˜—Kšœ˜—K˜ KšŸ	œžœžœžœ˜E˜ šŸ	œž	œ˜%Kšœžœ˜šžœžœžœ˜šœ˜šœ˜KšœK™KKšžœ˜	Kšœ˜—Kšœ˜—Kšœžœ˜Kšœ˜—K˜K˜ —K™(Kšœ"™"KšœH™HKšžœžœžœ˜*KšœJ™JKšœ˜Kšœ ˜ Kšœ ˜ KšœF™FKšžœžœžœžœ#˜SKšžœžœžœ#˜<K˜ Kšœ˜K˜ —š"Ÿœžœžœžœžœ
+žœ
+žœ
+žœžœžœ	žœžœ	žœžœžœ!žœžœ˜óK˜ šœ˜KšœX˜X—šžœ˜Kšœs˜s—K˜K˜ —KšŸœžœžœžœžœ	žœžœžœ!žœžœ˜Ç˜ Kšœžœ˜	Kšœžœ˜Kšœžœ˜!šŸœžœžœ
+žœ˜=Kšœžœ˜%Kšœžœ˜'Kšœžœ˜'šžœžœ2˜JKšœ=žœNœ˜K˜—K˜,K˜K˜ —šžœžœž
+œžœ!žœ$ž˜fK™,K˜5Kšžœ˜—K˜ šžœžœ˜K˜DK˜K˜ —šžœžœž	œ˜%˜Kšœ˜Kšœ&˜&Kšœ,˜,—K˜—K˜ šœ0™0Kšœ0™0K™K™#K™$K™#K™
+K™—˜K˜šœžœ	˜K˜/Kšžœ˜K˜#K˜$K˜#K˜K˜—K˜—Kšžœžœžœ,˜HK˜ ˜$Kšœ(˜(Kšœ˜Kšœ4˜4Kšœ6˜6Kšœ5˜5KšœžœH˜P—Kšœ0™0šžœ	žœ˜KšœÈ™ÈKšœi˜iK˜Kšœžœ˜K˜K˜K˜ —šœ8˜8KšœžœH˜P—K˜ šžœ˜	K˜	Kšœžœ˜ šœ	žœ˜Kšžœžœ	˜Kšžœžœžœ˜%K˜BK˜—Kšœ˜—K˜K˜ —šœžœžœ˜K˜ —šŸœ/žœ˜AK˜ —šŸœ/žœ˜CK˜ —šœ6˜6K˜ —Kšœ8˜8K˜ Kšžœ˜—K˜ K˜ — …—    "ò  9†  

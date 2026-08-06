@@ -1,0 +1,1421 @@
+
+DIRECTORY
+Basics USING[BITLSHIFT, BITRSHIFT, BITXOR, LongNumber],
+BasicTime USING[ToNSTime],
+CardTab USING[Create, Fetch, Insert, Ref, Store],
+Commander USING[CommandProc, Register],
+CommanderOps USING[ArgumentVector, Parse],
+Convert USING[RopeFromCard],
+ConvertUnsafe USING[SubString, SubStringToRope],
+CountedVM USING[Handle, SimpleAllocate],
+IO,
+MobAccess,
+MobDefs USING[Base, FTSelf, MobBase, MTIndex, NullVersion, SGHandle, SGNull, VersionID, VersionStamp],
+MobMapper USING[AlterMob],
+MobUtilDefs USING[MobHandle, MobObject],
+PFS USING [UniqueID, PathFromRope, RopeFromPath],
+PFSNames USING [PATH],
+RefTab USING[Create, Fetch, Key, Insert, Ref],
+Rope USING[Cat, Equal, ROPE],
+Symbols,
+SymbolSegment USING[Base, biases, bodyType, ctxType, ExtFirst, extType, FGHeader, htType, ltType, mdType, seType, ssType, stType, STHeader, treeType, VersionID],
+SymbolTablePrivate USING[SymbolTableBaseRep],
+SystemInterface USING[FileSet, CirioFile, GetStreamForFile, ReleaseStreamForFile, GetFileInfo, CirioFileInfo, CreateFileSet, GetCirioFile, CloseFileSet, GetNameOfFile],
+VM USING[PagesForBytes, WordsForPages];
+
+MobAccessImpl: CEDAR PROGRAM IMPORTS Basics, BasicTime, CardTab, Commander, CommanderOps, Convert, ConvertUnsafe, CountedVM, IO, MobMapper, PFS, RefTab, Rope, SystemInterface, VM EXPORTS MobAccess =
+BEGIN
+
+MobError: PUBLIC ERROR[msg: Rope.ROPE] = CODE;
+
+
+MobCookie: TYPE = REF MobCookieBody;
+MobCookieBody: PUBLIC TYPE = RECORD[
+file: SystemInterface.CirioFile,
+mobHandle: MobUtilDefs.MobHandle, -- contains some of the table bases
+mobBase: MobDefs.MobBase,
+sym: SymbolTableBase,
+leftShift: CARD,
+rightShift: CARD,
+recentBtiParent: Symbols.BTIndex ¨ Symbols.BTFirst,
+seiTable: RefTab.Ref,
+ctxTable: RefTab.Ref,
+btTable: RefTab.Ref,
+mdTable: CardTab.Ref,
+stringTable: CardTab.Ref,
+lostSeis: CardTab.Ref
+];
+
+
+GetFileForMobCookie: PUBLIC PROC [mc: MobCookie] RETURNS [SystemInterface.CirioFile]
+= {RETURN [mc.file]};
+
+CreateMobCookie: PUBLIC PROC[f: SystemInterface.CirioFile] RETURNS[MobCookie] = {
+newCookie: MobCookie ¨ NEW[MobCookieBody];
+stream: IO.STREAM ¨ SystemInterface.GetStreamForFile[f];
+ctxh: CTXH; ctxr: CTXR; seh: SEH;
+
+BEGIN ENABLE UNWIND => SystemInterface.ReleaseStreamForFile[f, stream];
+
+newCookie.file ¨ f;
+newCookie.seiTable ¨ RefTab.Create[equal: SEIKeyEqualProc, hash: SEIKeyHashProc];
+newCookie.ctxTable ¨ RefTab.Create[equal: CTXKeyEqualProc, hash: CTXKeyHashProc];
+newCookie.btTable ¨ RefTab.Create[equal: BTKeyEqualProc, hash: BTKeyHashProc];
+newCookie.mdTable ¨ CardTab.Create[];
+newCookie.stringTable ¨ CardTab.Create[];
+newCookie.lostSeis ¨ CardTab.Create[];
+
+TRUSTED {
+[newCookie.mobHandle, newCookie.mobBase] ¨ ReadMob[stream]};
+TRUSTED{newCookie.sym ¨ GetSymbols[newCookie.mobBase];
+newCookie.leftShift ¨ SELECT TRUE FROM
+BITS[UNIT] >= newCookie.mobBase.format.bitsPerUnit[0] => 0,
+BITS[UNIT] = 8 AND newCookie.mobBase.format.bitsPerUnit[0] = 16 => 1,
+ENDCASE => ERROR MobError["can't adjust mob"];
+newCookie.rightShift ¨ SELECT TRUE FROM
+BITS[UNIT] <= newCookie.mobBase.format.bitsPerUnit[0] => 0,
+BITS[UNIT] = 16 AND newCookie.mobBase.format.bitsPerUnit[0] = 8 => 1,
+ENDCASE => ERROR MobError["can't adjust mob"]};
+
+END;
+SystemInterface.ReleaseStreamForFile[f, stream];
+ctxh ¨ ReallyMakeCTXH[newCookie, Symbols.CTXNull];
+ctxr ¨ FetchCTXR[ctxh];
+IF ctxr#NIL THEN seh ¨ ctxr.seList;
+WHILE seh#NIL DO
+ser: SER ~ FetchSER[seh];
+WITH ser.body SELECT FROM
+idser: REF id BodySE => {
+IF idser.idCtx=NIL OR idser.idCtx=ctxh
+THEN [] ¨ newCookie.lostSeis.Store[LOOPHOLE[seh.sei], $T];
+seh ¨ idser.ctxLink};
+ENDCASE => NULL;
+ENDLOOP;
+RETURN[newCookie]};
+
+IsLost: PUBLIC PROC[seh: SEH] RETURNS[BOOL]
+~ {RETURN [seh.mob.lostSeis.Fetch[LOOPHOLE[seh.sei]].found]};
+
+ReadMobVersionStamp: PUBLIC PROC[mob: MobCookie] RETURNS[MobDefs.VersionStamp] =
+BEGIN
+versionStamp: MobDefs.VersionStamp ¨ ALL[0];
+
+LookForVersionStamp: PROC[mobHandle: MobUtilDefs.MobHandle, mobBase: MobDefs.MobBase, sym: SymbolTableBase] = TRUSTED
+{versionStamp ¨ mobBase.version};
+
+ExamineMob[mob, LookForVersionStamp];
+
+
+RETURN[versionStamp];
+END;
+
+ReadSourceVersionStamp: PUBLIC PROC[mob: MobCookie] RETURNS[MobDefs.VersionStamp] =
+BEGIN
+versionStamp: MobDefs.VersionStamp ¨ ALL[0];
+
+LookForSourceVersionStamp: PROC[mobHandle: MobUtilDefs.MobHandle, mobBase: MobDefs.MobBase, sym: SymbolTableBase] = TRUSTED
+{versionStamp ¨ mobBase.sourceVersion};
+
+ExamineMob[mob, LookForSourceVersionStamp];
+
+
+RETURN[versionStamp];
+END;
+
+ComputeSourceVersionStamp: PUBLIC PROC[mesaSourceFile: SystemInterface.CirioFile] RETURNS[MobDefs.VersionStamp] =
+BEGIN
+fileInfo: SystemInterface.CirioFileInfo ¨ SystemInterface.GetFileInfo[mesaSourceFile];
+vs: MobDefs.VersionStamp ¨ MobDefs.NullVersion;
+vs[0] ¨ BasicTime.ToNSTime[fileInfo.uniqueID.egmt.gmt];
+RETURN[vs];
+END;
+
+
+ExamineMob: PROC[cookie: MobCookie, examiner: PROC[mobHandle: MobUtilDefs.MobHandle, mobBase: MobDefs.MobBase, sym: SymbolTableBase]] =
+{examiner[cookie.mobHandle, cookie.mobBase, cookie.sym]};
+
+VSKeyEqualProc: PROC[key1, key2: RefTab.Key] RETURNS[BOOL] =
+BEGIN
+vs1AsKey: REF MobDefs.VersionStamp ¨ NARROW[key1];
+vs2AsKey: REF MobDefs.VersionStamp ¨ NARROW[key2];
+RETURN[vs1AsKey≠ = vs2AsKey≠];
+END;
+
+VSKeyHashProc: PROC[key: RefTab.Key] RETURNS[CARDINAL] = TRUSTED
+BEGIN
+vsAsKey: REF MobDefs.VersionStamp ¨ NARROW[key];
+word0: Basics.LongNumber ¨ LOOPHOLE[vsAsKey≠[0]];
+word1: Basics.LongNumber ¨ LOOPHOLE[vsAsKey≠[1]];
+RETURN[Basics.BITXOR[Basics.BITXOR[word0.lo, word0.hi], Basics.BITXOR[word1.lo, word1.hi]]];
+END;
+
+
+
+bytesPerWord: CARD = BYTES[WORD];
+bytesPerVMWord: CARD = BYTES[WORD];
+
+ReadMob: PROC [stream: IO.STREAM] RETURNS [h: MobUtilDefs.MobHandle, mobBase: MobDefs.MobBase] = TRUSTED {
+bytes: INT ¨ IO.GetLength[stream];
+allocatedBytes: CARD ¨ VM.WordsForPages[VM.PagesForBytes[bytes]] * bytesPerVMWord;
+vmh: CountedVM.Handle;
+
+IF bytes = 0 THEN ERROR MobError["empty mob file"];
+vmh ¨ CountedVM.SimpleAllocate[allocatedBytes/bytesPerWord];
+IO.SetIndex[stream, 0];
+[] ¨ IO.UnsafeGetBlock[
+self: stream,
+block: [base: vmh.pointer, startIndex: 0, count: bytes]];
+mobBase ¨ LOOPHOLE[vmh.pointer];
+IF MobMapper.AlterMob[mobBase, LOOPHOLE[mobBase], bytes/BYTES[UNIT]] = badVersion THEN 
+ERROR MobError["MobMapper.AlterMob failed in MobUtilities.ReadMob"];
+IF mobBase.versionIdent # MobDefs.VersionID THEN MobError["not a MOB file"];
+h ¨ NEW[MobUtilDefs.MobObject ¨ [
+bHeader: mobBase,
+countedVMHandle: vmh,
+bases: [
+ctb: LOOPHOLE[mobBase + mobBase.ctOffset.units],
+mtb: LOOPHOLE[mobBase + mobBase.mtOffset.units],
+lfb: LOOPHOLE[mobBase + mobBase.lfOffset.units],
+rfb: LOOPHOLE[mobBase + mobBase.rfOffset.units],
+tfb: LOOPHOLE[mobBase + mobBase.tfOffset.units],
+etb: LOOPHOLE[mobBase + mobBase.expOffset.units],
+itb: LOOPHOLE[mobBase + mobBase.impOffset.units],
+sgb: LOOPHOLE[mobBase + mobBase.sgOffset.units],
+ftb: LOOPHOLE[mobBase + mobBase.ftOffset.units],
+ssb: LOOPHOLE[mobBase + mobBase.ssOffset.units],
+evb: LOOPHOLE[mobBase + mobBase.evOffset.units],
+tyb: LOOPHOLE[mobBase + mobBase.typOffset.units],
+tmb: LOOPHOLE[mobBase + mobBase.tmOffset.units],
+ntb: LOOPHOLE[mobBase + mobBase.ntOffset.units],
+spb: LOOPHOLE[mobBase + mobBase.spOffset.units],
+fpb: LOOPHOLE[mobBase + mobBase.fpOffset.units] 
+],
+limits: [
+ct: mobBase.ctLimit,
+mt: mobBase.mtLimit,
+et: mobBase.expLimit,
+it: mobBase.impLimit,
+sg: mobBase.sgLimit,
+ft: mobBase.ftLimit,
+tm: mobBase.tmLimit,
+nt: mobBase.ntLimit,
+sp: mobBase.spLimit,
+fp: mobBase.fpLimit]
+]];
+};
+
+
+
+SymbolTableBase: TYPE = REF SymbolTableBaseRep;
+SymbolTableBaseRep: TYPE = SymbolTablePrivate.SymbolTableBaseRep;
+
+GetSymbols: PROC[mob: MobDefs.MobBase] RETURNS[SymbolTableBase] = TRUSTED
+BEGIN
+sgb: MobDefs.Base = LOOPHOLE[mob+mob.sgOffset.units];
+mtb: MobDefs.Base = LOOPHOLE[mob+mob.mtOffset.units];
+sgh: MobDefs.SGHandle = IF mtb[FIRST[MobDefs.MTIndex]].sseg = MobDefs.SGNull
+THEN ERROR MobError["NoSymbols"]
+ELSE @sgb[mtb[FIRST[MobDefs.MTIndex]].sseg];
+stb: LONG POINTER TO SymbolSegment.STHeader = LOOPHOLE[mob+sgh.base.units];
+IF mob.nConfigs # 0 THEN ERROR MobError["Can't get symbols from a config"];
+IF sgh.file # MobDefs.FTSelf OR sgh.units.units = 0 THEN ERROR MobError["funny looking mob"]; --NoSymbols;
+IF stb.versionIdent # SymbolSegment.VersionID THEN ERROR MobError["invalid-looking mob"]; -- WrongSymbolsVersion;
+RETURN[InstallSymbolTable[stb]]
+END;
+
+InstallSymbolTable: PROC [node: LONG POINTER] RETURNS [SymbolTableBase] = TRUSTED {
+b: LONG POINTER = node;
+tB: SymbolSegment.Base = LOOPHOLE[b];
+p: LONG POINTER TO SymbolSegment.STHeader = b;
+base: SymbolTableBase ¨ NEW[SymbolTableBaseRep];
+base.cacheInfo ¨ LOOPHOLE[node];
+base.hashVec ¨ b+p.hvBlock.offset;
+base.htb ¨ tB + p.htBlock.offset - SymbolSegment.biases[SymbolSegment.htType];
+base.ssb ¨ b + p.ssBlock.offset - SymbolSegment.biases[SymbolSegment.ssType];
+base.seb ¨ tB + p.seBlock.offset - SymbolSegment.biases[SymbolSegment.seType];
+base.ctxb ¨ tB + p.ctxBlock.offset - SymbolSegment.biases[SymbolSegment.ctxType];
+base.mdb ¨ tB + p.mdBlock.offset - SymbolSegment.biases[SymbolSegment.mdType];
+base.bb ¨ tB + p.bodyBlock.offset - SymbolSegment.biases[SymbolSegment.bodyType];
+base.tb ¨ tB + p.treeBlock.offset - SymbolSegment.biases[SymbolSegment.treeType];
+base.ltb ¨ tB + p.litBlock.offset - SymbolSegment.biases[SymbolSegment.ltType];
+base.stb ¨ tB + p.sLitBlock.offset - SymbolSegment.biases[SymbolSegment.stType];
+base.extb ¨ tB + p.extBlock.offset - SymbolSegment.biases[SymbolSegment.extType];
+base.mdLimit ¨ Symbols.MDFirst + p.mdBlock.size;
+base.extLimit ¨ SymbolSegment.ExtFirst + p.extBlock.size;
+base.mainCtx ¨ p.outerCtx;  base.stHandle ¨ p;
+IF p.fgRelBase = 0 OR p.fgCount = 0
+THEN {
+base.sourceFile ¨ NIL;
+base.fgTable ¨ NIL;
+}
+ELSE {
+q: LONG POINTER TO SymbolSegment.FGHeader = LOOPHOLE[b + p.fgRelBase];
+source: LONG STRING = LOOPHOLE[q + SIZE[SymbolSegment.FGHeader[0]]
+- SIZE[StringBody[0]]];
+base.sourceFile ¨ source;
+base.fgTable ¨ DESCRIPTOR[q + q.offset, q.length];
+};
+RETURN [base];
+};
+
+BTR: TYPE = MobAccess.BTR;
+BTRBody: TYPE = MobAccess.BTRBody;
+
+BodyLinkRcd: TYPE = MobAccess.BodyLinkRcd;
+
+BTH: TYPE = REF BTHBody;
+BTHBody: PUBLIC TYPE = RECORD[
+mob: MobCookie,
+bti: Symbols.BTIndex,
+btr: BTR];
+
+BTHDetails: PUBLIC PROC [bth: BTH] RETURNS [mob: MobCookie, bti: Symbols.BTIndex]
+~ {RETURN [bth.mob, bth.bti]};
+
+MakeBTH: PUBLIC PROC[mob: MobCookie, bti: Symbols.BTIndex] RETURNS[BTH] =
+BEGIN
+IF bti = Symbols.BTNull THEN RETURN[NIL]
+ ELSE
+BEGIN
+btiAsKey: REF Symbols.BTIndex ¨ NEW[Symbols.BTIndex ¨ bti];
+bth: BTH ¨ NARROW[RefTab.Fetch[mob.btTable, btiAsKey].val];
+IF bth # NIL THEN RETURN[bth];
+bth ¨ NEW[BTHBody¨[mob, bti, NIL]];
+IF NOT RefTab.Insert[mob.btTable, btiAsKey, bth] THEN ERROR MobError["MobAccessImpl confused (by concurrent access?)"];
+RETURN[bth]
+END
+END;
+
+MakeBTHFromCodedBti: PUBLIC PROC[mob: MobCookie, codedBti: CARD] RETURNS[BTH] =
+BEGIN
+tentativeResult: BTH ¨ NIL;
+Inner: PROC[mobHandle: MobUtilDefs.MobHandle, mobBase: MobDefs.MobBase, sym: SymbolTableBase] = TRUSTED
+BEGIN
+shiftedBti: CARD ¨ SELECT TRUE FROM
+mob.leftShift # 0 => Basics.BITLSHIFT[codedBti, mob.leftShift],
+mob.rightShift # 0 => Basics.BITRSHIFT[codedBti, mob.rightShift],
+ENDCASE => codedBti;
+tentativeBti: Symbols.BTIndex ¨ LOOPHOLE[shiftedBti];
+tentativeBtiAsKey: REF Symbols.BTIndex ¨ NEW[Symbols.BTIndex ¨ tentativeBti];
+tentativeResult ¨ NARROW[RefTab.Fetch[mob.btTable, tentativeBtiAsKey].val];
+IF tentativeResult = NIL THEN -- we have to build it from scratch
+BEGIN
+[] ¨ CheckTentativeBti[tentativeBti, mob, sym, 0
+! BadTentativeBti => {GOTO failure}];
+tentativeResult ¨ MakeBTH[mob, tentativeBti];
+EXITS
+failure => NULL; -- thus, leaving result = NIL
+END;
+END;
+ExamineMob[mob, Inner];
+RETURN[tentativeResult];
+END;
+
+GetRootBTH: PUBLIC PROC[mob: MobCookie] RETURNS[BTH]
+~ {RETURN MakeBTH[mob, Symbols.BTFirst]};
+
+CheckTentativeBti: PROC[tentativeBti: Symbols.BTIndex, mob: MobCookie, sym: SymbolTableBase, checkDepth: CARD] RETURNS[Symbols.BTIndex] = TRUSTED
+BEGIN
+IF checkDepth > 15 THEN BadTentativeBti[tentativeBti];
+[] ¨ BoundsCheckTentativeBti[tentativeBti, sym];
+IF tentativeBti = Symbols.BTFirst THEN RETURN[tentativeBti];
+IF tentativeBti = mob.recentBtiParent THEN RETURN[tentativeBti];
+
+BEGIN
+counter: INT ¨ 0;
+scan: Symbols.BTIndex ¨ tentativeBti;
+parent: Symbols.BTIndex;
+
+DO
+IF sym.bb[scan].link.which = parent THEN EXIT;
+
+IF counter > 1000 THEN BadTentativeBti[tentativeBti];
+counter ¨ counter + 1;
+
+IF sym.bb[scan].link.which = sibling THEN
+{scan ¨ BoundsCheckTentativeBti[sym.bb[scan].link.index, sym]; LOOP};
+
+BadTentativeBti[tentativeBti];
+ENDLOOP;
+
+
+parent ¨ CheckTentativeBti[sym.bb[scan].link.index, mob, sym, checkDepth+1];
+scan ¨ BoundsCheckTentativeBti[sym.bb[parent].firstSon, sym];
+
+DO
+IF counter > 1000 THEN BadTentativeBti[tentativeBti];
+counter ¨ counter + 1;
+IF scan = tentativeBti THEN
+{mob.recentBtiParent ¨ parent; RETURN[tentativeBti]};
+IF sym.bb[scan].link.which = parent THEN BadTentativeBti[tentativeBti];
+IF sym.bb[scan].link.which = sibling THEN
+scan ¨ BoundsCheckTentativeBti[sym.bb[scan].link.index, sym];
+ENDLOOP;
+
+END;
+END;
+
+BoundsCheckTentativeBti: PROC[tentativeBti: Symbols.BTIndex, sym: SymbolTableBase] RETURNS[Symbols.BTIndex] = TRUSTED
+BEGIN  -- this must act like a relative pointer that lands within the body table
+
+addr: CARD ¨ LOOPHOLE[sym.bb, CARD] + LOOPHOLE[tentativeBti, CARD];
+
+tableBase: CARD ¨ LOOPHOLE[sym.stHandle, CARD] + LOOPHOLE[sym.stHandle.bodyBlock.offset, CARD];
+
+IF addr < tableBase THEN
+BadTentativeBti[tentativeBti];
+
+IF addr >= tableBase+sym.stHandle.bodyBlock.size THEN
+BadTentativeBti[tentativeBti];
+
+RETURN[tentativeBti];
+END;
+
+BadTentativeBti: ERROR[Symbols.BTIndex] = CODE;
+
+GenCallableBodies: PUBLIC PROC[mob: MobCookie, for: PROC[callableBody: BTH]] = TRUSTED
+BEGIN
+Inner: PROC[mobHandle: MobUtilDefs.MobHandle, mobBase: MobDefs.MobBase, sym: SymbolTableBase] = TRUSTED
+BEGIN
+
+Visit: PROC[bti: Symbols.BTIndex] = TRUSTED
+{IF sym.bb[bti].kind = Callable THEN for[MakeBTH[mob, bti]]};
+
+ScanSubTree: PROC[treeRoot: Symbols.BTIndex] = TRUSTED
+BEGIN
+IF sym.bb[treeRoot].firstSon # Symbols.BTNull THEN
+FOR scan: Symbols.BTIndex ¨ sym.bb[treeRoot].firstSon, sym.bb[scan].link.index WHILE scan # treeRoot DO
+ScanSubTree[scan];
+Visit[scan];
+ENDLOOP;
+END;
+ScanSubTree[Symbols.RootBti];
+Visit[Symbols.RootBti];
+END;
+ExamineMob[mob, Inner];
+END;
+
+GetParentOfBTH: PUBLIC PROC[bth: BTH] RETURNS[BTH] =
+BEGIN
+result: BTH ¨ NIL; -- tentative
+Inner: PROC[mobHandle: MobUtilDefs.MobHandle, mobBase: MobDefs.MobBase, sym: SymbolTableBase] = TRUSTED
+BEGIN
+IF bth.bti = Symbols.RootBti THEN {result ¨ NIL}
+ ELSE
+BEGIN
+x: Symbols.BTIndex ¨ bth.bti;
+WHILE sym.bb[x].link.which # parent DO x ¨ sym.bb[x].link.index ENDLOOP;
+result ¨ MakeBTH[bth.mob, sym.bb[x].link.index];
+END;
+END;
+ExamineMob[bth.mob, Inner];
+RETURN[result];
+END;
+
+GetCodedBTIFromBTH: PUBLIC PROC[bth: BTH] RETURNS[CARD] =
+BEGIN
+result: CARD ¨ 0;
+Inner: PROC[mobHandle: MobUtilDefs.MobHandle, mobBase: MobDefs.MobBase, sym: SymbolTableBase] = TRUSTED
+BEGIN
+result ¨ SELECT TRUE FROM
+bth.mob.leftShift # 0 => Basics.BITRSHIFT[LOOPHOLE[bth.bti], bth.mob.leftShift],
+bth.mob.rightShift # 0 => Basics.BITLSHIFT[LOOPHOLE[bth.bti], bth.mob.rightShift],
+ENDCASE => LOOPHOLE[bth.bti];
+END;
+ExamineMob[bth.mob, Inner];
+RETURN[result]
+END;
+
+BTKeyEqualProc: PROC[key1, key2: RefTab.Key] RETURNS [BOOL] =
+BEGIN
+bti1Ref: REF Symbols.BTIndex ¨ NARROW[key1];
+bti2Ref: REF Symbols.BTIndex ¨ NARROW[key2];
+RETURN[bti1Ref≠ = bti2Ref≠];
+END;
+
+BTKeyHashProc: PROC[key: RefTab.Key] RETURNS [CARDINAL] =
+BEGIN
+btiRef: REF Symbols.BTIndex ¨ NARROW[key];
+asLongNumber: Basics.LongNumber ¨ LOOPHOLE[btiRef≠];
+RETURN[Basics.BITXOR[asLongNumber.lo, asLongNumber.hi]];
+END;
+
+FetchBTR: PUBLIC PROC[bth: BTH] RETURNS[BTR] =
+BEGIN
+Inner: PROC[mobHandle: MobUtilDefs.MobHandle, mobBase: MobDefs.MobBase, sym: SymbolTableBase] = TRUSTED
+BEGIN
+bth.btr ¨ NEW[BTRBody¨[
+link: [
+which: IF sym.bb[bth.bti].link.which = sibling THEN sibling ELSE parent,
+index: MakeBTH[bth.mob, sym.bb[bth.bti].link.index]],
+firstSon: MakeBTH[bth.mob, sym.bb[bth.bti].firstSon],
+type: MakeSEH[bth.mob, sym.bb[bth.bti].type],
+localCtx: MakeCTXH[bth.mob, sym.bb[bth.bti].localCtx],
+sourceIndex: sym.bb[bth.bti].sourceIndex,
+info: MakeBTInfo[bth, mobHandle, mobBase, sym],
+level: sym.bb[bth.bti].level,
+class: sym.bb[bth.bti].class,
+extension: MakeBTExtension[bth, mobHandle, mobBase, sym]]];
+END;
+IF bth = NIL THEN RETURN[NIL];
+IF bth.btr = NIL THEN ExamineMob[bth.mob, Inner];
+RETURN[bth.btr];
+END;
+
+MakeBTInfo: PROC[bth: BTH, mobHandle: MobUtilDefs.MobHandle, mobBase: MobDefs.MobBase, sym: SymbolTableBase] RETURNS[REF MobAccess.BodyInfo] = TRUSTED
+BEGIN
+WITH info: sym.bb[bth.bti].info SELECT FROM
+Internal =>
+RETURN[NEW[Internal MobAccess.BodyInfo ¨ [Internal[info.frameSize]]]];
+External =>
+RETURN[NEW[External MobAccess.BodyInfo ¨ [External[
+bytes: info.bytes,
+startIndex: info.startIndex,
+indexLength: info.indexLength]]]];
+ENDCASE => ERROR MobError["invalid BodyInfo.mark"];
+
+END;
+
+MakeBTExtension: PROC[bth: BTH, mobHandle: MobUtilDefs.MobHandle, mobBase: MobDefs.MobBase, sym: SymbolTableBase] RETURNS[REF MobAccess.BTRExtension] = TRUSTED
+BEGIN
+WITH extension: sym.bb[bth.bti] SELECT FROM
+Callable =>
+RETURN[NEW[Callable MobAccess.BTRExtension ¨ [Callable[
+id: MakeSEH[bth.mob, extension.id],
+ioType: MakeSEH[bth.mob, extension.ioType],
+frameOffset: extension.frameOffset,
+entryIndex: extension.entryIndex,
+hints: [extension.hints.safe, extension.hints.argUpdated, extension.hints.nameSafe, extension.hints.noStrings],
+entry: extension.entry,
+internal: extension.internal,
+inline: extension.inline,
+monitored: extension.monitored,
+noXfers: extension.noXfers,
+resident: extension.resident,
+kind: SELECT extension.kind FROM
+Outer => Outer,
+Inner => Inner,
+Catch => Catch,
+Other => Other,
+ENDCASE => ERROR MobError["invalid Callable BodyRecord BodyKind"] ]]]];
+Other =>
+RETURN[NEW[Other MobAccess.BTRExtension ¨ [Other[extension.relOffset]]]];
+ENDCASE => ERROR MobError["invalid BodyRecord kind"];
+END;
+
+
+GenBodiesWithDepth: PROC[mob: MobCookie, body: BTH, baseDepth: INT, for: PROC[body: BTH, depth: INT]] = TRUSTED
+BEGIN
+Inner: PROC[mobHandle: MobUtilDefs.MobHandle, mobBase: MobDefs.MobBase, sym: SymbolTableBase] = TRUSTED
+BEGIN
+
+Visit: PROC[bti: Symbols.BTIndex] = TRUSTED
+BEGIN
+bth: BTH ¨ MakeBTH[mob, bti];
+for[bth, baseDepth+1];
+GenBodiesWithDepth[mob, bth, baseDepth+1, for];
+END;
+
+ScanSubTree: PROC[treeRoot: Symbols.BTIndex] = TRUSTED
+BEGIN
+IF sym.bb[treeRoot].firstSon # Symbols.BTNull THEN
+FOR scan: Symbols.BTIndex ¨ sym.bb[treeRoot].firstSon, sym.bb[scan].link.index WHILE scan # treeRoot DO
+ScanSubTree[scan];
+Visit[scan];
+ENDLOOP;
+END;
+ScanSubTree[body.bti];
+END;
+ExamineMob[mob, Inner];
+END;
+
+MobBodyTreeToRope: PROC[mob: MobCookie] RETURNS[Rope.ROPE] =
+{RETURN[BodyTreeToRope[mob, MakeBTH[mob, Symbols.RootBti]]]};
+
+BodyTreeToRope: PROC[mob: MobCookie, body: BTH] RETURNS[Rope.ROPE] =
+BEGIN
+rope: Rope.ROPE ¨ NIL;
+eachBody: PROC[body: BTH, depth: INT] =
+BEGIN
+rope ¨ Rope.Cat[rope, BodyToRope[body, depth], "\N"];
+END;
+eachBody[body, 0];
+GenBodiesWithDepth[mob, body, 1, eachBody];
+RETURN[rope];
+END;
+
+BodyToRope: PROC[body: BTH, depth: INT] RETURNS[Rope.ROPE] =
+BEGIN
+btr: BTR ¨ FetchBTR[body];
+st: IO.STREAM ¨ IO.ROS[];
+putDepth: PROC[d: INT¨0] = {FOR I: INT IN [0..depth+d) DO IO.PutRope[st, " "] ENDLOOP};
+rope: PROC[r: Rope.ROPE, d: INT ¨ 0] =
+{putDepth[d]; IO.PutRope[st, r]};
+put: PROC[d: INT, f: Rope.ROPE, v1, v2, v3, v4, v5: IO.Value ¨ [null[]]] =
+BEGIN
+putDepth[d];
+IO.PutFL[st, f, LIST[v1, v2, v3, v4, v5]];
+END;
+rope["body"];
+put[0, " source index = %g\N", IO.card[btr.sourceIndex]];
+rope[CTXToRope[btr.localCtx, depth+5]];
+RETURN[IO.RopeFromROS[st]];
+END;
+MDR: TYPE = MobAccess.MDR;
+MDRBody: TYPE = MobAccess.MDRBody;
+
+
+MDH: TYPE = REF MDHBody;
+MDHBody: PUBLIC TYPE = RECORD[
+mob: MobCookie,
+mdi: Symbols.MDIndex,
+mdr: MDR];
+
+MakeMDH: PUBLIC PROC[mob: MobCookie, mdi: Symbols.MDIndex] RETURNS[MDH] =
+BEGIN
+IF mdi = Symbols.MDNull THEN RETURN[NIL]
+ ELSE
+BEGIN
+mdiAsKey: CARD ~ LOOPHOLE[mdi];
+mdh: MDH ¨ NARROW[CardTab.Fetch[mob.mdTable, mdiAsKey].val];
+
+IF mdh # NIL THEN RETURN[mdh];
+
+mdh ¨ NEW[MDHBody¨[mob, mdi, NIL]];
+IF NOT CardTab.Insert[mob.mdTable, mdiAsKey, mdh] THEN ERROR MobError["MobAccessImpl confused (by concurrent access?)"];
+RETURN[mdh]
+END
+END;
+
+FetchMDR: PUBLIC PROC[mdh: MDH] RETURNS[MDR] =
+BEGIN
+Inner: PROC[mobHandle: MobUtilDefs.MobHandle, mobBase: MobDefs.MobBase, sym: SymbolTableBase] = TRUSTED
+BEGIN
+raw: LONG POINTER TO Symbols.MDRecord ~ @sym.mdb[mdh.mdi];
+mdh.mdr ¨ NEW[MDRBody¨[
+stamp: raw.stamp,
+moduleId: RopeForName[mdh.mob, mobHandle, mobBase, sym, raw.moduleId],
+fileId: RopeForName[mdh.mob, mobHandle, mobBase, sym, raw.fileId],
+shared: raw.shared,
+exported: raw.exported,
+ctx: MakeCTXH[mdh.mob, raw.ctx],
+defaultImport: MakeCTXH[mdh.mob, raw.defaultImport]
+]];
+END;
+IF mdh = NIL THEN RETURN[NIL];
+IF mdh.mdr = NIL THEN ExamineMob[mdh.mob, Inner];
+RETURN[mdh.mdr];
+END;
+
+GetMobForMDH: PUBLIC PROC[mdh: MDH] RETURNS[MobCookie] =
+{RETURN[mdh.mob]};
+
+GetMdiForMDH: PUBLIC PROC[mdh: MDH] RETURNS[Symbols.MDIndex] =
+{RETURN[mdh.mdi]};
+
+CTXR: TYPE = MobAccess.CTXR;
+CTXRBody: TYPE = MobAccess.CTXRBody;
+
+
+CTXH: TYPE = REF CTXHBody;
+CTXHBody: PUBLIC TYPE = RECORD[
+mob: MobCookie,
+ctx: Symbols.CTXIndex,
+ctxr: CTXR];
+
+MakeCTXH: PUBLIC PROC[mob: MobCookie, ctx: Symbols.CTXIndex] RETURNS[CTXH] = {
+IF ctx = Symbols.CTXNull
+THEN RETURN[NIL]
+ELSE RETURN ReallyMakeCTXH[mob, ctx]};
+
+ReallyMakeCTXH: PROC[mob: MobCookie, ctx: Symbols.CTXIndex] RETURNS[CTXH] = {
+ctxAsKey: REF Symbols.CTXIndex ¨ NEW[Symbols.CTXIndex ¨ ctx];
+ctxh: CTXH ¨ NARROW[RefTab.Fetch[mob.ctxTable, ctxAsKey].val];
+
+IF ctxh # NIL THEN RETURN[ctxh];
+
+ctxh ¨ NEW[CTXHBody¨[mob, ctx, NIL]];
+IF NOT RefTab.Insert[mob.ctxTable, ctxAsKey, ctxh] THEN ERROR MobError["MobAccessImpl confused (by concurrent access?)"];
+RETURN[ctxh]};
+
+MakeStdCtxh: PUBLIC PROC[mob: MobCookie] RETURNS[CTXH]
+~ {RETURN MakeCTXH[mob, Symbols.FirstStandardCtx]};
+
+BoundsCheckTentativeCTX: PROC[tentativeCTX: Symbols.CTXIndex, sym: SymbolTableBase] RETURNS[Symbols.CTXIndex] = TRUSTED
+BEGIN
+addr: CARD ¨ LOOPHOLE[sym.ctxb, CARD] + LOOPHOLE[tentativeCTX, CARD];
+tableBase: CARD ¨ LOOPHOLE[sym.stHandle, CARD] + LOOPHOLE[sym.stHandle.ctxBlock.offset, CARD];
+IF tentativeCTX = Symbols.CTXNull THEN BadTentativeCTX[tentativeCTX];
+IF addr < tableBase THEN
+BadTentativeCTX[tentativeCTX];
+IF addr >= tableBase+sym.stHandle.ctxBlock.size THEN
+BadTentativeCTX[tentativeCTX];
+RETURN[tentativeCTX];
+END;
+
+BadTentativeCTX: ERROR[Symbols.CTXIndex] = CODE;
+
+CTXKeyEqualProc: PROC[key1, key2: RefTab.Key] RETURNS [BOOL] =
+BEGIN
+ctx1Ref: REF Symbols.CTXIndex ¨ NARROW[key1];
+ctx2Ref: REF Symbols.CTXIndex ¨ NARROW[key2];
+RETURN[ctx1Ref≠ = ctx2Ref≠];
+END;
+
+CTXKeyHashProc: PROC[key: RefTab.Key] RETURNS [CARDINAL] =
+BEGIN
+ctxRef: REF Symbols.CTXIndex ¨ NARROW[key];
+asLongNumber: Basics.LongNumber ¨ LOOPHOLE[ctxRef≠];
+RETURN[Basics.BITXOR[asLongNumber.lo, asLongNumber.hi]];
+END;
+
+FetchCTXR: PUBLIC PROC[ctxh: CTXH] RETURNS[CTXR] =
+BEGIN
+Inner: PROC[mobHandle: MobUtilDefs.MobHandle, mobBase: MobDefs.MobBase, sym: SymbolTableBase] = TRUSTED
+BEGIN
+seH: SEH ~ MakeSEH[ctxh.mob, sym.ctxb[ctxh.ctx].seList];
+lvl: Symbols.ContextLevel ~ sym.ctxb[ctxh.ctx].level;
+varUpdated: BOOL ~ sym.ctxb[ctxh.ctx].varUpdated;
+WITH x: sym.ctxb[ctxh.ctx] SELECT FROM
+simple => ctxh.ctxr ¨ NEW[CTXRBody¨[seList: seH, level: lvl,
+varUpdated: varUpdated,
+extension: simple[copied: x.copied] ]];
+included => ctxh.ctxr ¨ NEW[CTXRBody¨[seList: seH, level: lvl,
+varUpdated: varUpdated,
+extension: included[
+chain: MakeCTXH[ctxh.mob, x.chain],
+module: MakeMDH[ctxh.mob, x.module],
+map: x.map, copied: x.copied,
+reset: x.reset, closed: x.closed,
+complete: x.complete, restricted: x.restricted
+] ]];
+imported => ctxh.ctxr ¨ NEW[CTXRBody¨[seList: seH, level: lvl,
+varUpdated: varUpdated,
+extension: imported[MakeCTXH[ctxh.mob, x.includeLink]] ]];
+nil => ctxh.ctxr ¨ NEW[CTXRBody¨[seList: seH, level: lvl,
+varUpdated: varUpdated,
+extension: nil[] ]];
+ENDCASE => ERROR MobError["invalid CTXRecord ctxType"];
+END;
+IF ctxh = NIL THEN RETURN[NIL];
+IF ctxh.ctxr = NIL THEN ExamineMob[ctxh.mob, Inner];
+RETURN[ctxh.ctxr];
+END;
+
+GetMobForCTXH: PUBLIC PROC[ctxh: CTXH] RETURNS[MobCookie] =
+{RETURN[ctxh.mob]};
+
+GetCtxForCTXH: PUBLIC PROC[ctxh: CTXH] RETURNS[Symbols.CTXIndex] =
+{RETURN[ctxh.ctx]};
+
+
+
+CTXToRope: PROC[ctxh: CTXH, depth: INT] RETURNS[Rope.ROPE] =
+BEGIN
+IF ctxh = NIL THEN RETURN[NIL]
+ ELSE
+BEGIN
+ctxr: CTXR ¨ FetchCTXR[ctxh];
+st: IO.STREAM ¨ IO.ROS[];
+seh: SEH ¨ ctxr.seList;
+putDepth: PROC[d: INT¨0] = {FOR I: INT IN [0..depth+d) DO IO.PutRope[st, " "] ENDLOOP};
+putDepth[]; IO.PutF[st, "ctx = %g, level = %g\N", IO.rope[Convert.RopeFromCard[LOOPHOLE[ctxh.ctx]]], IO.card[ctxr.level]];
+WHILE seh # NIL DO
+ser: SER ¨ FetchSER[seh];
+IO.PutF1[st, "%g", IO.rope[SEHToRope[seh, depth+2]]];
+WITH ser.body SELECT FROM
+id: REF id BodySE => seh ¨ id.ctxLink;
+ENDCASE => seh ¨ NIL;
+ENDLOOP;
+RETURN[IO.RopeFromROS[st]];
+END
+END;
+
+SER: TYPE = MobAccess.SER;
+SERBody: TYPE = MobAccess.SERBody;
+
+BodySE: TYPE = MobAccess.BodySE;
+
+TypeInfoConsSE: TYPE = MobAccess.TypeInfoConsSE;
+
+
+SEH: TYPE = REF SEHBody;
+SEHBody: PUBLIC TYPE = RECORD[
+mob: MobCookie,
+sei: Symbols.SEIndex,
+ser: SER];
+
+
+MakeSEH: PUBLIC PROC[mob: MobCookie, sei: Symbols.SEIndex] RETURNS[SEH] =
+BEGIN
+IF sei = Symbols.SENull THEN RETURN[NIL]
+ ELSE
+BEGIN
+seiAsKey: REF Symbols.SEIndex ¨ NEW[Symbols.SEIndex ¨ sei];
+seh: SEH ¨ NARROW[RefTab.Fetch[mob.seiTable, seiAsKey].val];
+IF seh # NIL THEN RETURN[seh];
+
+seh ¨ NEW[SEHBody¨[mob, sei, NIL]];
+IF NOT RefTab.Insert[mob.seiTable, seiAsKey, seh] THEN ERROR MobError["MobAccessImpl confused (by concurrent access?)"];
+RETURN[seh]
+END;
+END;
+
+MakeSEHFromCodedSei: PUBLIC PROC[mob: MobCookie, codedSei: CARD, name: Rope.ROPE] RETURNS[SEH] =  TRUSTED
+BEGIN
+tentativeResult: SEH ¨ NIL;
+Inner: PROC[mobHandle: MobUtilDefs.MobHandle, mobBase: MobDefs.MobBase, sym: SymbolTableBase] = TRUSTED
+BEGIN
+seNull: CARD ~ LOOPHOLE[Symbols.SENull];
+shiftedSei: CARD ¨ SELECT TRUE FROM
+mob.leftShift # 0 => Basics.BITLSHIFT[codedSei, mob.leftShift],
+mob.rightShift # 0 => Basics.BITRSHIFT[codedSei, mob.rightShift],
+ENDCASE => codedSei;
+tentativeSei: Symbols.SEIndex ¨ LOOPHOLE[shiftedSei+seNull];
+tentativeSeiAsKey: REF Symbols.SEIndex ¨ NEW[Symbols.SEIndex ¨ tentativeSei];
+tentativeResult ¨ NARROW[RefTab.Fetch[mob.seiTable, tentativeSeiAsKey].val];
+IF tentativeResult = NIL THEN -- we have to build it from scratch
+BEGIN
+CheckTentativeISei[tentativeSei, sym
+! BadTentativeSei, BadTentativeCTX => {GOTO failure}];
+tentativeResult ¨ MakeSEH[mob, tentativeSei];
+EXITS
+failure => NULL; -- thus, leaving result = NIL
+END;
+END;
+ExamineMob[mob, Inner];
+IF tentativeResult # NIL THEN RETURN[CheckSEHName[tentativeResult, name]] ELSE RETURN[NIL];
+END;
+
+GetCodedSeiFromSEH: PUBLIC PROC[seh: SEH] RETURNS[CARD] =
+BEGIN
+result: CARD ¨ 0;
+Inner: PROC[mobHandle: MobUtilDefs.MobHandle, mobBase: MobDefs.MobBase, sym: SymbolTableBase] = TRUSTED
+BEGIN
+nominal: CARD ¨ LOOPHOLE[seh.sei, CARD] - LOOPHOLE[Symbols.SENull, CARD];
+result ¨ SELECT TRUE FROM
+seh.mob.leftShift # 0 => Basics.BITRSHIFT[nominal, seh.mob.leftShift],
+seh.mob.rightShift # 0 => Basics.BITLSHIFT[nominal, seh.mob.rightShift],
+ENDCASE => nominal;
+END;
+ExamineMob[seh.mob, Inner];
+RETURN[result]
+END;
+
+CheckSEHName: PROC[seh: SEH, name: Rope.ROPE] RETURNS[SEH] = 
+BEGIN
+ser: SER ¨ FetchSER[seh];
+body: REF BodySE ¨ ser.body;
+IF name = NIL THEN RETURN[seh]; -- client didn't really want to check
+WITH body SELECT FROM
+id: REF id BodySE =>
+IF Rope.Equal[name, id.hash] THEN RETURN[seh]
+ ELSE RETURN[NIL]; -- name didn't check
+ENDCASE => RETURN[NIL]; -- was expecting an id seh
+END;
+
+CheckTentativeISei: PROC[tentativeISei: Symbols.SEIndex, sym: SymbolTableBase] = TRUSTED
+BEGIN
+[] ¨ BoundsCheckTentativeSei[tentativeISei, sym];
+WITH body: sym.seb[tentativeISei] SELECT FROM
+id => -- at least its got the right tag
+BEGIN
+tentativeCtx: Symbols.CTXIndex ¨ BoundsCheckTentativeCTX[body.idCtx, sym];
+firstSei: Symbols.SEIndex ¨ BoundsCheckTentativeSei[sym.ctxb[tentativeCtx].seList, sym];
+nextSei: Symbols.SEIndex ¨ firstSei;
+
+DO
+sei: Symbols.SEIndex ¨ BoundsCheckTentativeSei[nextSei, sym];
+IF sei = tentativeISei THEN RETURN;
+WITH body: sym.seb[sei] SELECT FROM
+id => -- at least its got the right tag
+BEGIN
+WITH lnk: body SELECT FROM
+terminal => BadTentativeSei[tentativeISei];
+sequential => 
+{nextSei ¨ sei + Symbols.SERecord.id.sequential.SIZE; LOOP};
+linked =>
+{nextSei ¨ lnk.link; LOOP};
+embedded => BadTentativeSei[tentativeISei]; -- I am not sure if this is what I should do here
+ENDCASE => BadTentativeSei[tentativeISei];
+END
+ENDCASE => BadTentativeSei[tentativeISei];
+ENDLOOP;
+
+END;
+ENDCASE => BadTentativeSei[tentativeISei];
+END;
+
+BoundsCheckTentativeSei: PROC[tentativeSei: Symbols.SEIndex, sym: SymbolTableBase] RETURNS[Symbols.SEIndex] = TRUSTED
+BEGIN  -- this must act like a relative pointer that lands within the se table
+
+addr: CARD ¨ LOOPHOLE[sym.seb, CARD] + LOOPHOLE[tentativeSei, CARD];
+
+tableBase: CARD ¨ LOOPHOLE[sym.stHandle, CARD] + LOOPHOLE[sym.stHandle.seBlock.offset, CARD];
+
+IF addr < tableBase THEN
+BadTentativeSei[tentativeSei];
+
+IF addr >= tableBase+sym.stHandle.seBlock.size THEN
+BadTentativeSei[tentativeSei];
+
+RETURN[tentativeSei];
+END;
+
+BadTentativeSei: ERROR[tentativeSei: Symbols.SEIndex] = CODE;
+
+CheckTentativeName: PROC[name: Symbols.Name, sym: SymbolTableBase] = TRUSTED
+BEGIN
+addr: CARD ¨ LOOPHOLE[sym.htb, CARD] + LOOPHOLE[name, CARD];
+tableBase: CARD ¨ LOOPHOLE[sym.stHandle, CARD] + LOOPHOLE[sym.stHandle.htBlock.offset, CARD];
+IF addr < tableBase THEN
+BadTentativeName[name];
+IF addr >= tableBase+sym.stHandle.htBlock.size THEN
+BadTentativeName[name];
+IF (addr-tableBase) MOD SIZE[Symbols.HTRecord] # 0 THEN 
+BadTentativeName[name];
+END;
+
+BadTentativeName: SIGNAL[Symbols.Name] ~ CODE;
+
+
+SEIKeyEqualProc: PROC[key1, key2: RefTab.Key] RETURNS [BOOL] =
+BEGIN
+sei1Ref: REF Symbols.SEIndex ¨ NARROW[key1];
+sei2Ref: REF Symbols.SEIndex ¨ NARROW[key2];
+RETURN[sei1Ref≠ = sei2Ref≠];
+END;
+
+SEIKeyHashProc: PROC[key: RefTab.Key] RETURNS [CARDINAL] =
+BEGIN
+seiRef: REF Symbols.SEIndex ¨ NARROW[key];
+asLongNumber: Basics.LongNumber ¨ LOOPHOLE[seiRef≠];
+RETURN[Basics.BITXOR[asLongNumber.lo, asLongNumber.hi]];
+END;
+
+FetchSER: PUBLIC PROC[seh: SEH] RETURNS[SER] =
+BEGIN
+Inner: PROC[mobHandle: MobUtilDefs.MobHandle, mobBase: MobDefs.MobBase, sym: SymbolTableBase] = TRUSTED
+BEGIN
+IF seh.sei-Symbols.SEFirst<0 OR CARD[seh.sei-Symbols.SEFirst]>=sym.stHandle.seBlock.size THEN ERROR MobError[IO.PutFR["bogus SEI %x into %g", [cardinal[LOOPHOLE[seh.sei]]], [rope[PFS.RopeFromPath[SystemInterface.GetNameOfFile[seh.mob.file]]]] ]];
+
+seh.ser ¨ NEW[SERBody ¨ [
+body: WITH body: sym.seb[seh.sei] SELECT FROM
+id => NEW[BodySE ¨ [id[
+extended: body.extended, public: body.public,
+immutable: body.immutable, constant: body.constant,
+linkSpace: body.linkSpace, idDecl: body.idDecl,
+idCtx: MakeCTXH[seh.mob, body.idCtx],
+idType: MakeSEH[seh.mob, body.idType],
+idInfoAndValue: NIL, -- filled in below
+hash: RopeForName[seh.mob, mobHandle, mobBase, sym, body.hash],
+flags: body.flags,
+special: body.special,
+ctxLink: WITH lnk: body SELECT FROM
+terminal => NIL,
+sequential => MakeSEH[seh.mob, seh.sei + Symbols.SERecord.id.sequential.SIZE],
+linked => MakeSEH[seh.mob, lnk.link],
+embedded => ERROR MobError["MobAccessImpl can't handle embedded ISEIs"],
+ENDCASE => ERROR MobError["invalid id SERecord linkTag"] ]]],
+cons => NEW[BodySE ¨ [cons[
+align: body.align,
+typeInfo: WITH cons: body SELECT FROM
+mode => NEW[TypeInfoConsSE ¨ [mode[]]],
+basic => NEW[TypeInfoConsSE ¨ [basic[
+ordered: cons.ordered,
+code: cons.code,
+length: cons.length]]],
+signed => NEW[TypeInfoConsSE ¨ [signed[cons.length]]],
+unsigned => NEW[TypeInfoConsSE ¨ [unsigned[cons.length]]], 
+real => NEW[TypeInfoConsSE ¨ [real[cons.length]]],
+enumerated => NEW[TypeInfoConsSE ¨ [enumerated[
+range: cons.range,
+valueCtx: MakeCTXH[seh.mob, cons.valueCtx],
+empty: cons.empty,
+sparse: cons.sparse,
+painted: cons.painted,
+ordered: cons.ordered,
+machineDep: cons.machineDep]]],
+record => NEW[TypeInfoConsSE ¨ [record[
+length: cons.length,
+fieldCtx: MakeCTXH[seh.mob, cons.fieldCtx],
+bitOrder: MyifyBitOrder[cons.bitOrder],
+grain: cons.grain,
+hints: [
+comparable: cons.hints.comparable,
+assignable: cons.hints.assignable,
+unifield: cons.hints.unifield,
+variant: cons.hints.variant,
+privateFields: cons.hints.privateFields,
+refField: cons.hints.refField,
+default: cons.hints.default,
+voidable: cons.hints.voidable],
+packed: cons.packed,
+list: cons.list,
+argument: cons.argument,
+monitored: cons.monitored,
+machineDep: cons.machineDep,
+painted: cons.painted,
+linkPart: WITH link: cons SELECT FROM
+notLinked => NIL,
+linked => MakeSEH[seh.mob, link.linkType],
+ENDCASE => ERROR MobError["invalid record cons SERecord linkTag"] ]]],
+ref => NEW[TypeInfoConsSE ¨ [ref[
+refType: MakeSEH[seh.mob, cons.refType],
+counted: cons.counted,
+ordered: cons.ordered,
+readOnly: cons.readOnly,
+list: cons.list,
+var: cons.var,
+basing: cons.basing,
+length: cons.length
+]]],
+array => NEW[TypeInfoConsSE ¨ [array[
+componentType: MakeSEH[seh.mob, cons.componentType],
+indexType: MakeSEH[seh.mob, cons.indexType],
+packed: cons.packed,
+bitOrder: MyifyBitOrder[cons.bitOrder]]]],
+arraydesc => NEW[TypeInfoConsSE ¨ [arraydesc[
+describedType: MakeSEH[seh.mob, cons.describedType],
+var: cons.var, readOnly: cons.readOnly,
+bitOrder: MyifyBitOrder[cons.bitOrder],
+length: cons.length]]],
+transfer => NEW[TypeInfoConsSE ¨ [transfer[
+safe: cons.safe,
+mode: SELECT cons.mode FROM
+proc => proc,
+port => port,
+signal => signal,
+error => error,
+process => process,
+program => program,
+none => none,
+ENDCASE => ERROR MobError["invalid transfer cons SERecord mode"],
+typeIn: MakeSEH[seh.mob, cons.typeIn],
+typeOut: MakeSEH[seh.mob, cons.typeOut],
+length: cons.length]]],
+definition => NEW[TypeInfoConsSE ¨ [definition[
+defCtx: MakeCTXH[seh.mob, cons.defCtx],
+slots: cons.slots,
+named: cons.named]]],
+union => NEW[TypeInfoConsSE ¨ [union[
+caseCtx: MakeCTXH[seh.mob, cons.caseCtx],
+tagSei: MakeSEH[seh.mob, cons.tagSei],
+hints: [
+equalLengths: cons.hints.equalLengths,
+refField: cons.hints.refField,
+default: cons.hints.default,
+voidable: cons.hints.voidable],
+overlaid: cons.overlaid, controlled: cons.controlled,
+machineDep: cons.machineDep,
+bitOrder: MyifyBitOrder[cons.bitOrder],
+grain: cons.grain]]],
+sequence => NEW[TypeInfoConsSE ¨ [sequence[
+parentType: MakeSEH[seh.mob, cons.parentType],
+tagSei: MakeSEH[seh.mob, cons.tagSei],
+componentType: MakeSEH[seh.mob, cons.componentType],
+packed: cons.packed,
+controlled: cons.controlled,
+machineDep: cons.machineDep,
+bitOrder: MyifyBitOrder[cons.bitOrder],
+grain: cons.grain]]],
+relative => NEW[TypeInfoConsSE ¨ [relative[
+baseType: MakeSEH[seh.mob, cons.baseType],
+offsetType: MakeSEH[seh.mob, cons.offsetType],
+resultType: MakeSEH[seh.mob, cons.resultType]]]],
+subrange => NEW[TypeInfoConsSE ¨ [subrange[
+empty: cons.empty,
+biased: cons.biased,
+filled: cons.filled,
+rangeType: MakeSEH[seh.mob, cons.rangeType],
+origin: cons.origin,
+range: cons.range]]],
+opaque => NEW[TypeInfoConsSE ¨ [opaque[
+id: MakeSEH[seh.mob, cons.id],
+length: cons.length,
+lengthKnown: cons.lengthKnown]]],
+zone => NEW[TypeInfoConsSE ¨ [zone[
+counted: cons.counted,
+mds: cons.mds,
+length: cons.length]]],
+any => NEW[TypeInfoConsSE ¨ [any[]]],
+nil => NEW[TypeInfoConsSE ¨ [nil[]]],
+ENDCASE => ERROR MobError["invalid cons SERecord typeTag"]
+]]],
+ENDCASE => ERROR MobError["invalid SERecord seTag"] ]];
+
+WITH bodySource: sym.seb[seh.sei] SELECT FROM
+id => WITH bodyTarget: seh.ser.body SELECT FROM
+id =>
+BEGIN
+
+
+IF bodySource.idType = Symbols.typeTYPE THEN
+BEGIN
+idInfoSEI: Symbols.SEIndex ¨ LOOPHOLE[bodySource.idInfo];
+idInfoSEH: SEH ¨ MakeSEH[seh.mob, idInfoSEI];
+bodyTarget.idInfoAndValue ¨ NEW[MobAccess.TypeDesc ¨ [idInfoSEH, LOOPHOLE[bodySource.idValue]]];
+GOTO installed;
+END;
+
+
+BEGIN
+entrySEI: Symbols.SEIndex ¨ UnderType[bodySource.idType, sym];
+isBTI: BOOLEAN ¨ FALSE;
+WITH entryTypeBody: sym.seb[entrySEI] SELECT FROM
+cons =>
+SELECT TRUE FROM
+bodySource.constant AND NOT bodySource.extended =>
+WITH etb: entryTypeBody SELECT FROM
+transfer => SELECT etb.mode FROM
+proc, signal, error, program => isBTI ¨ TRUE;
+ENDCASE => NULL;
+ENDCASE => NULL;
+bodySource.constant AND bodySource.extended =>
+WITH etb: entryTypeBody SELECT FROM
+transfer => SELECT etb.mode FROM
+proc => isBTI ¨ TRUE;
+ENDCASE => NULL;
+ENDCASE => NULL
+ENDCASE => NULL;
+ENDCASE => ERROR MobError["Can't happen: UnderType returned a non-cons sei"];
+
+IF isBTI THEN
+BEGIN
+bodyTarget.idInfoAndValue ¨ NEW [MobAccess.BlockDesc ¨ [MakeBTH[seh.mob, LOOPHOLE[bodySource.idInfo]], LOOPHOLE[bodySource.idValue]]];
+GOTO installed;
+END;
+END;
+
+IF bodySource.constant THEN -- we are dealing with a constant
+BEGIN
+bodyTarget.idInfoAndValue ¨ NEW[MobAccess.ConstVal ¨ [LOOPHOLE[bodySource.idValue]]];
+GOTO installed;
+END;
+
+BEGIN
+bitSize: CARD ¨ LOOPHOLE[bodySource.idInfo, CARD]; -- size of field (in bits)
+bitOffset: INT ¨ LOOPHOLE[bodySource.idValue, INT]; -- offset of field from the appropriate base (in bits)
+bodyTarget.idInfoAndValue ¨ NEW[MobAccess.FieldDesc ¨ [bitSize, bitOffset]];
+GOTO installed;
+END;
+
+
+EXITS
+installed => NULL;
+
+END;
+ENDCASE => ERROR MobError["can't happen: we just made it the other way"];
+ENDCASE => NULL;
+
+
+END;
+
+
+IF seh = NIL THEN RETURN[NIL];
+IF seh.ser = NIL THEN ExamineMob[seh.mob, Inner];
+RETURN[seh.ser]
+END;
+
+MyifyBitOrder: ARRAY Symbols.BitOrder OF MobAccess.BitOrder = [msBit: msBit, lsBit: lsBit];
+
+GetMobForSEH: PUBLIC PROC[seh: SEH] RETURNS[MobCookie] =
+{RETURN[seh.mob]};
+
+GetSeiForSEH: PUBLIC PROC[seh: SEH] RETURNS[sei: Symbols.SEIndex] =
+{RETURN[seh.sei]};
+
+UnderType: PROC[sei: Symbols.SEIndex, sym: SymbolTableBase] RETURNS [Symbols.SEIndex] = TRUSTED
+BEGIN
+DO
+WITH se: sym.seb[sei] SELECT FROM
+id => IF se.idType = Symbols.typeTYPE THEN {sei ¨ LOOPHOLE[se.idInfo]; LOOP};
+cons => RETURN [sei];
+ENDCASE;
+ERROR MobError["BadMobContents"];
+ENDLOOP;
+END;
+
+SEHToRope: PROC[seh: SEH, depth: INT] RETURNS[Rope.ROPE] =
+BEGIN
+ser: SER ¨ FetchSER[seh];
+st: IO.STREAM ¨ IO.ROS[];
+putDepth: PROC[d: INT¨0] = {FOR I: INT IN [0..depth+d) DO IO.PutRope[st, " "] ENDLOOP};
+rope: PROC[r: Rope.ROPE, d: INT ¨ 0] =
+{putDepth[d]; IO.PutRope[st, r]};
+put: PROC[d: INT, f: Rope.ROPE, v1, v2, v3, v4, v5: IO.Value ¨ [null[]]] =
+BEGIN
+putDepth[d];
+IO.PutFL[st, f, LIST[v1, v2, v3, v4, v5]];
+END;
+put[0, "sei = %g\N", IO.rope[Convert.RopeFromCard[LOOPHOLE[seh.sei]]]];
+WITH ser.body SELECT FROM
+id: REF id BodySE =>
+BEGIN
+put[0, "id = %g\N", [rope[id.hash]]];
+put[0, "ctx = %g\N", [rope[IF id.idCtx = NIL THEN "NIL" ELSE Convert.RopeFromCard[LOOPHOLE[id.idCtx.ctx]]]]];
+SELECT id.special FROM
+normal => rope[" normal\N"];
+globalLink => rope[" globalLink\N"];
+staticLink => rope[" staticLink\N"];
+frameExtension => rope[" frameExtension\N"];
+memoryLink => rope[" memoryLink\N"];
+returnLink => rope[" returnLink\N"];
+ENDCASE => rope[" unknown special\N"];
+IF id.flags.valid THEN
+BEGIN
+IF id.flags.used THEN rope[" used"] ELSE rope[" not-used"];
+IF id.flags.addressed THEN rope[" addressed"] ELSE rope[" not-addressed"];
+IF id.flags.assigned THEN rope[" assigned"] ELSE rope[" not-assigned"];
+IF id.flags.upLevel THEN rope[" upLevel\N"] ELSE rope[" not-upLevel\N"];
+END;
+END;
+cons: REF cons BodySE => rope["cons\N"];
+ENDCASE => rope["unknown ser\N"];
+RETURN[IO.RopeFromROS[st]];
+END;
+
+
+RopeHolder: TYPE = REF RopeHolderBody;
+RopeHolderBody: TYPE = RECORD[rope: Rope.ROPE];
+
+RopeForName: PROC[cookie: MobCookie, mobHandle: MobUtilDefs.MobHandle, mobBase: MobDefs.MobBase, sym: SymbolTableBase, name: Symbols.Name] RETURNS[Rope.ROPE] =
+BEGIN
+IF name = Symbols.nullName THEN RETURN[NIL] ELSE TRUSTED
+BEGIN
+ropeHolder: RopeHolder ¨ NARROW[CardTab.Fetch[cookie.stringTable, sym.htb[name].ssIndex].val]; 
+IF ropeHolder # NIL THEN RETURN[ropeHolder.rope]
+ ELSE
+BEGIN
+offset: CARDINAL ¨ sym.htb[name-Symbols.HTRecord.SIZE].ssIndex+1;
+ss: ConvertUnsafe.SubString ¨ [
+base: sym.ssb,
+offset: offset,
+length: sym.htb[name].ssIndex - offset];
+rope: Rope.ROPE;
+IF ss.offset > ss.base.length OR ss.length > CARD[ss.base.length-ss.offset] THEN ERROR MobError["bogus name"];
+rope ¨ ConvertUnsafe.SubStringToRope[ss]; -- The current DMachine Cedar version of this routine allocates new storage for the rope.  I.E., we do not end up pointing back into the symbol table.  This is good, because if we ended up pointing back into the symbol table, we would be in deep trouble if the symbol table left the symbol table cache.
+ropeHolder ¨ NEW[RopeHolderBody¨[rope]];
+IF NOT CardTab.Insert[cookie.stringTable, sym.htb[name].ssIndex, ropeHolder] THEN ERROR MobError["MobAccessImpl confused (by concurrent access?)"];
+RETURN[rope];
+END;
+END;
+END;
+
+
+
+ViewMob: Commander.CommandProc = 
+BEGIN
+args: CommanderOps.ArgumentVector ¨ CommanderOps.Parse[cmd];
+path: PFSNames.PATH ¨ PFS.PathFromRope[args[1]];
+fileSet: SystemInterface.FileSet ¨ SystemInterface.CreateFileSet[];
+BEGIN ENABLE UNWIND => SystemInterface.CloseFileSet[fileSet];
+file: SystemInterface.CirioFile ¨ SystemInterface.GetCirioFile[fileSet, path];
+mob: MobCookie ¨ CreateMobCookie[file];
+inner: PROC[mobHandle: MobUtilDefs.MobHandle, mobBase: MobDefs.MobBase, sym: SymbolTableBase] =
+BEGIN
+ERROR; -- so that we can look around with the debugger
+END;
+ExamineMob[mob, inner];
+END;
+SystemInterface.CloseFileSet[fileSet];
+END;
+
+
+Commander.Register["ViewMob", ViewMob];
+
+END..
+
+
+  4  
+MobAccessImpl.mesa
+Copyright ” 1991, 1992 by Xerox Corporation.  All rights reserved.
+Sturgis, March 1, 1990 10:16 am PST
+Last tweaked by Mike Spreitzer on December 17, 1991 9:42 am PST
+Coolidge, July 17, 1990 2:45 pm PDT
+Laurie Horton, November 30, 1990 11:49 am PST
+Willie-s, May 15, 1992 3:01 pm PDT
+
+Note: one can learn a lot by looking at [PCedar2.0]<Mimosa>MobMapperImpl.mesa
+
+MobCookies
+This implementation holds them open forever.  We probably want to do better.  In principle, they need only be in memory during an ExamineMob call.
+
+the following fields are valid only when the mob is in memory
+the following values are used for correcting coded index values that appear in DotO files
+the following value is used to accelerate validity checks on coded btis.
+the following fields are valid at all times
+the following could be delayed until an ExamineMob call
+but it must be protected by an
+UNWIND => SystemInterface.ReleaseStreamForFile[f, stream]
+for the convenience of clients
+this is adapted from [PCedar2.0]<MakeDo>CcDeps.mesa  MobStampFromTime
+The following is copied from [PCedar1.2]<Cinder>MobUtilities.mesa
+
+PBasics.Fill[where: vmh.pointer, nWords: allocatedWord32s, value: CARD.LAST];
+actually, MobMapper.AlterMob will already have made the above check, so we should never fail.
+Following is adapted from [PCedar1.2]<XLister>KLister.mesa  ProcessSymbols
+Body Tables
+
+See numerous comments on MakeSEHFromCodedSei.  They apply here with slight variations.
+This Loophole is effectively what SymbolOpsExtras.CBTIndexFromCard does.
+we accept this BTI if it bounds checks, we can find our way to the root from it, and we can find our way back to it from the root.  We maintain an accelerator in the cookie, so that we do not necessarily have to go all the way back to the root each time.
+I believe that Mobs have an even more conservative limit than 15
+we are not the root, nor are we a recent parent, so find our parent
+more than 1000 blocks in a module?
+now see if we can find ourselves from our supposed parent
+more than 1000 blocks in a module?
+this is what mob.sym.bb[card] would deliver
+addr too low
+addr far too high (this check will not prevent a bad pointer that is too close to the end of the table)
+generated depth first
+Note: we shift in the opposite direction from that which we would shift during decoding
+
+
+Module Directory
+
+
+Context Tables
+
+
+this is what mob.sym.seb[card] would deliver
+addr too low
+addr far too high (this check will not prevent a bad pointer that is too close to the end of the table)
+typical use in the D-machine debugger
+IO.PutRope[&H.tsOutStream, MobAccessImpl.CTXToRope[ctx, 0]]
+
+
+Semantic Entries code  (my own invention)
+
+This code assumes that a codedSei is obtained from an octal encoding of the offset of an se entry from the start of the se table (i.e., sei-seNull).   Further, we assume that this subtraction followed by subsequent conversion into octal was performed in the same addressing units as on the machine on which the Mob was written.
+Most of this computation must be inside Inner so that mob.leftShift and mob.rightShift will be valid
+the following shifts are suggested by code in MobMapperImpl
+further: the are are able to perform this correction here, in MobAccessImpl, rather than in DotOAccess because we assume that the C file (from which the DotO file was ultimately obtained) was written at the same time (and hence on the same machine) as this Mob file.  Hence, the corrections for addressing unit size will be the same for both files.  In addition, we must determine the correction from the Mob file, because there is no correction information recorded in the DotO file.
+The above computation is adapted from SymbolOpsExtrasImpl.SEIndexFromOffset, as suggested by MSImplE.C2CParse
+Note: we shift in the opposite direction from that which we would shift during decoding
+returns NIL if doesn't check
+checks to see if tentativeSei leads to a (supposed) context that includes self.  This is not a perfect check, but it is pretty good.  Requires a lot of accidents to succeed if the tentativeSei is actually incorrect.  Further, we don't have to depend on the client supplying a name.
+we scan through the context looking for ourselves
+we found ourselves
+
+This check is only a bounds check, and is not precise at that.  So, the contents of the record should not be trusted.
+this is what mob.sym.seb[card] would deliver
+addr too low
+addr far too high (this check will not prevent a bad pointer that is too close to the end of the table)
+This check is complete, the name can be trusted if no signal generated.  Hence the string pointer can be followed without checking.
+addr too low
+addr far too high (this check will not prevent a bad pointer that is too close to the end of the table)
+addr not exactly on an entry
+
+Note: I don't think that I can remove the two loopholes in this procedure, since  [Mimosa]<Mimosa>Mimosa>SymbolOpsImpl.UnderType contains a LOOPHOLE under similar circumstances.
+delayed fill in of the idInfoAndValue field
+(We delay because we must compute the idType SEH first, and we can't guarantee the order in which the fields are computed)
+(Further, as this is a complicated computation, it must be done offline, either in a procedure, or a separate statement.)
+if we get here, then there is an idInfoAndValue field to be filled in
+first we check to see if we are dealing with a TYPE name
+lets check to see if it is a bti
+This computation is adapted from [PCedar2.0]<Mimosa>MobMapperImpl.AlterSERecord2
+
+not a type or bti
+
+if the constant occupies one word or less, then the following will be meaningful.  Otherwise we should examine the extension table?
+
+
+I think that we are dealing with a field offset, either a variable with an offset from the frame pointer (valid only if in the frame extension, then it is really an offset within the frame extension) or a field in a record (in which case it is an offset from the start of the record).
+I may still be missing some cases.  One might be able to sort them out by looking at [PCedar2.0]<Mimosa>MobMapperImpl.AlterSERecord2, although that code is really trying to decide whether to do some alterations or not, and stops its analysis as soon as it knows.
+
+Names
+Experimental for the moment
+We assume that this will be called during the fetching of some symbol table record.
+WE MUST reduce the number of params to what we actually need
+for debugging
+main code
+example for using ViewMob
+
+ViewMob  Test.mob
+ù 3é  ñ(cedarcode) styleïNewlineDelimiter
+ô codeöúôKöú
+œeú7ôBKöú#ô#Kô?Kô#Kô-Kô"óKò öœk	ò	Kö	úûúû	úû	úûúò7Köú
+ûúòKöúûú$ò1Köú
+ûúò'Köúûúò*KöúûúòKöúûúò0Köú
+ûúò(KöûúòKöú
+ò
+KöúûúYòfKöú
+ûúòKöúûúò(Köúûú(ò1Köú	ûúûúòKöúûú"ò.KöúûúûúòKöúòKöúûúéò°Köúûúò-Köúûúìò®Köûúûúò'óò Kô óöœnúûúûúûúYûúûú!ûúûúò∆KöûòKò Kö
+üúûúûúûúûúò.Kò KöúMôMKô ô
+KôíKô Kò Köúûúûúò$öúûúûúûúò$Köú ò Köú=ô=Köú"œc#òEKòKöúòKôYKöúûúòKöúûúòKöúHôHKò3Köú+ô+KòKòKòKòKòKòKòKò óKò öüúûúûúûúòTKöúûúòóKò öüúûúûúûúòQKöúûúò*Köúûúûú'ò8Köúûúûúûúò!ò Köûúûúûú4òGKò KòKòQKòQKòNKò%Kò)Kò&Kò ô7öúôKöú9ô9óóöûúò	Kò<Köûú/ò6öúûúûúûò&Köûúûú2ò;Köûúûúûú3òEKöûúûúò.óöúûúûúûò'Köûúûú2ò;Köûúûúûú2òEKöûúûúò/óóKò KöûúòóKöú0ò0Kò2KòKöûúûúûúò#öûúûúûòKöúûúòöûú
+ûúûòöúûúòöûúûúûúò&Köûúûúò:óKòóKöûúûúòóKöûúòóKöûúòóKò öüúûúûúûúûúûúò+Köúûúûúò=óKò ö–bnúûúûúûúòPKöûòKöú%ûúò,Kò öüúûúUûòuKò!óKò Köú%ò%Kò Kò KöûúòKöûúòóKò ö°úûúûúûúòSKöûòKöú%ûúò,Kò öüúûúUûò{Kò'óKò Köú+ò+Kò Kò KöûúòKöûúòóò KôKôEóöüúûúûú,ûúòqKöûòKòVKò/Kò7KöûúòKöûúòóKò Kò öü
+úûúûúUòáKöú9ò9óKò öüúûúûúûúò<KöûòKöú
+ûúûúò2Köú
+ûúûúò2KöûúòöûúòKò óóö	üúûúûúûúûò@KöûòKöú	ûúûúò0Köúûúò1Köúûúò1Köûúûúûúûúò\KöûúòóóKò Kò KöúAôAô Kò Köúûúûúûúò!Köúûúûúûúò#Kò öüúûú
+ûúûúûú8ûúòjKöúûúûúò"Köúûúûúûú(òRKöúòKò Köûúûúûúò3Kò<KöúBûúûúôMKöûúòöúûúòKöúòKöú9ò9óKöú
+ûúò ö
+ûúûúûúûúûúòWKöûú?òDóöûú*ûúòLKöú]ô]óöúûúò!KöúòKöúòöúòKöúûú#ò0Köúûú#ò0Köúûú#ò0Köúûú#ò0Köúûú#ò0Köúûú$ò1Köúûú$ò1Köúûú#ò0Köúûú#ò0Köúûú#ò0Köúûú#ò0Köúûú$ò1Köúûú#ò0Köúûú#ò0Köúûú#ò0Köúûú#ò0Köúòóöú	ò	KòKòKòKòKòKòKòKòKòKòóKòóKòóóKò Kò ôJKò Köúûúûúò/Köúûú)òAKò öü
+úûúûúûòIKöûòKöúûúò5Köúûúò5öúûúûú(òLKöûúûúò Köûú
+ûúò,óKö	úûúûúûúûúòKKöûúûúûú-òKKö	ûúûúûúûú †òjKöûú,ûúûú"†òqKöûúòKöûúòóKò öüúûúûúûúûúûúòSKöúûúûúòKöúûúò%Köúûúûúûúò.Köúûúò0Köúûúò Kò"KòNKòMKòNKòQKòNKòQKòQKòOKòPKòQKò0Kò9Kò.öûúûúò#öûúòKöúûúòKöúûúòKöúòóöûúòKö	úûúûúûúûúòFKöúûúûúûúûúûúòZKòKöúû
+úò2KöúòóóKöûúòKòóKò óôKô KöûúûúûúòKöú	ûúò"Kò Köúûúò*Kò Köûúûúûú	òöú	ûúûúûúòKöúòKòKöúûúò
+óKò ö
+ü
+úûúûúûúûú'òQKöúûúòóKò ö
+üúûúûú'ûúûúòIKöûòKöûúûúûúûúò(öúûòKöûòKöú
+ûúûúò;Köúûúûú*ò;KöûúûúûúûúòKöúûúûúò#Köûúûú+ûúûú<òwKöûúòKöûòóKöûúòóò KôVóöüúûúûúûúûúûúòOKöûòKöúûúûúòöüúûúUûògKöûòöúûúûúûúûò#Köúû	úò?Köúû	úòAKöûúòóöú ûúò5KôHóKöúûúûú!òMKöúûú3òKöûúûúûœi–ci#òAKöûòò0Köúûúò%óKò-öûòKöúûú†ò.óKöûúòóKöûúòóKöúòKöûúòKöûúòóKò ö
+ü
+úûúûúûúûúò4Köúûú ò)óò KöúûúÏô˛óö	üúûúRûúûúûòëKöûòöûúûúò6Kô@óKò0Köûú ûúûúò<Köûú$ûúûúò@Kò öúCôCKöûòKöú	ûúòKò%KöúòKò öûòKöûú"ûúûúò.Kò öûúûúò5Kô"óKòKò öûú#ûò)Köú?ûúòEóKò KöúòKöûúòóKò Köú9ô9Kò KòLKò=Kò öûòöûúûúò5Kô"óKòöûúûòKöúûúò5óKöûú"ûúòGöûú#ûò)Kò=óKöûúòKò óKöûúòóKöûúòóKò öüúûú6ûúûòuKöûú†IòPKò öúûúûú	ûúûúûúòCKöú+ô+óKò Köúûúûúûúûú ûúò_Kò öûúûòKöúôKöúòóKò öûú/ûò5KöúgôgKöúòKò óKöûúòKöûúòóKò Köüúûúûúò/ò KôóöüúûúûúûúûúûòVKöûòöüúûúUûògKöûòKò öüúûúûò+Köúûúûúò=Kò óöüúûúûò6Köûòöûú,ûò2öûúLûúûògKöúòKòKöûúòóóKöûúòóKöúòKöúòKöûúòóKöúòKöûúòóKò öüúûúûúûúûúûúò4KöûòKöúûúûú†òöüúûúUûògKöûòKöûúûúûúò0öúûòKöûòKòKöûúûúûúòHKò0KöûúòóKöûúòóKöúòKöûú	òKöûúòóKò öüúûúûúûúûúûúò9KöûòKöúûúòöüúûúUûògöûòKôWóöú	ûúûúûòKöú û	úûúòPKöú!û	úûúòRKöûúûú
+òóKöûúòóKöúòKöûúòKöûúòóKò öüúûúûúûúò=KöûòKöú	ûúûúò,Köú	ûúûúò,KöûúòKöûúòKò óöüúûúûúûúò9KöûòKöúûúûúò*Köú"ûú
+ò4Köûúûú$ò8KöûúòóKò öüúûúûúûúûúûúò.KöûòöüúûúUûògKöûòöú
+ûú
+òöúòKöúûú&ûú	ûúòHKöú5ò5óKöú5ò5Köú-ò-Köú6ò6Köú)ò)Köú/ò/KöúòKöúòKöú;ò;óKöûúòóKö
+ûúûúûúûúûúòKöûúûúûúò1Köûú
+òKöûúòóKò öü
+úûúûúTûúûúûòñKöûòöûúûúûò+òKöûúûú<òFóòöûúûú)ò3KöúòKöúòKöú"ò"óóKöûúûú#ò3Kò óKöûúòóKò öüúûúûúTûúûúûòüKöûòöûúûúûò+öúòöûúûú-ò7Köú#ò#Köú+ò+Köú#ò#Köú!ò!KöúoòoKöúòKöúòKöúòKöúòKöúòKöúòöúûúûò KöúòKöúòKöúòKöúòKöûúûú7òGóóóòKöûúûú?òIóKöûúûú%ò5óKöûúòóKò Kò öüúûúûúûúûúûú	ûúûòoöûòöüúûúUûògKöûòKò öüúûúûò+KöûòKöúûúòKöúòKöú/ò/KöûúòKò óöüúûúûò6Köûòöûú,ûò2öûúLûúûògKöúòKòKöûúòóóKöûúòóKöúòKöûúòóóKöúòKöûúòóKò öüúûúûúûúò<Köúûú6ò=óKò ö
+üúûúûúûúûúòDKöûòKöúûúûúòöú
+ûúûú	ûúò'KöûòKò5KöûúòóKòKò+KöûúòKöûúòóKò öü
+úûúûú	ûúûúûúò<KöûòKöúûúòKö	úûúûúûúûúòKöú
+ûúûúûúüúûúûúûúûúûúòWöúûú	ûúûúò&Köúûúò!óö	úûúûú
+ûúûúòJKöûòKòKöûúûúò*KöûúòóKòKöúûúò9Kò'KöûúûúòKöûúòóóKô Kô ôKô Kô KöûúûúûúòKöú	ûúò"Kò Kò Köûúûúûú	òöú	ûúûúûúòKöúòKòKöúûúò
+óKò ö
+üúûúûú'ûúûúòIKöûòKöûúûúûúûúò(öúûòKöûòKöú
+ûúûúòKöúûúûú+ò<Kò öûúûúûúûúòKò óKöúûúûúò#Köûúûú,ûúûú<òxKöûúòKöûòóKöûúòóKò öüúûúûúûúûúûúò.KöûòöüúûúUûògKöûòKöúûúûúûú&ò:öú
+ûú
+òKòKöúFòFKöúBòBKöúòKòKò Köú3ò3KòóKöûúòóKö
+ûúûúûúûúûúòKöûúûúûúò1Köûú
+òKöûúòóKò ö
+üúûúûúûúûúò8KöúûúòKò óö
+üúûúûúûúûúò>KöúûúòKò óóôKô Kô KöûúûúûúòKöú
+ûúò$Kò Kò Köûúûúûú
+òöú
+ûúûúûúòKöúòKòKöúûúòóKò ö
+üúûúûú(ûúûúòNöûúòKöûúûúûúòKöûúûúò&óóKò öüúûú(ûúûúòMKöú
+ûúûúò=Köúûúûú+ò>Kò öûúûúûúûúò Kò óKöúûúûúò%Köûúûú-ûúûú<òyKöûúòóKò ö
+üúûúûúûúûúò6Köúûú*ò3óKò öüúûú7ûúûòwKöûòöúûúûúûúûúûúòEKöú,ô,óKöúûúûúûúûúûúò^Köûú ûúòEöûúûòKöúôKöúòóöûú.ûò4KöúgôgKöúòóKöûúòKöûúòóKò Köüúûúûúò0Kò öüúûúûúûúò>KöûòKöú	ûúûúò-Köú	ûúûúò-KöûúòKöûúòKò óöüúûúûúûúò:KöûòKöúûúûúò+Köú"ûú
+ò4Köûúûú$ò8KöûúòóKò öü	úûúûúûúûúûúò2KöûòöüúûúUûògKöûòKöúûú0ò8Köú5ò5Köúûú!ò1öûúûúûò&öúûú#ò<KöúòKöú'ò'óöúûú#ò>KöúòöúòKò#Kò$KòKöú!ò!Köú.ò.Kòóóöúûú#ò>KöúòKöú:ò:óöúûú#ò9KöúòKöúòóKöûúûú'ò7óKöûúòóKö
+ûúûúûúûúûúòKöûúûúûúò4KöûúòKöûúòóKò ö
+üúûúûúûúûúò;KöúûúòKò óö
+üúûúûúûúûúòBKöúûúòKò óKò ò ô%Köûú9ô;óóöü	úûúûú	ûúûúûúò<KöûòKö
+ûúûúûúûúûúòöúûòKöûòKöúûúòKö	úûúûúûúûúòKöúûúòKöú
+ûúûúûúüúûúûúûúûúûúòWKö	úûú$ûúûúûúòzöûúûúûòKöúûúòKöûúûú ò5öûú
+ûúûòKöúûúò&Köûú
+ûúòóKöûúòóKöûúûúòKöûòóKöûúòóóKô Kô ô)ò Kô óKöûúûúûúòKöú	ûúò"Kò Köúûúò Kò Köúûúò0Kò Kò Köûúûúûú	òöú	ûúûúûúòKöúòKòKöúûúò
+óKò Kò ö
+üúûúûú'ûúûúòIKöûòKöûúûúûúûúò(öúûòKöûòKöú
+ûúûúò;Köúûúûú+ò<öûúûúûúûúòKò óKöúûúûúò#Köûúûú,ûúûú;òxKöûúòKöûúòóKöûúòóò Kô«óöüúûúûúûúûúûúûúûòiKöûòKöúûúûúòKöúdôdöüúûúUûògKöûòöúûúûúò(Kô;Kô‰óöúûúûúûúûò#Köúû	úò?Köúû	úòAKöûúòóöú ûúò<KöúmômóKöúûúûú!òMKöúûú4òLöûúûúû¢£#òAöûòöú$ò$Köú'ûúò6óKò-öûòKöúûú†ò.óóKöûúòóKöûúòóKöúòKöûúûúûúûú&ûúûúûúò[KöûúòóKò öüúûúûúûúûúûúò9KöûòKöúûúòöüúûúUûògöûòKôWóKöú	ûúûú
+ûúûúûúòIöú	ûúûúûòKöú û	úòFKöú!û	úòHKöûúòóKöûúòóKöúòKöûúòKöûúòóò Köúûúôóöüúûúûúûúûúûúò=KöûòKöúûúòKöúûúòKö	ûúûúûúûú†%òEöûúûúûòöúûúòKöûúûúûúò-Kö	úûúûúûú¢£ò'óKöûúûúûú¢£ò2óKöûúòóò Kôôóöüúûú9ûòXKöûòKò1öûúûúûò-öú¢£!ò'KöûòKòJKòXKò$Kò Kô1öûòKò=öûúûúûúò#KôKô óöûúûúûò#öú¢£!ò'KöûòöûúûúûòKöú+ò+öúòKöú0ûúûúò<óò	KöúûúòóKöú,†1ò]Köûú#ò*óKöûòóKöûú#ò*óKöûúòóKò KöûúòóKöûú#ò*óKöûúòóò Kôuóöüúûú6ûúûòuKöûú†GòNKò öúûúûú
+ûúûúûúòDKöú,ô,óKò Köúûúûúûúûúûúò]Kò öûúûòKöúôKöúòóKò öûú-ûò3KöúgôgKöúòKò óKöûúòKöûúòóKò Köüúûú"ûúò=ò KôÉóöüúûú-ûòLKöûòKöúûúûú
+ûúûúûúò<Köúûúûúûúûúûúò]öûúûòKöúôKöúòóöûú-ûò3KöúgôgKöúòóöûúûúûúûúò8KôKöúòóKöûúòóKò Köüúûúûúò.Kò Kò öüúûúûúûúò>KöûòKöú	ûúûúò,Köú	ûúûúò,KöûúòKöûúòKò óöüúûúûúûúò:KöûòKöúûúûúò*Köú"ûú
+ò4Köûúûú$ò8KöûúòKò Kô Köüúàûúô±óöüúûúûúûúûúûúò.KöûòöüúûúUûògKöûòKöûúûúûú5ûúûú
+ûú)ûúûú@òˆKò öú
+ûúòöúûúûúûò-öúûúòKöú-ò-Köú3ò3Köú/ò/Köú%ò%Köú&ò&Köúûú†ò'Köú?ò?KòKöúòöú	ûúûúûò#KöúûúòKöúHûúòNKöú%ò%Köúûú7òHKöûúûú-ò=óóöúûúòKòöú
+ûúûúûò%Köúûúò'öú	ûúò%KòKòKòóKöú
+ûú)ò6Köúûú,ò;Köúûú'ò2öúûúò/KòKöú+ò+KòKòKòKòKòóöú
+ûúò'KöúòKöú+ò+Köú'ò'KöúòöúòKöú"ò"Köú"ò"KöúòKöúòKöú(ò(KöúòKöúòKöúòóKöúòKòKöúòKöúòKöúòKöúòöú
+ûúûúûò%KöúûúòKöú*ò*Köûúûú6òFóóöúûúò!Köú(ò(KöúòKöúòKöúòKöúòKöúòKöúòKöúòKòóöú	ûúò%Köú4ò4Köú,ò,KöúòKöú*ò*óöúûúò-Köú4ò4Köú'ò'Köú'ò'Köúòóöúûúò+KöúòöúûúûòKöúòKöúòKöúòKöúòKöúòKöúòKöúòKöûúûú1òAóKöú&ò&Köú(ò(Köúòóöúûúò/Köú'ò'KöúòKöúòóöú	ûúò%Köú)ò)Köú&ò&öúòKöú&ò&KöúòKöúòKöúòóKöú5ò5KöúòKöú'ò'Köúòóöúûúò+Köú.ò.Köú&ò&Köú4ò4KöúòKöúòKöúòKöú'ò'Köúòóöúûúò+Köú*ò*Köú.ò.Köú1ò1óöúûúò+KöúòKöúòKöúòKöú,ò,KòKòóöú
+ûúò'KöúòKöúòKöú!ò!óöúûúò#KöúòKöúòKöúòóKöúûúò%Köúûúò%Köûúûú*ò:óKöúòóKöûúûú'ò7ò Kô+Köú-ûúJôzóKôyóöûúûúûò-öúûúûúûò/òKöûòKöúEôEKò Köú/ûúô8Kò öûú&ûò,öûòKöúûúò9Köúûúò-Köúûú"ûúò`KöûúòKöûúòóóKò Kò ô KöúPôPóô KöûòKò>Köúûúûúòöûú"ûúûò1òöûúûúûòöúûúûúò2öûúûúûò#öúûú
+ûò Köú(ûúò-KöûúûúòóKöûúûúòóóöúûúò.öûúûúûò#öúûú
+ûò KöúûúòKöûúûúòóKöûúûòóóKöûúûúòóóKöûúûú=òMóKò öûúûòKöûòKöúûú*ûúûúòÜKöûúòKöûúòóKöûúòóKò KôKô öûúûú£!ò=KôÉKöûòKöúûúûúòUKöûúòKöûúòóKô Kô ôúKò KöûòKö	ú	ûúûúûú†£òMKöúûúûúûú£6òjKöúûú-òLKöûúòKöûúòóKò KöúÜôÜò Kô óöûòKöúûúòóKò KöûúòóKöûúûú9òIóKöûúûúòóKò Kò KöûúòóKò Kò óKö
+ûúûúûúûúûúòKöûúûúûúò1Köûú	òKöûúòóKò Köüúûúûú3ò[Kò ö
+üúûúûúûúûúò8KöúûúòKò óö
+üúûúûúûúûúòCKöúûúòKò óöü	úûú-ûúûò_Köûòöûòöûúûúûò!Kö	úûúûúûúûúòMKöúûúòKöûúòóKöûúò!KöûúòóKöûúòóKò öü	úûúûú	ûúûúûúò:KöûòKöúûúòKö	úûúûúûúûúòKöú
+ûúûúûúüúûúûúûúûúûúòWöúûú	ûúûúò&Köúûúò!óö	úûúûú
+ûúûúòJKöûòKòKöûúûúò*KöûúòóKöúûúûúòGöûú
+ûúûòöúûúòKöûòKò%KöúûúûúûúûúûúòmöûúûòKöúòKöú$ò$Köú$ò$Köú,ò,Köú$ò$Köú$ò$Köûúò&óöûúûòKö–ktòKöûúûúûúò;KöûúûúûúòJKöûúûúûúòGKöûúûúûúòHKöûúòóKöûúòóKöúûúò(Köûúò!óKöûúûúòKöûúòKò óóôKôKò Köúûúûúò&Köúûúûúûúò/ò KôSKöûúûú5ô<óöüúûúzûúûúòüKöûòöûúûúûúûúûúûò8KöûòKöúûú@ò_Köûúûúûúûúò0öúûòKöûòKöúûú!ûúòAòKòKöúòKöú(ò(óKöúûúòKö
+ûúûúûúûúûúònKöú*£ÆòÿKöúûúò(KöûúûúGûúûú<òìKöûúòKöûúòóKöûúòóKöûúòóóKò Kò ôKò öüúò!KöûòKò<Köúûúûúò0òCKöûúûúûú*ò=KòNKò'öúûúTò_KöûòKöûú†/ò6KöûúòóKöúòKöûúòóKöú&ò&KöûúòóóKò ô	Kò Köú'ò'ò ôKô Kö¢ôóóóKöûúòóó Öó    °  Ìƒ  

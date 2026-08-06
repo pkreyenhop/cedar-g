@@ -1,0 +1,975 @@
+
+DIRECTORY
+Basics,
+InstallationStartInfo,
+InstallationSupportPrivate,
+MesaLoadState,
+MesaLoadStateBackdoor,
+MesaLoadStateQuery,
+Process,
+Rope,
+RefTab,
+RefTabBackdoor,
+RuntimeError,
+SafeStorage,
+UXStrings;
+
+InstallationScopesImpl: CEDAR MONITOR
+IMPORTS Basics, InstallationSupportPrivate, RefTab, RefTabBackdoor, Rope, RuntimeError, UXStrings
+EXPORTS InstallationStartInfo, MesaLoadState, MesaLoadStateBackdoor, MesaLoadStateQuery
+~ BEGIN 
+
+OPEN InstallationSupportPrivate;
+InterfaceRecord: PUBLIC TYPE = InstallationSupportPrivate.InterfaceRecord;
+
+ConfigRep: PUBLIC TYPE ~ InstallationSupportPrivate.ConfigRep;
+
+ProgramRep: PUBLIC TYPE ~ InstallationSupportPrivate.ProgramRep;
+
+ProgramOrConfig: TYPE ~ MesaLoadState.ProgramOrConfig;
+ProgramAndConfigList: TYPE ~ MesaLoadState.ProgramAndConfigList;
+
+InstallationProblem: TYPE ~ MesaLoadState.InstallationProblem;
+InstallationProblems: TYPE ~ MesaLoadState.InstallationProblems;
+ReportProc: TYPE ~ MesaLoadState.ReportProc;
+
+TypeExport: TYPE = RECORD[
+name: CString,
+abstract: Type,
+concrete: Type,
+exporter: Program
+];
+
+TypeClash: TYPE = RECORD[
+name: CString,
+attempter: Program,
+exporter: Program
+];
+
+TypeExports: TYPE ~ LIST OF TypeExport;
+initialized: BOOL ¬ FALSE;
+installationScopesStarted: BOOL ¬ FALSE; -- funny business for getting the start traps for this module removed
+cedarCoreStarted: BOOL ¬ FALSE; 
+cedarCoreErrors: InstallationProblems;
+
+installationLock: BOOL ¬ FALSE; -- protects the uncommitted data structures
+installationLockReleased: CONDITION;
+
+inspectionLock: BOOL ¬ FALSE; -- protects the committed data structures
+inspectionLockReleased: CONDITION;
+
+uncommittedGlobalConfig: Config;
+newProgsAndConfigs: ProgramAndConfigList; -- progs and configs making up the current installation transaction
+currentConfig: Config;
+currentProgram: Program;
+typeClashes: LIST OF TypeClash ¬ NIL;
+interfacesNeedingWork: LIST OF Interface;
+keyInterfaceCache: Interface ¬ NEW[InterfaceRecord[0]]; -- used in Lookup to avoid allocation;
+typeExports: TypeExports ¬ NIL;
+uncommittedTypeExports: TypeExports ¬ NIL;
+lastUncommittedTypeExport: TypeExports ¬ NIL; -- for efficient catenation;
+programs: LIST OF Program ¬ NIL;
+globalConfig: Config;
+
+ExternalNames: PROC [] = TRUSTED MACHINE CODE {
+"^ExternalNames\n";
+"BeginInstallation XR_BeginInstallation\n";
+"PrepareToCommitInstallation XR_PrepareToCommitInstallation\n";
+"CommitInstallation XR_CommitInstallation\n";
+"AbortInstallation XR_AbortInstallation\n";
+"PushScope XR_PushScope\n";
+"PopScope XR_PopScope\n";
+"ImportInterface XR_ImportInterface\n";
+"ExportInterface XR_ExportInterface\n";
+"HideNames XR_HideNames\n";
+"ExportProc XR_ExportProc\n";
+"ImportProc XR_ImportProc\n";
+"PushRename XR_PushRename\n";
+"PopRename XR_PopRename\n";
+"DeclareGlobalFrame XR_DeclareGlobalFrame\n";
+"StartFrame XR_Start\n";
+"StartModule XR_StartModule\n";
+"XRStartProgram XR_StartProgram\n";
+"EnsureConfigStarted XR_StartCedarModule\n";
+"FirstControl XR_FirstControl\n";
+"AddControl XR_AddControl\n";
+"ExportVar XR_ExportVar\n";
+"ExportType XR_ExportType\n";
+"IsBound XR_IsBound\n";
+"RaiseUnbound XR_RaiseUnbound\n";
+"Unload XR_Unload\n";
+"VerboseCommit XR_VerboseCommit\n";
+};
+
+Insert: PROC[i: Interface, e: Environ] ~ TRUSTED {
+IF e=NIL OR i=NIL THEN ERROR;
+WITH erep: e­ SELECT FROM
+list => erep.list ¬ CONS[i, erep.list];
+reftab => [] ¬ RefTab.Store[erep.tab, i, i];
+ENDCASE => NULL;
+};
+
+GlobalConfig: PUBLIC PROC[] RETURNS [Config] ~ {
+RETURN[globalConfig];
+};
+
+Parent: PUBLIC PROC[object: ProgramOrConfig] RETURNS [Config] ~ {
+WITH object SELECT FROM
+c: ProgramOrConfig.config => RETURN[c.config.parent];
+p: ProgramOrConfig.program => RETURN[p.program.parent];
+ENDCASE => ERROR;
+};
+
+EnumerateChildren: PUBLIC PROC[config: Config, proc: MesaLoadState.ChildProc] ~ {
+FOR l: ProgramAndConfigList ¬ config.contents, l.rest WHILE l#NIL DO
+proc[l.first];
+ENDLOOP;
+};
+
+EnumerateInterfaces: PUBLIC PROC[config: Config, proc: MesaLoadState.InterfaceProc] ~ {
+MaybeMonitorEnumerateInterfaces[config, proc, TRUE]};
+
+UnmonitoredEnumerateInterfaces: PUBLIC PROC[config: Config, proc: MesaLoadState.InterfaceProc] ~ {
+MaybeMonitorEnumerateInterfaces[config, proc, FALSE]};
+
+MaybeMonitorEnumerateInterfaces: PROC[config: Config, proc: MesaLoadState.InterfaceProc, monitor: BOOL] ~ {
+EachInterface: PROC[interface: Interface] ~ {
+proc[interface~interface, transparent~interface.nItems=0];
+};
+MaybeMonitorEnumerateEnviron[config.interfaces, EachInterface, monitor];
+};
+
+EnumerateExports: PUBLIC PROC[program: Program, proc: MesaLoadState.ExportItemProc] ~ {
+FOR l: LIST OF ExportItem ¬ program.exportsTo, l.rest WHILE l#NIL DO
+proc[l.first.interface, l.first.item];
+ENDLOOP;
+};
+
+ObjectName: PUBLIC PROC[object: ProgramOrConfig] RETURNS [Rope.ROPE] ~ {
+WITH object SELECT FROM
+c: ProgramOrConfig.config => RETURN[UXStrings.ToRope[c.config.name]];
+p: ProgramOrConfig.program => RETURN[UXStrings.ToRope[p.program.name]];
+ENDCASE => ERROR;
+};
+
+ProgramType: PUBLIC PROC[program: Program] RETURNS[SafeStorage.Type] ~ {
+RETURN[program.type];
+};
+
+InterfaceName: PUBLIC PROC[interface: Interface] RETURNS [Rope.ROPE] ~ {
+RETURN[UXStrings.ToRope[interface.key.name]];
+};
+
+InterfaceType: PUBLIC PROC[interface: Interface] RETURNS [SafeStorage.Type] ~ {
+RETURN[interface.key.type];
+};
+
+StartFault: SIGNAL[prog: PROGRAM] ~ RuntimeError.StartFault;
+UndeclaredFrame: ERROR[frame: GlobalFrame] ~ CODE;
+
+TakeInstallationLock: ENTRY PROC[] ~ {
+ENABLE UNWIND => NULL;
+WHILE installationLock DO WAIT installationLockReleased ENDLOOP;
+installationLock ¬ TRUE;
+};
+
+GiveInstallationLock: ENTRY PROC[] ~ {
+installationLock ¬ FALSE;
+BROADCAST installationLockReleased;
+};
+
+TakeInspectionLock: ENTRY PROC[] ~ {
+ENABLE UNWIND => NULL;
+WHILE inspectionLock DO WAIT inspectionLockReleased ENDLOOP;
+inspectionLock ¬ TRUE;
+};
+
+GiveInspectionLock: ENTRY PROC[] ~ {
+inspectionLock ¬ FALSE;
+BROADCAST inspectionLockReleased;
+};
+
+BeginInstallation: PUBLIC PROC [] RETURNS [] ~ { -- XR¬BeginInstallation
+dummy: INT ¬ 1; -- for Cirio
+TakeInstallationLock[];
+IF NOT initialized THEN  {
+globalConfig ¬ NEW[ConfigRep];
+globalConfig.opaque ¬ TRUE;
+globalConfig.started ¬ TRUE;
+globalConfig.interfaces ¬ NEW[EnvironRep.list];
+currentConfig ¬ globalConfig;
+uncommittedGlobalConfig ¬ NEW[ConfigRep];
+uncommittedGlobalConfig.opaque ¬ TRUE;
+uncommittedGlobalConfig.started ¬ TRUE;
+uncommittedGlobalConfig.interfaces ¬ NEW[EnvironRep.list];
+initialized ¬ TRUE;
+};
+};
+
+CheckInstallation: PUBLIC PROC [report: ReportProc] ~ { --  XR¬PrepareToCommitInstallation 
+dummy: INT ¬ 1; -- for Cirio
+CheckDuplicate: PROC [interface: Interface] ~ {
+IF Lookup[[interface.key.name, SafeStorage.nullType], globalConfig.interfaces].found THEN report[[interface, 0, interfaceVersionMismatch[]]];
+};
+EnumerateEnviron[uncommittedGlobalConfig.interfaces, CheckDuplicate];
+FOR l: LIST OF Interface ¬ interfacesNeedingWork, l.rest WHILE l#NIL DO
+CheckInterface[l.first, report];
+ENDLOOP;
+FOR l: LIST OF TypeClash ¬ typeClashes, l.rest WHILE l#NIL DO
+report[[NIL, 0, typeClash[UXStrings.ToRope[l.first.name], l.first.attempter, l.first.exporter]]];
+ENDLOOP;
+};
+
+CheckInterface: PROC [interface: Interface, report: ReportProc] ~ {  
+dummy: INT ¬ 1; -- for Cirio
+FOR i: INT IN [0..interface.nItems) DO
+WITH interface.aux.items[i] SELECT FROM
+peItem: AuxItem.uncommittedProcExports => IF peItem.ue.rest#NIL OR peItem.itemTag IN [startTrap..bound] THEN {
+FOR l: LIST OF UncommittedProcExport ¬ peItem.ue, l.rest WHILE l#NIL DO
+IF peItem.itemTag=empty THEN report[[interface, i, multipleExports[l.first.exporter]]]
+ELSE report[[interface, i, reExport[l.first.exporter]]];
+ENDLOOP;
+};
+veItem: AuxItem.uncommittedVarExport => IF veItem.uv.rest#NIL OR veItem.itemTag#empty THEN {
+FOR l: LIST OF UncommittedVarExport ¬ veItem.uv, l.rest WHILE l#NIL DO
+IF veItem.itemTag=empty THEN report[[interface, i, multipleExports[l.first.exporter]]]
+ELSE report[[interface, i, reExport[l.first.exporter]]];
+ENDLOOP;
+};
+piItem: AuxItem.importDesired => {
+FOR l: LIST OF ImportDesired ¬ piItem.ui, l.rest WHILE l#NIL DO
+report[[interface, i, unboundImport[l.first.importer]]]
+ENDLOOP;
+};
+ENDCASE => NULL; 
+ENDLOOP;
+};
+
+CommitInstallation: PUBLIC PROC [] RETURNS [] ~ { --  XR¬CommitInstallation 
+dummy: INT ¬ 1; -- for Cirio
+MakeCommitted: PROC [interface: Interface] ~ {
+Insert[interface, globalConfig.interfaces];
+};
+TakeInspectionLock[];
+EnumerateEnviron[uncommittedGlobalConfig.interfaces, MakeCommitted];
+EmptyInterfaces[uncommittedGlobalConfig];
+FOR l: ProgramAndConfigList ¬ uncommittedGlobalConfig.contents, l.rest WHILE l#NIL DO
+globalConfig.contents ¬ CONS[l.first, globalConfig.contents];
+ENDLOOP;
+uncommittedGlobalConfig.contents ¬ NIL;
+FOR needsWork: LIST OF Interface ¬ interfacesNeedingWork, needsWork.rest WHILE needsWork#NIL DO
+CommitInterface[needsWork.first];
+ENDLOOP;
+IF lastUncommittedTypeExport#NIL THEN {
+lastUncommittedTypeExport.rest ¬ typeExports;
+typeExports ¬ uncommittedTypeExports;
+uncommittedTypeExports ¬ lastUncommittedTypeExport ¬ NIL;
+typeClashes ¬ NIL;
+};
+interfacesNeedingWork ¬ NIL;
+newProgsAndConfigs ¬ NIL;
+GiveInspectionLock[];
+GiveInstallationLock[];
+};
+
+CommitInterface: PROC [interface: Interface] ~ {
+dummy: INT ¬ 1; -- for Cirio
+FOR i: INT IN [0..interface.nItems) DO
+CommitItem[interface, i];
+ENDLOOP;
+};
+
+CommitItem: PROC [interface: Interface, i: INT] ~ {
+dummy: INT ¬ 1; -- for Cirio
+WITH interface.aux.items[i] SELECT FROM
+n: AuxItem.none => RETURN;
+up: AuxItem.uncommittedProcExports => {
+SELECT TRUE FROM
+interface.aux.prohibitDuplicateExports AND up.itemTag IN [startTrap..bound] => NULL;
+ENDCASE => {
+OPEN pe~~up.ue.first;
+prev: POINTER TO TrapDescriptor ~ 
+IF interface.aux.items[i].itemTag = unboundTrap THEN LOOPHOLE[interface.items[i]] ELSE NIL;
+interface.items[i] ¬ GetStartTrap[pe.unitsOut, pe.unitsIn, pe.argsIn, pe.exporter, pe.proc];
+interface.aux.items[i].itemTag ¬ startTrap;
+IF prev#NIL THEN TRUSTED{ prev.shadowedProc ¬ LOOPHOLE[interface.items[i]] };
+};
+};
+uv: AuxItem.uncommittedVarExport => {
+SELECT TRUE FROM
+interface.aux.prohibitDuplicateExports AND uv.itemTag=bound => NULL;
+ENDCASE => {
+interface.items[i] ¬ LOOPHOLE[uv.uv.first.varPtr];
+interface.aux.items[i].itemTag ¬ bound;
+};
+};
+id: AuxItem.importDesired => {
+SELECT TRUE FROM
+id.itemTag IN [unboundTrap..bound] => NULL;
+ENDCASE => {
+interface.items[i] ¬ GetUnboundTrap[id.ui.first.unitsOut, id.ui.first.unitsIn, id.ui.first.argsIn];
+interface.aux.items[i].itemTag ¬ unboundTrap;
+};
+};
+ENDCASE;
+TRUSTED {interface.aux.items[i].uncommitted ¬ none[]};
+};
+
+AbortInstallation: PUBLIC PROC [] RETURNS [] ~ { --  XR¬AbortInstallation 
+dummy: INT ¬ 1; -- for Cirio
+EmptyInterfaces[uncommittedGlobalConfig];
+FOR needsWork: LIST OF Interface ¬ interfacesNeedingWork, needsWork.rest WHILE needsWork#NIL DO
+AbortInterface[needsWork.first];
+ENDLOOP;
+interfacesNeedingWork ¬ NIL;
+uncommittedGlobalConfig.contents ¬ NIL;
+newProgsAndConfigs ¬ NIL;
+uncommittedTypeExports ¬ lastUncommittedTypeExport ¬ NIL;
+typeClashes ¬ NIL;
+GiveInstallationLock[];
+};
+
+AbortInterface: PROC [interface: Interface] ~ {
+dummy: INT ¬ 1; -- for Cirio
+FOR i: INT IN [0..interface.nItems) DO
+AbortItem[interface, i];
+ENDLOOP;
+};
+
+AbortItem: PROC [interface: Interface, i: INT] ~ {
+dummy: INT ¬ 1; -- for Cirio
+SELECT interface.aux.items[i].auxTag FROM
+none => RETURN;
+ENDCASE => TRUSTED {interface.aux.items[i].uncommitted ¬ none[]};
+};
+
+NewEnvironRefTab: PROC [] RETURNS [environ: Environ] ~ {
+RETURN [NEW[EnvironRep ¬ [reftab[tab: RefTab.Create[equal~InterfaceMatch, hash~InterfaceHash]]]]];
+};
+
+InterfaceMatch: RefTab.EqualProc ~ TRUSTED {
+k1: Interface ¬ LOOPHOLE[key1];
+k2: Interface ¬ LOOPHOLE[key2];
+RETURN[KeyMatch[k1.key, k2.key]];
+};
+
+InterfaceHash: RefTab.HashProc ~ TRUSTED {
+k: Interface ¬ LOOPHOLE[key];
+name: CString ¬ k.key.name;
+hash: CARD ¬ 0;
+i: CARD ¬ 0;
+WHILE name[i] # '\000 DO
+hash ¬ hash + ORD[name[i]];
+i ¬ i+1;
+ENDLOOP;
+RETURN[ hash ];
+};
+
+PushScope: PROC [name: CString] ~ { --  XR¬PushScope 
+dummy: INT ¬ 1; -- for Cirio
+IF NOT initialized THEN BeginInstallation[]; -- once only;
+IF currentConfig=globalConfig AND currentProgram#NIL THEN {
+CommitInstallation[]; -- bogus, but until the clients are reworked to do their own commits, it's necessary.
+currentProgram ¬ NIL;
+};
+{
+newScope: Config ¬ NEW[ConfigRep ¬ [currentConfig, name, [NIL, NIL], NIL, FALSE, IF installationScopesStarted THEN NewEnvironRefTab[] ELSE NEW[EnvironRep.list], FALSE]];
+IF currentConfig=globalConfig THEN {
+uncommittedGlobalConfig.contents ¬ CONS[[config[newScope]], uncommittedGlobalConfig.contents]
+}
+ELSE currentConfig.contents ¬ CONS[[config[newScope]], currentConfig.contents];
+currentConfig ¬ newScope;
+currentProgram ¬ NIL;
+};
+};
+
+PopScope: PROC [] RETURNS [] ~ { -- XR¬PopScope
+dummy: INT ¬ 1; -- for Cirio
+IF currentConfig.parent = NIL THEN ERROR;
+currentConfig ¬ currentConfig.parent;
+currentProgram ¬ NIL;
+};
+
+
+ImportInterface: PROC [name: CString, type: Type, size: INT] RETURNS [Interface] ~ { -- XR¬ImportInterface
+key: Key ~ [name, type];
+RETURN [GetAnyInterface[key~key, size~size, config~currentConfig]];
+};
+
+ExportInterface: PROC [name: CString, type: Type, size: INT] RETURNS [Interface] ~ { -- XR¬ExportInterface
+key: Key ~ [name, type];
+RETURN[ GetAnyInterface[key~key, size~size, config~currentConfig] ];
+};
+
+GetAnyInterface: PROC [key: Key, size: INT, config: Config] RETURNS [interface: Interface] ~ {
+found: BOOL ¬ FALSE;
+IF config=globalConfig THEN [found, interface] ¬ Lookup[key, uncommittedGlobalConfig.interfaces];
+IF NOT found THEN [found, interface] ¬ Lookup[key, config.interfaces];
+SELECT TRUE FROM
+config.opaque AND ~found => {
+IF key.type # SafeStorage.nullType THEN {
+interface ¬ NewInterface[size, key];
+IF config=globalConfig THEN Insert[ interface, uncommittedGlobalConfig.interfaces ]
+ELSE Insert[ interface, config.interfaces ];
+};
+};
+config.opaque AND found => 
+IF interface.nItems=0 THEN RETURN [ GetAnyInterface[key, size, config.parent] ]
+ELSE RETURN[ interface ];
+~config.opaque AND ~found => {
+Insert[ NewInterface[0, key], config.interfaces ];
+RETURN [GetAnyInterface[key, size, config.parent]];
+};
+~config.opaque AND found => RETURN [GetAnyInterface[key, size, config.parent]];  -- Imports and Exports of the same interface from a config will cause this 
+ENDCASE => NULL; 
+};
+
+HideNames: PROC [] RETURNS [] ~ { -- XR¬HideNames
+dummy: INT ¬ 1; -- for Cirio
+currentConfig.opaque ¬ TRUE;
+};
+
+NewInterface: PROC [size: INT, key: Key] RETURNS [interface: Interface] ~ {
+dummy: INT ¬ 1; -- for Cirio
+interface ¬ NEW[ InterfaceRecord[size] ];
+interface.key ¬ key;
+IF size > 0 THEN {
+interface.aux ¬ NewAuxInterface[size];
+interface.aux.prohibitDuplicateExports ¬ FALSE;
+interface.aux.unique ¬ FALSE;
+};
+};
+
+NewAuxInterface: PROC [size: INT] RETURNS [aux: AuxInterface] ~ TRUSTED {
+dummy: INT ¬ 1; -- for Cirio
+aux ¬ NEW[ AuxInterfaceRecord[size] ];
+FOR i: INT IN [0..size) DO
+aux.items[i] ¬ [empty, none[]];
+ENDLOOP;
+};
+
+ExportProc: PROC [interface: Interface, item: CARD, proc: PROC, unitsOut: CARD, unitsIn: CARD, argsIn: CARD] ~ TRUSTED { -- XR¬ExportProc
+dummy: INT ¬ 1; -- for Cirio
+WITH it~~interface.aux.items[item] SELECT FROM
+none, importDesired => it.uncommitted ¬ uncommittedProcExports[LIST[[proc, unitsOut, unitsIn, argsIn, currentProgram]]];
+uncommittedProcExports => it.ue ¬ CONS[[proc, unitsOut, unitsIn, argsIn, currentProgram], it.ue];
+uncommittedVarExport => ERROR;
+ENDCASE;
+InterfaceNeedsWork[interface];
+currentProgram.exportsTo ¬ CONS[[interface, item], currentProgram.exportsTo];
+};
+
+ImportProc: PROC [interface: Interface, item: CARD, unitsOut: CARD, unitsIn: CARD, argsIn: CARD] ~ TRUSTED { -- XR¬ImportProc
+dummy: INT ¬ 1; -- for Cirio
+IF interface.aux.items[item].itemTag IN [startTrap..bound] THEN RETURN;
+WITH it~~interface.aux.items[item] SELECT FROM
+none => interface.aux.items[item].uncommitted ¬ importDesired[LIST[[unitsOut, unitsIn, argsIn, currentProgram]]]; 
+importDesired => it.ui ¬ CONS[[unitsOut, unitsIn, argsIn, currentProgram], it.ui];
+uncommittedProcExports =>  NULL;
+uncommittedVarExport => ERROR;
+ENDCASE;
+InterfaceNeedsWork[interface];
+};
+
+ExportVar: PROC [interface: Interface, item: CARD, addr: POINTER] ~ TRUSTED { -- XR¬ExportVar
+dummy: INT ¬ 1; -- for Cirio
+WITH it~~interface.aux.items[item] SELECT FROM
+none, importDesired => it.uncommitted ¬ uncommittedVarExport[LIST[[addr, currentProgram]]];
+uncommittedProcExports => ERROR;
+uncommittedVarExport => it.uv ¬ CONS[[addr, currentProgram], it.uv];
+ENDCASE;
+InterfaceNeedsWork[interface];
+};
+
+ExportType: PROC [typeName: CString, abstract, concrete: Type] ~ TRUSTED { -- XR¬ExportType
+export: TypeExports ¬ FindExporter[abstract, uncommittedTypeExports];
+doExport: BOOL ¬ TRUE;
+IF export=NIL THEN export ¬ FindExporter[abstract, typeExports];
+SELECT TRUE FROM
+export#NIL AND export.first.concrete#concrete => {
+typeClashes ¬ CONS[[typeName, currentProgram, export.first.exporter], typeClashes];
+};
+export#NIL AND export.first.concrete=concrete => doExport ¬ FALSE;
+ENDCASE => NULL;
+IF doExport THEN {
+IF uncommittedTypeExports=NIL THEN uncommittedTypeExports ¬ lastUncommittedTypeExport ¬ LIST[[typeName, abstract, concrete, currentProgram]]
+ELSE uncommittedTypeExports ¬ CONS[[typeName, abstract, concrete, currentProgram], uncommittedTypeExports];
+};
+};
+
+FindExporter: PROC [abstract: Type, list: TypeExports] RETURNS [TypeExports] ~ {
+FOR l: TypeExports ¬ list, l.rest WHILE l#NIL DO
+IF l.first.abstract = abstract THEN RETURN[l];
+ENDLOOP;
+RETURN[NIL];
+};
+
+ConcreteTypeFromAbstractType: PUBLIC PROC[abstract: SafeStorage.Type] RETURNS[concrete: SafeStorage.Type] ~ {
+export: TypeExports ¬ FindExporter[abstract, typeExports];
+IF export#NIL THEN RETURN[export.first.concrete] ELSE RETURN [SafeStorage.nullType];
+};
+
+InterfaceNeedsWork: PROC [interface: Interface] ~ {
+dummy: INT ¬ 1; -- for Cirio
+FOR ints: LIST OF Interface ¬ interfacesNeedingWork, ints.rest WHILE ints # NIL DO
+IF ints.first = interface THEN RETURN;
+ENDLOOP;
+interfacesNeedingWork ¬ CONS[interface, interfacesNeedingWork];
+};
+
+StartTrapAuxInfo: TYPE ~ RECORD[ procDesc: ProcDescriptor, exporter: Program];
+
+GetStartTrap: PROC [unitsOut, unitsIn, argsIn: CARD, prog: Program, proc: PROC] RETURNS [LinkItem.proc] ~ TRUSTED {
+original: Proc ¬ LOOPHOLE[proc];
+GetStartTrapCode: PROC[unitsOut, unitsIn, argsIn: CARD] RETURNS[POINTER] ~ TRUSTED MACHINE CODE {
+"XR_GetStartTrap"
+};
+trapInfo: REF StartTrapAuxInfo ~ LOOPHOLE[NEW[StartTrapAuxInfo]];
+trapInfo.procDesc ¬ original­;
+trapInfo.exporter ¬ prog;
+original­ ¬ [GetStartTrapCode[unitsOut, unitsIn, argsIn], LOOPHOLE[trapInfo]];
+RETURN[ LOOPHOLE[original] ];
+};
+ 
+GetUnboundTrap: PROC [unitsOut, unitsIn, argsIn: CARD] RETURNS [LinkItem.proc] ~ TRUSTED {
+GetUnboundTrapCode: PROC[unitsOut, unitsIn, argsIn: CARD] RETURNS[POINTER] ~ TRUSTED MACHINE CODE {
+"XR_GetUnboundTrap"
+};
+trapDesc: POINTER TO TrapDescriptor ~ AllocateTrapDescriptor[];
+trapDesc­ ¬ [[GetUnboundTrapCode[unitsOut, unitsIn, argsIn], unbound], NIL];
+RETURN[ LOOPHOLE[trapDesc] ];
+};
+ 
+trapDescriptors: LIST OF REF DescriptorSegment ¬ NIL;
+MaxDescriptorsPerSegment: CARD = (4096/BYTES[TrapDescriptor]) - 4;
+DescriptorSegment:  TYPE ~ ARRAY [0..MaxDescriptorsPerSegment) OF TrapDescriptor;
+nextDescriptor: CARD ¬ 0;
+
+
+AllocateTrapDescriptor: PROC [] RETURNS [d: POINTER TO TrapDescriptor] ~ {
+IF trapDescriptors=NIL OR nextDescriptor=MaxDescriptorsPerSegment THEN {
+trapDescriptors ¬ CONS[NEW[DescriptorSegment], trapDescriptors];
+nextDescriptor ¬ 0;
+};
+TRUSTED { d ¬ @(trapDescriptors.first[nextDescriptor]) };
+nextDescriptor ¬ nextDescriptor.SUCC;
+};
+
+Lookup: PROC [ key: Key, e: Environ ] RETURNS [found: BOOL, interface: Interface] ~ {
+WITH e­ SELECT FROM
+listrep: EnvironRep.list => {
+FOR l: LIST OF Interface ¬ listrep.list, l.rest WHILE l#NIL DO
+IF KeyMatch[l.first.key, key] THEN RETURN[TRUE, l.first]; 
+ENDLOOP;
+RETURN[FALSE, NIL];
+};
+tabrep: EnvironRep.reftab => TRUSTED {
+found: BOOL;
+interface: REF;
+keyInterfaceCache.key ¬ key;
+[found, interface] ¬ RefTab.Fetch[tabrep.tab, keyInterfaceCache];
+RETURN[found, LOOPHOLE[interface]];
+};
+ENDCASE;
+RETURN[FALSE, NIL];
+};
+
+EnumerateEnviron: PROC [e: Environ, p: PROC[interface: Interface]] ~ {
+MaybeMonitorEnumerateEnviron[e, p, TRUE]};
+
+MaybeMonitorEnumerateEnviron: PROC [e: Environ, p: PROC[interface: Interface], monitor: BOOL] ~ {
+WITH e­ SELECT FROM
+listrep: EnvironRep.list => {
+FOR l: LIST OF Interface ¬ listrep.list, l.rest WHILE l#NIL DO
+p[l.first]; 
+ENDLOOP;
+};
+tabrep: EnvironRep.reftab => {
+EachPair: RefTab.EachPairAction ~ TRUSTED {
+p[LOOPHOLE[val]];
+};
+[] ¬ (IF monitor THEN RefTab.Pairs ELSE RefTabBackdoor.UnmonitoredPairs)[tabrep.tab, EachPair];
+};
+ENDCASE => NULL;
+};
+EmptyInterfaces: PROC[ config: Config ] ~ TRUSTED {
+WITH erep: config.interfaces­ SELECT FROM
+list => erep.list ¬ NIL;
+reftab => RefTab.Erase[erep.tab];
+ENDCASE => NULL;
+};
+
+KeyMatch: PROC[ k1, k2: Key ] RETURNS [BOOL] ~ {
+dummy: INT ¬ 1; -- for Cirio
+IF strcmp[k1.name, k2.name]#0 THEN RETURN[FALSE];
+IF k1.type=SafeStorage.nullType OR k2.type=SafeStorage.nullType THEN RETURN[TRUE];
+RETURN[k1.type=k2.type];
+};
+
+strcmp: PROC [s1, s2: CString] RETURNS[INT] ~ TRUSTED MACHINE CODE {
+"strcmp"
+};
+
+PushRename: PROC [] RETURNS [] ~ { -- XR¬PushRename 
+NULL;
+};
+
+PopRename: PROC [] RETURNS [] ~ { -- XR¬PopRename 
+NULL
+};
+
+
+DeclareGlobalFrame: PROC [name: CString, frame: GlobalFrame, type: Type, main: PROC]  ~ { -- XR¬DeclareGlobalFrame 
+IF currentConfig=globalConfig AND currentProgram#NIL THEN CommitInstallation[]; -- bogus but necessary 'til clients are fixed;
+{
+program: Program ~ NEW[ProgramRep ¬ [name, frame, type, main, currentConfig, NIL, FALSE]];
+IF currentConfig=globalConfig THEN uncommittedGlobalConfig.contents ¬ CONS[[program[program]], uncommittedGlobalConfig.contents]
+ELSE currentConfig.contents ¬ CONS[[program[program]], currentConfig.contents];
+programs ¬ CONS[program, programs];
+currentProgram ¬ program;
+};
+};
+
+ProgramFromFrame: PROC  [frame: GlobalFrame] RETURNS[Program] ~ {
+dummy: INT ¬ 1; -- for Cirio
+FOR l: LIST OF Program ¬ programs, l.rest WHILE l#NIL DO
+IF l.first.frame = frame THEN RETURN[l.first];
+ENDLOOP;
+RETURN[NIL];
+};
+
+DoStartConfig: PROC [config: Config] ~ { 
+dummy: INT ¬ 1;
+config.started ¬ TRUE;
+FOR l: ProgramAndConfigList ¬ config.controlModule.first, l.rest WHILE l#NIL DO
+WITH l.first SELECT FROM
+config: ProgramOrConfig.config => DoStartConfig[config.config];
+program: ProgramOrConfig.program => DoStartProgram[program.program];
+ENDCASE => ERROR;
+ENDLOOP;
+};
+
+DoStartProgram: PROC [program: Program] ~ {
+startedInstallationScopes: BOOL ¬ installationScopesStarted;
+IF program.started THEN RETURN;
+IF FixStartTraps[program] THEN {
+program.main[];
+startedInstallationScopes ¬ (startedInstallationScopes#installationScopesStarted);
+IF startedInstallationScopes THEN [] ¬ FixStartTraps[program];
+};
+};
+
+startOrder: LIST OF Program ¬ NIL;
+ListStartOrder: PUBLIC PROC RETURNS [list: LIST OF Rope.ROPE ¬ NIL] ~ {
+FOR tail: LIST OF Program ¬ startOrder, tail.rest UNTIL tail = NIL DO
+list ¬ CONS[QualifiedName[[program[tail.first]]], list];
+ENDLOOP;
+};
+
+FixStartTraps: ENTRY PROC [program: Program] RETURNS [doStart: BOOL] ~ {
+doStart ¬ NOT program.started;
+program.started ¬ TRUE;
+
+FOR l: LIST OF ExportItem ¬ program.exportsTo, l.rest WHILE l#NIL DO
+int: Interface ~ l.first.interface;
+item: INT ~  l.first.item;
+{
+IF int.aux.items[item].itemTag = startTrap THEN TRUSTED {
+t: POINTER TO ProcDescriptor ¬ LOOPHOLE[int.items[item]];
+trapInfo: REF StartTrapAuxInfo ¬ NARROW[LOOPHOLE[t.linkInfo, REF]];
+IF trapInfo.exporter = program THEN {
+t­ ¬ trapInfo.procDesc;
+int.aux.items[item].itemTag ¬ bound;
+};
+}; 
+};
+ENDLOOP;
+IF doStart THEN startOrder ¬ CONS[program, startOrder];
+};
+
+
+EnsureConfigStarted: PROC [config: Config] ~ { -- XR¬StartCedarModule
+IF config=NIL THEN RETURN;
+IF config.started THEN RETURN;
+IF cedarCoreStarted THEN {
+EnsureConfigStarted[config.parent];
+IF config.started THEN RETURN;
+}
+ELSE cedarCoreStarted ¬ TRUE;
+DoStartConfig[config];
+};
+
+StartFrame: PROC [frame: GlobalFrame]  ~ { -- XR¬Start 
+IF frame=NIL THEN RETURN;
+{
+program: Program ¬ ProgramFromFrame[frame];
+IF program=NIL THEN ERROR UndeclaredFrame[frame];
+IF program.started THEN ERROR StartFault[LOOPHOLE[program]];
+StartProgram[program];
+};
+};
+
+StartModule: PROC [args: POINTER, frame: GlobalFrame, rets: POINTER]  ~ { -- XR¬StartModule 
+StartFrame[frame];
+};
+
+startTrapped: LIST OF Program ¬ NIL;
+ListStartTraps: PUBLIC PROC RETURNS [list: LIST OF Rope.ROPE ¬ NIL] ~ {
+FOR tail: LIST OF Program ¬ startTrapped, tail.rest UNTIL tail = NIL DO
+list ¬ CONS[QualifiedName[[program[tail.first]]], list];
+ENDLOOP;
+};
+
+LogStartTrap: ENTRY PROC [program: Program] ~ {
+startTrapped ¬ CONS[program, startTrapped];
+};
+
+XRStartProgram: PROC [program: Program] ~ { -- XR_StartProgram
+LogStartTrap[program];
+StartProgram[program];
+};
+
+StartProgram: PROC [program: Program] ~ { -- XR¬StartProgram
+IF currentConfig=globalConfig AND currentProgram=program THEN { -- bogus auto-commit until clients are fixed;
+CommitInstallation[];
+currentProgram ¬ NIL;
+};
+
+EnsureConfigStarted[program.parent];
+IF program.started THEN RETURN;
+DoStartProgram[program];
+};
+
+FirstControl: PROC [] RETURNS [Config] ~ { -- XR¬FirstControl
+dummy: INT ¬ 1; -- for Cirio
+RETURN[currentConfig];
+};
+
+AddToCM: PROC [item: ProgramOrConfig] ~ { 
+dummy: INT ¬ 1; -- for Cirio
+IF currentConfig.controlModule.first = NIL THEN {
+currentConfig.controlModule.first ¬ LIST[item];
+currentConfig.controlModule.last ¬ currentConfig.controlModule.first
+}
+ELSE {
+currentConfig.controlModule.last.rest ¬ LIST[item];
+currentConfig.controlModule.last ¬ currentConfig.controlModule.last.rest;
+};
+};
+
+AddControl: PROC [name: CString] ~ { -- XR¬AddControl 
+itemName: CString;
+FOR l: ProgramAndConfigList ¬ currentConfig.contents, l.rest WHILE l#NIL DO
+WITH l.first SELECT FROM
+program: ProgramOrConfig.program => itemName ¬ program.program.name;
+config: ProgramOrConfig.config => itemName ¬ config.config.name;
+ENDCASE;
+IF strcmp[itemName, name]=0 THEN {
+AddToCM[l.first];
+EXIT
+};
+ENDLOOP;
+};
+
+RaiseUnbound: PROC [p: PROC ANY RETURNS ANY] ~ TRUSTED { -- XR¬RaiseUnbound
+newProc: PROC ANY RETURNS ANY ¬ SIGNAL RuntimeError.UnboundProcedureFault[p];
+r: REF TrapDescriptor ¬ NARROW[LOOPHOLE[p]];
+r.procDesc ¬ LOOPHOLE[newProc, Proc]­;
+};
+
+IsBound: PROC [p: PROC ANY RETURNS ANY] RETURNS [BOOL] ~ TRUSTED { --XR¬IsBound
+t: Proc ¬ LOOPHOLE[p];
+IF t=NIL THEN RETURN[FALSE];
+IF t.linkInfo=unbound THEN RETURN[FALSE];
+RETURN[TRUE];
+};
+
+Unload: PROC [config: Config] RETURNS [] ~ { -- XR¬Unload
+ERROR;
+};
+
+CedarCoreReport: ReportProc ~ {
+cedarCoreErrors ¬ CONS[problem, cedarCoreErrors];
+};
+
+QualifiedName: PUBLIC PROC [pc: MesaLoadState.ProgramOrConfig] RETURNS [Rope.ROPE] ~ {
+WITH pc SELECT FROM
+p: MesaLoadState.ProgramOrConfig.program => {
+RETURN[Rope.Concat[QualifiedName[[config[p.program.parent]]], UXStrings.ToRope[p.program.name]]];
+};
+c: MesaLoadState.ProgramOrConfig.config => {
+IF c.config=globalConfig THEN RETURN[NIL] 
+ELSE RETURN[Rope.Cat[QualifiedName[[config[c.config.parent]]],  UXStrings.ToRope[c.config.name], Rope.FromChar['.]]];
+};
+ENDCASE => RETURN[NIL];
+};
+
+ProgramListFromName: PUBLIC PROC[name: Rope.ROPE, optionalList: LIST OF Program ¬ NIL]
+RETURNS[LIST OF Program] ~ {
+makeCopy: BOOL ~ optionalList = NIL;
+copy, copyTail: LIST OF Program ¬ NIL;
+cName: CString ~ UXStrings.Create[name];
+start: LIST OF Program ¬ programs;
+IF optionalList # NIL THEN {
+IF strcmp[cName, optionalList.first.name] = 0 THEN optionalList ¬ optionalList.rest;
+IF optionalList = NIL THEN RETURN[NIL];
+start ¬ optionalList;
+};
+FOR p: LIST OF Program ¬ start, p.rest UNTIL p = NIL DO
+IF strcmp[cName, p.first.name] = 0 THEN RETURN[p];
+ENDLOOP;
+RETURN[NIL];
+};
+
+ConvertToRefTab: PROC [] ~ {
+TakeInstallationLock[];
+TakeInspectionLock[];
+WITH globalConfig.interfaces­ SELECT FROM
+elist: EnvironRep.list => {
+lsave: LIST OF Interface ¬ elist.list;
+tab: RefTab.Ref ¬ RefTab.Create[equal~InterfaceMatch, hash~InterfaceHash];
+FOR l: LIST OF Interface ¬ lsave, l.rest WHILE l#NIL DO
+[] ¬ RefTab.Insert[tab, l.first, l.first];
+ENDLOOP;
+globalConfig.interfaces ¬ NEW[EnvironRep ¬ [reftab[tab]]];
+};
+ENDCASE => NULL;
+GiveInstallationLock[];
+GiveInspectionLock[];
+};
+
+PutCedarCoreProblems: PROC [] RETURNS [] ~ {
+IF cedarCoreErrors # NIL AND Basics.IsBound[InstallationSupportPrivate.DefaultProblemPrinter] THEN {
+InstallationSupportPrivate.DefaultProblemPrinter[cedarCoreErrors];
+};
+};
+
+VerboseCommit: PROC [] RETURNS [] ~ { -- XR¬VerboseCommit
+problems: InstallationProblems;
+RecordProblems: ReportProc ~ {
+problems ¬ CONS[problem, problems];
+};
+CheckInstallation[RecordProblems];
+CommitInstallation[];
+IF problems#NIL AND Basics.IsBound[InstallationSupportPrivate.DefaultProblemPrinter] THEN InstallationSupportPrivate.DefaultProblemPrinter[problems];
+};
+
+EnableAborts: PROC [pCondition: Process.ConditionPointer] = {
+DoIt: PROC [pCondition: Process.ConditionPointer] ~ TRUSTED MACHINE CODE {
+"XR_EnableAborts"
+};
+DoIt[pCondition];
+};
+
+
+CheckInstallation[CedarCoreReport];
+CommitInstallation[];
+ConvertToRefTab[];
+TRUSTED { EnableAborts[@installationLockReleased] };
+TRUSTED { EnableAborts[@inspectionLockReleased] };
+ExternalNames[];
+installationScopesStarted ¬ TRUE;
+END.
+
+   ¨  
+InstallationScopesImpl.mesa
+Copyright Ó 1990, 1991, 1992, 1993 by Xerox Corporation.  All rights reserved.
+Chauser, March 5, 1993 2:18 pm PST
+Willie-s, March 9, 1993 2:17 pm PST
+Michael Plass, November 6, 1992 4:39 pm PST
+Protocol:
+Clients doing installations should bracket sequences of calls on the installation routines with BeginInstallation[]..CommitInstallation[] or BeginInstallation[]..AbortInstallation[].  Sequences ending with AbortInstallation have no effect.  Concurrent clients, each following this protocol, will be properly synchronized with one another.
+Clients using the inspection procedures (enumerate?...) will not see uncommitted updates (those that would disappear were an AbortInstallation[] to occur).
+
+Types Exported to MesaLoadState  
+Types Exported to MesaLoadState  
+Local Types
+  
+Global variables
+These global variables are not monitored; they are updated only while there is but a single thread in the world.  They are used to coordinate the delicate dance of getting this module and CedarCore installed and started. 
+These global variables are protected by the MONITOR lock
+These global variables are protected by the Installation lock
+
+These global variables are protected by the Inspection lock
+ExternalNames
+remember, nullType acts as a wild-card. The fact that the typed interface is in uncommittedGlobalConfig implies that it is not in globalConfig.  Hence, any match with the wildcard is a versionMismatch. 
+walk the data structures finding out what might be wrong and reporting to the client.
+walk the data structures finding out what might be wrong and reporting to the client.
+move uncommitted global names to the committed data structures.  Also uncommitted interface changes to the committed interfaces.
+toss the uncommitted changes in the global config and interface records.
+IF currentConfig=globalConfig THEN {
+CommitInstallation[]; -- bogus, but until the clients are reworked to do their own commits, it's necessary.
+};
+If there's going to be one, it's going to be here.
+Theres's already one here; cases: transparent or not
+It won't be here.
+this is a real interface, not an entry denoting transparency.
+Global Frame Support
+Warning: calls into this module and InstallationTypesImpl prior to the time this procedure is called for the first time will allocate objects with 0 type code in them, instead of the correct one.  This shouldn't be a problem because these are never used in NARROW or ISTYPE, but it could get clients in trouble if they are allowed to escape from this module.  The objects in question are the globalConfig, the CedarCore config and the InstallationSupportPackage config, together with some of the list elements they point to.
+This funny business gets the start traps for this module, InstallationScopesImpl, removed after the start code is run.  (Because this module's installation isn't complete until after it's start code is run!)
+put the original proc descriptor back into the global frame in place of the descriptor for the trap.
+This is called by Cinder-generated code, e.g. XR_StartCedarModule(firstControl)
+makes sure all of config's ancestors are started, then starts config.
+CedarCore must always be the first thing started, even if it is contained in another config.  Furthermore, its being started does not depend on the parent being started, so, we just use a 'first time flag' to not start the parent in the course of starting CedarCore.
+This is called by Mimosa-generated XR_run_xxx procedures, e.g. XR_Start(&gf)
+This is called by Mimosa-generated code for the mesa "START Program" construct.  Note that non-NIL args and rets are unsupported by the compiler and runtime.
+This is called from StartTrapImpl.c.
+This is called above and from StartTrapImpl.c.
+makes sure all of program's ancestors are started, then starts program.
+copied from ProcessImpl, because that's not yet available when this need to be done.
+InstallationScopesImpl
+Now it's possible to report errors in CedarCore installation
+
+March 5, 1993
+changed ... AND currentProgram#NIL to ... AND currentProgram=program in StartProgram to avoid a situation in which an installation was corrupted by the CommitInstallation invoked here when we were really trying to start trap an entirely different program.
+ Ê&7  –(cedarcode) style•NewlineDelimiter
+™ šœ™Jšœ
+ÏeœC™NJ™"J™#J™+—Icode˜ šÏk	˜	K˜K˜K˜K˜Kšœ˜K˜K˜Kšœ˜K˜Kšœ˜K˜K˜Kšœ
+˜
+K˜ —™	K™ÒK™›K™ —KšÐlnœž˜%KšžœZ˜aKšžœP˜Wšœžœ˜K˜ —Kšžœ˜ head2™!Kšœžœžœ.˜JK˜ šœžœžœ(˜>K˜ —šœžœžœ)˜@K˜ ——™!Kšœžœ!˜6Kšœžœ&˜@K˜ Kšœžœ%˜>Kšœžœ&˜@Kšœžœ˜,K˜ —™šœžœžœ˜K˜K˜K˜K˜Kšœ˜K˜ —šœžœžœ˜K˜K˜K˜Kšœ˜K˜ —Kšœžœžœžœ˜'K™—™™ÝKšœžœžœ˜KšœžœžœÏcE˜nKšœžœžœ˜ Kšœ&˜&K˜ —™8Kšœžœžœ +˜KKšœž	œ˜$K˜ Kšœžœžœ )˜GKšœž	œ˜"K˜ —™=K˜ Kšœ* C˜mK˜K˜Kšœžœžœžœ˜%Kšœžœžœ˜)Kšœžœ &˜^—K™ ™;Kšœžœ˜Kšœ&žœ˜*Kšœ)žœ ˜JKšœ
+žœžœžœ˜ Kšœ˜K˜ —head™š
+Ïnœžœžœžœžœ˜/Kšœ˜Kšœ¡œžœ˜+Kšœ¡œžœ ˜?Kšœ¡œžœ˜-Kšœ¡œžœ˜+Kšœ¡	œžœ˜Kšœ¡œžœ˜Kšœ¡œžœ˜'Kšœ¡œžœ˜'Kšœ¡	œžœ˜Kšœ¡
+œžœ˜Kšœ¡
+œžœ˜Kšœ¡
+œžœ˜Kšœ¡	œžœ˜Kšœ¡œžœ˜-Kšœ¡
+œžœ
+˜Kšœ¡œžœ˜Kšœ¡œžœ˜#Kšœ¡œžœ˜,Kšœ¡œžœ˜!Kšœ¡
+œžœ˜Kšœ¡	œžœ˜Kšœ¡œ˜Kšœ¡œ˜Kšœ¡œ˜!Kšœ¡œ˜Kšœ¡œžœ˜#Kšœ˜——K˜ š¡œžœžœ˜2Kšžœžœžœžœžœžœ˜šžœ
+žœž˜Kšœžœ˜'Kšœ,˜,Kšžœžœ˜—Kšœ˜—K˜ š¡œžœžœžœ˜0Kšžœ˜Kšœ˜K˜ —š¡œžœžœ˜Ašžœžœž˜Kšœžœ˜5Kšœžœ˜7Kšžœžœ˜—Kšœ˜K˜ —š¡œžœ3˜Qšžœ3žœžœž˜DK˜Kšžœ˜—Kšœ˜—K˜ š¡œžœžœ7˜WKšœ.žœ˜5—K˜ š¡œžœžœ7˜bKšœ.žœ˜6—K˜ š¡œžœ=žœ˜kš¡œžœ˜-Kšœ:˜:Kšœ˜—KšœH˜HKšœ˜—K˜ š¡œžœžœ:˜Wšžœžœžœ(žœžœž˜DK˜&Kšžœ˜—Kšœ˜—K˜ š
+¡
+œžœžœžœžœ˜Hšžœžœž˜Kšœžœ"˜EKšœžœ#˜GKšžœžœ˜—Kšœ˜—K˜ š¡œžœžœžœ˜HKšžœ˜Kšœ˜K˜ —š
+¡œžœžœžœžœ˜HKšžœ'˜-Kšœ˜K˜ —š¡œžœžœžœ˜OKšžœ˜Kšœ˜—K˜ Kš¡
+œžœžœ˜<Kš¡œžœžœ˜2K˜ š¡œžœžœ˜&Kšžœžœžœ˜Kšžœžœžœžœ˜@Kšœžœ˜Kšœ˜—K˜ š¡œžœžœ˜&Kšœžœ˜Kšž	œ˜#Kšœ˜K˜ —š¡œžœžœ˜$Kšžœžœžœ˜Kšžœžœžœžœ˜<Kšœžœ˜Kšœ˜—K˜ š¡œžœžœ˜$Kšœžœ˜Kšž	œ˜!Kšœ˜K˜ —š	¡œžœžœžœ ˜HKšœžœ ˜Kšœ˜šžœžœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜/Kšœ˜Kšœžœ˜)Kšœ!žœ˜&Kšœ"žœ˜'Kšœ%žœ˜:Kšœžœ˜Kšœ˜—K˜—K˜ š¡œžœžœ #˜[Kšœžœ ˜š¡œžœ˜/KšœÊ™ÊKšžœSžœ4˜K˜—K™UKšœE˜Ešžœžœžœ+žœžœž˜GKšœ ˜ Kšžœ˜—šžœžœžœ!žœžœž˜=KšœžœV˜aKšžœ˜—K˜K˜ —š¡œžœ0 ˜EKšœžœ ˜K™Ušžœžœžœž˜&šžœžœž˜'šœ*žœžœžœžœžœ˜nšžœžœžœ+žœžœž˜GKšžœžœ:˜VKšžœ4˜8Kšžœ˜—K˜—šœ(žœžœžœ˜\šžœžœžœ*žœžœž˜FKšžœžœ:˜VKšžœ4˜8Kšžœ˜—Kšœ˜—šœ"˜"šžœžœžœ#žœžœž˜?Kšœ7˜7Kšžœ˜—Kšœ˜—Kšžœžœ˜—Kšžœ˜—K˜K˜ —š	¡œžœžœžœ ˜LK™€Kšœžœ ˜š¡œžœ˜.Kšœ+˜+K˜—K˜KšœD˜DKšœ)˜)šžœDžœžœž˜UKšœžœ!˜=Kšžœ˜—Kšœ#žœ˜'šžœžœžœ3žœžœž˜_K˜!Kšžœ˜—šžœžœžœ˜'Kšœ-˜-Kšœ%˜%Kšœ5žœ˜9Kšœžœ˜Kšœ˜—Kšœžœ˜Kšœžœ˜K˜K˜K˜K˜ —š¡œžœ˜0Kšœžœ ˜šžœžœžœž˜&Kšœ˜Kšžœ˜—K˜K˜ —š¡
+œžœžœ˜3Kšœžœ ˜šžœžœž˜'Kšœžœ˜šœ'˜'šžœžœž˜Kšœ'žœžœžœ˜Tšžœ˜Kšžœ˜Kšœžœžœžœ.žœžœžœžœ˜~Kšœ\˜\Kšœ+˜+Kš
+žœžœžœžœžœ˜MK˜——Kšœ˜—šœ%˜%šžœžœž˜Kšœ'žœžœ˜Dšžœ˜Kšœžœ˜2Kšœ'˜'K˜——Kšœ˜—šœ˜šžœžœž˜Kšœžœžœ˜+šžœ˜Kšœc˜cKšœ-˜-K˜——Kšœ˜—Kšžœ˜—Kšžœ/˜6K˜K˜ —š	¡œžœžœžœ ˜JK™HKšœžœ ˜Kšœ)˜)šžœžœžœ3žœžœž˜_K˜ Kšžœ˜—Kšœžœ˜Kšœ#žœ˜'Kšœžœ˜Kšœ5žœ˜9Kšœžœ˜K˜K˜K˜ —š¡œžœ˜/Kšœžœ ˜šžœžœžœž˜&Kšœ˜Kšžœ˜—K˜K˜ —š¡	œžœžœ˜2Kšœžœ ˜šžœž˜)Kšœžœ˜Kšžœžœ/˜A—K˜K˜ —š¡œžœžœ˜8KšœžœW˜bKšœ˜K˜ —š¡œžœ˜,Kšœžœ˜Kšœžœ˜Kšžœ˜!K˜K˜ —š¡œžœ˜*Kšœžœ˜K˜Kšœžœ˜Kšœžœ˜šžœž˜Kšœžœ
+˜K˜Kšžœ˜—Kšžœ	˜Kšœ˜K˜ —š¡	œžœ ˜5Kšœžœ ˜Kšžœžœžœ ˜:šžœžœžœžœ˜;Kšœ U˜kKšœžœ˜Kšœ˜—˜Kšœžœ$žœžœžœžœžœžœžœžœžœ˜©šžœžœ˜$Kšœ#žœ6˜]Kšœ˜—Kšžœžœ-˜OKšœ˜Kšœžœ˜K˜—K˜—K˜ š¡œžœžœ ˜/Kšœžœ ˜Kšžœžœžœžœ˜)Kšœ%˜%Kšœžœ˜šžœžœ™$Kšœ U™kK™—K˜K˜ K˜ —š	¡œžœ#žœžœ ˜jK˜Kšžœ=˜CK˜——˜ š	¡œžœ#žœžœ ˜jK˜Kšžœ>˜DK˜K˜ —š¡œžœžœžœ˜^Kšœžœžœ˜KšžœžœF˜aKšžœžœžœ5˜Fšžœžœž˜šœžœ˜K™2šžœ!žœ˜)Kšœ$˜$Kšžœžœ8˜SKšžœ(˜,K˜—K˜—šœžœ
+˜K™4Kšžœžœžœ.˜OKšžœžœ˜—šœžœ˜K™Kšœ2˜2Kšžœ-˜3K˜—Kšœžœ
+žœ/ K˜œKšžœžœ˜—K˜K˜ —š¡	œžœžœ ˜1Kšœžœ ˜Kšœžœ˜K˜K˜ —š¡œžœžœžœ˜KKšœžœ ˜Kšœžœ˜)K˜šžœ
+žœ˜K™=Kšœ&˜&Kšœ)žœ˜/Kšœžœ˜K˜—K˜K˜ —š
+¡œžœžœžœžœ˜IKšœžœ ˜Kšœžœ˜&šžœžœžœž˜Kšœ˜Kšžœ˜—K˜K˜ —š¡
+œžœžœžœžœžœ
+žœžœ ˜‰Kšœžœ ˜šžœžœž˜.Kšœ?žœ5˜xKšœ"žœ;˜aKšœžœ˜Kšžœ˜—K˜Kšœžœ.˜MK˜—K˜ š¡
+œžœžœžœžœ
+žœžœ ˜}Kšœžœ ˜Kšžœ#žœžœžœ˜Gšžœžœž˜.Kšœ>žœ0˜rKšœžœ5˜RKšœžœ˜ Kšœžœ˜Kšžœ˜—K˜K˜K˜ —š¡	œžœžœžœžœ ˜]Kšœžœ ˜šžœžœž˜.Kšœ=žœ˜[Kšœžœ˜ Kšœ žœ ˜DKšžœ˜—K˜K˜—K˜ š¡
+œžœ1žœ ˜[KšœE˜EKšœ
+žœžœ˜Kšžœžœžœ.˜@šžœžœž˜šœžœžœ$˜2KšœžœA˜SKšœ˜—Kšœžœžœ.žœ˜BKšžœžœ˜—šžœ
+žœ˜Kšžœžœžœ6žœ0˜ŒKšžœžœI˜kKšœ˜—K˜K˜ —š¡œžœ%žœ˜Pšžœžœžœž˜0Kšžœžœžœ˜.Kšžœ˜—Kšžœžœ˜K˜—K˜ š¡œžœžœ ˜mKšœ:˜:Kšžœžœžœžœžœžœ˜TKšœ˜K˜ —š¡œžœ˜3Kšœžœ ˜šžœžœžœ.žœžœž˜RKšžœžœžœ˜&Kšžœ˜—Kšœžœ#˜?K˜—K˜ Kšœžœžœ/˜NK˜ š¡œžœžœžœžœžœ˜sKšœžœ˜ š¡œžœžœžœžœžœžœžœ˜aKšœ˜Kšœ˜—Kšœ
+žœžœžœ˜AKšœ˜K˜Kšœ:žœ˜NKšžœžœ˜K˜K˜—š
+¡œžœžœžœžœ˜Zš¡œžœžœžœžœžœžœžœ˜cKšœ˜Kšœ˜—Kšœ
+žœžœ+˜?KšœGžœ˜LKšžœžœ˜K˜K˜—Kš	œžœžœžœžœ˜5Kš¡œžœ	žœ˜BKšœžœžœžœ˜QKšœžœ˜˜ K˜ —š
+¡œžœžœžœžœ˜Jšžœžœžœ)žœ˜HKšœžœžœ&˜@K˜Kšœ˜—Kšžœ2˜9Kšœ žœ˜%K˜K˜ —š¡œžœžœ	žœ˜Ušžœžœž˜šœ˜šžœžœžœ"žœžœž˜>Kšžœžœžœžœ˜:Kšžœ˜—Kšžœžœžœ˜Kšœ˜—šœžœ˜&Kšœžœ˜Kšœžœ˜Kšœ˜KšœA˜AKšžœžœ˜#Kšœ˜—Kšžœ˜—Kšžœžœžœ˜Kšœ˜K˜ —š¡œžœžœ˜FKšœ#žœ˜*—K˜ š¡œžœžœ!žœ˜ašžœžœž˜šœ˜šžœžœžœ"žœžœž˜>Kšœ˜Kšžœ˜—Kšœ˜—šœ˜š¡œžœ˜+Kšœžœ˜K˜—Kšœžœ	žœžœ8˜_Kšœ˜—Kšžœžœ˜—K˜—š¡œžœžœ˜3šžœžœž˜)Kšœžœ˜Kšœ!˜!Kšžœžœ˜—Kšœ˜—K˜ š¡œžœžœžœ˜0Kšœžœ ˜Kšžœžœžœžœ˜1Kš
+žœžœžœžœžœ˜RKšžœ˜Kšœ˜—K˜ šœžœžœžœžœžœžœ˜DK˜Kšœ˜K˜ —š¡
+œžœžœ ˜4Kšžœ˜K˜K˜ —š¡	œžœžœ ˜2Kšž˜K˜K˜ ——™K˜ š¡œžœ7žœ ˜sK™ŒKš	žœžœžœžœ .˜~˜Kšœžœ7žœžœ˜ZKšžœžœ$žœ6˜€Kšžœžœ-˜OKšœžœ˜#K˜K˜—K˜K˜ —š¡œžœžœ˜AKšœžœ ˜šžœžœžœžœžœž˜8Kšžœžœžœ
+˜.Kšžœ˜—Kšžœžœ˜Kšœ˜K˜ —š¡œžœ˜)Kšœžœ˜Kšœžœ˜šžœ>žœž˜Ošžœ	žœž˜Kšœ?˜?KšœD˜DKšžœžœ˜—Kšžœ˜—K˜K˜ —š¡œžœ˜+šœžœ˜<KšœZœp™Ï—Kšžœžœžœ˜šžœžœ˜ K˜KšœR˜RKšžœžœ˜>K˜—K˜K˜ —Kšœžœžœžœ˜"š¡œžœžœžœžœžœžœžœ˜Gšžœžœžœ!žœžœž˜EKšœžœ-˜8Kšžœ˜—Kšœ˜K˜ —š
+¡œžœžœžœžœ˜HKšœ
+žœ˜Kšœžœ˜K˜ šžœžœžœ(žœžœž˜DK˜#Kšœžœ˜˜šžœ)žœžœ˜9Kšœžœžœžœ˜9Kš	œ
+žœžœžœžœ˜Cšžœžœ˜%K™dKšœ˜Kšœ$˜$K˜—Kšœ˜—K˜—Kšžœ˜—Kšžœ	žœžœ˜7K˜K˜ —K˜ š¡œžœ ˜EKšœ. œ™OK™EKšžœžœžœžœ˜Kšžœžœžœ˜šžœžœ˜K™ŠKšœ#˜#Kšžœžœžœ˜K˜—Kšžœžœ˜K˜K˜K˜ —š¡
+œžœ ˜7Kšœ#žœžœ™LKšžœžœžœžœ˜˜K˜+Kšžœ	žœžœžœ˜1Kšžœžœžœžœ˜<Kšœ˜K˜—K˜K˜ —š	¡œžœžœžœ ˜\Kšœ™K˜K˜K˜ —Kšœžœžœžœ˜$š¡œžœžœžœžœžœžœžœ˜Gšžœžœžœ#žœžœž˜GKšœžœ-˜8Kšžœ˜—Kšœ˜K˜ —š¡œžœžœ˜/Kšœžœ˜+K˜K˜ —š¡œžœ œ ˜>K™$K˜K˜K˜K˜ —š¡œžœ ˜<K™.KšœG™Gšžœžœžœ -˜mK˜Kšœžœ˜Kšœ˜—K˜ Kšœ$˜$Kšžœžœžœ˜K˜K˜K˜ —š¡œžœžœ ˜=Kšœžœ ˜Kšžœ˜K˜K˜ —š¡œžœ˜*Kšœžœ ˜šžœ%žœžœ˜1Kšœ$žœ˜/KšœD˜DKšœ˜—šžœ˜Kšœ(žœ˜3KšœI˜IKšœ˜—K˜K˜ —š¡
+œžœ ˜6K˜šžœ:žœžœž˜Kšžœ	žœž˜KšœD˜DKšœ@˜@Kšžœ˜—šžœžœ˜"K˜Kšž˜K˜—Kšžœ˜—K˜K˜ —š¡œžœžœžœžœžœžœ ˜KKšœ	žœžœžœžœžœ'˜MKšœžœžœžœ˜,Kšœžœ˜&K˜K˜ —š¡œžœžœžœžœžœžœžœžœ ˜OKšœ
+žœ˜Kš
+žœžœžœžœžœ˜Kšžœžœžœžœ˜)Kšžœžœ˜Kšœ˜—K˜ š¡œžœžœ ˜9Kšžœ˜K˜—K˜ š¡œ˜Kšœžœ˜1K˜K˜ —š
+¡œžœžœ%žœžœ˜Všžœžœž˜šœ-˜-Kšžœ[˜aKšœ˜—šœ,˜,Kšžœžœžœžœ˜*Kšžœžœj˜uK˜—Kšžœžœžœ˜—K˜—K˜ š¡œžœžœžœžœžœžœžœžœžœ˜sKšœ
+žœžœ˜$Kšœžœžœžœ˜&Kšœ(˜(Kšœžœžœ˜"šžœžœžœ˜Kšžœ,žœ"˜TKš
+žœžœžœžœžœ˜'Kšœ˜K˜—šžœžœžœžœžœž˜7Kšžœ!žœžœ˜2Kšžœ˜—Kšžœžœ˜K˜K˜ —š¡œžœ˜K˜K˜šžœžœž˜)šœ˜Kšœžœžœ˜&KšœJ˜Jšžœžœžœžœžœž˜7K˜*Kšžœ˜—Kšœžœ˜:Kšœ˜—Kšžœžœ˜—K˜K˜Kšœ˜——K˜ š¡œžœžœ˜,šžœžœžœBžœ˜dKšœB˜BKšœ˜—K˜K˜ —š¡œžœžœ ˜9K˜š¡œ˜Kšœžœ˜#Kšœ˜—Kšœ"˜"K˜Kšžœ
+žœžœBžœ<˜•Kšœ˜K˜ —š¡œžœ+˜=K™Tš
+¡œžœ)žœžœžœ˜JKšœ˜K˜—Kšœ˜Kšœ˜K˜ —šœ™K˜ K˜#K˜K˜Kšžœ-˜4Kšžœ+˜2K˜Kšœžœ˜!K™<—K™ Kšžœ˜K˜ ™KšœžœžœÒ™ÿ—— …—    qš  ¨y  

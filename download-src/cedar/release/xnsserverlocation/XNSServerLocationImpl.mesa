@@ -1,0 +1,567 @@
+
+DIRECTORY
+Basics USING [Card16FromH, FFromCard32, FillBytes, FWORD, HFromCard16, HWORD, UnsafeBlock],
+Commander USING [CommandObject, CommandProc, Register],
+CrRPCBackdoor USING [CallHdr, CallMsgHdr, callMsgHdrBytes, callMsgType, courierVersionNum, MsgHdr, ReturnMsgHdr, returnMsgHdrBytes, returnMsgType, SessionHdr, sessionHdrBytes],
+IO USING [PutF, PutRope, STREAM],
+MentatInterface USING [bytesForNonPassThroughPE, bytesForOldNonPassThroughPE, bytesForOldPassThroughPE, bytesForPassThroughPE, PacketExchangeOptions, PacketExchangeOptionsOld, xnsPEPDevice],
+Rope USING [ActionType, Fetch, FetchType, Length, MapType, MoveType, ROPE],
+TLI USING [ConnectionData, ConnectionDataRep, TBind, TClose, TErrno, TInfo, TOpen, TRcvUData, TRcvUDErr, TSndUData],
+UnixErrno USING [Errno, GetErrno],
+UnixSysCalls USING [Close, IOCtl, Open, Poll],
+UnixTypes USING [CHARPtr, FD, FileFlags, Mode, PollFD, SysCallResult],
+UXStrings USING [Create, CString],
+XNS USING [Address, broadcastHost, broadcastNet, Host, Socket, Net],
+XNSExchangeTypes USING [expeditedCourierType],
+XNSRouter USING [maxHops],
+XNSServerLocation USING [EachAddressProc];
+
+
+XNSServerLocationImpl: CEDAR MONITOR
+IMPORTS Basics, Commander, IO, Rope, TLI, UnixErrno, UnixSysCalls, UXStrings
+EXPORTS XNSServerLocation
+~ BEGIN
+ROPE: TYPE = Rope.ROPE;
+STREAM: TYPE = IO.STREAM;
+maxRadius: CARDINAL ~ XNSRouter.maxHops;
+
+XNSSendTUnitData: TYPE ~ MACHINE DEPENDENT RECORD [
+addr: AddrNetBuf,	-- address
+opt: OptNetBuf,	-- options
+udata: SendUdataNetBuf	-- user data
+];
+
+XNSRcvTUnitData: TYPE ~ MACHINE DEPENDENT RECORD [
+addr: AddrNetBuf,	-- address
+opt: OptNetBuf,	-- options
+udata: RcvUdataNetBuf	-- user data
+];
+
+AddrNetBuf: TYPE ~ MACHINE DEPENDENT RECORD [
+maxlen: CARD,
+len: CARD,
+xnsaddr: REF XNS.Address
+];
+
+OptNetBuf: TYPE ~ MACHINE DEPENDENT RECORD [
+maxlen: CARD,
+len: CARD,
+peo: REF MentatInterface.PacketExchangeOptions
+];
+
+SendUdataNetBuf: TYPE ~ MACHINE DEPENDENT RECORD [
+maxlen: CARD,
+len: CARD,
+crh: REF CrRPCCallHeader
+];
+
+RcvUdataNetBuf: TYPE ~ MACHINE DEPENDENT RECORD [
+maxlen: CARD,
+len: CARD,
+rb: REF ReturnBuffer
+];
+
+ XNSTUDErr: TYPE ~ MACHINE DEPENDENT RECORD [
+addr: AddrNetBuf,	-- address
+opt: OptNetBuf,	-- options
+error: INT		-- error code
+];
+
+CrRPCCallHeader: TYPE ~ MACHINE DEPENDENT RECORD [
+sessionHdr: CrRPCBackdoor.SessionHdr,
+callMsgHdr: CrRPCBackdoor.CallMsgHdr
+];
+sanity: BOOL[TRUE..TRUE] ~ BYTES[CrRPCCallHeader] = CrRPCBackdoor.sessionHdrBytes + CrRPCBackdoor.callMsgHdrBytes;
+
+exchangeBufMaxBodyBytes: CARDINAL ~ 540; -- from XNSExchangeBuf.maxBodyBytes;
+maxBodyBytes: CARDINAL ~ exchangeBufMaxBodyBytes - CrRPCBackdoor.sessionHdrBytes - CrRPCBackdoor.returnMsgHdrBytes;
+maxBodyHWords: CARDINAL ~ maxBodyBytes/BYTES[Basics.HWORD];
+returnBufferOverhead: CARDINAL ~ CrRPCBackdoor.sessionHdrBytes + CrRPCBackdoor.returnMsgHdrBytes;
+
+ReturnBuffer: TYPE ~ MACHINE DEPENDENT RECORD [
+sessionHdr: CrRPCBackdoor.SessionHdr,
+returnMsgHdr: CrRPCBackdoor.ReturnMsgHdr,
+body: PACKED ARRAY [0 .. maxBodyHWords) OF Basics.HWORD 
+];
+maxTries: ARRAY [0..maxRadius) OF CARDINAL ¨ [
+3, 4, 4, 4, 4, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6];
+clicksPerResend: ARRAY [0..maxRadius) OF CARDINAL ¨ [
+2, 4, 6, 8, 10, 12, 12, 14, 14, 16, 16, 16, 18, 18, 18];
+clickMSec: INT ~ 200;
+waitForever: INT ~ -1; -- -1 to poll is forever
+StopBroadcast: PUBLIC ERROR ~ CODE;
+
+LocateServers: PUBLIC PROC [remotePgm: CARD, remotePgmVersion: CARDINAL,
+eachAddress: XNSServerLocation.EachAddressProc,
+socket: XNS.Socket, net: XNS.Net, maxHops: CARDINAL, tryLimit: CARDINAL] ~ {
+IF old THEN
+LocateServersOld[remotePgm, remotePgmVersion, eachAddress, socket, net, maxHops, tryLimit]
+ELSE
+LocateServersInner[remotePgm, remotePgmVersion, eachAddress, socket, net, maxHops, tryLimit];
+};
+
+LocateServersInner: PROC [remotePgm: CARD, remotePgmVersion: CARDINAL,
+eachAddress: XNSServerLocation.EachAddressProc,
+socket: XNS.Socket, net: XNS.Net, maxHops: CARDINAL, tryLimit: CARDINAL] ~ {
+SafePoll: PROC [timeout: INT] RETURNS [selected: INT] = TRUSTED {
+RETURN[ UnixSysCalls.Poll[fds: @fds, nfds: 1, timeout: timeout] ]};
+CleanUp: PROC = {[] ¨ TLI.TClose[cd: cd]};
+cd: TLI.ConnectionData ~ AllocateCD[];
+path: UXStrings.CString ~ UXStrings.Create[MentatInterface.xnsPEPDevice];
+sendData: REF XNSSendTUnitData ¨ NEW[XNSSendTUnitData]; -- the data to be sent
+rcvData: REF XNSRcvTUnitData ¨ NEW[XNSRcvTUnitData]; -- the data to be read
+uderr: REF XNSTUDErr ¨ NEW[XNSTUDErr]; -- error data
+fds: UnixTypes.PollFD;
+flags: REF INT ~ NEW[INT];
+radius: CARDINAL;
+resval: INT32 ¨ 0;
+
+sendData.addr ¨ [BYTES[XNS.Address], BYTES[XNS.Address], NEW[XNS.Address]];
+sendData.opt ¨ [BYTES[MentatInterface.PacketExchangeOptions], 0, NEW[MentatInterface.PacketExchangeOptions]]; 
+sendData.udata ¨ [BYTES[CrRPCCallHeader], BYTES[CrRPCCallHeader], NEW[CrRPCCallHeader]];
+rcvData.addr ¨ [BYTES[XNS.Address], BYTES[XNS.Address], NEW[XNS.Address]];
+rcvData.opt ¨ [MentatInterface.bytesForPassThroughPE, MentatInterface.bytesForPassThroughPE, NEW[MentatInterface.PacketExchangeOptions]];
+rcvData.udata ¨ [BYTES[ReturnBuffer], BYTES[ReturnBuffer], NEW[ReturnBuffer]];
+uderr.addr ¨ [BYTES[XNS.Address], BYTES[XNS.Address], NEW[XNS.Address]];
+uderr.opt ¨ [MentatInterface.bytesForPassThroughPE, MentatInterface.bytesForPassThroughPE, NEW[MentatInterface.PacketExchangeOptions]];
+
+IF tryLimit = 0 THEN tryLimit ¨ LAST[CARDINAL];
+maxHops ¨ MIN[maxHops, maxRadius];
+resval ¨ TLI.TOpen[cd: cd, path: path, flags: [access: RDWR]];
+IF resval < 0 
+THEN RETURN; -- can't open the device.  Should be error.
+resval ¨ TLI.TBind[cd: cd, request: NIL, return: NIL];
+IF resval < 0 THEN { -- can't bind to any socket
+[] ¨ TLI.TClose[cd: cd];
+RETURN;
+};
+fds.fd ¨ LOOPHOLE[cd.fd]; -- set up the poll structure
+fds.events ¨ [pri: true, in: true]; -- look for POLLIN | POLLPRI
+FOR radius IN [0 .. maxHops) DO
+ENABLE {
+UNWIND => CleanUp[];
+StopBroadcast => EXIT;
+};
+timeout: INT ¨ waitForever; -- wait forever since there will be a reply, may be an error
+FillInQuery[sendData, radius, remotePgm, remotePgmVersion, socket, net, 
+maxHops, tryLimit];
+resval ¨ XNSTSndUData[cd: cd, unitdata: sendData];
+IF resval < 0 THEN EXIT; -- trouble
+fds.fd ¨ LOOPHOLE[cd.fd]; -- set up the poll structure
+fds.events ¨ [pri: true, in: true]; -- look for POLLIN | POLLPRI
+fds.revents ¨ [pri: false, in: false];
+WHILE SafePoll[timeout: timeout] = 1 DO
+timeout ¨ MIN[maxTries[radius], tryLimit] * clicksPerResend[radius] * clickMSec; -- this should be about the same timeout used by the D machines.  Since the retransmission of the request packets is done by the kernel, re really don't know how much time it takes before it retransmits.  The Mentat helper uses 2000ms as the timeout on expanding rings.
+IF fds.revents.in = false THEN EXIT; -- try again at the next radius.  Same below
+resval ¨ XNSTRcvUData[cd: cd, unitdata: rcvData, flags: flags];
+IF resval < 0 THEN {
+IF cd.errno # TLOOK THEN EXIT; -- there is nothing in the look buffer
+[] ¨ XNSTRcvUDErr[cd: cd, uderr: uderr]; -- read to clear the TLOOK buffer
+EXIT;
+};
+ProcessReply[rcvData: rcvData, eachAddress: eachAddress];
+ENDLOOP; 
+ENDLOOP; -- radius
+CleanUp[];
+};
+
+XNSTRcvUData: PROC [cd: TLI.ConnectionData, unitdata: REF XNSRcvTUnitData, flags: REF INT32]
+RETURNS [INT32] = TRUSTED { 
+RETURN[TLI.TRcvUData[cd, LOOPHOLE[unitdata], flags]]};
+
+XNSTSndUData: PROC [cd: TLI.ConnectionData, unitdata: REF XNSSendTUnitData] RETURNS [INT32] = TRUSTED {
+RETURN[TLI.TSndUData[cd, LOOPHOLE[unitdata]]]};
+
+XNSTRcvUDErr: PROC [cd: TLI.ConnectionData, uderr: REF XNSTUDErr] RETURNS [INT32] =
+TRUSTED { 
+RETURN[TLI.TRcvUDErr[cd, LOOPHOLE[uderr]]]};
+
+FillInQuery: PROC [sendData: REF XNSSendTUnitData, radius: CARDINAL, remotePgm: CARD, remotePgmVersion: CARDINAL, socket: XNS.Socket, net: XNS.Net, maxHops: CARDINAL, tryLimit: CARDINAL] ~ {
+v: Basics.HWORD ~ Basics.HFromCard16[CrRPCBackdoor.courierVersionNum];
+callHdr: CrRPCCallHeader;
+peOptions: MentatInterface.PacketExchangeOptions;
+
+peOptions.clientType ¨ XNSExchangeTypes.expeditedCourierType;
+peOptions.retries ¨ MIN[maxTries[radius], tryLimit];
+peOptions.secondsPerRetry ¨ 0; -- let it do the right thing.  sure!
+peOptions.wantsMultipleReplies ¨ 1; -- since we want the results of the expanding ring
+
+IF net = XNS.broadcastNet
+THEN {
+peOptions.wasBroadcast ¨ 0;
+peOptions.radius ¨ radius;
+peOptions.padding0 ¨ 0;
+peOptions.padding1 ¨ 0;
+peOptions.passThroughToXR ¨ 1; -- tell the guy below
+sendData.opt.len ¨ MentatInterface.bytesForPassThroughPE;
+}
+ELSE sendData.opt.len ¨ MentatInterface.bytesForNonPassThroughPE;
+
+callHdr.sessionHdr ¨ [lowVersion: v, highVersion: v];
+callHdr.callMsgHdr.msgHdr ¨ [msgType: CrRPCBackdoor.callMsgType];
+callHdr.callMsgHdr.callHdr ¨ [
+tID: [0, 0],
+pgmNum: Basics.FFromCard32[remotePgm],
+pgmVersion: Basics.HFromCard16[remotePgmVersion],
+procNum: [0, 0]];
+
+sendData.addr.xnsaddr≠ ¨ [net, XNS.broadcastHost, socket];
+sendData.opt.peo≠ ¨ peOptions;
+sendData.udata.crh≠ ¨ callHdr;
+};
+
+ProcessReply: PROC [rcvData: REF XNSRcvTUnitData, eachAddress: XNSServerLocation.EachAddressProc] ~ {
+rb: ReturnBuffer ~ rcvData.udata.rb≠; -- should be the return data
+IF rcvData.udata.len <= returnBufferOverhead THEN RETURN;
+IF Basics.Card16FromH[rb.sessionHdr.lowVersion] > CrRPCBackdoor.courierVersionNum
+THEN RETURN;
+IF Basics.Card16FromH[rb.sessionHdr.highVersion] < CrRPCBackdoor.courierVersionNum
+THEN RETURN;
+IF rb.returnMsgHdr.msgHdr.msgType # CrRPCBackdoor.returnMsgType
+THEN RETURN;
+eachAddress[rcvData.addr.xnsaddr≠];
+};
+
+AllocateCD: PROC RETURNS [cd: TLI.ConnectionData] = {
+bytes: CARD32 ~ BYTES[TLI.ConnectionDataRep];
+cd ¨ NEW[TLI.ConnectionDataRep]; -- the rest gets filled in in the call to TOpen
+TRUSTED {Basics.FillBytes[dstBase: LOOPHOLE[cd], dstStart: 0, count: bytes, value: 0]};
+};
+XNSOldSendTUnitData: TYPE ~ MACHINE DEPENDENT RECORD [
+addr: AddrNetBuf,	-- address
+opt: OldOptNetBuf,	-- options
+udata: SendUdataNetBuf	-- user data
+];
+
+XNSOldRcvTUnitData: TYPE ~ MACHINE DEPENDENT RECORD [
+addr: AddrNetBuf,	-- address
+opt: OldOptNetBuf,	-- options
+udata: RcvUdataNetBuf	-- user data
+];
+
+OldOptNetBuf: TYPE ~ MACHINE DEPENDENT RECORD [
+maxlen: CARD,
+len: CARD,
+peo: REF MentatInterface.PacketExchangeOptionsOld
+];
+
+ XNSOldTUDErr: TYPE ~ MACHINE DEPENDENT RECORD [
+addr: AddrNetBuf,	-- address
+opt: OldOptNetBuf,	-- options
+error: INT		-- error code
+];
+
+LocateServersOld: PROC [remotePgm: CARD, remotePgmVersion: CARDINAL,
+eachAddress: XNSServerLocation.EachAddressProc,
+socket: XNS.Socket, net: XNS.Net, maxHops: CARDINAL, tryLimit: CARDINAL] ~ {
+SafePoll: PROC [timeout: INT] RETURNS [selected: INT] = TRUSTED {
+RETURN[ UnixSysCalls.Poll[fds: @fds, nfds: 1, timeout: timeout] ]};
+CleanUp: PROC = {[] ¨ TLI.TClose[cd: cd]};
+cd: TLI.ConnectionData ~ AllocateCD[];
+path: UXStrings.CString ~ UXStrings.Create[MentatInterface.xnsPEPDevice];
+sendData: REF XNSOldSendTUnitData ¨ NEW[XNSOldSendTUnitData]; -- the data to be sent
+rcvData: REF XNSOldRcvTUnitData ¨ NEW[XNSOldRcvTUnitData]; -- the data to be read
+uderr: REF XNSOldTUDErr ¨ NEW[XNSOldTUDErr]; -- error data
+fds: UnixTypes.PollFD;
+flags: REF INT ~ NEW[INT];
+radius: CARDINAL;
+resval: INT32 ¨ 0;
+
+sendData.addr ¨ [BYTES[XNS.Address], BYTES[XNS.Address], NEW[XNS.Address]];
+sendData.opt ¨ [BYTES[MentatInterface.PacketExchangeOptionsOld], 0, NEW[MentatInterface.PacketExchangeOptionsOld]]; 
+sendData.udata ¨ [BYTES[CrRPCCallHeader], BYTES[CrRPCCallHeader], NEW[CrRPCCallHeader]];
+rcvData.addr ¨ [BYTES[XNS.Address], BYTES[XNS.Address], NEW[XNS.Address]];
+rcvData.opt ¨ [MentatInterface.bytesForOldPassThroughPE, MentatInterface.bytesForOldPassThroughPE, NEW[MentatInterface.PacketExchangeOptionsOld]];
+rcvData.udata ¨ [BYTES[ReturnBuffer], BYTES[ReturnBuffer], NEW[ReturnBuffer]];
+uderr.addr ¨ [BYTES[XNS.Address], BYTES[XNS.Address], NEW[XNS.Address]];
+uderr.opt ¨ [MentatInterface.bytesForOldPassThroughPE, MentatInterface.bytesForOldPassThroughPE, NEW[MentatInterface.PacketExchangeOptionsOld]];
+
+IF tryLimit = 0 THEN tryLimit ¨ LAST[CARDINAL];
+maxHops ¨ MIN[maxHops, maxRadius];
+resval ¨ TLI.TOpen[cd: cd, path: path, flags: [access: RDWR]];
+IF resval < 0 
+THEN RETURN; -- can't open the device.  Should be error.
+resval ¨ TLI.TBind[cd: cd, request: NIL, return: NIL];
+IF resval < 0 THEN { -- can't bind to any socket
+[] ¨ TLI.TClose[cd: cd];
+RETURN;
+};
+fds.fd ¨ LOOPHOLE[cd.fd]; -- set up the poll structure
+fds.events ¨ [pri: true, in: true]; -- look for POLLIN | POLLPRI
+FOR radius IN [0 .. maxHops) DO
+ENABLE {
+UNWIND => CleanUp[];
+StopBroadcast => EXIT;
+};
+timeout: INT ¨ waitForever; -- wait forever since there will be a reply, may be an error
+FillInOldQuery[sendData, radius, remotePgm, remotePgmVersion, socket, net, 
+maxHops, tryLimit];
+resval ¨ XNSOldTSndUData[cd: cd, unitdata: sendData];
+IF resval < 0 THEN EXIT; -- trouble
+fds.fd ¨ LOOPHOLE[cd.fd]; -- set up the poll structure
+fds.events ¨ [pri: true, in: true]; -- look for POLLIN | POLLPRI
+fds.revents ¨ [pri: false, in: false];
+WHILE SafePoll[timeout: timeout] = 1 DO
+timeout ¨ MIN[maxTries[radius], tryLimit] * clicksPerResend[radius] * clickMSec; -- this should be about the same timeout used by the D machines.  Since the retransmission of the request packets is done by the kernel, re really don't know how much time it takes before it retransmits.  The Mentat helper uses 2000ms as the timeout on expanding rings.
+IF fds.revents.in = false THEN EXIT; -- try again at the next radius.  Same below
+resval ¨ XNSOldTRcvUData[cd: cd, unitdata: rcvData, flags: flags];
+IF resval < 0 THEN {
+IF cd.errno # TLOOK THEN EXIT; -- there is nothing in the look buffer
+[] ¨ XNSOldTRcvUDErr[cd: cd, uderr: uderr]; -- read to clear the TLOOK buffer
+EXIT;
+};
+ProcessOldReply[rcvData: rcvData, eachAddress: eachAddress];
+ENDLOOP; 
+ENDLOOP; -- radius
+CleanUp[];
+};
+
+XNSOldTRcvUData: PROC [cd: TLI.ConnectionData, unitdata: REF XNSOldRcvTUnitData, flags: REF INT32]
+RETURNS [INT32] = TRUSTED { 
+RETURN[TLI.TRcvUData[cd, LOOPHOLE[unitdata], flags]]};
+
+XNSOldTSndUData: PROC [cd: TLI.ConnectionData, unitdata: REF XNSOldSendTUnitData] RETURNS [INT32] = TRUSTED {
+RETURN[TLI.TSndUData[cd, LOOPHOLE[unitdata]]]};
+
+XNSOldTRcvUDErr: PROC [cd: TLI.ConnectionData, uderr: REF XNSOldTUDErr] RETURNS [INT32] =
+TRUSTED { 
+RETURN[TLI.TRcvUDErr[cd, LOOPHOLE[uderr]]]};
+
+FillInOldQuery: PROC [sendData: REF XNSOldSendTUnitData, radius: CARDINAL, remotePgm: CARD, remotePgmVersion: CARDINAL, socket: XNS.Socket, net: XNS.Net, maxHops: CARDINAL, tryLimit: CARDINAL] ~ {
+v: Basics.HWORD ~ Basics.HFromCard16[CrRPCBackdoor.courierVersionNum];
+callHdr: CrRPCCallHeader;
+peOptions: MentatInterface.PacketExchangeOptionsOld;
+
+peOptions.clientType ¨ XNSExchangeTypes.expeditedCourierType;
+peOptions.retries ¨ MIN[maxTries[radius], tryLimit];
+peOptions.secondsPerRetry ¨ 0; -- let it do the right thing.  sure!
+peOptions.wantsMultipleReplies ¨ 1; -- since we want the results of the expanding ring
+
+IF net = XNS.broadcastNet
+THEN {
+peOptions.radius ¨ radius;
+peOptions.padding0 ¨ 0;
+peOptions.padding1 ¨ 0;
+peOptions.passThroughToXR ¨ 1; -- tell the guy below
+sendData.opt.len ¨ MentatInterface.bytesForOldPassThroughPE;
+}
+ELSE sendData.opt.len ¨ MentatInterface.bytesForOldNonPassThroughPE;
+
+callHdr.sessionHdr ¨ [lowVersion: v, highVersion: v];
+callHdr.callMsgHdr.msgHdr ¨ [msgType: CrRPCBackdoor.callMsgType];
+callHdr.callMsgHdr.callHdr ¨ [
+tID: [0, 0],
+pgmNum: Basics.FFromCard32[remotePgm],
+pgmVersion: Basics.HFromCard16[remotePgmVersion],
+procNum: [0, 0]];
+
+sendData.addr.xnsaddr≠ ¨ [net, XNS.broadcastHost, socket];
+sendData.opt.peo≠ ¨ peOptions;
+sendData.udata.crh≠ ¨ callHdr;
+};
+
+ProcessOldReply: PROC [rcvData: REF XNSOldRcvTUnitData, eachAddress: XNSServerLocation.EachAddressProc] ~ {
+rb: ReturnBuffer ~ rcvData.udata.rb≠; -- should be the return data
+IF rcvData.udata.len <= returnBufferOverhead THEN RETURN;
+IF Basics.Card16FromH[rb.sessionHdr.lowVersion] > CrRPCBackdoor.courierVersionNum
+THEN RETURN;
+IF Basics.Card16FromH[rb.sessionHdr.highVersion] < CrRPCBackdoor.courierVersionNum
+THEN RETURN;
+IF rb.returnMsgHdr.msgHdr.msgType # CrRPCBackdoor.returnMsgType
+THEN RETURN;
+eachAddress[rcvData.addr.xnsaddr≠];
+};
+
+LookupResult: TYPE = {unInit, foundName, couldntFindName, couldntOpenModule};
+
+StrIOCTL: TYPE = MACHINE DEPENDENT RECORD [
+cmd, timeout, len: INT32,
+cp: UnixTypes.CHARPtr
+];
+
+INREAD: INT32 = 040045301H;  -- /usr/include/sys/stropts.h.I¨NREAD
+ISTR: CARD32 = 0c0105308H; -- /usr/include/sys/stropts.h.I¨STR
+NDGET: INT32 = 04e00H; -- nd.h.ND¨GET
+CharSequence: TYPE ~ PACKED ARRAY [0..1024) OF CHAR;
+
+LookupNDDname: PROC [dev: ROPE, variable: ROPE]
+RETURNS [lookupresult: LookupResult, num: INT ¨ 0, errno: UnixErrno.Errno ¨ EREMCHG] = TRUSTED {
+flatvar: CharSequence ¨ ALL['\000];
+stri: REF StrIOCTL;
+len: REF INT32 ¨ NEW[INT32];
+flags: UnixTypes.FileFlags;
+mode: UnixTypes.Mode;
+fd: UnixTypes.FD;
+
+flags.access ¨ RDONLY;
+
+FOR i: INT IN [0..Rope.Length[variable]) DO
+flatvar[i] ¨ Rope.Fetch[variable, i];
+ENDLOOP;
+
+stri ¨ NEW[StrIOCTL ¨ [NDGET, 0, 1024, LOOPHOLE[@flatvar] ]];
+fd ¨ UnixSysCalls.Open[UXStrings.Create[dev], flags, mode];
+
+SELECT TRUE FROM
+LOOPHOLE[fd, INT32] = -1 =>
+{ lookupresult ¨ couldntOpenModule; errno ¨ UnixErrno.GetErrno[] };
+UnixSysCalls.IOCtl[fd, INREAD, LOOPHOLE[len]] = failure =>
+{ lookupresult ¨ couldntOpenModule; num ¨ 1; errno ¨ UnixErrno.GetErrno[] };
+UnixSysCalls.IOCtl[fd, LOOPHOLE[ISTR], LOOPHOLE[stri]] # failure =>
+lookupresult ¨ foundName;
+((errno ¨ UnixErrno.GetErrno[]) = ENOENT) => lookupresult ¨ couldntFindName;
+ENDCASE => { lookupresult ¨ couldntOpenModule; num ¨ 12 };
+
+[] ¨ UnixSysCalls.Close[fd];
+
+};
+
+XNSDetectorCommandProc: Commander.CommandProc = {
+out: STREAM = cmd.out;
+res: LookupResult;
+num: INT;
+errno: UnixErrno.Errno;
+[res, num, errno] ¨ LookupNDDname["/dev/xr", "xr_is_inr"];
+
+IF res = foundName THEN {
+[res, num, errno] ¨ LookupNDDname["/dev/xr", "xr_MisNumberedNetTrap"];
+IF res # foundName THEN num ¨ num + 10;
+};
+
+SELECT res FROM
+foundName => IO.PutRope[out, newDriver];
+couldntFindName => IO.PutRope[out, oldDriver];
+ENDCASE => IO.PutF[out, unknown, [integer[num]], [cardinal[LOOPHOLE[errno]]] ];
+};
+
+InitVals: Commander.CommandProc = {
+IF old = FALSE THEN IO.PutRope[cmd.out, newDriver]
+ELSE IF res1 = couldntFindName THEN IO.PutRope[cmd.out, oldDriver]
+ELSE IO.PutF[cmd.out, unknown, [integer[num1]], [cardinal[LOOPHOLE[errno1]]] ];
+};
+
+Init: PROC ~ {
+[res1, num1, errno1] ¨ LookupNDDname["/dev/xr", "xr_is_inr"];
+IF res1 # foundName THEN RETURN;
+[res2, num2, errno2] ¨ LookupNDDname["/dev/xr", "xr_MisNumberedNetTrap"];
+IF res2 = foundName THEN old ¨ FALSE;
+
+};
+
+SetNewXNSCommandProc: Commander.CommandProc = {old ¨ FALSE};
+SetOldXNSCommandProc: Commander.CommandProc = {old ¨ TRUE};
+
+xnsInitValsDoc: ROPE = "XNSInitVals - which XNS streams driver was initially detected";
+xnsDetectorDoc: ROPE = "XNSDetector - (re)Try to figure out which XNS streams driver is loaded";
+setNewXNSdoc: ROPE = "SetNewXNS - assert that the 4.0e XNS streams driver is loaded";
+setOldXNSdoc: ROPE = "SetOldXNS - assert that the 2.3 XNS streams driver is loaded";
+
+old: BOOLEAN ¨ TRUE; 
+res1, res2: LookupResult ¨ unInit;
+num1, num2: INT ¨ 0;
+errno1, errno2: UnixErrno.Errno ¨ ok;
+newDriver: ROPE ~ "running the 4.0e XNS driver\n";
+oldDriver: ROPE ~ "running the 2.3 XNS driver\n";
+unknown: ROPE ~ "XNS streams driver not loaded(?); num = %g, errno = %g\n\n";
+
+Init[];
+
+Commander.Register[key: "XNSInitVals", proc: InitVals,
+doc: xnsInitValsDoc, clientData: NIL, interpreted: TRUE];
+Commander.Register[key: "XNSDetector", proc: XNSDetectorCommandProc,
+doc: xnsDetectorDoc, clientData: NIL, interpreted: TRUE];
+Commander.Register[key: "SetNewXNS", proc: SetNewXNSCommandProc,
+doc: setNewXNSdoc, clientData: NIL, interpreted: TRUE];
+Commander.Register[key: "SetOldXNS", proc: SetOldXNSCommandProc,
+doc: setOldXNSdoc, clientData: NIL, interpreted: TRUE];
+
+END.
+   	⁄  
+XNSServerLocationImpl.mesa
+Copyright ” 1989, 1992 by Xerox Corporation.  All rights reserved.
+Tim Diebert: December 4, 1989 11:04:30 am PST
+Foote, July 28, 1992 3:43 pm PDT
+Willie-s, January 26, 1993 12:43 pm PST
+Types
+Here's the scoop on the New vs. Old MentatInterface.PacketExchangeOptions: When XSoft introduced the 2.0K XNS streams driver they had to modify the shape of the PacketExchangeOptions structure.  If we could stop the world, recompile, reinstall everything would be peachy.  But in the real world we have to be prepared for both kinds of drivers being present on the host.  So we take advantage of the fact that there are a couple of debugging variables which are present in the new (2.0K and later) driver to decide the heritage of the streams driver we're running on.  For simplicity we carry around both the old and new sendData refs and only use the one we need at the appropriate moment.  A better solution would be to objectize this structure, but since this is a temporary scafolding I haven't bothered (famous last words).  
+Nothing is named "New"; when the "Old" stuff dies (ie when support for old XNS streams drivers is withdrawn) just toss the Old stuff and keep the rest. - JKF
+
+-- TLI data structures, but specific to XNS - ASSERT (LOOPHOLE!) these overlay the corresponding TLI types.
+Parameters
+Public Things
+Allocate buffers:
+note that b.sendData.opt.len still needs to be set prior to use
+Do the real work:
+Other good stuff
+Old stuff
+-- TLI data structures, but specific to XNS - ASSERT (LOOPHOLE!) these overlay the corresponding TLI types.
+Allocate buffers:
+note that b.sendData.opt.len still needs to be set prior to use
+Do the real work:
+Stuff to figure out which version of the XNS driver is running:
+
+from /usr/include/sys/stropts.h.strioctl:
+flatvar needs to be on the stack; otherwise the gc can writeprotect the storage and the IOCtl call will then fail
+IF LOOPHOLE[fd, INT32] = -1 THEN
+{ lookupresult ¨ couldntOpenModule; errno ¨ UnixErrno.GetErrno[] }
+ELSE IF UnixSysCalls.IOCtl[fd, INREAD, LOOPHOLE[len]] = failure THEN
+{ lookupresult ¨ couldntOpenModule; num ¨ 1; errno ¨ UnixErrno.GetErrno[] }
+ELSE IF UnixSysCalls.IOCtl[fd, LOOPHOLE[ISTR], LOOPHOLE[stri]] # failure THEN
+lookupresult ¨ foundName
+ELSE IF ( errno ¨ UnixErrno.GetErrno[]) = ENOENT THEN
+lookupresult ¨ couldntFindName
+ELSE
+{ lookupresult ¨ couldntOpenModule; num ¨ 2 };
+[cmd: Handle] RETURNS [result: REF _ NIL, msg: ROPE _ NIL]
+CommandObject = [in, out, err: STREAM, commandLine, command: ROPE, ...]
+ ù 
+  ñ"cedarcode" styleïNewlineDelimiter
+ô öúôIcodeöú
+œeú7ôBKô-Kô Kô'óKò öœk	ò	Köúûú'ûúûúò[Köú
+ûú(ò7Köúûúùò∞Köûúûúûúò!Köúûú©òæKöúûú;ûúòKKöûúûúkòtKöú
+ûúò"Köúûúò.Köú
+ûúûú*òFKöú
+ûúò"Köûúûú;òDKöúûúò.Köú
+ûúòKöúûúò*óKò Kò Kö–lnúûúûò$Köûúûúûú$òLKöûúòKöúûòhead2ôKöûúûúûúòKöûúûúûúûúòKöúûúò(Kò KöúæôæKöúùôùKô Köúkôkö	úûúûúû	úûúò3Köúœc
+òKöú†
+òKöú†ò#KöúòKò óö	úûúûúû	úûúò2Köú†
+òKöú†
+òKöú†ò"KöúòKò óö	úûúûúû	úûúò-KöúûúòKöúûúò
+Köú	ûúûúòKöúòKò óö	úûúûúû	úûúò,KöúûúòKöúûúò
+Köúûú&ò.KöúòKò óö	úûúûúû	úûúò2KöúûúòKöúûúò
+KöúûúòKöúòKò óö	úûúûúû	úûúò1KöúûúòKöúûúò
+KöúûúòKöúòKò óö	úûúûúû	úûúò-Köú†
+òKöú†
+òKöúûú†òKöúòKò óö	úûúûúû	úûúò2Kò%Kò$Kòóö	úûúûúûúûúRòrKò óKöúûú†$òMKöúûú]òsKöúûúûúûúò;KöúûúCòaKò ö	úûúûúû	úûúò/Kò%Köú)ò)Kö	úûúûúûúûúò8Kòóóô
+Köú
+ûúûúûú2ò\Köúûúûúûú=ònKöúûúòKöúûú†ò/óôKöœnúûúûúûúò#Kò ö°úûúûúûúûú:ûúûúûúûúò≈öûúûòKöúZòZóöûòKöú]ò]óKòóKò ö°úûúûúûú:ûúûúûúûúò√ö°úûúûúûúûúûúòAKöûú=òCóKö°úûú	ûúò*Köúûúò&KòIKöú
+ûúûú†òNKöú	ûúûú†òKKöúûúûú†ò4KòKö	úûúûúûúûúòKöúûúòKöúûúòKò KöúôKöúûúûúûúûúûúûúòKöúûú,ûú*ònKöú?ô?óKöúûúûúûúòXKöúûúûúûúûúûúûúòJKöú]ûú)òâKöúûúûúûúòNKöúûúûúûúûúûúûúòHKöú[ûú)òáKò KöúôKöûúûúûúûúò/Köú
+ûúò"Köú	ûú+ûúò>Köûúûúûú†+òGKöú	ûúûú
+ûúò6öûúûú†ò0KöúûúòKöûúòKöúòóKöú	ûú	†ò6Köú$†ò@öûúûúûòöûúòKöûúòKöúûúòKòóKöú	ûú†<òXöúHòHKöúòóKò2Köûúûúûú†
+ò#Köú	ûú	†ò6Köú$†ò@Kò&öûú ûò'Köú
+ûúD†çòﬁKöûúûúûú†,òQKò?öûúûúòKö	ûúûúûúûú†&òEKöú)†!òJKöûúòKöúòóKöú9ò9Köûúò	óKöûú†	òóKöú
+ò
+KòKò óóôö°úûúûúûúûúûúûúûúûúòyKöûúûúûúò6Kò óö°úûúûúûúûúûúûúògKöûúûúûúò/Kò óö°úûúûúûúûúûúûúò^Köûúûúûúò,Kò óö°úûúûúûúûúûú
+ûúûúûúûúòæKöú
+ûú7òFKöúòKöú1ò1Kò Kò=Köúûúò4Köú†$òCKöú$†2òVKò öûúûúòöûúòKòKòKòKòKöú†ò4Kò9KöúòóKöûú=òAóKò Kò5KòAKòñKò Köúûúò:KòKòKòóKò ö°úûúûúEòeKöú&†òBKöûú+ûúûúò9KöûúPûúûúò^KöûúQûúûúò_Köûú>ûúûúòLKò#KòKò óö°
+úûúûúûúò5Köúûúûúûúò-Köúûúûú†/òPKöûúûú,òWKöúòóóô	Köúkôkö	úûúûúû	úûúò6Köú†
+òKöú†
+òKöú†ò#KöúòKò óö	úûúûúû	úûúò5Köú†
+òKöú†
+òKöú†ò"KöúòKò óö	úûúûúû	úûúò/KöúûúòKöúûúò
+Köúûú)ò1KöúòKò óö	úûúûúû	úûúò0Köú†
+òKöú†
+òKöúûú†òKöúòKò óö°úûúûúûú:ûúûúûúûúò¡ö°úûúûúûúûúûúòAKöûú=òCóKö°úûú	ûúò*Köúûúò&KòIKöú
+ûúûú†òTKöú	ûúûú†òQKöúûúûú†ò:KòKö	úûúûúûúûúòKöúûúòKöúûúòKò KöúôKöúûúûúûúûúûúûúòKöúûú/ûú-òtKöú?ô?óKöúûúûúûúòXKöúûúûúûúûúûúûúòJKöúcûú,òíKöúûúûúûúòNKöúûúûúûúûúûúûúòHKöúaûú,òêKò KöúôKöûúûúûúûúò/Köú
+ûúò"Köú	ûú+ûúò>Köûúûúûú†+òGKöú	ûúûú
+ûúò6öûúûú†ò0KöúûúòKöûúòKöúòóKöú	ûú	†ò6Köú$†ò@öûúûúûòöûúòKöûúòKöúûúòKòóKöú	ûú†<òXöúKòKKöúòóKò5Köûúûúûú†
+ò#Köú	ûú	†ò6Köú$†ò@Kò&öûú ûò'Köú
+ûúD†çòﬁKöûúûúûú†,òQKòBöûúûúòKö	ûúûúûúûú†&òEKöú,†!òMKöûúòKöúòóKöú<ò<Köûúò	óKöûú†	òóKöú
+ò
+KòKò óö°úûúûúûúûúûúûúûúûúòKöûúûúûúò6Kò óö°úûúûúûúûúûúûúòmKöûúûúûúò/Kò óö°úûúûúûúûúûúûúòdKöûúûúûúò,Kò óö°úûúûúûúûúûú
+ûúûúûúûúòƒKöú
+ûú7òFKöúòKöú4ò4Kò Kò=Köúûúò4Köú†$òCKöú$†2òVKò öûúûúòöûúòKòKòKòKöú†ò4Kò<KöúòóKöûú@òDóKò Kò5KòAKòñKò Köúûúò:KòKòKòóKò ö°úûúûúHòkKöú&†òBKöûú+ûúûúò9KöûúPûúûúò^KöûúQûúûúò_Köûú>ûúûúòLKò#KòKò óóKöú?ô?ô Köúûú;òMKò Köú)ô)ö	ú
+ûúûúû	úûúò+KöúûúòKöúòKòóKò Köûúûú†ú†òBKöûúûú†ú†ò>Köûúûú†
+ú†ò%Köúûúûúûúûúûúò4Kò ö°úûúûúûúûú#ûúûúûúòêKôqKöúûúò#Köúûú
+òKö	úûúûúûúûúòKòKòKöúûúòKò KöúûúòKò öûúûúûúûò+Kò%KöûúòKò óKöúûúûúûúò=Kò;Kò öûúûúûòöûúûú	òKòCóöúûúûúò:KòLóöúûúûúûúòCKòóKöú"ûú$òLKöûú3ò:óKò öûúûúûúûô KôBóö	ûúûúûúûúûôDKôKóöûúûúûúûúûúûôMKôóöûúûú#ûúûô5KôóöûôKô.óKòKòKò óö°úò1öúûú
+ûúûúûúûúô:KöúûúûúôGóKöúûúòKòKöúûúò	KòKò:Kò öûúûúòKòFKöûúûúò'KòKò óöûúûòKöúûúò(Köúûúò.Köûúûú.ûúòOóKòKò óö°úò#öûúûúûúûúò2öûúûúûúûúòBKöûúûú3ûúòOóóKòKò óö°úûúòKò=Köûúûúûúò KòIKöûúûúûúò%Kò KòóKò Kö°ú!ûúò<ö°ú!ûúò;Kò óKöúûúCòWKöúûúLò`KöúûúCòUKöúûúBòTKò KöúûúûúòKò"KöúûúòKò%Köúûú#ò2Köúûú"ò1Köú	ûú@òMKò KòKò ò6Köú!ûúûúò9óòDKöú!ûúûúò9óöú@ò@Köúûúûúò7óöú@ò@Köúûúûúò7Kò óóKöûúòó Öó    M  kˆ  

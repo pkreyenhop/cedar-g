@@ -1,0 +1,758 @@
+
+DIRECTORY
+Ascii USING [Digit, Letter],
+Basics USING [MoveBytes, RawBytes, UnsafeBlock],
+BasicTime USING [GetClockPulses, GMT, Now, Pulses, PulsesToSeconds],
+CedarProcess,
+Commander USING [CommandProc, Handle, Register],
+CommanderOps USING [DoCommand, Failed, ParseToList],
+DFUtilities USING [DirectoryItem, FileItem, FileSyntaxError, Filter, ImportsItem, IncludeItem, ParseFromFile, ParseFromStream, ProcessItemProc, SearchUsingList, SortUsingList],
+FileNames USING [ResolveRelativePath, StripVersionNumber],
+IO,
+PFS USING [Close, EnumerateForNames, Error, GetInfo, NameProc, Open, OpenFile, PATH, PathFromRope, RopeFromPath, StreamFromOpenFile, StreamOpen, tDirectory],
+PFSNames USING [ExpandName, SetVersionNumber, ShortName, ShortNameRope],
+Process USING [CheckForAbort, Pause, MsecToTicks, Yield],
+Rope,
+SymTab,
+VersionMap USING [Map, MapList, Range, RangeList, RangeToEntry, ShortNameToRanges],
+VersionMapDefaults USING [GetMapList],
+VM USING [AddressForPageNumber, Allocate, bytesPerPage, Free, Interval];
+
+QFind: CEDAR MONITOR LOCKS ml USING ml: Lock
+IMPORTS Ascii, Basics, BasicTime, CedarProcess, Commander, CommanderOps, DFUtilities, FileNames, IO, PFS, PFSNames, Process, Rope, SymTab, VersionMap, VersionMapDefaults, VM
+= BEGIN
+
+STREAM: TYPE = IO.STREAM;
+ROPE: TYPE = Rope.ROPE;
+PATH: TYPE = PFS.PATH;
+
+Lock: TYPE ~ REF MONITORLOCK;
+
+overlap: CARDINAL = 154; -- keep this many chars from previous buffer so we can try to back up to beginning of line when we find a match (must be divisible by bytesPerWord)
+bufferPages: NAT = 40;
+bufferSize: CARDINAL = bufferPages*VM.bytesPerPage;
+Buffer: TYPE = RECORD [PACKED SEQUENCE COMPUTED CARDINAL OF CHAR];
+Map: TYPE = PACKED ARRAY CHAR OF CHAR;
+
+OpenFile: PROC [name: PATH] RETURNS [st: STREAM ¬ NIL, isDir: BOOL ¬ FALSE] = {
+of: PFS.OpenFile;
+of ¬ PFS.Open[name ! PFS.Error => IF error.group # bug THEN CONTINUE];
+IF of = NIL THEN RETURN;
+IF PFS.GetInfo[of].fileType = PFS.tDirectory THEN { PFS.Close[of]; isDir ¬ TRUE; RETURN };
+st ¬ PFS.StreamFromOpenFile[of
+! PFS.Error => IF error.group # bug THEN CONTINUE];
+};
+
+NonAlpha: PROC [char: CHAR] RETURNS [BOOL] ~ {
+RETURN [NOT (Ascii.Letter[char] OR Ascii.Digit[char])]
+};
+
+QFindCmd: Commander.CommandProc ~ {
+log: IO.STREAM ¬ cmd.err;
+out: IO.STREAM ¬ cmd.out;
+inputList: LIST OF ROPE;
+buffer: LONG POINTER TO Buffer;
+vmInt: VM.Interval;
+qual, key, file: ROPE;
+bm, bmq: BMhandle;
+startTime: BasicTime.Pulses ¬ BasicTime.GetClockPulses[];
+matches, files: INT ¬ 0;
+map: REF Map;
+caseless: BOOL ¬ TRUE;
+tkey, tqual: REF TEXT;
+shortNames: BOOL ¬ FALSE;
+listNamesOnly: BOOL ¬ FALSE;
+openFiles: BOOL ¬ FALSE;
+filePos: BOOL ¬ FALSE;
+matchWordsOnly: BOOL ¬ FALSE;
+useVersionMap: BOOL ¬ FALSE;
+textOnly: BOOL ¬ FALSE;
+ignoreRemainingSwitches: BOOL ¬ FALSE;
+modular: BOOL ¬ FALSE;
+roots: LIST OF PATH ¬ NIL;
+fc: FileConsumer ¬ NIL;
+
+AddDFNames: PROC [key: ROPE, in: LIST OF ROPE] RETURNS [out: LIST OF ROPE] ~ {
+ProcessItem: DFUtilities.ProcessItemProc ~ {
+WITH item SELECT FROM
+f: REF DFUtilities.FileItem => l ¬ l.rest ¬ LIST[FileNames.StripVersionNumber[f.name]];
+ENDCASE;
+};
+stream: STREAM;
+l: LIST OF ROPE ¬ in;
+out ¬ in;
+stream ¬ PFS.StreamOpen[PFS.PathFromRope[FileNames.ResolveRelativePath[key]] !
+PFS.Error => {
+IF error.group # bug THEN {
+IO.PutF1[cmd.out, "** %g\n", [rope[error.explanation]] ];
+GOTO bad;
+};
+}];
+IF in = NIL THEN RETURN;
+WHILE l.rest # NIL DO l ¬ l.rest ENDLOOP;
+DFUtilities.ParseFromStream[stream, ProcessItem, [FALSE, source, all, all]];
+IO.Close[stream];
+EXITS
+bad => NULL;
+};
+SearchFile: PFS.NameProc = {
+RETURN ConsumeFile[fc, name]
+};
+inputList ¬ CommanderOps.ParseToList[cmd: cmd !
+CommanderOps.Failed => { log.PutRope["invalid input format\n"]; GO TO quit }].list;
+IF inputList = NIL THEN RETURN[NIL, usage];
+map ¬ NEW [Map];
+FOR c: CHAR IN CHAR DO
+map[c] ¬ IF c IN ['a..'z] THEN c - 'a + 'A ELSE c;
+ENDLOOP;
+DO 
+key ¬ inputList.first; inputList ¬ inputList.rest;
+IF Rope.Size[key] > 1 AND Rope.Fetch[key, 0] = '- AND NOT ignoreRemainingSwitches THEN {
+IF Rope.Equal[key, "-d", FALSE]
+THEN {
+key ¬ inputList.first;
+inputList ¬ inputList.rest;
+inputList ¬ AddDFNames[key, inputList];
+}
+ELSE {
+FOR i: INT IN [1..Rope.Size[key]) DO
+SELECT Rope.Fetch[key, i] FROM
+'c, 'C	=> FOR c: CHAR IN ['a..'z] DO map[c] ¬ c ENDLOOP;
+'f, 'F	=> listNamesOnly ¬ TRUE;
+'o, 'O	=> openFiles ¬ TRUE;
+'m, 'M	=> useVersionMap ¬ TRUE;
+'p, 'P	=> filePos ¬ TRUE;
+'q, 'Q	=> ignoreRemainingSwitches ¬ TRUE;
+'r, 'R	=> {
+	modular ¬ TRUE;
+	roots ¬ CONS[PFS.PathFromRope[inputList.first], roots];
+	inputList ¬ inputList.rest
+	};
+'s, 'S	=> shortNames ¬ TRUE;
+'t, 'T	=> textOnly ¬ TRUE;
+'w, 'W	=> matchWordsOnly ¬ TRUE;
+ENDCASE => {
+log.PutF1["invalid switch: $g", [character[Rope.Fetch[key, i]]]]; GO TO quit};
+ENDLOOP;
+};
+LOOP;
+};
+EXIT;
+ENDLOOP;
+IF modular THEN {
+dotPos: INT ~ key.Find["."];
+IF dotPos<0 THEN CommanderOps.Failed["No dot in key"];
+qual ¬ key.Substr[len: dotPos];
+key ¬ key.Substr[start: dotPos+1]
+};
+tkey ¬ Rope.ToRefText[key];
+FOR i: CARDINAL IN [0..tkey.length) DO
+tkey[i] ¬ map[tkey[i]];
+ENDLOOP;
+bm ¬ MakeFailureFunctions[tkey];
+IF modular THEN {
+tqual ¬ Rope.ToRefText[qual];
+FOR i: CARDINAL IN [0..tqual.length) DO
+tqual[i] ¬ map[tqual[i]];
+ENDLOOP;
+bmq ¬ MakeFailureFunctions[tqual]
+};
+vmInt ¬ VM.Allocate[bufferPages];
+buffer ¬ LOOPHOLE[VM.AddressForPageNumber[vmInt.page]];
+IF useVersionMap THEN {
+mapList: VersionMap.MapList ~ VersionMapDefaults.GetMapList[$Source];
+head: LIST OF ROPE ~ LIST[NIL];
+last: LIST OF ROPE ¬ head;
+FOR each: LIST OF ROPE ¬ inputList, each.rest UNTIL each=NIL DO
+pattern: ROPE ~ IF Rope.Match["*.*", each.first] THEN each.first ELSE Rope.Concat[each.first, ".mesa"];
+rangeList: VersionMap.RangeList ~ VersionMap.ShortNameToRanges[mapList, pattern];
+FOR r: VersionMap.RangeList ¬ rangeList, r.rest UNTIL r=NIL DO
+range: VersionMap.Range ¬ r.first;
+WHILE range.len # 0 DO
+fullFName: ROPE;
+[name: fullFName, next: range] ¬ VersionMap.RangeToEntry[range];
+last ¬ last.rest ¬ LIST[PFSNames.ShortNameRope[PFS.PathFromRope[fullFName]]];
+ENDLOOP;
+ENDLOOP;
+ENDLOOP;
+inputList ¬ head.rest;
+};
+fc ¬ NEW[FileConsumerPrivate ¬ [NEW[MONITORLOCK ¬ []], bm, bmq, buffer, cmd, map, shortNames, listNamesOnly, openFiles, matchWordsOnly, filePos, textOnly, modular]];
+IF roots # NIL THEN GenerateRoots[fc, roots, qual, key];
+WHILE inputList # NIL DO
+ENABLE  
+UNWIND => TRUSTED { --give buffer back
+VM.Free[vmInt]};
+pattern: PATH ¬ DefaultToHighestGeneration[inputList.first];
+file ¬ inputList.first; inputList ¬ inputList.rest;
+PFS.EnumerateForNames[pattern, SearchFile
+! PFS.Error => IF error.group # bug THEN {
+out.PutF1["** %g\n", [rope[error.explanation]] ];
+LOOP};
+];
+IF fc.abort THEN EXIT;
+ENDLOOP;
+TRUSTED { VM.Free[vmInt] };
+IF fc.abort THEN out.PutRope["\nABORTED\n"];
+RETURN[
+IF fc.abort THEN $aborted ELSE IF fc.matches = 0 THEN $Failure ELSE NIL, 
+IF listNamesOnly
+THEN NIL
+ELSE IO.PutFLR[
+"%g%g files, %g matches, %g seconds",
+LIST[ [rope[IF modular
+THEN IO.PutFR["%g Suites found, %g DFs tested, %g DFs searched, ",
+[integer[fc.dfs[suite]]], [integer[fc.dfs[test]]], [integer[fc.dfs[search]]] ]
+ELSE ""]],
+[integer[fc.files]], [integer[fc.matches]],
+[real[BasicTime.PulsesToSeconds[BasicTime.GetClockPulses[] - startTime]]]]] ];
+EXITS
+quit => RETURN[$Failure, NIL];
+};
+
+FileConsumer: TYPE ~ REF FileConsumerPrivate;
+FileConsumerPrivate: TYPE ~ RECORD [
+searchLock: Lock,
+bm, bmq: BMhandle,
+buffer: LONG POINTER TO Buffer,
+cmd: Commander.Handle,
+map: REF Map,
+shortNames, listNamesOnly, openFiles, matchWordsOnly, filePos, textOnly, modular: BOOL,
+abort: BOOL ¬ FALSE,
+files, matches: INT ¬ 0,
+dfs: ARRAY DfRole OF INT ¬ ALL[0]
+];
+DfRole: TYPE ~ {suite, test, search};
+
+ConsumeFile: PROC [fc: FileConsumer, fullFName: PATH]
+RETURNS [continue: BOOL ¬ TRUE] ~ {
+OPEN fc;
+worthy: BOOL ¬ TRUE;
+stream: STREAM;
+isDir: BOOL ¬ FALSE;
+vMatches, fMatches: INT ¬ 0;
+OneSearch: ENTRY PROC [ml: Lock] ~ {
+ENABLE UNWIND => NULL;
+localAbort: BOOL ¬ FALSE;
+IF isDir THEN {
+cmd.out.PutF1["%g is a directory\n", [rope[PFS.RopeFromPath[fullFName]]]];
+Process.CheckForAbort[]; -- may raise ABORTED caught above
+continue ¬ TRUE;
+RETURN};
+IF stream = NIL THEN {
+cmd.out.PutF1["%g cannot be opened\n", [rope[PFS.RopeFromPath[fullFName]]]];
+Process.CheckForAbort[]; -- may raise ABORTED caught above
+continue ¬ TRUE;
+RETURN};
+files ¬ files + 1;
+NULL; {
+ENABLE UNWIND => stream.Close[];
+IF modular THEN {
+[localAbort, vMatches] ¬ BoyerMooreSearch[fullFName, stream, bmq, buffer, cmd, map, shortNames, listNamesOnly, openFiles, matchWordsOnly, filePos, textOnly, TRUE];
+IF localAbort OR vMatches=0 THEN worthy ¬ FALSE ELSE stream.SetIndex[0];
+};
+IF worthy THEN [localAbort, fMatches] ¬
+BoyerMooreSearch[fullFName, stream, bm, buffer, cmd, map, shortNames, listNamesOnly, openFiles, matchWordsOnly, filePos, textOnly, FALSE];
+};
+IF localAbort THEN abort ¬ TRUE;
+stream.Close[];
+matches ¬ matches + fMatches;
+continue ¬ NOT abort;
+RETURN};
+[stream, isDir] ¬ OpenFile[fullFName];
+OneSearch[searchLock];
+RETURN};
+
+
+DefaultToHighestGeneration: PROC [filePattern: ROPE] RETURNS [path: PATH] = {
+path ¬ PFS.PathFromRope[filePattern];
+IF PFSNames.ShortName[path].version.versionKind # numeric THEN
+path ¬ PFSNames.SetVersionNumber[path, [highest]];
+};
+
+
+Delta1: TYPE = ARRAY CHAR OF CARDINAL;
+Delta2: TYPE = RECORD [SEQUENCE COMPUTED CARDINAL OF CARDINAL];
+
+BMhandle: TYPE = REF BMdata;
+BMdata: TYPE = RECORD [
+pattern: REF TEXT,
+delta1: REF Delta1,
+delta2: REF Delta2];
+
+MakeFailureFunctions: PROCEDURE [key: REF TEXT]
+RETURNS [BMhandle] = TRUSTED {
+c: CARDINAL;
+length: CARDINAL = key.length;
+t: CARDINAL ¬ length;
+delta1: REF Delta1 = NEW[Delta1];
+delta2: REF Delta2 = NEW[Delta2[length]];
+aux: REF Delta2 ¬ NEW[Delta2[length]];
+
+FOR ch: CHAR IN CHAR DO delta1[ch] ¬ length+1 ENDLOOP;
+FOR c IN [0..length) DO
+delta2[c] ¬ length + (delta1[key[c]] ¬ length - c);
+ENDLOOP;
+FOR c DECREASING IN [0..length) DO
+aux[c] ¬ t;
+WHILE t < length AND key[c] # key[t] DO
+t ¬ aux[t];
+ENDLOOP;
+t ¬ t - 1;
+delta2[t] ¬ MIN[delta2[t], length - (c-1)];
+
+ENDLOOP;
+FOR c IN [0..t] DO delta2[c] ¬ MIN[delta2[c], length+1+t-c] ENDLOOP;
+RETURN [NEW[BMdata ¬ [pattern: key, delta1: delta1, delta2: delta2]]]};
+
+BoyerMooreSearch: PROC [
+file: PATH,
+stream: STREAM,
+bm: BMhandle,
+buffer: LONG POINTER TO Buffer,
+cmd: Commander.Handle,
+map: REF Map,
+shortNames: BOOL ¬ FALSE,
+listNamesOnly: BOOL ¬ FALSE,
+openFiles: BOOL ¬ FALSE,
+matchWordsOnly: BOOL ¬ FALSE,
+filePos: BOOL ¬ FALSE,
+textOnly: BOOL ¬ FALSE,
+noOutput: BOOL ¬ FALSE]
+RETURNS [abort: BOOLEAN ¬ FALSE, matches: LONG CARDINAL ¬ 0]
+~ TRUSTED {
+ENABLE ABORTED => GO TO aborted;
+checkAbort: PROC RETURNS [a: BOOL ¬ FALSE] = TRUSTED {
+Process.CheckForAbort[!ABORTED => {a ¬ TRUE; CONTINUE}]};
+firstMatch: BOOL ¬ TRUE;
+delta1: REF Delta1 = bm.delta1;
+delta2: REF Delta2 = bm.delta2;
+pattern: REF TEXT = bm.pattern;
+length: INT = pattern.length;
+stopIndexPlusOne: INT ¬ bufferSize-overlap;
+block: Basics.UnsafeBlock ¬ [LOOPHOLE[buffer], 0, stopIndexPlusOne - 0];
+index: INT ¬ length;
+bytes: INT ¬ 0;
+winning: INT ¬ 0; -- if # 0, we're in the middle of printing a match, and are willing to scan this many more chars looking for end of line
+BEGIN -- for ENABLE purposes
+ENABLE ABORTED => IF stream # NIL THEN stream.Close[];
+IF stream = NIL THEN {
+cmd.out.PutF1["%g cannot be opened\n", [rope[PFS.RopeFromPath[file]]]];
+Process.CheckForAbort[]; -- may raise ABORTED caught above
+RETURN[FALSE, 0]};
+DO
+UNTIL index <= block.startIndex DO -- get enough characters to look at
+got: INT;
+IF IO.EndOf[stream] OR abort OR (abort ¬ checkAbort[]) THEN
+{IF winning # 0 THEN cmd.out.PutRope["\n"]; stream.Close[]; RETURN};
+IF block.startIndex = stopIndexPlusOne THEN {
+Basics.MoveBytes[
+dstBase: block.base, dstStart: 0,
+srcBase: block.base, srcStart: (stopIndexPlusOne-overlap),
+count: overlap
+];
+index ¬ index - (stopIndexPlusOne-overlap);
+block.startIndex ¬ overlap;
+stopIndexPlusOne ¬ bufferSize};
+block.count ¬ stopIndexPlusOne - block.startIndex;
+got ¬ stream.UnsafeGetBlock[block];
+block.startIndex ¬ block.startIndex + got;
+bytes ¬ bytes + got;
+IF winning # 0 THEN
+[index, winning] ¬ ReportMatch[cmd.out, block, index, winning, 0, textOnly];
+ENDLOOP;
+FOR keyIndex: CARDINAL DECREASING IN [0..length) DO
+IF map[buffer[index ¬ index-1]] # pattern[keyIndex] THEN {
+index ¬ index + MAX[delta1[map[buffer[index]]], delta2[keyIndex]];
+EXIT};
+REPEAT FINISHED => { -- found a match
+IF NOT matchWordsOnly OR ((index = 0 OR NonAlpha[map[buffer[index-1]]]) AND (index+length >= block.startIndex+block.count OR NonAlpha[map[buffer[index+length]]]))
+THEN {
+matches ¬ matches + 1;
+IF noOutput THEN RETURN;
+IF firstMatch THEN {
+firstMatch ¬ FALSE;
+IF listNamesOnly THEN {
+IO.PutF1[cmd.out, "%g", IO.rope[IF shortNames THEN PFSNames.ShortNameRope[file] ELSE PFS.RopeFromPath[file]]];
+IF filePos THEN IO.PutF1[cmd.out, "|%g", IO.int[bytes+index-block.startIndex]];
+IO.PutChar[cmd.out, '\n];
+RETURN;
+};
+IF openFiles THEN {
+IO.Close[stream];
+[] ¬ CommanderOps.DoCommand[IO.PutFR["Open \"%g|%g\"",
+[rope[PFS.RopeFromPath[file]]], [integer[bytes+index-block.startIndex]]], cmd];
+RETURN;
+};
+IF NOT textOnly THEN {
+IF shortNames
+THEN IO.PutF[cmd.out, "\n%l***\t%g%l\n", [rope["b"]], [rope[PFSNames.ShortNameRope[file]]], [rope["B"]]]
+ELSE IO.PutF[cmd.out, "%l%g%l\n", [rope["b"]], [rope[PFS.RopeFromPath[file]]], [rope["B"]]];
+};
+};
+[index, winning] ¬ ReportMatch[
+report: cmd.out, block: block, at: index --+length-1--, limit: 0, 
+total: bytes+index --+length-1-- -block.startIndex, textOnly: textOnly];
+}
+ELSE {index ¬ index + length};
+index ¬ (IF abort ¬ checkAbort[] THEN block.startIndex ELSE index) + 2;
+};
+ENDLOOP;
+ENDLOOP;
+END; -- of nested ABORTED catchphrase
+EXITS aborted => {RETURN [TRUE, matches]};
+};
+
+ReportMatch: PROC [
+report: STREAM, block: Basics.UnsafeBlock,
+at, limit: INT, total: INT ¬ 0, textOnly: BOOL]
+RETURNS [lastUsed, waitingForCR: CARDINAL] = TRUSTED {
+BytePointer: UNSAFE PROC [ptr: POINTER] RETURNS [POINTER TO Basics.RawBytes] ~ INLINE {
+RETURN [LOOPHOLE[ptr]];
+};
+extend: INT = IF limit = 0 THEN overlap ELSE limit;
+backTo: INT = MAX[at, extend] - extend;
+forwardTo: INT = MIN[at+extend, block.startIndex];
+IF limit = 0 THEN {
+IF NOT textOnly THEN report.PutF1["%5g: ", [cardinal[total]]];
+FOR cr: INT DECREASING IN [backTo..at) DO
+c: CHAR = VAL[BytePointer[block.base][cr]];
+SELECT c FROM
+'\l, '\r, '\n => {
+report.UnsafePutBlock[[block.base, cr+1, at - cr-1]];
+EXIT;
+};
+ENDCASE;
+REPEAT FINISHED => {
+IF total > extend THEN report.PutRope["..."];
+report.UnsafePutBlock[[block.base, backTo, at - backTo]]};
+ENDLOOP;
+};
+FOR cr: INT IN [at..forwardTo) DO
+c: CHAR = VAL[BytePointer[block.base][cr]];
+SELECT c FROM
+'\l, '\r, '\n => {
+report.UnsafePutBlock[[block.base, at, cr+1 - at]];
+RETURN [cr, 0];
+};
+ENDCASE;
+ENDLOOP;
+report.UnsafePutBlock[[block.base, at, forwardTo - at]];
+IF (waitingForCR ¬ at+extend - forwardTo) = 0 THEN report.PutRope["...\n"];
+lastUsed ¬ forwardTo - 1;
+};
+
+CheckDFData: TYPE = REF CheckDFDataRec;
+CheckDFDataRec: TYPE = RECORD [dfName: PATH, state: State];
+
+CheckFileData: TYPE = REF CheckFileDataRec;
+CheckFileDataRec: TYPE = RECORD [fileName: PATH, state: State];
+
+State: TYPE = REF StateRec; -- modification of state must always be monitored
+StateRec: TYPE = RECORD [
+dfSeen: SymTab.Ref, -- SymTab [DF full Name -> NIL]: list of all DF full names already seen (or being seen)
+moduleName, functionName: ROPE, 
+fc: FileConsumer,
+pool: ProcessPool,
+matches: INT ¬ 0
+];
+
+GenerateRoots: PROC [fc: FileConsumer, roots: LIST OF PATH, moduleName, functionName: ROPE] = {
+Abort: PROC ~ {fc.abort ¬ TRUE; fc.cmd.err.PutRope["\n ABORTED seen!\n"]};
+time: BasicTime.GMT ¬ BasicTime.Now[];
+state: State = NEW [StateRec ¬ [
+moduleName: moduleName, functionName: functionName, 
+dfSeen: SymTab.Create[case: FALSE],
+fc: fc,
+pool: CreateProcessPool[Abort]
+]];
+FOR rootList: LIST OF PATH ¬ roots, rootList.rest WHILE rootList#NIL DO
+[] ¬ ForkInPool[state.pool, CheckDF, NEW [CheckDFDataRec ¬ [dfName: rootList.first, state: state]], [priority: background, usePriority: TRUE]];
+ENDLOOP;
+JoinPool[state.pool];
+RETURN};
+
+IncDfs: ENTRY PROC [ml: Lock, fc: FileConsumer, role: DfRole] ~ {
+ENABLE UNWIND => NULL;
+fc.dfs[role] ¬ fc.dfs[role]+1;
+RETURN};
+
+CheckDF: PROC [data: REF] RETURNS [results: REF ¬ NIL] --CedarProcess.ForkableProc-- = {
+ScanDf: PROC [dfName: ROPE] ~ {
+IncDfs[fc.searchLock, fc, test];
+todo ¬ CONS[dfName, todo];
+DFUtilities.ParseFromFile[dfName, ProcessItem1 ! 
+PFS.Error => {state.fc.cmd.out.PutF1["Cannot open: %g\n", [rope[dfName]]]; GOTO Fails}; 
+DFUtilities.FileSyntaxError => {state.fc.cmd.out.PutF1["Cannot parse: %g\n", [rope[dfName]]]; GOTO Fails}];
+EXITS Fails => {}; 
+};
+ProcessItem1: PROC [item: REF ANY] RETURNS [stop: BOOL ¬ FALSE] --DFUtilities.ProcessItemProc-- = {
+IF fc.abort THEN RETURN [TRUE];
+WITH item SELECT FROM
+directory: REF DFUtilities.DirectoryItem  => {};
+file: REF DFUtilities.FileItem   => 
+IF Rope.Match[importeePattern, file.name, FALSE] THEN defining ¬ TRUE;
+import: REF DFUtilities.ImportsItem   => {
+DFUtilities.SortUsingList[import.list, TRUE];
+IF import.form=list AND DFUtilities.SearchUsingList[importeeName, import.list].found THEN importing ¬ TRUE;
+IF NOT import.exported THEN NULL
+ELSE IF SuiteTop[import.path1] THEN {
+new: CheckDFData = NEW [CheckDFDataRec ¬ [dfName: PFS.PathFromRope[import.path1], state: state]];
+[] ¬ ForkInPool[state.pool, CheckDF, new];
+}
+ELSE ScanDf[import.path1];
+};
+include: REF DFUtilities.IncludeItem => {
+IF SuiteTop[include.path1] THEN {
+new: CheckDFData = NEW [CheckDFDataRec ¬ [dfName: PFS.PathFromRope[include.path1], state: state]];
+[] ¬ ForkInPool[state.pool, CheckDF, new];
+}
+ELSE ScanDf[include.path1]};
+ENDCASE										=> ERROR;
+};
+processes: LIST OF CedarProcess.Process ¬ NIL;
+checkDFData: CheckDFData = NARROW [data];
+dfName: ROPE = PFS.RopeFromPath[checkDFData.dfName];
+state: State = checkDFData.state;
+fc: FileConsumer ~ state.fc;
+importing, defining: BOOL ¬ FALSE;
+importeeName: ROPE = Rope.Concat[state.moduleName, ".mob"];
+importeePattern: ROPE = Rope.Concat[state.moduleName, ".mob*"];
+todo: LIST OF ROPE ¬ NIL;
+IF fc.abort THEN RETURN;
+IF SymTab.Fetch[state.dfSeen, dfName].found THEN RETURN;
+[] ¬ SymTab.Store[state.dfSeen, dfName, NIL];
+IncDfs[fc.searchLock, fc, suite];
+ScanDf[dfName];
+IF importing OR defining THEN {
+FOR dolist: LIST OF ROPE ¬ todo, dolist.rest WHILE dolist#NIL DO
+currentDirectory: PATH ¬ PFS.PathFromRope["?no directory given?"];
+ProcessItem2: PROC [item: REF ANY] RETURNS [stop: BOOL ¬ FALSE] --DFUtilities.ProcessItemProc-- = {
+IF fc.abort THEN RETURN [TRUE];
+WITH item SELECT FROM
+directory: REF DFUtilities.DirectoryItem => currentDirectory ¬ PFS.PathFromRope[directory.path1];
+file: REF DFUtilities.FileItem => IF Rope.Match["*.mesa!*", file.name, FALSE] 
+THEN {
+new: CheckFileData = NEW [CheckFileDataRec ¬ [fileName: PFSNames.ExpandName[PFS.PathFromRope[file.name], currentDirectory], state: state]];
+[] ¬ ForkInPool[state.pool, CheckFile, new];
+};
+import: REF DFUtilities.ImportsItem		=> {};
+include: REF DFUtilities.IncludeItem		=> {};
+ENDCASE										=> ERROR;
+};
+IncDfs[fc.searchLock, fc, search];
+DFUtilities.ParseFromFile[dolist.first, ProcessItem2];
+ENDLOOP;
+};
+RETURN};
+
+suite: ROPE ~ "-Suite.df";
+suiteLen: INT ~ Rope.Length[suite];
+
+SuiteTop: PROC[name: ROPE] RETURNS [BOOL] ~ {
+shortNameRope: ROPE ¬ PFSNames.ShortNameRope[PFS.PathFromRope[name]];
+suitePos: INT ¬ Rope.Find[shortNameRope, suite, 0, FALSE];
+RETURN[(suitePos > 0) AND ((Rope.Length[shortNameRope] - suiteLen) = suitePos)];
+};
+
+CheckFile: CedarProcess.ForkableProc = {
+checkFileData: CheckFileData = NARROW [data];
+IF checkFileData.state.fc.abort THEN RETURN;
+[] ¬ ConsumeFile[checkFileData.state.fc, checkFileData.fileName];
+};
+
+ProcessPool: TYPE = REF ProcessPoolRec;
+ProcessPoolRec: TYPE = RECORD [
+lock: Lock,
+resultAction: ResultActionProc ¬ NIL,
+WhenAbort: PROC,
+processes: SEQUENCE maxProcesses: NAT OF CedarProcess.Process
+];
+
+ResultActionProc: TYPE = PROC [REF]; -- applied to results of actions, only if those results are NON-NIL
+
+CreateProcessPool: PROC [WhenAbort: PROC, maxProcesses: NAT ¬ 4, resultAction: ResultActionProc ¬ NIL] RETURNS [pool: ProcessPool] = {
+pool ¬ NEW [ProcessPoolRec[maxProcesses]];
+pool.lock ¬ NEW[MONITORLOCK ¬ []];
+TRUSTED { pool.WhenAbort ¬ WhenAbort };
+TRUSTED { pool.resultAction ¬ resultAction };
+};
+
+ForkInPool: PROC [pool: ProcessPool, action: CedarProcess.ForkableProc, data: REF ¬ NIL, options: CedarProcess.ForkOptions ¬ CedarProcess.DefaultForkOptions] RETURNS [forked: BOOL ¬ FALSE] = {
+ENABLE ABORTED => {pool.WhenAbort[]; CONTINUE};
+IF TryToForkInPool[pool.lock, pool, action, data, options] THEN RETURN[TRUE];
+Process.Yield[];
+IF TryToForkInPool[pool.lock, pool, action, data, options] THEN RETURN[TRUE];
+BEGIN
+results: REF = action[data]; 
+IF results#NIL AND pool.resultAction#NIL THEN pool.resultAction[results];
+RETURN [FALSE];
+END;
+};
+
+TryToForkInPool: ENTRY PROC [ml: Lock, pool: ProcessPool, action: CedarProcess.ForkableProc, data: REF, options: CedarProcess.ForkOptions] RETURNS [forked: BOOL] = {
+ENABLE UNWIND => NULL;
+LaunderPool[pool];
+FOR i: NAT IN [0 .. pool.maxProcesses) DO
+IF pool[i]=NIL THEN {pool[i] ¬ CedarProcess.Fork[action, data, options]; RETURN [TRUE]};
+ENDLOOP;
+RETURN [FALSE]};
+
+JoinPool: PROC [pool: ProcessPool] = {
+DO
+ENABLE ABORTED => {pool.WhenAbort[]; CONTINUE};
+IF IsPoolDone[pool.lock, pool] THEN EXIT;
+Process.Pause[Process.MsecToTicks[1000]];
+ENDLOOP;
+};
+
+IsPoolDone: ENTRY PROC [ml: Lock, pool: ProcessPool] RETURNS [done: BOOL ¬ FALSE] = {
+ENABLE UNWIND => NULL;
+LaunderPool[pool];
+FOR i: NAT IN [0 .. pool.maxProcesses) DO
+IF pool[i]#NIL THEN RETURN [FALSE]
+ENDLOOP;
+RETURN[TRUE]};
+
+LaunderPool: INTERNAL PROC [pool: ProcessPool] = {
+FOR i: NAT IN [0 .. pool.maxProcesses) DO
+IF pool[i]=NIL THEN LOOP; 
+IF pool[i].status=aborted THEN {pool[i] ¬ NIL; LOOP};
+IF pool[i].status=done THEN {
+IF pool[i].results#NIL AND pool.resultAction#NIL THEN pool.resultAction[pool[i].results];
+pool[i] ¬ NIL;
+};
+ENDLOOP;
+};
+
+usage: ROPE ~"
+\tSearch list of files for occurrences of a string token.
+\tUsage: QFind [option(s)] <search string (quoted ok)> <file list>
+\tOptions:
+\t\t-c\t\t\t\tbe case sensitive
+\t\t-f\t\t\t\tlist file names only
+\t\t-o\t\t\t\topen files successfully searched
+\t\t-d <DF file>\tcheck files in DF's directory clause
+\t\t-m\t\t\tuse source version maps to expand names
+\t\t-p\t\t\t\tprint file position of first match
+\t\t-q\t\t\t\t(last option) if search key starts with dash
+\t\t-s\t\t\t\tprint short names of files
+\t\t-t\t\t\t\ttext only (don't give positions or file names)
+\t\t-w\t\t\tmatch words only";
+
+Commander.Register["QFind", QFindCmd, usage];
+
+END.
+
+
+    QFind.mesa
+Copyright Ó 1985, 1987, 1988, 1989, 1990, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Sweet December 5, 1985 10:52:28 am PST
+Eric Nickell, March 25, 1987 10:58:52 pm PST
+Bloomenthal, December 12, 1990 9:20 pm PST
+Michael Plass, February 20, 1992 1:35 pm PST
+Tim Diebert: March 29, 1989 1:27:35 pm PST
+Russ Atkinson (RRA) June 21, 1989 8:14:02 pm PDT
+Wes Irish, October 4, 1989 10:11:25 am PDT
+Willie-s, June 16, 1992 6:02 pm PDT
+Last tweaked by Mike Spreitzer February 7, 1992 5:45 pm PST
+
+---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+Boyer-Moore parsing: construct tables of offsets for when match fails
+---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+See Knuth, Morris, Pratt, "Fast Pattern...", SIAM J. Comp, June 1977
+1/12/84:RSS Above algorithm (dd') fails for patterns in which all characters are identical.  Changed implementation to calculate dd instead of dd' in p342 algorithm.
+block points to remaining empty buffer beyond file contents currently there
+ReportMatch ignores the count field of block
+initial match as opposed to later search for closing CR
+---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+DF enumeration and clipping
+---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+we assume no perverse names for df files
+---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+Limited Processing
+---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+resultAction is only called for processes which are done and when results are not NIL
+No more process possible in the pool, we do not fork!
+
+---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+Command Line Registration
+---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+
+ ÊË  •NewlineDelimiter
+–(cedarcode) style˜ codešœ
+™
+Kšœ
+ÏeœU™`KšÏy&™&Kšž,™,K™*K™,K™*K™0K™*K™#K™;K™ šÏk	˜	KšœŸœ˜KšœŸœ$˜0Kšœ
+ŸœŸœ ˜DKšœ˜Kšœ
+Ÿœ!˜0KšœŸœ"˜4KšœŸœŸ˜°Kšœ
+Ÿœ+˜:KšŸœ˜KšŸœŸœFŸœJ˜Kšœ	Ÿœ:˜HKšœŸœ,˜9Kšœ˜K˜KšœŸœC˜SKšœŸœ˜&KšŸœŸœ@˜H——K˜ š
+ÐlnœŸœŸœŸœŸœ	˜,KšŸœZŸœŸœCŸ˜­—šœŸ˜K˜ KšŸœŸœŸœŸœ˜KšŸœŸœŸœ˜KšŸœŸœŸœŸœ˜K˜ KšœŸœŸœŸœ˜K˜ Kšœ	ŸœÏc“˜¬KšœŸœ˜KšœŸœŸœ˜3KšœŸœŸœŸœŸœŸœŸœŸœ˜BKšœŸœŸœŸœŸœŸœŸœ˜&K˜ šÏnœŸœŸœŸœŸœŸœ	ŸœŸœ˜OKšœŸœ
+˜KšœœŸœŸœ
+ŸœŸœŸœ˜FKšŸœŸœŸœŸœ˜KšŸœŸœŸœŸœŸœŸœŸœ˜ZšœŸœ˜Kš	œŸœ
+ŸœŸœŸœ˜3—Kšœ˜K˜ —•StartOfExpansionL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]š
+¢œŸœŸœŸœŸœ˜.KšŸœŸœŸœ˜6Kšœ˜K˜ —š¢œ˜#KšœŸœŸœ˜KšœŸœŸœ˜KšœŸœŸœŸœ˜KšœŸœŸœŸœ˜KšœŸœ
+˜KšœŸœ˜K˜K˜9KšœŸœ˜KšœŸœ˜Kšœ
+ŸœŸœ˜KšœŸœŸœ˜KšœŸœŸœ˜KšœŸœŸœ˜KšœŸœŸœ˜Kšœ	ŸœŸœ˜KšœŸœŸœ˜KšœŸœŸœ˜Kšœ
+ŸœŸœ˜KšœŸœŸœ˜&Kšœ	ŸœŸœ˜Kš	œŸœŸœŸœŸœ˜KšœŸœ˜K˜ š¢
+œŸœŸœŸœŸœŸœŸœŸœŸœŸœ˜NšÐbnœ!˜,šŸœŸœŸ˜KšœŸœ&Ÿœ'˜WKšŸœ˜—K˜—KšœŸœ˜KšœŸœŸœŸœ˜K˜	šœ	ŸœŸœ3˜NšŸœ˜šŸœŸœ˜KšŸœ7˜9KšŸœ˜	Kšœ˜—Kšœ˜——KšŸœŸœŸœŸœ˜KšŸœ
+ŸœŸœŸœ˜)Kšœ2Ÿœ˜LKšŸœ˜šŸ˜KšœŸœ˜—K˜—š£
+œŸœ˜KšŸœ˜K˜—KšœpŸœŸœ˜ƒKš
+ŸœŸœŸœŸœŸœ	˜+KšœŸœ˜š	ŸœŸœŸœŸœŸ˜Kš	œ	ŸœŸœ
+ŸœŸœ˜2KšŸœ˜—šŸœ˜Kšœ2˜2š
+ŸœŸœŸœŸœŸœ˜XšŸœŸœ˜šŸœ˜Kšœ˜Kšœ˜K˜'Kšœ˜—šŸœ˜šŸœŸœŸœŸ˜$šŸœŸ˜Kšœ
+ŸœŸœŸœ
+ŸœŸœ˜8KšœŸœ˜KšœŸœ˜KšœŸœ˜KšœŸœ˜Kšœ$Ÿœ˜)šœ˜KšœŸœ˜Kšœ	ŸœŸœ'˜8K˜K˜—KšœŸœ˜KšœŸœ˜KšœŸœ˜ šŸœ˜KšœBŸœŸœ˜N——KšŸœ˜—Kšœ˜——KšŸœ˜Kšœ˜—KšŸœ˜KšŸœ˜—šŸœ	Ÿœ˜KšœŸœ˜KšŸœ
+Ÿœ&˜6K˜K˜!K˜—Kšœ˜šŸœŸœŸœŸ˜&K˜KšŸœ˜—Kšœ ˜ šŸœ	Ÿœ˜K˜šŸœŸœŸœŸ˜'K˜KšŸœ˜—K˜!K˜—KšœŸœ˜!Kšœ	ŸœŸœ#˜7šŸœŸœ˜KšœE˜EKšœŸœŸœŸœŸœŸœ˜KšœŸœŸœŸœ˜šŸœŸœŸœŸœŸœŸœŸ˜?Kš	œ	ŸœŸœŸœŸœ"˜gKšœQ˜QšŸœ-ŸœŸœŸ˜>K˜"šŸœŸ˜KšœŸœ˜K˜@KšœŸœŸœ˜MKšŸœ˜—KšŸœ˜—KšŸœ˜—K˜Kšœ˜—KšœŸœŸœŸœv˜¥KšŸœ	ŸœŸœ%˜8šŸœŸœŸ˜šŸœ˜šŸœŸœ¡˜&KšŸœ˜——Kšœ	Ÿœ/˜<Kšœ3˜3šŸœ&˜)šœŸœ
+ŸœŸœ˜*Kšœ1˜1KšŸœ˜—Kšœ˜—KšŸœ
+ŸœŸœ˜KšŸœ˜—KšŸœŸœ˜KšŸœ
+Ÿœ˜,šŸœ˜KšŸœ
+Ÿœ
+ŸœŸœŸœ
+ŸœŸœ˜IšŸœ˜KšŸœŸ˜šŸœŸœ˜Kšœ%˜%šŸœŸœ˜šŸœŸœ;˜BK˜N—KšŸœ˜
+—Kšœ+˜+K˜N———šŸ˜KšœŸœŸœ˜—Kšœ˜K˜ —KšœŸœŸœ˜-šœŸœŸœ˜$K˜Kšœ˜KšœŸœŸœŸœ˜Kšœ˜KšœŸœ˜KšœRŸœ˜WKšœŸœŸœ˜KšœŸœ˜Kš	œŸœŸœŸœŸœ˜!K˜KšœŸœ˜%—K˜ š¢œŸœŸœŸœŸœŸœ˜YKšŸœ˜KšœŸœŸœ˜KšœŸœ˜KšœŸœŸœ˜KšœŸœ˜š¢	œŸœŸœ˜$KšŸœŸœŸœ˜KšœŸœŸœ˜šŸœŸœ˜Kšœ+Ÿœ˜JKšœ¡!˜:KšœŸœ˜KšŸœ˜—šŸœ
+ŸœŸœ˜Kšœ-Ÿœ˜LKšœ¡!˜:KšœŸœ˜KšŸœ˜—K˜šŸœ˜KšŸœŸœ˜ šŸœ	Ÿœ˜KšœŸœ˜£Kš
+ŸœŸœŸœ
+ŸœŸœ˜HK˜—šŸœŸœ˜'KšœƒŸœ˜Š—K˜—KšŸœŸœ	Ÿœ˜ K˜K˜KšœŸœ˜KšŸœ˜—K˜&K˜KšŸœ˜—˜ K˜ —š
+¢œŸœŸœŸœŸœ˜MKšœŸœ˜%KšŸœ8Ÿœ3˜qK˜K˜ —KšœE™EKšœE™EKšœE™EK˜ KšœŸœŸœŸœŸœŸœ˜&šœŸœŸœŸœŸœŸœŸœŸœ˜?K˜ —Kšœ
+ŸœŸœ˜šœŸœŸœ˜Kšœ	Ÿœ˜KšœŸœ˜KšœŸœ	˜—K˜ š¢œŸ	œŸœŸœ˜/KšŸœŸœ˜KšœD™DKšœ¥™¥KšœŸœ˜KšœŸœ˜KšœŸœ
+˜KšœŸœ
+Ÿœ	˜!KšœŸœ
+Ÿœ˜)KšœŸœ
+Ÿœ˜&K˜ KšŸœŸœŸœŸœŸœŸœ˜6šŸœŸœŸ˜K˜3KšŸœ˜—šŸœŸ
+œŸœŸ˜"K˜šŸœŸœŸ˜'K˜KšŸœ˜—K˜
+KšœŸœ˜+K˜ KšŸœ˜—Kš
+ŸœŸœŸœŸœŸœ˜DKšŸœŸœ<˜GK˜ —š¢œŸœ˜KšœŸœ˜KšœŸœ˜Kšœ˜KšœŸœŸœŸœ˜K˜KšœŸœ˜KšœŸœŸœ˜KšœŸœŸœ˜KšœŸœŸœ˜KšœŸœŸœ˜Kšœ	ŸœŸœ˜Kšœ
+ŸœŸœ˜Kšœ
+ŸœŸœ˜Kš
+Ÿœ	ŸœŸœŸœŸœ˜<KšœŸœ˜KšŸœŸœŸœŸœ	˜ šœŸœŸœŸœŸœŸœ˜6KšœŸœ	ŸœŸœ˜9—KšœŸœŸœ˜KšœŸœ˜KšœŸœ˜Kšœ	Ÿœ˜KšœŸœ˜KšœŸœŸœ˜+šœŸœ#˜HKšœK™KK™,—KšœŸœ
+˜KšœŸœ˜Kšœ	Ÿœ¡x˜ŠKšŸœ¡˜Kš
+ŸœŸœŸœ
+ŸœŸœ˜6šŸœ
+ŸœŸœ˜Kšœ-Ÿœ˜GKšœ¡!˜:KšŸœŸœ˜—šŸ˜šŸœŸœ¡#˜FKšœŸœ˜	š	ŸœŸœŸœŸœŸ˜;KšœŸœŸœ(Ÿœ˜D—šŸœ%Ÿœ˜-šœ˜Kšœ!˜!Kšœ:˜:Kšœ˜Kšœ˜—K˜+K˜K˜—K˜2K˜#K˜*K˜šŸœŸ˜K˜L—KšŸœ˜—š	ŸœŸœŸ
+œŸœŸ˜3šŸœ2Ÿœ˜:KšœŸœ/˜BšŸœ˜šŸœŸœ¡˜%šŸœŸœŸœŸœ!Ÿœ/Ÿœ&˜¢šŸœ˜K˜KšŸœ
+ŸœŸœ˜šŸœŸœ˜KšœŸœ˜šŸœŸœ˜KšŸœŸœŸœŸœŸœŸœ˜nKšŸœ	ŸœŸœŸœ$˜OKšŸœ˜KšŸœ˜K˜—šŸœŸœ˜KšŸœ˜šœŸœ˜6KšœŸœF˜O—KšŸœ˜K˜—šŸœŸœ
+Ÿœ˜šŸœ˜KšŸœŸœa˜hKšŸœŸœU˜\—K˜—K˜—˜Kšœ)¡œ˜BKšœ¡œ(˜H—Kšœ˜—KšŸœ˜Kšœ	ŸœŸœŸœ˜G—Kšœ˜———KšŸœ˜—KšŸ˜—KšŸœ¡ ˜%KšŸœŸœŸœ˜*K˜K˜ —š¢œŸœ˜KšœŸœ˜*KšœŸœ	ŸœŸœ˜/KšŸœŸœŸœ˜6š¢œŸœŸœŸœŸœŸœŸœŸœ˜WKšŸœŸœ˜Kšœ˜—Kš	œŸœŸœŸœ	Ÿœ˜3KšœŸœŸœ˜'KšœŸœŸœ˜2šŸœŸœ˜Kšœ7™7KšŸœŸœ
+Ÿœ*˜>š	ŸœŸœŸ
+œŸœŸ˜)KšœŸœŸœ˜+šŸœŸ˜˜K˜5KšŸœ˜Kšœ˜—KšŸœ˜—šŸœŸœ˜KšŸœŸœ˜-K˜:—KšŸœ˜—Kšœ˜—šŸœŸœŸœŸ˜!KšœŸœŸœ˜+šŸœŸ˜˜K˜3KšŸœ	˜K˜—KšŸœ˜—KšŸœ˜—K˜8KšŸœ,Ÿœ˜KK˜K˜K˜ —KšœE™EK™KšœE™EKšœŸœŸœ˜'KšœŸœŸœ
+Ÿœ˜;K˜ KšœŸœŸœ˜+šœŸœŸœŸœ˜?K˜ —KšœŸœŸœ¡1˜Mšœ
+ŸœŸœ˜Kšœ¡W˜kKšœŸœ˜ K˜Kšœ˜Kšœ	Ÿœ˜Kšœ˜K˜ —š¢œŸœŸœŸœŸœŸœ˜_Kš¢œŸœŸœ,˜JKšœŸœ˜&šœŸœ˜ Kšœ4˜4KšœŸœ˜#K˜Kšœ¢œ˜Kšœ˜—šŸœŸœŸœŸœŸœ
+ŸœŸ˜GKšœ%Ÿœ`Ÿœ˜KšŸœ˜—Kšœ˜KšŸœ˜K˜ —š¢œŸœŸœ/˜AKšŸœŸœŸœ˜K˜KšŸœ˜K˜ —š¢œŸœŸœŸœŸœŸœ¡œ˜Xš¢œŸœ
+Ÿœ˜Kšœ ˜ KšœŸœ˜˜1KšŸœHŸœ	˜XKšœ^Ÿœ	˜k—KšŸœ˜K˜—š¢œŸœŸœŸœŸœŸœŸœ¡œ˜cKšŸœ
+ŸœŸœŸœ˜šŸœŸœŸ˜KšœŸœ"˜0šœŸœ˜$KšŸœ(ŸœŸœŸœ˜F—šœŸœ˜*Kšœ'Ÿœ˜-KšŸœŸœ>ŸœŸœ˜kKšŸœŸœŸœŸ˜ šŸœŸœŸœ˜%KšœŸœŸœ,˜aK˜*K˜—KšŸœ˜K˜—šœ	Ÿœ˜)šŸœŸœ˜!KšœŸœŸœ-˜bK˜*K˜—KšŸœ˜—KšŸœŸœ˜—K˜—KšœŸœŸœŸœ˜.KšœŸœ˜)KšœŸœŸœ"˜4Kšœ!˜!K˜KšœŸœŸœ˜"KšœŸœ)˜;KšœŸœ*˜?Kš	œŸœŸœŸœŸœ˜KšŸœ
+ŸœŸœ˜KšŸœ*ŸœŸœ˜8Kšœ(Ÿœ˜-K˜!K˜šŸœŸœ
+Ÿœ˜šŸœ	ŸœŸœŸœŸœŸœŸ˜@KšœŸœŸœ&˜Bš¢œŸœŸœŸœŸœŸœŸœ¡œ˜cKšŸœ
+ŸœŸœŸœ˜šŸœŸœŸ˜KšœŸœ1Ÿœ˜ašœŸœŸœ#Ÿœ˜NšŸœ˜KšœŸœ4Ÿœ<˜‹K˜,K˜——KšœŸœ ˜+Kšœ	Ÿœ ˜,KšŸœŸœ˜—K˜—Kšœ"˜"K˜6KšŸœ˜—Kšœ˜—KšŸœ˜K˜ —KšœŸœ˜šœ
+Ÿœ˜#K˜ —š
+¢œŸœŸœŸœŸœ˜-K™(KšœŸœŸœ˜EKšœ
+Ÿœ&Ÿœ˜:KšŸœŸœ7˜PK˜K˜ —š¢	œ˜(KšœŸœ˜-KšŸœŸœŸœ˜,K˜AK˜K˜ —KšœE™EK™KšœE™EK™ KšœŸœŸœ˜'šœŸœŸœ˜K˜Kšœ!Ÿœ˜%Kš¢	œŸœ˜KšœŸœŸœŸœ˜=K˜K˜ —šœŸœŸœŸœ¡C˜hK˜ —š¢œŸœ¢	œŸœŸœ'ŸœŸœ˜†KšœŸœ ˜*KšœŸœŸœ˜"KšŸœ ˜'KšŸœ&˜-K˜K˜ —KšœU™Uš¢
+œŸœ>ŸœŸœGŸœ
+ŸœŸœ˜ÀKšŸœŸœŸœ˜/KšŸœ9ŸœŸœŸœ˜MK˜KšŸœ9ŸœŸœŸœ˜MKšœ5™5šŸ˜Kšœ	Ÿœ˜Kš
+Ÿœ	ŸœŸœŸœŸœ˜IKšŸœŸœ˜KšŸœ˜—K˜K˜ —š¢œŸœŸœHŸœ%Ÿœ
+Ÿœ˜¥KšŸœŸœŸœ˜Kšœ˜šŸœŸœŸœŸ˜)Kš
+Ÿœ	ŸœŸœ6ŸœŸœ˜XKšŸœ˜—KšŸœŸœ˜K˜ —š¢œŸœ˜&šŸ˜KšŸœŸœŸœ˜/KšŸœŸœŸœ˜)Kšœ)˜)KšŸœ˜—K˜K˜ —š¢
+œŸœŸœŸœŸœŸœ˜UKšŸœŸœŸœ˜Kšœ˜šŸœŸœŸœŸ˜)Kš
+Ÿœ	ŸœŸœŸœŸœ˜"KšŸœ˜—KšŸœŸœ˜K˜ —š¢œŸœŸœ˜2šŸœŸœŸœŸ˜)KšŸœ	ŸœŸœŸœ˜KšŸœŸœŸœŸœ˜5šŸœŸœ˜Kš
+ŸœŸœŸœŸœŸœ$˜YKšœ
+Ÿœ˜Kšœ˜—KšŸœ˜—K˜K˜ —K™ KšœE™EK™KšœE™EK™ KšœŸœÙ˜äK˜ Kšœ-˜-K˜ —KšŸœ˜K˜ K˜ — …—    X  }ñ  

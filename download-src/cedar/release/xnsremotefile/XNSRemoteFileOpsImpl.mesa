@@ -1,0 +1,1066 @@
+
+DIRECTORY
+AuthenticationP14V2 USING [CallProblem, Credentials, CredentialsType, Problem, SeqWords, Verifier, Which],
+Basics USING [FWORD, HWORD, RawBytes, UnsafeBlock],
+BasicTime USING [GetClockPulses, GMT, Now, Pulses, PulsesToMicroseconds],
+CrRPC USING [BulkDataCheckAbortProc, BulkDataSink, BulkDataSource, BulkDataValueProc, CreateClientHandle, DestroyClientHandle, Error, ErrorReason, Handle, HandleClass, ReadBulkDataStream],
+FilingAttributesP10V5 USING [AccessSequence, Attribute, AttributeSequence, AttributeSequenceObject, AttributeValue, FileID],
+FilingP10V5 USING [AccessError, AccessProblem, AttributeTypeSequence, AuthenticationError, ByteRange, ChangeAttributes, ChangeControls, Close, Continue, Control, ControlObject, ControlSequence, ControlSequenceObject, Create, Delete, Deserialize, FilterType, Handle, HandleError, List, Lock, Logoff, Logon, Move, nullHandle, Open, ReplaceBytes, Retrieve, RetrieveBytes, ScopeSequence, ServiceError, ServiceProblem, Session, SessionError, SessionProblem, SessionToken, Store, UndefinedError],
+FinalizeOps USING [CallQueue, CreateCallQueue, EnableFinalization, FinalizeProc],
+IO USING [EndOf, EndOfStream, Error, GetBlock, PutBlock, PutFR1, STREAM, UnsafeGetBlock, UnsafePutBlock, Value],
+PFS USING [AccessOptions, CreateOptions, Error, ErrorGroup, FileType, InfoProc, Mutability, NameConfirmProc, NameFormat, NameProc, nullUniqueID, PathFromRope, PropProc, RetrieveConfirmProc, RopeFromPath, StoreConfirmProc, tUnspecified, UniqueID],
+PFSBackdoor USING [ErrorCode, ProduceError],
+PFSClass USING [AttachProc, CaseSensitiveProc, CloseProc, CopyProc, DeleteProc, EnumerateClientPropertiesProc, EnumerateForInfoProc, EnumerateForNamesProc, FileInfoProc, FileManipulationProcs, FileManipulationProcsObject, FSHandle, FSObject, GetClientPropertyProc, GetHandleProc, GetInfoProc, LookupNameProc, MaintenanceProcs, MaintenanceProcsObject, OpenFile, OpenFileObject, OpenProc, PFSNameToUnixNameProc, ReadProc, Register, RenameProc, RetrieveProc, SetAttributesProc, SetByteCountAndUniqueIDProc, SetClientPropertyProc, StoreProc, SweepProc, ValidateProc, WriteProc],
+PFSNames USING [Cat, IsAbsolute, IsADirectory, PATH, PrivatePathObject, StripVersionNumber, SubName, Version, VersionKind],
+RefText USING [ObtainScratch, ReleaseScratch],
+Rope USING [ActionType, Cat, Concat, Equal, Fetch, FetchType, IsEmpty, MapType, MaxLen, MoveType, ROPE, Substr],
+XNS USING [Address, unknownAddress],
+XNSAuth USING [AuthenticationError, CallError, Conversation, Credentials, defaultCredentialsLifetime, GetCredentials, GetNextVerifier, Identity, Initiate, Refresh, SetRecipientHostNumber, Verifier],
+XNSCH USING [LookupAddressFromRope],
+XNSCHName USING [Name, RopeFromName],
+XNSCredentials USING [GetIdentity],
+XNSRemoteFileDeserialize USING [],
+XNSRemoteFilePrivate USING [BuildAttribute, BuildDirectoryAttribute, BuildScopeDepthAndFilter, BuildScopeFilter, BuildStoreAttributes, CallProtected, ConvertFSNameToXNS, ConvertPathToFile, EncapsulateCard32, EncapsulateFileID, GetAccessErrorMsg, GetAuthCallErrorMsg, GetAuthErrorMsg, GetCedarAttributes, GetConnection, GetCrRPCErrorMsg, GetServiceErrorMsg, GetSessionErrorMsg, InfoFromAttributeStream, InfoFromOpenFile, ParsePFSPath, ReportXNSError, ReturnConnection, Revive, UnknownFile],
+XNSRemoteFileTypes USING [AttributeSequence, AttributeSequenceObject, AttributeTypeSequence, FileID, fileID, name, GMT, nullGMT, Op, pathname, ROPE, ServerData, ServerDataObject, Session, STREAM, type, XNSOpenFile, XNSOpenFileObject];
+
+
+XNSRemoteFileOpsImpl: CEDAR MONITOR
+IMPORTS BasicTime, CrRPC, FilingP10V5, FinalizeOps, IO, PFS, PFSBackdoor, PFSClass, PFSNames, RefText, Rope, XNSAuth, XNSCH, XNSCHName, XNSCredentials, XNSRemoteFilePrivate
+EXPORTS XNSRemoteFileDeserialize
+~ BEGIN OPEN XNSRemoteFilePrivate, XNSRemoteFileTypes;
+
+PATH: TYPE = PFSNames.PATH;
+FSHandle: TYPE = PFSClass.FSHandle;
+
+FileType: TYPE ~ PFS.FileType;
+Version: TYPE = PFSNames.Version;
+
+myFlavor: ATOM ¨ $XNS;
+initialConnectionTTL: CARD ¨ 8;
+credentialsErrorTTL: CARD ¨ 30;
+xnsFlavor: ATOM ~ $XNS;
+crrpcClass: CrRPC.HandleClass ~ $CMUX;
+mo: PFSClass.MaintenanceProcs ~ NEW [PFSClass.MaintenanceProcsObject ¨ [
+sweep: XNSSweep,
+validate: XNSValidate
+]];
+fmo: PFSClass.FileManipulationProcs ~ NEW[PFSClass.FileManipulationProcsObject ¨ [
+delete: XNSDelete,
+enumerateForInfo: XNSEnumerateForInfo,
+enumerateForNames: XNSEnumerateForNames,
+fileInfo: XNSFileInfo,
+lookupName: XNSLookup,
+rename: XNSRename,
+copy: XNSCopy,
+setAttributes: XNSSetAttributes,
+setByteCountAndUniqueID: XNSSetByteCountAndUniqueID,
+setClientProperty: XNSSetClientProperty,
+getClientProperty: XNSGetClientProperty,
+enumerateClientProperties: XNSEnumerateClientProperties,
+read: XNSRead,
+write: XNSWrite,
+open: XNSOpen,
+close: XNSClose,
+store: XNSStore,
+retrieve: XNSRetrieve,
+-- attach: XNSAttach,
+getInfo: XNSGetInfo
+]];
+vfsClass: PFSClass.FSHandle ~ NEW [PFSClass.FSObject ¨ [
+flavor: xnsFlavor,
+name: NIL, -- filled in upon instantiation
+maintenanceProcs: mo,
+procs: fmo,
+data: NIL -- filled in upon instantiation
+]];
+TransportProc: TYPE ~ PROC; --  [tr: Transport];
+Transport: TYPE ~ REF TransportBody;
+TransportBody: TYPE ~ MONITORED RECORD [
+crH: CrRPC.Handle,
+vfs: VFS
+];
+
+VFS: TYPE ~ REF VFSInstance;
+VFSInstance: TYPE ~ RECORD [
+fs: ROPE,
+flavorSpecified: BOOL,
+sD: ServerData
+];
+
+XNSDelete: PFSClass.DeleteProc ~ {
+class: PFSClass.FSHandle ~ h;
+vfs: VFS ~ NARROW[class.data];
+data: ServerData ¨ vfs.sD;
+crH: CrRPC.Handle ¨ GetConnection[data, h];
+doIt: BOOL ¨ TRUE;
+{ -- for ENABLE -- 
+ENABLE UNWIND => { data.active ¨ FALSE; ReturnConnection[crH] };
+P: PROC = {
+fileH: FilingP10V5.Handle; withKids: BOOL; version: Version;
+[fileH: fileH, version: version, withKids: withKids] ¨ FindFile[h, crH, file, wantedUniqueID, delete];
+IF withKids THEN {
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+FilingP10V5.Close[h: crH, file: fileH, session: data.session≠];
+ERROR PFS.Error[[client, $illegalDelete, IO.PutFR1["%g is a directory with children", [rope[PFS.RopeFromPath[file]]]]]];
+};
+IF proc # NIL THEN doIt ¨ proc[file, wantedUniqueID];
+IF doIt THEN {
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+FilingP10V5.Delete[h: crH, file: fileH, session: data.session≠];
+};
+data.active ¨ FALSE; ReturnConnection[crH];
+};
+CallProtected[proc: P, h: h, filePath: file, uid: wantedUniqueID];
+};
+};
+
+XNSEnumerateForInfo: PFSClass.EnumerateForInfoProc ~ {
+P: PROC [file: PATH, bytes: INT, created: GMT, fileType: FileType, version: Version, fID: FileID, isDir: BOOL, withKids: BOOL, pathName: REF TEXT]
+RETURNS [continue: BOOL] = {
+continue ¨ proc[fullFName: file, attachedTo: NIL, uniqueID: MakeUID[created], bytes: bytes, mutability: immutable, fileType: fileType]};
+InnerEnumerate[h, pattern, FALSE, P, enumerate];
+};
+
+XNSEnumerateForNames: PFSClass.EnumerateForNamesProc ~ {
+P: PROC [file: PATH, bytes: INT, created: GMT, fileType: FileType, version: Version,
+fID: FileID, isDir: BOOL, withKids: BOOL, pathName: REF TEXT]
+RETURNS [continue: BOOL] = {
+continue ¨ proc[file]
+};
+InnerEnumerate[h, pattern, TRUE, P, enumerateNames];
+};
+
+EnumerateProc: TYPE ~ PROC [--file:-- PATH, --bytes:-- INT, --created:-- GMT,
+--fileType:-- FileType, --version:-- Version, --fID:-- FileID, --isDir:-- BOOL, --withKids:-- BOOL, --pathName:-- REF TEXT] RETURNS [--continue:-- BOOL];
+
+InnerEnumerate: PROC [h: FSHandle, pattern: PATH, namesOnly: BOOL,
+proc: EnumerateProc, op: Op] ~ {
+class: PFSClass.FSHandle ~ h;
+vfs: VFS ~ NARROW[class.data];
+data: ServerData ¨ vfs.sD;
+root: FilingP10V5.Handle ¨ data.root;
+leadingDir: PATH ~ PFSNames.SubName[pattern, 0, 1, PFSNames.IsAbsolute[pattern], PFSNames.IsADirectory[pattern]];
+pat: ROPE ~ RemoveLeadingSlash[PFS.RopeFromPath[pattern]];
+newPattern: ROPE ¨ ConvertFSNameToXNS[pat, enumerate];
+scope: FilingP10V5.ScopeSequence ¨ BuildScopeFilter[matches, newPattern, pathname];
+types: AttributeTypeSequence ~ GetCedarAttributes[op];
+crH: CrRPC.Handle ¨ GetConnection[data, h];
+Listing: CrRPC.BulkDataSink ~ {
+EachElement: CrRPC.BulkDataValueProc ~ {
+file: ROPE; continue: BOOL;
+pathName: REF TEXT;
+filePath: PATH;
+bytes: INT ¨ 0; created: GMT ¨ nullGMT;
+fileType: PFS.FileType ¨ PFS.tUnspecified;
+version: Version ¨ [none, 0];
+fileID: FileID; isDir: BOOL; numKids: CARD;
+[version, bytes, created, fileType, pathName, fileID, isDir, numKids] ¨ InfoFromAttributeStream[s];
+file ¨ ConvertPathToFile[pathName, isDir];
+IF file = NIL THEN { RefText.ReleaseScratch[pathName]; RETURN[FALSE] }; -- the server has given us a file that has a bad character in it so go around
+filePath ¨ PFSNames.Cat[leadingDir, PFS.PathFromRope[file]];
+continue ¨ proc[PFS.PathFromRope[file], bytes, created, fileType, version, fileID, isDir,
+(isDir AND (numKids # 0)), pathName];
+RefText.ReleaseScratch[pathName];
+RETURN[NOT continue];
+}; -- EachElement
+IF ( s.EndOf[] ) THEN { abort ¨ FALSE; RETURN }; -- "Services" feature workaround
+abort ¨ CrRPC.ReadBulkDataStream[crH, s, checkAbort, EachElement];
+}; -- Listing
+{ -- for ENABLE --
+DO
+ENABLE UNWIND => { data.active ¨ FALSE; ReturnConnection[crH] };
+ok: BOOL ¨ TRUE;
+openL: LIST OF FilingP10V5.Handle;
+listDir: LIST OF ROPE;
+listBase: ROPE;
+
+P: PROC = {
+FilingP10V5.List[crH, root, types, scope, Listing, data.session≠
+! PFS.Error => {
+IF error.code = $illegalScopeValue THEN ok ¨ FALSE; CONTINUE } ];
+IF NOT ok THEN RETURN;
+data.active ¨ FALSE; ReturnConnection[crH];
+};
+CallProtected[proc: P, h: h, filePath: NIL, uid: PFS.nullUniqueID];
+IF ok THEN {
+FOR l: LIST OF FilingP10V5.Handle ¨ openL, l.rest UNTIL l = NIL DO
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+FilingP10V5.Close[h: crH, file: l.first, session: data.session≠];
+ENDLOOP;
+RETURN;
+};
+BEGIN
+fileH: FilingP10V5.Handle ¨ FilingP10V5.nullHandle;
+[listDir, listBase] ¨ ParsePFSPath[pattern];
+FOR l: LIST OF ROPE ¨ listDir, l.rest UNTIL l = NIL DO
+directory: ROPE ~ l.first;
+found: BOOL ¨ TRUE;
+attributes: AttributeSequence ¨ BuildAttribute[directory, name];
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+fileH ¨ FilingP10V5.Open[h: crH, attributes: attributes, directory: fileH,
+controls: nullControls, session: data.session≠
+! FilingP10V5.AccessError => IF problem = fileNotFound THEN
+{found ¨ FALSE; CONTINUE} ELSE REJECT];
+IF NOT found THEN {
+data.active ¨ FALSE; ReturnConnection[crH];
+RETURN;
+};
+openL ¨ CONS[fileH, openL];
+ENDLOOP;
+END;
+IF openL = NIL THEN RETURN;
+root ¨ openL.first;
+scope ¨ BuildScopeDepthAndFilter[1, matches, ConvertFSNameToXNS[listBase, enumerate], name]; 
+ENDLOOP;
+};
+};
+
+
+XNSFileInfo: PFSClass.FileInfoProc ~ {
+class: PFSClass.FSHandle ~ h;
+vfs: VFS ~ NARROW[class.data];
+data: ServerData ~ vfs.sD;
+crH: CrRPC.Handle ¨ GetConnection[data, h];
+{ -- for ENABLE --
+ENABLE UNWIND => {data.active ¨ FALSE; ReturnConnection[crH]};
+P: PROC = {
+fileH: FilingP10V5.Handle;
+created: GMT;
+[fileH, version, bytes, created, fileType] ¨
+FindFile[h, crH, file, PFS.nullUniqueID, enumerate];
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+FilingP10V5.Close[h: crH, file: fileH, session: data.session≠];
+data.active ¨ FALSE;
+ReturnConnection[crH];
+mutability ¨ immutable;
+uniqueID ¨ MakeUID[created];
+};
+CallProtected[proc: P, h: h, filePath: file, uid: wantedUniqueID];
+};
+};
+
+XNSLookup: PFSClass.LookupNameProc ~ {
+vfs: VFS ~ NARROW[h.data];	-- sanity check
+UnImplemented["XNSLookup"];
+RETURN[file];
+};
+
+XNSRename: PFSClass.RenameProc ~ {
+class: PFSClass.FSHandle ~ h;
+vfs: VFS ~ NARROW[class.data];
+data: ServerData ~ vfs.sD;
+crH: CrRPC.Handle ¨ GetConnection[data, h];
+fromDir, toDir, lor2: LIST OF ROPE; fromBase, toBase: ROPE;
+different: BOOL ¨ FALSE;
+openL: LIST OF FilingP10V5.Handle ¨ NIL;
+
+[fromDir, fromBase -- version--] ¨ ParsePFSPath[fromFile];
+[toDir, toBase -- version--] ¨ ParsePFSPath[toFile];
+lor2 ¨ toDir; -- so we keep toDir intact
+FOR lor1: LIST OF ROPE ¨ fromDir, lor1.rest UNTIL lor1 = NIL DO
+IF lor2 = NIL THEN {different ¨ TRUE; EXIT};
+IF lor2.first = NIL THEN {different ¨ TRUE; EXIT};
+IF ~Rope.Equal[s1: lor1.first, s2: lor2.first, case: FALSE] THEN {different ¨ TRUE; EXIT};
+lor2 ¨ lor2.rest;
+ENDLOOP;
+IF lor2 # NIL THEN different ¨ TRUE;
+
+IF different
+THEN {
+ENABLE UNWIND => {
+FOR l: LIST OF FilingP10V5.Handle ¨ openL, l.rest UNTIL l = NIL DO
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+FilingP10V5.Close[h: crH, file: l.first, session: data.session≠
+! FilingP10V5.AuthenticationError, FilingP10V5.HandleError, FilingP10V5.SessionError, FilingP10V5.UndefinedError, CrRPC.Error, IO.EndOfStream, IO.Error => CONTINUE
+];
+ENDLOOP;
+data.active ¨ FALSE;
+ReturnConnection[crH];
+};
+P: PROC = {
+fileH, orig: FilingP10V5.Handle ¨ FilingP10V5.nullHandle;
+version: Version;
+[fileH: orig, version: version] ¨ FindFile[h, crH, fromFile, wantedUniqueID, rename]; -- may raise not found error
+IF ( proc = NIL ) OR ( proc[fromFile, wantedUniqueID]) THEN { -- ???
+attributes: AttributeSequence;
+FOR l: LIST OF ROPE ¨ toDir, l.rest UNTIL l = NIL DO
+directory: ROPE ~ l.first;
+build: BOOL ¨ FALSE;
+attributes ¨ BuildAttribute[directory, name];
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+fileH ¨ FilingP10V5.Open[h: crH, attributes: attributes, directory: fileH,
+controls: nullControls, session: data.session≠
+! FilingP10V5.AccessError => IF problem = fileNotFound THEN
+{build ¨ TRUE; CONTINUE} ELSE REJECT];
+IF build THEN { -- fileH is still the handle for the previous level directory
+attributes ¨ BuildDirectoryAttribute[directory];
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+fileH ¨ FilingP10V5.Create[h: crH, directory: fileH, attributes: attributes, controls: nullControls, session: data.session≠];
+};
+openL ¨ CONS[fileH, openL];
+ENDLOOP;
+attributes ¨ BuildAttribute[toBase, name];
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+FilingP10V5.Move[h: crH, file: orig, destinationDirectory: fileH,
+attributes: attributes, session: data.session≠];
+};
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+FilingP10V5.Close[h: crH, file: orig, session: data.session≠];
+FOR l: LIST OF FilingP10V5.Handle ¨ openL, l.rest UNTIL l = NIL DO
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+FilingP10V5.Close[h: crH, file: l.first, session: data.session≠];
+ENDLOOP;
+data.active ¨ FALSE; ReturnConnection[crH];
+};
+CallProtected[proc: P, h: h, filePath: fromFile, uid: wantedUniqueID];
+}
+ELSE { -- the subdirectory is the same so just change the name
+ENABLE UNWIND => {data.active ¨ FALSE; ReturnConnection[crH]};
+P: PROC = {
+fileH: FilingP10V5.Handle; version: Version;
+[fileH: fileH, version: version] ¨ FindFile[h, crH, fromFile, wantedUniqueID, rename];
+IF ( proc = NIL ) OR ( proc[fromFile, wantedUniqueID] ) THEN {	-- ???
+attributes: AttributeSequence ¨ BuildAttribute[toBase, name];
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+FilingP10V5.ChangeAttributes[h: crH, file: fileH, attributes: attributes, session: data.session≠];
+};
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+FilingP10V5.Close[h: crH, file: fileH, session: data.session≠];
+data.active ¨ FALSE; ReturnConnection[crH];
+};
+CallProtected[proc: P, h: h, filePath: fromFile, uid: wantedUniqueID];
+};
+};
+
+XNSCopy: PFSClass.CopyProc ~ {
+vfs: VFS ~ NARROW[h.data];	-- sanity check
+UnImplemented["XNSCopy"];
+};
+
+XNSSetAttributes: PFSClass.SetAttributesProc = {
+vfs: VFS ~ NARROW[h.data];
+data: ServerData ~ vfs.sD;
+crH: CrRPC.Handle ¨ GetConnection[data, h];
+xattributes: AttributeSequence ¨ NEW[AttributeSequenceObject[1]];
+xattributes[0] ¨ [type: type, value: EncapsulateCard32[attributes.fileType]];
+{ -- for ENABLE --
+ENABLE UNWIND => { data.active ¨ FALSE; ReturnConnection[crH] };
+P: PROC = {
+xnsFile: XNSOpenFile ~ NARROW[file.data];
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+FilingP10V5.ChangeAttributes[h: crH, file: xnsFile.fileH, attributes: xattributes, session: data.session≠];
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+data.active ¨ FALSE;
+ReturnConnection[crH];
+};
+CallProtected[proc: P, h: h, filePath: NIL, uid: PFS.nullUniqueID];
+};
+};
+
+XNSSetByteCountAndUniqueID: PFSClass.SetByteCountAndUniqueIDProc ~ {
+vfs: VFS ~ NARROW[h.data];	-- sanity check
+UnImplemented["XNSSetByteCountAndUniqueID"];
+};
+
+ControlSeqFromRope: PROC [r: Rope.ROPE] RETURNS [cs: FilingP10V5.ControlSequence] = {
+lock: FilingP10V5.Lock;
+SELECT TRUE FROM
+Rope.Equal[r, "lockNone"] => lock ¨ lockNone;
+Rope.Equal[r, "share"] => lock ¨ share;
+Rope.Equal[r, "exclusive"] => lock ¨ exclusive;
+ENDCASE => ERROR; -- unknows ControlType
+cs ¨ NEW [FilingP10V5.ControlSequenceObject[1]];
+cs[0] ¨ NEW [FilingP10V5.ControlObject ¨ [lock[lock]]];
+RETURN[cs];
+};
+
+XNSSetClientProperty: PFSClass.SetClientPropertyProc -- [h: FSHandle, file: OpenFile, propertyName: ROPE, propertyValue: ROPE] -- = {
+vfs: VFS ~ NARROW[h.data];	-- sanity check
+data: ServerData ~ vfs.sD;
+crH: CrRPC.Handle ¨ GetConnection[data, h];
+SELECT TRUE FROM 
+Rope.Equal[propertyName, "ControlType"] => {
+ENABLE UNWIND => { data.active ¨ FALSE; ReturnConnection[crH] };
+P: PROC = {
+controls: FilingP10V5.ControlSequence = ControlSeqFromRope[propertyValue];
+xnsFile: XNSOpenFile ~ NARROW[file.data];
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+FilingP10V5.ChangeControls[crH, xnsFile.fileH, controls, data.session≠];
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+};
+CallProtected[proc: P, h: h, filePath: NIL, uid: PFS.nullUniqueID];
+};
+ENDCASE => PFSBackdoor.ProduceError[notImplemented, Rope.Concat[propertyName, " is not an implemented property in the XNS view"]];
+};
+
+XNSGetClientProperty: PFSClass.GetClientPropertyProc ~ {
+vfs: VFS ~ NARROW[h.data];	-- sanity check
+UnImplemented["XNSGetClientProperty"];
+RETURN[propertyValue];
+};
+
+XNSEnumerateClientProperties: PFSClass.EnumerateClientPropertiesProc ~ {
+vfs: VFS ~ NARROW[h.data];	-- sanity check
+UnImplemented["XNSEnumerateClientProperties"];
+};
+
+XNSRead: PFSClass.ReadProc ~ {
+vfs: VFS ~ NARROW[h.data];
+data: ServerData ¨ vfs.sD;
+P: PROC ~ {
+xnsFile: XNSOpenFile ~ NARROW[file.data];
+range: FilingP10V5.ByteRange;
+crH: CrRPC.Handle;
+posAsInt: INT ¨ filePosition;
+Sink: CrRPC.BulkDataSink ~ TRUSTED {
+block: Basics.UnsafeBlock ~ [base: toPtr, startIndex: toStart, count: nBytes];
+abort ¨ checkAbort[h];
+IF ( NOT s.EndOf[] ) THEN bytesRead ¨ s.UnsafeGetBlock[block];
+};
+IF file.bytes <= posAsInt THEN RETURN;	-- at end
+range ¨ [filePosition, nBytes];
+crH ¨ CrRPC.CreateClientHandle[crrpcClass, data.address];
+FilingP10V5.RetrieveBytes[crH, xnsFile.fileH, range, Sink, data.session≠];
+CrRPC.DestroyClientHandle[crH];
+};
+bytesRead ¨ 0;
+CallProtected[proc: P, h: h, filePath: NIL, uid: PFS.nullUniqueID];
+};
+
+XNSWrite: PFSClass.WriteProc ~ {
+vfs: VFS ~ NARROW[h.data];
+data: ServerData ¨ vfs.sD;
+P: PROC ~ {
+xnsFile: XNSOpenFile ~ NARROW[file.data];
+range: FilingP10V5.ByteRange ~ [filePosition, nBytes];
+Source: CrRPC.BulkDataSource ~ TRUSTED {
+block: Basics.UnsafeBlock ~ [base: fromPtr, startIndex: fromStart, count: nBytes];
+abort ¨ checkAbort[h];
+s.UnsafePutBlock[block];
+bytesWritten ¨ nBytes;
+};
+crH: CrRPC.Handle ~ CrRPC.CreateClientHandle[crrpcClass, data.address];
+FilingP10V5.ReplaceBytes[crH, xnsFile.fileH, range, Source, data.session≠];
+CrRPC.DestroyClientHandle[crH];
+};
+bytesWritten ¨ 0;
+CallProtected[proc: P, h: h, filePath: NIL, uid: PFS.nullUniqueID];
+};
+
+XNSOpen: PFSClass.OpenProc ~ {
+class: PFSClass.FSHandle ~ h;
+vfs: VFS ~ NARROW[class.data];
+data: ServerData ~ vfs.sD;
+LegitimateMatch: PROC RETURNS [match: BOOL] ~ {
+match ¨ TRUE;
+};
+version: Version;
+attachedTo: PATH;
+bytes: INT;
+uniqueID: PFS.UniqueID;
+mutability: PFS.Mutability;
+zfileType: FileType;
+of: PFSClass.OpenFile ¨ NIL;
+OpenInner: PROC ~ {
+ENABLE UNWIND => { NULL };
+xnsFile: XNSOpenFile;
+newFile: ROPE ~ RemoveLeadingSlash[PFS.RopeFromPath[file]];
+attributes: AttributeSequence ~ BuildAttribute[newFile, pathname];
+fileH: FilingP10V5.Handle;
+crH: CrRPC.Handle ~ CrRPC.CreateClientHandle[crrpcClass, data.address];
+fileH ¨ FilingP10V5.Open[h: crH, attributes: attributes, directory: data.root, controls: nullControls, session: data.session≠];
+CrRPC.DestroyClientHandle[crH];
+xnsFile ¨ NEW[XNSOpenFileObject ¨ [fileH, BasicTime.Now[]]];
+of ¨ NEW[PFSClass.OpenFileObject ¨ [fs: class, fullFName: file, attachedTo: attachedTo, uniqueID: uniqueID, bytes: bytes, mutability: mutability, fileType: zfileType, access: access, state: open, data: xnsFile]];
+OpenInternal[data];
+};
+[version, attachedTo, bytes, uniqueID, mutability, zfileType] ¨
+XNSFileInfo[h, file, wantedUniqueID];
+IF ( NOT LegitimateMatch[] )
+THEN {
+UnknownFile[PFS.RopeFromPath[file], wantedUniqueID.egmt.gmt];
+RETURN[NIL]; -- not reached!
+};
+CallProtected[proc: OpenInner, h: h, filePath: file, uid: wantedUniqueID];
+RETURN[of];
+};
+
+XNSClose: PFSClass.CloseProc ~ {
+vfs: VFS ~ NARROW[h.data];
+data: ServerData ~ vfs.sD;
+P: PROC ~ {
+xnsFile: XNSOpenFile ~ NARROW[file.data];
+IF (data.session # NIL ) THEN {
+crH: CrRPC.Handle ~ CrRPC.CreateClientHandle[crrpcClass, data.address];
+FilingP10V5.Close[h: crH, file: xnsFile.fileH, session: data.session≠];
+CrRPC.DestroyClientHandle[crH];
+};
+CloseInternal[data];
+};
+CallProtected[proc: P, h: h, filePath: NIL, uid: PFS.nullUniqueID];
+};
+
+XNSStore: PFSClass.StoreProc ~ {
+class: PFSClass.FSHandle ~ h;
+vfs: VFS ~ NARROW[class.data];
+data: ServerData ~ vfs.sD;
+crH: CrRPC.Handle ¨ GetConnection[data, h];
+Content: CrRPC.BulkDataSource = {
+buffer: REF TEXT = RefText.ObtainScratch[512];
+abort ¨ FALSE;
+DO
+nBytes: NAT = IO.GetBlock[str, buffer, 0];
+IF nBytes = 0 THEN EXIT;
+IO.PutBlock[s, buffer, 0, nBytes];
+ENDLOOP;
+RefText.ReleaseScratch[buffer];
+};
+dir: LIST OF ROPE; fName, homeDir: ROPE;
+fileH, newFileH: FilingP10V5.Handle ¨ FilingP10V5.nullHandle;
+openL: LIST OF FilingP10V5.Handle ¨ NIL;
+version: Version; -- aka 0
+doIt: BOOL ¨ TRUE;
+[dir, fName, version] ¨ ParsePFSPath[file];
+homeDir ¨ dir.first; dir ¨ dir.rest; -- take off the main directory name
+{ -- for ENABLE
+ENABLE UNWIND => {
+FOR l: LIST OF FilingP10V5.Handle ¨ openL, l.rest UNTIL l = NIL DO
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+FilingP10V5.Close[h: crH, file: l.first, session: data.session≠
+! FilingP10V5.AuthenticationError, FilingP10V5.HandleError, FilingP10V5.SessionError, FilingP10V5.UndefinedError, CrRPC.Error, IO.EndOfStream, IO.Error => CONTINUE
+];
+ENDLOOP;
+data.active ¨ FALSE;
+ReturnConnection[crH];
+};
+P: PROC = {
+attributes: AttributeSequence ¨ BuildAttribute[homeDir, name];
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+fileH ¨ FilingP10V5.Open[h: crH, attributes: attributes, directory: fileH, controls: nullControls, session: data.session≠
+! FilingP10V5.AccessError => IF problem = fileNotFound THEN CONTINUE ELSE REJECT];
+IF fileH = FilingP10V5.nullHandle THEN { -- directory not found
+data.active ¨ FALSE; ReturnConnection[crH];
+ReportXNSError[unknownFile, h, file, nullGMT];	-- ???
+};
+openL ¨ CONS[fileH, openL];
+FOR lor: LIST OF ROPE ¨ dir, lor.rest UNTIL lor = NIL DO
+directory: ROPE ~ lor.first;
+build: BOOL ¨ FALSE;
+attributes ¨ BuildAttribute[directory, name];
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+fileH ¨ FilingP10V5.Open[h: crH, attributes: attributes, directory: fileH,
+controls: nullControls, session: data.session≠
+! FilingP10V5.AccessError => IF problem = fileNotFound THEN
+{build ¨ TRUE; CONTINUE} ELSE REJECT];
+IF build THEN { -- fileH is still the handle for the previous level directory
+attributes ¨ BuildDirectoryAttribute[directory];
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+fileH ¨ FilingP10V5.Create[h: crH, directory: fileH, attributes: attributes, controls: nullControls, session: data.session≠];
+};
+openL ¨ CONS[fileH, openL];
+ENDLOOP;
+attributes ¨ BuildAttribute[fName, name];
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+newFileH ¨ FilingP10V5.Open[h: crH, attributes: attributes, directory: fileH, controls: nullControls, session: data.session≠
+! FilingP10V5.AccessError => IF problem = fileNotFound THEN CONTINUE ELSE REJECT];
+IF newFileH # FilingP10V5.nullHandle
+THEN {
+IF version.versionKind = none THEN {
+version ¨ InfoFromOpenFile[data, crH, newFileH, store].version;
+IF version.versionKind = numeric THEN
+version.version ¨ version.version + 1;
+};
+}
+ELSE { IF version.versionKind = none THEN version ¨ [numeric, 1] };
+IF proc # NIL THEN {
+doIt ¨ proc[file];
+};
+IF doIt THEN {
+attributes ¨ BuildStoreAttributes[fName, version.version, wantedUniqueID.egmt.gmt];
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+fileH ¨ FilingP10V5.Store[h: crH, directory: fileH, attributes: attributes, controls: nullControls, content: Content, session: data.session≠];
+};
+openL ¨ CONS[fileH, openL];
+FOR l: LIST OF FilingP10V5.Handle ¨ openL, l.rest UNTIL l = NIL DO
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+FilingP10V5.Close[h: crH, file: l.first, session: data.session≠];
+ENDLOOP;
+data.active ¨ FALSE; ReturnConnection[crH];
+};
+CallProtected[proc: P, h: h, filePath: file, uid: wantedUniqueID];
+};
+};
+
+XNSRetrieve: PFSClass.RetrieveProc ~ {
+class: PFSClass.FSHandle ~ h;
+vfs: VFS ~ NARROW[class.data];
+data: ServerData ~ vfs.sD;
+localStream: STREAM ¨ NIL;
+Content: CrRPC.BulkDataSink = {
+buffer: REF TEXT = RefText.ObtainScratch[512];
+nBytes: NAT;
+abort ¨ FALSE;
+DO
+IF s.EndOf[] THEN EXIT;	-- seems to end this way sometimes
+nBytes ¨ s.GetBlock[buffer, 0];
+IF nBytes = 0 THEN EXIT;
+localStream.PutBlock[buffer, 0, nBytes];
+ENDLOOP;
+RefText.ReleaseScratch[buffer];
+};
+InnerRetrieve: PROC = {
+crH: CrRPC.Handle ¨ GetConnection[data, h];
+{ -- for ENABLE --
+ENABLE UNWIND => { data.active ¨ FALSE; ReturnConnection[crH] };
+P: PROC = {
+version: Version; bytes: INT; created: GMT;
+fileH: FilingP10V5.Handle;
+[fileH: fileH, version: version, bytes: bytes, created: created] ¨ FindFile[h, crH, file, wantedUniqueID, retrieve];
+localStream ¨ proc[file, bytes, MakeUID[created]];
+IF localStream # NIL THEN {
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+FilingP10V5.Retrieve[h: crH, file: fileH, content: Content, session: data.session≠];
+};
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+FilingP10V5.Close[h: crH, file: fileH, session: data.session≠];
+data.active ¨ FALSE; ReturnConnection[crH];
+};
+CallProtected[proc: P, h: h, filePath: file, uid: wantedUniqueID];
+};
+};
+InnerRetrieve[];
+};
+
+XNSGetInfo: PFSClass.GetInfoProc ~ {
+vfs: VFS ~ NARROW[h.data];
+fullFName ¨ file.fullFName;
+attachedTo ¨ file.attachedTo;
+uniqueID ¨ file.uniqueID;
+bytes ¨ file.bytes;
+mutability ¨ file.mutability;
+fileType ¨ file.fileType;
+};
+
+XNSDeserialize: PUBLIC PROC[h: FSHandle, directory: PATH, str: STREAM,
+proc: PFS.StoreConfirmProc] ~ {
+vfs: VFS ~ NARROW[h.data];
+data: ServerData ~ vfs.sD;
+crH: CrRPC.Handle ¨ GetConnection[data, h];
+Content: CrRPC.BulkDataSource = {
+buffer: REF TEXT = RefText.ObtainScratch[512];
+abort ¨ FALSE;
+DO
+nBytes: NAT = IO.GetBlock[str, buffer, 0];
+IF nBytes = 0 THEN EXIT;
+IO.PutBlock[s, buffer, 0, nBytes];
+ENDLOOP;
+RefText.ReleaseScratch[buffer];
+};
+dir: LIST OF ROPE; fName, homeDir: ROPE;
+fileH, newFileH: FilingP10V5.Handle ¨ FilingP10V5.nullHandle;
+openL: LIST OF FilingP10V5.Handle ¨ NIL;
+version: Version ¨ [lowest, 0]; -- aka 0
+doIt: BOOL ¨ TRUE;
+[dir, fName, version] ¨ ParsePFSPath[directory];
+homeDir ¨ dir.first; dir ¨ dir.rest; -- take off the main directory name
+{ -- for ENABLE
+ENABLE UNWIND => {
+FOR l: LIST OF FilingP10V5.Handle ¨ openL, l.rest UNTIL l = NIL DO
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+FilingP10V5.Close[h: crH, file: l.first, session: data.session≠
+! FilingP10V5.AuthenticationError, FilingP10V5.HandleError, FilingP10V5.SessionError, FilingP10V5.UndefinedError, CrRPC.Error, IO.EndOfStream, IO.Error => CONTINUE
+];
+ENDLOOP;
+data.active ¨ FALSE;
+ReturnConnection[crH];
+};
+P: PROC = {
+attributes: AttributeSequence ¨ BuildAttribute[homeDir, name];
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+fileH ¨ FilingP10V5.Open[h: crH, attributes: attributes, directory: fileH, controls: nullControls, session: data.session≠
+! FilingP10V5.AccessError => IF problem = fileNotFound THEN CONTINUE ELSE REJECT];
+IF fileH = FilingP10V5.nullHandle THEN { -- directory not found
+data.active ¨ FALSE; ReturnConnection[crH];
+ReportXNSError[unknownFile, h, directory, nullGMT];	--???
+};
+openL ¨ CONS[fileH, openL];
+FOR lor: LIST OF ROPE ¨ dir, lor.rest UNTIL lor = NIL DO
+directory: ROPE ~ lor.first;
+build: BOOL ¨ FALSE;
+attributes ¨ BuildAttribute[directory, name];
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+fileH ¨ FilingP10V5.Open[h: crH, attributes: attributes, directory: fileH,
+controls: nullControls, session: data.session≠
+! FilingP10V5.AccessError => IF problem = fileNotFound THEN
+{build ¨ TRUE; CONTINUE} ELSE REJECT];
+IF build THEN { -- fileH is still the handle for the previous level directory
+attributes ¨ BuildDirectoryAttribute[directory];
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+fileH ¨ FilingP10V5.Create[h: crH, directory: fileH, attributes: attributes, controls: nullControls, session: data.session≠];
+};
+openL ¨ CONS[fileH, openL];
+ENDLOOP;
+attributes ¨ BuildAttribute[fName, name];
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+newFileH ¨ FilingP10V5.Open[h: crH, attributes: attributes, directory: fileH, controls: nullControls, session: data.session≠
+! FilingP10V5.AccessError => IF problem = fileNotFound THEN CONTINUE ELSE REJECT];
+IF newFileH # FilingP10V5.nullHandle
+THEN {
+IF version.versionKind = none
+THEN {
+version ¨ InfoFromOpenFile[data, crH, newFileH, store].version;
+IF version.versionKind = numeric THEN
+version.version ¨ version.version + 1;	-- not set ??
+};
+}
+ELSE { IF version.versionKind = none THEN version ¨ [numeric, 1] };
+IF proc # NIL THEN doIt ¨ proc[directory];	-- ???
+attributes ¨ NEW [AttributeSequenceObject[0]];
+IF doIt THEN {
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+fileH ¨ FilingP10V5.Deserialize[h: crH, directory: fileH, attributes: attributes, controls: nullControls, serializedFile: Content, session: data.session≠];
+};
+openL ¨ CONS[fileH, openL];
+FOR l: LIST OF FilingP10V5.Handle ¨ openL, l.rest UNTIL l = NIL DO
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+FilingP10V5.Close[h: crH, file: l.first, session: data.session≠];
+ENDLOOP;
+data.active ¨ FALSE; ReturnConnection[crH];
+};
+CallProtected[proc: P, h: h, filePath: directory, uid: PFS.nullUniqueID];
+};
+};
+
+nullAttributes: AttributeSequence ~ NEW[AttributeSequenceObject[0]];
+nullControls: FilingP10V5.ControlSequence ~ NEW [FilingP10V5.ControlSequenceObject[0]];
+XNSGetServer: PFSClass.GetHandleProc ~ {
+vfs: VFS ~ NEW[VFSInstance ¨ [fs: fs, flavorSpecified: flavorSpecified, sD: NIL] ];
+data: ServerData;
+session: REF Session;
+qualified: XNSCHName.Name; address: REF XNS.Address; name: ROPE;
+crH: CrRPC.Handle;
+conversation: XNSAuth.Conversation; credentials: XNSAuth.Credentials;
+verifier: XNSAuth.Verifier; realId: XNSAuth.Identity; ttl: CARD ¨ initialConnectionTTL;
+root: FilingP10V5.Handle;
+opened: BOOL ¨ FALSE;
+downMsg ¨ "can\'t connect";
+{
+ENABLE {
+CrRPC.Error =>
+{ downMsg ¨ GetCrRPCErrorMsg[errorReason, text]; CONTINUE };
+FilingP10V5.AccessError =>
+{ downMsg ¨ GetAccessErrorMsg[problem]; CONTINUE };
+FilingP10V5.AuthenticationError =>
+{ downMsg ¨ GetAuthErrorMsg[problem]; CONTINUE };
+FilingP10V5.ServiceError =>
+{ downMsg ¨ GetServiceErrorMsg[problem]; CONTINUE };
+FilingP10V5.SessionError =>
+{ downMsg ¨ GetSessionErrorMsg[problem]; CONTINUE };
+FilingP10V5.UndefinedError =>
+{ downMsg ¨ "Undefined error from server"; CONTINUE };
+XNSAuth.AuthenticationError =>
+{ downMsg ¨ GetAuthErrorMsg[problem]; CONTINUE };
+XNSAuth.CallError =>
+{ downMsg ¨ GetAuthCallErrorMsg[problem]; CONTINUE };
+};
+add: XNS.Address;
+[qualified, add] ¨ XNSCH.LookupAddressFromRope[fs];
+IF add = XNS.unknownAddress THEN -- host not known -- RETURN[NIL, NIL];
+name ¨ XNSCHName.RopeFromName[qualified];
+address ¨ NEW[XNS.Address ¨ add];
+crH ¨ CrRPC.CreateClientHandle[crrpcClass, address];
+realId ¨ XNSCredentials.GetIdentity[];
+conversation ¨ XNSAuth.Initiate[realId, qualified];
+credentials ¨ XNSAuth.GetCredentials[conversation];
+XNSAuth.SetRecipientHostNumber[conversation, address.host];
+verifier ¨ XNSAuth.GetNextVerifier[conversation];
+session ¨ NEW[Session ¨ FilingP10V5.Logon[crH, qualified, credentials, verifier]];
+session.verifier ¨ XNSAuth.GetNextVerifier[conversation];
+ttl ¨ FilingP10V5.Continue[crH, session≠];
+XNSAuth.Refresh[conversation, ttl];
+session.verifier ¨ XNSAuth.GetNextVerifier[conversation];
+root ¨ FilingP10V5.Open[crH, nullAttributes, FilingP10V5.nullHandle, nullControls, session≠];
+CrRPC.DestroyClientHandle[crH];
+opened ¨ TRUE;
+};
+IF NOT opened THEN RETURN [NIL, downMsg];
+data ¨ NEW[ServerDataObject ¨
+[downMsg: NIL, connectionTTL: ttl, continuance: ttl, session: session, conversation: conversation, conversationTTL: 10000, qualified: qualified, serverName: name, address: address, root: root]];
+[] ¨ FinalizeOps.EnableFinalization[data, dfq];
+vfs.sD ¨ data;
+h ¨ NEW[PFSClass.FSObject ¨ vfsClass≠];
+h.name ¨ fs;
+h.data ¨ vfs;
+RETURN [h, NIL];
+};
+
+XNSValidate: PFSClass.ValidateProc ~ {
+ENABLE UNWIND => NULL;
+class: PFSClass.FSHandle ~ h;
+vfs: VFS ~ NARROW[class.data];
+data: ServerData ~ vfs.sD;
+IF data.connectionTTL > 0 THEN [] ¨ Revive[data]; -- returns 0 on errors
+RETURN [(data.connectionTTL <= 0), NIL];
+};
+
+dfq: FinalizeOps.CallQueue ~ FinalizeOps.CreateCallQueue[Finalize];
+
+XNSSweep: PFSClass.SweepProc -- [h: FSHandle, seconds: CARD] -- ~ {
+vfs: VFS ~ NARROW[h.data];
+data: ServerData ~ vfs.sD;
+session: REF Session ¨ NIL; address: REF XNS.Address;
+XNSSweepInner: ENTRY PROC ~ {
+ENABLE UNWIND => NULL;
+IF data.connectionTTL > seconds
+THEN data.connectionTTL ¨ data.connectionTTL - seconds
+ELSE {
+IF NOT data.active THEN {-- there is no time left on the connection so kill it.
+session ¨ data.session;
+address ¨ data.address;
+data.session ¨ NIL;
+data.connectionTTL ¨ 0;
+};
+};
+};
+XNSSweepInner[];
+IF session # NIL THEN {
+crH: CrRPC.Handle ~ CrRPC.CreateClientHandle[crrpcClass, address];
+FilingP10V5.Logoff[h: crH, session: session≠ ! FilingP10V5.SessionError, FilingP10V5.AuthenticationError, CrRPC.Error => CONTINUE];
+CrRPC.DestroyClientHandle[crH];
+};
+};
+
+Finalize: FinalizeOps.FinalizeProc = {
+droppedData: ServerData ~ NARROW[object];
+session: REF Session ~ droppedData.session;
+IF session # NIL THEN {
+address: REF XNS.Address ~ droppedData.address;
+crH: CrRPC.Handle ¨ CrRPC.CreateClientHandle[crrpcClass, address];
+FilingP10V5.Logoff[h: crH, session: session≠ ! FilingP10V5.SessionError, FilingP10V5.AuthenticationError, CrRPC.Error => CONTINUE];
+CrRPC.DestroyClientHandle[crH];
+droppedData.session ¨ NIL;
+};
+};
+startO, endO: CARD;
+openTime: CARD;
+
+UnImplemented: PROC [msg: ROPE] ~
+{ PFSBackdoor.ProduceError[notImplemented, msg] };
+
+RemoveLeadingSlash: PROC [maybeWithSlash: ROPE]
+RETURNS [noSlash: ROPE] ~ {
+IF Rope.IsEmpty[maybeWithSlash] THEN RETURN[maybeWithSlash];
+noSlash ¨ IF ( maybeWithSlash.Fetch[0] = '/ ) THEN maybeWithSlash.Substr[1] ELSE maybeWithSlash;
+};
+
+FindFile: PROC [h: FSHandle, crH: CrRPC.Handle, fromPath: PATH, wantedUniqueID: PFS.UniqueID, op: Op]
+RETURNS [fileH: FilingP10V5.Handle ¨ FilingP10V5.nullHandle, version: Version, bytes: INT, created: GMT, fileType: FileType, pathName: REF TEXT, fID: FileID,
+isDir: BOOL, withKids: BOOL] = {
+wantedTime: GMT ~ wantedUniqueID.egmt.gmt;
+file: ROPE ¨ RemoveLeadingSlash[PFS.RopeFromPath[fromPath]];
+class: PFSClass.FSHandle ~ h;
+vfs: VFS ~ NARROW[class.data];
+data: ServerData ~ vfs.sD;
+timeSearch: BOOL ~ wantedTime # nullGMT;
+attributes: AttributeSequence;
+newFile: ROPE ¨ ConvertFSNameToXNS[file, op];
+IF NOT Revive[data, crH] THEN ReportXNSError[resourceLimitExceeded, h, NIL, nullGMT];
+attributes ¨ BuildAttribute[newFile, pathname];
+startO ¨ BasicTime.GetClockPulses[];
+fileH ¨ FilingP10V5.Open[h: crH, attributes: attributes, directory: data.root,
+controls: nullControls, session: data.session≠
+! FilingP10V5.AccessError => {IF problem = fileNotFound THEN CONTINUE ELSE REJECT};
+];
+IF fileH # FilingP10V5.nullHandle THEN { -- found
+endO ¨ BasicTime.GetClockPulses[];
+[version, bytes, created, fileType, pathName, fID, isDir, withKids] ¨ InfoFromOpenFile[data, crH, fileH, op];
+IF (NOT timeSearch) OR (wantedTime = created) THEN { -- this one is ok
+openTime ¨ BasicTime.PulsesToMicroseconds[endO] - BasicTime.PulsesToMicroseconds[startO];
+RETURN[fileH, version, bytes, created, fileType, pathName, fID, isDir, withKids];
+};
+};
+IF timeSearch THEN { -- since it is a timeSearch we need to do an enumerate
+Note: PROC [eFile: PATH, eBytes: INT, eCreated: GMT, type: PFS.FileType, eVersion: Version, eFID: FileID, dir: BOOL, kids: BOOL, path: REF TEXT]
+RETURNS [continue: BOOL] ~ {
+IF wantedTime = eCreated THEN { -- ask if this is the one
+as: AttributeSequence ¨ NEW[AttributeSequenceObject[1]];
+as[0] ¨ [type: fileID, value: EncapsulateFileID[eFID]];
+data.session.verifier ¨ XNSAuth.GetNextVerifier[data.conversation];
+fileH ¨ FilingP10V5.Open[h: crH, attributes: as,
+directory: FilingP10V5.nullHandle, controls: nullControls,
+session: data.session≠];
+version ¨ eVersion; bytes ¨ eBytes; created ¨ eCreated; fileType ¨ type;
+pathName ¨ path; isDir ¨ dir; withKids ¨ kids;
+RETURN[FALSE];
+};
+RETURN[TRUE]; -- not the right one
+};
+fileH ¨ FilingP10V5.nullHandle; -- because there may be a non-time-matching  file left from the first call to open
+file ¨ PFS.RopeFromPath[PFSNames.StripVersionNumber[PFS.PathFromRope[file]]]; --UGH!
+file ¨ file.Concat["!*"];		-- ??
+newFile ¨ ConvertFSNameToXNS[file, op];
+InnerEnumerate[h: h, pattern: PFS.PathFromRope[newFile], namesOnly: FALSE, proc: Note, op: op];
+endO ¨ BasicTime.GetClockPulses[];
+openTime ¨ BasicTime.PulsesToMicroseconds[endO] - BasicTime.PulsesToMicroseconds[startO];
+IF fileH # FilingP10V5.nullHandle THEN RETURN[fileH, version, bytes, created, fileType, pathName, fID, isDir, withKids];
+};
+UnknownFile[name: Rope.Cat[r1: "[", r2: data.serverName, r3: "]", r4: file],
+createdTime: wantedTime];
+};
+
+MakeUID: PROC[gmt: GMT] RETURNS[uid: PFS.UniqueID] =
+{ uid.egmt.gmt ¨ gmt };
+ 
+OpenInternal: ENTRY PROC [data: ServerData] ~ {
+ENABLE UNWIND => { NULL };
+data.files ¨ data.files.SUCC;
+};
+
+CloseInternal: ENTRY PROC [data: ServerData] ~ {
+ENABLE UNWIND => { NULL };
+data.files ¨ data.files.PRED;
+};
+RPath: PROC [path: PATH] RETURNS [rope: ROPE] ~
+{ RETURN[PFS.RopeFromPath[path]] };
+
+Init: PROC = {
+PFSClass.Register[myFlavor, XNSGetServer];
+};
+
+Init[];
+
+END.
+  f  XNSRemoteFileOpsImpl.mesa
+Copyright ” 1988, 1989, 1990, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Tim Diebert: September 14, 1988 11:11:57 am PDT
+Willie-sue, December 17, 1992 10:58 am PST
+Foote, July 9, 1991 1:52 pm PDT
+Christian Jacobi, July 24, 1992 1:33 pm PDT
+
+Copied Types
+Parameters
+PFS Class name
+Maintenance Object
+File Manipulation Object
+Initialized Data - order is important!
+Transport Management
+XNS Virtual File System(s)
+File Manipulation Procs
+[h: FSHandle, file: PATH, wantedUniqueID: UniqueID, proc: PFS.NameConfirmProc]
+NameConfirmProc: TYPE ~ PROC [fullName: PATH, uniqueID: UniqueID] RETURNS [continue: BOOL _ FALSE];
+[h: FSHandle, pattern: PATH, proc: PFS.InfoProc, lbound: PATH, hbound: PATH]
+InfoProc: TYPE ~ PROC [fullFName, attachedTo: PATH, uniqueID: UniqueID, bytes: INT, mutability: Mutability, fileType: FileType]RETURNS [continue: BOOL _ TRUE];
+[h: FSHandle, pattern: PATH, proc: PFS.NameProc, lbound: PATH, hbound: PATH]
+NameProc: TYPE ~ PROC [name: PATH] RETURNS [continue: BOOL _ TRUE;
+we need to prefix names with leadingDir, so that full path names are returned - this is a PFS thing
+[h: CrRPC.Handle, s: STREAM, checkAbort: CrRPC.BulkDataCheckAbortProc] RETURNS [abort: BOOL]
+[s: STREAM] RETURNS [abort: BOOL _ FALSE]
+we are accessing a server that does not implement filters on pathnames, so we have to ramble down the directory path ourselves, and then do a depth 1 listing at the directory level, filtering on just the filename
+[h: FSHandle, file: PATH, wantedUniqueID: UniqueID]RETURNS [version: Version, attachedTo: PATH, bytes: INT, uniqueID: UniqueID, mutability: PFS.Mutability, fileType: PFS.FileType]
+[h: FSHandle, file: PATH] RETURNS[PATH]
+[h: FSHandle, fromFile: PATH, wantedUniqueID: UniqueID, toFile: PATH, createOptions: PFS.CreateOptions, proc: PFS.NameConfirmProc]
+NameConfirmProc: TYPE ~ PROC [fullName: PATH, uniqueID: UniqueID] RETURNS [continue: BOOL _ FALSE];
+[h: FSHandle, fromFile: PATH, wantedUniqueID: UniqueID, toFile: PATH, createOptions: PFS.CreateOptions, proc: PFS.NameConfirmProc] RETURNS [done: BOOL _ FALSE]
+[h: FSHandle, file: OpenFile, attributes: PFS.CreateOptions]
+This only does SetFileType
+FilingP10V5.Close[h: crH, file: xnsFile.fileH, session: data.session^];
+[h: FSHandle, file: OpenFile, bytes: INT, uniqueID: PFS.UniqueID]
+[h: FSHandle, file: OpenFile, propertyName: ROPE] RETURNS [propertyValue: ROPE]
+[h: FSHandle, file: OpenFile, proc: PFS.PropProc]
+h: FSHandle, file: OpenFile, filePosition, nBytes: CARD, to: LONG POINTER, toStart: CARD] RETURNS [bytesRead: INT]
+h: FSHandle, file: OpenFile, filePosition, nBytes: CARD, from: LONG POINTER, fromStart: CARD] RETURNS [bytesWritten: INT]
+h: FSHandle, file: PATH, wantedUniqueID: UniqueID, access: PFS.AccessOptions, checkFileType: BOOL, fileType: PFS.FileType, createOptions: PFS.CreateOptions] RETURNS [OpenFile
+h: FSHandle, file: OpenFile
+[h: FSHandle, file: PATH, wantedUniqueID: UniqueID, str: IO.STREAM, proc: PFS.StoreConfirmProc, createOptions: PFS.CreateOptions] 
+StoreConfirmProc: TYPE ~ PROC [fullName: PATH] RETURNS [continue: BOOLEAN _ TRUE];
+[h: CrRPC.Handle, s: STREAM, checkAbort: CrRPC.BulkDataCheckAbortProc] RETURNS [abort: BOOL]
+attributes _ BuildStoreAttributes[fName, version.version, created];
+[h: FSHandle, file: PATH, wantedUniqueID: UniqueID, proc: PFS.RetrieveConfirmProc, checkFileType: BOOL _ FALSE, fileType: PFS.FileType]
+RetrieveConfirmProc: TYPE ~ PROC [fullFName: PATH, bytes: INT, uniqueID: UniqueID]RETURNS [STREAM];
+[h: CrRPC.Handle, s: STREAM, checkAbort: CrRPC.BulkDataCheckAbortProc] RETURNS [abort: BOOL]
+h: FSHandle, file: OpenFile] RETURNS [fullFName, attachedTo: PATH, uniqueID: UniqueID, bytes: INT, mutability: PFS.Mutability, fileType: PFS.FileType
+Generic Implementation
+XNSSerialize: PFSClass.SerializeProc = {
+[h: ServerHandle, directory: ROPE, str: STREAM, proc: ConfirmRetrieveProc]
+};
+
+StoreConfirmProc: TYPE ~ PROC [fullName: PATH] RETURNS [continue: BOOL _ TRUE];
+[h: CrRPC.Handle, s: STREAM, checkAbort: CrRPC.BulkDataCheckAbortProc] RETURNS [abort: BOOL]
+attributes _ BuildStoreAttributes[fName, version, created];
+Filing defaults
+Registered with PFSClass
+[fs: ROPE, flavorSpecified: BOOL] RETURNS [h: FSHandle, downMsg: ROPE]
+Returns [NIL, NIL] if server doesn't exist.
+Returns [NIL, msg] if server exists but is down.
+The flavorSpecified parameter is ignored.
+[h: FSHandle] RETURNS [obsolete: BOOL, downMsg: ROPE]
+Utilities
+at this point a file may or may not have been found.  If it was found it didn't meet the create time requested so we need to do an enumerate to find a file matching it
+file _ FileNames.StripVersionNumber[file];
+Reference Counting Files Open/Close
+Debugging
+Initialization
+ù 9ˇ  ñ(cedarcode) styleïNewlineDelimiter
+ò öúôIcodeöú
+œeúIôTKô/Kô*KôKô+Kô óöœk	ò	KöúûúQòjKöúûúûúûúò3Köú
+ûúûú%òIKöúûú±òºKöúûúaò|KöúûúŸòÍKöúûú@òQKöûúûú9ûú)òpKöûúûúÌòˆKöúûúò,Köú	ûú∞òæKöú	ûú!ûúHò{Köúûú!ò.KöúûúXûú
+òpKöûúûúò$Köúûúπò∆Köûúûúò$Köú
+ûúò%Köúûúò#Köúûúò"KöúûúœòÈKö	úûú[ûúûú'ûú(òÍóKò Kò öœnúûúûò#Köûú-ûúûú;ûú1ò¨Köûúò Köúûúûú*ò6Icode1ò headôLöûúûúûúòLöú
+ûúò#Lò Löú
+ûúûú
+òLöú	ûúò!Kò óô
+Löú
+ûúòLöúûúòLöúûúòóöœzôKöœb	úûúòKò&óö†ôö°úûú%òHKöúòKöúòKöúòóóö†ôö°ú#ûú)òRKòKöú&ò&Köú(ò(KöúòKöúòKöúòKöúòKöú ò Köú4ò4Köú(ò(Köú(ò(Köú8ò8KöúòKöúòKöúòKöúòKöúòKöúòKöúòKòKöúòóóö†&ô&ö°úûúò8Köú°	úòKöúûúœcò*Köú°úòKöú°úòKöúûú¢ò)Köúòóóö†ôKöúûúûú¢ò0Köúûúûúò$öúûúû	úûúò(KöúòKöúûòKöúòKò óóö†ôKöûúûúûúòöúûúûúòKöúûúò	KöúûúòKöúòKöúòKò óóö†ôöü	úò"Icode2öúNôNKöúûúûúûúûúûúûúôcKöúòKöúûúûúòKòNò+Nöúûúûúòöú¢úòKöûúûúûúò@öüúûúòKöú%ûúò<Kòföûú
+ûúòKòCKïStartOfExpansionO[h: CrRPC.Handle, file: FilingP10V5.Handle, session: FilingP10V5.Session]ò?Köûúûú ûú1ûúòxKòóKöûúûúûú#ò5ñO[h: CrRPC.Handle, file: FilingP10V5.Handle, session: FilingP10V5.Session]öûúûúòKòCNò@NòóNöúûúò+NòóNöúBòBKöúòóNöúòNò óöüú#ò6Nöú9ûú
+ûúôLKöú
+ûúûúûúûú.ûúûúûúô†öüúûúûú	ûúûú<ûúûúûúòíKöûúûúòKöú-ûúXòàóNöúûúò0NöúòNò óöüú$ò8Nö	úûúûúûú
+ûúôLKöú
+ûúûúûúûúûúûúôBöüúûúûú	ûúûú<ûúûúûúòíKöûúûúòKòKöúòóNöúûúò4NöúûòóNò Nö+úûúûú¢	úûú¢
+úûú¢úûú¢ú¢ú
+¢ú	¢
+úûú¢úûú¢úûúûúûú¢úûúòÁNò öüúûúûúûú"òcKöúòKöúûúûúòKòKò%KöúcôcKöúûúaòqKöúûúûúò:Köúûú&ò6KòSKöú6ò6Nò+öüúòKö–ck\ô\öüúò(Kö£)ô)KöúûúûúòKöú
+ûúûúòKöú
+ûúòKöúûúûúò'Köú
+ûúûúò*KòKöúûúûúò+KòcKò*Köûúûúûú%ûúûú¢MòïKöú$ûúò<KöúûúNûúòKöú!ò!KöûúûúòKöú¢òóKö	ûúûúûúûú¢ òQKòBKöú¢
+òóöú¢û¢òöûòKöûúûúò@KöúûúûúòKöúûúûúò"Köú	ûúûúûúòKöú
+ûúòKò öüúûúòöúCûúòQKöûú!ûúûúûúòAóNöûúûúûúûúòNöúûúò+NòóNöú'ûúûúòCöûúûúûòöûúûúûú$ûúûúûòBKòCKñO[h: CrRPC.Handle, file: FilingP10V5.Handle, session: FilingP10V5.Session]òAKöûúòóKöûúòKòóKô‘öûòKò3Kò,öûúûúûúûúûúûúûò6KöúûúòKöúûúûúòKò@KòCñ¥[h: CrRPC.Handle, attributes: FilingAttributesP10V5.AttributeSequence, directory: FilingP10V5.Handle, controls: FilingP10V5.ControlSequence, session: FilingP10V5.Session]òyKöúûúûú
+ûúûúûúûúòcóöûúûúûúòKöúûúò+KöûúòKòóKöúûúòKöûúòóKöûúòóKöûú	ûúûúûúòKòKò]KöûúòóKòóKòóKò Nò öüúò&NöúûúCûú	ûú"ûúûú
+ô¥KöúòKöúûúûúòKöúòNò+öú¢û¢òKöûúûúûúò>öüúûúòKöúòKöú	ûúòKöúDûúòaKòCKñO[h: CrRPC.Handle, file: FilingP10V5.Handle, session: FilingP10V5.Session]ò?NöúûúòNöúòNòNòNòóNöúBòBKöúòóKòKò óöü	úò&Köúûúûúûúô'Köúûúûú
+¢ò*KòKöûúòKöúòKò óöü	úò"Nö	úûú$ûúûúûúôÇKöúûúûúûúûúûúûúôcKöúòKöúûúûúòKöúòKò+Kö	úûúûúûúûúò;KöúûúûúòKöúûúûúûúò(Kò Köú¢úò:Köú¢úò4Köú¢ò(öûúûúûúûúûúûúûò?Kö
+ûúûúûúûúûúò,Kö
+ûúûúûúûúûúò2Kñ-[s1: ROPE, s2: ROPE, case: BOOL _ TRUE]ö
+ûú3ûúûúûúûúòZKòKöûúòóNöûúûúûúûúò$Nò öûú
+òöûúòöûúòöûúûúûú$ûúûúûòBKòCKñO[h: CrRPC.Handle, file: FilingP10V5.Handle, session: FilingP10V5.Session]öúøûúûú
+ûúòÊKöûúòóKöúûúòKöúòKòóöüúûúòKò9KöúòKöúV¢òrö	ûú
+ûúûú#ûú¢òDKöúòöûúûúûúûúûúûúûò4KöúûúòKöúûúûúòKò-KòCñ¥[h: CrRPC.Handle, attributes: FilingAttributesP10V5.AttributeSequence, directory: FilingP10V5.Handle, controls: FilingP10V5.ControlSequence, session: FilingP10V5.Session]òyKöúûúûú
+ûúûúûúûúòbóöûúûú¢=òMKò0KòCKñ¥[h: CrRPC.Handle, directory: FilingP10V5.Handle, attributes: FilingAttributesP10V5.AttributeSequence, controls: FilingP10V5.ControlSequence, session: FilingP10V5.Session]ò}KöúòóKöúûúòKöûúòóKò*KòCKñ€[h: CrRPC.Handle, file: FilingP10V5.Handle, destinationDirectory: FilingP10V5.Handle, attributes: FilingAttributesP10V5.AttributeSequence, controls: FilingP10V5.ControlSequence, awaaion: FilingP10V5.Session]òrKöúòóKòCKñO[h: CrRPC.Handle, file: FilingP10V5.Handle, session: FilingP10V5.Session]ò>öûúûúûú$ûúûúûòBKòCKñO[h: CrRPC.Handle, file: FilingP10V5.Handle, session: FilingP10V5.Session]òAKöûúòóNöúûúò+NòóNöúFòFKòóöûú¢7ò>Köûúûúûúò>öüúûúòKöú,ò,KòVö	ûú
+ûúûú$ûú¢òEKò=KòCKñÜ[h: CrRPC.Handle, file: FilingP10V5.Handle, attributes: FilingAttributesP10V5.AttributeSequence, session: FilingP10V5.Session]òbKòóKòCKñO[h: CrRPC.Handle, file: FilingP10V5.Handle, session: FilingP10V5.Session]ò?Nöúûúò+NòóNöúFòFKöúòóóNöúòNò óöüúòKöúûú$ûúûúûúûúûúûúôüKöúûúûú
+¢ò*KòKöúòNò óñF -- [h: RemoteFile.ServerHandle, file: ROPE, newFileType: FS.FileType]öüú ò0Köú*ûúô<KôKöúûúûú	òKöúòKò+Köú!ûúòAKòMöú¢û¢òKöûúûúûúò@öüúûúòKöúûúò)KòCKñÜ[h: CrRPC.Handle, file: FilingP10V5.Handle, attributes: FilingAttributesP10V5.AttributeSequence, session: FilingP10V5.Session]òkKòCKñO[h: CrRPC.Handle, file: FilingP10V5.Handle, session: FilingP10V5.Session]öúGôGNöúûúòNöúòNòóNöú'ûúûúòCKòóNòNò óöüú*òDKöú%ûúûú
+ôAKöúûúûú
+¢ò*Köú,ò,KöúòNò óöüúûú
+ûúûú&òUKöúòöûúûúûòKò-Kò'Kò/Köûúûú¢ò(óKöúûú(ò0Köúûú,ò7KöûúòòKò óóöüú!¢–csF¢úòÖKöúûúûú
+¢ò*KöúòKò+öûúûúûúòöú,ò,Köûúûúûúò@öüúûúòKöúJòJKöúûúò)KòCKòHKòCKöúòóNöú'ûúûúòCKòóKöûú{òÇóKöúòKò óöüú$ò8Köú,ûúûúûúôOKöúûúûú
+¢ò*Köú&ò&KöûúòKöúòNò óöüú,òHKöú$ûú
+ô1Köúûúûú
+¢ò*Köú.ò.KöúòNò óöüúòKöú3ûúûúû	ú	ûúûúûôrKöúûúûú	òKòöüúûúòKöúûúò)KöúòKöúòKöú
+ûúòöüúûúò$KòNKòKöûúûúûú%ò>KöúòóKöûúûúûú¢	ò0KòKò9KòJKöúòNöúòóNòNöú'ûúûúòCKöúòKò óöüúò Köú3ûúûúû	úûúûúûúôyKöúûúûú	òKòöüúûúòKöúûúò)Kò6öüúûúò(KòRKòKöúòKòKöúòóKöúGòGKòKKöúòNöúòóNòNöú'ûúûúòCKöúòKò óöüúòKöúûú$ûúûúûúûúûú
+ôÆKöúòKöúûúûúòKöúòöüúûúûú	ûúò/KöúûúòKöúòóKöúòKöúûúòKöúûúòKöú
+ûú
+òKöúûúòKöúòKöúûúòöü	úûúòKöûúûúûúòKöúòKöú	ûúûúò;KöúBòBKöúòKöúGòGKòKöúòKöú
+ûú/ò<KöúûúÃò‘KöúòNöúòóKòeöûúûúòöûúòKöúûú.ò=Köûúûú¢òKöúòóóNöúJòJKöûúòKöúòKò óöüúò KöúôKöúûúûú	òKòöüúûúòKöúûúò)öûúûúûúòKöúGòGKòGKöúòNòóKöúòNöúòóNöú'ûúûúòCKöúòKò óöüúò Nöúûú!ûúûúûú"ûúôÇKöúûúûúûúûúûúûúôRKöúòKöúûúûúòKöúòKò+ñ` -- [h: CrRPC.Handle, s: STREAM, checkAbort: CrRPC.BulkDataCheckAbortProc] RETURNS [abort: BOOL]öüúò!Kö£\ô\Köúûúûúò.KöúûúòöûòKöúûúûúò*KöûúûúûúòKöûú ò"KöûúòóKöúòKòóKö	úûúûúûúûúò(Kò=Köúûúûúûúò(Köú¢òKöúûúûúòKò+Köú%¢#òHöú¢ûòöûúûúòöûúûúûú$ûúûúûòBKòCKñO[h: CrRPC.Handle, file: FilingP10V5.Handle, session: FilingP10V5.Session]öúøûúûú
+ûúòÊKöûúòóKöúûúòKöúòKòóöüúûúòKò>KòCKñ¥[h: CrRPC.Handle, attributes: FilingAttributesP10V5.AttributeSequence, directory: FilingP10V5.Handle, controls: FilingP10V5.ControlSequence, session: FilingP10V5.Session]öúóûúûúûúûúûúòÃöûú ûú¢ò?Nöúûúò+KñZ[r1: ROPE _ NIL, r2: ROPE _ NIL, r3: ROPE _ NIL, r4: ROPE _ NIL, r5: ROPE _ NIL]öú/¢ò5KöúòóKöúûúòöûúûúûúûúûúûúûò8KöúûúòKöúûúûúòKò-KòCñ¥[h: CrRPC.Handle, attributes: FilingAttributesP10V5.AttributeSequence, directory: FilingP10V5.Handle, controls: FilingP10V5.ControlSequence, session: FilingP10V5.Session]òyKöúûúûú
+ûúûúûúûúòbóöûúûú¢=òMKò0KòCKñ¥[h: CrRPC.Handle, directory: FilingP10V5.Handle, attributes: FilingAttributesP10V5.AttributeSequence, controls: FilingP10V5.ControlSequence, session: FilingP10V5.Session]ò}KöúòóKöúûúòKöûúòóKò)KòCKñ¥[h: CrRPC.Handle, attributes: FilingAttributesP10V5.AttributeSequence, directory: FilingP10V5.Handle, controls: FilingP10V5.ControlSequence, session: FilingP10V5.Session]öúöûúûúûúûúûúòœöûú"ò$öûúòöûúûúò$Kò?Köûúûú'òLKòóKöúòóKöûúûúûúòCóöûúûúûúòKòKöúòóKöúCôCöûúûúòKòSKòCKòéKòóKöúûúòöûúûúûú$ûúûúûòBKòCKñO[h: CrRPC.Handle, file: FilingP10V5.Handle, session: FilingP10V5.Session]òAKöûúòóNöúûúò+NòóNöúBòBKöúòóöúòNò óóöüúò&Nöúûú"ûú%ûúûúûú
+ôáKöúûúûúûú	ûúûúûúôdKöúòKöúûúûúòKöúòNöúûúûúòñ¥[h: CrRPC.Handle, attributes: FilingAttributesP10V5.AttributeSequence, directory: FilingP10V5.Handle, controls: FilingP10V5.ControlSequence, session: FilingP10V5.Session]öüúòNö£\ô\Köúûúûúò.KöúûúòKöúûúòöûòKöûúûúûú¢"ò:KòKöûúûúûúòKöú(ò(KöûúòóKöúòNòóöüúûúòNò+öú¢û¢òKöûúûúûúò@öüúûúòKöúûúûúò+KöúòKòtKò2öûúûúûúòKòCKñn[h: CrRPC.Handle, file: FilingP10V5.Handle, content: CrRPC.BulkDataSink, session: FilingP10V5.Session]òTKöúòóKòCKñO[h: CrRPC.Handle, file: FilingP10V5.Handle, session: FilingP10V5.Session]ò?Nöúûúò+NòóNöúBòBKòóKöúòóNöúòNöúòNò óöü
+úò$Köúûúûúûú4ôïKöúûúûú	òNôNöúûú
+òNöúûúòKòKòKòKöúûú	òKöúòóNò öüúô(KöúûúûúôJKöúôKô óöüúûúûúûúûúûúòfKöúûúûúûúûúûúûúôOKöúûúûú	òKöúòKò+ñ` -- [h: CrRPC.Handle, s: STREAM, checkAbort: CrRPC.BulkDataCheckAbortProc] RETURNS [abort: BOOL]öüúò!Kö£\ô\Köúûúûúò.KöúûúòöûòKöúûúûúò*KöûúûúûúòKöûú ò"KöûúòóKöúòKòóKö	úûúûúûúûúò(Kò=Köúûúûúûúò(Köú ¢ò(KöúûúûúòKò0Köú%¢#òHöú¢ûòöûúûúòöûúûúûú$ûúûúûòBKòCKñO[h: CrRPC.Handle, file: FilingP10V5.Handle, session: FilingP10V5.Session]öúøûúûú
+ûúòÊKöûúòóKöúûúòKöúòKòóöüúûúòKò>KòCKñ¥[h: CrRPC.Handle, attributes: FilingAttributesP10V5.AttributeSequence, directory: FilingP10V5.Handle, controls: FilingP10V5.ControlSequence, session: FilingP10V5.Session]öúóûúûúûúûúûúòÃöûú ûú¢ò?Nöúûúò+KñZ[r1: ROPE _ NIL, r2: ROPE _ NIL, r3: ROPE _ NIL, r4: ROPE _ NIL, r5: ROPE _ NIL]öú4¢ò9KöúòóKöúûúòöûúûúûúûúûúûúûò8KöúûúòKöúûúûúòKò-KòCñ¥[h: CrRPC.Handle, attributes: FilingAttributesP10V5.AttributeSequence, directory: FilingP10V5.Handle, controls: FilingP10V5.ControlSequence, session: FilingP10V5.Session]òyKöúûúûú
+ûúûúûúûúòbóöûúûú¢=òMKò0KòCKñ¥[h: CrRPC.Handle, directory: FilingP10V5.Handle, attributes: FilingAttributesP10V5.AttributeSequence, controls: FilingP10V5.ControlSequence, session: FilingP10V5.Session]ò}KöúòóKöúûúòKöûúòóKò)KòCKñ¥[h: CrRPC.Handle, attributes: FilingAttributesP10V5.AttributeSequence, directory: FilingP10V5.Handle, controls: FilingP10V5.ControlSequence, session: FilingP10V5.Session]öúöûúûúûúûúûúòœöûú"ò$öûúòöûúòöûúòKò?Köûúûú(¢òZKòóóKöúòóKöûúûúûúòCóKöûúûúûú¢ò1Köú;ô;Köúûúò.öûúûúòKòCKòõKòóKöúûúòöûúûúûú$ûúûúûòBKòCKñO[h: CrRPC.Handle, file: FilingP10V5.Handle, session: FilingP10V5.Session]òAKöûúòóNöúûúò+NòóNöú7ûúòIKöúòóNöúòóNò óôKöú$ûúòDKöú,ûú(òWóôöüúò(Kö	úûúûúûúûúôFKöú	ûúûúô+Köú	ûú$ô0Köúùúô)Köúûúûú>ûúòSKöúòKöú	ûú	òKöú$ûúûúûúò@KöúòKöúEòEKöú;ûúòWKöúòKöúûúûúòKòöúòöûúòKöú@û	úòKKöúCû	úòNKöúIû	úòTKöúEû	úòPKöúDû
+úòPKöúIû	úòTKöúEû	úòPKöú?û	úòJKöúòóKöúûú	òKöúûúò3Köûúûúûú¢úûúûúûúòGKò)Köú
+ûúûúò!Kò4Kò&Kò3Kò3Köú;ò;Kò1Köú
+ûúEòRKò9Kò*Köú#ò#Kò9Kò]KöúòKöú	ûúòKöúòóKö
+ûúûúûúûúûúò)Köúûúûúµò‡Kò/KòKöúûú°úò'KòKòKöûúûúòKòKò óöüúò&Köú5ô5KöûúûúûúòKöúòKöúûúûúòKöúòKöûúûú¢òHKöûúûúò(KòKò óòCKò óöüú¢œi¢úòCKöúûúûú	òKöúòKö	ú	ûúûúûúûú	ò5öüúûúûúòKöûúûúûúòöûúòKöûú2ò6öûúòöûúûúûú¢6òOKòKòKöúûúòKòKòóKòóóKöúòóKòöûúûúûúòKöúBòBKñ3[h: CrRPC.Handle, session: FilingP10V5.Session]öúyûúòÉKöúòKöúòóKòKò óöüúò&Köúûú	ò)Köú	ûúò+öûúûúûúòKöú	ûúûúò/KòBKñ3[h: CrRPC.Handle, session: FilingP10V5.Session]öúyûúòÉKöúòKöúûúòKòóKòóóô	Köúûúòöú
+ûúòKò óöüúûúûúò!Köú2ò2Kò óö
+üúûúûúûúûúòKKöûúûúûúò<Köú
+ûú"ûúûúò`KöúòKò óöüúûú,ûúûúûúOûúûú ûúûúûúûúò§Köúûúò*Köúûúûúò<KöúòKöúûúûúòKöúòKöúûúò(KöúòKöú	ûú ò-Kñ¥[h: CrRPC.Handle, attributes: FilingAttributesP10V5.AttributeSequence, directory: FilingP10V5.Handle, controls: FilingP10V5.ControlSequence, session: FilingP10V5.Session]öûúûúûú*ûúòUKñ([base: ROPE _ NIL, rest: ROPE _ NIL]ò/Kò$ò}KöúûúûúûúûúûúòSKöúòóöûú ûú¢ò1Kò"Kòmö	ûúûúûúûú¢òFKòYKöûúKòQKöúòóKöúòóKöúßôßöûúûú¢6òKöüúûú	ûú
+ûúûúûú1ûúûúûúûúûúûúò≠öûúûú¢ò9Kñ¥[h: CrRPC.Handle, attributes: FilingAttributesP10V5.AttributeSequence, directory: FilingP10V5.Handle, controls: FilingP10V5.ControlSequence, session: FilingP10V5.Session]öúûúò8Kò7KòCKòÑKòHKò.KöûúûúòKöúòóNöûúûú¢ò"NöúòóNöú ¢RòrNöúûú*ûúòTNöú*ô*Nöú¢ò Kò'Nñ&[problem: FilingP10V5.AccessProblem]öúûú#ûúò_Kò"KòYKöûú ûúûúKòxKöúòóKñZ[r1: ROPE _ NIL, r2: ROPE _ NIL, r3: ROPE _ NIL, r4: ROPE _ NIL, r5: ROPE _ NIL]öúfòfKöúòKò óö
+üúûúûúûúûúò4KòKòóóö†#ô#öüúûúûúò/KöûúûúûúòKöúûúòKòKò óöüúûúûúò0KöûúûúûúòKöúûúòKòóóô	öüúûúûúûúûúûúûúòSKò óóôöüúûúòKöú*ò*KöúòKò óKòóóKò Köûúòó Öó    ñí  ‚˜  

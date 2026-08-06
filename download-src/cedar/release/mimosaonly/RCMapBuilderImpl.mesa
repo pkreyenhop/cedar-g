@@ -1,0 +1,905 @@
+
+DIRECTORY
+Basics USING [LowHalf],
+OSMiscOps USING [Copy, Fill, FreeUnits, Units],
+MimZonePort,
+RCMap USING [AIndex, Base, componentMaxIndex, controlLinkIndex, FieldDescriptor, Index, invalidIndex, nullIndex, NVIndex, Object, ObjectKind, refIndex, SeqIndex, simpleMaxIndex, VIndex],
+RCMapOps USING [MapMapItem, MapMapObj, MapMap, OuterProc, Visitor],
+SymbolOps USING [AUsForType, Cardinality, CtxEntries, FirstCtxSe, FnField, NextSe, RecordLink, STB, TypeForm, TypeLink, UnderType],
+Symbols USING [ArraySEIndex, Base, BitAddress, BitCount, CSEIndex, CSENull, CTXIndex, CTXNull, CTXRecord, ISEIndex, ISENull, MDIndex, nullName, RecordSEIndex, SERecord, Type, TypeClass, UNSPEC],
+SymbolTable USING [],
+SymbolTablePrivate USING [SymbolTableBaseRep],
+Target: TYPE MachineParms USING [bitsPerAU, bitsPerWord];
+RCMapBuilderImpl: PROGRAM
+IMPORTS Basics,MimZonePort, OSMiscOps,  SymbolOps
+EXPORTS RCMapOps, SymbolTable = {
+
+OPEN Symbols, RCMap;
+
+STB: TYPE = REF SymbolTableBaseRep;
+SymbolTableBaseRep: PUBLIC TYPE = SymbolTablePrivate.SymbolTableBaseRep;
+
+bitsPerAU: NAT = Target.bitsPerAU;
+bitsPerWord: NAT = Target.bitsPerWord;
+unitsPerWord: NAT = bitsPerWord / bitsPerAU;
+
+scratchChunk1: Base ¨ NIL;
+scratchChunk2: Base ¨ NIL;
+unitsPerChunk: CARDINAL ¨ 8192*SIZE[WORD];
+
+
+Ptr: TYPE = LONG POINTER TO RCMap.Object;
+
+UnionSEIndex: TYPE = Symbols.Base RELATIVE LONG POINTER TO SERecord.cons.union;
+SequenceSEIndex: TYPE = Symbols.Base RELATIVE LONG POINTER TO SERecord.cons.sequence;
+
+RCMapTable: PUBLIC TYPE = RECORD [
+rcz: UNCOUNTED ZONE ¨ NIL,
+scratch: MimZonePort.Scratch,
+base: Base ¨ NIL,
+x: CARD ¨ 0,  	-- number of AUs in use
+outer: OuterProc ¨ NIL,
+expandable: BOOL ¨ FALSE,
+limit: CARD ¨ 0,  	-- number of AUs allocated
+zone: UNCOUNTED ZONE ¨ NIL
+];
+
+RCMT: TYPE = LONG POINTER TO RCMapTable;
+
+SelfPtr: TYPE = UNCOUNTED ZONE;
+
+Handle: TYPE = RECORD [base: Base, index: Index];
+
+MapMapItem: TYPE = RCMapOps.MapMapItem;
+MapMapObj: TYPE = RCMapOps.MapMapObj;
+MapMap: TYPE = RCMapOps.MapMap;
+OuterProc: TYPE = RCMapOps.OuterProc;
+
+
+TooManyRCMaps: ERROR = CODE;
+NIY: ERROR[kind: {packedComponent, computedTag, nakedSeq}] = CODE;
+
+GetOuter: SIGNAL RETURNS [OuterProc] = CODE;
+
+
+DecodeBitAddr: PROC [ba: UNSPEC] RETURNS [BitAddress] = INLINE {
+RETURN [LOOPHOLE[ba, BitAddress]];
+};
+
+DecodeCard: PROC [n: UNSPEC] RETURNS [CARD] = INLINE {RETURN [LOOPHOLE[n, CARD]]};
+
+
+Create: PUBLIC PROC
+[zone: UNCOUNTED ZONE, outerProc: OuterProc ¨ NIL, expansionOK: BOOL ¨ FALSE]
+RETURNS [rcmt: RCMT] = {
+ptr: Base ¨ AllocChunk[];
+rcmt ¨ zone.NEW[RCMapTable ¨ [
+rcz: NIL,
+scratch: ALL[0],
+base: ptr,
+x: 0,
+outer: outerProc,
+expandable: expansionOK,
+limit: unitsPerChunk,
+zone: zone]];
+rcmt.rcz ¨ MimZonePort.MakeZone[alloc: ZoneAllocProc, free: NIL, scratch: @rcmt.scratch];
+{
+p: LONG POINTER ¨ rcmt.rcz.NEW[Object.null ¨ [null[]]];
+p ¨ rcmt.rcz.NEW[Object.ref ¨ [ref[]]];
+p ¨ rcmt.rcz.NEW[Object.controlLink ¨ [controlLink[]]];
+};
+};
+
+Destroy: PUBLIC PROC [rcmt: RCMT] RETURNS [RCMT] = {
+zone: UNCOUNTED ZONE = rcmt.zone;
+FreeChunk[rcmt.base, rcmt.limit];
+zone.FREE[@rcmt];
+RETURN [NIL];
+};
+
+GetSpan: PUBLIC PROC [rcmt: RCMT] RETURNS [base: Base, size: CARD] = {
+RETURN [rcmt.base, rcmt.x];
+};
+
+Acquire: PUBLIC PROC [rcmt: RCMT, stb: STB, type: Type] RETURNS [Index] = {
+RETURN [DoAcquire[rcmt, stb, type ! GetOuter => {RESUME[rcmt.outer]}]];
+};
+
+DoAcquire: PROC [rcmt: RCMT, stb: STB, type: Type] RETURNS [Index] = {
+csei: CSEIndex = SymbolOps.UnderType[stb, type];
+WITH cse~~stb.seb[csei] SELECT FROM
+record => RETURN [RCMapForRecord[rcmt, stb, LOOPHOLE[csei, RecordSEIndex]]];
+array => RETURN [RCMapForArray[rcmt, stb, LOOPHOLE[csei, ArraySEIndex]]];
+sequence => RETURN [RCMapForSequence[rcmt, stb, LOOPHOLE[csei, SequenceSEIndex]]];
+union => RETURN [RCMapForUnion[rcmt, stb, LOOPHOLE[csei, UnionSEIndex]]];
+zone => RETURN [(IF cse.counted THEN refIndex ELSE nullIndex)];
+ref => RETURN [(IF cse.counted THEN refIndex ELSE nullIndex)];
+ENDCASE => RETURN [nullIndex];
+};
+
+Include: PUBLIC PROC
+[rcmt: RCMT, rcmb: Base, size: CARD, zone: UNCOUNTED ZONE¨NIL]
+RETURNS [mm: MapMap ¨ NIL] = {
+ENABLE GetOuter => {RESUME[rcmt.outer]};
+mmEntries, mmNext: CARDINAL ¨ 0;
+
+Count: RCMapOps.Visitor = {mmEntries ¨ mmEntries + 1};
+
+Include: RCMapOps.Visitor = {
+mmi: MapMapItem = [old: rcmx, new: MapRCMIndex[rcmt, [rcmb, rcmx]]];
+IF mm # NIL THEN mm[mmNext] ¨ mmi;
+mmNext ¨ mmNext + 1;
+};
+
+IF zone # NIL THEN {
+[] ¨ Enumerate[rcmb, size, Count];
+mm ¨ zone.NEW[MapMapObj[mmEntries]];
+};
+[] ¨ Enumerate[rcmb, size, Include];
+};
+
+FindMapMapEntry: PUBLIC PROC [mapMap: MapMap, oldIndex: Index] RETURNS [Index] = {
+FOR i: CARDINAL IN [0..mapMap.length) DO
+IF mapMap[i].old = oldIndex THEN RETURN [mapMap[i].new]
+ENDLOOP;
+RETURN [invalidIndex];
+};
+
+Enumerate: PUBLIC PROC
+[base: RCMap.Base, limit: CARD, proc: RCMapOps.Visitor]
+RETURNS [stopped: BOOL ¨ FALSE] = {
+FOR rcmi: Index ¨ Index.FIRST, rcmi + InlineSize[[base, rcmi]]
+UNTIL LOOPHOLE[rcmi, CARD] >= limit DO
+IF Complete[[base, rcmi]] AND proc[rcmi] THEN RETURN [TRUE];
+ENDLOOP;
+};
+
+NextRCMap: SIGNAL = CODE;
+
+ListRCMaps: PROC [rcmt: RCMT] = {
+p: RCMapOps.Visitor = {SIGNAL NextRCMap};
+[] ¨ Enumerate[rcmt.base, rcmt.x, p];
+};
+
+Complete: PROC [h: Handle] RETURNS [BOOL] = INLINE {
+RETURN [WITH rcmr~~h.base[h.index] SELECT FROM
+null => TRUE,
+ref => TRUE,
+controlLink => TRUE,
+oneRef => TRUE,
+simple => TRUE,
+nonVariant => rcmr.complete,
+variant => rcmr.complete,
+array => TRUE,
+sequence => TRUE,
+ENDCASE => ERROR]
+};
+
+
+
+NewSeqRCM: PROC [rcmt: RCMT] RETURNS [SeqIndex] = {
+RETURN [LOOPHOLE[PtrToIndex[rcmt, rcmt.rcz.NEW[Object.sequence]]]];
+};
+
+SimpleRCM: TYPE = Object.null;
+
+InstallSimpleRCM: PROC [rcmt: RCMT, ptr: Ptr] RETURNS [ans: Index ¨ nullIndex] = {
+proc: RCMapOps.Visitor = {
+pp: Ptr ¨ @rcmt.base[rcmx];
+IF pp.type = ptr.type THEN
+WITH pp: pp SELECT FROM
+simple => WITH p: ptr SELECT FROM
+simple => IF pp.length = p.length AND pp.refs = p.refs THEN {
+stop ¨ TRUE;
+ans ¨ rcmx;
+};
+ENDCASE;
+oneRef => WITH p: ptr SELECT FROM
+oneRef => IF pp.offset = p.offset THEN {stop ¨ TRUE; ans ¨ rcmx};
+ENDCASE;
+ENDCASE;
+};
+nw: CARDINAL ¨ SimpleRCM.SIZE;
+WITH p: ptr SELECT FROM
+null => RETURN [nullIndex];
+ref => RETURN [refIndex];
+controlLink => RETURN [controlLinkIndex];
+oneRef => IF p.offset = 0 THEN RETURN [refIndex] ELSE
+IF Enumerate[rcmt.base, rcmt.x, proc] THEN RETURN [ans];
+simple => IF Enumerate[rcmt.base, rcmt.x, proc] THEN RETURN [ans];
+ENDCASE => ERROR;
+ans ¨ AllocRCMap[rcmt, SimpleRCM.SIZE];
+OSMiscOps.Copy[from: ptr, nwords: SimpleRCM.WORDS, to: @rcmt.base[ans]];
+};
+
+RCMapForRecord: PROC [rcmt: RCMT, stb: STB, rsei: RecordSEIndex] RETURNS [Index] = {
+RETURN [SELECT TRUE FROM
+~stb.seb[rsei].hints.refField => nullIndex,
+stb.seb[rsei].hints.variant => RCMapForVRecord[rcmt, stb, rsei],
+ENDCASE => RCMapForNVRecord[rcmt, stb, rsei]]
+};
+
+RCMapForArray: PROC [rcmt: RCMT, stb: STB, asei: ArraySEIndex] RETURNS [Index] = {
+componentType: Type = stb.seb[asei].componentType;
+IF IsRC[stb, componentType] THEN {
+oldx: CARDINAL = rcmt.x;
+ercmi: Index = DoAcquire[rcmt, stb, componentType];
+NewARCM: PROC RETURNS [ans: AIndex] = {
+ans ¨ LOOPHOLE[AllocRCMap[rcmt, Object.array.SIZE]];
+rcmt.base[ans] ¨ [array[]];
+};
+arcmi: AIndex = NewARCM[];
+simpRCM: SimpleRCM;
+simplified: BOOL;
+rcmt.base[arcmi] ¨ [array[
+unitsPerElement: SymbolOps.AUsForType[stb, componentType],
+nElements: SymbolOps.Cardinality[stb, stb.seb[asei].indexType],
+rcmi: ercmi]];
+[simpRCM, simplified] ¨ SimplifyRCM[[rcmt.base, arcmi]];
+IF simplified
+THEN {
+rcmt.x ¨ oldx;
+RETURN [InstallSimpleRCM[rcmt, @simpRCM]]}
+ELSE {
+found: BOOL;
+x: Index;
+[found, x] ¨ FindRCMap[rcmt.base, [rcmt.base, arcmi], oldx];
+IF found THEN {rcmt.x ¨ oldx; RETURN [x]};
+RETURN [arcmi];
+};
+};
+RETURN [nullIndex];
+};
+
+RCMapForSequence: PROC [rcmt: RCMT, stb: STB, seqsei: SequenceSEIndex]
+RETURNS [Index] = {
+componentType: Type = stb.seb[seqsei].componentType;
+parentType: RecordSEIndex = stb.seb[seqsei].parentType;
+parentIndex: Index = RCMapForVRecord[rcmt, stb, parentType];
+RETURN [parentIndex];
+};
+
+RCMapForUnion: PROC [rcmt: RCMT, stb: STB, usei: UnionSEIndex]
+RETURNS [rcmi: Index ¨ invalidIndex] = {
+IF stb.seb[usei].hints.refField
+THEN {
+GetRCMX: FilterType = {
+rcsei: CSEIndex = SymbolOps.UnderType[stb, SymbolOps.TypeLink[stb, isei]];
+rcmi ¨ RCMapForRecord[rcmt, stb, LOOPHOLE[rcsei, RecordSEIndex]];
+RETURN [TRUE];
+};
+nVariants: CARDINAL = SymbolOps.Cardinality[stb, stb.seb[stb.seb[usei].tagSei].idType];
+caseCtx: CTXIndex = stb.seb[usei].caseCtx;
+[] ¨ EnumerateCtxIseis[stb, caseCtx, GetRCMX,
+(nVariants=SymbolOps.CtxEntries[stb, caseCtx])];
+IF rcmi = invalidIndex THEN ERROR;
+}
+ELSE rcmi ¨ nullIndex;
+};
+
+RCMapForNVRecord: PROC [rcmt: RCMT, stb: STB, rsei: RecordSEIndex]
+RETURNS [Index] = {
+nc: CARDINAL = CountRCCommonComponents[stb, rsei];
+IF nc # 0 THEN {
+NewNVRCM: PROC [nComponents: NAT] RETURNS [ans: NVIndex] = {
+ptr: LONG POINTER TO Object.nonVariant
+¨ rcmt.rcz.NEW[Object.nonVariant[nComponents]];
+ans ¨ LOOPHOLE[ptr-rcmt.base];
+FOR i: NAT IN [0..nComponents) DO
+ptr.components[i] ¨ [];
+ENDLOOP
+};
+Stuff: FilterType = {
+type: Type = stb.seb[isei].idType;
+FieldOffset: PROC [isei: ISEIndex] RETURNS [BitAddress] = {
+IF argrec
+THEN RETURN [SymbolOps.FnField[stb, isei].offset]
+ELSE RETURN [DecodeBitAddr[stb.seb[isei].idValue]];
+};
+SELECT SymbolOps.TypeForm[stb, type] FROM
+$union, $sequence => NULL;	-- skip any variant part
+ENDCASE =>
+IF (~stb.seb[isei].constant) AND IsRC[stb, type] THEN {
+rcmt.base[nvrcmi].components[n] ¨ [
+unitOffset: FieldOffset[isei]/bitsPerAU,
+rcmi: DoAcquire[rcmt, stb, type]]; 
+n ¨ n + 1;
+};
+};
+oldx: CARDINAL = rcmt.x;
+nvrcmi: NVIndex = NewNVRCM[nc];
+argrec: BOOL = stb.seb[rsei].argument;
+n: CARDINAL ¨ 0;
+simpRCM: SimpleRCM;
+simplified: BOOL;
+[] ¨ EnumerateRecordIseis[stb, rsei, Stuff];
+IF n # nc THEN ERROR;
+[simpRCM, simplified] ¨ SimplifyRCM[[rcmt.base, nvrcmi]];
+IF simplified
+THEN {
+rcmt.x ¨ oldx;
+RETURN [InstallSimpleRCM[rcmt, @simpRCM]]}
+ELSE {
+found: BOOL;  x: Index;
+rcmt.base[nvrcmi].complete ¨ TRUE;
+[found, x] ¨ FindRCMap[rcmt.base, [rcmt.base, nvrcmi], oldx];
+IF found THEN {rcmt.x ¨ oldx; RETURN [x]};
+RETURN [nvrcmi];
+}
+};
+RETURN [nullIndex];
+};
+
+RCMapForVRecord: PROC [rcmt: RCMT, stb: STB, rsei: RecordSEIndex]
+RETURNS [ans: Index ¨ nullIndex] = {
+oldx: CARDINAL = rcmt.x;
+nvrcmi: Index = RCMapForNVRecord[rcmt, stb, rsei];
+TagFd: PROC [stb: STB, tag: ISEIndex] RETURNS [FieldDescriptor] = {
+offset: BitAddress = DecodeBitAddr[stb.seb[tag].idValue];
+RETURN [[
+bitOffset: offset.bd,
+bitCount: DecodeCard[stb.seb[tag].idInfo]]]
+};
+DoUnion: PROC [ucstb: STB, ucsei: UnionSEIndex] = {
+nvc: CARDINAL = CountRCVariants[ucstb, ucsei];
+IF nvc # 0 THEN {
+NewVRCM: PROC [nVariants: NAT, fdTag: FieldDescriptor, default: Index]
+RETURNS [ans: VIndex] = {
+ptr: LONG POINTER TO Object.variant ¨ rcmt.rcz.NEW[Object.variant[nVariants]];
+ptr.fdTag ¨ TagFd[ucstb, tagSei];
+ptr.complete ¨ FALSE;
+FOR i: NAT IN [0..nVariants) DO
+ptr.variants[i] ¨ default;
+ENDLOOP;
+ans ¨ LOOPHOLE[ptr-rcmt.base];
+};
+Stuff: FilterType = {
+IF IsRC[stb, isei, FALSE] THEN {
+rcmt.base[vrcmi].variants[DecodeCard[stb.seb[isei].idValue]] ¨
+DoAcquire[rcmt, stb, isei];
+n ¨ n + 1;
+};
+};
+tagSei: ISEIndex = ucstb.seb[ucsei].tagSei;
+nVariants: CARDINAL = SymbolOps.Cardinality[ucstb, ucstb.seb[tagSei].idType];
+caseCtx: CTXIndex = stb.seb[ucsei].caseCtx;
+vrcmi: VIndex = NewVRCM[
+nVariants: nVariants, fdTag: TagFd[ucstb, tagSei], default: nvrcmi];
+n: CARDINAL ¨ 0;
+found: BOOL;
+x: Index;
+[] ¨ EnumerateCtxIseis[stb, caseCtx, Stuff,
+(nVariants=SymbolOps.CtxEntries[stb, caseCtx])];
+IF n # nvc THEN ERROR;
+rcmt.base[vrcmi].complete ¨ TRUE;
+[found, x] ¨ FindRCMap[rcmt.base, [rcmt.base, vrcmi], oldx];
+IF found THEN {rcmt.x ¨ oldx; ans ¨ x} ELSE ans ¨ vrcmi;
+}
+};
+DoSeq: PROC [scstb: STB, scsei: SequenceSEIndex] = {
+componentType: Type = scstb.seb[scsei].componentType;
+IF IsRC[scstb, componentType] THEN {
+ercmi: Index = DoAcquire[rcmt, scstb, componentType];
+tagSei: ISEIndex = scstb.seb[scsei].tagSei;
+seqrcmi: SeqIndex;
+found: BOOL;  x: Index;
+IF ~scstb.seb[scsei].controlled THEN ERROR NIY[$computedTag];
+seqrcmi ¨ NewSeqRCM[rcmt];
+rcmt.base[seqrcmi] ¨ [sequence[
+unitsPerElement: SymbolOps.AUsForType[scstb, componentType],
+fdLength: TagFd[scstb, tagSei],
+commonPart: nvrcmi,
+dataOffset: (DecodeBitAddr[scstb.seb[tagSei].idValue].bd + DecodeCard[scstb.seb[tagSei].idInfo])/bitsPerAU,
+rcmi: ercmi]];
+[found, x] ¨ FindRCMap[rcmt.base, [rcmt.base, seqrcmi], oldx];
+IF found THEN {rcmt.x ¨ oldx; ans ¨ x} ELSE ans ¨ seqrcmi;
+};
+};
+DoVariant: FilterType = {
+csei: CSEIndex = SymbolOps.UnderType[stb, stb.seb[isei].idType];
+ans ¨ nvrcmi;
+WITH c~~stb.seb[csei] SELECT FROM
+union => DoUnion[stb, LOOPHOLE[csei]];
+sequence => DoSeq[stb, LOOPHOLE[csei]];
+ENDCASE => RETURN [FALSE];
+RETURN [TRUE];
+};
+IF ~EnumerateCtxIseis[stb, stb.seb[rsei].fieldCtx, DoVariant] THEN ERROR;
+};
+
+
+SimplifyRCM: PROC [h: Handle] RETURNS [rcmr: SimpleRCM, simplified: BOOL] = {
+EnumerateForSimplifyRCM: PROC
+[index: Index, offset: INT] RETURNS [stopped: BOOL ¨ FALSE] = {
+WITH rcm~~h.base[index] SELECT FROM
+null => RETURN [FALSE];
+ref => RETURN [Test[offset]];
+controlLink => RETURN [TRUE];
+oneRef => RETURN [Test[offset+rcm.offset]];
+simple => {
+FOR i: CARDINAL IN [0..rcm.length) DO
+IF rcm.refs[i] AND Test[offset+i].stop THEN RETURN [TRUE];
+ENDLOOP;
+RETURN [FALSE];
+};
+nonVariant => {
+FOR i: CARDINAL IN [0 .. rcm.nComponents) DO
+noff: INT ¨ rcm.components[i].unitOffset;
+IF (Basics.LowHalf[noff] MOD unitsPerWord) # 0 THEN RETURN [TRUE];
+IF EnumerateForSimplifyRCM[
+rcm.components[i].rcmi, offset + (noff/unitsPerWord)].stopped THEN
+RETURN [TRUE];
+ENDLOOP;
+RETURN [FALSE];
+};
+array => {
+FOR i: INT IN [0 .. rcm.nElements) DO
+noff: INT ¨ i*rcm.unitsPerElement;
+IF (Basics.LowHalf[noff] MOD unitsPerWord) # 0 THEN RETURN [TRUE];
+IF EnumerateForSimplifyRCM[
+rcm.rcmi, offset+(noff/unitsPerWord)].stopped THEN
+RETURN [TRUE];
+ENDLOOP;
+RETURN [FALSE];
+};
+variant, sequence => RETURN [TRUE];
+ENDCASE => ERROR
+};
+Test: PROC [off: INT] RETURNS [stop: BOOL ¨ FALSE] = {
+lo: CARD16 = Basics.LowHalf[off];
+IF nRefOffsets >= componentMaxIndex THEN RETURN [TRUE];
+nRefOffsets ¨ nRefOffsets+1;
+IF off >= CARD16.LAST THEN RETURN [TRUE];
+rrcmr.offset ¨ off;
+SELECT TRUE FROM
+off <= simpleMaxIndex => {
+tempInt: INT;
+nSimpleVecEntries ¨ nSimpleVecEntries + 1;
+IF nSimpleVecEntries # nRefOffsets THEN RETURN [TRUE];  -- can't simplify
+srcmr.refs[lo] ¨ TRUE;
+tempInt ¨ srcmr.length;
+--srcmr.length ¨ MAX[LONG[INT[srcmr.length]], off + 1];
+srcmr.length ¨ MAX[tempInt, off + 1];
+};
+nRefOffsets = 1 => {};
+ENDCASE => RETURN [TRUE];
+};
+srcmr: Object.simple ¨ [simple[refs: ALL[FALSE]]];
+rrcmr: Object.oneRef ¨ [oneRef[]];
+nRefOffsets: CARDINAL ¨ 0;
+nSimpleVecEntries: CARDINAL ¨ 0;
+simplified ¨ ~EnumerateForSimplifyRCM[h.index, 0].stopped;
+rcmr ¨ Object[null[]];
+IF simplified THEN
+SELECT nRefOffsets FROM
+0 => {};
+1 => IF rrcmr.offset = 0
+THEN rcmr ¨ LOOPHOLE[Object[ref[]]]
+ELSE rcmr ¨ LOOPHOLE[rrcmr];
+ENDCASE => rcmr ¨ LOOPHOLE[srcmr];
+};
+
+
+
+FilterType: TYPE = PROC [stb: STB, isei: ISEIndex] RETURNS [stop: BOOL ¨ FALSE];
+
+EnumerateRecordIseis: PROC [
+    stb: STB,
+    rsei: RecordSEIndex,
+    p: FilterType,
+    level: CARDINAL ¨ 0] 
+  RETURNS [stopped: BOOL] = {
+Filter: FilterType = {
+form: TypeClass = SymbolOps.TypeForm[stb, stb.seb[isei].idType];
+IF ~(form = $union OR form = $sequence) OR level = 0 THEN RETURN [p[stb, isei]];
+RETURN [FALSE];
+};
+IF rsei = CSENull THEN RETURN [FALSE];
+SELECT stb.seb[rsei].linkTag FROM
+$linked =>
+IF EnumerateRecordIseis[
+stb, SymbolOps.RecordLink[stb, rsei], p, level+1] THEN RETURN [TRUE];
+ENDCASE;
+RETURN [EnumerateCtxIseis[stb, stb.seb[rsei].fieldCtx, Filter]];
+};
+
+EnumerateCtxIseis: PROC [
+    stb: STB, ctx: CTXIndex,
+    proc: FilterType,
+    reallyComplete: BOOL ¨ FALSE]
+  RETURNS [stopped: BOOL ¨ FALSE] = {
+IF ctx # CTXNull THEN {
+IF ~reallyComplete THEN
+WITH c~~stb.ctxb[ctx] SELECT FROM
+included => 
+IF ~c.complete THEN {
+p: PROC [base: STB] = { -- called once
+stopped ¨ EnumerateCtxIseis[base, c.map, proc]};
+outer: OuterProc = SIGNAL GetOuter[];
+IF outer = NIL THEN ERROR ELSE outer[stb, c.module, p];
+RETURN [stopped];
+};
+simple => NULL;
+ENDCASE => ERROR;
+FOR isei: ISEIndex ¨ SymbolOps.FirstCtxSe[stb, ctx], SymbolOps.NextSe[stb, isei]
+UNTIL isei = ISENull DO
+SELECT TRUE FROM
+stb.seb[isei].hash = nullName AND stb.seb[isei].idCtx = CTXNull => {};
+proc[stb, isei] => RETURN [TRUE];
+ENDCASE;
+ENDLOOP;
+};
+RETURN [FALSE];
+};
+
+CountRCVariants: PROC [stb: STB, usei: UnionSEIndex] 
+  RETURNS [n: CARDINAL ¨ 0] = {
+Count: FilterType = {
+IF IsRC[stb, isei, FALSE] THEN n ¨ n+1;
+};
+caseCtx: CTXIndex = stb.seb[usei].caseCtx;
+tagCardinality: CARDINAL = SymbolOps.Cardinality[stb, stb.seb[stb.seb[usei].tagSei].idType];
+[] ¨ EnumerateCtxIseis[stb, caseCtx, Count,
+(tagCardinality=SymbolOps.CtxEntries[stb, caseCtx])];
+};
+
+CountRCCommonComponents: PROC [stb: STB, rsei: RecordSEIndex]
+RETURNS [n: CARDINAL ¨ 0] = {
+Count: FilterType = {
+type: Type = stb.seb[isei].idType;
+SELECT SymbolOps.TypeForm[stb, type] FROM
+$union, $sequence => NULL;  -- don't count the variant part
+ENDCASE => IF (~stb.seb[isei].constant) AND IsRC[stb, type] THEN n ¨ n+1
+};
+[] ¨ EnumerateRecordIseis[stb, rsei, Count];
+};
+
+IsRC: PROC [stb: STB, seIndex: Type, checkCommon: BOOL¨TRUE]
+RETURNS [BOOL] = {
+csei: CSEIndex = SymbolOps.UnderType[stb, seIndex];
+WITH cr~~stb.seb[csei] SELECT FROM
+record => {
+rcP: FilterType = {
+csei1: CSEIndex = SymbolOps.UnderType[stb, stb.seb[isei].idType];
+WITH cse1~~stb.seb[csei1] SELECT FROM
+union => {
+urcP: FilterType= {RETURN [IsRC[stb, isei, FALSE]]};
+tagCardinality: CARDINAL
+= SymbolOps.Cardinality[stb, stb.seb[cse1.tagSei].idType];
+RETURN [EnumerateCtxIseis[stb, cse1.caseCtx, urcP, (tagCardinality=SymbolOps.CtxEntries[stb, cse1.caseCtx])]];
+};
+sequence => RETURN [IsRC[stb, cse1.componentType]];
+ENDCASE => RETURN [IsRC[stb, csei1]];
+};
+RETURN [
+IF checkCommon
+THEN cr.hints.refField
+ELSE (cr.hints.refField AND EnumerateCtxIseis[stb, cr.fieldCtx, rcP])
+];
+};
+ref => RETURN [cr.counted];
+array => RETURN [IsRC[stb, cr.componentType]];
+transfer => RETURN [FALSE];  -- NOTE for now
+union, sequence => ERROR;
+relative => RETURN [FALSE];  -- NOTE for now
+zone => RETURN [cr.counted];
+ENDCASE => RETURN [FALSE]
+};
+
+
+
+InlineSize: PROC [h: Handle] RETURNS [CARDINAL] = INLINE {
+RETURN [WITH rcm~~h.base[h.index] SELECT FROM
+null => Object.null.SIZE,
+ref => Object.ref.SIZE,
+controlLink => Object.controlLink.SIZE,
+oneRef => Object.oneRef.SIZE,
+simple => Object.simple.SIZE,
+nonVariant => Object.nonVariant[rcm.nComponents].SIZE,
+variant => Object.variant[rcm.nVariants].SIZE,
+array => Object.array.SIZE,
+sequence => Object.sequence.SIZE,
+ENDCASE => ERROR];
+};
+
+EqualMaps: PROC [h1, h2: Handle] RETURNS [BOOL] = {
+WITH m1~~h1.base[h1.index] SELECT FROM
+null, ref, controlLink => RETURN [h1.index = h2.index];	-- StandardRCMap's
+oneRef => RETURN [m1 = h2.base[h2.index]];
+simple => RETURN [m1 = h2.base[h2.index]];
+nonVariant =>
+WITH m2~~h2.base[h2.index] SELECT FROM
+nonVariant => {
+matched: BOOL ¨
+(m1.complete AND m2.complete) AND (m1.nComponents = m2.nComponents);
+FOR i: NAT IN [0 .. m1.nComponents) WHILE matched DO
+matched ¨ (m1.components[i].unitOffset = m2.components[i].unitOffset)
+AND EqualMaps[[h1.base, m1.components[i].rcmi],
+[h2.base, m2.components[i].rcmi]];
+ENDLOOP;
+RETURN [matched]};
+ENDCASE => RETURN [FALSE];
+variant =>
+WITH m2~~h2.base[h2.index] SELECT FROM
+variant => {
+matched: BOOL ¨ (m1.complete AND m2.complete)
+AND (m1.nVariants = m2.nVariants) AND (m1.fdTag = m2.fdTag);
+FOR i: NAT IN [0 .. m1.nVariants) WHILE matched DO
+matched ¨ EqualMaps[[h1.base, m1.variants[i]], [h2.base, m2.variants[i]]];
+ENDLOOP;
+RETURN [matched]};
+ENDCASE => RETURN [FALSE];
+array =>
+WITH m2~~h2.base[h2.index] SELECT FROM
+array =>
+RETURN [
+(m1.unitsPerElement = m2.unitsPerElement)
+AND (m1.nElements = m2.nElements)
+AND EqualMaps[[h1.base, m1.rcmi], [h2.base, m2.rcmi]]
+];
+ENDCASE => RETURN [FALSE];
+sequence =>
+WITH m2~~h2.base[h2.index] SELECT FROM
+sequence =>
+RETURN [
+(m1.unitsPerElement = m2.unitsPerElement)
+AND (m1.fdLength = m2.fdLength)
+AND (m1.dataOffset = m2.dataOffset)
+AND EqualMaps[[h1.base, m1.commonPart], [h2.base, m2.commonPart]]
+AND EqualMaps[[h1.base, m1.rcmi], [h2.base, m2.rcmi]]
+];
+ENDCASE => RETURN [FALSE];
+ENDCASE => ERROR;
+};
+
+
+FindRCMap: PROC [rcmb: Base, h: Handle, limit: CARD]
+RETURNS [found: BOOL, index: Index] = {
+WITH rcm~~h.base[h.index] SELECT FROM
+null, ref, controlLink => {found ¨ TRUE;  index ¨ h.index};
+ENDCASE => {
+FOR rcmi: Index ¨ controlLinkIndex+Object.controlLink.SIZE,
+rcmi + InlineSize[[rcmb, rcmi]] UNTIL LOOPHOLE[rcmi, CARD] >= limit DO
+IF EqualMaps[h, [rcmb, rcmi]] THEN RETURN [TRUE, rcmi];
+ENDLOOP;
+found ¨ FALSE};
+};
+
+EnterRCMap: PROC [rcmt: RCMT, h: Handle] RETURNS [new: Index] = {
+upw: CARDINAL = SIZE[WORD];
+size: CARDINAL = InlineSize[h];
+words: CARDINAL = (size+upw-1)/upw;
+new ¨ AllocRCMap[rcmt, size];
+WITH m~~h.base[h.index] SELECT FROM
+array => {
+aRcmi: AIndex = LOOPHOLE[new];
+cRcmi: Index = MapRCMIndex[rcmt, [h.base, m.rcmi]];
+OSMiscOps.Copy[from: @h.base[h.index], to: @rcmt.base[new], nwords: words];
+rcmt.base[aRcmi].rcmi ¨ cRcmi;
+};
+nonVariant => {
+nvRcmi: RCMap.NVIndex = LOOPHOLE[new];
+OSMiscOps.Copy[from: @h.base[h.index], to: @rcmt.base[new], nwords: words];
+rcmt.base[nvRcmi].complete ¨ FALSE;
+FOR i: NAT IN [0..m.nComponents) DO
+rcmt.base[nvRcmi].components[i] ¨ [
+m.components[i].unitOffset,
+MapRCMIndex[rcmt, [h.base, m.components[i].rcmi]]];
+ENDLOOP;
+rcmt.base[nvRcmi].complete ¨ TRUE;
+};
+variant => {
+vRcmi: RCMap.VIndex = LOOPHOLE[new];
+OSMiscOps.Copy[from: @h.base[h.index], to: @rcmt.base[new], nwords: words];
+rcmt.base[vRcmi].complete ¨ FALSE;
+FOR i: NAT IN [0..m.nVariants) DO
+rcmt.base[vRcmi].variants[i] ¨ MapRCMIndex[rcmt, [h.base, m.variants[i]]];
+ENDLOOP;
+rcmt.base[vRcmi].fdTag ¨ m.fdTag;
+rcmt.base[vRcmi].complete ¨ TRUE;
+};
+sequence => {
+seqRcmi: SeqIndex = LOOPHOLE[new];
+commonRcmi: Index = MapRCMIndex[rcmt, [h.base, m.commonPart]];
+cRcmi: Index = MapRCMIndex[rcmt, [h.base, m.rcmi]];
+OSMiscOps.Copy[from: @h.base[h.index], to: @rcmt.base[new], nwords: words];
+rcmt.base[seqRcmi].commonPart ¨ commonRcmi;
+rcmt.base[seqRcmi].rcmi ¨ cRcmi;
+};
+ENDCASE =>
+OSMiscOps.Copy[from: @h.base[h.index], to: @rcmt.base[new], nwords: words];
+};
+
+MapRCMIndex: PROC [rcmt: RCMT, old: Handle] RETURNS [new: Index] = {
+found: BOOL;
+[found, new] ¨ FindRCMap[rcmt.base, old, rcmt.x];
+IF ~found THEN new ¨ EnterRCMap[rcmt, old];
+};
+
+AllocRCMap: PROC [rcmt: RCMT, size: CARDINAL] RETURNS [Index] = {
+short: CARDINAL ¨ rcmt.x;
+new: Index ¨ LOOPHOLE[rcmt.x];
+IF new = invalidIndex THEN ERROR TooManyRCMaps;
+rcmt.x ¨ rcmt.x + size;
+IF rcmt.x >= rcmt.limit THEN ExpandRCMSpace[rcmt];
+OSMiscOps.Fill[where: @rcmt.base[new], nWords: size/unitsPerWord, value: 0];
+RETURN [LOOPHOLE[new]];
+};
+
+ZoneAllocProc: PROC [self: SelfPtr, size: CARDINAL] RETURNS [LONG POINTER] = {
+rcmt: RCMT = LOOPHOLE[self, RCMT] - SIZE[UNCOUNTED ZONE];
+index: Index = AllocRCMap[rcmt, size];
+RETURN [@rcmt.base[index]];
+};
+
+PtrToIndex: PROC [rcmt: RCMT, ptr: Ptr] RETURNS [Index] = INLINE {
+RETURN [LOOPHOLE[ptr-rcmt.base]];
+};
+
+ExpandRCMSpace: PROC [rcmt: RCMT] = {
+IF rcmt.expandable THEN {
+oldUnits: CARD = rcmt.limit;
+newUnits: CARD = MAX[oldUnits, CARD[unitsPerChunk]]*2;
+newBase: RCMap.Base = LOOPHOLE[OSMiscOps.Units[newUnits], RCMap.Base];
+oldBase: RCMap.Base = rcmt.base;
+IF oldBase # NIL THEN {
+OSMiscOps.Copy[from: oldBase, to: newBase, nwords: oldUnits/unitsPerWord];
+OSMiscOps.Fill[where: oldBase, nWords: oldUnits/unitsPerWord, value: 0];
+FreeChunk[oldBase, oldUnits];
+};
+rcmt.base ¨ newBase;
+rcmt.limit ¨ newUnits;
+RETURN;
+};
+ERROR TooManyRCMaps;
+};
+
+AllocChunk: PROC RETURNS [Base] = {
+ptr: Base ¨ scratchChunk1;
+IF ptr # NIL THEN {scratchChunk1 ¨ NIL; RETURN [ptr]};
+ptr ¨ scratchChunk2;
+IF ptr # NIL THEN {scratchChunk2 ¨ NIL; RETURN [ptr]};
+RETURN [OSMiscOps.Units[unitsPerChunk]];
+};
+
+FreeChunk: PROC [base: Base, units: CARD] = {
+IF base # NIL THEN {
+IF units = unitsPerChunk THEN {
+IF scratchChunk1 = NIL THEN {scratchChunk1 ¨ base; RETURN};
+IF scratchChunk2 = NIL THEN {scratchChunk2 ¨ base; RETURN};
+};
+OSMiscOps.FreeUnits[base];
+};
+};
+
+
+check: BOOL [
+TRUE .. RCMap.ObjectKind.null.ORD = 0
+AND Object.null.SIZE = SimpleRCM.SIZE
+AND Object.ref.SIZE = SimpleRCM.SIZE
+AND Object.oneRef.SIZE = SimpleRCM.SIZE
+AND Object.simple.SIZE = SimpleRCM.SIZE
+AND Object.controlLink.SIZE = SimpleRCM.SIZE
+] = TRUE;
+
+}.
+
+
+  î  
+RCMapBuilderImpl.mesa
+Copyright ” 1984, 1985, 1986, 1988, 1990, 1991 by Xerox Corporation.  All rights reserved.
+Satterthwaite On June 18, 1986 11:55:56 am PDT
+Russ Atkinson (RRA) June 21, 1989 11:53:11 am PDT
+JKF May 25, 1990 5:59:40 pm PDT
+Willie-s, September 24, 1991 4:48 pm PDT
+The scratch chunks to reduce allocations
+
+Make this a power of two!
+Types
+zone stuff
+basic state
+expansion information
+Errors
+Decoding of Symbols.UNSPEC (duplicates of inlines in SymbolOps) 
+PUBLIC PROCS
+make standard entries
+FOR DEBUGGING
+
+first level utility PROCs for constructing RCMap Objects
+any of Object.null, Object.ref, Object.simple, Object.oneRef
+get the rcmi for the enclosing record
+NOTE offset, inclusion of common parts
+maybe a sequence-containing record
+called once
+called once
+IF scstb.seb[scsei].packed THEN ERROR NIY[$packedComponent];
+second level utility PROCs for constructing RCMap Objects
+
+PROCS for poking around in the symbol table
+copied (GROAN) from RTWalkSymbolsImpl
+Padding field
+easy if the common parts count
+look individually at the fields of the variant part (unless none possible)
+PROCs for managing RCMap Bases
+standard entries
+Frequent case of Enumerate is placed INLINE and specialized!
+Note that EqualMaps itself tests for completeness
+Skip backwards over the zone ptr slot (self = @rcmt.scratch)
+Caution, this may affect rcmt.base
+There was an old base
+START HERE
+static check of size assumptions
+ù !  ñ(cedarcode) styleïNewlineDelimiter
+ô codeöúôKöú
+œeúOôZKöœy.ô.Kô1KôKô(óò öœk	ò	KöúüúòKöú
+üú ò/KöúòKöúüúØò∫Köú	üú5òCKöú
+üúPüú!òÉKöúüú≠üúò¬KöúüúòKöúüúò.Köúüúüúò9óóheadöœnúüòKöüú*ò1Köüúò!Kò KöüúòKò Köüúüúüúò#Köúüúüú)òHKò Köúüúò"Köúüúò&Köúüúò,Kò KöúüúòöúüúòKô(Kô óöúüúüúüúò*KôóKò óöúôKò Kö	úüúüúüúüúò)Kò Kö	úüúüúüúüúòOö	úüúüúüúüúòUKò óöúüúüúüúò"ô
+Köúü	úüúüúòKöúòóöúôKöúüúòKöúüúœcò&KöúüúòóöúôKöúüúüúòKöúüú°ò-Köúü	úüúüòóKòKò óKö
+üúüúüúüúüúò(Kò öú	üúü	úüúòKò óKöúüúüúò1Kò Köúüúò'Köúüúò%KöúüúòKöúüúò%Kò óöúôKò Kö†úüúüúòKöüúüú3üúòBKò Kö†úüúüúüúò,Kò óô@Kò ö
+†úüúüúüúüúò@Köüúüúò"KöúòóKò Kö†
+úüúüúüúüúüúüúüúüúòRKò óKôò ö†úüúüúü	úüúüúüúüúüúüúòzKöúòöúüúòKöúüúò	Köú	üúòKöú
+ò
+KòKòKöúòKöúòKöúòóKöú<üúòYòKöúôKöúüúüúüúò7Köúüúò'Köúüú'ò7KòóKòKò óö†úüúüúüúüúüúò4Köúü	úüúò!Köú!ò!KöúüúòKöüúüúòKöúòóKò ö†úüúüúüúüúüúòFKöüúòKöúòKò óö†úüúüúüúüúüúòKKöüú+üúòGKöúòKò óö
+†	úüúüúüúüúòFKöú0ò0öüúüúüò#Köú
+üúüúòLKöú	üúüúòIKöúüúüúòRKöú	üúüúòIKö	úüúüúüú
+üúò?Kö	úüúüúüú
+üúò>KöüúüúòóöúòKò óóö†úüúüúüúüúü	úüúüúüúòrKöüúüúò(Köúüúò Kò ö†ú1ò6Kò óö†úòKöúDòDKöüúüúüúò"KöúòKöúòKò óöüúüúüúòKöú"ò"Köú
+üúò$KöúòóKöú$ò$KöúòKò óö†úüúüú#üúòRöüúüúüúüò(Köüúüúüúò7KöüúòóKöüúòKöúòKò óö†	úüúüúüúüúüúüúòröüúüú"üúüúüúüòeKö
+üúüúüúüúüúò<KöüúòóKòKò óóKöúôô Kö†	úüúüúòKò ö†
+úüúüúò!Köúüúò)Köú%ò%KòKò óö
+†úüúüúüúüúò4öüúüúüúüò.KöúüúòKöúüúòKöúüúòKöú
+üúòKöú
+üúòKòKòKöú	üúòKöúüúòKöüúüúòóöúòKò Kò óóóKöú8ô8ò ö†	úüúüúüúò3KöüúüúüúòCKòKò óöúüúòKöú<ô<óKò ö†úüúüúüúòRöúòKöúòöüúüòöüúüúüòöú
+üúüúüò!öú
+üúüúüúò=KöúüúòKöúòKöúòóKöüúòóöú
+üúüúüò!Köú
+üúüú	üúòAKöüúòóKöüúòóóKöúòóKöúüúüúòöüúüúüòKöúüúòKöúüúòKöúüúò)öú
+üúüúüúüò5Köüú$üúüúò8óKöú
+üú$üúüúòBKöüúüúòóKöú!üúò'Köú,üúòHKöúòóKò ö
+†úüúüúüúüúòTöüúüúüúüòKöú+ò+Köú@ò@Köüú&ò-óKöúòKò óö
+†úüúüúüúüúòRKò2öüúüúò"Köúüú
+òKöú3ò3ö†úüúüúò'Köúüúüúò4KòKòóKòKöúòKöúüúòòKò:Köú?ò?KòóKò8öüúòöüúòKöúòKöüú$ò*óöüúòKöúüúòKöú	ò	Kò<Köüúüúüúò*Köüú	òKöúòóóKöúòóKöüúòKöúòóKò ö
+†úüúüúüúüúòZKò4Köú7ò7Köú<ò<KöüúòKöúòóKò ö
+†úüúüúüúüú!ògöüúòöüúòö†úòKöú%ô%KöúJòJKöú&ô&Köú!üúòAKöüúüúòKöúòóKöúüúDòWKöú*ò*Köú^ò^Köüúüúüò"KöúòóKöüúòóKöúòKò óö
+†úüúüúüúüúòVKöúüú&ò2öüúüúòö†úüúüúüúò<Kö	úüúüúüúüú!òVKöúüúòöüúüúüúüò!KöúòKöüòóKòóö†úòKò"ö†úüúüúò;öüúò	Köüúüú&ò1Köüúüú(ò3óKöúòóöüúüò)Köúüú°ò3öüúò
+öüúüúüúò7ò#Köú(ò(Kò#óKò
+KòóóóKöúòóKöúüú
+òKöúòKöúüúò&KöúüúòKöúòKöúüúòKò,KöüúüúüúòKò9öüúòöüúòKöúòKöüú$ò*óöüúòKöúüúòKöúüúò"Kò=Köüúüúüúò*Köüú
+òKöúòóóKòóKöüúòöúòKò óóö
+†úüúüúüúüúòfKöú"ô"Köúüú
+òKöú2ò2ö†úüúüúüúòCKöú9ò9öüúò	KöúòKöú+ò+óKòóö†úüú	üúò3KöúôKöúüú!ò.öüú	üúòö†úüúüú*üúò`Kö	úüúüúüúüúòNKöú!ò!KöúüúòöüúüúüúüòKöúòKöüúòóKöúüúòKöúòóö†úòöüúüúüúò ò>KòóKò
+KòóKöúòóKò+Köúüú:òMKöú+ò+òKöúDòDóKöúüúòKöúüúòKöú	ò	Köú\ò\Köüú	üúüúòKöúüúò!Kò<Köüúüúüúò8KöúòóKöúòóö†úüú	üúò4KöúôKöú5ò5öüúüúò$Köú5ò5Kò+KòKöúüúòKöüúüúüúüúò=Köüúüúüúüúô<KòöúòKöú<ò<KòKòKöúkòkKòóKò>Köüúüúüúò:KöúòóKöúòóö†	úòKò@Köúòöüúüúüò!Köúüúò&Köúüúò'KöüúüúüúòóKöüúüúòKöúòóKöüú<üúüúòIKöúòóKò óöú9ô9Kò ö†úüúüúüúòMö†úüúüúüúüúüúò]öüúüúüò#KöúüúüúòKöúüúòKöúüúüúòKöú
+üúò+òöüúüúüúüò%Kö
+üúüúüúüúüúò:KöüúòóKöüúüúòKöúòóöúòöüúüúüúüò,Köúüú ò)Kö
+üúüúüúüúüúòBöüúXüò^KöüúüúòóKöüúòóKöüúüúòKöúòóöú
+ò
+öüúüúüúüò%Köúüúò"Kö
+üúüúüúüúüúòBöüúHüòNKöüúüúòóKöüúòóKöüúüúòKöúòóKöúüúüúò#KöüúüòóKöúòóö†úüúüúüúüúüúò6Köúüúò!Köüú"üúüúüúò7KòKöüúüúüúüúüúüúò)KöúòöüúüúüòöúòKöú	üúòKò*Kö	üú!üúüúüú°òIKöúüúòKöúòKöúüúüúüúò7Köúüúò%KòóKöúòKöüúüúüúòóKöúòóKöú%üúüúò2Kò"KöúüúòKöúüúò Köú:ò:KöúòöüúüòöüúüòKòKöúüúüúüúüúüúòYKöüúüúò"óóKöúòKò óóKô öú+ô+ò Köú%ô%óKò öúüúüúüúüúüúüúòPKò óö†úüúòKöú	üúòKòKöúòKöúü
+úòKöúüúüúòö†úòKöú@ò@Kö
+üúüúüúüúüúòPKöüúüúòKöúòóKöüúüúüúüúò&öüúüúüò!ò
+KöüúIüúüúüúò^óKöüúòóKöüú:ò@KöúòKò óö†úüúòKöú	üúòKöúòKöúüúüúò!Köúüúüúüúò%öüúüúòöüúüòöüúüúüò!òöüúüúòöúüúüú°ò&Kò0óKöúüúò%Kö
+üú	üúüúüúüúò7KöüúòóKöúòóKöú
+üúòKöüúüúòóóöüúNüúüòhöüúüúüòöúüú%òFKôóKöúüúüúò!KöüúòóKöüúòóKòóKöüúüúòKöúòKò óö†úüúüúò5Köúüúüú	òö†úòKöüúüúüú	ò'KöúòóKöú*ò*KöúüúDò\KöúaòaöúòKò óóö
+†úüúüúüúüú	ò[ö†úòKò"öüúüò)Köúüú°ò;KöüúüúüúüúòHóKöúòóKò,òKò óóö†úüúüúü	úüúüúòOKò3öüúüúüò"òöúòKòAöüúüúüò%ò
+Köúüúüúò4Köúü	ú:òSKöüúhònKöúòóKöúüú!ò3Köüúüúò%óKöúòóöüúòöüúòöüúòKöúôóöüúüú*òEKöúJôJóóKòóKöúòóKöúüúòKöú	üúò.Köúüúüú°ò,KöúüúòKöúüúüú°ò,KöúüúòKöüúüúüúòóöúòò Kò óóóóKöúôò ö
+†
+úüúüúüúüúò:öüúüúüúüò-KöúüúòKöúüúòKöú"üúò'KöúüúòKöúüúòKöú1üúò6Köú)üúò.KöúüúòKöúüúò!KöüúüúòóKöúòKò óö†	úüúüúüúò3öüúüúüò&Köúüú°òJKöú
+üúò*Köú
+üúò*òöüúüúüò&òöú	üúòKöúüúüú#òDóö	üúüúüúüú	üò4öúEòEöüú,ò/Kò"óóKöüúòóKöüúòóKöüúüúüúòóóò
+öüúüúüò&òöú	üúüúò-Köüúüúò<óö	üúüúüúüú	üò2KòJKöüúòóKöüúòóKöüúüúüúòóóòöüúüúüò&òöüúòöú)ò)Köüúò!Köüú2ò5óKòóóKöüúüúüúòóóòöüúüúüò&òöüúòöú)ò)KöüúòKöüú ò#Köüú>òAKöüú2ò5óKöúòóóKöüúüúüúòóóKöüúüúòóöúòò Kò óóóö
+†	úüú üúüú	üúò\öüúüúüò%öú#üúò;KöúôóöüúòKöú%üúô<Kö°1ô1öüú3üúò;öú üúüúüúüòFKöüúüúüúüúò7KöüúòóóKöúüúòóóKöúòKò óö†
+úüúüúüúòAKöúüúüúüúòKöúüúòKöúüúò#Köúòöüúüúüò#ò
+KöúüúòKò3KöúKòKKöúòKòóòKöúüúò&KöúKòKKöúüúò#öüúüúüúüò#KöúsòsKöüúòóKöúüúò"KöúòóòKöúüúò$KöúKòKKöúüúò"öüúüúüúüò!KòJKöüúòóKöú!ò!Köúüúò!KöúòóòKöúüúò"Kò>Kò3KöúKòKKöú+ò+Köú ò Kòóöüúò
+KöúKòKóóKöúòKò óö†úüúüúüúòDKöúüúòKò1Köüúüúò+KöúòKò óö
+†
+úüúüúüúüúòAKöúüú
+òKöúüú	òKöüúüúüúò/KöúòKöüúüúò2KöúLòLKöüúüúòKöúòKò óö†úüúüúüúüúüúòNöúüúüúüúüúü	úüúò9Köú<ô<óöú&ò&Köú"ô"óKöüúòKòKò óö
+†
+úüúüúüúüúòBKöüúüúò!KòKò óö†úüúüúò%öüúüúòKöú
+üúòKöú
+üúüúüúò6Köúüú(òFKöú ò öüúüúüúòKôKöúJòJKöúHòHKöúòKöúòóKöúòKöúòKöüúòKòóKöüúòKöúòKò óö†
+úüúüúò#KöúòKö
+üúüúüúüúüúò6KöúòKö
+üúüúüúüúüúò6Köüú"ò(KòKò óö†	úüúüúò-öüúüúüúòöüúüúòKöüúüúüúüúò;Köüúüúüúüúò;KòóKöúòKòóKòKò óóKöú
+ô
+ò Köú ô öúüúüúüúüúüúüúüúüúüúüúüúüúüúüò˚öúüúò	Kò óóKòóKò Kò ó Öó    ^  Öñ  

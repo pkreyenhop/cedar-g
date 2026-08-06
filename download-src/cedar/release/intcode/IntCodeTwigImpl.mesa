@@ -1,0 +1,1904 @@
+
+DIRECTORY
+Basics32 USING [BITXOR],
+IntCodeDefs USING [ApplyNode, AssignNode, BlockNode, CaseList, CommentNode, CompositeLocation, ConstNode, DeclNode, DerefLocation, EnableNode, EscapeLocation, FieldLocation, GlobalVarLocation, GotoNode, Handler, HandlerRep, IndexedLocation, Label, LabelNode, LabelRep, LambdaNode, LocalVarLocation, Location, LocationRep, LogicalId, MachineCodeNode, ModuleNode, Node, NodeList, NodeRep, nullVariableId, OperNode, OperRep, ReturnNode, SourceNode, Var, VariableFlags, VarList, WordConstNode],
+IntCodeEnables USING [GenLabel, GenTemp, RewriteEnables],
+IntCodeOpt USING [CleanupLambda, GenAnonLocal, SimplifyValueBlocks],
+IntCodeStuff USING [addrOperNode, allocOperNode, BitsForArgList, constant0, constant1, constant2, CopyVar, defaultNIL, emptyReturn, freeOperNode, GenAddr, GenAnonVar, GenApply, GenAssign, GenBlock, GenComment, GenComposite, GenConst, GenDecl, GenDeref, GenDummy, GenField, GenFieldLoc, GenXFieldLoc, GenFieldLocOfVar, GenFieldOfDeref, GenFree, GenGoTo, GenLabelAddress, GenLargeReturn, GenReturn, GenUpLevel, globalLinkInit, MarkAddressed, MarkAssigned, MarkUsed, NodeContains, NodeListCons2, NodeListCons3, NodeListCons5, PadComposite, StripNilCheck, subOperNode],
+IntCodeTarget USING [bitsPerAU, bitsPerGlobal, bitsPerLink, bitsPerLocal, directGlobals, firstGlobalOffset, lastRegister, lastStack, logBitsPerGlobal, logBitsPerLocal, logMinBitsPerArgument, logMinBitsPerReturn, maxBitsArgumentRecord, maxBitsReturnRecord, minBitsPerArgument, minBitsPerReturn, ToBits, ToUnits],
+IntCodeTwig USING [BaseModel, BaseModelRep, DeclsFetch, DeclsSize, DeclsStore, Duplicate, LabelsFetch, LabelsSize, LabelsStore, LambdaModel, LambdaModelRep, ModelsFetch, ModelsStore, Switches],
+IntCodeUtils USING [IdTab, LabelVisitor, MapNode, MapNodeList, NewIdTab, NodeListCons, NodeListTail, SideEffectFree, SimplyEqual, VarListCons, VarListTail, VisitLabels, Visitor, WordToCard, WordToInt, zone],
+IO USING [PutF1, PutFR, PutFR1, STREAM],
+ProcessProps USING [GetProp],
+Rope USING [ROPE],
+Target: TYPE MachineParms USING [AlignmentIndex, Alignments, bitsPerProc, bitsPerWord, bitsPerProcess];
+IntCodeTwigImpl: CEDAR PROGRAM
+IMPORTS Basics32, IntCodeEnables, IntCodeOpt, IntCodeStuff, IntCodeTarget, IntCodeTwig, IntCodeUtils, IO, ProcessProps
+EXPORTS IntCodeTwig
+= BEGIN OPEN IntCodeDefs, IntCodeEnables, IntCodeStuff, IntCodeTarget, IntCodeTwig, IntCodeUtils, Rope;
+
+IdTab: TYPE = IntCodeUtils.IdTab;
+
+
+smallExceptions: BOOL ¨ FALSE;
+simplifyValueBlocks: BOOL ¨ TRUE;
+useMemoryFromHandlers: BOOL = TRUE;
+heapAllocFX: BOOL = FALSE;
+cleanupCode: BOOL ¨ TRUE;
+
+indexedImpliesAddressedLimit: INT ¨ LAST[INT];
+localVarRegisterLimit: INT ¨ LAST[INT];
+firstMappedOffset: INT ¨ 8*LONG[1024]*IntCodeTarget.bitsPerAU;
+
+worst: NAT = Target.Alignments[Target.AlignmentIndex.LAST];
+staticLinkOffset: NAT = 0;
+firstLocalOffsetLinks: NAT = 4;
+firstLocalOffset: NAT = firstLocalOffsetLinks*bitsPerLink;
+
+z: ZONE ¨ IntCodeUtils.zone;
+
+rewriteEnables: PROC
+[node: Node, genTemp: GenTemp, genLabel: GenLabel] RETURNS [Node] ¨ NIL;
+
+Duplicate: PUBLIC SIGNAL = CODE;
+
+CantHappen: SIGNAL = CODE;
+
+NotYetImplemented: SIGNAL = CODE;
+
+DoModule: PUBLIC PROC [module: Node, switches: Switches] RETURNS [BaseModel] = {
+ENABLE
+CantHappen => IF switches['i] THEN {
+RESUME;
+};
+RETURN [DoModuleInner[module, switches]];
+};
+
+DoModuleInner: PROC [module: Node, switches: Switches] RETURNS [BaseModel] = {
+base: BaseModel ¨ z.NEW[BaseModelRep ¨ [
+module: module,
+labels: IntCodeUtils.NewIdTab[],
+decls: IntCodeUtils.NewIdTab[],
+models: IntCodeUtils.NewIdTab[]
+]];
+
+IF switches['h] OR rewriteEnables # NIL THEN {
+genTemp: GenTemp = {
+RETURN [IntCodeOpt.GenAnonLocal[base, parent, bits]];
+};
+genLabel: GenLabel = {
+RETURN [GenAnonLabelNode[base, node]];
+};
+IF rewriteEnables # NIL
+THEN module ¨ rewriteEnables[module, genTemp, genLabel]
+ELSE module ¨ IntCodeEnables.RewriteEnables[module, genTemp, genLabel];
+};
+
+InitModels[base, module, NIL];
+CanonVars[base, module, NIL];
+
+FOR m: LambdaModel ¨ base.first, m.next WHILE m # NIL DO
+MarkUplevelLocals[base, m, m.lambda];
+ENDLOOP;
+
+IF simplifyValueBlocks THEN
+FOR m: LambdaModel ¨ base.first, m.next WHILE m # NIL DO
+IntCodeOpt.SimplifyValueBlocks[base, m, m.lambda];
+ENDLOOP;
+
+IF lastStack # 0 THEN
+FOR m: LambdaModel ¨ base.first, m.next WHILE m # NIL DO
+CheckStackDepth[base, m, m.lambda];
+ENDLOOP;
+
+FOR m: LambdaModel ¨ base.first, m.next WHILE m # NIL DO
+AllocMemLocals[base, m, m.lambda];
+ENDLOOP;
+
+FOR m: LambdaModel ¨ base.first, m.next WHILE m # NIL DO
+SubstUplevelLocals[base, m, m.lambda];
+ENDLOOP;
+
+FOR m: LambdaModel ¨ base.first, m.next WHILE m # NIL DO
+SubstLocals[base, m, m.lambda];
+ENDLOOP;
+
+IF cleanupCode THEN
+FOR m: LambdaModel ¨ base.first, m.next WHILE m # NIL DO
+rtnPtr: Var ¨ NIL;
+IF m.returnVar # NIL THEN
+WITH m.returnVar.location SELECT FROM
+deref: REF LocationRep.deref =>
+WITH deref.addr SELECT FROM
+v: Var => rtnPtr ¨ v;
+ENDCASE;
+ENDCASE;
+IntCodeOpt.CleanupLambda[base, m, m.lambda, rtnPtr];
+ENDLOOP;
+
+WITH module SELECT FROM
+m: ModuleNode => {
+tail: NodeList ¨ m.procs ¨ NIL;
+FOR lm: LambdaModel ¨ base.first, lm.next WHILE lm # NIL DO
+labelNode: LabelNode ¨ z.NEW[NodeRep.label ¨ [0, label[lm.label]]];
+list: NodeList ¨ NodeListCons[labelNode];
+IF tail = NIL THEN m.procs ¨ list ELSE tail.rest ¨ list;
+tail ¨ list;
+ENDLOOP;
+};
+ENDCASE;
+
+RETURN [base];
+};
+
+InitModels: PROC [base: BaseModel, node: Node, model: LambdaModel] = {
+inner: IntCodeUtils.Visitor = {
+WITH node SELECT FROM
+const: ConstNode => RETURN [node];
+var: Var =>
+WITH var.location SELECT FROM
+local: LocalVarLocation => RETURN [node];
+global: GlobalVarLocation => RETURN [node];
+ENDCASE;
+decl: DeclNode =>
+AddVar[decl.var, model];
+label: LabelNode => {
+lab: Label ¨ label.label;
+IF lab # NIL THEN {
+id: LogicalId ¨ lab.id;
+IF LabelsFetch[base, id] # lab THEN LabelsStore[base, id, lab];
+WITH lab.node SELECT FROM
+lambda: LambdaNode => {
+newModel: LambdaModel ¨ z.NEW[LambdaModelRep ¨ [
+label: lab,
+lambda: lambda,
+parentModel: NIL,
+parentLabel: lambda.parent,
+nesting: 0,
+forceLong: id = 0]];
+IF lambda.parent # NIL
+AND lambda.descBody = NIL
+AND lambda.formalArgs # NIL THEN
+newModel.isCatch ¨ TRUE;
+ModelsStore[base, id, newModel];
+IF base.tail = NIL
+THEN base.first ¨ newModel
+ELSE base.tail.next ¨ newModel;
+base.tail ¨ newModel;
+InitModels[base, lambda, newModel];
+RETURN [node];
+};
+ENDCASE;
+};
+};
+lambda: LambdaNode => {
+units: INT ¨ 0;
+
+model.returnBits ¨ lambda.bitsOut;
+
+FOR each: VarList ¨ lambda.formalArgs, each.rest WHILE each # NIL DO
+arg: Var ¨ each.first;
+IF arg # NIL THEN
+units ¨ units + ToUnits[arg.bits, minBitsPerArgument, logMinBitsPerArgument];
+ENDLOOP;
+model.argumentBits ¨ ToBits[units, logMinBitsPerArgument];
+
+IF model.forceLong OR model.argumentBits > maxBitsArgumentRecord
+THEN {
+oldArgList: VarList ¨ lambda.formalArgs;
+argPtr: Var ¨ GenAnonVar[bitsPerLink];
+argTemp: Var ¨ GenDeref[argPtr, MAX[model.argumentBits, bitsPerLink], worst];
+units: INT ¨ 0;
+model.argumentBits ¨ bitsPerLink;
+FOR each: VarList ¨ oldArgList, each.rest WHILE each # NIL DO
+arg: Var ¨ each.first;
+IF arg # NIL THEN {
+bits: INT ¨ ToBits[units, logMinBitsPerArgument];
+arg.location ¨ GenFieldLocOfVar[argTemp, bits];
+AddVar[arg, model];
+units ¨ units + ToUnits[arg.bits, minBitsPerArgument, logMinBitsPerArgument];
+};
+ENDLOOP;
+lambda.formalArgs ¨ VarListCons[argPtr];
+model.argVar ¨ argTemp;
+AddVar[argPtr, model];
+}
+ELSE {
+FOR each: VarList ¨ lambda.formalArgs, each.rest WHILE each # NIL DO
+AddVar[each.first, model];
+ENDLOOP;
+};
+
+IntCodeUtils.MapNodeList[lambda.body, inner];
+
+IF model.returnVar # NIL OR HasLongReturnVar[model, model.returnBits] THEN
+WITH model.returnVar.location SELECT FROM
+deref: REF LocationRep.deref =>
+WITH deref.addr SELECT FROM
+rtnPtr: Var => {
+AddVar[rtnPtr, model];
+lambda.formalArgs ¨ VarListCons[rtnPtr, lambda.formalArgs];
+lambda.bitsOut ¨ 0;
+};
+ENDCASE => SIGNAL CantHappen;
+ENDCASE => SIGNAL CantHappen;
+
+RETURN [node];
+};
+goto: GotoNode => {
+label: Label = goto.dest;
+SELECT TRUE FROM
+label = NIL => {};
+NOT label.used OR NOT label.jumpedTo => {};
+goto.backwards AND NOT label.backTarget => {};
+ENDCASE => RETURN [node];
+SIGNAL CantHappen;
+RETURN [node];
+};
+apply: ApplyNode => {
+retBits: INT ¨ apply.bits;
+argBits: INT ¨ BitsForArgList[apply.args];
+units: INT ¨ ToUnits[argBits, minBitsPerArgument, logMinBitsPerArgument];
+tail: NodeList ¨ NIL;
+useLargeArgs: BOOL ¨ argBits > maxBitsArgumentRecord;
+useLargeRets: BOOL ¨ retBits > minBitsPerReturn;
+IntCodeUtils.MapNode[apply, inner];
+WITH apply.proc SELECT FROM
+mc: MachineCodeNode => RETURN [node];
+oper: OperNode => {
+args: NodeList ¨ apply.args;
+WITH oper.oper SELECT FROM
+code: REF OperRep.code => {
+IF code.label = NIL OR NOT code.label.used THEN SIGNAL CantHappen;
+};
+mesa: REF OperRep.mesa => {
+SELECT mesa.mesa FROM
+signal, error => IF apply.args = NIL THEN SIGNAL CantHappen ELSE {
+first: Node ¨ args.first;
+rest: NodeList ¨ args.rest;
+nArgs: INT ¨ 0;
+
+FOR each: NodeList ¨ rest, each.rest WHILE each # NIL DO
+nArgs ¨ nArgs + 1;
+ENDLOOP;
+
+IF smallExceptions THEN {
+name: ROPE ¨ NIL;
+SELECT mesa.mesa FROM
+error => SELECT nArgs FROM
+0 => name ¨ "XR_Error0";
+1 => name ¨ "XR_Error1";
+2 => name ¨ "XR_Error2";
+ENDCASE => GO TO notSmall;
+signal => {
+IF retBits # 0 THEN GO TO notSmall;
+SELECT nArgs FROM
+0 => name ¨ "XR_Signal0";
+1 => name ¨ "XR_Signal1";
+2 => name ¨ "XR_Signal2";
+ENDCASE => GO TO notSmall;
+};
+ENDCASE => ERROR;
+apply.proc ¨ z.NEW[NodeRep.machineCode ¨
+[bits: 0, details: machineCode[name]]];
+GO TO ret;
+EXITS notSmall => {};
+};
+
+IF rest = NIL
+THEN rest ¨ NodeListCons[defaultNIL]
+ELSE {
+apply.args ¨ rest;
+node ¨ GenLargeArgs[base, apply, model];
+rest ¨ apply.args;
+};
+SELECT TRUE FROM
+mesa.mesa = error => {};
+retBits = 0 =>
+rest ¨ NodeListCons[defaultNIL, rest];
+ENDCASE => {
+addr: Node ¨ NIL;
+[new: node, addr: addr]
+¨ GenLargeRets[base, model, node, retBits];
+rest ¨ NodeListCons[addr, rest];
+};
+apply.args ¨ NodeListCons[first, rest];
+GO TO ret;
+};
+fork => {
+node ¨ TransformFork[base, model, apply];
+GO TO ret;
+};
+join => {
+rtnBits: INT ¨ node.bits;
+node.bits ¨ bitsPerLink;
+IF rtnBits # 0 THEN {
+result: Var ¨ IntCodeOpt.GenAnonLocal[base, model.label, rtnBits];
+rtnPtr: Var ¨ IntCodeOpt.GenAnonLocal[base, model.label, bitsPerLink];
+rtnSrc: Node ¨ GenDeref[rtnPtr, rtnBits, worst];
+head: NodeList ¨ NodeListCons[GenDecl[result, NIL]];
+tail: NodeList ¨ head;
+tail ¨ tail.rest ¨ NodeListCons[GenDecl[rtnPtr, node]];
+tail ¨ tail.rest ¨ NodeListCons[GenAssign[result, rtnSrc]];
+tail ¨ tail.rest ¨ NodeListCons[GenFree[rtnPtr]];
+tail ¨ tail.rest ¨ NodeListCons[result];
+RETURN [GenBlock[head, rtnBits]];
+};
+RETURN [GenAssign[GenDummy[bitsPerLink], node]];
+};
+resume, reject, unwind => {
+[] ¨ HasLongReturnVar[model, minBitsPerArgument*2];
+GO TO checkArgs;
+};
+startGlobal => {
+prog: Node ¨ apply.args.first;
+rest: NodeList ¨ apply.args ¨ apply.args.rest;
+IF rest # NIL
+THEN node ¨ GenLargeArgs[base, apply, model]
+ELSE apply.args ¨ NodeListCons[defaultNIL];
+apply.args ¨ NodeListCons[prog, apply.args];
+IF retBits = 0
+THEN apply.args ¨ NodeListCons[defaultNIL, apply.args]
+ELSE {
+addr: Node ¨ NIL;
+[node, addr] ¨ GenLargeRets[base, model, node, retBits];
+apply.args ¨ NodeListCons[addr, apply.args];
+};
+GO TO ret;
+};
+addr => apply.proc ¨ addrOperNode;
+free => apply.proc ¨ freeOperNode;
+alloc => apply.proc ¨ allocOperNode;
+ENDCASE;
+GO TO ret;
+};
+ENDCASE => GO TO ret;
+EXITS checkArgs => {};
+};
+ENDCASE;
+IF useLargeArgs THEN
+node ¨ GenLargeArgs[base, apply, model];
+IF useLargeRets THEN {
+addr: Node ¨ NIL;
+[node, addr] ¨ GenLargeRets[base, model, node, retBits];
+apply.args ¨ NodeListCons[addr, apply.args];
+};
+GO TO ret;
+EXITS ret => RETURN [node];
+};
+return: ReturnNode => {
+IF return.rets = NIL THEN RETURN [emptyReturn];
+IntCodeUtils.MapNode[node, inner];
+node ¨ CanonReturn[return, model];
+RETURN [node];
+};
+module: ModuleNode => {
+offset: INT ¨ IntCodeTarget.firstGlobalOffset;
+FOR each: VarList ¨ module.vars, each.rest WHILE each # NIL DO
+var: Var ¨ each.first;
+IF var # NIL THEN {
+bits: INT ¨ var.bits;
+units: INT ¨ ToUnits[bits, IntCodeTarget.bitsPerGlobal, IntCodeTarget.logBitsPerGlobal];
+round: INT ¨ ToBits[units, IntCodeTarget.logMinBitsPerArgument];
+loc: Location ¨ z.NEW[LocationRep.globalVar ¨ [globalVar[offset]]];
+var.location ¨ loc;
+DeclsStore[base, var.id, var];
+offset ¨ offset + round;
+};
+ENDLOOP;
+};
+ENDCASE;
+IntCodeUtils.MapNode[node, inner];
+RETURN [node];
+};
+AddVar: PROC [var: Var, model: LambdaModel] = {
+IF var # NIL AND model # NIL AND DeclsFetch[base, var.id] = NIL THEN {
+IF var.id = nullVariableId THEN
+var.id ¨ -DeclsSize[base]-1;
+IF var.location = NIL THEN
+var.location ¨ z.NEW[LocationRep.localVar ¨ [localVar[var.id, model.label]]];
+DeclsStore[base, var.id, var];
+};
+};
+canonLabels: IntCodeUtils.LabelVisitor = {
+IF NOT define THEN {
+new: Label ¨ LabelsFetch[base, label.id];
+IF new # NIL THEN RETURN [new];
+};
+RETURN [label];
+};
+[] ¨ inner[node];
+IF model = NIL THEN
+IntCodeUtils.VisitLabels[node: node, visitor: canonLabels, fullTree: TRUE, visitNIL: FALSE];
+};
+
+CanonVars: PROC [base: BaseModel, node: Node, model: LambdaModel] = {
+inner: IntCodeUtils.Visitor = {
+WITH node SELECT FROM
+var: Var => {
+canon: Var ¨ DeclsFetch[base, var.id];
+IF canon # NIL THEN {
+WITH canon.location SELECT FROM
+local: LocalVarLocation => {
+parent: Label ¨ IF model = NIL THEN NIL ELSE model.label;
+IF local.parent # parent THEN canon.flags[upLevel] ¨ TRUE;
+};
+global: GlobalVarLocation => IF NOT IntCodeTarget.directGlobals THEN {
+IF model # NIL AND model.globalLink = NIL THEN
+model.globalLink ¨ IntCodeOpt.GenAnonLocal[base, model.label, bitsPerLink];
+};
+ENDCASE;
+var ¨ canon;
+};
+WITH var.location SELECT FROM
+local: LocalVarLocation => {
+IF var.bits > localVarRegisterLimit THEN
+MarkAddressed[var];
+};
+indexed: IndexedLocation => {
+base: Node ¨ indexed.base ¨ inner[indexed.base];
+index: Node ¨ indexed.index ¨ inner[indexed.index];
+WITH index SELECT FROM
+const: WordConstNode => {
+val: INT ¨ IntCodeUtils.WordToInt[const.word];
+var.location ¨ GenFieldLoc[base, val*var.bits];
+};
+ENDCASE =>
+IF base # NIL AND base.bits > indexedImpliesAddressedLimit THEN
+MarkAddressed[base];
+};
+ENDCASE => IntCodeUtils.MapNode[var, inner];
+RETURN [var];
+};
+decl: DeclNode => {
+var: Var ¨ DeclsFetch[base, decl.var.id];
+decl.init ¨ inner[decl.init];
+RETURN [node];
+};
+labelNode: LabelNode => {
+label: Label = labelNode.label;
+IF label # NIL THEN {
+id: LogicalId ¨ label.id;
+WITH label.node SELECT FROM
+lambda: LambdaNode => {
+newModel: LambdaModel ¨ ModelsFetch[base, id];
+lambda.descBody ¨ NARROW[inner[lambda.descBody]];
+CanonLambda[base, newModel, lambda];
+IF newModel.isCatch THEN
+[] ¨ GetHandlerArgs[newModel];
+RETURN [node];
+};
+ENDCASE;
+};
+};
+enable: EnableNode => {
+handler: Handler ¨ enable.handle;
+IF handler # NIL THEN {
+proc: Node ¨ handler.proc;
+handler.proc ¨ MarkCatch[base, proc];
+[] ¨ inner[proc];
+};
+};
+assign: AssignNode => {
+IntCodeUtils.MapNode[node, inner];
+IF assign.lhs # NIL AND assign.lhs.id # nullVariableId THEN
+assign.lhs.flags[assigned] ¨ TRUE;
+RETURN [node];
+};
+apply: ApplyNode => {
+handler: Handler ¨ apply.handler;
+IF handler # NIL THEN {
+proc: Node ¨ handler.proc;
+handler.proc ¨ MarkCatch[base, proc];
+[] ¨ inner[proc];
+};
+IntCodeUtils.MapNode[node, inner];
+WITH apply.proc SELECT FROM
+oper: OperNode => {
+WITH oper.oper SELECT FROM
+mesa: REF OperRep.mesa =>
+SELECT mesa.mesa FROM
+addr => {
+args: NodeList ¨ apply.args;
+IF args # NIL THEN MarkAddressed[args.first];
+};
+ENDCASE;
+ENDCASE;
+};
+ENDCASE;
+RETURN [node];
+};
+block: BlockNode => {
+list: NodeList ¨ block.nodes;
+count: INT ¨ 0;
+decl0: DeclNode ¨ NIL;
+assign1: AssignNode ¨ NIL;
+var1: Var ¨ NIL;
+var2: Var ¨ NIL;
+FOR each: NodeList ¨ list, each.rest WHILE each # NIL DO
+WITH each.first SELECT FROM
+decl: DeclNode =>
+IF count = 0 THEN decl0 ¨ decl ELSE decl0 ¨ NIL;
+assign: AssignNode =>
+IF count = 1 THEN assign1 ¨ assign ELSE assign1 ¨ NIL;
+var: Var => {
+IF count = 1 THEN var1 ¨ var ELSE var1 ¨ NIL;
+IF count = 2 THEN var2 ¨ var ELSE var2 ¨ NIL;
+};
+ENDCASE;
+count ¨ count + 1;
+IF count > 3 THEN EXIT;
+ENDLOOP;
+SELECT count FROM
+1 => IF decl0 = NIL THEN
+RETURN [inner[list.first]];
+2 => IF decl0 # NIL AND decl0.var = var1 THEN
+RETURN [inner[decl0.init]];
+3 => IF decl0 # NIL AND decl0.var = var2 AND decl0.init = NIL
+AND assign1 # NIL AND assign1.lhs = var2 THEN
+IF NOT NodeContains[assign1.rhs, var2] THEN
+RETURN [inner[assign1.rhs]];
+ENDCASE;
+};
+ENDCASE;
+IntCodeUtils.MapNode[node, inner];
+RETURN [node];
+};
+[] ¨ inner[node];
+};
+
+DetermineNesting: PROC [base: BaseModel, model: LambdaModel] = {
+parent: Label ¨ model.parentLabel;
+IF parent # NIL AND model.nesting = 0 THEN {
+parentModel: LambdaModel ¨ ModelsFetch[base, parent.id];
+IF parentModel # NIL THEN {
+DetermineNesting[base, parentModel];
+model.parentModel ¨ parentModel;
+model.parentLabel ¨ parentModel.label;
+model.nesting ¨ parentModel.nesting + 1;
+};
+};
+};
+
+CanonLambda: PROC [base: BaseModel, model: LambdaModel, lambda: LambdaNode] = {
+IF model # NIL AND model.parentLabel # NIL AND model.parentModel = NIL THEN
+DetermineNesting[base, model];
+CanonVars[base, lambda, model];
+
+SELECT TRUE FROM
+model.isCatch => {
+model.staticLink ¨ GetHandlerArgs[model].regsPtr;
+model.returnBits ¨ 2*bitsPerLink;
+};
+lambda.parent # NIL => {
+static: Var ¨ IntCodeOpt.GenAnonLocal[base, model.label, bitsPerLink];
+staticList: VarList ¨ VarListCons[static];
+model.staticLink ¨ static;
+IF lambda.formalArgs = NIL
+THEN lambda.formalArgs ¨ staticList
+ELSE VarListTail[lambda.formalArgs].rest ¨ staticList;
+};
+ENDCASE;
+
+IF model.globalLink # NIL THEN {
+decl: Node ¨ GenDecl[model.globalLink, globalLinkInit];
+model.globalLink.flags[frequent] ¨ TRUE;
+lambda.body ¨ NodeListCons[decl, lambda.body];
+};
+};
+
+CheckStackDepth: PROC [base: BaseModel, model: LambdaModel, lambda: LambdaNode] = {
+inner: IntCodeUtils.Visitor = {
+oldDepth: INT ¨ depth;
+IF depth > lastStack THEN ERROR CantHappen;
+IF node = NIL OR CanSimplyPush[node, depth] THEN RETURN [node];
+WITH node SELECT FROM
+decl: DeclNode => {
+var: Var ¨ decl.var;
+IF var # NIL AND NOT var.flags[notRegister] THEN
+WITH var.location SELECT FROM
+local: LocalVarLocation => {
+units: INT ¨ ToUnits[var.bits, bitsPerLocal, logBitsPerLocal];
+next: INT ¨ depth+units;
+IF next > lastRegister
+THEN {
+var.flags[notRegister] ¨ TRUE;
+}
+ELSE {
+depth ¨ next;
+IF depth > max THEN max ¨ depth;
+};
+};
+ENDCASE;
+decl.init ¨ inner[decl.init];
+RETURN [node];
+};
+apply: ApplyNode => {
+args: NodeList ¨ apply.args;
+argsUnits: INT ¨ ToUnits[BitsForArgList[args], bitsPerLocal, logBitsPerLocal];
+tail: NodeList ¨ NIL;
+lastTemp: INT ¨ lastStack-maxBitsArgumentRecord/bitsPerLocal;
+PutArgInMemory: PROC [arg: Node] RETURNS [Var] = {
+var: Var ¨ GenMemTemp[base, arg.bits, model];
+new: NodeList ¨ NodeListCons[GenDecl[var, inner[arg]]];
+var.flags[constant] ¨ TRUE;
+IF tail = NIL
+THEN {
+new.rest ¨ NodeListCons[apply];
+node ¨ GenBlock[new, apply.bits];
+}
+ELSE {
+new.rest ¨ tail.rest;
+tail.rest ¨ new;
+};
+tail ¨ new;
+RETURN [var];
+};
+
+IF NOT CanSimplyPush[apply.proc, depth+argsUnits] THEN
+apply.proc ¨ PutArgInMemory[apply.proc];
+
+SELECT TRUE FROM
+args = NIL =>
+GO TO commonExit;
+args.rest = NIL => {
+args.first ¨ inner[args.first];
+GO TO commonExit;
+};
+ENDCASE;
+WITH apply.proc SELECT FROM
+oper: OperNode => {
+WITH oper.oper SELECT FROM
+code: REF OperRep.code => GO TO useProcApply;
+mesa: REF OperRep.mesa =>
+SELECT mesa.mesa FROM
+addr, equal, notEqual => GO TO useAddrs;
+ENDCASE;
+ENDCASE;
+FOR each: NodeList ¨ args, each.rest WHILE each # NIL DO
+arg: Node ¨ each.first;
+units: INT ¨ ToUnits[arg.bits, minBitsPerArgument, logMinBitsPerArgument];
+SELECT TRUE FROM
+depth <= lastTemp, CanSimplyPush[arg, depth+argsUnits] =>
+each.first ¨ inner[arg];
+ENDCASE =>
+each.first ¨ PutArgInMemory[arg];
+ENDLOOP;
+GO TO commonExit;
+EXITS
+useProcApply => {};
+useAddrs => {
+localsPerLink: NAT = bitsPerLink/bitsPerLocal;
+FOR each: NodeList ¨ args, each.rest WHILE each # NIL DO
+depth ¨ depth + localsPerLink;
+ENDLOOP;
+FOR each: NodeList ¨ args, each.rest WHILE each # NIL DO
+each.first ¨ inner[each.first];
+ENDLOOP;
+GO TO commonExit;
+};
+};
+ENDCASE;
+FOR each: NodeList ¨ args, each.rest WHILE each # NIL DO
+arg: Node ¨ each.first;
+units: INT ¨ ToUnits[arg.bits, minBitsPerArgument, logMinBitsPerArgument];
+next: INT ¨ units+depth;
+SELECT TRUE FROM
+next <= lastTemp => {
+depth ¨ next;
+each.first ¨ inner[arg];
+};
+CanSimplyPush[arg, depth] =>
+each.first ¨ inner[arg];
+ENDCASE =>
+each.first ¨ PutArgInMemory[arg];
+ENDLOOP;
+GO TO commonExit;
+EXITS commonExit => {
+depth ¨ oldDepth;
+RETURN [node];
+};
+};
+lambda: LambdaNode => RETURN [node];
+source: SourceNode => {
+FOR each: NodeList ¨ source.nodes, each.rest WHILE each # NIL DO
+each.first ¨ inner[each.first];
+ENDLOOP;
+RETURN [node];
+};
+ENDCASE;
+IntCodeUtils.MapNode[node, inner];
+depth ¨ oldDepth;
+RETURN [node];
+};
+depth: INT ¨ ToUnits[model.argumentBits, minBitsPerArgument, logMinBitsPerArgument];
+max: INT ¨ depth;
+localsPerLink: NAT = bitsPerLink/bitsPerLocal;
+IF model.returnVar # NIL THEN depth ¨ depth+localsPerLink;
+IF model.globalLink # NIL THEN depth ¨ depth+localsPerLink;
+IntCodeUtils.MapNode[lambda, inner];
+};
+
+MarkUplevelLocals: PROC [base: BaseModel, model: LambdaModel, lambda: LambdaNode] = {
+inner: IntCodeUtils.Visitor = {
+WITH node SELECT FROM
+var: Var => {
+WITH var.location SELECT FROM
+local: LocalVarLocation => {
+IF model # NIL AND var.flags[upLevel] THEN {
+target: Label = local.parent;
+IF target # NIL AND target # model.label THEN {
+notRegister: BOOL ¨ var.flags[notRegister];
+FOR mod: LambdaModel ¨ model, mod.parentModel DO
+SELECT TRUE FROM
+mod = NIL => {
+VarCantHappen[var, "ref to non-enclosing lambda"];
+EXIT};
+mod.label = target => {
+var.flags[notRegister] ¨ notRegister;
+RETURN [CopyVar[var]];
+};
+mod.staticLink = NIL => {
+VarCantHappen[var, "can't find static link"];
+EXIT};
+ENDCASE;
+IF useMemoryFromHandlers OR NOT mod.isCatch THEN
+notRegister ¨ TRUE;
+ENDLOOP;
+};
+};
+RETURN [node];
+};
+deref: DerefLocation => {
+old: Node ¨ deref.addr;
+IF old # NIL THEN {
+new: Node ¨ inner[old];
+IF new # old THEN {
+nVar: Var ¨ CopyVar[var];
+nVar.location ¨ z.NEW[LocationRep.deref ¨ [deref[new, deref.align]]];
+RETURN [nVar];
+};
+};
+RETURN [var];
+};
+field: FieldLocation => {
+old: Node ¨ field.base;
+IF old # NIL THEN {
+new: Node ¨ inner[old];
+IF new # old THEN {
+nVar: Var ¨ CopyVar[var];
+IF field.cross 
+THEN nVar.location ¨ GenXFieldLoc[new, field.start] --ChJ, May 4, 1993
+ELSE nVar.location ¨ GenFieldLoc[new, field.start];
+RETURN [nVar];
+};
+};
+RETURN [var];
+};
+indexed: IndexedLocation => {
+base: Node ¨ indexed.base;
+index: Node ¨ indexed.index;
+IF base # NIL THEN base ¨ inner[base];
+IF index # NIL THEN index ¨ inner[index];
+IF base # indexed.base OR index # indexed.index THEN {
+nVar: Var ¨ CopyVar[var];
+nVar.location ¨ z.NEW[LocationRep.indexed ¨ [indexed[base, index]]];
+RETURN [nVar];
+};
+RETURN [var];
+};
+composite: CompositeLocation => {
+FOR each: NodeList ¨ composite.parts, each.rest WHILE each # NIL DO
+old: Node ¨ each.first;
+IF old # NIL THEN {
+new: Node ¨ inner[old];
+IF old # new THEN {
+nVar: Var ¨ CopyVar[var];
+head: NodeList ¨ NIL;
+tail: NodeList ¨ NIL;
+nLoc: REF LocationRep.composite
+¨ z.NEW[LocationRep.composite ¨ [composite[NIL]]];
+FOR lead: NodeList ¨ composite.parts, lead.rest WHILE lead # each DO
+copy: NodeList ¨ NodeListCons[lead.first];
+IF tail = NIL THEN nLoc.parts ¨ copy ELSE tail.rest ¨ copy;
+tail ¨ copy;
+ENDLOOP;
+IF tail = NIL
+THEN tail ¨ nLoc.parts ¨ NodeListCons[new]
+ELSE tail ¨ tail.rest ¨ NodeListCons[new];
+FOR lead: NodeList ¨ each.rest, lead.rest WHILE lead # NIL DO
+copy: NodeList ¨ NodeListCons[old ¨ lead.first];
+IF old # NIL THEN copy.first ¨ inner[old];
+tail ¨ tail.rest ¨ copy;
+ENDLOOP;
+nVar.location ¨ nLoc;
+RETURN [nVar];
+};
+};
+ENDLOOP;
+RETURN [var];
+};
+escape: EscapeLocation => {
+base: Node ¨ escape.base;
+IF base # NIL THEN {
+base ¨ inner[base];
+IF base # escape.base THEN {
+nVar: Var ¨ CopyVar[var];
+nVar.location ¨ z.NEW[LocationRep.escape
+¨ [escape[id: escape.id, base: base, offset: escape.offset]]];
+RETURN [nVar];
+};
+};
+RETURN [var];
+};
+ENDCASE;
+};
+return: ReturnNode =>
+node ¨ CanonReturn[return, model];
+apply: ApplyNode => {
+WITH apply.proc SELECT FROM
+oper: OperNode => {
+args: NodeList ¨ apply.args;
+WITH oper.oper SELECT FROM
+mesa: REF OperRep.mesa => {
+SELECT mesa.mesa FROM
+reject => {
+rets: NodeList ¨ NodeListCons[constant0, NodeListCons[constant0]];
+node ¨ GenReturn[rets];
+GO TO fixReturn;
+};
+resume => {
+rets: NodeList ¨ NodeListCons[constant1, NodeListCons[constant0]];
+node ¨ GenReturn[rets];
+IF args # NIL THEN {
+comp: Node ¨ PadComposite[args, logMinBitsPerReturn];
+dest: Var ¨ GenDeref[
+GetHandlerArgs[model].rtnPtr, comp.bits, worst];
+assign: Node ¨ GenAssign[dest, comp];
+node ¨ GenBlock[NodeListCons2[assign, node]];
+};
+GO TO fixReturn;
+};
+unwind => {
+rets: NodeList ¨ NodeListCons[constant2, args];
+node ¨ GenReturn[rets];
+GO TO fixReturn;
+};
+ENDCASE;
+EXITS fixReturn => RETURN [inner[node]];
+};
+ENDCASE;
+};
+ENDCASE;
+};
+lambda: LambdaNode => RETURN [node];
+ENDCASE;
+IntCodeUtils.MapNode[node, inner];
+RETURN [node];
+};
+IntCodeUtils.MapNode[lambda, inner];
+};
+
+AllocMemLocals: PROC [base: BaseModel, model: LambdaModel, lambda: LambdaNode] = {
+inner: IntCodeUtils.Visitor = {
+WITH node SELECT FROM
+var: Var => WITH var.location SELECT FROM
+stack: REF LocationRep.stack => forceExtension ¨ TRUE;
+ENDCASE;
+decl: DeclNode => CountVar[decl.var];
+block: BlockNode => {
+oldDepth: INT ¨ model.memDepth;
+IntCodeUtils.MapNode[node, inner];
+model.memDepth ¨ oldDepth;
+RETURN [node];
+};
+enable: EnableNode => IF enable.handle # NIL THEN forceExtension ¨ TRUE;
+apply: ApplyNode => IF apply.handler # NIL THEN forceExtension ¨ TRUE;
+lambda: LambdaNode => RETURN [node];
+ENDCASE;
+IntCodeUtils.MapNode[node, inner];
+RETURN [node];
+};
+CountVar: PROC [var: Var] = {
+WITH var.location SELECT FROM
+local: LocalVarLocation =>
+SELECT TRUE FROM
+NOT var.flags[notRegister] => {};
+NOT heapAllocFX AND NOT var.flags[upLevel] => {};
+ENDCASE => {
+units: INT ¨ ToUnits[var.bits, bitsPerLocal, logBitsPerLocal];
+depth: INT ¨ model.memDepth;
+IF local.parent # model.label THEN {
+varId: Rope.ROPE = IF local.parent = NIL
+THEN "??"
+ELSE IO.PutFR1["%g", [integer[local.parent.id]] ];
+modelId: Rope.ROPE = IF model.label = NIL
+THEN "??"
+ELSE IO.PutFR1["%g", [integer[model.label.id]] ];
+VarCantHappen[var, IO.PutFR["%g # %g", [rope[varId]], [rope[modelId]] ]];
+};
+local.id ¨ depth;
+IF (model.memDepth ¨ depth + units) > model.memMax THEN
+model.memMax ¨ model.memDepth;
+};
+stack: REF LocationRep.stack => forceExtension ¨ TRUE;
+ENDCASE => VarCantHappen[var, "location not stack, not local"];
+};
+forceExtension: BOOL ¨ FALSE;
+model.memDepth ¨ model.memMax ¨ firstLocalOffsetLinks;
+FOR each: VarList ¨ lambda.formalArgs, each.rest WHILE each # NIL DO
+CountVar[each.first];
+ENDLOOP;
+IntCodeUtils.MapNode[lambda, inner];
+IF model.memMax = firstLocalOffsetLinks AND NOT forceExtension
+THEN
+model.memDepth ¨ model.memMax ¨ 0
+ELSE {
+memBits: INT ¨ ToBits[model.memMax, logBitsPerLocal];
+fxLink: Var ¨ IntCodeOpt.GenAnonLocal[base, model.label, bitsPerLink];
+fxSpace: Var ¨ model.frameExtension ¨ IF heapAllocFX
+THEN GenDeref[fxLink, memBits, worst]
+ELSE IntCodeOpt.GenAnonLocal[base, model.label, memBits];
+fxLink.flags[frequent] ¨ TRUE;
+IF model.staticLink # NIL THEN
+lambda.body ¨ NodeListCons[
+GenAssign[
+lhs: GenField[fxSpace, staticLinkOffset, bitsPerLink],
+rhs: model.staticLink],
+lambda.body];
+IF heapAllocFX
+THEN {
+model.memoryLink ¨ fxLink;
+AddFrameExtension[base, model, lambda];
+}
+ELSE {
+IF lambda.body = NIL THEN
+lambda.body ¨ NodeListCons[GenComment["entry point"]];
+model.entryPoint ¨ lambda.body;
+IF NOT useMemoryFromHandlers THEN {
+model.memoryLink ¨ fxLink;
+lambda.body ¨ NodeListCons[
+GenDecl[var: fxLink, init: GenAddr[fxSpace]],
+lambda.body];
+};
+lambda.body ¨ NodeListCons[
+GenDecl[var: fxSpace, init: NIL],
+lambda.body];
+fxSpace.flags[notRegister] ¨ FALSE;
+};
+};
+};
+
+AddFrameExtension: PROC [base: BaseModel, model: LambdaModel, lambda: LambdaNode] = {
+link: Var ¨ model.memoryLink;
+ext: Var ¨ model.frameExtension;
+
+bits: INT ¨ ext.bits;
+units: INT ¨ ToUnits[bits, minBitsPerArgument, logMinBitsPerArgument];
+alloc: Node ¨ GenDecl[link, GenApply[allocOperNode,
+NodeListCons[GenConst[units, minBitsPerArgument]]]];
+free: Node ¨ GenFree[link];
+freeExit: LabelNode ¨ SELECT model.returnBits FROM
+0, > maxBitsReturnRecord => GenAnonLabelNode[base, free],
+ENDCASE => NIL;
+
+inner: IntCodeUtils.Visitor = {
+WITH node SELECT FROM
+return: ReturnNode => {
+IF freeExit # NIL THEN
+RETURN [GenGoTo[freeExit.label]];
+IF return.rets = NIL
+THEN SIGNAL CantHappen
+ELSE {
+clean: NodeList ¨ NodeListCons[free];
+NodeListTail[return.rets].rest ¨ clean;
+};
+RETURN [node];
+};
+lambda: LambdaNode => RETURN [node];
+ENDCASE;
+IntCodeUtils.MapNode[node, inner];
+RETURN [node];
+};
+
+lambda.body ¨ NodeListCons[
+alloc,
+model.entryPoint ¨ NodeListCons[
+z.NEW[NodeRep.enable ¨ [0, enable[
+handle: z.NEW[HandlerRep ¨ [context: link, proc: NIL]],
+scope: lambda.body]]],
+IF freeExit # NIL THEN NodeListCons[freeExit] ELSE NIL
+]];
+
+IntCodeUtils.MapNode[lambda, inner];
+};
+
+SubstUplevelLocals: PROC [base: BaseModel, model: LambdaModel, lambda: LambdaNode] = {
+inner: IntCodeUtils.Visitor = {
+WITH node SELECT FROM
+var: Var => {
+WITH var.location SELECT FROM
+local: LocalVarLocation => {
+target: Label = local.parent;
+SELECT target FROM
+model.label => {
+};
+# NIL => {
+link: Var ¨ model.staticLink;
+mod: LambdaModel ¨ model;
+fromCatch: BOOL ¨ mod.isCatch;
+DO
+parentModel: LambdaModel ¨ mod.parentModel;
+SELECT TRUE FROM
+target = mod.parentLabel => {
+inRegister: BOOL ¨ NOT var.flags[notRegister];
+offset: INT ¨ ToBits[local.id, logBitsPerLocal];
+bits: INT ¨ var.bits;
+SELECT TRUE FROM
+fromCatch AND NOT useMemoryFromHandlers => {
+IF inRegister THEN RETURN [GenUpLevel[link, var]];
+link ¨ GenUpLevel[link, mod.parentModel.memoryLink];
+};
+parentModel # NIL AND parentModel.staticLink = var => {
+link ¨ mod.staticLink;
+offset ¨ staticLinkOffset;
+};
+inRegister => VarCantHappen[var, "SubstUplevelLocals"];
+ENDCASE;
+IF link = NIL
+THEN VarCantHappen[var, "SubstUplevelLocals"]
+ELSE RETURN [GenFieldOfDeref[link, offset, bits]];
+};
+ENDCASE => {
+next: LambdaModel ¨ mod.parentModel;
+IF next = NIL OR next.staticLink = NIL THEN {
+VarCantHappen[var, "SubstUplevelLocals"];
+EXIT;
+};
+SELECT TRUE FROM
+useMemoryFromHandlers OR NOT fromCatch =>
+link ¨ GenFieldOfDeref[link, staticLinkOffset, bitsPerLink];
+ENDCASE =>
+link ¨ GenUpLevel[link, next.staticLink];
+fromCatch ¨ mod.isCatch;
+mod ¨ next;
+};
+ENDLOOP;
+};
+ENDCASE => VarCantHappen[var, "SubstUplevelLocals"];
+RETURN [node];
+};
+global: GlobalVarLocation => IF NOT IntCodeTarget.directGlobals THEN
+IF model.globalLink # NIL THEN {
+gVar: Var ¨ GenFieldOfDeref[model.globalLink, global.id, var.bits];
+gVar.id ¨ var.id;
+RETURN [gVar];
+};
+stack: REF LocationRep.stack => {
+ext: Var = model.frameExtension;
+new: Node ¨ ext;
+IF ext = NIL THEN ERROR CantHappen;
+new ¨ GenField[new, stack.offset*IntCodeTarget.bitsPerAU, node.bits];
+RETURN [new];
+};
+ENDCASE;
+};
+lambda: LambdaNode => RETURN [node];
+ENDCASE;
+IntCodeUtils.MapNode[node, inner];
+RETURN [node];
+};
+IntCodeUtils.MapNode[lambda, inner];
+};
+
+SubstLocals: PROC [base: BaseModel, model: LambdaModel, lambda: LambdaNode] = {
+innerVar: PROC [var: Var] RETURNS [Var] = {
+IF var # NIL THEN {
+loc: Location ¨ var.location;
+WITH loc SELECT FROM
+local: LocalVarLocation => {
+SELECT TRUE FROM
+NOT var.flags[notRegister] => {};
+NOT heapAllocFX AND NOT var.flags[upLevel] => {};
+var = model.frameExtension => {};
+ENDCASE => {
+target: Label = local.parent;
+SELECT target FROM
+model.label => {
+ext: Var ¨ model.frameExtension;
+IF ext = NIL
+THEN VarCantHappen[var, "SubstLocals"]
+ELSE var.location ¨
+GenFieldLocOfVar[ext, ToBits[local.id, logBitsPerLocal]];
+};
+ENDCASE => SIGNAL CantHappen;
+};
+};
+field: FieldLocation => {
+base: Node ¨ field.base ¨ inner[field.base];
+WITH base SELECT FROM
+fv: Var => WITH fv.location SELECT FROM
+ff: FieldLocation => {
+IF ff.cross#field.cross 
+THEN {
+IF fv.bits >= Target.bitsPerWord 
+THEN { 
+-- we should test if the basefield.start is a multiple of words LAI
+field.start _ field.start + ff.start;
+}
+ELSE {
+field.start _ field.start + Basics32.BITXOR[ff.start + fv.bits-1, Target.bitsPerWord-1]
+};
+}
+ELSE {
+field.start ¨ field.start + ff.start;
+};
+field.base ¨ ff.base;
+};
+fd: DerefLocation => IF NOT var.flags[addressed] THEN {
+addr: Node ¨ StripNilCheck[fd.addr];
+IF addr # fd.addr THEN {
+IF field.start < firstMappedOffset
+THEN fd.addr ¨ addr
+ELSE addr ¨ fd.addr;
+};
+};
+ENDCASE;
+ENDCASE;
+};
+indexed: IndexedLocation => {
+derefLoc: DerefLocation ¨ NIL;
+WITH indexed.base SELECT FROM
+var: Var => WITH var.location SELECT FROM
+field: FieldLocation => IF field.start < firstMappedOffset THEN
+WITH field.base SELECT FROM
+fv: Var => WITH fv.location SELECT FROM
+deref: DerefLocation => derefLoc ¨ deref;
+ENDCASE;
+ENDCASE;
+deref: DerefLocation => derefLoc ¨ deref;
+ENDCASE;
+ENDCASE;
+IF derefLoc # NIL THEN {
+derefAddr: Node ¨ derefLoc.addr;
+stripped: Node ¨ StripNilCheck[derefAddr];
+index: Node ¨ indexed.index;
+IF stripped # derefAddr
+AND IntCodeUtils.SideEffectFree[stripped, FALSE]
+AND IntCodeUtils.SideEffectFree[index, FALSE] THEN {
+scanner: IntCodeUtils.Visitor = {
+IF derefAddr # NIL THEN {
+WITH node SELECT FROM
+var: Var => WITH var.location SELECT FROM
+deref: DerefLocation => {
+ds: Node ¨ StripNilCheck[deref.addr];
+IF ds = stripped THEN GO TO noMap;
+IF IntCodeUtils.SimplyEqual[ds, stripped] THEN GO TO noMap;
+};
+ENDCASE;
+ENDCASE;
+IntCodeUtils.MapNode[node, scanner];
+EXITS noMap => {derefAddr ¨ NIL};
+};
+RETURN [node];
+};
+
+WITH index SELECT FROM
+wc: WordConstNode => {
+x: CARD ¨ IntCodeUtils.WordToCard[wc.word];
+sz: CARD ¨ var.bits;
+IF x < CARD[firstMappedOffset]/sz THEN derefAddr ¨ NIL;
+};
+ENDCASE => {
+[] ¨ scanner[index];
+};
+IF derefAddr = NIL THEN
+derefLoc.addr ¨ stripped;
+};
+};
+};
+ENDCASE => IF loc = NIL THEN VarCantHappen[var, "SubstLocals"];
+};
+RETURN [var];
+};
+inner: IntCodeUtils.Visitor = {
+WITH node SELECT FROM
+var: Var => {
+var ¨ innerVar[var];
+MarkUsed[var];
+};
+decl: DeclNode => {
+decl.var ¨ innerVar[decl.var];
+decl.init ¨ inner[decl.init];
+RETURN [node];
+};
+assign: AssignNode => {
+MarkAssigned[assign.lhs];
+};
+lambda: LambdaNode => RETURN [node];
+apply: ApplyNode =>
+IF apply.handler # NIL THEN
+IF apply.handler.context = NIL AND model.frameExtension # NIL THEN
+apply.handler.context ¨ GenAddr[model.frameExtension];
+enable: EnableNode =>
+IF enable.handle # NIL THEN
+IF enable.handle.context = NIL AND model.frameExtension # NIL THEN
+enable.handle.context ¨ GenAddr[model.frameExtension];
+ENDCASE;
+IntCodeUtils.MapNode[node, inner];
+RETURN [node];
+};
+IntCodeUtils.MapNode[lambda, inner];
+IF model.frameExtension # NIL AND lambda.formalArgs # NIL THEN {
+tail: NodeList ¨ NIL;
+head: NodeList ¨ NIL;
+lag: NodeList ¨ NIL;
+FOR each: VarList ¨ lambda.formalArgs, each.rest WHILE each # NIL DO
+var: Var ¨ each.first;
+WITH var.location SELECT FROM
+local: LocalVarLocation => {};
+register: REF LocationRep.register => {};
+ENDCASE => {
+anon: Var ¨ IntCodeOpt.GenAnonLocal[base, model.label, var.bits];
+assign: NodeList ¨ NodeListCons[GenDecl[var, anon]];
+each.first ¨ anon;
+IF tail = NIL THEN head ¨ assign ELSE tail.rest ¨ assign;
+tail ¨ assign;
+};
+ENDLOOP;
+IF tail # NIL THEN {
+FOR each: NodeList ¨ lambda.body, each.rest WHILE each # NIL DO
+IF each = model.entryPoint THEN {
+tail.rest ¨ each;
+IF lag = NIL THEN SIGNAL CantHappen;
+lag.rest ¨ head;
+EXIT;
+};
+lag ¨ each;
+ENDLOOP;
+};
+};
+{
+parent: Label ¨ lambda.parent;
+descBody: Var ¨ lambda.descBody;
+lambda.descBody ¨ NIL;
+IF descBody # NIL AND NOT model.isCatch THEN {
+staticLink: Var ¨ model.staticLink;
+IF staticLink # NIL THEN {
+WITH descBody.location SELECT FROM
+field: FieldLocation => {
+units: INT ¨ field.start / bitsPerAU;
+IF field.cross THEN ERROR; -- cross record here??? LAI
+IF units # 0 THEN {
+args: NodeList ¨ NodeListCons[staticLink,
+NodeListCons[GenConst[units, minBitsPerArgument]]];
+assign: Node ¨ GenAssign[staticLink, GenApply[subOperNode, args]];
+lambda.body ¨ NodeListCons[assign, lambda.body];
+};
+};
+ENDCASE;
+};
+};
+};
+};
+
+TransformFork: PROC [base: BaseModel, model: LambdaModel, apply: ApplyNode]
+RETURNS [Node] = {
+args: NodeList ¨ apply.args;
+procToFork: Node = args.first;
+retBits: INT ¨ IntCodeUtils.WordToInt[
+NARROW[args.rest.first, IntCodeDefs.WordConstNode].word];
+nRets: INT ¨ ToUnits[retBits, minBitsPerArgument, logMinBitsPerArgument];
+argsToCallWith: NodeList = args.rest.rest;
+argBits: INT ¨ BitsForArgList[argsToCallWith];
+nArgs: INT ¨ ToUnits[argBits, minBitsPerArgument, logMinBitsPerArgument];
+helperNode: LabelNode ¨ GenAnonLabelNode[base, NIL];
+helperLabel: Label ¨ helperNode.label;
+helperAddr: Node ¨ GenLabelAddress[helperLabel, FALSE];
+tempVar: Var ¨ IntCodeOpt.GenAnonLocal[base, model.label, bitsPerLink];
+newArgs: NodeList ¨ NodeListCons[helperAddr, NodeListCons[constant0, args]];
+bogusBits: INT ¨ BitsForArgList[newArgs];
+nBogus: INT ¨ ToUnits[bogusBits, minBitsPerArgument, logMinBitsPerArgument];
+rtnVar: Var ¨ IntCodeOpt.GenAnonLocal[base, model.label, Target.bitsPerProcess];
+rtnDecl: DeclNode ¨ GenDecl[rtnVar, NIL];
+tempDecl: DeclNode ¨ GenDecl[tempVar,
+GenApply[allocOperNode, NodeListCons[GenConst[nBogus, minBitsPerArgument]]]];
+assignNode: Node ¨ GenAssign[
+GenDeref[tempVar, bogusBits, worst],
+GenComposite[newArgs, bogusBits]];
+
+apply.args ¨ NodeListCons2[GenAddr[rtnVar], tempVar];
+apply.bits ¨ 0;
+
+{
+
+formal: Var ¨ IntCodeOpt.GenAnonLocal[base, helperLabel, bitsPerLink];
+actualProc: Var ¨ IntCodeOpt.GenAnonLocal[base, helperLabel, Target.bitsPerProc];
+actualProcDecl: Node ¨ GenDecl[actualProc,
+GenFieldOfDeref[formal, 2*minBitsPerArgument, Target.bitsPerProc]];
+applyNode: ApplyNode ¨ GenApply[actualProc, NIL, retBits];
+applyListNode: NodeList ¨ NodeListCons[applyNode];
+tail: NodeList ¨ applyListNode;
+head: NodeList ¨ NodeListCons[
+actualProcDecl,
+NodeListCons[GenFree[formal], applyListNode]];
+result: Node ¨ defaultNIL;
+newProc: LambdaNode ¨ z.NEW[NodeRep.lambda ¨ [0, lambda[
+parent: NIL,
+descBody: NIL,
+kind: fork,
+bitsOut: bitsPerLink,
+formalArgs: VarListCons[formal],
+body: NIL]]];
+
+IF argBits # 0 THEN {
+actualArgs: Var ¨ IntCodeOpt.GenAnonLocal[base, helperLabel, argBits];
+actualArgsDecl: Node ¨ GenDecl[
+actualArgs,
+GenFieldOfDeref[formal, 4*minBitsPerArgument, argBits]];
+argsTail: NodeList ¨ NIL;
+offset: INT ¨ 0;
+FOR each: NodeList ¨ argsToCallWith, each.rest WHILE each # NIL DO
+bits: INT ¨ IF each.first = NIL THEN 0 ELSE each.first.bits;
+IF bits # 0 THEN {
+new: NodeList ¨ NodeListCons[GenField[actualArgs, offset, bits]];
+IF argsTail = NIL THEN applyNode.args ¨ new ELSE argsTail.rest ¨ new;
+argsTail ¨ new;
+};
+offset ¨ offset + bits;
+ENDLOOP;
+head ¨ NodeListCons[actualArgsDecl, head];
+};
+
+IF nRets # 0 THEN {
+retTemp: Var ¨ IntCodeOpt.GenAnonLocal[base, helperLabel, bitsPerLink];
+retDecl: DeclNode ¨ GenDecl[retTemp, GenApply[allocOperNode, NodeListCons[GenConst[nRets, minBitsPerArgument]]]];
+applyListNode.first ¨ GenAssign[GenDeref[retTemp, retBits, worst], applyNode];
+head ¨ NodeListCons[retDecl, head];
+result ¨ retTemp;
+};
+
+tail ¨ tail.rest ¨ NodeListCons[GenReturn[NodeListCons[result]]];
+
+head ¨ NodeListCons[
+GenComment[IO.PutFR[
+"intermediary proc for a FORK, nArgs: %g, nRets: %g",
+[integer[nArgs]], [integer[nRets]] ]],
+head];
+newProc.body ¨ head;
+helperLabel.node ¨ newProc;
+WITH base.module SELECT FROM
+module: ModuleNode =>
+NodeListTail[module.procs].rest ¨ NodeListCons[helperNode];
+ENDCASE => ERROR;
+};
+RETURN [GenBlock[
+NodeListCons5[rtnDecl, tempDecl, assignNode, apply, rtnVar],
+Target.bitsPerProcess]];
+};
+
+CanonReturn: PROC [return: ReturnNode, model: LambdaModel] RETURNS [node: Node] = {
+IF return.rets # NIL THEN {
+units: INT ¨ 0;
+bits: INT ¨ 0;
+FOR each: NodeList ¨ return.rets, each.rest WHILE each # NIL DO
+ret: Node ¨ each.first;
+IF ret # NIL THEN
+units ¨ units + ToUnits[ret.bits, minBitsPerReturn, logMinBitsPerReturn];
+ENDLOOP;
+bits ¨ ToBits[units, logMinBitsPerReturn];
+SELECT TRUE FROM
+bits # model.returnBits => SIGNAL CantHappen;
+HasLongReturnVar[model, bits] => {
+rets: NodeList ¨ return.rets;
+IF bits = 0 THEN RETURN [emptyReturn];
+RETURN [GenLargeReturn[rets, model.returnVar]];
+};
+ENDCASE;
+};
+RETURN [return];
+};
+
+HasLongReturnVar: PROC [model: LambdaModel, bits: INT] RETURNS [BOOL] = {
+IF model.forceLong OR bits > maxBitsReturnRecord THEN {
+rtnVar: Var ¨ model.returnVar;
+IF bits = 0 THEN bits ¨ bitsPerLink;
+IF rtnVar = NIL THEN {
+rtnPtr: Var ¨ GenAnonVar[bitsPerLink];
+rtnVar ¨ GenDeref[rtnPtr, bits, worst];
+model.returnVar ¨ rtnVar;
+};
+IF rtnVar.bits # bits THEN SIGNAL CantHappen;
+RETURN [TRUE];
+};
+RETURN [FALSE];
+};
+
+GenLargeArgs: PROC
+[base: BaseModel, apply: ApplyNode, model: LambdaModel] RETURNS [Node] = {
+comp: Node ¨ PadComposite[apply.args, logMinBitsPerArgument];
+IF comp # NIL THEN {
+var: Var ¨ GenMemTemp[base, comp.bits, model];
+var.flags[constant] ¨ TRUE;
+apply.args ¨ NodeListCons[GenAddr[var]];
+RETURN [GenBlock[bits: apply.bits, nodes: NodeListCons2[GenDecl[var, comp], apply]]];
+};
+apply.args ¨ NIL;
+RETURN [apply];
+};
+
+GenLargeRets: PROC
+[base: BaseModel, model: LambdaModel, node: Node, bits: INT]
+RETURNS [new: Node, addr: Node] = {
+WITH node SELECT FROM
+apply: ApplyNode => {
+temp: Var ¨ GenMemTemp[base, bits, model];
+temp.flags[constant] ¨ TRUE;
+addr ¨ GenAddr[temp];
+apply.bits ¨ 0;
+new ¨ GenBlock[bits: bits, nodes: NodeListCons3[GenDecl[temp, NIL], node, temp]];
+RETURN;
+};
+block: BlockNode =>
+FOR each: NodeList ¨ block.nodes, each.rest WHILE each # NIL DO
+WITH each.first SELECT FROM
+apply: ApplyNode => {
+[each.first, addr] ¨ GenLargeRets[base, model, apply, bits];
+new ¨ node;
+RETURN;
+};
+ENDCASE;
+ENDLOOP;
+ENDCASE;
+SIGNAL CantHappen;
+new ¨ node;
+addr ¨ NIL;
+};
+
+GenAnonLabelNode: PROC [base: BaseModel, node: Node]
+RETURNS [LabelNode] = {
+next: LogicalId ¨ -LabelsSize[base]-1;
+label: Label ¨ z.NEW[LabelRep ¨ [
+id: next, node: node, backTarget: FALSE, jumpedTo: FALSE, used: FALSE]];
+LabelsStore[base, next, label];
+RETURN [z.NEW[NodeRep.label ¨ [0, label[label]]]];
+};
+
+GenMemTemp: PROC
+[base: BaseModel, bits: INT, model: LambdaModel]
+RETURNS [Var] = {
+var: Var ¨ IntCodeOpt.GenAnonLocal[base, model.label, bits];
+model.memTemps ¨ VarListCons[var, model.memTemps];
+RETURN [var];
+};
+
+CanSimplyPush: PROC [arg: Node, depth: INT] RETURNS [BOOL] = {
+IF arg = NIL
+THEN RETURN [TRUE]
+ELSE {
+DO
+units: INT ¨ ToUnits[arg.bits, bitsPerLocal, logBitsPerLocal];
+IF depth+units > lastStack THEN RETURN [FALSE];
+WITH arg SELECT FROM
+var: Var =>
+WITH var.location SELECT FROM
+deref: REF LocationRep.deref => {arg ¨ deref.addr; LOOP};
+indexed: REF LocationRep.indexed => {
+index: Node ¨ indexed.index;
+IF CanSimplyPush[index, depth] THEN {
+indexUnits: INT ¨ ToUnits[index.bits, bitsPerLocal, logBitsPerLocal];
+depth ¨ depth + indexUnits;
+arg ¨ indexed.base;
+LOOP;
+};
+};
+field: REF LocationRep.field => {arg ¨ field.base; LOOP};
+upLevel: REF LocationRep.upLevel => {arg ¨ upLevel.link; LOOP};
+composite: REF LocationRep.composite => {
+bitDepth: INT ¨ ToBits[depth, logBitsPerLocal];
+FOR each: NodeList ¨ composite.parts, each.rest WHILE each # NIL DO
+eachBits: INT ¨ each.first.bits;
+unitDepth: INT ¨ ToUnits[bitDepth, bitsPerLocal, logBitsPerLocal];
+IF NOT CanSimplyPush[each.first, unitDepth] THEN RETURN [FALSE];
+IF eachBits > bitsPerLocal THEN {
+eachUnits: INT ¨ ToUnits[eachBits, bitsPerLocal, logBitsPerLocal];
+IF unitDepth+eachUnits > lastRegister THEN {
+alignedBits: INT ¨ ToBits[unitDepth, logBitsPerLocal];
+IF alignedBits # bitDepth THEN RETURN [FALSE];
+};
+};
+bitDepth ¨ bitDepth + eachBits;
+ENDLOOP;
+};
+escape: REF LocationRep.escape => RETURN [FALSE];
+ENDCASE => RETURN [TRUE];
+const: ConstNode => RETURN [TRUE];
+oper: OperNode => RETURN [TRUE];
+machineCode: MachineCodeNode => RETURN [TRUE];
+apply: ApplyNode => {
+args: NodeList ¨ apply.args;
+IF args # NIL THEN {
+WITH apply.proc SELECT FROM
+oper: OperNode =>
+WITH oper.oper SELECT FROM
+mesa: REF OperRep.mesa =>
+SELECT mesa.mesa FROM
+addr => IF args # NIL THEN {arg ¨ args.first; LOOP};
+ENDCASE;
+ENDCASE;
+ENDCASE;
+FOR each: NodeList ¨ args, each.rest WHILE each # NIL DO
+first: Node ¨ each.first;
+IF first # NIL THEN {
+IF NOT CanSimplyPush[first, depth] THEN RETURN [FALSE];
+depth ¨ depth + ToUnits[first.bits, bitsPerLocal, logBitsPerLocal];
+};
+ENDLOOP;
+};
+arg ¨ apply.proc;
+LOOP;
+};
+ENDCASE;
+EXIT;
+ENDLOOP;
+RETURN [FALSE];
+};
+};
+
+MarkCatch: PROC [base: BaseModel, node: Node] RETURNS [Node] = {
+WITH node SELECT FROM
+labelNode: LabelNode => {
+lab: Label ¨ labelNode.label;
+IF lab # NIL THEN {
+handlerModel: LambdaModel ¨ ModelsFetch[base, lab.id];
+IF handlerModel = NIL
+THEN SIGNAL CantHappen
+ELSE handlerModel.isCatch ¨ TRUE;
+RETURN [GenGoTo[lab]];
+};
+};
+ENDCASE;
+IF node # NIL THEN SIGNAL CantHappen;
+RETURN [node];
+};
+
+GetHandlerArgs: PROC
+[model: LambdaModel] RETURNS [regsPtr, except, rtnPtr, argPtr: Var ¨ NIL] = {
+IF model.isCatch THEN {
+args: VarList ¨ model.lambda.formalArgs;
+rtnVar: Var ¨ model.returnVar;
+IF args = NIL THEN GO TO noGood;
+IF rtnVar # NIL THEN
+WITH rtnVar.location SELECT FROM
+deref: DerefLocation => IF deref.addr = args.first THEN {
+args ¨ args.rest;
+IF args = NIL THEN GO TO noGood;
+};
+ENDCASE => GO TO noGood;
+regsPtr ¨ args.first;
+IF (args ¨ args.rest) = NIL THEN GO TO noGood;
+except ¨ args.first;
+IF (args ¨ args.rest) = NIL THEN GO TO noGood;
+rtnPtr ¨ args.first;
+IF (args ¨ args.rest) = NIL THEN GO TO noGood;
+argPtr ¨ args.first;
+IF (args ¨ args.rest) # NIL THEN GO TO noGood;
+RETURN;
+EXITS noGood => {};
+};
+SIGNAL CantHappen;
+};
+
+VarCantHappen: PROC [var: Var, msg: Rope.ROPE ¨ NIL] = {
+IF var # NIL THEN
+WITH ProcessProps.GetProp[$StdOut] SELECT FROM
+st: IO.STREAM => {
+IO.PutF1[st, "\nBadVar[id: %g] ", [integer[var.id]] ];
+IF msg # NIL THEN IO.PutF1[st, "(%g) ", [rope[msg]] ];
+};
+ENDCASE;
+SIGNAL CantHappen;
+};
+
+END.
+
+
+  ?æ  
+IntCodeTwigImpl.mesa
+Copyright ” 1986, 1987, 1988, 1989, 1990, 1991, 1993 by Xerox Corporation.  All rights reserved.
+Russ Atkinson (RRA) April 9, 1990 9:17:33 pm PDT
+JKF July 27, 1988 8:00:10 am PDT
+Christian Jacobi, May 4, 1993 8:30 pm PDT
+Options
+TRUE => use small exception raising
+FALSE => use "normal" exception raising
+
+TRUE => perform some simplifications of value-returning blocks
+FALSE => no transformation of value-returning blocks
+
+TRUE => uplevel use from catch phrase handlers force the target variable into memory
+FALSE => uplevel use from catch phrase handlers can use registers
+
+TRUE => use heap allocation for frame extensions
+FALSE => declare the frame extension as a simple (addressed) variable
+
+TRUE => call CleanupLambda to remove junk
+FALSE => don't call CleanupLambda
+
+Funny machine limitations (should be relocated some day)
+for larger indexed bases they must be addressable
+for larger local vars they must be addressable
+This should be parameterized!
+
+Statically known offsets in the frame extension
+link to next enclosing frame extension (bits)
+offset for first local variable (in words)
+offset for first local variable (in bits)
+The global zone
+The (optional) pass to rewrite enables
+Signals & Errors
+Signalled when a duplicate condition is found
+Signalled when something is simply not possible (according to our intentions, at least)
+Signalled when something is not yet supported.
+Public routines
+Eventually do some debugging here and allow for resuming
+Build the initial models for each procedure in the graph.
+Canonicalize the variables for each procedure in the graph.
+[[ This pass sets the upLevel and addressed (=> notRegister) variable flags ]]
+Find and mark all of the local variables that are up-level referenced
+[[ This pass sets the notRegister variable flag ]]
+Run a pass to remove block exprs, since we only introduce simple locals
+There is stack depth checking in force.  If lastStack = 0 then the stack is effectively unlimited (as is the case for translating into some higher-level language).
+Allocate the memory for local variables that must be placed in memory locations (as opposed to registers).  This creates the frame extension.
+Create the locations for up-level references to local variables in enclosing scopes
+Create the locations for local variables that must be in memory
+[[ This pass sets the used and assigned bits for variables ]]
+Cleanup the world
+[[ At this point we can rely on the used & assigned flags ]]
+Place the final comment
+Private routines
+[node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]
+No components => no map
+No components => no map
+No components => no map
+Note the test for id = 0
+First, calculate the size of the argument record.
+Now assign initial locations to the arguments.
+This procedure has a large argument record, so replace it with an argument record pointer.  Also replace the locations of the formal arguments with field values.
+reassign the location to be a field of the arg record
+The arguments are all simple local variables.
+Now map over the subsidiary nodes of the procedure.
+At this point we have determined the number of bits that are to be returned.
+The return variable is indirect from an argument!
+Make long argument & return records into indirections.  Do the same for argument & resume records for signals & errors.  Don't do it for applications of machine code!
+Map all of the pieces first
+Don't transform this further, since we are being quite trusting here.
+The first argument is the signal or error to be raised.  For a signal, the second argument is the pointer to the resume record (NIL if none).  The remaining argument is a pointer to the argument record (NIL if none).  The signaller does not need to know the size of the arguments.
+No resume value possible for errors, none expected.  However, retBits need not be 0, as in the code for:
+x _ IF P[...] THEN 4 ELSE ERROR
+No resume value possible.  Pass in a NIL.
+There may be a resume value passed back.  It always gets assigned through the memory pointer.
+need to create a block with a temp large enough to contain the return value, then free the return record
+The join primitive always returns a pointer
+declare the result variable
+gen the call to primitive JOIN and save the result pointer
+assign from the result pointer to the actual result variable
+free the temporary variable variable
+the result is in the result variable
+In the case of no return values we just ignore the result
+We need to return two things
+rets _ START module[args]
+There is a large argument record, which must be placed in memory.  The argument list is then converted into passing a pointer to that temporary.
+note: changes apply.args!
+There is a large return record.  This means that the first argument for the procedure is really a pointer to the return record.
+Assign global locations to the variables.
+Generate a new id
+[label: Label, node: Node, define: BOOL _ FALSE] RETURNS [Label]
+Canonicalize the labels for the whole model
+[node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]
+Canonicalize the variable
+Any use of a local variable outside of its parent scope causes it to become addressed and marked as an upLevel variable.
+A global variable, and we need a global link.
+We have to have a global link, which looks like an anonymous local variable.
+Any use of a local variable outside of its parent scope causes it to become addressed.
+A local variable is addressable if it is large enough
+If a constant index gets this far we can turn it into a field
+An array is addressable if it is large enough and indexed
+No processing necessary for a declared variable.
+Process the initialization as a normal expression
+For argument list verification.
+Sometimes blocks get generated for no particularly good reason
+This is a trivial block, so just use the first node
+This is a nearly trivial block, so just use the decl0 initialization
+This may be a trivial block, so check farther
+How about that, the block is trivial!
+Finally we can determine the parent model.
+The static link is passed in via the regsPtr argument
+This procedure always takes a static link, which appears as an extra argument.
+This lambda uses global variables, so we add a global link.
+[node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]
+This is simply not right!
+Guaranteed to be simple enough to push without transformations.  This includes having no declarations, so no further transformations are needed.
+Each decl that can be on the stack is assumed to be there.
+Can't be an addressable register
+Can be an addressable register
+For complicated applications we may have to build some arguments in memory.
+The first time through we turn the node into a block expression.  The tail is always the most recent thing to be made into a memory temporary.
+Slip the new node in between the last thing made into a temporary and the apply node.
+In the unlikely case that the procedure is really complicated, then put it into a temp first of all.  This keeps us from getting into trouble by putting all of the arguments on the stack before discovering disaster.
+If there are 0 arguments or a single argument then no further temporary is necessary.
+Single argument procedure.
+Use normal application mechanism
+Multi-argument operations get special treatment because the order of evaluation for the arguments is not always specified.  We make a very conservative estimate here, which can be worse (but not better) than the normal procedure call case.
+No temporary needed
+This is a complicated argument and the stack is pretty full, so evaluate the argument into memory.
+We are actually using the addresses of the arguments, not the arguments themselves.  So we just calculate the number of words we need, then transform the arguments.
+to allocate locals for a link
+Push this argument
+This can be generated as necessary, so we do not need to pre-evaluate it
+This is a complicated argument and the stack is nearly full, so evaluate the argument into memory.
+Source nodes must preserve any depth alterations
+This routine walks the tree and marks all variables that are up-level referenced.  We also have to copy them because the locations will be altered when we assign memory & register locations to locals.
+Also, this routine transforms reject, resume and unwind nodes into the appropriate return nodes.
+[node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]
+This is an up-level reference to a local variable.
+Up-level reference to a lambda that does not logically enclose!
+This should have been done in CanonLambda!  Why not?
+Must use memory locations for this variable
+At this point we have to copy the current part of the list, then map the rest, and return the new variable.
+Copy the head of the list up to the list node that differs
+Now append the differing element
+Now append the rest, mapping if not NIL
+Just in case we changed things
+Transform application of resume & unwind applications.
+Return with code = 0.
+The return values (if any) get assigned through the rtnPtr.
+Then we return with code = 1.
+Return with code = 2.
+This routine allocates space in the frame extension for the various memory locals.
+[node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]
+Refers to some offset in the frame extension
+Any variable still marked as being possibly in a register is not in the FX.
+If we are NOT heap allocating the FX, then only upLevel accessed variables are forced into the FX.
+This variable must be in the FX.
+Refers to some offset in the frame extension
+No memory locals, so no memoryLink needed.
+Make up the memory link & the frame extension
+Just an approximation, perhaps we can do better some day
+Make sure that the static link is in the first word of the frame extension.  Do NOT use the fxLink variable.
+This is the simplest way to allocate space if the target is kind enough.
+There must be something here
+In this case we still need a "register" to point at the frame extension, since that is how we chain from handlers.
+Despite the addressing, force this to be "register" based (not really a register)
+Note: at this point model.frameExtension # NIL indicates that there is a frame extension to hold addressed variables and variables that are too large.  However, model.memoryLink # NIL indicates that there is a separate variable to hold onto the address of the extension, something that we only need when (heapAllocFX OR NOT useMemoryFromHandlers).
+The idea here is to add the allocation, freeing, and unwind code associated with managing frame extensions.  Allocation is handled at the start of the procedure (is the size constant?), then we start an enables node to deal with the UNWIND and the need to free the extension (this is also used to deal with RETURN WITH ERROR).  After the enables scope we have an explict unwind before the return.  For frames with extensions the return nodes must be transformed into goto nodes which transfer to the extension freeing code.
+First, generate the code to deal with the frame extension.  This includes the allocation, the enables block, and the freeing code.  This involves replacing body with:
+{decl {var link} {apply {oper mesa alloc} {const word size}}}
+{enable {} body}
+A NIL handle is used to indicate that the signaller should get rid of the frame extension.
+ 
+{apply {oper mesa free} {var link}}
+Note: alloc expects units quantized to min arg size
+[node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]
+This simple version ignores conflicts between return values and memory temporaries.  We have to fix this sometime!
+We can go to a common label for empty returns.
+The cleanup is done by a dummy return value.
+This routine walks the tree and substitutes memory-based locations for local variables that cannot be in registers and are referenced upLevel.  Note that we have to make completely new variables for these transformations to avoid aliasing problems we would get into if we just replaced the locations.
+[node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]
+This is local to the enclosing lambda, and cannot be transformed yet
+This is an up-level reference to a local variable for another lambda.
+found it!
+Direct reference to a register
+Must chase the memory link register
+Can chase through static links even though marked as being in registers
+We are chasing through the frame extension
+Catch phrase, and can use registers
+Substitute a dereference for the global variable
+Refers to some offset in the frame extension
+This routine walks the tree and substitutes memory-based locations for local variables that cannot be in registers.  We can go ahead and clobber the locations, because upLevel uses have already been transformed (it says here).
+This variable is not in the FX
+This variable is not in the FX
+Don't try to nest the FX inside itself!
+This is a local variable in memory.
+This is an up-level reference to a local variable for another lambda.  We should have transformed all of these already!
+This stuff is to simplify field descriptions.
+If a nested field gets this far we collapse the locations
+--Lifted from little endian compiler without understanding, ChJ, May 4, 1993
+There is a NIL check in here that we might discard
+At this point we may be performing a gratuitous NIL check
+A constant offset that may be within the unmapped region
+We must scan over the index expression to find other derefs of the expression
+We can eliminate the NIL check, since the indexing node will fault first if there really is a problem.
+[node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]
+Transform all of the local variables that must be in memory
+At this point we may have moved some of the arguments into memory.  We need to generate assignments from the incoming `registers' into the eventual memory locations.
+This variable is in memory (sigh), and must be transformed.
+We should not be missing the allocation for the memory!
+This code deals with inserting the initial subtraction that converts a procedure descriptor into a static link.  The idea is that the variable describing the procedure descriptor has been planted in the lambda node, and that variable has a field location if the offset # 0.  After all of this is over, only nested procedures that are NOT catch phrases will have lambda.parent # NIL (for later use).
+There is a static link, which must be adjusted.
+Big Utilities
+To allow a runtime routine to deal with constant types for the forked routine we construct an intermediary routine of a constant type (takes an argument that points at the actual proc and arguments, returns one result that points at the actual return values).  This is the routine that is fed to the runtime, while the routine that we really wanted to call is called from the specially constructed intermediary.
+Prefix the arg list with a proc desc body!
+[pc, 0, proc, nRets, args...]
+The arguments to the FORK primitive are the address of the rtnVar and the args.
+No bits are returned (but rtnVar is modified).
+Now generate the bogus procedure that we need to intermediate the forking call
+Start list with the proc decl, the formal free, and the actual application.
+We also need to declare (and initialize) the actual arguments.  To make the C code turn out correctly over various implementations, we have to declare the arguments with the same number and sizes that the actual argument list has.
+There are some returns to process
+Finally return the newly allocated return record
+Splice the new proc at the tail
+Little Utilities
+Whenever there is a return node we have to look at the return bits.  If we have a long return record then we transform the return node into an assignment followed by a return of nothing.
+A large return record
+At this point we have to assign the current rets to the return value.  The transformed return does not return anything at all.
+A large return record
+Time to have a new large variable
+This is very conservative right now.  It is meant to return TRUE if the given argument can be pushed onto the stack only using the given number of available stack locations.
+Special case for things like the default counted zone (not really pushed anyway)
+This is a big (more than 1 local reg) value
+What's worse, the value can't be easily addressed!
+Sigh, the big value isn't aligned, so we can't simply push!
+Whenever we fall through we have a case more complicated than we want to handle.
+There is a return var in front of the "normal" arguments
+ù E‚  ïNewlineDelimiter
+ñ(cedarcode) styleô headöúôIcodeöú
+œeúUô`Lô0Lô Lô)óò öœk	ò	Löú	ûúûúòLöúûúŸòÍLöúûú%ò9Löúûú4òDLöúûú£òµLöúûú§ò∑Löúûú∞ò¡LöúûúΩòœLöûúûúûúò(LöúûúòLöúûúûúòLöúûúûúHògóóöúûúûòLöûú_ûúòvLöûúòLöúûúûú[ògLò Löúûúò!Lò ôLñ2.5 in tabStopsò ñ2.5 in tabStopsöúûúûúòLñ2.5 in tabStopsöûúô#Lñ2.5 in tabStopsöûú"ô'Lñ2.5 in tabStopsô óñ2.5 in tabStopsöúûúûúò!Lñ2.5 in tabStopsöûú:ô>Lñ2.5 in tabStopsöûú/ô4Lñ2.5 in tabStopsô óñ2.5 in tabStopsöúûúûúò#Lñ2.5 in tabStopsöûúPôTLñ2.5 in tabStopsöûú<ôALñ2.5 in tabStopsô óñ2.5 in tabStopsöúûúûúòLñ2.5 in tabStopsöûú,ô0Lñ2.5 in tabStopsöûú@ôELñ2.5 in tabStopsô óñ2.5 in tabStopsöúûúûúòLñ2.5 in tabStopsöûú%ô)Lñ2.5 in tabStopsöûúô!Lñ2.5 in tabStopsô óóLò ñ2.5 in tabStopsô8ñ2.5 in tabStopsöúûúûúûúò.Lñ2.5 in tabStopsô1óñ2.5 in tabStopsöúûúûúûúò'Lñ2.5 in tabStopsô.óñ2.5 in tabStopsöúûúûúò>Lñ2.5 in tabStopsôóLñ2.5 in tabStopsò ñ2.5 in tabStopsöúûú+ûúò;Lñ2.5 in tabStopsô óóñ2.5 in tabStopsöú/ô/ñ2.5 in tabStopsöúûúòLñ2.5 in tabStopsöú-ô-óñ2.5 in tabStopsöúûúòLñ2.5 in tabStopsöú*ô*óñ2.5 in tabStopsöúûú%ò:Lñ2.5 in tabStopsöú)ô)óLñ2.5 in tabStopsò óôLöúûúòLò óô&Löúûú4ûú
+ûúò]óLò óhead2ñ2.5 in tabStopsôöúûúûúûúò Löú-ô-Lò óöúûúûúòLöúWôWLò óöúûúûúò!Löú.ô.Lò óóôöœnúûúûú$ûúòPöûòöúûúûúò$Lô8LöûúòLòóóLöûú#ò)LòLò óöüúûú$ûúòNöúûúò(LöúòLöú ò LöúòLöúòLöúòóLò öûúûúûúûúò.öúòLöûú/ò5LòóöúòLöûú ò&LòóöûúûòLöûú3ò7LöûúCòGóLòLò óöúûúòLô9óöúûúòLô;LöúNôNóLò ôELöú2ô2óöûú%ûúûúûò8Löú%ò%LöûúòóLò öûúûòLôGöûú%ûúûúûò8Löú2ò2LöûúòóóLïStartOfExpansion7 -- [node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]ò öûúûòLô£öûú%ûúûúûò8Löú#ò#LöûúòóóLñ7 -- [node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]ò Lôçöûú%ûúûúûò8Löú"ò"LöûúòóLò LôSöûú%ûúûúûò8Löú&ò&LöûúòLò óô?Lô=óñ7 -- [node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]öûú%ûúûúûò8LöúòLöûúòóLò ôLô<óñ7 -- [node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]öûúûòöûú%ûúûúûò8Löúûúòöûúûúûòöûúûúûò%öúûúòöûúûúûòLöúòóLöûúòóLöûúòóóLöú4ò4LöûúòóóLò LôöûúûúûòöúòLñ7 -- [node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]öúûúòöûú'ûúûúûò;Löúûú'òCLöú)ò)Löûúûúûúûúò8LòLöûúòóLòóLöûúòóLò LöûúòLòLò óóôöü
+úûú6òFñ7 -- [node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]òLö–ck3ô3öûúûúûòöúûúò"Lôóöúòöûúûúûòöúûúò)Lôóöúûúò+LôóLöûúòóóöúòLöúòóöúòLöúòöûúûúûúòLöúòLöûúûúò?öûú
+ûúûòöúòöúûúò0LöúòLöúòLöúûúòLöúòLöúòöúòLôóóöûúûúûúûúûúûúûòQLöúûúòóLöú ò öûúûòLöûúòLöûúòóLöúòLöú#ò#LöûúòLòóLöûúòóLòóLòóöúòLöúûúòLò Löú"ò"Lò Löú1ô1öûú.ûúûúûòDLöúòöûúûúûòLöúMòMóLöûúòóLöú:ò:Lò Löú.ô.öûúûú+ò@öûúòLöú°ô°Löú(ò(Löú&ò&Löú ûú*òMLöúûúòLöú!ò!öûú'ûúûúûò=Löú5ô5LòöûúûúûúòLöúûú(ò1Löú/ò/LöúòLöúMòMLòóLöûúòóLöú(ò(LöúòLöúòLòóöûúòLöú-ô-öûú.ûúûúûòDLöúòLöûúòóLòLò óóLöú3ô3Löú-ò-Lò LöúLôLöûúûúûú+ûòJLô1öûúûúûò)öúûúòöûúûúûòöúòLöúòLöú;ò;LòLòóLöûúûúòóóLöûúûúòóóLò LöûúòLòóöúòLöúòöûúûúûòLöúûúòLöûúûúûúò+Löúûúûúò.LöûúûúòóLöûúòLöûúòLòóöúòLöú¶ô¶Löú	ûúòLöú	ûúò*Löúûú?òILöúûúòLöúûú
+ûúò5Löúûú
+ûúò0öú#ò#Lôóöûúûúûòöúûúò%LôEóöúòLöúòöûú	ûúûòöúûúòLöûúûúûúûúûúûúòBLöúòóöúûúòöûúûòöúûúûúûúûúûúòBLöúòôòLöúòLöúòLöúûúòLò öûú"ûúûúûò8LòLöûúòLò óöûúûúòLöúûúûúòöûúûòöú	ûúûòLòLòLòLöûúûúûú
+òóöúòLöûúûúûúûú
+ò#öûúûòLòLòLòLöûúûúûú
+òóLòóLöûúûúòóLöúûú>òPLöûúûúò
+LöûúòLòLò óöûúûòLöûú ò$öûúòLöúòLöú(ò(LöúòLòóóöûúûúûòöúòöúhôhLöúûúûúûúûôóóöúòLöú%ûúô)Löú&ò&óöûúòLöú]ô]LöúûúòLöúCòCLöú ò LòóóLöú'ò'Löûúûúò
+Lòóò	Löú)ò)Löûúûúò
+Lòóò	LôhLöú	ûúòöúòLô+óöûúûúòLöúBòBLöúFòFLöú0ò0öú.ûúò4LôóLöúòöú7ò7Löúûúô:óöú;ò;Lô<óöú1ò1Lô$óöú(ò(Lô$óLöûúò!Lòóöûú*ò0Lô9óLòóöúòLôLöú3ò3LöûúûúòLòóöúòLöúûúôLöúòLöú.ò.öûúûòLöûú(ò,Löûú'ò+óLöú,ò,öûúòLöûú2ò6öûúòLöúûúòLöú8ò8Löú,ò,LòóóLöûúûúò
+LöúòóLöú"ò"Löú"ò"Löú$ò$LöûúòóLöûúûúò
+LöúòóLöûúûúûúòóLöûúòLòóLöûúòóöûúûòLöúêôêöú(ò(LöúôóóöûúûúòLöúôLöúûúòLöú8ò8Löú,ò,LòóLöûúûúò
+LöûúûúòLòóöúòLöûúûúûúûúò/Löú"ò"Löú"ò"LöûúòLòóöúòLöú)ô)Löúûú#ò.öûú(ûúûúûò>LöúòöûúûúûúòLöúûúòLöúûúNòXLöúûú6ò@Löúûú.òCLöúòLöúòLöúòLòóLöûúòóLòóLöûúòóLöú"ò"LöûúòLòóöüúûú#ò/öûúûúûú	ûúûúûúûúòFöûúûòLöúôLöúòóöûúûúûòLöúûú9òMóLöúòLòóLòóöú*ò*Löú#ûúûúûúô@öûúûúûúòLöú)ò)LöûúûúûúûúòLòóLöûú	òLòóLöúòöûú	ûúûòLöú+ô+LöúEûúûúò\óLòLò óöü	úûú6òEñ7 -- [node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]òLö†3ô3öûúûúûòöúòLöúôLöú&ò&öûú	ûúûúòöûúûúûòöúòLöúxôxLöúûú	ûúûúûúûúò9Löûúûúûúò:LòóöúûúûúûúòFLöú-ô-ö	ûú	ûúûúûúûò.LöúLôLLöúKòKóLòóLöûúòóLöúòLòóöûúûúûòöúòLöúVôVöûú"ûò(Lô5LöúòóLòóöúòLöú0ò0Löú3ò3öûúûúûòòLô=Löúûú&ò.Löú/ò/Lòóöûúò
+öûúûúûú*ûò?Lô9LöúòóóóLòóLöûú%ò,óLöûúòLòóòöú)ò)Lô0óòLô1óLöûúòLòóöúòLöúòöûú	ûúûúòLöúòöûúûúûòöúòLöú.ò.Löúûúò1Löú$ò$öûúûòLöúòLöúôóLöûúòLòóLöûúòóLòóLòóöúòLöú!ò!öûúûúûúòLöúòLöú%ò%LòLòóLòóöúòLöú"ò"öûúûúûú ûò;Löúûúò"óLöûúòLòóöúòLöú!ò!öûúûúûúòLöúòLöú%ò%LòLòóLöú"ò"öûúûúûòöúòöûúûúûòöúûúòöûúûòöú	ò	LöúòLöûúûúûúò-LòóLöûúòóóLöûúòóLòóLöûúòóLöûúòLòóöúòLô>LöúòLöúûúòLöúûúòLöúûúòLöúûúòLöúûúòöûú"ûúûúûò8öûúûúûòöúòLöûúûúûú	ûúò0óöúòLöûúûúûúûúò6óöúòLöûúûúûúûúò-Löûúûúûúûúò-LòóLöûúòóLöúòLöûúûúûúòLöûúòóöûúûòöúûú	ûúûòLô3Löûúòóöúûú	ûúûúûò-LöúDôDLöûúòóöúûú	ûúûúûúûúûúûúûòkLöú-ô-öûúûú!ûò+Lô%LöûúòóóLöûúòóLòóLöûúòóLöú"ò"LöûúòLòóLòLòLò óöüúûú*ò@Löú"ò"öûú
+ûúûúûúò,Löú8ò8öûúûúûúòLöú$ò$Löú ò Löú&ò&Löú(ò(LòóLòóLòLò óöüúûú>òOöûú	ûúûúûúûúûúûòKLöú*ô*LöúòóLöúòLò öûúûúûòöúòLöú5ô5Löú1ò1Löú!ò!LòóöúûúòLöúNôNLöúFòFLöú*ò*LöúòöûúûòLöûúò#Löûú2ò6óLòóLöûúòóLò öûúûúûúò Löú;ô;Löú7ò7Löú#ûúò(Löú.ò.LòóLòLò óöüúûú>òSñ7 -- [node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]òLö†3ô3Löú
+ûú	òöûúûúûúò+Löúôóö
+ûúûúûúûúûúò?LöúêôêóöûúûúûòöúòLöú:ô:Lòö	ûúûúûúûúûò0öûúûúûòöúòLöúûú4ò>LöúûúòöûúòöûúòLöú ô LöúûúòLòóöûúòLöúôLöúòLöûúûúò LòóóLòóLöûúòóóLöúòLöûúòLòóöúòLöúKôKLòLöúûú@òNLöúûúòLöú
+ûú0ò=öüúûúûú
+ò2Löú-ò-Löú7ò7LöúûúòöûúûòöûúòLöúéôéLöúòLöú!ò!LòóöûúòLöúUôULòLòLòóóLòLöûúòLòLò óöûúûú,ûò6Löú◊ô◊Löú(ò(óLò LöúUôUöûúûúûòöúûúòLöûúûúòóöúûúòLöúôLòLöûúûúòLòóLöûúòóöûúûúûòöúòöûúûúûòöúûúûúûúò-Löú ô óöúûúòöûúûòLöúûúûú
+ò(LöûúòóóLöûúòóLöúÔôÔöûú"ûúûúûò8LòLöúûú@òJöûúûúûòöú9ò9LôLòóöûúò
+LöúbôbLöú!ò!óóLöûúòóLöûúûúòöûòLöúòòLöú§ô§öúûúò.Löúôóöûú"ûúûúûò8LòLöûúòóöûú"ûúûúûò8LòLöûúòóLöûúûúòLòóóLòóLöûúòóöûú"ûúûúûò8LòLöúûú@òJLöúûúòöûúûúûòöúòLöúôLöúòLòLòóöúòLöúHôHLòóöûúò
+LöúbôbLöú!ò!óóLöûúòóLöûúûúòöûúòLöúòLöûúòLöúòóLòóLöúûúò$öúòLô0öûú*ûúûúûò@LöúòLöûúòóLöûúòLòóLöûúòóLöú"ò"LöúòLöûúòLòóLöúûúJòTLöúûú	òLöúûúò.Löûúûúûúò:Löûúûúûúò;Löú$ò$LòLò óöüúûú>òULöú»ô»Löú`ô`ñ7 -- [node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]òLö†3ô3öûúûúûòöúòöûúûúûòöúòöûú	ûúûúûúò,Löúòöûú
+ûúûúûúò/Löú2ô2Löúûúò+öûú+ûò0öûúûúûòöúûúòLöú?ô?Löú2ò2LöûúòóöúòLöú%ò%LöûúòLòóöúûúòLöú4ô4Löú-ò-LöûúòóLöûúòóöûúûúûúûò0Lô+LöúûúòóLöûúòóLòóLòóLöûúòLòóöúòLöúòöûúûúûúòLöúòöûúûúòLöúòLöúûú0òELöûúòLòóLòóLöûúòLòóöúòLöúòöûúûúûúòLöúòöûúûúòLöúòöûúòLöûúBòFLöûú/ò3óLöûúòLòóLòóLöûúòLòóöúòLöúòLöúòLöûúûúûúò&Löûú	ûúûúò)öûúûúûúò6LöúòLöúûú/òDLöûúòLòóLöûúòLòóöú!ò!öûú-ûúûúûòCLöúòöûúûúûúòLöúòöûúûúòLôkLòLöúûúòLöúûúòLöúûúûú$ûúòRLô:öûú-ûúûòDLöú*ò*Löûúûúûúûúò;LòLöûúòóLô öûúûòLöûú&ò*Löûú&ò*óLô'öûú'ûúûúûò=Löú0ò0Löûúûúûúò*LöúòLöûúòóLöúòLöûúòLòóLòóLöûúòóLöûúòLòóöúòLöúòöûúûúûúòLöúòöûúûúòLöúòLöúûúRògLöûúòLòóLòóLöûúòLòóLöûúòóLòóòLôLò"óöúòLöú6ô6öûúûúûòöúòLöúòöûúûúûòöúûúòöûúûòöúòLôLöúBòBLöúòLöûúûúòLòóöúòLöú;ô;LôLöúBòBLöúòöûúûúûúòLöú5ò5LöúFòFLöú%ò%Löú-ò-LòóLöûúûúòLòóöúòLôLöú/ò/LöúòLöûúûúòLòóLöûúòóLöûúûúò(LöúòóLöûúòóLòóLöûúòóLòóLöúûúò$LöûúòóLöú"ò"LöûúòLòóLöú$ò$LòLò óöüúûú>òRLöúRôRñ7 -- [node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]òLö†3ô3öûúûúûòöúûúûúûò)öúûú'ûúò6Lô,óLöûúòóLöú%ò%òLöú
+ûúòLöú"ò"LöúòLöûúòLòóLö	úûúûúûúûúòHLö	úûúûúûúûúòFLöúûúò$LöûúòóLöú"ò"LöûúòLòóöüúûúòöûúûúûòöúòöûúûúûòöûúò!LöúHûúôKóöûúûúûúò1Löú
+ûúûú;ûúôbóöûúòLöúûúô Löúûú4ò>Löúûúòöûúûò$Löúûúûúûúûúûúûú+òeLöúûúûúûúûúûúûú*òeLöúûú4òILòóLöúòöûú1ûò7LöúòóLòóóóöúûú'ûúò6Lô,óLöûú8ò?óLòóLöúûúûúòLöú6ò6öûú.ûúûúûòDLöúòLöûúòóLöú$ò$öûú&ûúûúò>öûòLöú*ô*Löú!ò!óöûúòLöú-ô-Löú	ûú)ò5LöúFòFöú&ûúò4Löûú!ò%Löûú5ò9óöúûúòLô8óöûúûúûòLöúlôlòöú
+ò
+Löú6ò6LöúòóLòóóöûúòöûúòLöúòLöú'ò'LòóöûúòLôHöûúûúûòLôLöú6ò6óLöúòöûúûúûúò#LôrLöúòòLöú-ò-LòóLòóòLöúûúò!Lòóöúûúò#LôQóLòóóLöú€ô€LòóóLòLò óöüúûú>òULöúãôãLöúòLöú ò Lò öúúœzúô¶Löú°ú'°úô=öú°úôInoteô\óLöú°úô#óLöúûúòöúûú<òFLöú3ô3óLöúhòhLöúòöúûúûò2Löú9ò9LöûúûúòóLò öúòLö†3ô3öûúûúûòòLöúrôröûúûúûòLöú.ô.Löûúò!óöûúûòLöûúûúòöûúòLöú,ô,Löú%ò%Löú'ò'LòóóLöûúòLòóLöúûúò$LöûúòóLöú"ò"LöûúòLòóLò öúòLöúòöú ò Löúûú(ûú$ûúòqLö	ûúûúûúûúûò6LöúòLò óóLöú$ò$LòLò óöüúûú>òVLöú¨ô¨ñ7 -- [node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]òLö†3ô3öûúûúûòöúòöûúûúûòöúòLöúòöûúûòöúòLöúDôDLöúòóöúûúò
+LöúEôELöúòLöúòLöúûúòöûòLöú+ò+öûúûúûòöúòLöú	ô	Löúûúûúò.Löúûú%ò0Löúûúòöûúûúûòöú
+ûúûúò,öûúûúûúò2Löúôóöú4ò4Löú#ô#óLòóöúûúûú"ò7LôGLöúòLöúòLöúòóLöú7ò7LöûúòóöûúûòLöûú)ò-Löûúûú'ò2óLòóöûúòLöú$ò$ö
+ûúûúûúûúûúò-Löú)ò)LöûúòLöúòóöûúûúûòöúûúûúò)Löú*ô*Löú<ò<óöûúò
+Lô#Löú)ò)óóLöúòLòLòóóLöûúòóLòóLöûú-ò4óLöûúòLòóöúûúûúûòDöûúûúûúò Löú0ô0LöúCòCLöúòLöûúòLòóóöúûúò!Lô,Löú ò LöúòLöûúûúûúûúò#LöúEòELöûúòLòóLöûúòóLòóLöúûúò$LöûúòóLöú"ò"LöûúòLòóLöú$ò$LòLò óöüúûú>òOLöú‚ô‚ñ7 -- [node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]öú
+ûúûú
+ò+öûúûúûúòLöúòöûúûúûòöúòöûúûúûòöûúò!Löúûôóöûúûúûúò1Löúûôóöú!ò!Löúûúô'óöûúòLöúòöûúûòöúòLöú#ô#Löú ò öûúûòLöûú"ò&LöûúIòMóLöúòóöûúûúòLöúwôwóóLòóóLòóöúòLöú-ô-Löú,ò,öûúûúûòöúûúûúûò'öúòLô9öûúòöûúòLôLöûúò!öûúòLöœcCòCLò%LòóöûúòLöú%ûú,òWLòóóLòóöûúòLò%LòóóLöúòLòóöúûúûúûúò7Löú$ò$öûúûúòLöúûú$ô2öûú ò"LöûúòLöûúòóLòóLòóLöûúòóLöûúòóLòóòLöúûúòöûúûúûòöúûúûúûò)öúûú!ûò?öûúûúûòöúûúûúûò'Löú)ò)LöûúòóLöûúòóóLöú)ò)LöûúòóLöûúòóöûúûúûúòLöú ò Löú*ò*Löúòöûúûú'ûúûú$ûúûúò}Löú0ûúô9ò!öûúûúûúòöûúûúûòöúûúûúûò)öúòLöú%ò%Löûúûúûúûúò"Löûú(ûúûúûúò;LòóLöûúòóLöûúòóLöú$ò$Löûúûúò!LòóLöûúòLòóLò öûúûúûòöúòLô8Löúûú$ò+LöúûúòLöûúûúûúûúò7LòóöûúòLôMLöúòLòóóöûúûúûòLöúûúNôfLöúòóLòóLòóLòóLöûúûúûúûú#ò?óLòóLöûúòLòóòLö†3ô3öûúûúûòöúòLöúòLöúòLòóöúòLöúòLöúòLöûúòLòóöúòLöúòLòóLöúûúò$öúòöûúûúûòö	ûúûúûúûúûòBLöú6ò6óóóöúòöûúûúûòö	ûúûúûúûúûòBLöú6ò6óóóLöûúòóLöú"ò"LöûúòLòóöú$ò$Löú;ô;óö
+ûúûúûúûúûúò@Löú•ô•LöúûúòLöúûúòLöúûúòöûú.ûúûúûòDLòöûúûúûòLòLöú
+ûúò)öûúòLöú;ô;LöúAòALöú4ò4LöúòLöûúûúûúûúò9LöúòLòóóLöûúòóöûúûúûúòöûú)ûúûúûò?öûúûúò!Löúòöûúûúûúûúò$Löú7ô7óLòLöûúòLòóLöúòLöûúòóLòóLòóòLôéLöúòLöú ò Löúûúòö
+ûúûúûúûúûúò.Lò#öûúûúûúòöûúûúûò"öúòLöúûúò%Löûúûúûú¢ò6öûúûúòLô/Löú]ò]LöúBòBLöú0ò0LòóLòóLöûúòóLòóLòóLòóLòLò óóöúôöüúûú9ûúò^LôõLöúòLòLöú	ûúûú3ò`Löúûú?òILò*Löú	ûú"ò.Löúûú?òILöú/ûúò4Löú&ò&Löú0ûúò7LöúGòGöúLòLô*LöúôóóLöúûúò)LöúûúAòLLöúPòPLöú$ûúò)LöúsòsLöúeòeLò öú5ò5Löúûú6ôOóòLöú.ô.óLò òLôNLò LöúFòFLöúQòQLöúnònLöú,ûúò:Löú2ò2Löúòöú]ò]LöúKôKóLöúòöúûúò8LöúûúòLöú
+ûúòLòLöúòLöú ò LöúûúòóLò öûúûúòLôÊLöúFòFLöúdòdLöúûúòLöúûúòöûú,ûúûúûòBLöúûúûúûúûúûúò<öûú
+ûúòLöúAòALöûúûúûúûúòELöúòLòóLöúòLöûúòóLöú*ò*LòóLò öûúûúòLô!LöúGòGLöúqòqLöúNòNLöú#ò#LöúòLòóLò öúAòALô0óLò öúòLöúûúdòqLöúòóLöúòLöúòöûúûúûòöúòLôLöú;ò;óLöûúûúòóLòóLöûúaògLòLò óóöúôöüúûú*ûúòSLöú∫ô∫öûúûúûúòLöúûúòLöúûúòöûú)ûúûúûò?LöúòöûúûúûòLöúIòIóLöûúòóLöú*ò*öûúûúûòLöúûúò-öú"ò"LöúôLòLöú~ô~Löûú
+ûúûúò&Löûú)ò/LòóLöûúòóLòóLöûú
+òLòLò óö
+üúûúûúûúûúòIöûúûúûúò7LöúôLöúòLöûú
+ûúò$öûú
+ûúûúòLöú!ô!Löú&ò&Löú'ò'LöúòLòóLöûúûúûúò-LöûúûúòLòóLöûúûúòLòLò óöüúûú8ûúò]Löú=ò=öûúûúûúòLöú.ò.LöúûúòLöú(ò(LöûúOòULòóLöúûúòLöûú	òLòLò óöüúûú8ûúûúòsöûúûúûòöúòLöú*ò*LöúûúòLöúòLöúòLöú>ûúòQLöûúòLöúòóöúòöûú)ûúûúûò?öûúûúûòöúòLöú<ò<LòLöûúòLöúòóLöûúòóLöûúòóóLöûúòóLöûúòLòLöúûúòLòLò óöüúûúûúòLLöú&ò&Lö	úûú0ûúûúûúòjLöúòLöûúûú%ò2LòLò óöü
+úûúûúûú
+òSLöú<ò<Löú2ò2LöûúòLòLò óö
+üúûúûúûúûúò>Löú≠ô≠öûúûòöûúûúûúòLöúPôPóöûúòöûòLöúûú4ò>Löûúûúûúûúò/öûúûúûòòöûúûúûòLöúûú)ûúò9öú	ûúò%Löúòöûúûúò%Löúûú6òELöúòLöúòLöûúòLòóLòóLöúûú)ûúò9Löú	ûú-ûúò?öúûúò)Löú
+ûú"ò/öûú-ûúûúûòCLöú
+ûúò Löúûú4òBLö
+ûúûú&ûúûúûúò@öûúûúò!Lô+Löúûú4òBöûú$ûúò,Lô2Löúûú&ò6öûúûúûúûúò.Lô;óLòóLòóLöúòLöûúòóLòóLöúûúûúûúò1LöûúûúûúòóóLöúûúûúò"Löúûúûúò Löú ûúûúò.òLòöûúûúûúòöûúûúûòòöûúûúûòöúûúòöûúûòLö	úûúûúûúûúò4LöûúòóóLöûúòóóLöûúòóöûú"ûúûúûò8Lòöûú	ûúûúòLö
+ûúûúûúûúûúò7LöúCòCLòóLöûúòóLòóLöúòLöûúòLòóLöûúòóLöúPôPLöûúòLöûúòóLöûúûúòLòóóLòLò óöü	úûúûúò@öûúûúûòöúòLöúòöûúûúûúòLöú6ò6öûúûòLöûúûúòLöûúûúò!óLöûúòLòóLòóLöûúòóLöûúûúûúûúò%LöûúòLòLò óöüúûúûú)ûúòböûúûúòLöú(ò(LöúòLö
+ûúûúûúûúûúò öûú
+ûúûòöûúûúûò öúûúûúò9Lô8LöúòLö
+ûúûúûúûúûúò LòóLöûúûúûúòóóLöúòLö
+ûúûúûúûúûúò.LöúòLö
+ûúûúûúûúûúò.LöúòLö
+ûúûúûúûúûúò.LöúòLö
+ûúûúûúûúûúò.LöûúòLöûúòLöúòóLöûúòLòLò óöüúûúûúûúò8öûúûúûòöûúûúûò.öúûúûúòLöûú4ò6Löûúûúûúûú"ò6LòóLöûúòóóLöûúòLòLò óóLöûúòLò Lò ó Öó    ±®  7H 

@@ -1,0 +1,581 @@
+
+DIRECTORY 
+Rope, RopeList, Xl, XlDispatch, XlPredefinedAtoms, XlTQOps, X11SelectionOwner, X11SelectionOwnerPrivate, X11SelectionPrivate, XTk;
+
+X11SelectionOwnerImpl: CEDAR MONITOR
+IMPORTS RopeList, X11SelectionPrivate, Xl, XlDispatch, XlTQOps, XTk
+EXPORTS X11SelectionOwner ~
+BEGIN OPEN X11SelectionOwner, X11SelectionOwnerPrivate, X11SelectionPrivate;
+
+
+IgnoreErrors: Xl.EventProcType = {};
+
+detailsForSynchronous: Xl.Details ~ NEW[Xl.DetailsRec ¨ [synchronous: TRUE]];
+detailsForIgnoreErrors: Xl.Details ~ NEW[Xl.DetailsRec ¨ [errorMatch: NEW[Xl.MatchRep ¨ [proc: IgnoreErrors, handles: NIL, tq: Xl.CreateTQ[]]]]];
+propertyNotifyEvents: Xl.EventFilter ~ Xl.CreateEventFilter[propertyNotify];
+selectionEvents: Xl.EventFilter ~ Xl.CreateEventFilter[selectionRequest, selectionClear];
+myPropertyKey: REF ~ NEW[INT];
+
+
+WidgetOData: TYPE = REF WidgetODataRec;  --per Widget selection Owner Data (for all selections)
+WidgetODataRec: PUBLIC TYPE = X11SelectionOwnerPrivate.ImplWidgetODataRec;
+
+GetWidgetOData: PROC [w: XTk.Widget] RETURNS [wod: WidgetOData] = {
+EntryGetWidgetOData: ENTRY PROC [w: XTk.Widget] RETURNS [wod: WidgetOData] = {
+WITH XTk.GetWidgetProp[w, myPropertyKey] SELECT FROM
+ok: WidgetOData => wod ¨ ok;
+ENDCASE => {
+wod ¨ NEW[WidgetODataRec];
+XTk.PutWidgetProp[w, myPropertyKey, wod];
+};
+};
+WITH XTk.GetWidgetProp[w, myPropertyKey] SELECT FROM
+ok: WidgetOData => wod ¨ ok;
+ENDCASE => wod ¨ EntryGetWidgetOData[w];
+IF wod.cd=NIL OR wod.cd.connection#w.connection THEN {
+c: Xl.Connection ¨ w.connection;
+IF Xl.Alive[c] THEN wod.cd ¨ GetConnectionData[c];
+};
+};
+
+AssertServiceMatch: ENTRY PROC [wod: WidgetOData, w: XTk.Widget] = {
+IF ~wod.matchEstablished THEN {
+wod.matchEstablished ¨ TRUE;
+IF wod.serviceTQ=NIL THEN wod.serviceTQ ¨ Xl.CreateTQ[];
+XTk.AddPermanentMatch[w, [proc: ServiceEventProc, handles: selectionEvents, tq: wod.serviceTQ, data: wod]];
+XTk.RegisterNotifier[w, XTk.bindScreenKey, BindScreen, wod];
+};
+};
+
+BindScreen: XTk.WidgetNotifyProc = {
+wod: WidgetOData ~ NARROW[registerData];
+FOR list: LIST OF OwnershipHandle ¨ wod.selections, list.rest WHILE list#NIL DO
+list.first.selection ¨ Xl.MakeAtom[widget.connection, list.first.ac.selection];
+ENDLOOP;
+};
+
+PreEstablishServiceTQ: PUBLIC PROC [w: XTk.Widget, serviceTQ: Xl.TQ ¨ NIL] = {
+wod: WidgetOData ~ GetWidgetOData[w];
+IF wod.serviceTQ=NIL THEN {
+IF serviceTQ=NIL THEN serviceTQ ¨ Xl.CreateTQ[];
+wod.serviceTQ ¨ serviceTQ;
+AssertServiceMatch[wod, w] 
+};
+};
+
+GetOwnership: PROC [wod: WidgetOData, selection: Xl.XAtom] RETURNS [OwnershipHandle ¨ NIL] = {
+FOR list: LIST OF OwnershipHandle ¨ wod.selections, list.rest WHILE list#NIL DO
+IF list.first.selection=selection THEN RETURN [list.first];
+ENDLOOP;
+};
+
+AppendOwnership: ENTRY PROC [wod: WidgetOData, oh: OwnershipHandle] RETURNS [error: BOOL ¨ FALSE] = {
+newTail: LIST OF OwnershipHandle ~ LIST[oh];
+p: LIST OF OwnershipHandle ¨ wod.selections;
+IF p=NIL THEN {wod.selections ¨ newTail; RETURN};
+DO
+IF p.first.selection=oh.selection THEN RETURN [error¨TRUE];
+IF p.rest=NIL THEN {p.rest ¨ newTail; RETURN};
+p ¨ p.rest;
+ENDLOOP;
+};
+
+RemoveOwnership: ENTRY PROC [wod: WidgetOData, oh: OwnershipHandle] = {
+IF wod.selections=NIL THEN RETURN;
+IF wod.selections.first=oh THEN {wod.selections ¨ wod.selections.rest; RETURN};
+FOR l: LIST OF OwnershipHandle ¨ wod.selections, l.rest WHILE l#NIL AND l.rest#NIL  DO
+IF l.rest.first=oh THEN {l.rest ¨ l.rest.rest; RETURN};
+ENDLOOP
+};
+
+AcknowledgeConversion: PROC [e: Xl.SelectionRequestEvent, property: Xl.XAtom] RETURNS [failed: BOOL ¨ FALSE] = INLINE {
+Xl.SendSelectionNotifyEvent[c: e.connection, destination: e.requestor, selection: e.selection, target: e.target, property: property, timeStamp: e.timeStamp, details: detailsForSynchronous ! Xl.XError => {failed ¨ TRUE; CONTINUE}];
+};
+
+RefuseConversion: PROC [e: Xl.SelectionRequestEvent] = {
+[] ¨ AcknowledgeConversion[e, [0]];
+};
+
+ReleaseConversion: --transferTQ-- PROC [r: Request, success: BOOL] = {
+IF ~Xl.Alive[r.event.connection] THEN RETURN;
+IF r.transferMatch#NIL THEN 
+XlDispatch.RemoveMatch[c: r.event.connection, w: r.event.requestor, match: r.transferMatch, details: detailsForIgnoreErrors <<asynchronously destroyed connection>>];
+IF success
+THEN success ¨ ~AcknowledgeConversion[r.event, r.event.property]
+ELSE RefuseConversion[r.event];
+IF ~success THEN r.anyFailed ¨ TRUE;
+r.timeOutData ¨ $allDone;
+IF r.oh.sharedTransferTQ#NIL --so transferTQ is shared-- THEN {
+RemoveServicing[r];
+FOR n: Request ¨ r.next, n.next WHILE n#NIL DO
+IF n.event.requestor=r.event.requestor AND n.isDelayed THEN {
+n.isDelayed ¨ FALSE; [] ¨ WakeUp[n];
+};
+ENDLOOP
+};
+};
+
+FindTargetIdx: PROC [r: Request, property: Xl.XAtom] RETURNS [idx: INT ¨ -1] = {
+FOR i: NAT IN [0..r.length) DO
+IF r[i].property=property THEN RETURN [i];
+ENDLOOP
+};
+
+PropertyDeletedEvent: --transferTQ-- Xl.EventProcType = {
+WITH event SELECT FROM
+e: Xl.PropertyNotifyEvent => {
+WITH clientData SELECT FROM
+r: Request => {
+idx: INT ~ FindTargetIdx[r, e.atom];
+IF idx>=0 AND idx=r.index THEN [] ¨ WakeUp[r];
+};
+ENDCASE => {};
+};
+ENDCASE => {};
+}; 
+
+TimeoutCheckEvent: --transferTQ-- Xl.EventProcType = {
+r: Request ~ NARROW[clientData];
+SELECT r.timeOutData FROM
+$reset => {
+r.timeOutData ¨ $alert;
+XlTQOps.EnqueueSoon[ms: r.oh.timeoutMsec, tq: tq --is transferTQ--, proc: TimeoutCheckEvent, data: r, event: event];
+};
+$alert => {
+ReleaseConversion[r, FALSE];
+IF r.oh.ac.done#NIL THEN r.oh.ac.done[r];
+};
+ENDCASE => {--e.g. after a timeout--};
+};  
+
+EnqueueOrCall: PROC [selfTQ, callTQ: Xl.TQ, proc: Xl.EventProcType, data: REF ¨ NIL, event: Xl.Event ¨ NIL] = INLINE {
+IF selfTQ=callTQ
+THEN proc[event, data, callTQ]
+ELSE Xl.Enqueue[callTQ, proc, data, event]
+};
+
+ServiceEventProc: --serviceTQ-- Xl.EventProcType = {
+wod: WidgetOData ~ NARROW[clientData];
+WITH event SELECT FROM
+e: Xl.SelectionRequestEvent => {
+oh: OwnershipHandle ~ GetOwnership[wod, e.selection];
+IF oh#NIL --otherwise not ours-- THEN {
+transferTQ: Xl.TQ ¨ NIL;
+getTransferTQ: GetTQProc ~ oh.ac.getTransferTQ;
+IF getTransferTQ#NIL THEN transferTQ ¨ getTransferTQ[oh, e];
+IF transferTQ=NIL THEN {
+transferTQ ¨ oh.sharedTransferTQ;
+IF transferTQ=NIL THEN transferTQ ¨ Xl.CreateTQ[];
+};
+EnqueueOrCall[tq, transferTQ, StartConversion, oh, e];
+};
+};
+e: Xl.SelectionClearEvent => {
+oh: OwnershipHandle ~ GetOwnership[wod, e.selection];
+IF oh#NIL --otherwise not ours-- THEN {
+EnqueueOrCall[tq, oh.initiateTQ, NotifyLostOwnership, oh, e];
+};
+};
+ENDCASE => {};
+};
+
+EnqueueServicing: --shared transferTQ-- PROC [r: Request] = {
+tail: Request ¨ r.oh.serviceQueue;
+IF tail=NIL 
+THEN r.oh.serviceQueue ¨ r
+ELSE {
+IF tail.event.requestor=r.event.requestor THEN r.isDelayed ¨ TRUE;
+WHILE tail.next#NIL DO 
+tail ¨ tail.next; 
+IF tail.event.requestor=r.event.requestor THEN r.isDelayed ¨ TRUE;
+ENDLOOP;
+tail.next ¨ r
+};
+r.isInQueue ¨ TRUE;
+};
+
+RemoveServicing: --shared transferTQ-- PROC [r: Request] = {
+front: Request ¨ r.oh.serviceQueue;
+IF front=r 
+THEN r.oh.serviceQueue ¨ r.next
+ELSE {
+WHILE front.next#NIL DO 
+IF front.next=r THEN {
+front.next ¨ r.next; 
+ReviveDelayed[front.next, r.event.requestor];
+RETURN
+};
+front ¨ front.next; 
+ENDLOOP;
+};
+};
+
+ReviveDelayed: --shared transferTQ-- PROC [front: Request, requestor: Xl.Window] = {
+FOR r: Request ¨ front, r.next WHILE r#NIL DO
+IF r.isDelayed AND r.event.requestor=requestor THEN {
+Xl.Enqueue[r.oh.sharedTransferTQ, DelayedTailRecursion, r, r.event];
+RETURN;
+}; 
+ENDLOOP
+};
+
+DelayedTailRecursion: --shared transferTQ-- Xl.EventProcType = {
+r: Request ~ NARROW[clientData];
+r.isDelayed ¨ FALSE;
+[] ¨ WakeUp[r];
+};
+
+StartConversion: Xl.EventProcType = {
+oh: OwnershipHandle ~ NARROW[clientData];
+e: Xl.SelectionRequestEvent ~ NARROW[event];
+r: Request;
+failed, somefailed: BOOL ¨ FALSE;
+IF oh.ac.checkTime AND Xl.Period[from: oh.ownedSince, to: e.timeStamp]<0 AND oh.ownedSince#Xl.currentTime THEN {
+RefuseConversion[e]; RETURN
+};
+IF e.target=oh.wod.cd.multipleXAtom 
+THEN {
+pr: Xl.PropertyReturnRec;
+IF e.property=XlPredefinedAtoms.nullNotAnAtom THEN {
+RefuseConversion[e]; RETURN
+};
+pr ¨ Xl.GetProperty[c: e.connection, w: e.requestor, property: e.property ! 
+Xl.XError => {failed ¨ TRUE; CONTINUE}
+];
+IF failed OR pr.format#32 OR pr.bytesAfter>0--nobody will do that-- THEN {
+RefuseConversion[e]; RETURN
+};
+WITH pr.value SELECT FROM
+ms: REF Xl.Card32Sequence => {
+IF ms.leng MOD 2 # 0 THEN {RefuseConversion[e]; RETURN};
+r ¨ NEW[RequestSequence[ms.leng / 2]];
+r.multiSeq ¨ ms;
+FOR i: INT IN [0..r.length) DO
+r[i].target ¨ [ms[2*i]];
+r[i].property ¨ [ms[2*i+1]];
+r[i].num ¨ INT.LAST;
+ENDLOOP;
+};
+ENDCASE => {
+RefuseConversion[e]; RETURN;
+};
+}
+ELSE {
+property: Xl.XAtom ¨ e.property;  
+IF property=XlPredefinedAtoms.nullNotAnAtom THEN {
+property ¨ e.target;
+IF property=XlPredefinedAtoms.nullNotAnAtom THEN {
+RefuseConversion[e]; RETURN;
+};
+};
+r ¨ NEW[RequestSequence[1]];
+r[0].target ¨ e.target;
+r[0].property ¨ property;
+r[0].num ¨ INT.LAST;
+};
+r.oh ¨ oh;
+r.event ¨ e;
+r.transferTQ ¨ tq;
+oh.ac.convert[r];
+IF r.refuse OR (r.multiSeq=NIL AND r[0].response=$Failed) THEN {
+RefuseConversion[e]; RETURN;
+};
+FOR i: NAT IN [0..r.length) DO
+IF r[i].response=$Failed 
+THEN {
+somefailed ¨ TRUE;
+IF r.multiSeq#NIL THEN r.multiSeq[i*2+1] ¨ 0;
+r[i].remain ¨ 0;
+}
+ELSE {
+num: INT;
+[num, r[i].unit] ¨ Xl.XPropInfo[r[i].response];
+r[i].remain ¨ MIN[num-r[i].start, r[i].num];
+};
+ENDLOOP;
+IF somefailed THEN {
+IF r.multiSeq=NIL 
+THEN failed ¨ TRUE
+ELSE {
+Xl.ChangeProperty[c: e.connection, w: e.requestor, property: e.property, data: r.multiSeq, type: XlPredefinedAtoms.atom, details: detailsForSynchronous
+! Xl.XError => {failed ¨ TRUE; CONTINUE;}
+];
+};
+IF failed THEN {RefuseConversion[e]; RETURN};
+};
+IF ~r.isInQueue AND r.oh.sharedTransferTQ#NIL THEN EnqueueServicing[r];
+IF ~r.isDelayed THEN [] ¨ WakeUp[r];
+};
+
+WakeUp: --transferTQ-- PROC [r: Request] RETURNS [allDone: BOOL ¨ FALSE]  = {
+cpMode: Xl.ChangePropertyMode ¨ replace;
+thisNum, thisStart: INT; response: REF; type: Xl.XAtom;
+e: Xl.SelectionRequestEvent ¨ r.event;
+idx: INT ¨ r.index;	--expected index; but might be all done and need increment
+newStep: BOOL;	--first time we visit index
+DO --until we find one which did not fail (? ICCCM doesn't really say what to do)
+newStep ¨ FALSE;
+SELECT TRUE FROM
+r.timeOutData=$timedOut => RETURN; 
+idx<0 => {
+r.index ¨ idx ¨ 0; newStep ¨ TRUE;
+r.transferMatch ¨ NEW[Xl.MatchRep ¨ [
+proc: PropertyDeletedEvent, 
+handles: propertyNotifyEvents, 
+tq: r.transferTQ, 
+data: r 
+]];
+XlDispatch.AddMatch[c: e.connection, w: e.requestor, match: r.transferMatch, generate: [propertyChange: TRUE <<possibility of destroyed connection not interesting as this is first call>>]];
+XlTQOps.EnqueueSoon[ms: r.oh.timeoutMsec, tq: r.transferTQ, proc: TimeoutCheckEvent, data: r, event: e];
+}; 
+idx<r.length => {
+SELECT r[idx].state FROM
+$waitForAck =>  {
+r.index ¨ idx ¨ idx + 1; newStep ¨ TRUE;
+IF idx>=r.length THEN {
+ReleaseConversion[r, TRUE]; 
+IF r.oh.ac.done#NIL THEN r.oh.ac.done[r];
+allDone ¨ TRUE; 
+RETURN
+};
+};
+$startIncr => cpMode ¨ replace;
+$continueIncr => cpMode ¨ append;
+ENDCASE => ERROR;
+};
+ENDCASE => ERROR;
+response  ¨ r[idx].response;
+IF response#$Failed 
+THEN EXIT
+ELSE {--similar to $waitForAck
+r.index ¨ idx ¨ idx + 1; newStep ¨ TRUE;
+IF idx>=r.length THEN {
+ReleaseConversion[r, TRUE]; 
+IF r.oh.ac.done#NIL THEN r.oh.ac.done[r];
+allDone ¨ TRUE; 
+RETURN
+};
+};
+ENDLOOP;
+type  ¨ r[idx].type;
+thisNum ¨ MIN[r[idx].remain, 1000, Xl.Info[e.connection].maxRequestLength];
+thisStart ¨ r[idx].next;
+IF newStep 
+THEN {
+IF thisNum<r[idx].remain AND thisNum>0 
+THEN {
+cs: REF Xl.Card32Sequence ¨ response ¨ NEW[Xl.Card32Sequence[1]];
+cs[0] ¨ r[idx].remain;
+r[idx].state ¨ $startIncr;
+thisNum ¨ 1; thisStart ¨ 0;
+type ¨ r.oh.wod.cd.incrXAtom;
+}
+ELSE {
+r[idx].state ¨ $waitForAck;
+};
+}
+ELSE { 
+r[idx].next ¨ thisStart+thisNum;
+r[idx].remain ¨ r[idx].remain-thisNum;
+IF r[idx].remain<=0 
+THEN r[idx].state ¨ $waitForAck  --note incr is terminated by appending zero bytes
+ELSE r[idx].state ¨ $continueIncr;
+};
+Xl.ChangeProperty[c: e.connection, w: e.requestor, 
+property: r[idx].property, type: type, mode: cpMode, 
+data: response, start: thisStart, num: thisNum, 
+details: detailsForIgnoreErrors--this is NOT our window--  
+];
+r.timeOutData ¨ $reset;
+};
+
+EstablishSelectionOwnerProtocol: PUBLIC PROC [w: XTk.Widget, ac: ApplicationClass, initiateTQ: Xl.TQ ¨ NIL, transferTQ: Xl.TQ ¨ NIL, ownershipData: REF ¨ NIL] RETURNS [oh: OwnershipHandle] = {
+c: Xl.Connection ~ w.connection;
+selection: Xl.XAtom ¨ [0];
+wod: WidgetOData ~ GetWidgetOData[w];
+IF Xl.Alive[c] THEN selection ¨ Xl.MakeAtom[c, ac.selection];
+IF initiateTQ=NIL THEN {
+initiateTQ ¨ transferTQ;
+IF initiateTQ=NIL THEN initiateTQ ¨ Xl.CreateTQ[];
+};
+oh ¨ NEW[OwnershipRec ¨ [
+ac: ac,
+initiateTQ: initiateTQ,
+sharedTransferTQ: transferTQ,
+w: w,
+selection: selection,
+timeoutMsec: ac.defaultTimeoutMsec,
+ownershipData: ownershipData,
+wod: wod
+]];
+PreEstablishServiceTQ[w, NIL];
+IF AppendOwnership[wod, oh].error THEN ERROR;
+};
+
+DeEstablishSelectionOwnerProtocol: PUBLIC PROC [oh: OwnershipHandle] = {
+w: XTk.Widget ¨ oh.w;
+wod: WidgetOData ~ GetWidgetOData[w];
+RemoveOwnership[wod, oh];
+};
+
+ChangeTimeOut: PUBLIC PROC [oh: OwnershipHandle, timeoutMsec: INT] = {
+oh.timeoutMsec ¨ timeoutMsec
+};
+
+
+NotifyLostOwnership: --initiateTQ-- Xl.EventProcType = {
+oh: OwnershipHandle ~ NARROW[clientData];
+e: Xl.SelectionClearEvent ~ NARROW[event];
+IF (Xl.Period[from: oh.ownedSince, to: e.timeStamp]>=0 OR oh.ownedSince=Xl.currentTime) AND e.owner=oh.w.window THEN { 
+notify: LostOwnershipNotifyProc ¨ oh.ac.lostOwnership;
+previousTime: Xl.TimeStamp ¨ oh.ownedSince;
+oh.iHaveIt ¨ FALSE;
+IF notify#NIL THEN notify[oh: oh, timeStamp: e.timeStamp, event: e, previousTime: previousTime];
+};
+};
+
+AquireOwnership: PUBLIC PROC [oh: OwnershipHandle, time: Xl.TimeStamp] RETURNS [success: BOOL ¨ FALSE] = {
+IF oh.w.state=realized AND oh.w.fastAccessAllowed=ok THEN {
+action: PROC = {
+window: Xl.Window;
+Xl.SetSelectionOwner[c: oh.w.connection, owner: oh.w.window, selection: oh.selection, time: time];
+window ¨ Xl.GetSelectionOwner[oh.w.connection, oh.selection];
+success ¨ window=oh.w.window;
+IF success THEN {
+notify: GotOwnershipNotifyProc ¨ oh.ac.gotOnwership;
+previouslyOwned: BOOL ¨ oh.iHaveIt;
+previousTime: Xl.TimeStamp ¨ oh.ownedSince;
+oh.iHaveIt ¨ TRUE;
+oh.ownedSince ¨ time;
+IF notify#NIL THEN notify[oh, time, previouslyOwned, previousTime];
+}
+};
+IF time=Xl.currentTime THEN time ¨ Xl.LastTime[oh.w.connection];
+Xl.CallWithLock[tq: oh.initiateTQ, proc: action];
+};
+};
+
+ReleaseOwnership: PUBLIC PROC [oh: OwnershipHandle, time: Xl.TimeStamp ¨ Xl.currentTime] = {
+IF oh.w.fastAccessAllowed#ok THEN RETURN;
+Xl.SetSelectionOwner[c: oh.w.connection, owner: Xl.nullWindow, selection: oh.selection, time: time]
+};
+
+FillSomeTargets: PUBLIC PROC [request: Request, targetIdx: NAT, assignFailed: BOOL ¨ FALSE] RETURNS [success: BOOL ¨ TRUE] = {
+wod: WidgetOData ~ request.oh.wod;
+cd: X11SelectionPrivate.ConnectionData ~ wod.cd;
+SELECT request[targetIdx].target FROM
+cd.timeStampXAtom => {
+t: Xl.TimeStamp ~ request.oh.ownedSince;
+request[targetIdx].response ¨ NEW[CARD32 ¨ t];
+request[targetIdx].type ¨ XlPredefinedAtoms.integer;
+};
+cd.targetsXAtom => {
+ConsIfMissing: PROC [r: Rope.ROPE, list: LIST OF Rope.ROPE] RETURNS [LIST OF Rope.ROPE] = {
+IF ~RopeList.Memb[list, r] THEN list ¨ RopeList.Cons[list, r]; 
+RETURN [list];
+};
+count: INT; n: NAT ¨ 0; 
+targetSeq: REF Xl.Card32Sequence;
+list: LIST OF Rope.ROPE ¨ request.oh.ac.targets;
+list ¨ ConsIfMissing["TARGETS", list];
+list ¨ ConsIfMissing["MULTIPLE", list];
+list ¨ ConsIfMissing["TIMESTAMP", list];
+count ¨ RopeList.Length[list];
+targetSeq ¨ NEW[Xl.Card32Sequence[count]];
+FOR l: LIST OF Rope.ROPE ¨ list, l.rest WHILE l#NIL AND n<count DO
+targetSeq[n] ¨ Xl.MakeAtom[request.oh.w.connection, l.first]; n ¨ n+1;
+ENDLOOP;
+request[targetIdx].response ¨ targetSeq;
+request[targetIdx].type ¨ XlPredefinedAtoms.atom;
+};
+ENDCASE => {
+success ¨ FALSE; 
+IF assignFailed THEN request[targetIdx].response ¨ $Failed;
+};
+};
+
+END.
+ 
+     X11SelectionOwnerImpl.mesa
+Copyright ” 1990, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Christian Jacobi, November 12, 1990 5:42 pm PST
+Christian Jacobi, February 21, 1992 5:48 pm PST
+
+
+Missing: 
+check all the threads
+what happens before widget is realized; could some things happen beforee?. PreEstablishServiceTQ, EstablishOwnership do make sense before realization
+------------------
+Establishes code handling selections; for all selections.  Optional, but if used it must be called before first call of EstablishSelectionOwnerProtocol.
+In a first try we handle ownership of all selections in the same serviceTQ.  This would allows us to register a single event matcher for SelectionRequestEvents.  I'm not yet sure whether this is an advantage. 
+WARNING:  Selection requests with large side effects have to use the INSERT_SELECTION convention. ICCCM 2.6.3.2.  As I want to hide this knowledge from selection requestors (Do I want to?) ownership could be established hiddenly)
+--Careful ordering: GetOwnership is not monitored for speed
+--Assert: p#NIL
+--send acknowledging SendSelectionNotifyEvent; use only if no event handlers need un-registration
+--careful about catching errors; this is not our window; it could have been destroyed
+--send denying SendSelectionNotifyEvent; use only if no event handlers need un-registration
+--unregisters event handlers and send final SendSelectionNotifyEvent
+--requestor acknowledges by deleting property
+--Called when the time ticks.  Use right transferTQ to protect r.timeOutData and for reporting timeout.  
+--Start new timeslice, as we didn't know when in the last timeslice was started.
+--A whole timeslice was inactive; do the timing out.
+--Received a request; initiate handling it.
+--Enqueue this request into queue of requests currently in works... 
+--Set delay if conflicting request is in progreass 
+--Remove this request from queue of requests currently in works... 
+--If there was a conflicting request, continue its servicing 
+--Checks queue for a request whose servicing ought to be continued and do it
+BEGIN
+Dont do it this way but use queue
+r.isDelayed _ FALSE;
+[] _ WakeUp[r];  --possibly infinite tail recursion
+END;
+--Service the request 
+--Use a per selection thread (transferTQ) to enable re-entrant calling on other selections or other requests
+--See note about Xl.currentTime in NotifyLostOwnership
+--is it ok to do this before transmitting the real answers?
+--start funny loop transmittinmg real answers
+--Funny loop; all loop control state is stored in r.
+--synchrounous first call
+--called from an event (or previous response was failed)
+--start an incr
+--use single request
+--continue incr
+details: detailsForSynchronous--this is NOT our window--  
+! Xl.XError => {ReleaseConversion[r, FALSE]; --?? ought to really report failure --GOTO oops}
+Install ownership duties for a particular selection.  This does not actually aquire ownership but registers the procedures necessary to aquire it.   Must not be called more then once per widget and selection tuple. 
+--We do not test "IF oh.iHaveIt THEN" for robustness reasons: if an errounous state happens, loosing the selection the next time will automatically put us into a correct state again.  
+--We do let Xl.currentTime through: Some clients which don't use the connection for any other purpose as to state selection-ownership might not have a timeStamp when aquiring the selection (and Xl.LastTime might not have a reasonable value either).  Those clients have to watch themself for race conditions.  
+--Aquires active selection ownership. 
+--OwnershipHandle must have been previously established. 
+--Do not use Xl.currentTime. 
+--Helpful X protocol twist: Noop in buggy situation of time in the future
+--Voluntarily releases selection ownership.
+--OwnershipHandle must have been previously established
+ù œ  ñ(cedarcode) styleïNewlineDelimiter
+ò codeôKöú
+œeú=ôHKô/Kô/Kô óöœk	úò
+KöúÇòÇKò óöœnúûúûò$Köûú<òCKöûúòóKöûúûúBòLKô ô	KôKöúïôïóKò KöúôKò Köüúò$Kò Köú$ûúûúòMKöú%ûúûú-ûúòëKöúLòLKöúYòYKöúûúûúûúòKò Kò Köúûúûúœc–bc†°†°†ò_öúûúûú/òJKò óöüúûúûúòCöüúûúûúûúòNöûú%ûúûò4KòöûúòKöúûúòKò)KòóóKòóöûú%ûúûò4KòKöûú!ò(óöûúûúûú ûúò6Köú ò Köûúûúò2KòóKòóKò öüúûúûú&òDöûúûúòKöúûúòKöûúûúûúò8KöúkòkKöú<ò<KòóKòóKò öü
+úò$Köúûúò(öûúûúûú-ûúûúûòOKöúOòOKöûúòóKöúòóKò ö
+üúûúûúûúûúòNKôòKöú—ô—KôÂKò%öûúûúûúòKöûúûúûúò0KöúòKòKòóKòKò óöüúûú)ûúûúò^öûúûúûú-ûúûúûòOKöûú ûúûúò;KöûúòóKòKò óöüúûúûú)ûú	ûúûúòeKô;Köú	ûúûúûúò,Köúûúûú"ò,Köûúûúûúûúò1öûòKôKöûú ûúûúûúò;Köûúûúûúûúò.KòKöûúòóKòKò óöüúûúûú,òGKöûúûúûúûúò"Köûúûú(ûúòOöûúûúûú*ûúûúûúûúûòVKöûúûúûúò7KöûòóKòóKò öüúûú3ûú
+ûúûúûúòwKôaKöœiUôUKöú’ûúûúòÊKòKò óöüúûú"ò8Kô[Kò#KòKò óöüú†úûúûúòFKôDKöûúûúûúò-öûúûúûúòKöú•ò•óöûúò
+Köûú<ò@KöûúòóKöûú
+ûúûúò$Kòöûúûú†úûúò?Kòöûúûúûúûò.öûú%ûúûúò=Köúûúò$KòóKöûòóKòóKòóKò öüúûú"ûúûú
+òPöûúûúûúûòKöûúûúûúò*KöûòóKòKò óöüú†úò9Kô-öûúûúûòöúòöûúûúûòòKöúûúò$Köûúûúûúò.KòóKöûúòóKòóKöûúòóKòKò óöüú†úò6Köú)†
+ú6ôiKöúûúò öûúûòòKôPKòKöú1†ú2òtKòóòKô4KöúûúòKöûúûúûúò)KòóKöûú†úò&óKòóKò öüúûúûú ûúûúûúûúòvöûúòKöûúòKöûú&ò*óKòóKò öüú†úò4Kô+Köúûúò&öûúûúûòöú ò Kò5ö
+ûúûú†°†úûúò'KöúûúûúòKöú/ò/Köûúûúûú#ò<öûúûúûúòKöú!ò!Köûúûúûúò2KöúòóKöú6ò6KòóKòóöúòKöú5ò5ö
+ûúûú†°†úûúò'Köú=ò=KòóKòóKöûúòóKòKò óöüú†úûúò=KôDKô3Kò"öûúûúòKöûúòöûúòKöûú(ûúûúòBöûúûúûúòKòKöûú(ûúûúòBKöûúòóKòKòóóKöúûúòKòKò óöüú†úûúò<KôCKô=Kò#öûú	òKöûúòöûúòöûúûúûúòöûúûúòKòKò-KöûòKòóKòKöûúòóKòóóKòKò óöüú†úûú+òTKôLöûúûúûúûò-öûúûúûúò5ôKô!KöúûúôKô3KôóKöúDòDKöûúòKòóKöûòóKòóKò öüú†úò@Köúûúò KöúûúòKòKòóKò öüúò%KôKöú†
+úDôlKöúûúò)Köúûúò,KòKöúûúûúò!öûúûú3ûúûúòpKöú6ô6KöúûòKòóöûú"ò$öûúòKöúòöûú,ûúò4KöúûòKòóöúLòLKöúûúûúò&Kòóö
+ûúûúûú†úûúòJKöúûòKòóöûú
+ûúûòöúûúòKöûú	ûúûúûúò8Köúûúò&KòöûúûúûúûòKòKòKöúûúûúòKöûúòóKòóöûúòKöúûúòKòóóKòóöûúòKöú"ò"öûú*ûúò2Köúòöûú*ûúò2KöúûúòKòóKòóKöúûúòKòKòKöúûúûúòKòóóKò
+KòKöœbú£úòKòö
+ûú
+ûúûúûúûúò@KöúûúòKòóöûúûúûúûòöûúòöûúòKöúûúòKöûúûúûúò-KòKòóöûúòKöúûúò	Kò/Köúûúò,KòóóKöûúòóöûúûúòöûúûúòKöûú
+ûòöûúòKô;öúóòóKöúûúûúò)KòóKòóóKöûúûúûúò-KòóKô-KöûúûúûúûúòGKöûúûúò$KòKò óöüú†úûúûúûúûúòMKô4Köú(ò(Köúûúûúò7Köú&ò&Köúûú†:òNKöú	ûú†ò*öûú†NòQKöú
+ûúòöûúûúûòKöúûúò#ò
+KôKöúûúò"öúûúò%KòKòKöúòKòKòóKöúhûú¢IúòΩKöúhòhKòóòKöú8ô8öûúûòòKöú#ûúò(öûúûúòKöúûúòKöûúûúûúò)Köú
+ûúòKöûòKòóKòóKòKò!KöûúûúòóKòóKöûúûúòóKòöûúòKöûúûò	öûú†òKöú#ûúò(öûúûúòKöúûúòKöûúûúûúò)Köú
+ûúòKöûòKòóKöúòóóKöûúòóKòKöú
+ûú>òKKòöûú	òöûúòöûúûúò'öûúòKôKöúûú ûúòAKòKòKòKòKòóöûúòKôKòKòóóKòóöûúòKôKò Kò&öûúòKöûú†1òRKöûúò"óKòóóöú3ò3Kò5Kò0Köú†úò;Köú†úô:Köú%ûú†&ûúô]KòóKòKòóKò öüúûúûú6ûúûúûúûúûúûúûúò¿Kô◊Köú ò KöúòKöú%ò%Köûúûú*ò=öûúûúûúòKöúòKöûúûúûúò2KòóöúûúòKòKöúòKöúòKòKöúòKò#KòKòKòóKöúûúòKöûú ûúûúò-KòKò óöü!úûúòHKöúòKöú%ò%KöúòKöúòKò óöüúûúûú$ûúòFKòKòóKò Kò öüú†úò8Köúûúò)Köúûúò*Kô∏Köúµôµöûú5ûúûúûúòwKò6Köú+ò+KöúûúòKöûúûúûúNò`KòóKòóKò öüúûúûú+ûúûúûúòjKô&Kô9Kôöûúûúûúò;öúûúòKöúòKôIKöúbòbKöú=ò=Kòöûú	ûúòKò4Köúûúò#Köú+ò+KöúûúòKòKöûúûúûú1òCKòóKòóKöûúûú%ò@Köú1ò1KòóKòKò óöüúûúûú?ò\Kô+Kô7Köûúûúûúò)KöúcòcKòóKò öüúûúûúûúûúûúûúûúûúò~Köú"ò"Köú0ò0öûúûò%öúòKöú(ò(Köúûúûúò.Köú4ò4Köúòóöúòöüúûú
+ûúûúûúûúûúûúûúûúò[Köûúûú ò?KöûúòKòóKöúûúûúòKöúûúò!Köúûúûúûúò0Köú&ò&Köú'ò'Köú(ò(KöúòKöúûúò*öûúûúûúûúûúûúûú	ûòBKöúFòFKöûúòóKöú(ò(Köú1ò1KöúòóöûúòKöú
+ûúòKöûúûú'ò;KòóóKòKò óKöûúòKòó Öó    >$  `ı  

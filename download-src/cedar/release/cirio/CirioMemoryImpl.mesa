@@ -1,0 +1,302 @@
+
+DIRECTORY Basics, CirioMemory, CirioNubAccess, IntHashTable, IO, LoadStateAccess, Rope, SymTab;
+
+CirioMemoryImpl: CEDAR PROGRAM
+IMPORTS Basics, CirioMemory, CirioNubAccess, IntHashTable, IO, Rope, SymTab
+EXPORTS CirioMemory
+
+= BEGIN OPEN CirioMemory, LSA:LoadStateAccess;
+
+Error: PUBLIC ERROR [msg: ROPE] ~ CODE;
+
+PtrRegName: ARRAY PtrReg OF ROPE
+~ [fp: "fp", sp: "sp", fe: "fe"];
+
+BaAsAbs: PUBLIC PROC [ba: BitAddr] RETURNS [BitAddr] ~ {
+IF ba.bits<0 THEN {
+ba.bits ¬ ba.bits + bitsPerAu;
+ba.aus ¬ ba.aus - 1;
+IF ba.bits<0 THEN Error["asked to absify a broken BitAddr"];
+};
+RETURN[ba]};
+
+BaCompare: PUBLIC PROC [a, b: BitAddr] RETURNS [Basics.Comparison] ~ {
+a ¬ BaAsAbs[a];
+b ¬ BaAsAbs[b];
+SELECT TRUE FROM
+a.aus < b.aus => RETURN [less];
+a.aus > b.aus => RETURN [greater];
+a.bits < b.bits => RETURN [less];
+a.bits > b.bits => RETURN [greater];
+ENDCASE => RETURN [equal]};
+
+BsCompose: PUBLIC PROC [main, inner: BitStretch] RETURNS [within: BOOL, compd: BitStretch] ~ {
+compd ¬ [main.start.BaAdd[inner.start], IF inner.size=unspecdBA AND main.size#unspecdBA THEN main.size.BaSub[inner.start] ELSE inner.size];
+SELECT TRUE FROM
+BaCompare[inner.size, zeroBA]<equal => within ¬ FALSE;
+main.size=unspecdBA => within ¬ TRUE;
+BaCompare[inner.start, zeroBA]<equal => within ¬ FALSE;
+inner.size=unspecdBA => within ¬ TRUE;
+ENDCASE => within ¬ BaCompare[inner.start.BaAdd[inner.size], main.size]<=equal;
+RETURN};
+
+MemIndirect: PUBLIC PROC [mem: Mem, size: BitAddr ¬ unspecdBA, offset: BitAddr ¬ zeroBA] RETURNS [Mem] ~ {
+base: CARD ~ mem.MemRead[bitsPerPtr, zeroBA];
+RETURN mem.class.CreateSimple[mem.data, [start: PtrToBa[base].BaAdd[offset], size: size], FALSE]};
+
+MemPtrRegIndirect: PUBLIC PROC [mem: Mem, ptrReg: PtrReg, size, offset: BitAddr, keepFrame: BOOL] RETURNS [Mem] ~ {
+ptrVal: BitStretch ~ mem.MemReadPtrReg[ptrReg];
+sub: BitStretch;
+within: BOOL;
+[within, sub] ¬ BsCompose[ptrVal, [start: offset, size: size]];
+IF NOT within THEN Error["MemPtrRegIndirecting out of bounds"];
+RETURN mem.class.CreateSimple[mem.data, sub, keepFrame]};
+
+MemSelectSegment: PUBLIC PROC [mem: Mem, segName: ROPE, segNum: INT, keepFrame: BOOL] RETURNS [Mem] ~ {
+seg: BitStretch ~ mem.MemReadSegReg[segName, segNum];
+RETURN mem.class.CreateSimple[mem.data, seg, keepFrame]};
+
+UMem: TYPE = REF UMemPrivate;
+UMemPrivate: TYPE ~ RECORD [
+nub: CirioNubAccess.Handle,
+ptrs: ARRAY PtrReg OF BitStretch,
+segTables: SymTab.Ref--segName -> IntHashTable.Table(segNum -> REF BitStretch)--,
+rawStart, rawSize: BitAddr];
+
+AintSimple: PROC [um: UMem] RETURNS [BOOL]
+~ INLINE {RETURN[um.rawStart=unspecdBA]};
+
+CreateSimpleMem: PUBLIC PROC[addr: CirioNubAccess.RemoteAddress, size: BitAddr ¬ unspecdBA] RETURNS[Mem] = {
+um: UMem;
+rawStart: BitAddr ¬ BaCons[addr.byteAddress, addr.bitOffset].BaAsAbs;
+IF rawStart=unspecdBA OR addr.nil OR NOT addr.valid THEN Error["trying to construct bogus Simple Mem in RMTWFrames"];
+um ¬ NEW [UMemPrivate ¬ [
+nub: addr.h,
+ptrs: ALL[[unspecdBA, unspecdBA]],
+segTables: SymTab.Create[--case?--],
+rawStart: rawStart,
+rawSize: size.BaAsAbs]];
+RETURN[[uMemClass, um]]};
+
+MakeDualMem: PUBLIC PROC [nub: CirioNubAccess.Handle, fp, sp: CARD, text, data, bss, fep, simple: BitStretch] RETURNS [mem: Mem] ~ {
+um: UMem ¬ NEW [UMemPrivate ¬ [
+nub: nub,
+ptrs: [
+fp: [IF fp=invalidPtr THEN unspecdBA ELSE PtrToBa[fp], unspecdBA],
+sp: [IF sp=invalidPtr THEN unspecdBA ELSE PtrToBa[sp], unspecdBA],
+fe: fep],
+segTables: SymTab.Create[--case?--],
+rawStart: simple.start,
+rawSize: simple.size ]];
+mem ¬ [uMemClass, um];
+IF text#unspecdBS THEN mem ¬ UAddSegReg[mem, "text", 0, text];
+IF data#unspecdBS THEN mem ¬ UAddSegReg[mem, "data", 0, data];
+IF bss#unspecdBS THEN mem ¬ UAddSegReg[mem, "bss", 0, bss];
+RETURN};
+
+UAddSegReg: PROC [mem: Mem, segName: ROPE, segNum: INT, val: BitStretch] RETURNS [--same--Mem] ~ {
+um: UMem ~ NARROW[mem.data];
+segTable: IntHashTable.Table ¬ NARROW[um.segTables.Fetch[segName].val];
+IF segTable=NIL THEN IF NOT um.segTables.Insert[segName, segTable ¬ IntHashTable.Create[]] THEN ERROR;
+IF NOT segTable.Insert[segNum, NEW[BitStretch ¬ val]] THEN Error["redefining segment register"];
+RETURN[mem]};
+
+uMemClass: MemClass ¬ NEW[MemClassPrivate ¬ [UCreateSimple, USubfield, UShift, UGetStretch, URead, UWrite, UReadPtrReg, UReadSegmentReg, USetPtrReg]];
+
+UCreateSimple: PROC [data: REF ANY, stretch: BitStretch, keepFrame: BOOL] RETURNS [Mem] ~ {
+oldUm: UMem ~ NARROW[data];
+new: Mem ¬ CreateSimpleMem[[h: oldUm.nub, byteAddress: stretch.start.aus, bitOffset: stretch.start.bits, nil: FALSE, valid: TRUE], stretch.size];
+newUm: UMem ¬ NARROW[new.data];
+CopySegReg: PROC [segName: ROPE, segNum: INT, val: BitStretch] RETURNS [BOOL]
+~ {[] ¬ UAddSegReg[new, segName, segNum, val]; RETURN[FALSE]};
+IF keepFrame THEN {
+newUm.ptrs ¬ oldUm.ptrs;
+IF UScanSegmentRegs[oldUm, CopySegReg].found THEN ERROR};
+RETURN[new]};
+
+USubfield: PROC [data: REF ANY, rel: BitStretch] RETURNS [Mem] ~ {
+oldUm: UMem ~ NARROW[data];
+newUm: UMem ~ NEW [UMemPrivate ¬ oldUm­];
+within: BOOL;
+IF AintSimple[oldUm] THEN Error["subfield of non-Simple Mem"];
+[within, [newUm.rawStart, newUm.rawSize]] ¬ BsCompose[[oldUm.rawStart, oldUm.rawSize], rel];
+IF NOT within THEN Error["taking subfield that extends outside main"];
+RETURN[[uMemClass, newUm]]};
+
+UShift: PROC [data: REF ANY, offset: BitAddr] RETURNS [Mem] ~ {
+oldUm: UMem ~ NARROW[data];
+newUm: UMem ~ NEW [UMemPrivate ¬ oldUm­];
+IF AintSimple[oldUm] THEN Error["shift of non-Simple Mem"];
+newUm.rawStart ¬ newUm.rawStart.BaAdd[offset];
+RETURN[[uMemClass, newUm]]};
+
+UGetStretch: PROC [data: REF ANY] RETURNS [BitStretch] ~ {
+um: UMem ~ NARROW[data];
+IF AintSimple[um] THEN Error["GetStretch of non-Simple Mem"];
+RETURN[[um.rawStart, um.rawSize]]};
+
+URead: PROC [data: REF ANY, bitSize: CARD, offset: BitAddr] RETURNS [CARD] ~ {
+um: UMem ~ NARROW[data];
+readStart, readSize: BitAddr;
+lmask, ans: CARD;
+within: BOOL;
+afterLastBit: CARD;
+IF AintSimple[um] THEN Error["Read of non-Simple Mem"];
+IF bitSize=0 THEN RETURN [0];
+IF bitSize > 32 THEN Error["trying to read more than 32 bits at once"];
+IF um.rawStart=zeroBA THEN Error["trying to read from NIL address"];
+[within, [readStart, readSize]] ¬ BsCompose[[um.rawStart, um.rawSize], [offset, BitsToBa[bitSize]]];
+readStart ¬ WordAlign[readStart];
+IF NOT within THEN Error["trying to read outside of bounds"];
+lmask ¬ Basics.BITRSHIFT[CARD.LAST, readStart.bits];
+afterLastBit ¬ readStart.bits+bitSize;
+ans ¬ CirioNubAccess.Read32BitsAsCard[[um.nub, readStart.aus, 0, readStart.aus=0, TRUE]]; --doesn't work right with non-0 bitOffset
+ans ¬ Basics.BITAND[ans, lmask];
+IF afterLastBit>32 THEN {
+ans2: CARD ~ CirioNubAccess.Read32BitsAsCard[[um.nub, readStart.aus+4, 0, readStart.aus+4=0, TRUE]];
+ans ¬ Basics.BITOR[
+Basics.BITLSHIFT[ans, afterLastBit-32],
+Basics.BITRSHIFT[ans2, 64-afterLastBit] ];
+RETURN[ans]};
+IF afterLastBit<32 THEN ans ¬ Basics.BITRSHIFT[ans, 32-afterLastBit];
+RETURN[ans]};
+
+UWrite: PROC [data: REF ANY, bits: CARD, bitSize: CARD, offset: BitAddr] ~ {
+um: UMem ~ NARROW[data];
+writeStart, writeSize: BitAddr;
+afterLastBit: CARD;
+within: BOOL;
+IF AintSimple[um] THEN Error["Write of non-Simple Mem"];
+IF bitSize=0 THEN RETURN;
+IF bitSize > 32 THEN Error["trying to write more than 32 bits at once"];
+IF um.rawStart=zeroBA THEN Error["trying to write to NIL address"];
+[within, [writeStart, writeSize]] ¬ BsCompose[[um.rawStart, um.rawSize], [offset, BitsToBa[bitSize]]];
+IF NOT within THEN Error["trying to write outside of bounds"];
+writeStart ¬ WordAlign[writeStart];
+IF (afterLastBit ¬ writeStart.bits+bitSize) > 32 THEN {--split across two words
+lMaskNew: CARD ~ Basics.BITRSHIFT[CARD.LAST, writeStart.bits];
+rMaskNew: CARD ~ Basics.BITLSHIFT[CARD.LAST, 64-afterLastBit];
+lInsNew: CARD ~ Basics.BITRSHIFT[bits, afterLastBit-32];
+rInsNew: CARD ~ Basics.BITLSHIFT[bits, 64-afterLastBit];
+lOld: CARD ~ CirioNubAccess.Read32BitsAsCard[[um.nub, writeStart.aus, 0, writeStart.aus=0, TRUE]];
+rOld: CARD ~ CirioNubAccess.Read32BitsAsCard[[um.nub, writeStart.aus+4, 0, writeStart.aus+4=0, TRUE]];
+lNew: CARD ~ Basics.BITOR[Basics.BITAND[lInsNew, lMaskNew], Basics.BITAND[lOld, Basics.BITNOT[lMaskNew]]];
+rNew: CARD ~ Basics.BITOR[Basics.BITAND[rInsNew, rMaskNew], Basics.BITAND[rOld, Basics.BITNOT[rMaskNew]]];
+CirioNubAccess.WriteCardAs32Bits[[um.nub, writeStart.aus, 0, FALSE, TRUE], lNew];
+CirioNubAccess.WriteCardAs32Bits[[um.nub, writeStart.aus+4, 0, FALSE, TRUE], rNew];
+RETURN}
+ELSE {
+hmn: CARD ~ 2**(bitSize-1);
+maskNew: CARD ~ Basics.BITLSHIFT[hmn+(hmn-1), 32-afterLastBit];
+insNew: CARD ~ Basics.BITLSHIFT[bits, 32-afterLastBit];
+old: CARD ~ CirioNubAccess.Read32BitsAsCard[[um.nub, writeStart.aus, 0, writeStart.aus=0, TRUE]];
+new: CARD ~ Basics.BITOR[Basics.BITAND[insNew, maskNew], Basics.BITAND[old, Basics.BITNOT[maskNew]]];
+CirioNubAccess.WriteCardAs32Bits[[um.nub, writeStart.aus, 0, FALSE, TRUE], new];
+RETURN};
+};
+
+WordAlign: PROC [ba: BitAddr] RETURNS [BitAddr] ~ {
+rem: CARD;
+ba ¬ ba.BaAsAbs[];
+rem ¬ ba.aus MOD 4;
+ba.aus ¬ ba.aus - rem;
+ba.bits ¬ ba.bits + rem*8;
+RETURN[ba]};
+
+UReadPtrReg: PROC [data: REF ANY, ptrReg: PtrReg] RETURNS [BitStretch] ~ {
+um: UMem ~ NARROW[data];
+bs: BitStretch ~ um.ptrs[ptrReg];
+IF bs.start=unspecdBA THEN Error[Rope.Cat["reading undefined pointer register (", PtrRegName[ptrReg], ")"]];
+IF bs.start.bits#0 THEN Error[Rope.Cat["found non-AU-aligned pointer! (", PtrRegName[ptrReg], ")"]];
+RETURN[bs]};
+
+UReadSegmentReg: PROC [data: REF ANY, segName: ROPE, segNum: INT] RETURNS [BitStretch] ~ {
+um: UMem ~ NARROW[data];
+segTable: IntHashTable.Table ~ NARROW[um.segTables.Fetch[segName].val];
+rbs: REF BitStretch;
+IF segTable=NIL THEN Error[IO.PutFR["trying to read non-existing segment register (for \"%q\" (#%g))", [rope[segName]], [integer[segNum]] ]];
+rbs ¬ NARROW[segTable.Fetch[segNum].value];
+IF rbs=NIL THEN Error[IO.PutFR["trying to read non-existing segment register (for #%g of \"%q\")", [integer[segNum]], [rope[segName]] ]];
+RETURN[rbs­]};
+
+USetPtrReg: PROC [data: REF ANY, ptrReg: PtrReg, val: BitStretch] ~ {
+um: UMem ~ NARROW[data];
+um.ptrs[ptrReg] ¬ val;
+RETURN};
+
+UScanSegmentRegs: PROC [data: REF ANY, Consume: PROC [segName: ROPE, segNum: INT, val: BitStretch] RETURNS [BOOL]] RETURNS [found: BOOL ¬ FALSE, itsName: ROPE ¬ NIL, itsNum: INT ¬ 0] ~ {
+um: UMem ~ NARROW[data];
+PerSegTable: PROC [key: ROPE, val: REF ANY] RETURNS [quit: BOOL ¬ FALSE] ~ {
+segName: ROPE ~ key;
+segTable: IntHashTable.Table ~ NARROW[val];
+PerSeg: PROC [key: INT, value: REF ANY] RETURNS [quit: BOOL] ~ {
+rbs: REF BitStretch ~ NARROW[value];
+IF Consume[segName, key, rbs­] THEN {
+found ¬ TRUE;
+itsName ¬ segName;
+itsNum ¬ key};
+RETURN[found]};
+[] ¬ segTable.Pairs[PerSeg];
+RETURN[found]};
+IF um.segTables#NIL THEN [] ¬ um.segTables.Pairs[PerSegTable];
+RETURN};
+
+END.
+   š  
+CirioMemoryImpl.mesa
+Copyright Ó 1991, 1992 by Xerox Corporation.  All rights reserved.
+Laurie Horton, September 20, 1991 8:36 am PDT
+Last tweaked by Mike Spreitzer April 24, 1992 12:27 pm PDT
+Philip James, February 24, 1992 9:59 am PST
+Willie-s, May 14, 1992 2:22 pm PDT
+Note: ABS[bits] < bitsPerAu.
+Note: 0 <= bits < bitsPerAu.
+MJS, May 23, 1991: As I write this for the first time, I am aware of no constraints on how I treat negatively-sized stretches, as I don't expect them to appear.
+MJS, May 25, 1991: when main.size=unspecdBA, this is a base address from which negative offsets are valid (ie, may be within).
+These cover both Simple and Frame Mems.
+ Ê  –(cedarcode) style•NewlineDelimiter
+™ code™Kšœ
+Ïeœ7™BK™-K™:K™+K™"—K˜ KšÏk	œ4žœ ˜_K˜ šÏnœžœž˜Kšžœ4žœ˜KKšžœ˜—K˜ Kšœžœžœžœ˜.K˜ Kš
+Ÿœžœžœžœžœ˜'K˜ šŸ
+œžœžœž˜ K˜!—K˜ šŸœžœžœžœ˜8šžœžœ˜K˜K˜Kšžœžœ+˜<K˜—Kšžœ˜—K˜ šŸ	œžœžœžœ˜FKšœžœ™K˜K˜Kšœ™šžœžœž˜Kšœžœ˜Kšœžœ˜"Kšœžœ˜!Kšœžœ˜$Kšžœžœ
+˜——K˜ š
+Ÿ	œžœžœžœ
+žœ˜^Kš	œ(žœžœžœžœ˜‹šžœžœž˜Kšœ0žœ˜6Kšœ žœ˜%Kšœ1žœ˜7Kšœ!žœ˜&KšžœH˜OK™ Kšœ~™~—Kšžœ˜—K˜ šŸœžœžœAžœ
+˜jKšœžœ#˜-KšžœTžœ˜b—K˜ š
+Ÿœžœžœ>žœžœ
+˜sKšœ/˜/K˜Kšœžœ˜K˜?Kšžœžœžœ-˜?Kšžœ3˜9—K˜ šŸœžœžœžœ
+žœžœžœ
+˜gKšœ5˜5Kšžœ3˜9—K˜ Kšœžœžœ˜šœžœžœ˜K˜Kšœžœžœ˜!KšœÏc;œ˜QKšœ˜K™'—K˜ šŸ
+œžœžœžœ˜*Kšœžœžœ˜)—K˜ šŸœžœžœ@žœ	˜lKšœ	˜	K˜EKš
+žœžœ
+žœžœžœ=˜ušœžœ˜K˜Kšœžœ˜"Kšœ 	œ˜$Kšœ˜Kšœ˜—Kšžœ˜—K˜ š
+Ÿœžœžœ&žœ,žœ˜„šœžœ˜K˜	˜Kšœžœžœžœ˜BKšœžœžœžœ˜BKšœ	˜	—Kšœ 	œ˜$K˜K˜—K˜Kšžœžœ(˜>Kšžœžœ(˜>Kšžœžœ&˜;Kšžœ˜—K˜ šŸ
+œžœžœ
+žœžœ œ˜bKšœžœ˜Kšœžœ"˜GKšžœ
+žœžœžœžœ@žœžœ˜fKšžœžœžœžœ&˜`Kšžœ˜—K˜ Kšœžœ}˜–K˜ šŸœžœžœžœ"žœžœ
+˜[Kšœžœ˜Kšœnžœ	žœ˜‘Kšœžœ˜šŸ
+œžœžœ
+žœžœžœ˜MKšœ/žœžœ˜>—šžœžœ˜K˜Kšžœ+žœžœ˜9—Kšžœ˜—K˜ š
+Ÿ	œžœžœžœžœ
+˜BKšœžœ˜Kšœžœ˜)Kšœžœ˜Kšžœžœ%˜>K˜\Kšžœžœžœ4˜FKšžœ˜—K˜ š
+Ÿœžœžœžœžœ
+˜?Kšœžœ˜Kšœžœ˜)Kšžœžœ"˜;K˜.Kšžœ˜—K˜ š
+Ÿœžœžœžœžœ˜:Kšœžœ˜Kšžœžœ'˜=Kšžœ˜#—K˜ šŸœžœžœžœžœžœžœ˜NKšœžœ˜K˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšžœžœ!˜7Kšžœžœžœ˜Kšžœžœ3˜GKšžœžœ*˜DK˜dK˜!Kšžœžœžœ+˜=Kšœž	œžœžœ˜4K˜&KšœRžœ )˜ƒKšœžœ˜ šžœžœ˜KšœžœSžœ˜dšœžœ˜Kšœž	œ˜'Kšœž	œ˜*—Kšžœ˜—Kšžœžœž	œ˜EKšžœ˜—K˜ šŸœžœžœžœžœžœ˜LKšœžœ˜K˜Kšœžœ˜Kšœžœ˜Kšžœžœ"˜8Kšžœžœžœ˜Kšžœžœ4˜HKšžœžœ)˜CK˜fKšžœžœžœ,˜>K˜#šžœ/žœ ˜OKš	œ
+žœ
+ž	œžœžœ˜>Kš	œ
+žœ
+ž	œžœžœ˜>Kšœ	žœ
+ž	œ˜8Kšœ	žœ
+ž	œ˜8KšœžœQžœ˜bKšœžœUžœ˜fKšœžœ
+žœžœžœžœ˜jKšœžœ
+žœžœžœžœ˜jKšœ=žœžœ	˜QKšœ?žœžœ	˜SKšžœ˜—šžœ˜Kšœžœ˜Kšœ	žœ
+ž	œ˜?Kšœžœ
+ž	œ˜7KšœžœQžœ˜aKšœžœ
+žœžœžœžœ˜eKšœ=žœžœ˜PKšžœ˜—Kšœ˜—K˜ šŸ	œžœžœ˜3Kšœžœ˜
+K˜Kšœžœ˜K˜K˜Kšžœ˜—K˜ š
+Ÿœžœžœžœžœ˜JKšœžœ˜K˜!KšžœžœR˜lKšžœžœM˜dKšžœ˜—K˜ šŸœžœžœžœžœ
+žœžœ˜ZKšœžœ˜Kšœžœ"˜GKšœžœ˜Kšžœ
+žœžœžœp˜Kšœžœ˜+Kšžœžœžœžœq˜‰Kšžœ˜—K˜ šŸ
+œžœžœžœ&˜EKšœžœ˜K˜Kšžœ˜—K˜ š ŸœžœžœžœŸœžœžœ
+žœžœžœžœ	žœžœžœžœ
+žœ	˜ºKšœžœ˜šŸœžœžœžœžœžœžœžœ˜LKšœ	žœ˜Kšœžœ˜+šŸœžœžœ	žœžœžœžœ˜@Kšœžœžœ˜$šžœžœ˜%Kšœžœ˜K˜K˜—Kšžœ	˜—K˜Kšžœ	˜—Kšžœžœžœ&˜>Kšžœ˜—K˜ Kšžœ˜— …—    )Þ  8~  

@@ -1,0 +1,444 @@
+
+DIRECTORY
+BufferedRefresh, BufferedRefreshTypes, BufferedRefreshPort, CodeTimer, Imager, ImagerBackdoor, ImagerBitmapContext, ImagerDitherContext, ImagerPixel, ImagerSample, ImagerTransformation, Basics, Real;
+
+BufferedRefreshImpl: CEDAR PROGRAM
+IMPORTS BufferedRefreshPort, CodeTimer, Imager, ImagerBackdoor, ImagerBitmapContext, ImagerDitherContext, ImagerPixel, ImagerSample, ImagerTransformation, Basics, Real
+EXPORTS BufferedRefresh =
+BEGIN OPEN BufferedRefresh, BufferedRefreshTypes;
+CreateSandwich: PUBLIC PROC [layers: LIST OF Layer] RETURNS [Sandwich] = {
+sandwich: Sandwich ~ NEW[SandwichObj];
+tail: LIST OF LayerData ¬ NIL;
+FOR list: LIST OF Layer ¬ layers, list.rest UNTIL list = NIL DO
+layerData: LayerData ~ NEW[LayerDataObj ¬ [name: list.first.name, refreshProc: list.first.refreshProc, wantsMap: list.first.backingMap, hasMap: FALSE, drawBkgnd: list.first.drawBkgnd]];
+prev: LIST OF LayerData ~ tail;
+tail ¬ CONS[layerData, NIL];
+IF prev=NIL THEN sandwich.layers ¬ tail ELSE prev.rest ¬ tail;
+ENDLOOP;
+RETURN[sandwich];
+};
+
+FitSandwichToScreen: PUBLIC PROC [sandwich: Sandwich, cw, ch: INTEGER, screen: Imager.Context, cx, cy: INTEGER ¬ 0] = {
+class: ATOM ~ Imager.GetClass[screen];
+IF sandwich.class=class AND sandwich.cw=cw AND sandwich.ch=ch THEN RETURN;
+sandwich.cw ¬ cw;
+sandwich.ch ¬ ch;
+sandwich.cx ¬ cx;
+sandwich.cy ¬ cy;
+sandwich.class ¬ class;
+sandwich.viewerToClient ¬ ImagerTransformation.Scale[1.0];
+sandwich.clientToViewer ¬ ImagerTransformation.Scale[1.0];
+FOR list: LIST OF LayerData ¬ sandwich.layers, list.rest UNTIL list = NIL DO
+layer: LayerData ~ list.first;
+bottomLayer: BOOL ~ (list=sandwich.layers);
+IF layer.hasMap THEN {
+layer.backingMap ¬ NIL;
+layer.backingContext ¬ NIL;
+layer.hasMap ¬ FALSE;
+};
+IF layer.wantsMap THEN {
+box: ImagerSample.Box ~ [min: [0, 0], max: [ch, cw]];
+type: {none, bitmap, dither, cg6} ¬ none;
+IF bottomLayer THEN SELECT TRUE FROM
+class=$Bitmap => type ¬ bitmap;
+Basics.IsBound[LOOPHOLE[ImagerDitherContext.Create]] AND class=ImagerDitherContext.classCode => type ¬ dither;
+class=$CG6 => type ¬ cg6; -- instead of class=ImagerCG6Context.classCode so we can still source-share
+ENDCASE => type ¬ none
+ELSE type ¬ bitmap; -- all layers but the bottom are 1-bit masks
+SELECT type FROM
+bitmap => {
+layer.backingMap ¬ ImagerSample.NewSampleMap[box];
+layer.backingContext ¬ ImagerBitmapContext.Create[
+deviceSpaceSize: box.max,
+scanMode: [down, right],
+surfaceUnitsPerInch: [72.0, 72.0],
+pixelUnits: TRUE,
+fontCacheName: ImagerBitmapContext.classCode];
+ImagerBitmapContext.SetBitmap[layer.backingContext, layer.backingMap];
+};
+dither => {
+screenMap: SampleMap ~ ImagerDitherContext.GetSampleMap[screen];
+bps: ImagerSample.BitsPerSample ~ ImagerSample.GetBitsPerSample[screenMap];
+layer.backingMap ¬ ImagerSample.NewSampleMap[box, bps];
+layer.backingContext ¬ ImagerDitherContext.Create[box.max, [down, right], 
+[72.0, 72.0], TRUE, ImagerDitherContext.classCode];
+BufferedRefreshPort.SetDitherMapFromScreen[layer.backingContext, screen];
+ImagerDitherContext.SetSampleMap[layer.backingContext, layer.backingMap];
+};
+cg6 => {
+bps: ImagerSample.BitsPerSample ~ 8;
+layer.backingMap ¬ ImagerSample.NewSampleMap[box, bps];
+layer.backingContext ¬ BufferedRefreshPort.CreateCG6Context[box.max, TRUE, $CG6];
+BufferedRefreshPort.SetCG6DitherMapFromScreen[layer.backingContext, screen];
+BufferedRefreshPort.SetCG6SampleMap[layer.backingContext, layer.backingMap];
+};
+ENDCASE;
+layer.hasMap ¬ (type#none);
+layer.mapOK ¬ FALSE;
+};
+ENDLOOP;
+};
+
+bigRect: Imager.Rectangle ~ [-Real.LargestNumber, -Real.LargestNumber, Real.LargestNumber, Real.LargestNumber];
+BigButNotTooBig: REAL = 1.0e+18;
+bigButNotTooBigRect: Imager.Rectangle = [-BigButNotTooBig, -BigButNotTooBig, 2*BigButNotTooBig, 2*BigButNotTooBig];
+DrawSandwichInBoxes: PUBLIC PROC [sandwich: Sandwich, screen: Imager.Context, clientToViewer, viewerToClient: Imager.Transformation, clientData: REF, bkgndColor: Imager.Color, ignoreBackingMap: BOOL ¬ FALSE, noBuffer: BOOL ¬ FALSE, changeRects: LIST OF Imager.Rectangle] = {
+drawLayers: PROC ~ {
+FOR list: LIST OF LayerData ¬ sandwich.layers, list.rest UNTIL list = NIL DO
+layer: LayerData ~ list.first;
+bottomLayer: BOOL ~ (list=sandwich.layers);
+IF ignoreBackingMap THEN {
+IF screen#NIL THEN {
+CodeTimer.StartInt[$DrawIgnoreMap2, $Gargoyle];
+[] ¬ DrawLayer[sandwich, screen, layer.refreshProc, layer.drawBkgnd, FALSE, bkgndColor, clientData, bottomLayer, rect];
+CodeTimer.StopInt[$DrawIgnoreMap2, $Gargoyle];
+};
+}
+ELSE IF NOT layer.hasMap THEN {
+IF screen#NIL THEN {
+CodeTimer.StartInt[$DrawNoMap2, $Gargoyle];
+[] ¬ DrawLayer[sandwich, screen, layer.refreshProc, layer.drawBkgnd, FALSE, bkgndColor, clientData, bottomLayer, rect];
+CodeTimer.StopInt[$DrawNoMap2, $Gargoyle];
+};
+}
+ELSE { -- use backing map
+IF NOT layer.mapOK THEN {
+UpdateMap2: PROC = {
+CodeTimer.StartInt[$DrawBackingMap2, $Gargoyle];
+Imager.TranslateT[layer.backingContext, [-sandwich.cx, -sandwich.cy]];
+layer.drawnOn ¬ DrawLayer[sandwich, layer.backingContext, layer.refreshProc, layer.drawBkgnd, TRUE, bkgndColor, clientData, TRUE, bigRect]; -- use bigRect (so the whole layer is recomputed), because if a layer is not OK, it may have been marked that way long ago before the current rect was computed.  To be safe, we will have to transfer the full screen in DoWithBuffer below as well.
+CodeTimer.StopInt[$DrawBackingMap2, $Gargoyle];
+layer.mapOK ¬ TRUE;
+};
+Imager.DoSave[layer.backingContext, UpdateMap2];
+};
+IF screen#NIL THEN
+IF bottomLayer THEN {
+CodeTimer.StartInt[$TransferLayer2, $Gargoyle];
+Imager.DrawPixels[
+context: screen,
+pixelMap: ImagerPixel.MakePixelMap[layer.backingMap],
+colorOperator: ImagerBackdoor.GetBufferColorOperator[screen],
+position: [0, sandwich.ch]
+];
+CodeTimer.StopInt[$TransferLayer2, $Gargoyle];
+}
+ELSE {
+MaskLayer: PROC = {
+Imager.SetColor[screen, Imager.black];
+Imager.MaskBitmap[screen, layer.backingMap, [sandwich.ch, 0]];
+};
+CodeTimer.StartInt[$MaskLayer2, $Gargoyle];
+IF layer.drawnOn THEN Imager.DoSave[screen, MaskLayer];
+CodeTimer.StopInt[$MaskLayer2, $Gargoyle];
+};
+};
+ENDLOOP;
+};
+x, y, w, h: INTEGER;
+rect: Imager.Rectangle;
+FOR list: LIST OF Imager.Rectangle ¬ changeRects, list.rest UNTIL list = NIL DO
+rect ¬ list.first;
+IF rect.x = -Real.LargestNumber THEN {
+x ¬ sandwich.cx; y ¬ sandwich.cy; w ¬ sandwich.cw; h ¬ sandwich.ch;
+}
+ELSE {
+thisRect: Imager.Rectangle ¬ ImagerTransformation.TransformRectangle[clientToViewer, rect];
+x ¬ Real.Floor[thisRect.x];
+y ¬ Real.Floor[thisRect.y];
+w ¬ Real.Ceiling[thisRect.x + thisRect.w]-x;
+h ¬ Real.Ceiling[thisRect.y + thisRect.h]-y;
+};
+sandwich.clientToViewer ¬ clientToViewer;
+sandwich.viewerToClient ¬ viewerToClient;
+IF screen=NIL THEN {
+CodeTimer.StartInt[$NILScreen2, $Gargoyle];
+drawLayers[]; -- just update backing contexts
+CodeTimer.StopInt[$NILScreen2, $Gargoyle];
+}
+ELSE {
+IF noBuffer THEN Imager.ConcatT[screen, viewerToClient]
+ELSE ImagerBackdoor.SetT[screen, idX ! Imager.Error => { -- get rid of Biscrollers transformation
+Imager.ConcatT[screen, viewerToClient]; -- old way if SetT not implemented
+CONTINUE;
+};];
+IF noBuffer
+THEN {
+CodeTimer.StartInt[$NoBuffer2, $Gargoyle];
+Imager.DoSaveAll[context: screen, action: drawLayers];
+CodeTimer.StopInt[$NoBuffer2, $Gargoyle];
+}
+ELSE {
+CodeTimer.StartInt[$DoWithBuffer2, $Gargoyle];
+Imager.DoWithBuffer[context: screen, action: drawLayers, 
+x: x, y: y, w: w, h: h, backgroundColor: bkgndColor];
+CodeTimer.StopInt[$DoWithBuffer2, $Gargoyle];
+};
+};
+ENDLOOP;
+};
+
+DrawSandwich: PUBLIC PROC [sandwich: Sandwich, screen: Imager.Context, clientToViewer, viewerToClient: Imager.Transformation, clientData: REF, bkgndColor: Imager.Color, ignoreBackingMap: BOOL ¬ FALSE, noBuffer: BOOL ¬ FALSE, changeRect: Imager.Rectangle ¬ [-Real.LargestNumber, -Real.LargestNumber, Real.LargestNumber, Real.LargestNumber]] = {
+drawLayers: PROC ~ {
+FOR list: LIST OF LayerData ¬ sandwich.layers, list.rest UNTIL list = NIL DO
+layer: LayerData ~ list.first;
+bottomLayer: BOOL ~ (list=sandwich.layers);
+IF ignoreBackingMap THEN {
+IF screen#NIL THEN {
+CodeTimer.StartInt[$DrawIgnoreMap, $Gargoyle];
+[] ¬ DrawLayer[sandwich, screen, layer.refreshProc, layer.drawBkgnd, FALSE, bkgndColor, clientData, bottomLayer, changeRect];
+CodeTimer.StopInt[$DrawIgnoreMap, $Gargoyle];
+};
+}
+ELSE IF NOT layer.hasMap THEN {
+IF screen#NIL THEN {
+CodeTimer.StartInt[$DrawNoMap, $Gargoyle];
+[] ¬ DrawLayer[sandwich, screen, layer.refreshProc, layer.drawBkgnd, FALSE, bkgndColor, clientData, bottomLayer, changeRect];
+CodeTimer.StopInt[$DrawNoMap, $Gargoyle];
+};
+}
+ELSE { -- use backing map
+IF NOT layer.mapOK THEN {
+UpdateMap: PROC = {
+CodeTimer.StartInt[$DrawBackingMap, $Gargoyle];
+Imager.TranslateT[layer.backingContext, [-sandwich.cx, -sandwich.cy]];
+layer.drawnOn ¬ DrawLayer[sandwich, layer.backingContext, layer.refreshProc, layer.drawBkgnd, TRUE, bkgndColor, clientData, TRUE, bigRect]; -- use bigRect (so the whole layer is recomputed), because if a layer is not OK, it may have been marked that way long ago before the current changeRect was computed.  To be safe, we will have to transfer the full screen in DoWithBuffer below as well.
+CodeTimer.StopInt[$DrawBackingMap, $Gargoyle];
+layer.mapOK ¬ TRUE;
+};
+Imager.DoSave[layer.backingContext, UpdateMap];
+};
+IF screen#NIL THEN
+IF bottomLayer THEN {
+CodeTimer.StartInt[$TransferLayer2, $Gargoyle];
+Imager.DrawPixels[
+context: screen,
+pixelMap: ImagerPixel.MakePixelMap[layer.backingMap],
+colorOperator: ImagerBackdoor.GetBufferColorOperator[screen],
+position: [sandwich.cx, sandwich.ch+sandwich.cy]
+];
+CodeTimer.StopInt[$TransferLayer2, $Gargoyle];
+}
+ELSE {
+MaskLayer: PROC = {
+Imager.SetColor[screen, Imager.black];
+Imager.MaskBitmap[screen, layer.backingMap, [sandwich.ch, 0]];
+};
+CodeTimer.StartInt[$MaskLayer, $Gargoyle];
+IF layer.drawnOn THEN Imager.DoSave[screen, MaskLayer];
+CodeTimer.StopInt[$MaskLayer, $Gargoyle];
+};
+};
+ENDLOOP;
+};
+x, y, w, h: INTEGER;
+IF changeRect.x = -Real.LargestNumber THEN {
+x ¬ sandwich.cx; y ¬ sandwich.cy; w ¬ sandwich.cw; h ¬ sandwich.ch;
+}
+ELSE {
+thisRect: Imager.Rectangle ¬ ImagerTransformation.TransformRectangle[clientToViewer, changeRect];
+x ¬ Real.Floor[thisRect.x];
+y ¬ Real.Floor[thisRect.y];
+w ¬ Real.Ceiling[thisRect.x + thisRect.w]-x;
+h ¬ Real.Ceiling[thisRect.y + thisRect.h]-y;
+};
+sandwich.clientToViewer ¬ clientToViewer;
+sandwich.viewerToClient ¬ viewerToClient;
+IF screen=NIL THEN {
+CodeTimer.StartInt[$NILScreen, $Gargoyle];
+drawLayers[]; -- just update backing contexts
+CodeTimer.StopInt[$NILScreen, $Gargoyle];
+}
+ELSE {
+IF noBuffer THEN Imager.ConcatT[screen, viewerToClient]
+ELSE ImagerBackdoor.SetT[screen, idX ! Imager.Error => { -- get rid of Biscrollers transformation
+Imager.ConcatT[screen, viewerToClient]; -- old way if SetT not implemented
+CONTINUE;
+};];
+IF noBuffer
+THEN {
+CodeTimer.StartInt[$NoBuffer, $Gargoyle];
+Imager.DoSaveAll[context: screen, action: drawLayers];
+CodeTimer.StopInt[$NoBuffer, $Gargoyle];
+}
+ELSE {
+CodeTimer.StartInt[$DoWithBuffer, $Gargoyle];
+Imager.DoWithBuffer[context: screen, action: drawLayers, x: x, y: y, w: w, h: h, backgroundColor: bkgndColor];
+CodeTimer.StopInt[$DoWithBuffer, $Gargoyle];
+}
+};
+};
+
+idX: ImagerTransformation.Transformation = ImagerTransformation.Scale[1.0];
+debug: BOOL ¬ FALSE;
+SetDebug: PROC [t: INT] = {debug ¬ t=1;};
+
+pageBox: Imager.Rectangle ~ [ 0, 0, 8.5*72.0, 11.0*72.0];
+DrawLayer: PROC [sandwich: Sandwich, context: Imager.Context, proc: RefreshProc, drawBkgnd: BOOL, mapUpdate: BOOL, bkgndColor: Imager.Color, clientData: REF ANY ¬ NIL, clear: BOOL ¬ FALSE, changeRect: Imager.Rectangle ¬ [-Real.LargestNumber, -Real.LargestNumber, Real.LargestNumber, Real.LargestNumber]] RETURNS [drewSomething: BOOL ¬ TRUE] = {
+inner: PROC ~ {
+bounds: Imager.Rectangle ¬ [0.0, 0.0, 0.0, 0.0];
+Imager.ConcatT[context, sandwich.clientToViewer];
+
+bounds ¬ ImagerBackdoor.GetBounds[context ! Imager.Error => CONTINUE];
+IF bounds.w=0.0 OR bounds.h=0.0 THEN { -- unknown bounds.  Unlikely case.
+IF drawBkgnd THEN {
+IF mapUpdate OR bkgndColor#NIL THEN {
+IF bkgndColor=NIL THEN Imager.SetColor[context, Imager.white]
+ELSE Imager.SetColor[context, bkgndColor];
+Imager.MaskRectangle[context, IF changeRect.w # Real.LargestNumber THEN changeRect ELSE pageBox];
+};
+}
+ELSE IF clear THEN {
+Imager.SetColor[context, Imager.white];
+Imager.MaskRectangle[context, IF changeRect.w # Real.LargestNumber THEN changeRect ELSE pageBox];
+};
+Imager.SetColor[context, Imager.black]; -- in case the client forgets
+drewSomething ¬ proc[context, IF changeRect.w # Real.LargestNumber THEN changeRect ELSE bigButNotTooBigRect, clientData];
+}
+ELSE { -- known reasonable bounds.  Likely case.
+IF drawBkgnd THEN {
+CodeTimer.StartInt[$LayerBkgnd, $Gargoyle];
+IF mapUpdate OR bkgndColor#NIL THEN {
+IF bkgndColor=NIL THEN Imager.SetColor[context, Imager.white]
+ELSE Imager.SetColor[context, bkgndColor];
+Imager.MaskRectangle[context, IF changeRect.w # Real.LargestNumber THEN changeRect ELSE bounds];
+};
+CodeTimer.StopInt[$LayerBkgnd, $Gargoyle];
+}
+ELSE IF clear THEN {
+CodeTimer.StartInt[$LayerBkgnd, $Gargoyle];
+Imager.SetColor[context, Imager.white];
+Imager.MaskRectangle[context, IF changeRect.w # Real.LargestNumber THEN changeRect ELSE bounds];
+CodeTimer.StopInt[$LayerBkgnd, $Gargoyle];
+};
+Imager.SetColor[context, Imager.black]; -- in case the client forgets
+drewSomething ¬ proc[context, IF changeRect.w # Real.LargestNumber THEN changeRect ELSE bounds, clientData];
+};
+};
+Imager.DoSaveAll[context, inner];
+};
+
+FindLayer: PROC [sandwich: Sandwich, layerName: ATOM] RETURNS [layer: LayerData] = {
+FOR list: LIST OF LayerData ¬ sandwich.layers, list.rest UNTIL list = NIL DO
+IF list.first.name = layerName THEN RETURN[list.first];
+ENDLOOP;
+ERROR;
+};
+
+SetLayerOK: PUBLIC PROC [sandwich: Sandwich, layerName: ATOM, ok: BOOL] = {
+layer: LayerData ~ FindLayer[sandwich, layerName];
+layer.mapOK ¬ ok;
+};
+
+GetLayerOK: PUBLIC PROC [sandwich: Sandwich, layerName: ATOM] RETURNS [ok: BOOL] = {
+layer: LayerData ~ FindLayer[sandwich, layerName];
+ok ¬ layer.mapOK;
+};
+
+RepairLayer: PUBLIC PROC [sandwich: Sandwich, layerName: ATOM, proc: RefreshProc, 
+bkgndColor: Imager.Color, clientData: REF ANY ¬ NIL, clear: BOOL ¬ FALSE] = {
+layer: LayerData ~ FindLayer[sandwich, layerName];
+IF layer.hasMap AND (clear OR layer.mapOK) THEN {
+DoRepairLayer: PROC = {
+Imager.TranslateT[layer.backingContext, [-sandwich.cx, -sandwich.cy]];
+layer.drawnOn ¬ DrawLayer[sandwich, layer.backingContext, proc, FALSE, TRUE, bkgndColor, clientData, clear];
+layer.mapOK ¬ TRUE;
+};
+Imager.DoSave[layer.backingContext, DoRepairLayer];
+};
+};
+
+SameSizeMaps: PROC [a, b: SampleMap] RETURNS [BOOL] = {
+RETURN[ImagerSample.GetBox[a]=ImagerSample.GetBox[b]];
+};
+
+SaveLayer: PUBLIC PROC [sandwich: Sandwich, layerName: ATOM] = {
+layer: LayerData ~ FindLayer[sandwich, layerName];
+IF NOT layer.hasMap THEN RETURN;
+IF layer.savedMap#NIL AND SameSizeMaps[layer.savedMap, layer.backingMap] THEN {
+ImagerSample.Transfer[dst: layer.savedMap, src: layer.backingMap];
+}
+ELSE {
+layer.savedMap ¬ ImagerSample.Copy[layer.backingMap];
+};
+};
+
+RestoreLayer: PUBLIC PROC [sandwich: Sandwich, layerName: ATOM] = {
+layer: LayerData ~ FindLayer[sandwich, layerName];
+IF NOT layer.hasMap THEN RETURN;
+IF layer.savedMap#NIL AND SameSizeMaps[layer.savedMap, layer.backingMap] THEN {
+IF Imager.GetClass[layer.backingContext]=ImagerBitmapContext.classCode THEN {
+temp: Imager.SampleMap ~ layer.backingMap;
+layer.backingMap ¬ layer.savedMap;
+layer.savedMap ¬ temp;
+ImagerBitmapContext.SetBitmap[layer.backingContext, layer.backingMap];
+}
+ELSE ImagerSample.Transfer[dst: layer.backingMap, src: layer.savedMap];
+};
+};
+
+END.
+
+
+  
+f  BufferedRefreshImpl.mesa
+Copyright Ó 1986, 1987, 1988, 1989, 1990, 1992 by Xerox Corporation.  All rights reserved.
+Contents:  Builds up an abstraction of transparent layers onto which shapes can be drawn.  Each layer may have a backing pixel map, in which case it need not be redrawn when other layers change.  This scheme is used by Gargoyle and Solidviews.
+Pier, June 25, 1993 11:37 am PDT
+Bier, July 13, 1993 4:35 pm PDT
+Doug Wyatt, September 15, 1989 3:49:32 pm PDT
+Michael Plass, March 25, 1992 11:51 am PST
+
+ [Artwork node; type 'ArtworkInterpress on' to command tool] 
+Layers should be specified in back to front order.
+Tells the sandwich how big its buffers need to be.  cx and cy specify the position of the lower left hand corner of the buffers.
+Construct the layer backing maps.
+keyword syntax is used here for compatibility with the Cedar7.0 version of ImagerBitmapContext.Create
+The color map is synchronized in case we are running on X or some other platform that can change the color map.
+Draw each of the layers
+following DrawPixels call courtesy MP. June 25, 1993.
+Compute x, y, w, h, and rect, which are free variables in drawLayers.
+IF ignoreBackingMap AND noBuffer THEN Imager.ConcatT[screen, viewerToClient]
+So MMM nested editors will work.  For these cases, viewerToClient means editorToClient
+Including a backgroundColor argument speeds up the call by nearly a factor of 2 since the command doesn't need to read the existing pixels.
+Draw each of the layers
+following DrawPixels call courtesy MP. June 25, 1993.
+IF ignoreBackingMap AND noBuffer THEN Imager.ConcatT[screen, viewerToClient]
+So MMM nested editors will work.  For these cases, viewerToClient means editorToClient
+Including a backgroundColor argument speeds up the call by nearly a factor of 2 since the command doesn't need to read the existing pixels.
+can raise Imager.Error or return 0 bounds, meaning bounds are unknown
+if bounds are unknown,  use changeRect to draw.
+If this is a background layer: If we're updating a map here than clear to the background color (or white if none).  Otherwise, clear only if the background color is non-NIL.
+For other layers: clear to white if asked.
+Imager.ClipRectangle[context, bounds]; -- UNNECESSARY and BUGGY
+Below, drawBkgnd is FALSE to avoid unintentional clearing of the full background layer
+If the named layer is backed with a bitmap, that bitmap will be copied for later use (see RestoreLayer).
+If the named layer is backed with a bitmap, then that bitmap will be replaced by the bitmap that most recently was saved (see SaveLayer).  This will only happen if the saved bitmap and the current bitmap are of the same size.
+Ê¢  •NewlineDelimiter
+–(cedarcode) style˜ code™Kšœ
+ÏeœO™ZK™óK™ K™K™-K™*K™ —šÏk	˜	Idefault˜Ç—K˜ šÏnœœ˜"Lšœ ˜§Kšœ˜—Kšœœ'˜1IartworkFigure•
+InterpressInterpress/Xerox/3.0  f j k j¡¥“Ä   ¼= ¤ ¨  ‡Ä8¿ :¡£ r jnÄâ­ + ¢ ¨¡¡¨ˆˆˆ£¡ˆ¡¡ÅXeroxÅResearchÅ	RGBLinear£¡¡¦ ç • ” ç¡•¡”­“Ä!Á Äÿ +™Äe 2Äq5 Ä í:  ï—Ä '  \Ä!Á Äÿ +—¡¡¡¡™¢¯“¡¡¨¢·“¢°“Ä!Á Äÿ +™Äe 2Äq5 Ä í:  ï—Ä '  \Ä!Á Äÿ +—¡¸ˆˆˆ£¡ ” ç¢•¢”­“Ä!Á ÄW +™Äe 2Äq5 Ä ô²  ï—Ä '  \Ä!Á ÄW +—¡¡¡¡™¢¯“¡¡¨¢·“¢°“Ä!Á ÄW +™Äe 2Äq5 Ä ô²  ï—Ä '  \Ä!Á ÄW +—¡¸ˆˆˆ£¡ ” ç£•£”­“Ä!Á Ä ¯ +™Äe 2Äq5 Ä ü*  ï—Ä '  \Ä!Á Ä ¯ +—¡¡¡¡™¢¯“¡¡¨¢·“¢°“Ä!Á Ä ¯ +™Äe 2Äq5 Ä ü*  ï—Ä '  \Ä!Á Ä ¯ +—¡¸ˆˆˆ£¡ ” ç¤•¤”­“ÄÈ  ×Ä" +™Äe 2Äq5 Ä¢  ï—Ä '  \ÄÈ  ×Ä" +—¡¡¡¡™¢¯“¡¡¨¢·“¢°“ÄÈ  ×Ä" +™Äe 2Äq5 Ä¢  ï—Ä '  \ÄÈ  ×Ä" +—¡¸¢¯“¡¡¨¢·“¢°“Ä!_ Ä D  k™Ä@… :Ä —¢¥¢¡ Ÿ¡º¢¯“¡¡¨¢·“¢°“ÄVi aÄ~º m™Ä!_ Ä D  k—˜”””£¡ ” ç¥•¥”­“ÄVi aÄRu @™ÄLn GÄ_Ğ A—ÄQ =ÄSd IÄRu @—ÄVi a¡¡¡¡™¢¯“¡¡¨¢·“¢°“ÄVi aÄRu @™ÄLn GÄ_Ğ A—ÄQ =ÄSd IÄRu @—ÄVi a¡¸ˆˆˆ£¡ ” ç¦•¦”­“ÄVi aÄRu @™Ä ¬Ì  ÄSd IÄRu @ÄVi a¡¡¡¡™¢¯“¡¡¨¢·“¢°“ÄVi aÄRu @™Ä ¬Ì  ÄSd IÄRu @ÄVi a¡¸ˆˆˆ£¡ ” ç§•§”­“ÄVi aÄ ¬Ì  ™Ä~º mÄSd IÄ ¬Ì  ÄVi a¡¡¡¡™¢¯“¡¡¨¢·“¢°“ÄVi aÄ ¬Ì  ™Ä~º mÄSd IÄ ¬Ì  ÄVi a¡¸ˆˆˆ£¡ ” ç¨•¨”­“ÄA¡ 7Ä ƒ³  —™Än§ kÄ@… :Ä —Ä' dÄA¡ 7Ä ƒ³  ——¡¡¡¡™¢¯“¡¡¨¢·“¢°“ÄA¡ 7Ä ƒ³  —™Än§ kÄ@… :Ä —Ä' dÄA¡ 7Ä ƒ³  ——¡¸¢¯“¡¡¨¢·“¢°“ÄVi aÄ~º m™Än§ kÄ ƒ³  ——˜¢¯“¡¡¨¢·“¢°“ÄQ =Ä D  k™Ä' dÄ —˜¢¯“¡¡¨¢·“¢°“ÄSd IÄ~º m™ÄA¡ 7Ä ƒ³  ——˜¢¯“¡¡¨¢·“¢°“Ä6õ /ÄK 1™Ä6õ /ÄiC @ÄU* CÄz¿  õÄO¡ :Ä¿ R¡’˜¢¯“¡¡¨¢·“¢°“Ä6õ /ÄK 1™Ä —Õ  „ÄS³ 6—Ä6õ /ÄK 1—Ä&  ÄS³ 6—˜ r j® ¤Äe§ HÄ Õ×  ‹ ¢ ¥ ¨ÅxeroxÅ
+tiogafontsÅHelvetica14£¡ “Ä ¤ ”©•© —¡¡¨  Š¡²“ÁScreen– k é r j® ¤Ä?÷ eÄms † ¢ ¥ ¨ÅxeroxÅ
+tiogafontsÅHelvetica14£¡ “Ä ¤ ”©•© —¡¡¨  Š¡²“ÁClient Coordinates– k é¢¯“¡¡¨¢·“¢°“Ä Ê¬  ©Ä 4 #™Ä Ê¬  ©ÄEE CÄ^ú IÄ ¡Ä  ­Ä º&  Änt u¡’˜¢¯“¡¡¨¢·“¢°“Ä Ê¬  ©Ä 4 #™Ä7x /ÄØ —Ä Ê¬  ©Ä 4 #—ÄT EÄØ —˜ r j® ¤Äb· BÄ §  µ ¢ ¥ ¨ÅxeroxÅ
+tiogafontsÅHelvetica14£¡ “Ä ¤ ”©•© —¡¡¨  Š¡²“ÁViewport– k é¢¯“¡¡¨¢·“¢°“şò™ÄÂ# 5Ä ±-  ’ÄO 9Äg f¡“˜¢¯“¡¡¨¢·“¢°“Ä<¤ EÄ «ª  ·™Ä:{ TÄ*= Äaá }Ä.™ $¡“˜¢¯“¡¡¨¢·“¢°“ÄO 9Äg f™Ä Ä±  Ä Ï/  È—ÄO 9Äg f—Ä{ WÄ İ   İ—˜¢¯“¡¡¨¢·“¢°“Äaá }Ä.™ $™Ä œÔ  ÉÄ…? Ç—Äaá }Ä.™ $—ÄP) jÄU B—˜¢¯“¡¡¨¢·“¢°“ÄVi aÄ`É M™ÄSd I˜¢¯“¡¡¨¢·“¢°“ÄVi aÄE ™ÄSd I˜¢¯“¡¡¨¢·“¢°“ÄQ =ÄÒ  Ç™Ä_Ğ AÄSd IÄRu @—Ä ¬Ì  ˜¢¯“¡¡¨¢·“¢°“ÄVi aÄE ™ÄSd I˜¢¯“¡¡¨¢·“¢°“ÄSd IÄ ¬Ì  ™Ä~º mÄQ =Ä D  k—Ä7	 '˜ r j® ¤%Ä_  ¢ ¥ ¨ÅxeroxÅ
+tiogafontsÅHelvetica14£¡ “Ä ¤ ”©•© —¡¡¨  Š¡²“ÁviewerToClient– k é r j® ¤Ö¾ ¢ ¥ ¨ÅxeroxÅ
+tiogafontsÅHelvetica14£¡ “Ä ¤ ”©•© —¡¡¨  Š¡²“ÁclientToViewer– k é¢¯“¡¡¨¢·“¢°“e™-˜¢¯“¡¡¨¢·“¢°“e™Ä\’  ïÄ Æ™  ú—e—Ä\’  ïÄ º+  ú—˜ r j® ¤5a ¢ ¥ ¨ÅxeroxÅ
+tiogafontsÅHelvetica14£¡ “Ä ¤ ”©•© —¡¡¨  Š¡²“ÁClient Sandwich– k é¢¯“¡¡¨¢·“¢°“ÄMã  ïÄMã  ï™Äiå  ï˜¢¯“¡¡¨¢·“¢°“ÄMã  ïÄMã  ï™—ÄMã  ïÄMã  ï—Ä º  ˆ—˜ r j® ¤)Ä½  ¢ ¥ ¨ÅxeroxÅ
+tiogafontsÅHelvetica14£¡ “Ä ¤ ”©•© —¡¡¨  Š¡²“ÁSandwich Bitmaps– k é¢¯“¡¡¨¢·“¢°“ÄSd IÄ`É M™ÄQ =ÄU ;—˜¢¯“¡¡¨¢·“¢°“ÄSd IÄ ¬Ì  ™ÄQ =ÄÒ  Ç—˜¢¯“¡¡¨¢·“¢°“ÄSd IÄE ™ÄQ =ÄI  5—˜ k é k g•Artwork
+Interpress•Bounds90.0 mm xmin 0.0 mm ymin 171.8028 mm xmax 88.3587 mm ymax –G91.18092 mm topLeading 91.18092 mm topIndent 1.411111 mm bottomLeading šŸ=™=unitšŸœœœ
+œœœ˜JK™2Kšœœ˜&Kšœœœœ˜šœœœœœ˜?Kšœœvœ$˜¹Kšœœœ˜Kšœœœ˜Kšœœœœ˜>Kšœ˜—Kšœ˜K˜K˜ —š
+Ÿœœœœ"œ	˜wL™€Kšœœ˜&Kš
+œœœœœ˜JK˜K˜K˜K˜K˜NšÏb!™!K˜:K˜:šœœœ(œœ˜LK˜Kšœœ˜+šœœ˜Kšœœ˜Kšœœ˜Kšœœ˜K˜—šœœ˜K•	CharPropsjPostfix0.83333 1 0.7 textColor Postfix0.83333 1 0.7 textColor Postfix0.83333 1 0.7 textColor˜5K˜)š	œœœœ˜$K˜Kšœœœ6˜nKšœÏcK˜eKšœ˜—Kšœ¡,˜@šœ˜˜K˜2˜2K˜K˜K˜"Kšœœ˜K˜.K™e—K˜FK˜—˜K™oK˜@K˜KK˜7KšœYœ!˜~Kšœ œ˜IK˜IK˜—˜K˜$K˜7KšœEœ˜QKšœŸœ˜LK˜LK˜—Kšœ˜—K˜Kšœœ˜K˜—Kšœ˜—K˜K˜ —K˜oKšœœ˜ K˜sšŸœœqœ.œœœœœœ˜’šœœ˜Kš ™šœœœ(œœ˜LK˜Kšœœ˜+šœœ˜šœœœ˜K˜/Kšœ4 Ğbkœ œ˜wK˜.K˜—K˜—šœœœœ˜šœœœ˜K˜+Kšœ4 ¢œ œ˜wK˜*K˜—K˜—šœ¡˜šœœœ˜šŸ
+œœ˜K˜0K–J* Postfix0.83333 1 0.7 textColor Postfix0.83333 1 0.7 textColor ˜FKšœM ¢œ¢œ¡õ˜K˜/Kšœœ˜K˜—K˜0K˜—šœœ˜šœœ˜K˜/K™5šœ 
+œ˜K˜K˜5K˜=K˜K˜—K˜.K˜—šœ˜šŸ	œœ˜K•StartOfExpansion;[context: Imager.Context, color: ImagerColorDefs.Color]˜&K˜>K˜—K˜+Kšœœ"˜7K˜*K˜——K˜—Kšœ˜—K˜—Kšœœ˜K˜šœœœ+œœ˜OK™EK˜šœœ˜&K˜CK˜—šœ˜K˜[K˜K˜K˜,K˜,K˜—K˜)K˜)šœœœ˜K˜+Kšœ¡˜-K˜*K˜—šœ˜Kšœœ
+œ'™Lšœ
+œ'˜7K™V—šœ5¡(˜aKšœ(¡"˜JKšœ˜	K˜—šœ	˜šœ˜K˜*K˜6K˜)K˜—šœ˜K˜.K˜oK™‹K˜-K˜——K˜—Kšœ˜—L˜N˜ —šŸœœœqœ.œœœœx˜×šœœ˜Kš ™šœœœ(œœ˜LK˜Kšœœ˜+šœœ˜šœœœ˜K˜.Kšœ4 œ! œ˜}K˜-K˜—K˜—šœœœœ˜šœœœ˜K˜*Kšœ4 œ! œ˜}K˜)K˜—K˜—šœ¡˜šœœœ˜šŸ	œœ˜K˜/K–J* Postfix0.83333 1 0.7 textColor Postfix0.83333 1 0.7 textColor ˜FKšœM œ¢œ¢œ¡û˜‡K˜.Kšœœ˜K˜—K˜/K˜—šœœ˜šœœ˜K˜/K™5šœ 
+œ˜K˜K˜5K˜=K–Postfix0.83333 1 0.7 textColor Postfix0.83333 1 0.7 textColor Postfix0.83333 1 0.7 textColor Postfix0.83333 1 0.7 textColor˜0K˜—K˜.K˜—šœ˜šŸ	œœ˜K–;[context: Imager.Context, color: ImagerColorDefs.Color]˜&K˜>K˜—K˜*Kšœœ"˜7K˜)K˜——K˜—Kšœ˜—K˜—Kšœœ˜šœ$œ˜,K˜CK˜—šœ˜K˜aK˜K˜K˜,K˜,K˜—K˜)K˜)šœœœ˜K˜*Kšœ¡˜-K˜)K˜—šœ˜Kšœœ
+œ'™Lšœ
+œ'˜7K™V—šœ5¡(˜aKšœ(¡"˜JKšœ˜	K˜—šœ	˜šœ˜K˜)K˜6K˜(K˜—šœ˜K˜-K˜nK™‹K˜,K˜——K˜—K˜K˜ —K˜KKšœœœ˜KšŸœœœ˜)K˜ K˜9šŸ	œœMœœ(œœœ	œœuœœœ˜Øšœœ˜K˜0K˜1K˜ šœ<œ˜FK™E—šœœœ¡"˜Išœœ˜šœœœœ˜%šœœœ'˜=Kšœ&˜*—Kšœœ#œœ
+˜aK˜—K˜—šœœ˜K˜'Kšœœ#œœ
+˜aK˜—Kš¡/™/Kšœ(¡˜EKšœœ#œœ"˜yK˜—šœ¡)˜0K™­K™*šœœ˜K˜+šœœœœ˜%šœœœ'˜=Kšœ&˜*—Kšœœ#œœ	˜`K˜—K˜*K˜—šœœœ˜K˜+K˜'Kšœœ#œœ	˜`K˜*K˜—Kšœ'¡™?Kšœ(¡˜EKšœœ#œœ˜lK˜—K˜—K˜!K˜K˜ —šŸ	œœ!œœ˜Tšœœœ(œœ˜LKšœœœ˜7Kšœ˜—Kšœ˜K˜K˜ —š
+Ÿ
+œœœ!œœ˜KK˜2K˜K˜K˜ —šŸ
+œœœ!œœœ˜TK˜2Kšœ
+œ˜K˜K˜ —šŸœœœ!œ<œœœ	œœ˜ K˜2šœœœœ˜1šŸœœ˜K™VK–J* Postfix0.83333 1 0.7 textColor Postfix0.83333 1 0.7 textColor ˜FKšœ@¢œœ!˜lKšœœ˜K˜—K˜3K˜—K˜K˜ —šŸœœœœ˜7Kšœ0˜6K˜K˜ —šŸ	œœœ!œ˜@K™hK˜2Kšœœœœ˜ šœœœ0œ˜OK˜BK˜—šœ˜K˜5K˜—K˜K˜ —šŸœœœ!œ˜CK™áK˜2Kšœœœœ˜ šœœœ0œ˜OšœEœ˜MK˜*K˜"K˜K˜FK˜—KšœC˜GK˜—K˜—K˜ Kšœ˜K˜ K˜ — …—    <¤  e¬  

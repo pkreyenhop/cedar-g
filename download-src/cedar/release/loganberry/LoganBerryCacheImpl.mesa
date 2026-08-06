@@ -1,0 +1,683 @@
+DIRECTORY
+Args USING [ Arg, ArgsGet, Error ],
+Atom USING [ GetProp, PutProp, RemProp ],
+BasicTime USING [ earliestGMT, GMT, Period ],
+Commander, CommanderOps, Convert,
+IO,
+List USING [ Sort, CompareProc ],
+LoganBerry,
+LoganBerryClass USING [Class, ClassObject, GetDBSpecifics, Register],
+LoganBerryEntry USING [ CopyEntry, GetAttr ],
+RefID USING [Seal, Reseal, Unseal],
+Rope USING [Compare, Equal, Find, ROPE, Substr],
+SymTab USING [ Create, Delete, EachPairAction, Erase, Fetch, GetSize, Insert, Pairs, Ref, Store, Val ]
+;
+
+LoganBerryCacheImpl: CEDAR MONITOR LOCKS dbinfo USING dbinfo: OpenDBInfo
+
+IMPORTS  Args, Atom, BasicTime, Commander, CommanderOps, Convert, IO, List, LoganBerry, LoganBerryClass, LoganBerryEntry, RefID, Rope, SymTab
+~ BEGIN OPEN IO;
+
+ROPE: TYPE ~ Rope.ROPE;
+Conv: TYPE ~ LoganBerry.Conv;
+OpenDB: TYPE ~ LoganBerry.OpenDB;
+AttributeType: TYPE ~ LoganBerry.AttributeType;
+AttributeValue: TYPE ~ LoganBerry.AttributeValue;
+Entry: TYPE ~ LoganBerry.Entry;
+nullDB: OpenDB~LoganBerry.nullDB;
+
+nilconv: INT = 0;
+
+OpenDBInfo: TYPE = REF OpenDBRecord;
+OpenDBRecord: TYPE = MONITORED RECORD [
+dbName: ROPE,
+realDB: OpenDB¨nullDB,
+realRealDB: OpenDB¨nullDB,
+dbCache: DBCache¨NIL,
+referencesThisInterval: INT¨0,
+isOpen: BOOLEAN¨FALSE,
+primaryKey: AttributeType ¨ NIL,
+writeList: LIST OF REF ANY ¨ NIL
+];
+notInDatabase: Entry ¨ LIST[[$NotInDatabase, "NotInDatabaseValue"]];
+
+Open: PROC [conv: Conv ¨ NIL, dbName: ROPE] RETURNS [db: OpenDB] ~ {
+dbinfo: OpenDBInfo;
+cacheRequestIndex: INT ¨ Rope.Find[s1: dbName, s2: "-CACHED", case: FALSE];
+IF cacheRequestIndex = -1 THEN RETURN[LoganBerry.nullDB];
+dbinfo ¨ GetSharedDB[dbName];
+IF NOT dbinfo.isOpen THEN
+MonitoredOpen[dbinfo, conv, dbinfo.dbName.Substr[len: cacheRequestIndex]];
+RETURN[RefID.Seal[dbinfo]];
+};
+
+MonitoredOpen: ENTRY PROC [dbinfo: OpenDBInfo, conv: Conv, realDBName: ROPE] ~ {
+ENABLE UNWIND => NULL;
+realDB: OpenDB; 
+IF dbinfo.isOpen THEN RETURN; -- lost the race
+realDB ¨ LoganBerry.Open[conv: conv, dbName: realDBName];
+dbinfo.primaryKey ¨
+LoganBerry.Describe[conv: conv, db: realDB].info.indices.first.key;
+dbinfo.realDB ¨ realDB;
+dbinfo.realRealDB ¨ LoganBerryClass.GetDBSpecifics[realDB].dbhandle;
+dbinfo.isOpen ¨ TRUE;
+};
+
+ReadEntry: PROC [conv: Conv ¨ NIL, db: OpenDB, key: AttributeType, value: AttributeValue] RETURNS [entry: Entry, others: BOOLEAN] ~ {
+[entry, others] ¨ ReadEntryI[GetInfo[db], conv, key, value];
+};
+
+ReadEntryI: ENTRY PROC [dbinfo: OpenDBInfo, conv: Conv, key: AttributeType, value: AttributeValue] RETURNS [entry: Entry, others: BOOLEAN¨FALSE] ~ {
+ENABLE UNWIND => NULL;
+primary: BOOL ¨ key=dbinfo.primaryKey;
+e: Entry¨NIL;
+IF primary THEN entry¨ReadCache[dbinfo, value, TRUE];
+IF entry#NIL THEN RETURN[IF entry=notInDatabase THEN NIL ELSE entry];
+[entry, others] ¨
+LoganBerry.ReadEntry[conv: conv, db: dbinfo.realDB, key: key, value: value];
+e ¨ entry;
+IF e = NIL THEN e ¨ notInDatabase;
+IF primary THEN RecordCache[dbinfo, value, e, TRUE];
+RETURN[entry, others];
+};
+
+WriteEntry: PROC [conv: Conv ¨ NIL, db: OpenDB, entry: Entry, log: LoganBerry.LogID ¨ LoganBerry.activityLog, replace: BOOLEAN ¨ FALSE] RETURNS [] ~ {
+WriteEntryI[GetInfo[db], conv, entry, log, replace];
+};
+
+WriteEntryI: ENTRY PROC [dbinfo: OpenDBInfo, conv: Conv, entry: Entry, log: LoganBerry.LogID, replace: BOOLEAN] ~ {
+ENABLE UNWIND => NULL;
+value: ROPE ¨ LoganBerryEntry.GetAttr[entry: entry, type: dbinfo.primaryKey];
+IF value=NIL OR ~writeCaching THEN {
+LoganBerry.WriteEntry[conv: conv, db: dbinfo.realDB, entry: entry, log: log, replace: replace];
+};
+IF value#NIL THEN RecordCache[dbinfo, value, entry, FALSE];
+};
+
+DeleteEntry: PROC [conv: Conv ¨ NIL, db: OpenDB, key: AttributeType, value: AttributeValue] RETURNS [deleted: Entry] ~ {
+deleted ¨ DeleteEntryI[GetInfo[db], conv, key, value];
+};
+
+DeleteEntryI: PROC [dbinfo: OpenDBInfo, conv: Conv, key: AttributeType, value: AttributeValue] RETURNS [deleted: Entry] ~ {
+ENABLE UNWIND => NULL;
+kValue: AttributeValue ¨ value;
+IF writeCaching THEN LoganBerry.Error[$OpNotAvailable, "Can't delete entries while write caching is enabled."];
+IF caching AND key#dbinfo.primaryKey THEN {
+entry: Entry ¨ LoganBerry.ReadEntry[conv: conv, db: dbinfo.realDB, key: key, value: value].entry;
+kValue ¨ LoganBerryEntry.GetAttr[entry, dbinfo.primaryKey];
+};
+LoganBerry.DeleteEntry[conv, dbinfo.realDB, key, value];
+IF ~caching THEN RETURN;
+IF kValue=NIL THEN
+LoganBerry.Error[$OpNotAvailable, "Not enough information to delete entry from cache."];
+[] ¨ dbinfo.dbCache.Delete[kValue];
+};
+
+EnumerateEntries: PROC [db: OpenDB, key: AttributeType, start: AttributeValue ¨ NIL, end: AttributeValue ¨ NIL, proc: LoganBerry.EntryProc] RETURNS [] ~ {
+dbinfo: OpenDBInfo ¨ GetInfo[db];
+LoganBerry.EnumerateEntries[dbinfo.realDB, key, start, end, proc];
+};
+
+GenerateEntries: PROC [conv: Conv ¨ NIL, db: OpenDB, key: AttributeType, start: AttributeValue ¨ NIL, end: AttributeValue ¨ NIL] RETURNS [cursor: LoganBerry.Cursor] ~ {
+dbinfo: OpenDBInfo ¨ GetInfo[db];
+RETURN[LoganBerry.GenerateEntries[conv, dbinfo.realDB, key, start, end]];
+};
+
+
+NextEntry: PROC [conv: Conv, cursor: LoganBerry.Cursor, dir: LoganBerry.CursorDirection]
+RETURNS [Entry] ~ {
+RETURN[LoganBerry.NextEntry[conv, cursor, dir]];
+};
+
+
+EndGenerate: PROC [conv: Conv ¨ NIL, cursor: LoganBerry.Cursor] RETURNS [] ~ {
+LoganBerry.EndGenerate[conv, cursor]; -- Believe it or not, we must get involved!
+};
+
+Close: PROC [conv: Conv ¨ NIL, db: OpenDB] RETURNS [] ~ {
+CloseI[GetInfo[db], conv];
+};
+
+CloseI: ENTRY PROC [dbinfo: OpenDBInfo, conv: Conv] ~ {
+ENABLE UNWIND => NULL;
+WriteOneOff[dbinfo]; -- Write all dirty records
+SymTab.Erase[dbinfo.dbCache]; -- Too dangerous to retain cached values.
+LoganBerry.Close[conv, dbinfo.realDB]; -- Whether open or not.
+dbinfo.isOpen ¨ FALSE;
+};
+
+
+BuildIndices: PROC [conv: Conv ¨ NIL, db: OpenDB] RETURNS [] ~ {
+FlushDBCache[db];
+LoganBerry.BuildIndices[conv, GetInfo[db].realDB];
+};
+
+CompactLogs: PROC [conv: Conv ¨ NIL, db: OpenDB] RETURNS [] ~ {
+FlushDBCache[db];
+LoganBerry.CompactLogs[conv, GetInfo[db].realDB];
+};
+
+Describe: PROC [conv: Conv ¨ NIL, db: OpenDB] RETURNS [info: LoganBerry.SchemaInfo] ~ {
+dbinfo: OpenDBInfo ¨ GetInfo[db];
+info ¨ LoganBerry.Describe[conv, dbinfo.realDB];
+info.dbName ¨ dbinfo.dbName;
+};
+
+IsLocal: PROC [db: LoganBerry.OpenDB] RETURNS [local: BOOL ¨ TRUE] = {
+local ¨ LoganBerry.IsLocal[GetInfo[db].realDB];
+};
+
+StartTransaction: PROC [db: LoganBerry.OpenDB, wantAtomic: BOOLEAN ¨ FALSE] = {
+LoganBerry.StartTransaction[GetInfo[db].realDB, wantAtomic];
+};
+
+EndTransaction: PROC [db: LoganBerry.OpenDB, commit: BOOLEAN ¨ TRUE] RETURNS [committed: BOOLEAN] = {
+committed ¨ EndTransactionI[GetInfo[db], commit];
+};
+
+EndTransactionI: ENTRY PROC [dbinfo: OpenDBInfo, commit: BOOLEAN] RETURNS [committed: BOOLEAN] = {
+ENABLE UNWIND => NULL;
+WriteOneOff[dbinfo]; -- Flush 
+committed ¨ LoganBerry.EndTransaction[dbinfo.realDB, commit];
+};
+
+FlushDBCache: PROC [db: LoganBerry.OpenDB ¨ LoganBerry.nullDB] = {
+dbinfo: OpenDBInfo ¨ IF db=LoganBerry.nullDB THEN NIL ELSE GetInfo[db];
+FlushOpenTable[dbinfo];
+IF dbinfo#NIL THEN LoganBerry.FlushDBCache[dbinfo.realDB];
+};
+
+caching: BOOL ¨ FALSE; -- default is not to do it!
+writeCaching: BOOL ¨ FALSE; -- default is not to do it . . .  by far the advisable course!!
+dateCompare: BOOL ¨ FALSE; -- default is not to do it.  Should be enabled DB by DB, somehow.
+DBCache: TYPE = SymTab.Ref;
+
+referencesPerInterval: INT ¨ 1500;
+minSustainedCacheSize: INT ¨ 3000;
+insertRefCount: INT ¨ 5;
+
+numPrunes: INT¨0;
+numSweeps: INT¨0;
+numNew: INT¨0;
+
+CacheEntry: TYPE~REF CacheEntryRecord;
+CacheEntryRecord: TYPE~RECORD[
+key: LoganBerry.AttributeValue,
+timeFromKey: BasicTime.GMT ¨ BasicTime.earliestGMT,
+entry: LoganBerry.Entry¨NIL,
+cleanEntry: LoganBerry.Entry¨NIL,
+dirty: BOOL¨FALSE,
+refCount: INT¨0
+];
+
+RemoteReadCache: PROC[realDB: LoganBerry.OpenDB, value: AttributeValue]
+RETURNS[entry: Entry ¨ NIL] ~ {
+dbinfo: OpenDBInfo ¨ GetCacheDBFromRealDB[realDB];
+IF dbinfo=NIL THEN RETURN;
+entry ¨ ReadCache[dbinfo, value, FALSE];
+IF entry = notInDatabase THEN entry ¨ NIL;
+};
+
+ReadCache: PROC[dbinfo: OpenDBInfo, value: AttributeValue, reading: BOOL¨TRUE]
+RETURNS[entry: Entry¨NIL] = {
+dbCache: DBCache ¨ dbinfo.dbCache;
+cacheEntry: CacheEntry;
+e: SymTab.Val;
+IF ~caching THEN RETURN[NIL];
+e ¨ SymTab.Fetch[dbCache, value].val;
+IF e=NIL THEN RETURN;
+cacheEntry ¨ NARROW[e];
+IF cacheEntry=NIL THEN RETURN;
+entry ¨ IF reading THEN cacheEntry.entry ELSE cacheEntry.cleanEntry;
+IF entry#NIL AND entry#notInDatabase AND reading THEN
+entry ¨ LoganBerryEntry.CopyEntry[entry]; -- Caller may mess with results.
+cacheEntry.refCount ¨ cacheEntry.refCount.SUCC;
+};
+
+RecordCache: PROC[
+dbinfo: OpenDBInfo, value: AttributeValue, entry: Entry, reading: BOOL] = {
+dbCache: DBCache ¨ dbinfo.dbCache;
+cacheEntry: CacheEntry¨NIL;
+e: SymTab.Val;
+IF ~caching THEN RETURN;
+e ¨ SymTab.Fetch[dbCache, value].val;
+IF e=NIL THEN {
+cacheEntry ¨ NEW[CacheEntryRecord¨[key: value]];
+[] ¨ SymTab.Store[dbCache, value, cacheEntry];
+cacheEntry.timeFromKey ¨ TimeFromKey[value];
+numNew ¨ numNew.SUCC;
+}
+ELSE cacheEntry ¨ NARROW[e];
+cacheEntry.entry ¨ IF reading AND entry#notInDatabase
+THEN LoganBerryEntry.CopyEntry[entry] ELSE entry;
+IF reading OR ~writeCaching THEN cacheEntry.cleanEntry ¨ cacheEntry.entry
+ELSE cacheEntry.dirty ¨ TRUE;
+cacheEntry.refCount ¨ MAX[insertRefCount, cacheEntry.refCount.SUCC];
+dbinfo.referencesThisInterval ¨ dbinfo.referencesThisInterval.SUCC;
+IF dbinfo.referencesThisInterval >= referencesPerInterval THEN PruneCache[dbinfo];
+};
+
+PruneCache: PROC[dbinfo: OpenDBInfo] ~{
+sweepIfBelow: INT¨0;
+minNextSeen: INT¨0;
+mod100: INT¨0;
+cacheSize: INT;
+dbCache: DBCache ¨ dbinfo.dbCache;
+dbinfo.writeList ¨ NIL;
+numPrunes ¨ numPrunes.SUCC;
+WHILE (cacheSize¨SymTab.GetSize[dbCache])>minSustainedCacheSize DO
+PruneOneEntry: SymTab.EachPairAction ~ {
+cacheEntry: CacheEntry ¨ NARROW[val];
+IF cacheEntry.refCount<=sweepIfBelow THEN {
+WriteOneEntry[dbinfo, cacheEntry]; -- only if dirty, of course.
+[]¨SymTab.Delete[dbCache, cacheEntry.key];
+cacheSize¨cacheSize.PRED;
+IF cacheSize<=minSustainedCacheSize THEN RETURN[TRUE];
+}
+ELSE minNextSeen ¨ MIN[minNextSeen, cacheEntry.refCount];
+cacheEntry.refCount ¨ 0;
+};
+numSweeps ¨ numSweeps.SUCC;
+[]¨SymTab.Pairs[dbCache, PruneOneEntry];
+IF minNextSeen<=sweepIfBelow THEN EXIT; -- ??  Should note this.
+sweepIfBelow ¨ minNextSeen;
+ENDLOOP;
+WriteDeferredList[dbinfo];
+dbinfo.referencesThisInterval ¨ 0;
+};
+
+WriteOneEntry: PROC[db: OpenDBInfo, cacheEntry: CacheEntry] ~ {
+IF cacheEntry=NIL OR ~cacheEntry.dirty THEN RETURN;
+db.writeList ¨ CONS[cacheEntry, db.writeList];
+};
+
+WriteOneOff: INTERNAL PROC[dbinfo: OpenDBInfo] ~{
+WriteOneEntryOff: SymTab.EachPairAction ~ {
+cacheEntry: CacheEntry ¨ NARROW[val];
+WriteOneEntry[dbinfo, cacheEntry];
+};
+IF ~writeCaching THEN RETURN;
+dbinfo.writeList ¨ NIL;
+[] ¨ SymTab.Pairs[dbinfo.dbCache, WriteOneEntryOff];
+WriteDeferredList[dbinfo];
+};
+
+WriteOffLocked: ENTRY PROC[dbinfo: OpenDBInfo] ~ {
+ENABLE UNWIND => NULL; WriteOneOff[dbinfo]; };
+
+WriteCachingOff: PROC ~{
+WriteOneCacheOff: SymTab.EachPairAction ~ {
+dbinfo: OpenDBInfo ¨ NARROW[val];
+IF dbinfo=NIL THEN RETURN;
+WriteOffLocked[dbinfo];
+};
+[]¨SymTab.Pairs[OpenDBTable, WriteOneCacheOff];
+writeCaching ¨ FALSE;
+};
+
+EraseEntry: ENTRY PROC[dbinfo: OpenDBInfo] ~ {
+ENABLE UNWIND => NULL;
+WriteOneOff[dbinfo];
+SymTab.Erase[dbinfo.dbCache];
+dbinfo.referencesThisInterval ¨ 0;
+};
+
+FlushOpenTable: PROC [dbinfo: OpenDBInfo ¨ NIL] = {
+FlushOneCache: SymTab.EachPairAction ~ {
+dbinfo: OpenDBInfo ¨ NARROW[val];
+EraseEntry[dbinfo];
+};
+IF dbinfo # NIL
+THEN  []¨FlushOneCache[NIL, dbinfo]
+ELSE []¨SymTab.Pairs[OpenDBTable, FlushOneCache];
+};
+
+WriteDeferredList: PROC[dbinfo: OpenDBInfo] ~ {
+IF dbinfo.writeList=NIL THEN RETURN;
+dbinfo.writeList ¨ List.Sort[dbinfo.writeList, Compare];
+FOR remList: LIST OF REF ANY ¨ dbinfo.writeList, remList.rest WHILE remList#NIL DO
+WriteOneEntryDeferred[dbinfo, NARROW[remList.first]];
+ENDLOOP;
+dbinfo.writeList ¨ NIL;
+};
+
+WriteOneEntryDeferred: PROC[dbinfo: OpenDBInfo, cacheEntry: CacheEntry] ~ {
+entry: Entry;
+IF cacheEntry=NIL OR ~cacheEntry.dirty THEN RETURN; -- eh?
+entry ¨ cacheEntry.entry;
+IF entry=NIL THEN RETURN;
+LoganBerry.WriteEntry[db: dbinfo.realDB, entry: entry, replace: TRUE];
+cacheEntry.cleanEntry ¨ cacheEntry.entry;
+cacheEntry.dirty ¨ FALSE;
+};
+
+Compare: List.CompareProc ~{
+cacheEntry1: CacheEntry ¨ NARROW[ref1];
+cacheEntry2: CacheEntry ¨ NARROW[ref2];
+t1: BasicTime.GMT ¨ cacheEntry1.timeFromKey;
+t2: BasicTime.GMT ¨ cacheEntry2.timeFromKey;
+RETURN[IF t1=t2 THEN Rope.Compare[cacheEntry1.key, cacheEntry2.key, FALSE]
+ELSE IF BasicTime.Period[t1, t2]>0 THEN less ELSE greater];
+};
+
+TimeFromKey: PROC[key: ROPE] RETURNS [time: BasicTime.GMT] ~ INLINE {
+index: INT;
+IF ~dateCompare THEN RETURN[BasicTime.earliestGMT];
+index ¨ Rope.Find[key, "@", 0];
+IF index=-1 THEN RETURN[BasicTime.earliestGMT];
+time ¨ Convert.TimeFromRope[Rope.Substr[key, index+1]!
+Convert.Error => { time ¨ BasicTime.earliestGMT; CONTINUE;}];
+};
+
+GetCacheDBFromRealDB: PROC[realDB: LoganBerry.OpenDB]
+RETURNS [dbinfo: OpenDBInfo¨NIL] ~ {
+IsThisIt: SymTab.EachPairAction~{
+db: OpenDBInfo ¨ NARROW[val];
+IF db.realRealDB=realDB THEN { dbinfo ¨ db; RETURN[TRUE]; };
+};
+[]¨SymTab.Pairs[OpenDBTable, IsThisIt];
+};
+
+OpenDBTable: SymTab.Ref;
+
+OpenDBTableSize: NAT = 2039;
+GetInfo: PROC [db: OpenDB] RETURNS [OpenDBInfo] ~ INLINE {
+ref: REF = RefID.Unseal[db];
+IF ref = NIL THEN
+ERROR LoganBerry.Error[$BadDBHandle, "NIL OpenDB handle."];
+WITH ref SELECT FROM
+dbinfo: OpenDBInfo => {
+RETURN[dbinfo];
+};
+ENDCASE => ERROR LoganBerry.Error[$BadDBHandle, "Invalid OpenDB handle."];
+};
+
+GetSharedDB: PROC [dbName: ROPE] RETURNS [dbinfo: OpenDBInfo] ~ {
+dbinfo ¨ NARROW[SymTab.Fetch[OpenDBTable, dbName].val];
+IF dbinfo = NIL THEN {
+dbinfo ¨ NEW[OpenDBRecord];
+dbinfo.dbName ¨ dbName;
+dbinfo.isOpen ¨ FALSE;
+dbinfo.dbCache ¨ SymTab.Create[];
+IF NOT SymTab.Insert[OpenDBTable, dbName, dbinfo] THEN  -- lost race
+dbinfo ¨ NARROW[SymTab.Fetch[OpenDBTable, dbName].val];
+};
+};
+
+LBCacheStats: Commander.CommandProc~{
+dbinfo: OpenDBInfo ¨ GetSharedDB[CommanderOps.NextArgument[cmd]];
+CacheStats[cmd, dbinfo]
+};
+
+CacheStats: PROC[cmd: Commander.Handle, dbinfo: OpenDBInfo] ~{
+IO.PutF[cmd.out,
+"pK: %g, refsThis: %g, sizeNow: %g",
+atom[dbinfo.primaryKey], 
+int[dbinfo.referencesThisInterval], 
+int[SymTab.GetSize[dbinfo.dbCache]]
+];
+IO.PutF[cmd.out,
+", prunes: %g, sweeps: %g, new: %g\n",
+int[numPrunes], int[numSweeps],
+int[numNew]
+];
+};
+
+LBCachedDBs: Commander.CommandProc~{
+LBCachedDB: SymTab.EachPairAction~{
+dbinfo: OpenDBInfo ¨NARROW[val];
+IO.PutF[cmd.out,
+"tabName: %g, dbName: %g, dbID: %g",
+rope[key], 
+rope[dbinfo.dbName], 
+card[RefID.Reseal[dbinfo]]
+];
+IO.PutF[cmd.out,
+", realDBID: %g, open: %g\n",
+card[dbinfo.realDB], 
+bool[dbinfo.isOpen]
+];
+CacheStats[cmd, dbinfo]
+};
+[]¨SymTab.Pairs[OpenDBTable, LBCachedDB];
+};
+
+LBParameterCommand: Commander.CommandProc~{
+foundOne: BOOL¨FALSE;
+GetInt: PROC[arg: Args.Arg, current: INT] RETURNS[new: INT] ~ {
+IF arg.ok THEN foundOne ¨ TRUE;
+new ¨ IF arg.ok THEN arg.int ELSE current;
+IF arg.ok THEN IF msg=NIL THEN msg ¨ IO.PutFR1["(%g)", int[new]]
+ELSE msg ¨ "";
+};
+GetOnOff: PROC[arg: Args.Arg, current: BOOL] RETURNS[new: BOOL] ~ {
+IF arg.ok THEN foundOne ¨ TRUE;
+new ¨ SELECT TRUE FROM
+NOT arg.ok => current,
+arg.rope.Equal["on", FALSE] => TRUE,
+ENDCASE => FALSE;
+IF arg.ok THEN msg ¨ IF msg#NIL THEN "" ELSE IF new THEN "(on)" ELSE "(off)"
+};
+cSize, cStretch, cCaching, cWriteCaching, cDateCompare: Args.Arg;
+newWriteCaching: BOOL¨FALSE;
+[cSize, cStretch, cCaching, cWriteCaching, cDateCompare] ¨ Args.ArgsGet[cmd, "-cacheSize%i-cacheStretch%i-caching%s-writeCaching%s-dateCompare%s" ! Args.Error => {
+IO.PutRope[cmd.err, infoRope];
+result ¨ $Failure; 
+GOTO BOMB
+}];
+IF cSize.ok THEN{ numNew ¨ numSweeps ¨ numPrunes ¨ 0; };
+minSustainedCacheSize ¨ GetInt[cSize, minSustainedCacheSize];
+referencesPerInterval ¨ GetInt[cStretch, referencesPerInterval];
+dateCompare ¨ GetOnOff[cDateCompare, dateCompare];
+caching ¨ GetOnOff[cCaching, caching];
+newWriteCaching ¨ GetOnOff[cWriteCaching, writeCaching];
+SELECT TRUE FROM
+NOT cCaching.ok => NULL;
+caching => Atom.PutProp[$LoganBerry, $RemoteReadCache, remoteReadCache];
+ENDCASE => Atom.RemProp[$LoganBerry, $RemoteReadCache];
+SELECT TRUE FROM
+NOT cWriteCaching.ok => NULL;
+newWriteCaching => writeCaching ¨ TRUE;
+ENDCASE => WriteCachingOff;
+IF NOT foundOne THEN {
+cmd.out.PutF["caching: %g\nwriteCaching: %g\ncacheSize: %g\n", bool[caching], bool[newWriteCaching], int[minSustainedCacheSize]];
+cmd.out.PutF["cacheStretch: %g\ndateCompare: %g\n", int[referencesPerInterval], bool[dateCompare]];
+};
+EXITS
+BOMB => NULL;
+};
+
+infoRope: Rope.ROPE ~ "Usage: LBParam [-cacheSize <numEntries> | -cacheStretch <numEntries> | -caching (on|off) | -writeCaching (on|off) | -dateCompare (on|off)]\n";
+class: LoganBerryClass.Class;
+RRC: TYPE ~ RECORD[
+readCache: PROC[LoganBerry.OpenDB, AttributeValue] RETURNS [Entry]
+];
+remoteReadCache: REF RRC ¨ NEW[RRC ¨ [RemoteReadCache]];
+
+
+Init: PROC ~ {
+OpenDBTable ¨ NARROW[Atom.GetProp[$LoganBerry, $OpenCachedDBTable]];
+IF OpenDBTable = NIL THEN {
+OpenDBTable ¨ SymTab.Create[mod: OpenDBTableSize, case: FALSE];
+Atom.PutProp[$LoganBerry, $OpenCachedDBTable, OpenDBTable];
+};
+LoganBerryClass.Register[name: class.name, class: class];
+Commander.Register["LBParameter", LBParameterCommand];
+Commander.Register["LBCachedDBs", LBCachedDBs];
+Commander.Register["LBCacheStats", LBCacheStats];
+};
+
+class ¨ NEW[LoganBerryClass.ClassObject ¨ [
+name: $CachedDB, 
+open: Open,
+describe: Describe,
+readEntry: ReadEntry,
+enumerateEntries: EnumerateEntries,
+generateEntries: GenerateEntries,
+nextEntry: NextEntry,
+endGenerate: EndGenerate,
+writeEntry: WriteEntry,
+deleteEntry: DeleteEntry,
+close: Close,
+buildIndices: BuildIndices,
+compactLogs: CompactLogs,
+isLocal: IsLocal,
+startTransaction: StartTransaction,
+endTransaction: EndTransaction,
+flushDBCache: FlushDBCache,
+classData: NIL
+]];
+
+Init[];
+
+END.
+Commander.Register["LBCachesDump", LBCachesDump];
+
+LBCachesDump: Commander.CommandProc~{
+DumpOpenTables[cmd.out, CommanderOps.NextArgument[cmd]];
+};
+
+DumpOpenTables: PROC [out: IO.STREAM, filter: ROPE¨NIL] = {
+dbName: ROPE ¨ NIL;
+DumpOneCache: SymTab.EachPairAction ~ {
+db: OpenDBInfo ¨ NARROW[val];
+DumpOneEntry: SymTab.EachPairAction ~ {
+cacheEntry: CacheEntry ¨ NARROW[val];
+IF cacheEntry=NIL THEN RETURN[FALSE];
+db.writeList ¨ CONS[cacheEntry, db.writeList];
+};
+DumpOneEntryDeferred: PROC[cacheEntry: CacheEntry] ~ {
+IF cacheEntry=NIL THEN RETURN;
+DE[cacheEntry.entry, filter, FALSE, IF cacheEntry.dirty THEN '_ ELSE ':];
+IF cacheEntry.cleanEntry#NIL AND cacheEntry.entry#cacheEntry.cleanEntry
+THEN DE[cacheEntry.cleanEntry, filter, TRUE, ':];
+};
+DE: PROC[entry: LoganBerry.Entry, filter: ROPE, old: BOOL, dirtyInd: CHAR] ~ {
+prefix: ROPE ¨ IF old THEN "old> " ELSE NIL;
+IF filter#NIL THEN {
+kVal: AttributeValue ¨ LoganBerryEntry.GetAttr[entry, db.primaryKey];
+IF Rope.Find[kVal, filter, 0]=-1 THEN RETURN;
+};
+FOR e: LoganBerry.Entry ¨ entry, e.rest WHILE e#NIL DO
+IO.PutF[out, "   %g%g%g %g\n", rope[prefix], atom[e.first.type], char[dirtyInd], rope[e.first.value]];
+ENDLOOP;
+IF entry#NIL THEN IO.PutChar[out, '\n];
+};
+IF db=NIL THEN RETURN;
+db.writeList ¨ NIL;
+[]¨SymTab.Pairs[db.dbCache, DumpOneEntry];
+IO.PutF[out, "Contents of cache for database %g\n", rope[db.dbName]];
+IF db.writeList=NIL THEN RETURN;
+db.writeList ¨ List.Sort[db.writeList, Compare];
+FOR remList: LIST OF REF ANY ¨ db.writeList, remList.rest WHILE remList#NIL DO
+DumpOneEntryDeferred[NARROW[remList.first]];
+ENDLOOP;
+db.writeList ¨ NIL;
+};
+[]¨SymTab.Pairs[OpenDBTable, DumpOneCache];
+};
+
+   ∆  
+LoganBerryCacheImpl.mesa
+Copyright ” 1991, 1992 by Xerox Corporation.  All rights reserved.
+Derived From LoganBerrySunStubImpl
+Swinehart, October 4, 1991 5:53 pm PDT
+Christian Jacobi, April 23, 1992 10:45 am PDT
+
+Provides a cached front-end to LoganBerry databases.  Dangerous if database is being updated by more than one client at once.  Speeds performance of ReadEntry[...primary key....].  Doesn't support activity log stuff in WriteEntry.   ReadEntry[].others is not always reliable.
+
+This implementation both raises some of its own LoganBerry errors and lets some of the real ones through.  This may eventually be confusing, since the DB in effect at the time may be different. 
+
+This implementation is willing to do non-write-through caching of entries.  The feature is of limited value: any attempt to access entries while LBWriteCaching is asserted through any key other than the primary one, or any concurrent attempts to write, are fraught with peril.  This feature is supported only for those who have consulted the author(s).
+Willie-s, April 23, 1992 5:18 pm PDT
+
+-- Operations are monitored to avoid thinking, for the present.
+EXPORTS LoganBerry indirectly by registering with LoganBerryClass
+Class methods -- cached operations.
+Since this implementation locks accesses to individual dbs, the locking during open is complicated (no record to lock yet).  See LoganBerryImpl for how this works.
+oldEntry _ IF value#NIL THEN ReadCache[dbinfo, value, FALSE] ELSE NIL;
+IF oldEntry = notInDatabase THEN oldEntry_NIL;
+Class methods -- pass on.
+Procedures are not locked that do not do anything of local interest.
+
+Permit NextEntry, EndGenerate to be fielded directly by the underlying real DB, until further notice.
+Believe it or not, we actually have to forward this!  The cursor we get from the ClassImpl is the next cursor down, and the ClassImpl has to dispatch on it.
+But we never really close ourselves.  It has no useful meaning.
+Next two not completely safe, but shouldn't be doing this with stuff running anyhow.
+Causes LoganBerry to flush all cached information about the specific database, or about all databases if db=nullDB.  This may be necessary if the schema has changed, for instance.
+If this is done with dirty entries in the cache, we're in trouble!
+Otherwise, the system will take care of the underlying DB
+Caching
+This package caches LoganBerry entries that are read and written using the above procedures.  At present, it only works if only one database is used with the cache, and if the only read and write accesses that use the cache refer to the database's primary key.  It maintains a single cache of up to minSustainedCacheSize+referencesPerInterval entries; once every referencesPerInterval reads, the cache is pruned to contain no more than minSustainedCacheSize entries.  An initial write to an entry produces a beginning reference count of insertRefCount.
+
+
+For cache pruning
+For debugging and statistics
+Other applications can read the cache by calling this procedure, found (if caching) registered in the appropriate place on an atom -- see below.  This is not monitor-protected, so there's a bit of danger.
+
+IF ~reading, then current (clean) DB copy of cache value is being read for the benefit of the superclass
+Deal with LRU stuff here.
+"reading" means the value has just been read from the DB and is being inserted into the cache.  Otherwise, the value is being written into the DB from the application.  The cleanEntry field will be occupied only if the value exists in the database.
+Flushes one or all databases from the OpenDBTable.
+Handles
+2039 is a good candidate because it is prime and is large enough that collisions should be rare.
+
+Unseals the database handle and ensures that it's valid.
+Remember: this routine is not called under a monitor lock.  If several clients try to create an OpenDBRecord concurrently, the first one to register with the OpenDBTable wins.
+Can't do full name processing, because name might be remote.  Have to believe the name will be presented the same way each time.
+Commander operations
+Class registration
+
+Obsolete stuff
+
+Causes LoganBerry to flush all cached information about the specific database, or about all databases if db=nullDB.  This may be necessary if the schema has changed, for instance.
+
+ù ´  ïNewlineDelimiter
+ñ(cedarcode) styleô öúôIcodeöú
+œeú7ôBKô"Kô&Kô-Kô KöúìôìKô Kô¬Kô Kô‡Kô$Kô óöœk	ò	Köúûúò#Köúûúò)Köú
+ûúûúò-Kò!KöûúòKöúûúò!KòKöúûú0òEKöúûúò-Köúûúò#Köúûúûú
+ò0KöúûúZòfKòKò óö
+—blnúûúûúûúûúòHKöú?ô?óKò Köûú9ûúIòçKöûú:ôAöúûúûúûúòKò Icode0öûúûúûúòKöúûúòKöúûúò!Köúûúò/Köúûúò1KöúûúòKò!Lò Löú	ûúòLò Löúûúûúò$öúûúûúò'LöúûúòLòLòLöúûúòLöúûúòLöúûúûúòLöúûúò Lö
+úûúûúûúûúûò Lòóóheadô#Köúûú)òDKò ö
+œnúûúûú
+ûúûúòDKô£KöúòKöúûú.ûúòKKöûúûúûúò9KòöûúûúûòKöúJòJóKöûúòKöúòKò óö†úûúûú.ûúòPKöûúûúûúòKòKöûúûúûúœcò.Kò9òKòCóKòKòDKöúûúòKöúòKò óö
+†	úûúûú9ûúûúòÖKò<KòKò óö
+†
+úû
+úMûúûúûúòîKöûúûúûúòKöú	ûúò&Köú	ûúòKöûú	ûú ûúò5KöûúûúûúûúûúûúûúûúòEòKöúLòLóKò
+Köûúûúûúò"Köûú	ûúûúò4KöûúòKòóKò ö†
+úûúûúUûúûúûúòñKöú4ò4KòKò óö†úû
+úPûúòsKöûúûúûúòKöúûúBòMöûúûúûúûúò$KöúûúûúûúûúûúûúôFKöûúûú
+ûúô.Kò_KòóKöûúûúûú#ûúò;KòKò óö†úûúûú9ûúòxKò6KòKò óö†úûúMûúò{KöûúûúûúòKòKöûúûú[òoöûú	ûúûúò+KòaKò;KòóKöú8ò8Köûú
+ûúûúòöûúûúûòKöúXòXóKò#KòóóôKò ö
+†úûú:ûúûúûúòöKò!KòBKòóKò KôDKô ö†úûúûú:ûúûúûú ò®KôeKò!KöûúCòIKöúòKò óKò ö†	úûúIòXKöûúòKöûú*ò0KöúúôúKòKò óKò ö†úûúûúûúòNKöú&°+òQKòóKò ö†úûúûúûúò9KöúòKòKò óö†úû
+ú%ò7KöûúûúûúòKöú°ò/Köú°)òGKöú'°ò>Kô?KöúûúòKòóKò KôTKò ö†úûúûúûúò@KòKöú2ò2KöúòóKò ö†úûúûúûúò?KòKöú1ò1KòóKò ö†úûúûúûú"òWKò!Kò0KòKòKò óö
+†úûúûú	ûúûúòFKò/KòKò óö†úûú$ûúûúòOKò<KòKò óö†úûú ûúûúûúûúòeKò1KòKò óö
+†úûúûúûúûúòbKöûúûúûúòKöú°	òKò=KòKò óö†úûú/òBKöú≥ô≥KôBKö	úûúûúûúûúòGKòöûúûúûú(ò:Kô9óKòKò óóôJöú®ô®Jô Köú	ûúûú°ò2Köúûúûú°?ò[Köúûúûú°Aò\Jô Köú	ûúòKò JôKöúûúò"Köúûúò"KöúûúòKò JôKöúûúòKöúûúòKöúûúòKò Köúûúûúò&öúûúûúòKòKöúûúò3KöúûúòKöúûúò!KöúûúûúòKöú
+ûúòKòKò óJôÃJô ö†úûú2òGKöûúûúòKò2KöûúûúûúûúòKöú!ûúò(Köûúûú	ûúò*KòKò óö†	úûú5ûúûúòNKöûúûúòJöûúû
+úDôhKò"KöúòKöúòKöûú
+ûúûúûúòKò%KöûúûúûúûúòKöúûúòKöûúûúûúûúòKöúûú	ûúûúòDö	ûúûúûúûú	ûò5Köú*° òJóKöú*ûúò/KòKò óïStartOfExpansionL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]ö†úûúòKöúBûúòKJôJô¯Kò"KöúûúòKöúòKöûú
+ûúûúòKò%öûúûúûúòKöúûú ò0Kò.Kò,KöúûúòKòóKöûúûúûòöúûú	ûúò5Köûú"ûúò1óöûú	ûúûú)òIKöûúûúòóKöúûú%ûúòDKöú>ûúòCKöûú8ûúòRKòKò óö†
+úûúò'KöúûúòKöúûúòKöúûúòKöúûúòKò"KöúûúòKöúûúòöûú;ûòBö†úò(Köúûúò%öûú#ûúò+Köú#°ò?Kò*KöúûúòKöûú"ûúûúûúò6KòóKöûúûú#ò9KòKòóKöúûúòKò(Köûúûúûú°ò@KòKöûúòóKòKò"KòKò óö†úûú,ò?Kö
+ûúûúûúûúûúò3Köúûúò.KòKò óö†úûúò1ö†úò+Köúûúò%Köú"ò"KòóKöûúûúûúòKöúûúòKò4KòKòKò óö†úûúûúò2Köûúûúûúò.Kò óö†úûúòö†úò+Köúûúò!KöûúûúûúûúòKöúòKòóKò/KöúûúòKòKò óö†
+úûúûúò.KöûúûúûúòKöúòKöúòKò"KöúòKò óö†úûúûúò3Kñ= -- [key: ROPE, val: SymTab.Val] RETURNS [quit: BOOL _ FALSE]öú2ô2ö†úò(Köúûúò!KöúòKòóöûú
+ûòKöûúûú	ò#Köûú-ò1óKòKò óö†úûúò/Köûúûúûúûúò$Kò8öûú
+ûúûúûúûú"ûú	ûúûòRKöúûúò5KöûúòóKöúûúòKòKò óö†úûú0òKKöúòKö
+ûúûúûúûúûúò:KòKöûúûúûúûúòKöú@ûúòFKò)KöúûúòKòKò óö†úòKöúûúò'Köúûúò'Köúûúò,Köúûúò,öúDûúòJKöûúûúûúûú
+ò;óKòKò óö†úûúûúûúûúûúòEKöúûúòKöûúûúûúò3KòKöûú
+ûúûúò/ò6Köú1ûúò=óKòKò óö†úûúò5Köûúûúò$ö†úò!KöúûúòKöûúûúûúûúò<KòóKò'KòKò óóôKö†úòKò ö†úûúòJöú`ô`Jô óö†úûúûúûúò:Kô8KöúûúòöûúûúûòKöûú6ò;óöûúûúûòöúûòKöûú	òKòóKöûúûú:òJóKòóKò ö†úûú
+ûúûúòAKöúØôØKôÄKöú	ûú(ò7öûú
+ûúûúòKöú	ûúòKòKöúûúòKò!öûúûú,ûú°òDKöú	ûú(ò7óKòóKòKò óóôö†úò%KòAKòKòKò óö†
+úûú.ò>öûúòKò$KòKò$Kò#KöúòóöûúòKò&KòKòKöúòóKòKò óö†úò$ö†
+úò#Köúûúò öûúòKò$KòKòKòKòóöûúòKòKòKòKòóKòKòóKò)KòKò óö†úò+Köú
+ûúûúòö
+†úûúûúûúûúò?KöûúûúûúòKöúûúûú	ûú	ò*öûúûúûúûúûúûúò@Köûú
+òóKòóö
+†úûúûúûúûúòCKöûúûúûúòöúûòKöûúòKöúûúûúò$KöûúûúòóKöûúûúûúûúûúûúûúûúûúòLKòóKòAKöúûúûúòò£KòKòKöûúûò	KöúòóKöûú
+ûú(ò8Kò=Kò@Kò2Kò&Kò8öûúûúûòKöûúûúòKöúHòHKöûú0ò7óöûúûúûòKöûúûúòKöú"ûúò'Köûúòóöûúûú
+ûúòKòÅKòcKòóöûòKöûúûúòóKòKò Köúûúíò•óóôKöúòöûúûúûúòKöúûú$ûúòBKòóKö	úûúûúûúûúò8Kò Kò ö†úûúòKöúûú0òDöûúûúûúòKöú8ûúò?Köú;ò;KòóKöú9ò9Kò6Kò/Kò1KòóKò öúûú ò+KòKöúòKöúòKöúòKöú#ò#Köú!ò!KöúòKöúòKöúòKöúòKòKöúòKöúòKòKò#KòKòKöúûòKöúòKò óKòKò óKöûúòKô KôKô Köú1ò1Kò ö†úò%Kò8KòKò óö†úûúûúûú
+ûúûúò;Köú≥ô≥Köúûúûúòö†úò'Köúûúòö†úò'Köúûúò%Kö
+ûúûúûúûúûúò%Köúûúò.Kòóö†úûúò6KöûúûúûúûúòKö
+ûúûúûúûúûúòIöûúûúûú'òGKöûúûú ûúûúò1óKòóö
+ûúûú"ûúûúûúòNKöúûúûúûú	ûúûúò,öûúûúûúòKòEKöûúûúûúò-Kòóöûú%ûúûúûò6KöûúdòfKöûúòóKöûúûúûúûúò'KòóKöûúûúûúûúòKöúûúòKò*KöûúCòEKöûúûúûúûúò Kò0öûú
+ûúûúûúûúûú	ûúûòNKöúûúò,KöûúòóKöúûúòKòóKò+KòKò óKô ó Öó    Lr  t„  

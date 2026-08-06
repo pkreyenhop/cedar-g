@@ -1,0 +1,733 @@
+
+
+DIRECTORY Atom, Basics, BasicTime, BootTime, Commander, Convert, HostAndTerminalOps, IO, IOErrorFormatting, List, LocalRegistryAgent, NetAddressing, NetworkName, NetworkStream, Process, RefTab, Rope, RopeHash, SimpleFeedback, TerminalLocation;
+
+HostCoordinationImpl: CEDAR MONITOR
+LOCKS rm USING rm: RefLock
+IMPORTS Atom, BasicTime, BootTime, Commander, Convert, HostAndTerminalOps, IO, IOErrorFormatting, List, LocalRegistryAgent, NetAddressing, NetworkName, NetworkStream, Process, RefTab, Rope, RopeHash, SimpleFeedback
+EXPORTS TerminalLocation
+=
+
+BEGIN OPEN HAT:HostAndTerminalOps, NA:NetAddressing, NN:NetworkName, Nws:NetworkStream, TL:TerminalLocation;
+ROPE: TYPE ~ Rope.ROPE;
+RefLock: TYPE ~ REF MONITORLOCK;
+
+debug: BOOL ¨ TRUE;
+LocSet: TYPE ~ TL.LocSet;
+LocState: TYPE ~ TL.LocState;
+Location: TYPE ~ TL.Location;
+
+LocsEqual: PUBLIC PROC [a, b: TL.Location] RETURNS [BOOL] ~ {
+IF a.kind # b.kind THEN RETURN [FALSE];
+WITH a SELECT FROM
+x: undefined TL.Location => RETURN [TRUE];
+x: local TL.Location => RETURN [TRUE];
+x: remote TL.Location => WITH b SELECT FROM
+y: remote TL.Location => RETURN NA.EqualAddrs[x.addr, y.addr];
+ENDCASE => ERROR;
+ENDCASE => ERROR;
+};
+
+LocEquiv: PUBLIC PROC [a, b: TL.Location] RETURNS [BOOL] ~ {
+IF a.kind # b.kind THEN RETURN [FALSE];
+WITH a SELECT FROM
+x: undefined TL.Location => RETURN [TRUE];
+x: local TL.Location => RETURN [TRUE];
+x: remote TL.Location => WITH b SELECT FROM
+y: remote TL.Location => {--NA doesn't export Equiv, so this is written with knowledge from NAImpl
+xAddr, yAddr: ROPE;
+xFam, yFam: ATOM;
+[xAddr, xFam] ¨ NA.ToNnAddress[x.addr];
+[yAddr, yFam] ¨ NA.ToNnAddress[y.addr];
+RETURN [xFam=yFam AND xAddr.Equal[yAddr]]};
+ENDCASE => ERROR;
+ENDCASE => ERROR;
+};
+
+FormatLoc: PUBLIC PROC [loc: TL.Location] RETURNS [rope: ROPE] ~ {
+WITH loc SELECT FROM
+x: undefined TL.Location => RETURN ["undefined"];
+x: local TL.Location => RETURN ["local"];
+x: remote TL.Location => RETURN NA.FormatAddress[x.addr, TRUE];
+ENDCASE => ERROR;
+};
+
+ParseLoc: PUBLIC PROC [rope: ROPE] RETURNS [TL.Location] ~ {
+len: INT ~ rope.Length[];
+SELECT TRUE FROM
+rope.Equal["undefined"] => RETURN [[undefined[]]];
+rope.Equal["local"] => RETURN [[local[]]];
+ENDCASE => {
+addr: NA.Address ¨ NA.ParseAddress[rope];
+IF addr.socket=NIL THEN addr.socket ¨ nws1TerminalPort;
+RETURN [[remote[addr]]]}};
+
+HashLoc: PUBLIC PROC [l: TL.Location] RETURNS [CARDINAL] ~ {
+WITH l SELECT FROM
+x: undefined TL.Location => RETURN [1];
+x: local TL.Location => RETURN [2];
+x: remote TL.Location => RETURN NA.HashAddr[x.addr];
+ENDCASE => ERROR};
+
+Canonicalize: PUBLIC PROC [l: TL.Location] RETURNS [TL.Location] ~ {
+WITH l SELECT FROM
+x: undefined TL.Location => RETURN [x];
+x: local TL.Location => RETURN [x];
+x: remote TL.Location => RETURN [[remote[addr: NA.Canonicalize[x.addr] ]]];
+ENDCASE => ERROR};
+
+CanonicalHashLoc: PUBLIC PROC [l: TL.Location] RETURNS [CARDINAL] ~ {
+WITH l SELECT FROM
+x: undefined TL.Location => RETURN [1];
+x: local TL.Location => RETURN [2];
+x: remote TL.Location => {
+addr: ROPE; family: ATOM;
+c: CARDINAL ¨ 3;
+[addr, family] ¨ NA.ToNnAddress[x.addr];
+c ¨ RopeHash.FromRope[rope: addr, seed: c];
+c ¨ RopeHash.FromRope[rope: Atom.GetPName[family], seed: c];
+RETURN [c]};
+ENDCASE => ERROR};
+
+CreateLocSet: PUBLIC PROC [shallow: BOOL] RETURNS [LocSet] ~ {
+IF shallow
+THEN RETURN RefTab.Create[equal: ShallowEqual, hash: ShallowHash]
+ELSE RETURN RefTab.Create[equal: DeepEqual, hash: DeepHash]};
+
+DeepEqual: PROC [key1, key2: REF ANY] RETURNS [BOOL] ~ {
+k1: REF TL.Location ~ NARROW[key1];
+k2: REF TL.Location ~ NARROW[key2];
+ans: BOOL;
+ans ¨ LocEquiv[k1≠, k2≠ !NA.Error => {ans ¨ TRUE; CONTINUE}];
+RETURN [ans]};
+
+ShallowEqual: PROC [key1, key2: REF ANY] RETURNS [BOOL] ~ {
+k1: REF TL.Location ~ NARROW[key1];
+k2: REF TL.Location ~ NARROW[key2];
+RETURN LocsEqual[k1≠, k2≠]};
+
+DeepHash: PROC [key: REF ANY] RETURNS [CARDINAL] ~ {
+k: REF TL.Location ~ NARROW[key];
+ans: CARDINAL;
+ans ¨ CanonicalHashLoc[k≠ !NA.Error => {ans ¨ 0; CONTINUE}];
+RETURN [ans]};
+
+ShallowHash: PROC [key: REF ANY] RETURNS [CARDINAL] ~ {
+k: REF TL.Location ~ NARROW[key];
+RETURN HashLoc[k≠]};
+
+CopyLocSet: PUBLIC PROC [ls: LocSet] RETURNS [LocSet]
+~ {RETURN ls.Copy[]};
+
+LocSetEqual: PUBLIC PROC [a, b: LocSet] RETURNS [BOOL] ~ {
+IF a.GetSize[] # b.GetSize[] THEN RETURN [FALSE];
+RETURN [LocSetCompare[a, b] = equal]};
+
+LocSetCompare: PUBLIC PROC [a, b: LocSet] RETURNS [Basics.PartialComparison] ~ {
+aSize: INT ~ a.GetSize[];
+bSize: INT ~ b.GetSize[];
+IF aSize=0 THEN RETURN [IF bSize=0 THEN equal ELSE less]
+ELSE IF bSize=0 THEN RETURN [greater]
+ELSE {
+stopOnDiff: BOOL ¨ aSize <= bSize;
+aExtra, bExtra: BOOL ¨ FALSE;
+other: LocSet ¨ b;
+Test: PROC [key, val: REF ANY] RETURNS [quit: BOOL ¨ FALSE] --RefTab.EachPairAction-- ~ {
+IF NOT other.Fetch[key].found THEN {bExtra ¨ TRUE; RETURN [stopOnDiff]};
+RETURN [FALSE]};
+IF a.Pairs[Test] THEN RETURN [incomparable];
+aExtra ¨ bExtra; bExtra ¨ FALSE;
+stopOnDiff ¨ bSize <= aSize;
+other ¨ a;
+IF a.Pairs[Test] THEN RETURN [incomparable];
+SELECT TRUE FROM --can't have both aExtra and bExtra
+aExtra => RETURN [greater];
+bExtra => RETURN [less];
+ENDCASE => RETURN [equal];
+}};
+
+CreateSingleLocState: PUBLIC PROC [cl, pl: TL.Location] RETURNS [LocState] ~ {
+ls: LocState ¨ [primaryCancl: cl, primaryPretty: pl, allCancl: CreateLocSet[FALSE], allPretty: CreateLocSet[FALSE] ];
+LocStateIncrement[ls, cl, pl];
+RETURN [ls]};
+
+CopyLocState: PUBLIC PROC [old: LocState] RETURNS [LocState] ~ {
+RETURN [[
+primaryCancl: old.primaryCancl, primaryPretty: old.primaryPretty,
+allCancl: old.allCancl.Copy[], allPretty: old.allPretty.Copy[]
+]]};
+
+LocStateEqual: PUBLIC PROC [a, b: LocState] RETURNS [BOOL] ~ {
+IF NOT LocsEqual[a.primaryCancl, b.primaryCancl] THEN RETURN [FALSE];
+RETURN LocSetEqual[a.allCancl, b.allCancl]};
+
+LocStateSetPrimary: PUBLIC PROC [ls: LocState, cl, pl: Location] RETURNS [LocState] ~ {
+nac, nap: LocSet;
+rcl, rpl: REF TL.Location;
+IF LocsEqual[ls.primaryCancl, cl] THEN RETURN [ls];
+nac ¨ ls.allCancl.Copy[];
+nap ¨ ls.allPretty.Copy[];
+IF NOT nac.Delete[NEW [TL.Location ¨ ls.primaryCancl]] THEN ERROR;
+IF NOT nap.Delete[NEW [TL.Location ¨ ls.primaryPretty]] THEN ERROR;
+rcl ¨ NEW [TL.Location ¨ cl];
+rpl ¨ NEW [TL.Location ¨ pl];
+IF nac.Insert[rcl, rpl] THEN {
+IF NOT nap.Insert[rpl, rcl] THEN ERROR};
+RETURN [[primaryCancl: cl, primaryPretty: pl, allCancl: nac, allPretty: nap]]};
+
+LocStateSelPrimary: PUBLIC PROC [ls: LocState, cl, pl: Location] RETURNS [LocState] ~ {
+IF LocsEqual[ls.primaryCancl, cl] THEN RETURN [ls];
+ls.allCancl ¨ ls.allCancl.Copy[];
+ls.allPretty ¨ ls.allPretty.Copy[];
+LocStateIncrement[ls, cl, pl];
+RETURN [[primaryCancl: cl, primaryPretty: pl, allCancl: ls.allCancl, allPretty: ls.allPretty]]};
+
+LocStateIncrement: PUBLIC PROC [ls: LocState, cl, pl: TL.Location] ~ {
+rcl: REF TL.Location ~ NEW [TL.Location ¨ cl];
+rpl: REF TL.Location ~ NEW [TL.Location ¨ pl];
+IF NOT ls.allCancl.Insert[rcl, rpl] THEN RETURN;
+IF NOT ls.allPretty.Insert[rpl, rcl] THEN ERROR;
+RETURN};
+
+LocStateDecrement: PUBLIC PROC [ls: LocState, cl: Location] ~ {
+rcl: REF TL.Location ~ NEW [TL.Location ¨ cl];
+rpl: REF TL.Location; ra: REF ANY;
+found: BOOL;
+[found, ra] ¨ ls.allCancl.Fetch[rcl];
+IF NOT found THEN RETURN;
+rpl ¨ NARROW[ra];
+IF NOT ls.allPretty.Delete[rpl] THEN ERROR;
+IF NOT ls.allCancl.Delete[rcl] THEN ERROR;
+RETURN};
+
+FormatLocState: PUBLIC PROC [ls: LocState] RETURNS [ans: ROPE] ~ {
+AddLoc: PROC [key, val: REF ANY] RETURNS [quit: BOOL ¨ FALSE] --RefTab.EachPairAction-- ~ {
+rl: REF TL.Location ~ NARROW[key];
+IF NOT LocsEqual[ls.primaryPretty, rl≠] THEN {
+this: ROPE ~ FormatLoc[rl≠];
+IF ans#NIL THEN ans ¨ ans.Cat[", ", this] ELSE ans ¨ this};
+RETURN};
+ans ¨ NIL;
+IF ls.allPretty.Pairs[AddLoc] THEN ERROR;
+ans ¨ Rope.Cat["[primary: ", FormatLoc[ls.primaryPretty], ", secondary: {", ans, "}]"];
+RETURN};
+
+FormatInstState: PUBLIC PROC [il: TL.InstState] RETURNS [ROPE] ~ {
+WITH il SELECT FROM
+x: changing TL.InstState => RETURN [IO.PutFR["changing from \"%q\" to \"%q\"", [rope[FormatLocState[x.from]]], [rope[FormatLocState[x.to]]]]];
+x: stable TL.InstState => RETURN [IO.PutFR1["stable at \"%q\"", [rope[FormatLocState[x.state]]]]];
+ENDCASE => ERROR;
+};
+
+ClientList: TYPE ~ LIST OF TL.Client;
+
+locCPLock: RefLock ¨ NEW [MONITORLOCK ¨ []];
+locCPing: BOOL ¨ FALSE;
+locCPChange: CONDITION;
+
+locLock: RefLock ¨ NEW [MONITORLOCK ¨ []];
+clients: ClientList ¨ NIL;
+locChange, locMetaChange: CONDITION;
+in: BOOL ¨ FALSE;
+locState: LocState ¨ CreateSingleLocState[[undefined[]], [undefined[]]];
+changing, observersAllowed: BOOL ¨ FALSE;
+fromState, toState: LocState ¨ locState;
+
+GetLocState: PUBLIC PROC RETURNS [LocState] ~ {
+WithLock: ENTRY PROC [rm: RefLock] RETURNS [LocState] ~ {
+ENABLE UNWIND => NULL;
+RETURN [locState]};
+RETURN WithLock[locLock];
+};
+
+SetLoc: --INTERNAL-- PROC [to: LocState] ~ TRUSTED {
+IF LocSetCompare[locState.allCancl, to.allCancl] # equal
+THEN TRUSTED {Process.Detach[FORK Kissoff[locState.allCancl, to.allCancl]]};
+locState ¨ to;
+RETURN};
+
+Kissoff: PROC [old, new: LocSet] ~ {
+MaybeDisco: PROC [key, val: REF ANY] RETURNS [quit: BOOL ¨ FALSE] --RefTab.EachPairAction-- ~ {
+rl: REF TL.Location ~ NARROW[key];
+IF NOT new.Fetch[rl].found THEN {
+WITH rl SELECT FROM
+x: REF TL.RemoteLocation => [] ¨ SendCommand[x≠, 'D, TRUE, FALSE];
+x: REF undefined TL.Location => NULL;
+x: REF local TL.Location => NULL;
+ENDCASE => ERROR;
+};
+RETURN};
+IF old.Pairs[MaybeDisco] THEN ERROR;
+RETURN};
+
+PeekLoc: PUBLIC PROC RETURNS [TL.InstState] ~ {
+WithLock: ENTRY PROC [rm: RefLock] RETURNS [TL.InstState] ~ {
+ENABLE UNWIND => NULL;
+RETURN [IF in AND changing THEN [changing[fromState, toState]] ELSE [stable[locState]]]};
+RETURN WithLock[locLock]};
+
+LocEnter: ENTRY PROC [rm: RefLock, cg: BOOL, to: LocState] ~ {
+ENABLE UNWIND => NULL;
+WHILE in DO WAIT locMetaChange ENDLOOP;
+in ¨ TRUE;
+changing ¨ cg;
+TRUSTED {
+toState ¨ to;
+fromState ¨ locState;
+};
+RETURN};
+
+LocExit: ENTRY PROC [rm: RefLock] ~ {
+ENABLE UNWIND => NULL;
+in ¨ FALSE;
+IF changing THEN BROADCAST locChange;
+BROADCAST locMetaChange;
+RETURN};
+
+LocDo: PROC [p: PROC, changing: BOOL, to: LocState] ~ {
+LocEnter[locLock, changing, to];
+p[!UNWIND => LocExit[locLock]];
+LocExit[locLock];
+RETURN};
+
+AddClient: PUBLIC --ENTRY-- PROC [c: TL.Client] ~ {
+WithLock: --INTERNAL-- PROC ~ {
+clients ¨ CONS[c, clients];
+c.NoteChange[c, locState];
+RETURN};
+LocDo[WithLock, FALSE, locState];
+RETURN};
+
+Wait: PUBLIC --ENTRY-- PROC [Test: PROC [LocState] RETURNS [done: BOOL ¨ TRUE]] ~ {
+in: BOOL ¨ FALSE;
+{ENABLE UNWIND => IF in THEN LocExit[locLock];
+LocEnter[locLock, FALSE, locState]; in ¨ TRUE;
+DO
+IF Test[locState] THEN EXIT;
+LocExit[locLock]; in ¨ FALSE;
+WaitForChange[locLock];
+LocEnter[locLock, FALSE, locState]; in ¨ TRUE;
+ENDLOOP;
+LocExit[locLock]; in ¨ FALSE;
+RETURN}};
+
+WaitForChange: ENTRY PROC [rm: RefLock] ~ {
+ENABLE UNWIND => NULL;
+WAIT locChange;
+RETURN};
+
+AllowObservers: PUBLIC PROC [allow: BOOL] ~ {
+AOWithLock: --INTERNAL-- PROC ~ {observersAllowed ¨ allow};
+LocDo[AOWithLock, FALSE, locState];
+RETURN};
+
+ObserversAllowed: PUBLIC PROC RETURNS [allow: BOOL ¨ observersAllowed] ~ {
+OAWithLock: --INTERNAL-- PROC ~ {allow ¨ observersAllowed};
+LocDo[OAWithLock, FALSE, locState];
+RETURN};
+
+SetState: PUBLIC --ENTRY-- PROC [to: LocState] ~ {
+WithLock: --INTERNAL-- PROC ~ {InnerSetState[to]};
+LocDo[WithLock, TRUE, to];
+RETURN};
+
+InnerSetState: --INTERNAL-- PROC [to: LocState] ~ {
+from: LocState ~ locState;
+SetLoc[to];
+FOR cls: ClientList ¨ clients, cls.rest WHILE cls#NIL DO
+cls.first.NoteChange[cls.first, to];
+ENDLOOP;
+RETURN};
+
+SetPrimary: PUBLIC PROC [pl: TL.Location] ~ {
+[] ¨ FullSetPrimary[pl, FALSE];
+RETURN};
+
+FullSetPrimary: PROC [pl: TL.Location, fromNet: BOOL] RETURNS [whyNot: ROPE ¨ NIL] ~ {
+cl: TL.Location ~ Canonicalize[pl];
+new: LocState ~ CreateSingleLocState[cl, pl];
+WithLock: --INTERNAL-- PROC ~ {
+SELECT TRUE FROM
+LocStateEqual[locState, new] => RETURN;
+fromNet AND locState.primaryPretty.kind#undefined => whyNot ¨ IO.PutFR["current primary input comes from %g, not %g", [rope[FormatLoc[locState.primaryPretty]]], [rope[FormatLoc[ [undefined[]] ]]] ];
+ENDCASE => {
+InnerSetState[new];
+RETURN};
+};
+LocDo[WithLock, TRUE, new];
+RETURN};
+
+SelPrimary: PUBLIC PROC [pl: TL.Location] ~ {
+rcl: REF TL.Location ~ NEW [TL.Location ¨ Canonicalize[pl]];
+WithLock: --INTERNAL-- PROC ~ {
+SELECT TRUE FROM
+LocsEqual[locState.primaryCancl, rcl≠] => RETURN;
+ENDCASE => {
+new: LocState ¨ LocStateSelPrimary[locState, rcl≠, pl];
+InnerSetState[new];
+RETURN};
+};
+LocDo[WithLock, TRUE, locState];
+RETURN};
+
+AddSecondary: PUBLIC PROC [pl: TL.Location]
+~ {[] ¨ FullAddSecondary[pl, FALSE]};
+
+FullAddSecondary: PUBLIC PROC [pl: TL.Location, fromNet: BOOL] RETURNS [whyNot: ROPE ¨ NIL] ~ {
+rcl: REF TL.Location ~ NEW [TL.Location ¨ Canonicalize[pl]];
+WithLock: --INTERNAL-- PROC ~ {
+SELECT TRUE FROM
+locState.allCancl.Fetch[rcl].found => RETURN;
+fromNet AND NOT observersAllowed => whyNot ¨ "observers not allowed";
+ENDCASE => {
+new: LocState ¨ CopyLocState[locState];
+LocStateIncrement[new, rcl≠, pl];
+InnerSetState[new];
+RETURN};
+};
+LocDo[WithLock, TRUE, locState];
+RETURN};
+
+Abandon: PUBLIC --ENTRY-- PROC [old: TL.Location, why: TL.Why] ~ {
+refold: REF TL.Location ~ NEW [TL.Location ¨ Canonicalize[old]];
+WithLock: --INTERNAL-- PROC ~ {
+SELECT TRUE FROM
+NOT locState.allCancl.Fetch[refold].found => RETURN;
+NOT LocsEqual[locState.primaryCancl, refold≠] => {
+new: LocState ¨ CopyLocState[locState];
+LocStateDecrement[new, refold≠];
+InnerSetState[new];
+RETURN};
+locState.allCancl.GetSize[] > 1 => {
+rps, rcs: REF TL.Location ¨ NIL;
+Survey: PROC [key, val: REF ANY] RETURNS [quit: BOOL ¨ FALSE] --RefTab.EachPairAction-- ~ {
+rpl: REF TL.Location ~ NARROW[key];
+rcl: REF TL.Location ~ NARROW[key];
+SELECT TRUE FROM
+LocsEqual[rcl≠, refold≠] => NULL;
+rps=NIL => {rps ¨ rpl; rcs ¨ rcl};
+rps.kind=undefined => {rps ¨ rpl; rcs ¨ rcl};
+rpl.kind=undefined => NULL;
+rps.kind=local => {rps ¨ rpl; rcs ¨ rcl};
+rpl.kind=local => NULL;
+ENDCASE => NULL;
+RETURN};
+IF locState.allPretty.Pairs[Survey] THEN ERROR;
+{new: LocState ¨ LocStateSetPrimary[locState, rcs≠, rps≠];
+InnerSetState[new];
+RETURN}};
+old.kind = undefined => RETURN;
+old.kind = local => RETURN;
+ENDCASE => {
+InnerSetState[CreateSingleLocState[[undefined[]], [undefined[]]]];
+RETURN};
+};
+LocDo[WithLock, TRUE, locState];
+RETURN};
+
+LocStart: PROC ~ {
+TRUSTED {
+Process.InitializeCondition[@locMetaChange, Process.MsecToTicks[10000]];
+Process.EnableAborts[@locMetaChange];
+Process.InitializeCondition[@locChange, Process.MsecToTicks[10000]];
+Process.EnableAborts[@locChange];
+Process.InitializeCondition[@locCPChange, Process.MsecToTicks[10000]];
+Process.EnableAborts[@locCPChange];
+};
+};
+nws1TerminalPort: ROPE ¨ "58813";
+firstNws1HostPort: INT ¨ 58812;
+nws1PortRope: ROPE ¨ "?uninitialized?";
+sockDelt: INT ¨ 10;
+sockLimit: INT ¨ 10;
+nwsListener: Nws.Listener ¨ NIL;
+nwsPF1: ATOM ¨ $ARPA;
+nwsTC1: ATOM ¨ $basicStream;
+hostService: LocalRegistryAgent.ServiceRegistration ¨ NIL;
+
+StopNwsListeningForTerminals: PROC ~ {
+IF nwsListener#NIL THEN Nws.DestroyListener[nwsListener];
+nwsListener ¨ NIL; nws1PortRope ¨ "?uninitialized?";
+IF hostService#NIL THEN LocalRegistryAgent.StopService[hostService];
+hostService ¨ NIL;
+RETURN};
+
+RestartListeners: Commander.CommandProc ~ {
+local: ROPE;
+IF nwsListener#NIL OR hostService#NIL THEN {StopNwsListeningForTerminals[]; Process.PauseMsec[1000]};
+FOR i: INT IN [0 .. sockLimit] DO
+nws1PortRope ¨ IO.PutFR1["%g", [integer[firstNws1HostPort + i*sockDelt]] ];
+local ¨ NN.AddressFromName[nwsPF1, NIL, nws1PortRope, port].addr;
+nwsListener ¨ Nws.CreateListener[
+protocolFamily: nwsPF1,
+transportClass: nwsTC1,
+local: local,
+listenerWorkerProc: NwsWorkForTerminal
+! IO.Error => {
+codes: LIST OF ATOM ¨ NIL;
+msg: ROPE ¨ "!Error getting details!";
+[codes, msg] ¨ Nws.GetIOErrorDetails[stream !Nws.Error => CONTINUE];
+SimpleFeedback.PutFL[$HostCoordination, oneLiner, $Error, "%g creating Host Control TCP listener on port %g", LIST[[rope[NA.FormatError[codes, msg]]], [rope[nws1PortRope]] ]];
+CONTINUE};
+Nws.Error => {
+SimpleFeedback.PutFL[$HostCoordination, oneLiner, $Error, "%g creating Host Control TCP listener on port %g", LIST[[rope[NA.FormatError[codes, msg]]], [rope[nws1PortRope]] ]];
+CONTINUE}
+];
+IF nwsListener#NIL THEN {
+now: BasicTime.GMT ~ BasicTime.Now[];
+bootTime: BasicTime.GMT ~ BootTime.Get[];
+SimpleFeedback.PutFL[$HostCoordination, oneLiner, $FYI, "At %g, Host Control listening on TCP port %g.", LIST[[time[now]], [rope[nws1PortRope]] ]];
+hostService ¨ LocalRegistryAgent.MaintainService[
+name: "Xerox/PARC/HostCoordination 2/6/92",
+value: LIST[
+List.DotCons[$StartTime, Convert.RopeFromTimeRFC822[now]],
+List.DotCons[$WorldStartTime, Convert.RopeFromTimeRFC822[bootTime]],
+List.DotCons[$port, nws1PortRope] ],
+regTimeout: 900*1000, regPeriod: 300*1000];
+EXIT};
+ENDLOOP;
+RETURN};
+
+NwsWorkForTerminal: PROC [listener: Nws.Listener, in, out: IO.STREAM] ~ {
+pf, tc: ATOM;
+remote, invertErr: ROPE ¨ NIL;
+rna: NA.Address ¨ NA.nullAddress;
+IF debug THEN SimpleFeedback.PutF[$HostCoordination, begin, $FYI, "At %g, starting to work ", [time[BasicTime.Now[]]] ];
+[protocolFamily: pf, remote: remote, transportClass: tc] ¨ Nws.GetStreamInfo[out];
+IF debug THEN SimpleFeedback.PutF[$HostCoordination, middle, $FYI, " for addr=%g ", [rope[remote]] ];
+rna ¨ NA.FromNnAddress[remote, pf !NA.Error => {invertErr ¨ NA.FormatError[codes, msg]; CONTINUE}];
+IF debug THEN SimpleFeedback.PutFL[$HostCoordination, end, $FYI, " host=%g.%g, invertErr=%g.", LIST[[rope[rna.host]], [rope[rna.socket]], [rope[invertErr]] ]];
+WorkForTerminal[in, out, rna, remote, invertErr, TRUE];
+RETURN};
+
+versionBrick: CHAR ~ CHAR.LAST;
+coordVersions: HAT.ProtocolVersionRange ¨ [1, 4];
+
+FailWork: ERROR [why: ROPE] ~ CODE;
+
+WorkForTerminal: PROC [in, out: IO.STREAM, remote: NA.Address, remoteAddress, invertErr: ROPE, optionalVR: BOOL] ~ {
+ENABLE {
+IO.Error => IF stream=in OR stream=out THEN GOTO closeit;
+};
+GetPort: PROC ~ {
+IF pv >= 4 THEN {
+addr: ROPE ~ in.GetRopeLiteral[];
+portName: ROPE ~ NN.NameFromAddress[$ARPA, addr, port !NN.Error => FailWork[NA.FormatError[CONS[$NetworkNameError, codes], msg]] ].name;
+sep: CHAR ~ in.GetChar[];
+IF sep#'; THEN FailWork[IO.PutFR1["sep was '%c, not ';", [character[sep]] ]];
+remote ¨ remote.SetSocket[portName];
+RETURN}
+ELSE {
+remote ¨ remote.SetSocket[nws1TerminalPort];
+RETURN};
+};
+cmd: CHAR ¨ in.GetChar[];
+reply: ROPE ¨ NIL;
+pv: HAT.ProtocolVersion ¨ 1;
+{ENABLE FailWork => {reply ¨ why; CONTINUE};
+IF cmd=versionBrick THEN {
+out.PutChar[versionBrick];
+out.PutChar[VAL[coordVersions.min]];
+out.PutChar[VAL[coordVersions.max]];
+out.Flush[];
+{hisVR: HAT.ProtocolVersionRange ¨ [min: in.GetChar[].ORD];
+hisVR.max ¨ in.GetChar[].ORD;
+pv ¨ MIN[coordVersions.max, hisVR.max];
+IF MAX[hisVR.min, coordVersions.min] > pv THEN {
+reply ¨ IO.PutFLR["version mismatch: your[%g..%g] <> my[%g .. %g] coordination protocol", LIST[[integer[hisVR.min]], [integer[hisVR.max]], [integer[coordVersions.min]], [integer[coordVersions.max]] ]];
+GOTO Reply};
+cmd ¨ in.GetChar[];
+cmd ¨ cmd}}
+ELSE IF NOT optionalVR THEN {
+reply ¨ "didn't open with version brick";
+GOTO Reply};
+IF remote = NA.nullAddress THEN {
+reply ¨ IO.PutFR["Couldn't invert your address (%g): %g", [rope[remoteAddress]], [rope[invertErr]] ];
+GOTO Reply};
+IF debug THEN SimpleFeedback.PutF[$HostCoordination, oneLiner, $FYI, "Got command %g.", [character[cmd]] ];
+SELECT cmd FROM
+'c, 'o => {
+whyNot: ROPE ¨ NIL;
+GetPort[];
+DO
+protocol: ROPE ~ in.GetRopeLiteral[];
+min: INT ~ in.GetInt[];
+max: INT ~ in.GetInt[];
+cr: CHAR ~ in.GetChar[];
+IF cr # '\r THEN {whyNot ¨ "control syntax error"; EXIT};
+IF protocol.Equal[""] THEN EXIT;
+{my: HAT.ProtocolVersionRange ~ HAT.GetProtocolVersionRangeForSide[Host, protocol];
+IF max < my.min OR my.max < min THEN {
+complaint: ROPE ~ IO.PutFLR[
+"%g protocol version mismatch: host[%g..%g] <> terminal[%g..%g]", LIST[
+[rope[protocol]],
+[integer[my.min]],
+[integer[my.max]],
+[integer[min]],
+[integer[max]]]];
+whyNot ¨ IF whyNot#NIL THEN whyNot.Cat["; ", complaint] ELSE complaint;
+};
+}ENDLOOP;
+IF whyNot=NIL THEN whyNot ¨ (IF cmd='c THEN FullSetPrimary ELSE FullAddSecondary)[[remote[remote]], TRUE];
+reply ¨ IF whyNot#NIL THEN Rope.Concat["No, because ", whyNot] ELSE "OK";
+};
+'d => {
+GetPort[];
+Abandon[[remote[remote]], [BasicTime.Now[], "terminal asked for disconned"]];
+reply ¨ "disconnected";
+};
+'q => reply ¨ FormatInstState[PeekLoc[]];
+'s => {outStream: IO.STREAM ~ IO.ROS[];
+SendPVR: PROC [protocol: ROPE, pvr: HAT.ProtocolVersionRange] ~ {
+outStream.PutF["\"%q\" %g %g; ", [rope[protocol]], [integer[pvr.min]], [integer[pvr.max]]];
+RETURN};
+HAT.EnumerateProtocolVersionsOfSide[Host, SendPVR];
+reply ¨ outStream.RopeFromROS[];
+};
+ENDCASE => {
+reply ¨ IO.PutFR1["Bad command character: %g", [rope[Rope.FromChar[cmd]]]];
+};
+EXITS Reply => NULL};
+out.PutRope[reply.Concat["\r"]];
+IO.Flush[out];
+[] ¨ in.GetChar[];
+in.Close[]; out.Close[];
+RETURN;
+EXITS
+closeit => {in.Close[!IO.Error => CONTINUE]; out.Close[!IO.Error => CONTINUE]};
+};
+
+SendCommand: PROC [rloc: TL.RemoteLocation, cmd: CHAR, postfixSelf, postfixVersions: BOOL] RETURNS [ok: BOOL ¨ TRUE, ans: ROPE] ~ {
+cmdIn, cmdOut: IO.STREAM ¨ NIL;
+pv: NAT;
+{ENABLE {
+IO.Error => IF stream=cmdIn OR stream=cmdOut THEN {ok ¨ FALSE; ans ¨ IOErrorFormatting.FormatError[ec, details, msg]; CONTINUE};
+IO.EndOfStream => IF stream=cmdIn OR stream=cmdOut THEN {ok ¨ FALSE; ans ¨ IO.PutFR1["stream closed while sending command [%g]", [character[cmd]] ]; CONTINUE};
+Nws.Error => {ok ¨ FALSE; ans ¨ NA.FormatError[codes, msg]; CONTINUE};
+};
+SendPVR: PROC [protocol: ROPE, pvr: HAT.ProtocolVersionRange] ~ {
+cmdOut.PutF["\"%q\" %g %g\r", [rope[protocol]], [integer[pvr.min]], [integer[pvr.max]]];
+RETURN};
+[cmdIn, cmdOut] ¨ Nws.CreateStreams[protocolFamily: rloc.addr.protocolFamily, remote: NA.ToNnAddress[rloc.addr].addr, transportClass: $basicStream];
+[pv, ans] ¨ StartCommand[cmdIn, cmdOut, cmd, postfixSelf];
+IF ans#NIL THEN GOTO Dun;
+IF postfixVersions THEN {
+HAT.EnumerateProtocolVersionsOfSide[Terminal, SendPVR];
+cmdOut.PutRope["\"\" 0 0\r"]};
+IO.Flush[cmdOut];
+ans ¨ cmdIn.GetLineRope[];
+EXITS Dun => ok ¨ FALSE;
+};
+IF cmdOut#NIL THEN FinishCommand[cmdIn, cmdOut];
+RETURN};
+
+StartCommand: PUBLIC PROC [in, out: IO.STREAM, cmd: CHAR, postfixSelf: BOOL] RETURNS [ctlVersion: NAT, err: ROPE ¨ NIL] ~ {
+out.PutChar[versionBrick];
+out.PutChar[VAL[coordVersions.min]];
+out.PutChar[VAL[coordVersions.max]];
+out.Flush[];
+{hisBrick: CHAR ~ in.GetChar[];
+IF hisBrick#versionBrick THEN RETURN [0, "Terminal didn't open with version brick"];
+{hisVR: HAT.ProtocolVersionRange ¨ [min: in.GetChar[].ORD];
+hisVR.max ¨ in.GetChar[].ORD;
+ctlVersion ¨ MIN[coordVersions.max, hisVR.max];
+IF MAX[coordVersions.min, hisVR.min] > ctlVersion THEN {
+err ¨ IO.PutFLR["control protocol version mismatch: his[%g..%g] <> mine[%g .. %g] coordination protocol", LIST[[integer[hisVR.min]], [integer[hisVR.max]], [integer[coordVersions.min]], [integer[coordVersions.max]] ]];
+RETURN};
+}};
+out.PutChar[cmd];
+IF postfixSelf AND ctlVersion>=4 THEN out.PutF1["\"%q\";", [rope[NN.AddressFromName[$ARPA, NIL, nws1PortRope, port].addr]] ];
+RETURN};
+
+FinishCommand: PROC [cmdIn, cmdOut: IO.STREAM] ~ {
+ENABLE IO.Error => CONTINUE;
+cmdOut.PutChar['.];
+cmdOut.Flush[];
+cmdOut.Close[];
+cmdIn.Close[];
+RETURN};
+LocStart[];
+[] ¨ RestartListeners[NIL];
+HAT.SetProtocolVersionRangeForSide[Host, "TerminalCoordination", coordVersions];
+Commander.Register["RestartHostControlListeners", RestartListeners, "stop (if going) and start Host Control listeners"];
+END.
+   Í  HostCoordinationImpl.mesa
+Copyright ” 1990, 1992 by Xerox Corporation.  All rights reserved.
+Last tweaked by Mike Spreitzer on March 20, 1992 2:49 pm PST
+Random Stuff
+Exports to TerminalLocation
+Network Service
+Final Randomness
+ù  S  ïNewlineDelimiter
+ñ(cedarcode) styleò codeôKöú
+œeú7ôBKô<óKò Köœk	úLûúúòÛKò öœnúûúûò#KöûúûúòKöûúDûúâò÷KöûúòKòóKò KöûúûúûúûúûúüúûúòlheadôKöûúûúûúòKöú	ûúûúûúò Kò KöúûúûúòóöúôKöúûúûúòKöú
+ûúûú
+òKöú
+ûúûú
+òKò öü	úûúûúûúûúûúò=Köûúûúûúûúò'öûúûúûòKöúûúûúûúò*Köú	ûúûúûúò&öú
+ûúûúûúûò+Köú
+ûúûúûúò>KöûúûúòóKöûúûúòóKòóKò öüúûúûúûúûúûúò<Köûúûúûúûúò'öûúûúûòKöúûúûúûúò*Köú	ûúûúûúò&öú
+ûúûúûúûò+öú
+ûúœcHòbKöúûúòKöúûúòKöúûúò'Köúûúò'Köûúûúò+óKöûúûúòóKöûúûúòóKòóKò öü	úûúûúûúûúûúòBöûúûúûòKöúûúûúò1Köú	ûúûúò)Kö	ú
+ûúûúûúûúò?KöûúûúòóKòóKò öüúûúûúûúûúûúò<KöúûúòöûúûúûòKöúûúò2Köúûúò*öûúòKöúûúûúò)Köûúûúûú ò7KöûúòóóóKò öüúûúûúûúûúûúò<öûúûúûòKöúûúûúò'Köú	ûúûúò#Köú
+ûúûúûúò4KöûúûúòóóKò öüúûúûúûúûúûúòDöûúûúûòKöúûúûúò'Köú	ûúûúò#Köú
+ûúûúûúòKKöûúûúòóóKò öüúûúûúûúûúûúòEöûúûúûòKöúûúûúò'Köú	ûúûúò#öú
+ûúòKöúûú
+ûúòKöúûúòKöúûúò(Köú+ò+Köú<ò<KöûúòóKöûúûúòóóKò ö
+üúûúûúûúûúò>öûúò
+Köûúûú6òAKöûúûú2ò=óóKò öü	úûúûúûúûúûúò8Köúûúûúûúò#Köúûúûúûúò#Köúûúò
+Köúûúûúûúò=KöûúòóKò öüúûúûúûúûúûúò;Köúûúûúûúò#Köúûúûúûúò#KöûúòóKò öüúûúûúûúûúûúò4Köúûúûúûúò!KöúûúòKöúûúûúò<KöûúòóKò öüúûúûúûúûúûúò7Köúûúûúûúò!KöûúòóKò öü
+úûúûúûú	ò5KöúûúòóKò ö
+üúûúûúûúûúò:Köûúûúûúûúò1Köûú ò&óKò öüúûúûúûúòPKöúûúòKöúûúòKöûú	ûúûúûú	ûúûúò8Köûúûú	ûúûú
+ò%öûúòKöúûúò"KöúûúûúòKòöüúûúûúûúûúûúûú†úòYKö
+ûúûúûúûúûúòHKöûúûúòóKöûúûúûúò,Köúûúò KòKò
+Köûúûúûúò,öûúûúûú†#ò4Köú
+ûúòKöú
+ûúòKöûúûú	òóKòóóKò ö
+üúûúûú
+ûúûúòNKöúLûúûúòuKöúòKöûúòóKò öüúûúûúûúò@öûúò	KòAKöú>ò>KòóóKò ö
+üúûúûúûúûúò>Kö
+ûúûú+ûúûúûúòEKöûú&ò,óKò öüúûúûú"ûúòWKöúòKöú
+ûúûú
+òKöûú ûúûúò3KòKòKöûúûúûúûúûúûúòBKöûúûúûúûúûúûúòCKöúûúûúòKöúûúûúòöûúûúòKöûúûúûúûúò(óKöûúIòOóKò öüúûúûú"ûúòWKöûú ûúûúò3Kò!Kò#KöúòKöûúZò`óKò öüúûúûúûúòFKö	úûúûúûúûúò.Kö	úûúûúûúûúò.Köûúûúûúûúò0Köûúûúûúûúò0KöûúòóKò öüúûúûú!ò?Kö	úûúûúûúûúò.Kö	úûúûúûúûúò"KöúûúòKò%KöûúûúûúûúòKöúûúòKöûúûúûúûúò+Köûúûúûúûúò*KöûúòóKò ö
+üúûúûúûúûúòBöüúûúûúûúûúûúûú†úò[Köúûúûúûúò"öûúûú"ûúò.KöúûúòKöûúûúûúûúò;óKöûúòóKöúûúò
+Köûúûúûúò)KöúWòWKöûúòóKò öüúûúûúûúûúûúòBöûúûúûòKöúûúûúûúhòéKöú
+ûúûúûú>òbKöûúûúòóKòóKò Kö	úûúûúûúûúò%Kò Köúûúûúò,Köú
+ûúûúòKöúû	úòKò Köúûúûúò*KöúûúòKöúû	úò$KöúûúûúòKöúHòHKöúûúûúò)Köú(ò(Kò öüúûúûúûúò/öüúûúûúûúò9KöûúûúûúòKöûúòóKöûúòKöúòóKò öüú†úûúûúò4öûú6ò8Köûúûúûú+òLóKöúòKöûúòóKò öüúûúò$öü
+úûúûúûúûúûúûú†úò_Köúûúûúûúò"öûúûúûúò!öûúûúûòKö	úûúûú,ûúûúòBKöúûúûúûúò%Köúûúûúûúò!KöûúûúòóKòóKöûúòóKöûúûúûúò$KöûúòóKò ö
+üúûúûúûúûúò/ö
+üúûúûúûúûúò=KöûúûúûúòKö
+ûúûúûú
+ûú ûúòYóKöûúòóKò öüúûúûúûúò>KöûúûúûúòKöûúûúûúûúò'Köúûúò
+Kòöûúò	KöúòKöúòKòóKöûúòóKò öüúûúûúò%KöûúûúûúòKöúûúòKöûú
+ûúû	úò%Köû	úòKöûúòóKò öüúûúûúûúò7Köú ò KöúûúòKòKöûúòóKò ö
+ü	úûú†	úûúûúò3öüú†úûúòKöú
+ûúòKöúòKöûúòóKöúûúò!KöûúòóKò öüúûú†	úûúüúûúûúûúûúòSKöúûúûúòKö	úûúûúûúûúò.Köúûúûúò.öûòKöûúûúûúòKöúûúòKòKöúûúûúò.KöûúòóKöúûúòKöûúò	óKò öüúûúûúò+KöûúûúûúòKöûúòKöûúòóKò öüúûúûú	ûúò-Köü
+ú†úûúò;Köúûúò#KöûúòóKò ö
+üúûúûúûú	ûúòJKöü
+ú†úûúò;Köúûúò#KöûúòóKò öüúûú†	úûúò2Köüú†úûúò2KöúûúòKöûúòóKò öüú†úûúò3KöúòKöúòöûú%ûúûúûò8Köú$ò$KöûúòóKöûúòóKò öü
+úûúûúûúò-KöúûúòKöûúòóKò öüúûúûúûúûú
+ûúûúòVKöúûúò#Köú-ò-öüú†úûúòöûúûúûòKöú ûúò'Köúûú3ûúÜò∆öûúòKöúòKöûúòóóKòóKöúûúòKöûúòóKò öü
+úûúûúûúò-Kö	úûúûúûúûúò<öüú†úûúòöûúûúûòKöú*ûúò1öûúòKò7KöúòKöûúòóóKòóKöúûúò KöûúòóKò öüúûúûúûú
+ò+Köúûúò%óKò öüúûúûúûúûúûú
+ûúûúò_Kö	úûúûúûúûúò<öüú†úûúòöûúûúûòKöú&ûúò-Köúûúûú6òEöûúòKò'Kò!KöúòKöûúòóóKòóKöúûúò KöûúòóKò öüúûú†	úûúûúûú	òBKö	úûúûúûúûúò@öüú†úûúòöûúûúûòKöûú*ûúò4öûú/ò2Kò'Kò KöúòKöûúòóò$Köú
+ûúûúûúò öüúûúûúûúûúûúûú†úò[Köúûúûúûúò#Köúûúûúûúò#öûúûúûòKöúûúò!Köúûúò"Köú-ò-KöúûúòKöú)ò)KöúûúòKöûúûúòóKöûúòóKöûú"ûúûúò/Kò:KöúòKöûúò	óKöúûúòKöúûúòöûúòKöúBòBKöûúòóóKòóKöúûúò KöûúòóKò öüúûúòöûúò	KöúHòHKöú%ò%KöúDòDKöú!ò!KöúFòFKöú#ò#KòóKöúòóóôKöúûúò!Köúûú	òKöúûúò'Köú
+ûúòKöúûúòKöúûúò Köúûú	òKöúûúòKöú6ûúò:Kò öüúûúò&Köûúûúûú"ò9Köúûú#ò4Köûúûúûú-òDKöúûúòKöûúòóKò öüúò+KöúûúòKö
+ûúûúûúûúûú;òeöûúûúûúûò!Köúûú:òKKöúûúûúòAöú!ò!KöúòKöúòKöúòKöú&ò&öúûúòKö	úûúûúûúûúòKöúûúò&Köú:ûúòDKöúnûúûú4òØKöûúò
+óöúòKöúnûúûú4òØKöûúò	óKòóöûúûúûúòKöúûúò%Köúûúò)Köúiûú&òìöú1ò1Köú+ò+öúûúòKöú:ò:KöúDòDKöú$ò$óKöú+ò+óKöûúòóKöûúòóKöûúòóKò öüúûú#ûúûúòIKöúûúòKöúûúûúòKöúûúûúò!KöûúûúkòxKöúRòRKöûúûúXòeKö	úûúûúûúûúòcKöûúûúRûú<òüKöú1ûúò7KöûúòóKò KöúûúûúûúòKöúûúò1Kò Köüúûúûúûúò#Kò öüúûúûúûú
+ûú$ûúûúòtöûúòKö
+ûú
+ûúûúûúûú	ò9Kòóöüúûúòöûú	ûúòKöúûúò!Köú
+ûúûú$ûúûúûú)òàKöúûúòKöûúûú
+ûú3òMKöú$ò$KöûúòóöûúòKöú,ò,KöûúòóKòóKöúûúòKöúûúûúòKöúûúòKöúûúûúò,öûúûúòKöúòKöúûúò$Köúûúò$KòKöúûú+ûúò;KöúûúòKöúûúò'öûúûú$ûúò0KöúûúPûúkò…KöûúòóKòKòóöûúûúûúûúòKò)Köûúòóöûú
+ûúûúò!Köúûú[òeKöûúòóKöûúûú^òköûúûòòKöúûúûúòKò
+öûòKöú
+ûúò%KöúûúòKöúûúòKöúûúòKöûú
+ûú#ûúò9Köûúûúûúò Köúûúûú0òSöûúûúûúò&öúûúûúòKöúBûúòGKöúòKòKòKòKòóKö	ú	ûúûúûúûúòGKòóKöúûúò	óKöûúûúûúûúûúûú%ûúòjKö	úûúûúûú%ûúòIKòóòKò
+KöúMòMKöúòKòóKöú)ò)ö	úûúûúûúûúò'öüúûúûúûúòAKöú[ò[KöûúòóKöûú0ò3Köú ò KòóöûúòKöúûúAòKKòóóKöûú
+ûúòKöú ò KöûúòKöúòKöúòKöûúòöûòKö	úûú
+ûúûú
+ûúòOóKöúòóKò öüúûúûúûú ûúûúûúûúûúòÉKöúûúûúûúòKöúûúòöúûúò	Köûú
+ûúûúûúûú9ûúòÄKöûúûúûúûúûúûúHûúòüKöúûúûúûúòFKöúòóöüúûúûúûúòAKöúXòXKöûúòóKöúVûú<òîKöú:ò:KöûúûúûúûúòöûúûúòKöûú4ò7KöúòóKöûúòKöúòKöûúûúòKòKöûúûúûúò0KöûúòóKò öüúûúûúûúûúûúûúûúûúûúûúò{KöúòKöúûúò$Köúûúò$KöúòKöúûúòKöûúûúûú0òTKöúûú+ûúò;KöúûúòKöúûúò/öûúûú,ûúò8KöúûúbûúkòŸKöûúòóKòKöúòKö
+ûúûúûúûúûúò}KöûúòKò óöüúûúûúûúò2Köûúûú
+ûúòKöúòKöúòKöúòKöúòKöûúòóóôKòKöúûúòKöûúMòPKöúxòxóLöûúòó Öó    [t  |±  

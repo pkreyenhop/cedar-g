@@ -1,0 +1,702 @@
+
+
+DIRECTORY
+Atom USING [GetPName, GetPropFromList, PropList, PutPropOnList, RemPropFromList],
+Basics USING [FWORD, HWORD, CopyBytes, RawBytes, UnsafeBlock],
+IO,
+IOErrorFormatting,
+IOUtils USING [],
+PreDebug USING [Explainer, Raise, RegisterErrorExplainer],
+RefText USING [InlineAppendChar, New],
+Rope USING [Cat, Concat, Length, ROPE],
+RuntimeError USING [BoundsFault];
+
+IOCommonImpl: CEDAR PROGRAM  
+IMPORTS Basics, IO, Atom, PreDebug, RefText, Rope, RuntimeError
+EXPORTS IO, IOErrorFormatting, IOUtils
+SHARES IO --for representation of StreamProcs
+= BEGIN OPEN IO;
+
+ROPE: TYPE = Rope.ROPE;
+RawBytes: TYPE = Basics.RawBytes;
+UnsafeBlock: TYPE = Basics.UnsafeBlock;
+Error: PUBLIC ERROR [ec: IO.ErrorCode, stream: STREAM, details: LIST OF REF ¬ NIL, msg: ROPE ¬ NIL] = CODE;
+EndOfStream: PUBLIC ERROR [stream: STREAM] = CODE;
+Rubout: PUBLIC ERROR [stream: STREAM] = CODE;
+Timeout: PUBLIC SIGNAL [which: REF, codes: LIST OF ATOM, msg: ROPE] = CODE;
+
+AtomFromErrorCode: PUBLIC PROC [ec: ErrorCode] RETURNS [ATOM] ~ {
+SELECT ec FROM
+Null => RETURN[$Null];
+NotImplementedForThisStream => RETURN[$NotImplementedForThisStream];
+StreamClosed => RETURN[$StreamClosed];
+Failure => RETURN[$Failure];
+IllegalBackup => RETURN[$IllegalBackup];
+BufferOverflow => RETURN[$BufferOverflow];
+BadIndex => RETURN[$BadIndex];
+SyntaxError => RETURN[$SyntaxError];
+PFInvalidCode => RETURN[$PFInvalidCode];
+PFInvalidPFProcs => RETURN[$PFInvalidPFProcs];
+PFCantBindConversionProc => RETURN[$PFCantBindConversionProc];
+PFFormatSyntaxError => RETURN[$PFFormatSyntaxError];
+PFUnprintableValue => RETURN[$PFUnprintableValue];
+ENDCASE => RETURN[NIL];
+};
+
+ErrorCodeFromAtom: PUBLIC PROC [atom: ATOM] RETURNS [ErrorCode] ~ {
+SELECT atom FROM
+$Null => RETURN[Null];
+$NotImplementedForThisStream => RETURN[NotImplementedForThisStream];
+$StreamClosed => RETURN[StreamClosed];
+$Failure => RETURN[Failure];
+$IllegalBackup => RETURN[IllegalBackup];
+$BufferOverflow => RETURN[BufferOverflow];
+$BadIndex => RETURN[BadIndex];
+$SyntaxError => RETURN[SyntaxError];
+$PFInvalidCode => RETURN[PFInvalidCode];
+$PFInvalidPFProcs => RETURN[PFInvalidPFProcs];
+$PFCantBindConversionProc => RETURN[PFCantBindConversionProc];
+$PFFormatSyntaxError => RETURN[PFFormatSyntaxError];
+$PFUnprintableValue => RETURN[PFUnprintableValue];
+ENDCASE => RETURN[ErrorCode.LAST];
+};
+
+RopeFromErrorCode: PUBLIC PROC [ec: ErrorCode] RETURNS [ROPE] ~ {
+a: ATOM ~ AtomFromErrorCode[ec];
+IF a=NIL THEN RETURN IO.PutFR1["code %g", [cardinal[ec.ORD]] ]
+ELSE RETURN [Atom.GetPName[a]]};
+
+FormatError: PUBLIC PROC [ec: ErrorCode, details: LIST OF REF ¬ NIL, msg: ROPE ¬ NIL] RETURNS [rope: ROPE] ~ {
+rope ¬ Rope.Concat["IO.Error[", RopeFromErrorCode[ec]];
+IF msg.Length[]>0 THEN rope ¬ rope.Cat[": ", msg];
+IF details#NIL THEN {
+rope ¬ IO.PutFR["%g (%g", [rope[rope]], [refAny[details.first]] ];
+FOR details ¬ details.rest, details.rest WHILE details#NIL DO
+rope ¬ rope.Cat["/", IO.PutR1[[refAny[details.first]]]];
+ENDLOOP;
+rope ¬ rope.Concat[")]"]}
+ELSE rope ¬ rope.Concat["]"];
+RETURN};
+
+ExplainIOError: PreDebug.Explainer = {
+message: ROPE ¬ "IO.Error";
+IF args#NIL THEN PreDebug.Raise[signalOrError, args ! Error => {
+message ¬ IO.PutFR["%g (ec: %g) %g", IO.rope[message], IO.card[ORD[ec]], IO.rope[msg]];
+CONTINUE
+}];
+RETURN [message]
+};
+
+ExplainEndOfStream: PreDebug.Explainer = {
+RETURN["EndOfStream"];
+};
+
+ExplainRubout: PreDebug.Explainer = {
+RETURN["Rubout"];
+};
+CreateStreamProcs: PUBLIC PROC [
+variety: IO.StreamVariety,
+class: ATOM,
+getChar: GetCharProc ¬ NIL,
+getBlock: GetBlockProc ¬ NIL,
+unsafeGetBlock: UnsafeGetBlockProc ¬ NIL,
+endOf: EndOfProc ¬ NIL,
+charsAvail: CharsAvailProc ¬ NIL,
+backup: BackupProc ¬ NIL,
+putChar: PutCharProc ¬ NIL,
+putBlock: PutBlockProc ¬ NIL,
+unsafePutBlock: UnsafePutBlockProc ¬ NIL,
+flush: FlushProc ¬ NIL,
+reset: ResetProc ¬ NIL,
+close: CloseProc ¬ NIL,
+getIndex: GetIndexProc ¬ NIL,
+setIndex: SetIndexProc ¬ NIL,
+getLength: GetLengthProc ¬ NIL,
+setLength: SetLengthProc ¬ NIL,
+eraseChar: EraseCharProc ¬ NIL
+] 
+RETURNS [REF StreamProcs] = {
+streamProcs: REF StreamProcs ¬ NEW[StreamProcs ¬ [
+variety: variety,
+class: class,
+getChar: IF getChar # NIL THEN getChar
+ELSE IF unsafeGetBlock # NIL THEN GetCharViaUnsafeGetBlock
+ELSE DefaultGetChar,
+getBlock: IF getBlock # NIL THEN getBlock
+ELSE IF unsafeGetBlock # NIL THEN GetBlockViaUnsafeGetBlock
+ELSE GetBlockViaGetChar,  
+unsafeGetBlock: IF unsafeGetBlock # NIL THEN unsafeGetBlock
+ELSE UnsafeGetBlockViaGetChar,
+endOf: IF endOf = NIL THEN DefaultEndOf ELSE endOf, 
+charsAvail: IF charsAvail = NIL THEN DefaultCharsAvail ELSE charsAvail,    
+backup: IF backup = NIL THEN DefaultBackup ELSE backup,
+putChar: IF putChar # NIL THEN putChar
+ELSE IF unsafePutBlock # NIL THEN PutCharViaUnsafePutBlock
+ELSE DefaultPutChar,  
+putBlock: IF putBlock # NIL THEN putBlock
+ELSE IF unsafePutBlock # NIL THEN PutBlockViaUnsafePutBlock
+ELSE PutBlockViaPutChar, 
+unsafePutBlock: IF unsafePutBlock # NIL THEN unsafePutBlock
+ELSE UnsafePutBlockViaPutChar,
+flush: IF flush = NIL THEN DefaultFlush ELSE flush, 
+reset: IF reset = NIL THEN DefaultReset ELSE reset, 
+close: IF close = NIL THEN DefaultClose ELSE close, 
+getIndex: IF getIndex = NIL THEN DefaultGetIndex ELSE getIndex,
+setIndex: IF setIndex = NIL THEN DefaultSetIndex ELSE setIndex,
+getLength: IF getLength = NIL THEN DefaultGetLength ELSE getLength,
+setLength: IF setLength = NIL THEN DefaultSetLength ELSE setLength,
+eraseChar: IF eraseChar = NIL THEN DefaultEraseChar ELSE eraseChar,
+propList: NIL]];
+RETURN[streamProcs];
+};
+
+CreateStream: PUBLIC PROC [streamProcs: REF StreamProcs, streamData: REF ANY, backingStream: STREAM ¬ NIL] RETURNS [stream: STREAM] = {
+stream ¬ NEW[IO.STREAMRecord ¬ [streamProcs: streamProcs, streamData: streamData, backingStream: backingStream]];
+};
+
+TextPtr: PROC [text: REF READONLY TEXT] RETURNS [POINTER TO RawBytes] ~ INLINE {
+RETURN[LOOPHOLE[text, POINTER TO RawBytes]+SIZE[TEXT[0]]];
+};
+
+GetBlockViaGetChar: PUBLIC PROC [self: STREAM, block: REF TEXT, startIndex: NAT, count: NAT] RETURNS [nBytesRead: NAT] = {
+rem: NAT ~ block.maxLength-startIndex; -- BoundsFault if startIndex>block.maxLength
+index: NAT ¬ startIndex;
+{ ENABLE EndOfStream => CONTINUE;
+THROUGH [0..MIN[count, rem]) DO
+block[index] ¬ IO.InlineGetChar[self];
+index ¬ index+1;
+ENDLOOP;
+};
+block.length ¬ index;
+RETURN[index-startIndex];
+};
+
+UnsafeGetBlockViaGetChar: PUBLIC UNSAFE PROC [self: STREAM, block: UnsafeBlock] RETURNS [nBytesRead: INT] = {
+startIndex: CARD ~ block.startIndex; -- BoundsFault if block.startIndex<0
+count: CARD ~ block.count; -- BoundsFault if block.count<0
+index: CARD ¬ startIndex;
+{ ENABLE EndOfStream => CONTINUE;
+THROUGH [0..count) DO
+TRUSTED { block.base[index] ¬ ORD[IO.InlineGetChar[self]] }; -- UNSAFE!
+index ¬ index+1;
+ENDLOOP;
+};
+RETURN[index-startIndex];
+};
+
+GetCharViaUnsafeGetBlock: PUBLIC PROC [self: STREAM] RETURNS [CHAR] = TRUSTED {
+buff: ARRAY [0..BYTES[WORD]) OF BYTE;
+base: POINTER TO RawBytes ~ LOOPHOLE[@buff];
+IF self.streamProcs.unsafeGetBlock[self, [base: base, startIndex: 0, count: 1]] = 1
+THEN RETURN[VAL[base[0]]]
+ELSE ERROR EndOfStream[self];
+};
+
+GetBlockViaUnsafeGetBlock: PUBLIC PROC [self: IO.STREAM, block: REF TEXT, startIndex: NAT, count: NAT] RETURNS [nBytesRead: NAT] = {
+rem: NAT ~ block.maxLength-startIndex; -- BoundsFault if startIndex>block.maxLength
+TRUSTED { nBytesRead ¬ self.streamProcs.unsafeGetBlock[self, [base: TextPtr[block], startIndex: startIndex, count: MIN[count, rem]]] };
+block.length ¬ startIndex+nBytesRead;
+};
+PutBlockViaPutChar: PUBLIC PROC [self: STREAM, block: REF READONLY TEXT, startIndex: NAT, count: NAT] = {
+rem: NAT ~ block.maxLength-startIndex; -- BoundsFault if startIndex>block.maxLength
+len: NAT ~ IF count>rem THEN MIN[rem, block.length-startIndex] ELSE count;
+FOR i: NAT IN [startIndex..startIndex+len) DO
+IO.InlinePutChar[self, IO.QFetch[block, i]];
+ENDLOOP;
+}; 
+
+UnsafePutBlockViaPutChar: PUBLIC PROC [self: STREAM, block: UnsafeBlock] = {
+startIndex: CARD ~ block.startIndex; -- BoundsFault if block.startIndex<0
+count: CARD ~ block.count; -- BoundsFault if block.count<0
+FOR i: CARD IN [startIndex..startIndex+count) DO
+TRUSTED { IO.InlinePutChar[self, VAL[block.base[i]]] };
+ENDLOOP;
+};
+
+PutCharViaUnsafePutBlock: PUBLIC PROC [self: STREAM, char: CHAR] = TRUSTED {
+buff: ARRAY [0..BYTES[WORD]) OF BYTE;
+base: POINTER TO RawBytes ~ LOOPHOLE[@buff];
+base[0] ¬ ORD[char];
+self.streamProcs.unsafePutBlock[self, [base: base, startIndex: 0, count: 1]];
+};
+
+PutBlockViaUnsafePutBlock: PUBLIC PROC [self: STREAM, block: REF READONLY TEXT, startIndex: NAT, count: NAT] = {
+rem: NAT ~ block.maxLength-startIndex; -- BoundsFault if startIndex>block.maxLength
+len: NAT ~ IF count>rem THEN MIN[rem, block.length-startIndex] ELSE count;
+self.streamProcs.unsafePutBlock[self, [base: TextPtr[block], startIndex: startIndex, count: len]];
+}; 
+DefaultGetChar: PROC [self: STREAM] RETURNS [CHAR] = {
+IF self.backingStream#NIL THEN RETURN[IO.InlineGetChar[self.backingStream]]
+ELSE ERROR Error[$NotImplementedForThisStream, self];
+};
+
+DefaultEndOf: PROC [self: STREAM] RETURNS [BOOL] = {
+IF self.backingStream#NIL THEN RETURN IO.InlineEndOf[self.backingStream]
+ELSE ERROR IO.Error[$NotImplementedForThisStream, self];
+};
+
+DefaultCharsAvail: PROC [self: STREAM, wait: BOOL] RETURNS [INT] = {
+IF self.backingStream#NIL THEN RETURN IO.CharsAvail[self.backingStream, wait]
+ELSE RETURN[INT.LAST];
+};
+
+DefaultPutChar: PROC [self: STREAM, char: CHAR] = {
+IF self.backingStream#NIL THEN IO.InlinePutChar[self.backingStream, char]
+ELSE ERROR IO.Error[$NotImplementedForThisStream, self];
+};
+
+DefaultFlush: PROC [self: STREAM] = {
+IF self.backingStream#NIL THEN IO.Flush[self.backingStream];
+};
+
+DefaultReset: PROC [self: STREAM] = {
+IF self.backingStream#NIL THEN IO.Reset[self.backingStream];
+};
+
+DefaultClose: PROC [self: STREAM, abort: BOOL ¬ FALSE] = { 
+IF abort THEN self.streamProcs.reset[self] ELSE self.streamProcs.flush[self];
+IF self.backingStream#NIL THEN IO.Close[self.backingStream, abort];
+self­ ¬ [streamProcs: closedStreamProcs];
+};
+
+DefaultGetIndex: PROC [self: STREAM] RETURNS [index: INT] = {
+IF self.backingStream#NIL THEN RETURN IO.GetIndex[self.backingStream]
+ELSE ERROR IO.Error[$NotImplementedForThisStream, self];
+};
+
+DefaultSetIndex: PROC [self: STREAM, index: INT] = {
+IF self.backingStream#NIL THEN IO.SetIndex[self.backingStream, index]
+ELSE ERROR IO.Error[$NotImplementedForThisStream, self];
+};
+
+DefaultGetLength: PROC [self: STREAM] RETURNS [length: INT] = {
+IF self.backingStream#NIL THEN RETURN IO.GetLength[self.backingStream]
+ELSE ERROR IO.Error[$NotImplementedForThisStream, self];
+};
+
+DefaultSetLength: PROC [self: STREAM, length: INT] = {
+IF self.backingStream#NIL THEN IO.SetLength[self.backingStream, length]
+ELSE ERROR IO.Error[$NotImplementedForThisStream, self];
+};
+
+DefaultEraseChar: PROC [self: STREAM, char: CHAR] = {
+IF self.backingStream#NIL THEN IO.EraseChar[self.backingStream, char]
+ELSE { IO.PutChar[self, '\\]; IO.PutChar[self, char] };
+};
+
+closedStreamProcs: PUBLIC REF StreamProcs ¬ NEW[StreamProcs ¬ [
+variety: $inputOutput,
+class: $Closed,
+getChar: ClosedGetChar,
+getBlock: ClosedGetBlock,
+unsafeGetBlock: ClosedUnsafeGetBlock,
+endOf: ClosedEndOf,
+charsAvail: ClosedCharsAvail,
+backup: ClosedBackup,
+putChar: ClosedPutChar,
+putBlock: ClosedPutBlock,
+unsafePutBlock: ClosedUnsafePutBlock,
+flush: ClosedFlush,
+reset: ClosedReset,
+close: ClosedClose,
+getIndex: ClosedGetIndex,
+setIndex: ClosedSetIndex,
+getLength: ClosedGetLength,
+setLength: ClosedSetLength,
+eraseChar: ClosedEraseChar,
+propList: NIL]];
+
+ClosedGetChar: GetCharProc = { ERROR IO.Error[$StreamClosed, self] };
+ClosedGetBlock: GetBlockProc = { ERROR IO.Error[$StreamClosed, self] };
+ClosedUnsafeGetBlock: UnsafeGetBlockProc = { ERROR IO.Error[$StreamClosed, self] };
+ClosedEndOf: EndOfProc = { ERROR IO.Error[$StreamClosed, self] };
+ClosedCharsAvail: CharsAvailProc = { ERROR IO.Error[$StreamClosed, self] };
+ClosedBackup: BackupProc = { ERROR IO.Error[$StreamClosed, self] };
+ClosedPutChar: PutCharProc = { ERROR IO.Error[$StreamClosed, self] };
+ClosedPutBlock: PutBlockProc = { ERROR IO.Error[$StreamClosed, self] };
+ClosedUnsafePutBlock: UnsafePutBlockProc = { ERROR IO.Error[$StreamClosed, self] };
+ClosedFlush: FlushProc = { ERROR IO.Error[$StreamClosed, self] };
+ClosedReset: ResetProc = { -- *noop* -- };
+ClosedClose: CloseProc = { -- *noop* -- };
+ClosedGetIndex: GetIndexProc = { ERROR IO.Error[$StreamClosed, self] };
+ClosedSetIndex: SetIndexProc = { ERROR IO.Error[$StreamClosed, self] };
+ClosedGetLength: GetLengthProc = { ERROR IO.Error[$StreamClosed, self] };
+ClosedSetLength: SetLengthProc = { ERROR IO.Error[$StreamClosed, self] };
+ClosedEraseChar: EraseCharProc = { ERROR IO.Error[$StreamClosed, self] };
+
+GetInfo: PUBLIC PROC [stream: STREAM] RETURNS [variety: StreamVariety, class: ATOM] = {
+RETURN [stream.streamProcs.variety, stream.streamProcs.class];
+};
+
+GetChar: PUBLIC PROC [self: STREAM] RETURNS [CHAR] = {
+i: NAT ~ self.bufferIndex;
+IF i < self.bufferInputLength
+THEN { self.bufferIndex ¬ i+1; RETURN[IO.QFetch[self.buffer, i]] }
+ELSE RETURN[self.streamProcs.getChar[self]];
+};
+
+GetBlock: PUBLIC PROC [self: STREAM, block: REF TEXT, startIndex: NAT ¬ 0, count: NAT ¬ NAT.LAST] RETURNS [nBytesRead: NAT] = {
+rem: NAT ~ block.maxLength-startIndex; -- BoundsFault if startIndex>block.maxLength
+len: NAT ~ MIN[count, rem];
+i: NAT ~ self.bufferIndex;
+IF i<self.bufferInputLength AND len<=NAT[self.bufferInputLength-i]
+THEN {
+TRUSTED { Basics.CopyBytes[
+dstBase: TextPtr[block], dstStart: startIndex, 
+srcBase: TextPtr[self.buffer], srcStart: i, 
+count: len] };
+self.bufferIndex ¬ i+len;
+block.length ¬ startIndex+len;
+RETURN[len];
+}
+ELSE RETURN[self.streamProcs.getBlock[self, block, startIndex, len]];
+};
+
+UnsafeGetBlock: PUBLIC UNSAFE PROC [self: STREAM, block: UnsafeBlock] RETURNS [nBytesRead: INT] = {
+startIndex: CARD ~ block.startIndex; -- BoundsFault if block.startIndex<0
+len: CARD ~ block.count; -- BoundsFault if block.count<0
+i: NAT ~ self.bufferIndex;
+IF i<self.bufferInputLength AND len<=CARD[self.bufferInputLength-i]
+THEN {
+TRUSTED { Basics.CopyBytes[
+dstBase: block.base, dstStart: startIndex, 
+srcBase: TextPtr[self.buffer], srcStart: i, 
+count: len] }; -- UNSAFE! (writing via block.base)
+self.bufferIndex ¬ i+len;
+RETURN[len];
+}
+ELSE TRUSTED { RETURN[self.streamProcs.unsafeGetBlock[self, block]] }; -- UNSAFE!
+};
+
+EndOf: PUBLIC PROC [self: STREAM] RETURNS [BOOL] = {
+RETURN[(self.bufferIndex >= self.bufferInputLength) AND self.streamProcs.endOf[self]];
+};
+
+CharsAvail: PUBLIC PROC [self: STREAM, wait: BOOL ¬ FALSE] RETURNS [INT] = {
+RETURN[self.streamProcs.charsAvail[self, wait]];
+};
+
+Backup: PUBLIC PROC [self: STREAM, char: CHAR] = {
+i: NAT ~ self.bufferIndex;
+IF i > 0 AND i <= self.bufferInputLength
+THEN {
+k: NAT ~ i-1;
+IF self.buffer[k]=char
+THEN self.bufferIndex ¬ k
+ELSE ERROR IO.Error[$IllegalBackup, self];
+}
+ELSE self.streamProcs.backup[self, char];
+}; 
+PeekChar: PUBLIC PROC [self: STREAM] RETURNS [char: CHAR] = {
+i: NAT ~ self.bufferIndex;
+IF i < self.bufferInputLength
+THEN RETURN[IO.QFetch[self.buffer, i]]
+ELSE Backup[self, (char ¬ self.streamProcs.getChar[self])];
+};
+
+PutChar: PUBLIC PROC [self: STREAM, char: CHAR] = {
+i: NAT ~ self.bufferIndex;
+IF i < self.bufferOutputLength
+THEN { self.bufferIndex ¬ i+1; self.buffer[i] ¬ char }
+ELSE self.streamProcs.putChar[self, char];
+};
+
+PutBlock: PUBLIC PROC [self: STREAM, block: REF READONLY TEXT, startIndex: NAT ¬ 0, count: NAT ¬ NAT.LAST] = {
+rem: NAT ~ block.maxLength-startIndex; -- BoundsFault if startIndex>block.maxLength
+len: NAT ~ IF count>rem THEN MIN[rem, block.length-startIndex] ELSE count;
+bufferOutputLength: NAT ~ IF self.buffer=NIL THEN 0 
+ELSE MIN[self.buffer.maxLength, self.bufferOutputLength];
+i: NAT ~ self.bufferIndex;
+IF i<bufferOutputLength AND len<=NAT[bufferOutputLength-i]
+THEN {
+TRUSTED { Basics.CopyBytes[
+dstBase: TextPtr[self.buffer], dstStart: i, 
+srcBase: TextPtr[block], srcStart: startIndex, 
+count: len] };
+self.bufferIndex ¬ i+len;
+}
+ELSE self.streamProcs.putBlock[self, block, startIndex, len];
+};
+
+UnsafePutBlock: PUBLIC PROC [self: STREAM, block: UnsafeBlock] = {
+startIndex: CARD ~ block.startIndex; -- BoundsFault if block.startIndex<0
+len: CARD ~ block.count; -- BoundsFault if block.count<0
+bufferOutputLength: NAT ~ IF self.buffer=NIL THEN 0 
+ELSE MIN[self.buffer.maxLength, self.bufferOutputLength];
+i: NAT ~ self.bufferIndex;
+IF i<bufferOutputLength AND len<=CARD[bufferOutputLength-i]
+THEN {
+TRUSTED { Basics.CopyBytes[
+dstBase: TextPtr[self.buffer], dstStart: i, 
+srcBase: block.base, srcStart: startIndex, 
+count: len] };
+self.bufferIndex ¬ i+len;
+}
+ELSE self.streamProcs.unsafePutBlock[self, block];
+};
+
+Flush: PUBLIC PROC [self: STREAM] = {
+self.streamProcs.flush[self];
+};
+EraseChar: PUBLIC PROC [self: STREAM, char: CHAR] = {
+self.streamProcs.eraseChar[self, char];
+};
+
+Reset: PUBLIC PROC [self: STREAM] = {
+self.streamProcs.reset[self];
+};
+Close: PUBLIC PROC [self: STREAM, abort: BOOL ¬ FALSE] = {
+self.streamProcs.close[self, abort];
+};  
+GetText: PUBLIC PROC [self: STREAM, len: NAT, buffer: REF TEXT ¬ NIL] RETURNS [text: REF TEXT] ~ {
+IF (text ¬ buffer)=NIL OR text.maxLength<len THEN text ¬ RefText.New[len];
+IF GetBlock[self: self, block: text, count: len]<len THEN ERROR EndOfStream[self];
+};
+
+PutText: PUBLIC PROC [self: STREAM, t: REF READONLY TEXT] = {
+IF t#NIL THEN PutBlock[self, t, 0, t.length];
+};
+
+GetHWord: PUBLIC PROC [self: IO.STREAM] RETURNS [hword: Basics.HWORD] = TRUSTED {
+hi: BYTE = IO.InlineGetByte[self];
+lo: BYTE = IO.InlineGetByte[self];
+RETURN[[hi, lo]]; -- leave no fields uninitialized
+};
+
+PutHWord: PUBLIC PROC [self: IO.STREAM, hword: Basics.HWORD] = TRUSTED {
+IO.InlinePutByte[self, hword.hi];
+IO.InlinePutByte[self, hword.lo];
+};
+
+GetFWord: PUBLIC PROC [self: IO.STREAM] RETURNS [fword: Basics.FWORD] = TRUSTED {
+hhi: BYTE = IO.InlineGetByte[self];
+hlo: BYTE = IO.InlineGetByte[self];
+lhi: BYTE = IO.InlineGetByte[self];
+llo: BYTE = IO.InlineGetByte[self];
+RETURN[[[hhi, hlo], [lhi, llo]]];
+};
+
+PutFWord: PUBLIC PROC [self: IO.STREAM, fword: Basics.FWORD] = TRUSTED {
+PutHWord[self, fword.hi];
+PutHWord[self, fword.lo];
+};
+GetIndex: PUBLIC PROC [self: STREAM] RETURNS [index: INT] = {
+RETURN[self.streamProcs.getIndex[self]]
+};
+
+SetIndex: PUBLIC PROC [self: STREAM, index: INT] = {
+self.streamProcs.setIndex[self, index]
+}; 
+
+GetLength: PUBLIC PROC [self: STREAM] RETURNS [length: INT] = {
+RETURN[self.streamProcs.getLength[self]]
+};
+SetLength: PUBLIC PROC [self: STREAM, length: INT] = {
+self.streamProcs.setLength[self, length]
+};
+
+AmbushStream: PUBLIC PROC [self: STREAM, streamProcs: REF StreamProcs,
+streamData: REF ANY, reusing: STREAM ¬ NIL] = {
+IF reusing = NIL OR reusing = self -- to prevent circularities due to bugs -- THEN
+reusing ¬ NEW[IO.STREAMRecord ¬ [streamProcs: NIL, streamData: NIL]];
+reusing­ ¬ self­;
+self­ ¬ [streamProcs: streamProcs, streamData: streamData, propList: reusing.propList, backingStream: reusing];
+reusing.propList ¬ NIL; -- keep only one copy of prop list.
+};
+UnAmbushStream: PUBLIC PROC [self: STREAM] = {
+propList: Atom.PropList = self.propList; 
+IF self.backingStream = NIL THEN RETURN;
+self­ ¬ self.backingStream­;
+IF self.propList # NIL THEN ERROR; -- access to the backing stream prop list was an error
+self.propList ¬ propList;
+};
+
+StoreData: PUBLIC PROC [self: STREAM, key: ATOM, data: REF ANY] = {
+self.propList ¬ Atom.PutPropOnList[self.propList, key, data];
+};
+
+LookupData: PUBLIC PROC [self: STREAM, key: ATOM] RETURNS [REF ANY] = {
+RETURN[Atom.GetPropFromList[self.propList, key]];
+};
+
+RemoveData: PUBLIC PROC [self: STREAM, key: ATOM] = {
+self.propList ¬ Atom.RemPropFromList[self.propList, key];
+};
+
+StoreProc: PUBLIC PROC [class: REF StreamProcs, key: ATOM, procRef: REF ANY] = {
+class.propList ¬ Atom.PutPropOnList[class.propList, key, procRef];
+};
+
+LookupProc: PUBLIC PROC [self: STREAM, key: ATOM] RETURNS [procRef: REF ANY] = {
+RETURN[Atom.GetPropFromList[self.streamProcs.propList, key]];
+};
+BackupData: TYPE = REF BackupRecord;
+BackupRecord: TYPE = RECORD[stream: STREAM, buffer: REF TEXT];
+backupProcs: REF StreamProcs = IO.CreateStreamProcs[
+variety: $inputOutput, class: $BackedUp,
+getChar: BackupGetChar,
+endOf: BackupEndOf,
+charsAvail: BackupCharsAvail,
+reset: BackupReset,
+backup: BackupBackup
+];
+DefaultBackup: PROC [self: STREAM, char: CHAR] = {
+data: BackupData ¬ NARROW[LookupData[self, $Backup]];
+IF data = NIL THEN {
+data ¬ NEW[BackupRecord ¬ [
+stream: IO.CreateStream[NIL, NIL], buffer: RefText.New[8]]];
+StoreData[self: self, key: $Backup, data: data] };
+IF data.stream = self THEN ERROR Error[IllegalBackup, self];
+-- while self in backed-up state, client performed self.backingStream.Backup[] (!)
+AmbushStream[self: self, streamProcs: backupProcs, streamData: data, reusing: data.stream];
+self.Backup[char];
+};
+BackupBackup: PROC [self: STREAM, char: CHAR] = {
+data: BackupData = NARROW[LookupData[self, $Backup]];
+data.buffer ¬ RefText.InlineAppendChar[data.buffer, char !
+RuntimeError.BoundsFault => ERROR IO.Error[BufferOverflow, self]];
+};
+BackupGetChar: PROC [self: STREAM] RETURNS [char: CHAR] = {
+data: BackupData = NARROW[self.streamData];
+char ¬ data.buffer[data.buffer.length - 1];
+data.buffer.length ¬ data.buffer.length - 1;
+IF data.buffer.length = 0 THEN UnAmbushStream[self];
+RETURN[char];
+};
+BackupEndOf: PROC [self: STREAM] RETURNS [BOOL] = {
+RETURN[FALSE];
+};
+BackupCharsAvail: PROC [self: STREAM, wait: BOOL] RETURNS [INT] = {
+data: BackupData = NARROW[self.streamData];
+IF data.buffer.length > 0 THEN RETURN [data.buffer.length];
+RETURN[self.backingStream.CharsAvail[wait]];
+};
+BackupReset: PROC [self: STREAM] = {
+data: BackupData = NARROW[self.streamData];
+data.buffer.length ¬ 0;
+UnAmbushStream[self];
+self.Reset[];
+};
+PreDebug.RegisterErrorExplainer[Error, ExplainIOError];
+PreDebug.RegisterErrorExplainer[EndOfStream, ExplainEndOfStream];
+PreDebug.RegisterErrorExplainer[Rubout, ExplainRubout];
+END.
+   4  IOCommonImpl.mesa
+Copyright Ó 1985, 1986, 1987, 1989, 1991, 1992 by Xerox Corporation.  All rights reserved.
+MBrown on January 13, 1984 2:15 pm
+Paul Rovner on May 26, 1983 2:00 pm
+Teitelman on April 20, 1983 2:52 pm
+Russ Atkinson (RRA) November 14, 1989 4:56:53 pm PST
+JKF August 26, 1988 3:24:36 pm PDT 
+Willie-Sue Orr/ Alan Demers, November 13, 1989 6:45:56 pm PST
+Christian Jacobi,  July 25, 1990 8:18 pm PDT
+Michael Plass, August 9, 1991 9:58 am PDT
+Willie-s, February 4, 1992 5:02 pm PST
+Last tweaked by Mike Spreitzer March 26, 1992 4:59 pm PST
+Doug Wyatt, April 10, 1992 6:12 pm PDT
+Types
+Errors
+Creating streams
+Default Procedures: Get/Put Char/Block
+
+
+Default Procedures: others
+Closed Stream Procedures
+General information
+Input operations
+
+Output Operations (defined for output and inputOutput streams)
+
+Control Operations (defined for all streams)
+
+
+Other Get/Put Operations
+
+Special Control Operations (defined for file-like streams)
+
+Ambush / UnAmbush  Stream
+
+Property list manipulation
+
+Default Backup implementation
+
+This is the implementation of Backup supplied by CreateStreamProcs when the client does not supply its own.  This implementation ambushes the stream self.  The stream created by the ambushing is saved so that it can be reused if the stream enters the backed-up state often.
+-- first time for this particular stream
+
+this is the implementation of Backup when a stream is in the backed-up state from a call to BackupFirstChar.
+
+
+
+
+
+
+Change Log
+Changed by MBrown on October 25, 1983 1:18 pm
+Added "IF NOT debugClose THEN self.streamProcs ¬ closedStreamProcs;" to DefaultClose (default is debugClose = TRUE because compiler and binder break otherwise ...)
+Changed by MBrown on November 15, 1983 5:25 pm
+Fixed off-by-one error in BackupGetChar.
+Michael Plass, Doug Wyatt, August 6, 1991
+Cedar10.0 conversion
+ Ê~  •NewlineDelimiter
+–"cedarcode" style˜ codešœ™Kšœ
+ÏeœO™ZKšœ
+Ïc™"Kšœž™#Kšž	œž™#J™4K™#K™=K™,K™)K™&K™9K™&—K˜ šÏk	˜	KšœŸœG˜QKšœŸœŸœŸœ$˜>KšŸœ˜K˜KšœŸœ˜Kšœ	Ÿœ,˜:KšœŸœ˜&KšœŸœŸœ˜'KšœŸœ˜!—K˜ šÏnœŸœŸœ˜KšŸœ	Ÿœ-˜?KšŸœŸœ˜&KšŸœŸœž#˜-KšœŸœŸœŸœ˜—K˜ head™KšŸœŸœŸœ˜Kšœ
+Ÿœ˜!KšœŸœ˜'—šœ™Kš œŸœŸœŸœŸœŸœŸœŸœŸœŸœŸœ˜kKš
+ œŸœŸœ
+ŸœŸœ˜2Kš
+ œŸœŸœ
+ŸœŸœ˜-š œŸœŸœ	Ÿœ	ŸœŸœŸœŸœŸœ˜KK˜ —š
+ œŸœŸœŸœŸœ˜AšŸœŸ˜KšœŸœ˜KšœŸœ˜DKšœŸœ˜&KšœŸœ˜KšœŸœ˜(KšœŸœ˜*KšœŸœ˜KšœŸœ˜$KšœŸœ˜(KšœŸœ˜.KšœŸœ˜>KšœŸœ˜4KšœŸœ˜2KšŸœŸœŸœ˜—K˜K˜ —š
+ œŸœŸœŸœŸœ˜CšŸœŸ˜Kšœ	Ÿœ˜Kšœ Ÿœ˜DKšœŸœ˜&KšœŸœ
+˜KšœŸœ˜(KšœŸœ˜*KšœŸœ˜KšœŸœ˜$KšœŸœ˜(KšœŸœ˜.KšœŸœ˜>KšœŸœ˜4KšœŸœ˜2KšŸœŸœŸœ˜"—K˜K˜ —š
+ œŸœŸœŸœŸœ˜AKšœŸœ˜ KšŸœŸœŸœŸœŸœ Ÿœ˜>KšŸœŸœ˜ K˜ —š œŸœŸœŸœŸœŸœŸœŸœŸœŸœŸœ˜nK˜7KšŸœŸœ˜2šŸœ	ŸœŸœ˜KšœŸœ9˜BšŸœ&Ÿœ	ŸœŸ˜=KšœŸœ!˜8KšŸœ˜—K˜—KšŸœ˜KšŸœ˜—K˜ š œ˜&Kšœ	Ÿœ˜šŸœŸœŸœ0˜@Kšœ
+ŸœŸœŸœŸœŸœ˜WKšŸ˜K˜—KšŸœ
+˜K˜K˜ —š œ˜*KšŸœ˜K˜K˜ —š œ˜%KšŸœ˜K˜——šœ™š œŸœŸœ˜ Kšœ	Ÿœ˜KšœŸœ˜KšœŸœ˜KšœŸœ˜Kšœ%Ÿœ˜)KšœŸœ˜KšœŸœ˜!KšœŸœ˜KšœŸœ˜KšœŸœ˜Kšœ%Ÿœ˜)KšœŸœ˜KšœŸœ˜KšœŸœ˜KšœŸœ˜KšœŸœ˜KšœŸœ˜KšœŸœ˜KšœŸ˜K˜KšŸœŸœ˜šœŸœŸœ˜2Kšœ˜K˜šœ	ŸœŸœŸœ˜&KšŸœŸœŸœŸœ˜:KšŸœ˜—šœ
+ŸœŸœŸœ	˜)KšŸœŸœŸœŸœ˜;KšŸœ˜—šœŸœŸœŸœ˜;KšŸœ˜—Kš	œŸœ	ŸœŸœŸœ˜4Kš	œŸœŸœŸœŸœ˜KKš	œŸœ
+ŸœŸœŸœ˜7šœ	ŸœŸœŸœ˜&KšŸœŸœŸœŸœ˜:KšŸœ˜—šœ
+ŸœŸœŸœ	˜)KšŸœŸœŸœŸœ˜;KšŸœ˜—šœŸœŸœŸœ˜;KšŸœ˜—Kš	œŸœ	ŸœŸœŸœ˜4Kš	œŸœ	ŸœŸœŸœ˜4Kš	œŸœ	ŸœŸœŸœ˜4Kš	œ
+ŸœŸœŸœŸœ
+˜?Kš	œ
+ŸœŸœŸœŸœ
+˜?Kš	œŸœŸœŸœŸœ˜CKš	œŸœŸœŸœŸœ˜CKš	œŸœŸœŸœŸœ˜CKšœ
+Ÿœ˜—KšŸœ˜Kšœ˜K˜ —š œŸœŸœŸœŸœŸœŸœŸœŸœ
+Ÿœ˜‡Kšœ	ŸœŸœb˜qKšœ˜K˜ ——šœ&™&š œŸœŸœŸœŸœŸœŸœŸœŸœ˜PKšŸœŸœŸœŸœŸœŸœ˜:Kšœ˜K˜ —š œŸœŸœ	ŸœŸœŸœ	ŸœŸ	œŸœ˜zKšœŸœÏrœž,˜SKšœŸœ˜šœŸœŸœ˜!šŸœŸœŸ˜Kš¡Ÿœ¡˜&Kšœ˜KšŸœ˜—K˜—Kš¡˜KšÐkr¡˜K˜K˜ —š œŸœŸœŸœŸœŸœŸœ˜mKšœŸœž$˜IKšœŸœž˜:KšœŸœ˜šœŸœŸœ˜!šŸœŸ˜KšŸœŸœŸœž
+˜GKšœ˜KšŸœ˜—K˜—Kš¢¡˜Kšœ˜K˜ —š œŸœŸœŸœŸœŸœŸœ˜OKšœŸœŸœŸœŸœŸœ˜%KšœŸœŸœŸœ˜,šŸœQ˜SKšŸœŸœŸœ
+˜KšŸœŸœ˜—K˜K˜ —š œŸœŸœŸœŸœ	ŸœŸœŸœ	ŸœŸ	œŸœ˜„KšœŸœ¡œž,˜SKšŸœlŸœ˜‡Kš¡œ˜%Kšœ˜K™ —š œŸœŸœŸœ	ŸœŸœŸœŸœ	Ÿœ˜iKšœŸœ¡œž,˜SKšœŸœŸœŸœŸœŸœ˜Jš	¢¡¢¡¢¡œ¡¢˜-Kš¢¡œ¢¡˜,Kš¢¡˜—K˜K˜ —š œŸœŸœŸœ˜LKšœŸœž$˜IKšœŸœž˜:š	¢¡Ÿ¡¢¡œ¡¢˜0Kš	¢¡œ¢¡œ¡¢¡˜7Kš¢¡˜—K˜K˜ —š œŸœŸœŸœŸœŸœ˜LKšœŸœŸœŸœŸœŸœ˜%KšœŸœŸœŸœ˜,Kšœ
+Ÿœ˜KšœM˜MK˜K˜ —š œŸœŸœŸœ	ŸœŸœŸœŸœ	Ÿœ˜pKšœŸœ¡œž,˜SKšœŸœŸœŸœŸœŸœ˜JKšœb˜bK˜K™ ——šœ™š
+ œŸœŸœŸœŸœ˜6Kš
+ŸœŸœŸœŸœŸœ#˜KKšŸœŸœ+˜5K˜K˜ —š
+ œŸœŸœŸœŸœ˜4Kš
+ŸœŸœŸœŸœŸœ ˜HKšŸœŸœŸœ+˜8K˜K˜ —š œŸœŸœŸœŸœŸœ˜DKš
+ŸœŸœŸœŸœŸœ%˜MKšŸœŸœŸœŸœ˜K˜K˜ —š œŸœŸœŸœ˜3KšŸœŸœŸœŸœ(˜IKšŸœŸœŸœ+˜8K˜K˜ —š œŸœŸœ˜%KšŸœŸœŸœŸœ˜<K˜K˜ —š œŸœŸœ˜%KšŸœŸœŸœŸœ˜<K˜K˜ —š
+ œŸœŸœ	ŸœŸœ˜;KšŸœŸœŸœ˜MKšŸœŸœŸœŸœ"˜CK˜)K˜K˜ —š
+ œŸœŸœŸœ	Ÿœ˜=Kš
+ŸœŸœŸœŸœŸœ˜EKšŸœŸœŸœ+˜8K˜K˜ —š œŸœŸœ	Ÿœ˜4KšŸœŸœŸœŸœ$˜EKšŸœŸœŸœ+˜8K˜K˜ —š
+ œŸœŸœŸœ
+Ÿœ˜?Kš
+ŸœŸœŸœŸœŸœ˜FKšŸœŸœŸœ+˜8K˜K˜ —š œŸœŸœ
+Ÿœ˜6KšŸœŸœŸœŸœ&˜GKšŸœŸœŸœ+˜8K˜K˜ —š œŸœŸœŸœ˜5KšŸœŸœŸœŸœ$˜EKšŸœŸœŸœ˜7K˜K˜ ——šœ™šœŸ
+œŸœ˜?Kšœ˜K˜Kšœ˜Kšœ˜Kšœ%˜%Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ%˜%Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ
+Ÿœ˜—K˜ Kš œŸœŸœ˜EKš œŸœŸœ˜GKš œŸœŸœ˜SKš œŸœŸœ˜AKš œŸœŸœ˜KKš œŸœŸœ˜CKš œŸœŸœ˜EKš œŸœŸœ˜GKš œŸœŸœ˜SKš œŸœŸœ˜AKš œžœ˜*Kš œžœ˜*Kš œŸœŸœ˜GKš œŸœŸœ˜GKš œŸœŸœ˜IKš œŸœŸœ˜Iš œŸœŸœ˜IK˜ ——šœ™š œŸœŸœ
+ŸœŸœ!Ÿœ˜WKšŸœ8˜>K˜K˜ ——™š œŸœŸœŸœŸœŸœ˜6KšœŸœ˜šŸœ˜KšŸœŸœŸœ˜BKšŸœŸœ!˜,—Kšœ˜K˜ —š œŸœŸœŸœ	ŸœŸœŸœŸœŸœŸœŸœŸœ˜KšœŸœ¡œž,˜SKšœŸœŸœ˜KšœŸœ˜šŸœŸœŸœ˜BšŸœ˜KšŸœ€˜‡Kšœ˜Kšœ˜KšŸœ˜K˜—KšŸœŸœ:˜E—Kšœ˜K˜ —š œŸœŸœŸœŸœŸœŸœ˜cKšœŸœž$˜IKšœŸœž˜8KšœŸœ˜šŸœŸœŸœ˜CšŸœ˜KšŸœ}ž#˜§Kšœ˜KšŸœ˜Kšœ˜—KšŸœŸœŸœ2ž
+˜Q—Kšœ˜K˜ —š œŸœŸœŸœŸœŸœ˜4KšŸœ.Ÿœ˜VKšœ˜K˜ —š 
+œŸœŸœŸœŸœŸœŸœŸœ˜LKšŸœ*˜0Kšœ˜K˜ —š
+ œŸœŸœŸœŸœ˜2KšœŸœ˜šŸœŸœ˜(šŸœ˜KšœŸœ˜šŸœ˜KšŸœ˜KšŸœŸœŸœ˜*—K˜—KšŸœ%˜)—Kšœ˜K™ —š œŸœŸœŸœŸœŸœ˜=KšœŸœ˜šŸœ˜KšŸœŸœŸœ˜&KšŸœ7˜;—Kšœ˜K˜ ——šœ>™>š
+ œŸœŸœŸœŸœ˜3KšœŸœ˜šŸœ˜KšŸœ2˜6KšŸœ&˜*—Kšœ˜K˜ —š œŸœŸœŸœ	ŸœŸœŸœŸœŸœŸœŸœ˜nKšœŸœ¡œž,˜SKšœŸœŸœŸœŸœŸœ˜JKšœŸœŸœŸœŸœŸœŸœ1˜nKšœŸœ˜šŸœŸœŸœ˜:šŸœ˜KšŸœ€˜‡Kšœ˜Kšœ˜—KšŸœ9˜=—Kšœ˜K˜ —š œŸœŸœŸœ˜BKšœŸœž$˜IKšœŸœž˜8KšœŸœŸœŸœŸœŸœŸœ1˜nKšœŸœ˜šŸœŸœŸœ˜;šŸœ˜KšŸœ|˜ƒKšœ˜Kšœ˜—KšŸœ.˜2—Kšœ˜K˜ —š œŸœŸœŸœ˜%Kšœ˜Kšœ˜K™ —š
+ 	œŸœŸœŸœŸœ˜5Kšœ'˜'Kšœ˜K˜ ——šœ,™,š œŸœŸœŸœ˜%Kšœ˜Kšœ˜K™ —š œŸœŸœŸœ	ŸœŸœ˜:Kšœ$˜$Kšœ˜K™ ——šœ™š œŸœŸœŸœŸœ
+ŸœŸœŸœŸœŸœŸœ˜bKšŸœŸœŸœŸœ˜JKšŸœ3ŸœŸœ˜RK˜K˜ —š œŸœŸœŸœŸœŸœŸœ˜=KšŸœŸœŸœ ˜-Kšœ˜K˜ —š œŸœŸœŸ	œŸœŸœŸœ˜QKšœŸœŸœ˜"KšœŸœŸœ˜"KšŸœž ˜2K˜K˜ —š œŸœŸœŸ	œŸœŸœ˜HKšŸœ˜!KšŸœ˜!K˜K˜ —š œŸœŸœŸ	œŸœŸœŸœ˜QKšœŸœŸœ˜#KšœŸœŸœ˜#KšœŸœŸœ˜#KšœŸœŸœ˜#KšŸœ˜!K˜K˜ —š œŸœŸœŸ	œŸœŸœ˜HK˜K˜Kšœ˜K™ ——šœ:™:š œŸœŸœŸœŸœ	Ÿœ˜=KšŸœ!˜'Kšœ˜K˜ —š
+ œŸœŸœŸœ	Ÿœ˜4Kšœ&˜&Kšœ˜K˜ —š 	œŸœŸœŸœŸœ
+Ÿœ˜?KšŸœ"˜(Kšœ˜K™ —š
+ 	œŸœŸœŸœ
+Ÿœ˜6Kšœ(˜(Kšœ˜K˜ ——šœ™š
+ œŸœŸœŸœŸœ˜FKš	œŸœŸœŸœŸœ˜/š	ŸœŸœŸœž*œŸ˜RKš	œ
+ŸœŸœŸœŸœ˜E—K˜K˜oKšœŸœž#˜;Kšœ˜K™ —š œŸœŸœŸœ˜.K˜)KšŸœŸœŸœŸœ˜(K˜Kš	ŸœŸœŸœŸœž6˜YKšœ˜Kšœ˜K˜ ——™š 	œŸœŸœŸœŸœŸœ˜CKšœ¡œ-˜=Kšœ˜K˜ —š 
+œŸœŸœŸœŸœŸœŸœŸœ˜GKšŸœ+˜1Kšœ˜K˜ —š 
+œŸœŸœŸœ˜5Kšœ¡œ)˜9Kšœ˜K˜ —š 	œŸœ	ŸœŸœŸœŸœ˜PKšœ¡œ1˜BKšœ˜K˜ —š 
+œŸœŸœŸœŸœŸœŸœŸœ˜PKšŸœ7˜=Kšœ˜K™ ——™KšœŸœŸœ˜$KšœŸœŸœ	Ÿœ
+ŸœŸœ˜>šœŸœŸœ˜4K˜(K˜K˜K˜K˜K˜K˜K™ —š œŸœŸœŸœ˜2Kšœ•¡œx™‘KšœŸœ˜5šŸœŸœŸœ˜Kšž'œ™(šœŸœ˜KšœŸœŸœ˜<—Kšœ2˜2—šŸœŸœŸœ˜<KšžR˜R—Kšœ[˜[K˜Kšœ˜K™ —š œŸœŸœŸœ˜1Kšœl™lKšœŸœ˜5šœ:˜:KšœŸœŸœ˜B—Kšœ˜K™ —š œŸœŸœŸœŸœŸ˜;KšœŸœ˜+Kšœ+˜+Kšœ,˜,KšŸœŸœ˜4KšŸœ˜Kšœ˜K™ —š
+ œŸœŸœŸœŸœ˜3KšŸœŸœ˜Kšœ˜K™ —š œŸœŸœŸœŸœŸœ˜CKšœŸœ˜+KšŸœŸœŸœ˜;KšŸœ&˜,Kšœ˜K™ —š œŸœŸœ˜$KšœŸœ˜+K˜Kšœ˜K˜Kšœ˜K™ —Kšœ7˜7KšœA˜AKšœ7˜7—K™ KšŸœ˜šž
+™
+™-Kš
+žŸœŸœ&žœ
+žŸž1™£—™.Kšžœ ™(—™)K™——— …—    Ul  {  

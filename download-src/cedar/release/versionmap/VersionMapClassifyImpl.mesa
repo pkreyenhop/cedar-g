@@ -1,0 +1,295 @@
+
+
+DIRECTORY
+Basics, 
+BasicTime USING [GMT, ToNSTime],
+FileNames,
+FS,
+IO, 
+MobDefs,
+RefText,
+Rope,
+VersionMap,
+VersionMapClassify;
+
+VersionMapClassifyImpl: CEDAR PROGRAM
+IMPORTS BasicTime, FileNames, FS, IO, RefText, Rope, VersionMap
+EXPORTS VersionMapClassify
+= BEGIN
+
+
+GMT: TYPE = BasicTime.GMT;
+Map: TYPE = VersionMap.Map;
+MapList: TYPE = VersionMap.MapList;
+ROPE: TYPE = Rope.ROPE;
+RopeList: TYPE = LIST OF ROPE;
+STREAM: TYPE = IO.STREAM;
+VersionStamp: TYPE = VersionMap.VersionStamp;
+NullVersion: VersionStamp = VersionMapClassify.NullVersion;
+BadVersion: VersionStamp = VersionMapClassify.BadVersion;
+
+
+KindName: PUBLIC ARRAY VersionMapClassify.KindSet OF ROPE ¬ [
+"unknown", "source", "intermediate", "sparc", "sparcOpt", "all" ];
+
+Classify: PUBLIC PROC [name: ROPE] RETURNS [kind: VersionMapClassify.Kind] ~ {
+nameWithoutVersion: ROPE ~ FileNames.StripVersionNumber[name];
+whichMap, other: ATOM;
+[whichMap, other] ¬ VersionMap.MapAtomForName[nameWithoutVersion];
+SELECT TRUE FROM
+whichMap = $Intermediate => kind ¬ intermediate;
+whichMap = $Source => kind ¬ source;
+whichMap = $Executable =>
+IF other = $opt THEN kind ¬ sparcOpt ELSE kind ¬ sparc;
+ENDCASE => kind ¬ source};
+
+CreatedToMimosaVersionStamp: PUBLIC PROC [created: BasicTime.GMT] RETURNS [VersionStamp] = {
+RETURN [[BasicTime.ToNSTime[created], 0]]};
+
+ReadVersionStamp: PUBLIC PROC [kind: VersionMapClassify.Kind, fullName: ROPE, created: BasicTime.GMT, rejectServerInaccessible: BOOL] RETURNS [stamp: VersionStamp, whyNot, warning: ROPE] ~ {
+bangPos: INT ~ fullName.Index[s2: "!"];
+verless: ROPE ~ fullName.Substr[len: bangPos];
+SELECT kind FROM
+unknown, source => RETURN [CreatedToMimosaVersionStamp[created], NIL, NIL];
+intermediate => SELECT TRUE FROM
+Rope.Match["*.mob", verless] => RETURN ReadMobStamp[fullName, created, rejectServerInaccessible];
+Rope.Match["*.c2c.c", verless] => {
+[stamp, whyNot] ¬ ReadCOStamp[fullName, created, rejectServerInaccessible];
+warning ¬ NIL; RETURN};
+ENDCASE => RETURN [CreatedToMimosaVersionStamp[created], NIL, NIL];
+sparc, sparcOpt => {
+[stamp, whyNot] ¬ ReadCOStamp[fullName, created, rejectServerInaccessible];
+IF whyNot#NIL AND NOT Rope.Match["*.c2c.o", verless] THEN {
+stamp ¬ CreatedToMimosaVersionStamp[created];
+warning ¬ whyNot.Concat["; create date used for stamp"]; whyNot ¬ NIL}
+ELSE warning ¬ NIL;
+RETURN};
+ENDCASE => ERROR;
+};
+
+ReadMobStamp: PROC [fullName: ROPE, created: BasicTime.GMT, rejectServerInaccessible: BOOL] RETURNS [stamp: VersionStamp, whyNot, warning: ROPE ¬ NIL] ~ {
+from: IO.STREAM;
+mob: MobDefs.Mob;
+nRead: INT;
+from ¬ FS.StreamOpen[fileName: fullName, wantedCreatedTime: created !FS.Error => IF error.code#$serverInaccessible OR NOT rejectServerInaccessible THEN {whyNot ¬ IO.PutFLR["FS.Open[%g of %g] => Error[%g, %g]", LIST[ [rope[fullName]], [time[created]], [atom[error.code]], [rope[error.explanation]]] ]; GOTO Abort} ];
+TRUSTED {nRead ¬ from.UnsafeGetBlock[[base: LOOPHOLE[@mob], count: BYTES[MobDefs.Mob]]]};
+from.Close[];
+IF nRead # BYTES[MobDefs.Mob] THEN RETURN [BadVersion, IO.PutFLR["%g of %g yielded only %g bytes, instead of %g", LIST[ [rope[fullName]], [time[created]], [integer[nRead]], [integer[BYTES[MobDefs.Mob]]]] ]];
+{cvi: CARD ~ LOOPHOLE[mob.versionIdent];
+SELECT cvi FROM
+CARD[MobDefs.VersionID] => RETURN [mob.version, NIL];
+SwapHWords[MobDefs.VersionID] => RETURN [[SwapHWords[mob.version[0]], SwapHWords[mob.version[1]] ], NIL];
+ENDCASE => RETURN[BadVersion, IO.PutFLR["%g of %g has unrecognized versionIdent (%08xH) [expected %08xH]", LIST[ [rope[fullName]], [time[created]], [cardinal[cvi]], [cardinal[MobDefs.VersionID]]] ]];
+};
+EXITS Abort => stamp ¬ BadVersion};
+
+SwapHWords: PROC [c: CARD] RETURNS [CARD] ~ {
+n: Basics.LongNumber ~ LOOPHOLE[c];
+sn: Basics.LongNumber ~ [pair[hi: n.lo, lo: n.hi]];
+RETURN [sn.card];
+};
+
+hashMark: ROPE = Rope.Cat["@(", "#)mob", "_version ["]; --broken up to avoid spurrious one
+sourceStampByteLimit: INT ¬ 8000;
+headerBytes: INT = 4+4*7; -- size of header for .o files
+textSizeOffset: INT = 4; -- byte offset of text size field in .o files
+
+ReadCOStamp: PROC [fullName: ROPE, created: BasicTime.GMT, rejectServerInaccessible: BOOL] RETURNS [stamp: VersionStamp, whyNot: ROPE ¬ NIL] ~ {
+hashMarkSize: INT = Rope.Length[hashMark];
+hashStartChar: CHAR = Rope.Fetch[hashMark, 0];
+buf: REF TEXT = RefText.ObtainScratch[nChars: 512];
+smallBuf: REF TEXT = NEW[TEXT[hashMarkSize]];
+start: INT ¬ 0;
+end: INT ¬ sourceStampByteLimit;
+index: INT ¬ 0;
+baselen: INT;
+stream: IO.STREAM;
+cp: FS.ComponentPositions;
+base: ROPE;
+[fullName, cp, ] ¬ FS.ExpandName[fullName];
+base ¬ fullName.Substr[start: cp.base.start, len: cp.base.length];
+base ¬ base.Substr[len: baselen ¬ base.Index[s2: "."]];
+{stream ¬ FS.StreamOpen[fileName: fullName, wantedCreatedTime: created !FS.Error => IF error.code#$serverInaccessible OR NOT rejectServerInaccessible THEN {whyNot ¬ IO.PutFLR["FS.Open[%g of %g] => Error[%g, %g]", LIST[ [rope[fullName]], [time[created]], [atom[error.code]], [rope[error.explanation]]] ]; GOTO NotOpen} ];
+{ENABLE {
+IO.Error => {whyNot ¬ IO.PutFR["IO.Error while trying to find version stamp in %g of %g", [rope[fullName]], [time[created]] ]; GOTO Abort};
+IO.EndOfStream => GOTO Alldun};
+IF (NOT stream.EndOf[]) AND IO.PeekChar[self: stream].ORD < 2 THEN {
+ReadBinaryINT: PROC [stream: IO.STREAM] RETURNS [INT] ~ {
+ln: Basics.LongNumber ¬ [card[0]];
+ln.hh ¬ IO.GetByte[stream];
+ln.hl ¬ IO.GetByte[stream];
+ln.lh ¬ IO.GetByte[stream];
+ln.ll ¬ IO.GetByte[stream];
+RETURN [ln.int]
+};
+IO.SetIndex[self: stream, index: textSizeOffset];
+start ¬ headerBytes + ReadBinaryINT[stream];
+end ¬ start + ReadBinaryINT[stream];
+IF NOT start IN [0..end) AND end <= IO.GetLength[stream] THEN {
+start ¬ 0;
+end ¬ IO.GetLength[stream];
+};
+};
+IO.SetIndex[stream, start];
+index ¬ start;
+WHILE index < end DO
+bytes: INT ¬ IO.GetBlock[self: stream, block: buf];
+i: NAT ¬ 0;
+needSetIndex: BOOL ¬ FALSE;
+IsHashMark: PROC [pos: INT] RETURNS [BOOL] ~ {
+IF pos+hashMarkSize <= bytes
+THEN {
+FOR j: INT ¬ 1, j+1 WHILE j < hashMarkSize DO
+IF hashMark.Fetch[j] # buf[pos+j] THEN RETURN [FALSE];
+ENDLOOP;
+IO.SetIndex[stream, index+pos+hashMarkSize];
+needSetIndex ¬ TRUE;
+RETURN [TRUE];
+}
+ELSE {
+IO.SetIndex[stream, index+pos];
+needSetIndex ¬ TRUE;
+[] ¬ IO.GetBlock[self: stream, block: smallBuf];
+RETURN [Rope.Equal[hashMark, RefText.TrustTextAsRope[smallBuf]]];
+}
+};
+IF bytes = 0 THEN EXIT;
+WHILE i < bytes DO
+IF buf[i]=hashStartChar AND IsHashMark[pos: i] THEN {
+moduleName: ROPE;
+newIndex: INT;
+vs: VersionStamp ¬ ALL[0];
+vs[0] ¬ stream.GetCard[ !IO.Error => IF ec=SyntaxError OR ec=Overflow THEN GOTO NotReally];
+IF stream.GetChar[] # ', THEN GOTO NotReally;
+vs[1] ¬ stream.GetCard[ !IO.Error => IF ec=SyntaxError OR ec=Overflow THEN GOTO NotReally];
+IF stream.GetChar[] # '] THEN GOTO NotReally;
+IF stream.GetChar[] # '  THEN GOTO NotReally;
+moduleName ¬ IO.GetTokenRope[stream: stream, breakProc: StopOnQuoteOrNull].token;
+IF base.IsPrefix[moduleName, FALSE] AND (baselen = moduleName.Length[] OR moduleName.EqualSubstrs[start1: baselen, s2: ".config", case: FALSE]) THEN {
+RefText.ReleaseScratch[buf];
+IO.Close[stream];
+RETURN [vs]};
+newIndex ¬ stream.GetIndex[];
+IF newIndex > index + bytes THEN{
+index ¬ newIndex;
+IO.SetIndex[stream, index];
+GOTO GetNextBlock;
+};
+i ¬ newIndex - index;
+EXITS NotReally => i ¬ i};
+i ¬ i + 1;
+REPEAT
+GetNextBlock => LOOP; -- the enclosing WHILE --
+ENDLOOP;
+index ¬ index + bytes;
+IF needSetIndex THEN IO.SetIndex[stream, index];
+ENDLOOP;
+GOTO Alldun;
+EXITS
+Alldun => whyNot ¬ IO.PutFR["%g of %g has no version stamp", [rope[fullName]], [time[created]] ];
+Abort => stamp ¬ BadVersion};
+IO.Close[stream];
+EXITS NotOpen => stamp ¬ BadVersion};
+RefText.ReleaseScratch[buf];
+RETURN [BadVersion, whyNot]};
+
+StopOnQuoteOrNull: IO.BreakProc = {
+RETURN [IF char = '\000 OR char = '" THEN break ELSE other]
+};
+
+ScanName: PROC [name: ROPE] RETURNS [pos,bang,dot: INT] = {
+len: INT = Rope.Length[name];
+pos ¬ bang ¬ dot ¬ len;
+WHILE pos > 0 DO
+posM: INT = pos-1;
+SELECT Rope.Fetch[name, posM] FROM
+'! => bang ¬ dot ¬ posM;
+'. => dot ¬ posM;
+'>, '/, '] => RETURN;
+ENDCASE;
+pos ¬ posM;
+ENDLOOP;
+};
+
+
+
+MapListLookup: PUBLIC PROC [mapList: MapList, fullName: ROPE, created: BasicTime.GMT, onlyOne, testCreated, testName: BOOL] RETURNS [found: BOOL ¬ FALSE, fromMap: ROPE ¬ NIL, version: VersionStamp ¬ NullVersion] = {
+IF onlyOne THEN {
+version ¬ CreatedToMimosaVersionStamp[created];
+fromMap ¬ VersionMap.VersionToName[mapList, version].name;
+{len: INT ¬ fromMap.Length[];
+bang: INT ¬ ScanName[fromMap].bang;
+SELECT Rope.Run[fromMap, 0, fullName, 0, FALSE] FROM
+=0, <bang => RETURN [FALSE];
+ENDCASE => RETURN [TRUE, fromMap, version];
+}}
+ELSE {
+short: ROPE = VersionMap.ShortName[fullName];
+rangeList: VersionMap.RangeList ¬
+VersionMap.ShortNameToRanges[mapList, short];
+WHILE rangeList # NIL DO
+range: VersionMap.Range ¬ rangeList.first;
+rangeList ¬ rangeList.rest;
+WHILE range.len # 0 DO
+name: ROPE;
+stamp: VersionStamp;
+eCreated: BasicTime.GMT;
+[name, stamp, eCreated, range] ¬ VersionMap.RangeToEntry[range];
+IF testCreated AND created#eCreated THEN LOOP;
+IF testName AND NOT Rope.Equal[fullName, name, FALSE] THEN LOOP;
+RETURN [TRUE, name, stamp];
+ENDLOOP;
+ENDLOOP;
+found ¬ FALSE;
+};
+RETURN};
+
+
+END.
+      VersionMapClassifyImpl.mesa
+Copyright Ó 1990, 1992 by Xerox Corporation.  All rights reserved.
+Willie-s, March 23, 1992 6:34 pm PST
+Spreitze, August 17, 1990 2:55 pm PDT
+T Y P E S
+Global variables
+Single file processing
+
+an object file.
+confusion! search whole file.
+[char: CHAR] RETURNS [IO.CharClass]
+Routines to use the old maps for verification of names
+At this point we did NOT get a match, so flake out!
+ÊŠ  –(cedarcode) style•NewlineDelimiter
+˜ codešœ™Kšœ
+Ïeœ7™BK™$K™%—K˜ šÏk	˜	K˜Kšœ
+žœžœ˜ K˜
+Kšžœ˜Kšžœ˜K˜K˜Kšœ˜Kšœ˜K˜K˜ —šÏnœžœž˜%Kšžœžœžœ˜?Kšžœ˜Kšœž˜K˜ —šœ	™	K˜ Kšžœžœžœ˜Kšœžœ˜Kšœ	žœ˜#Kšžœžœžœ˜Kš	œ
+žœžœžœžœ˜Kšžœžœžœžœ˜šœžœ˜-KšŸœ0˜;KšŸ
+œ/˜9—˜ K˜ ——šœ™š
+Ÿœžœžœžœžœ˜=KšœB˜B—K˜ —™K™ š
+Ÿœžœžœžœžœ$˜NKšœžœ&˜>Kšœžœ˜K˜Bšžœžœž˜K˜0K˜$šœ˜Kšžœžœžœ˜7—Kšžœ˜—K˜ —š
+Ÿœžœžœžœžœ˜\Kšžœ%˜+K˜ —šŸœžœžœ+žœžœžœžœ(žœ˜¾Kšœ	žœ˜'Kšœ	žœ!˜.šžœž˜Kšœžœ(žœžœ˜Kšœžœžœž˜ Kšœ žœ;˜ašœ#˜#K˜KKšœ
+žœžœ˜—Kšžœžœ(žœžœ˜C—šœ˜K˜Kš
+žœžœžœžœ žœ˜;K˜-KšœBžœ˜F—Kšžœžœ˜Kšžœ˜—Kšžœžœ˜—K˜K˜ —šŸœžœžœžœžœžœ(žœžœ˜šKšœžœžœ˜K˜Kšœžœ˜Kšœžœ<žœ
+žœ žœžœžœžœ.žœWžœ
+˜»Kšžœ%žœžœ˜YK˜Kšžœ	žœžœžœžœ9žœ@žœ˜ÏKšœžœžœ˜(šžœž˜Kšžœžœžœ˜5Kšœ!žœ=žœ˜iKšžœžœžœKžœX˜Ç—Kšœ˜Kšžœ˜#K˜ —š
+Ÿ
+œžœžœžœžœ˜-Kšœžœ˜#K˜3Kšžœ˜K˜K˜ —Kšœ
+žœ*Ïc"˜ZKšœžœ˜!Kšœžœ
+ ˜8Kšœžœ -˜FK˜ šŸœžœžœžœžœžœžœžœ˜Kšœžœ˜*Kšœžœ˜.K•StartOfExpansion[nChars: NAT]šœžœžœ&˜3Kš	œ
+žœžœžœžœ˜-Kšœžœ˜Kšœžœ˜ K–[self: STREAM]šœžœ˜Kšœ	žœ˜Kšœžœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜+K˜BK˜7Kšœ
+žœ<žœ
+žœ žœžœžœžœ.žœWžœ˜Àšœžœ˜	Kšžœžœgžœ˜‹Kšžœžœ	˜—šžœžœžœžœžœžœ˜DK™šŸœžœ
+žœžœžœžœ˜9K˜"Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšžœ	˜K˜—Kšžœ/˜1K˜,K˜$šžœžœžœ
+žœžœžœ˜?K™K˜
+Kšœžœ˜Kšœ˜—Kšœ˜—Kšžœ˜K˜šžœž˜K–P[self: STREAM, block: REF TEXT, startIndex: NAT _ 0, count: NAT _ 32767]šœžœžœ$˜3Kšœžœ˜Kšœžœžœ˜š
+Ÿ
+œžœžœžœžœ˜.šžœ˜šžœ˜šžœžœ
+žœž˜-Kšžœ žœžœžœ˜6Kšžœ˜—Kšžœ*˜,Kšœžœ˜Kšžœžœ˜Kšœ˜—šžœ˜Kšžœ˜K–P[self: STREAM, block: REF TEXT, startIndex: NAT _ 0, count: NAT _ 32767]šœžœ˜Kšœžœ)˜0Kšžœ;˜AK˜——K˜—Kšžœžœžœ˜šžœž˜šžœžœžœ˜5Kšœžœ˜Kšœ
+žœ˜Kšœžœ˜Kšœžœ
+žœžœžœžœ˜[Kšžœžœžœ˜-Kšœžœ
+žœžœžœžœ˜[Kšžœžœžœ˜-Kšžœžœžœ˜-KšœžœB˜Qšžœžœžœ žœ?žœžœ˜–Kšœ˜Kšžœ˜Kšžœ˜—K˜šžœžœ˜!K˜Kšžœ˜Kšžœ˜Kšœ˜—K˜Kšžœ˜—K˜
+šž˜Kšœžœ ˜/—Kšžœ˜—K˜Kšžœžœžœ˜0Kšžœ˜—Kšžœ˜šž˜KšœžœL˜aK˜—Kšžœ˜Kšžœ ˜%Kšœ˜Kšžœ˜K˜ —–' -- [char: CHAR] RETURNS [IO.CharClass]šŸœžœ˜#Kšœžœžœžœ™#Kš
+žœžœžœžœžœ˜;K˜K˜ —š
+Ÿœžœžœžœžœ˜;Kšœžœ˜K˜šžœ	ž˜Kšœžœ	˜šžœž˜"K˜K˜Kšœžœ˜Kšžœ˜—K˜Kšžœ˜—K˜K˜ —K˜ —šœ6™6K˜ —šŸœžœžœžœžœ"žœžœ	žœžœžœžœ*˜×šžœ	žœ˜K˜/K˜:Kšœžœ˜Kšœžœ˜#šžœ#žœž˜4Kšœžœžœ˜Kšžœžœžœ˜+—K˜—šžœ˜Kšœžœ"˜-˜!Kšœ-˜-—šžœžœž˜K˜*K˜šžœž˜Kšœžœ˜K˜Kšœžœ˜K˜@Kšžœžœžœžœ˜.Kšžœ
+žœžœžœžœžœ˜@Kšžœžœ˜Kšžœ˜—Kšžœ˜—Kšœ3™3Kšœžœ˜K˜—Kšžœ˜K˜ —K˜ Kšžœ˜— …—    #î  2  

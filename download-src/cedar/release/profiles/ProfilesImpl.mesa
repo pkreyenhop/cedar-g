@@ -1,0 +1,460 @@
+
+DIRECTORY
+PFS USING [Error, PathFromRope, StreamOpen],
+Profiles,
+ProfilesBackdoor,
+ProfilesPrivate USING [ProfileChangedItem, ProfileRep],
+Convert USING [IntFromRope],
+IO,
+Rope USING [ROPE, Cat, Concat, Equal, Index, Match, Substr],
+RuntimeError USING [UNCAUGHT],
+SymTab USING [Create, EachPairAction, Fetch, Pairs, Ref, Store];
+
+
+ProfilesImpl: CEDAR MONITOR
+IMPORTS Convert, IO, PFS, Rope, RuntimeError, SymTab--, UXIO--
+EXPORTS Profiles, ProfilesBackdoor 
+= BEGIN
+OPEN Profiles, ProfilesBackdoor;
+profileDir: ROPE ¨ NIL;
+freshProfiles: LIST OF Profile ¨ NIL;
+
+Profile: PUBLIC TYPE ~ REF ProfileRep;
+ProfileRep: PUBLIC TYPE ~ ProfilesPrivate.ProfileRep;
+ProfileChangedItem: TYPE ~ ProfilesPrivate.ProfileChangedItem;
+
+Create: PUBLIC PROC [files: LIST OF ROPE, keepFresh: BOOL ¨ TRUE] RETURNS [profile: Profile] ~ {
+SlicesFromFileNames: PROC [files: LIST OF ROPE] RETURNS [slices: LIST OF Slice] ~ {
+dummy: LIST OF Slice ~ LIST[[rope[NIL]]];
+tail: LIST OF Slice ¨ dummy;
+FOR each: LIST OF ROPE ¨ files, each.rest UNTIL each=NIL DO
+tail ¨ (tail.rest ¨ LIST[[file[fileName: each.first]]]);
+ENDLOOP;
+RETURN [dummy.rest];
+};
+profile ¨ NEW[ProfileRep ¨ [
+entries: NIL,		--Set by ParseProfile
+filesUsed: SymTab.Create[case: FALSE],
+slices: SlicesFromFileNames[files],
+keepFresh: keepFresh
+]];
+ParseProfile[profile];
+IF keepFresh THEN freshProfiles ¨ CONS[profile, freshProfiles];
+};
+CreateFromRope: PUBLIC PROC [slices: LIST OF ROPE] RETURNS [profile: Profile] ~ {
+SlicesFromRopes: PROC [slices: LIST OF ROPE] RETURNS [LIST OF Slice] ~ {
+dummy: LIST OF Slice ~ LIST[[rope[NIL]]];
+tail: LIST OF Slice ¨ dummy;
+FOR each: LIST OF ROPE ¨ slices, each.rest UNTIL each=NIL DO
+tail ¨ (tail.rest ¨ LIST[[rope[each.first]]]);
+ENDLOOP;
+RETURN [dummy.rest];
+};
+profile ¨ NEW[ProfileRep ¨ [
+entries: NIL,		--Set by ParseProfile
+filesUsed: SymTab.Create[case: FALSE],
+slices: SlicesFromRopes[slices],
+keepFresh: FALSE
+]];
+ParseProfile[profile];
+};
+CreateFromSlices: PUBLIC PROC [slices: LIST OF Slice, keepFresh: BOOL ¨ TRUE] RETURNS [profile: Profile] ~ {
+profile ¨ NEW[ProfileRep ¨ [
+entries: NIL,		--Set by ParseProfile
+filesUsed: SymTab.Create[case: FALSE],
+slices: slices,
+keepFresh: keepFresh
+]];
+ParseProfile[profile];
+IF keepFresh THEN freshProfiles ¨ CONS[profile, freshProfiles];
+};
+LetProfileGetStale: PUBLIC ENTRY PROC [profile: Profile] ~ {
+IF profile.keepFresh THEN {
+dummy: LIST OF Profile ¨ CONS[NIL, freshProfiles];
+FOR each: LIST OF Profile ¨ dummy, each.rest DO	--Addr fault => ERROR
+IF each.rest.first=profile THEN {
+each.rest ¨ each.rest.rest;
+EXIT;
+};
+ENDLOOP;
+profile.keepFresh ¨ FALSE;
+};
+};
+
+Boolean: PUBLIC PROC [profile: Profile, key: ROPE, default: BOOL ¨ FALSE] RETURNS [value: BOOL] = {
+entry: ProfileEntry;
+val: ROPE;
+entry ¨ Lookup[profile, key];
+val ¨ GetRope[entry];
+IF val = NIL THEN RETURN [default];
+IF val.Equal["TRUE", FALSE] THEN RETURN [TRUE];
+IF val.Equal["FALSE", FALSE] THEN RETURN [FALSE];
+Report[entry, val.Concat[" is not a Boolean"]];
+RETURN [default];
+};
+
+Number: PUBLIC PROC [profile: Profile, key: ROPE, default: INT] RETURNS [value: INT] = {
+entry: ProfileEntry ¨ Lookup[profile, key];
+val: ROPE ¨ GetRope[entry];
+IF val = NIL THEN RETURN [default];
+value ¨ Convert.IntFromRope[val
+! RuntimeError.UNCAUGHT => {
+value ¨ default; 
+Report[entry, val.Concat[" is not an INT"]];
+CONTINUE;
+}
+];
+};
+
+Token: PUBLIC PROC [profile: Profile, key: ROPE, default: ROPE] RETURNS [value: ROPE] = {
+entry: ProfileEntry ¨ Lookup[profile, key];
+val: ROPE ¨ GetRope[entry];
+IF val = NIL THEN RETURN [default];
+value ¨  val;
+};
+
+ListOfTokens: PUBLIC PROC [profile: Profile, key: ROPE, default: LIST OF ROPE] RETURNS [value: LIST OF ROPE] = {
+entry: ProfileEntry ¨ Lookup[profile, key];
+IF entry = NIL THEN RETURN [default] ELSE RETURN [entry.tokens];
+};
+
+Line: PUBLIC PROC [profile: Profile, key: ROPE, default: ROPE] RETURNS [value: ROPE] = {
+entry: ProfileEntry ¨ Lookup[profile, key];
+IF entry = NIL THEN RETURN [default];
+FOR l: LIST OF ROPE ¨ entry.tokens, l.rest UNTIL l = NIL DO
+IF value = NIL THEN value ¨ l.first ELSE
+value ¨ value.Cat[" ", l.first];
+ENDLOOP;
+};
+
+EnumerateKeys: PUBLIC PROC [profile: Profile, pattern: ROPE, proc: EnumProc] ~ {
+Enum: SymTab.EachPairAction = {
+IF Rope.Match[pattern: pattern, object: key, case: FALSE] THEN RETURN [proc[key]];
+};
+[] ¨ SymTab.Pairs[x: profile.entries, action: Enum];
+};
+
+HasEntry: PUBLIC ENTRY PROC [profile: Profile, key: ROPE] RETURNS [BOOL] ~ {
+ENABLE UNWIND => NULL;
+RETURN [FetchInternal[profile, key].found];
+};
+
+Lookup: PUBLIC ENTRY PROC [profile: Profile, key: ROPE] RETURNS [ProfileEntry] = {
+ENABLE UNWIND => NULL;
+RETURN [LookupInternal[profile, key]]
+};
+
+LookupInternal: INTERNAL PROC [profile: Profile, key: ROPE] RETURNS [ProfileEntry] = {
+RETURN [NARROW[FetchInternal[profile, key].val]];
+};
+
+FetchInternal: INTERNAL PROC [profile: Profile, key: ROPE] RETURNS [found: BOOL, val: REF ANY] ~ {
+[found: found, val: val] ¨ SymTab.Fetch[x: profile.entries, key: key];
+};
+
+GetRope: PROC [entry: ProfileEntry] RETURNS [value: ROPE] = INLINE {
+IF entry = NIL OR entry.tokens = NIL THEN RETURN [NIL];
+value ¨ entry.tokens.first;
+IF entry.tokens.rest # NIL THEN Report[entry, "extra material on line"];
+};
+
+GetProfileSlices: PUBLIC PROC [profile: Profile] RETURNS [LIST OF Slice] = {
+RETURN [profile.slices];
+};
+
+GetProfileNames: PUBLIC PROC [profile: Profile] RETURNS [LIST OF ROPE] = {
+dummy: LIST OF ROPE ~ LIST[NIL];
+tail: LIST OF ROPE ¨ dummy;
+FOR each: LIST OF Slice ¨ profile.slices, each.rest UNTIL each=NIL DO
+WITH each.first SELECT FROM
+fileSlice: Slice.file => tail ¨ (tail.rest ¨ LIST[fileSlice.fileName]);
+ENDCASE;
+ENDLOOP;
+RETURN [dummy.rest];
+};
+
+
+
+NoVersion: PROC [file: ROPE] RETURNS [ROPE] ~ {
+RETURN [Rope.Substr[base: file, len: Rope.Index[s1: file, s2: "!"]]];
+};
+
+ParseProfile: ENTRY PROC [profile: Profile] ~ {
+ENABLE UNWIND => NULL;
+TryProfile: INTERNAL PROC [slice: Slice] ~ {
+stream: IO.STREAM ¨ NIL;
+WITH slice SELECT FROM
+slice: Slice.rope => stream ¨ IO.RIS[rope: slice.text];
+slice: Slice.file => {
+profileName: ROPE ¨ Rope.Concat[profileDir, slice.fileName];
+stream ¨ PFS.StreamOpen[fileName: PFS.PathFromRope[profileName], accessOptions: read ! PFS.Error => CONTINUE];
+IF stream = NIL THEN RETURN;
+[] ¨ SymTab.Store[x: profile.filesUsed, key: profileName, val: $Parent];
+};
+ENDCASE => ERROR;
+ParseProfileInternal[profile, stream];
+};
+profile.entries ¨ SymTab.Create[case: FALSE];
+profile.filesUsed ¨ SymTab.Create[case: FALSE];
+FOR each: LIST OF Slice ¨ profile.slices, each.rest UNTIL each=NIL DO
+TryProfile[each.first];
+ENDLOOP;
+};
+
+ParseProfileInternal: INTERNAL PROC [profile: Profile, stream: IO.STREAM] ~ {
+DO
+ENABLE {
+RuntimeError.UNCAUGHT => EXIT;
+UNWIND => IO.Close[stream];
+};
+SkipWhite: PROC [flushLines: BOOL ¨ FALSE] RETURNS [c: CHAR] = {
+DO
+ENABLE IO.Error, IO.EndOfStream => GO TO stop;
+c ¨ stream.PeekChar[];
+SELECT c FROM
+'\n, '\r, '\l => IF NOT flushLines THEN RETURN;
+<= 40C => {};
+'- => {-- could be a comment
+[] ¨ stream.GetChar[];
+IF stream.PeekChar[] # '- THEN {
+stream.Backup[c];
+RETURN [c];
+};
+DO
+c ¨ stream.GetChar[];
+SELECT c FROM
+'\n, '\r, '\l => {
+stream.Backup[c];
+IF flushLines THEN EXIT;
+RETURN;
+};
+'- => IF stream.PeekChar[] = '- THEN EXIT;
+ENDCASE;
+ENDLOOP;
+};
+ENDCASE => RETURN;
+[] ¨ stream.GetChar[];
+ENDLOOP;
+EXITS stop => {c ¨ 0C};
+};
+LocalToken: PROC [flushLines: BOOL ¨ FALSE] = {
+stop: CHAR ¨ SkipWhite[flushLines];
+position ¨ stream.GetIndex[];
+token ¨ NIL;
+SELECT stop FROM
+0C, '\n, '\r, '\l => RETURN;
+'" => token ¨ stream.GetRopeLiteral[];
+ENDCASE => token ¨ stream.GetTokenRope[tokenProc].token;
+};
+tokenProc: IO.BreakProc = {
+RETURN [SELECT char FROM
+IO.SP, IO.TAB--, ',-- => sepr,
+IO.LF, IO.CR, ': => break,
+ENDCASE => other
+];
+};
+Cat: PROC [a, b: LIST OF ROPE] RETURNS [LIST OF ROPE] ~ {
+RETURN [IF a=NIL THEN b ELSE CONS[a.first, Cat[a.rest, b]]];
+};
+LookupTokens: INTERNAL PROC [key: ROPE] RETURNS [tokens: LIST OF ROPE] ~ {
+entry: ProfileEntry ~ LookupInternal[profile, key];
+RETURN [IF entry=NIL THEN NIL ELSE entry.tokens];
+};
+token: ROPE ¨ NIL;
+tokens, tail: LIST OF ROPE ¨ NIL;
+position: INT ¨ 0;
+key: ROPE ¨ NIL;
+additive: {none, prefix, suffix};
+LocalToken[TRUE];
+IF (key ¨ token) = NIL THEN EXIT;
+SELECT SkipWhite[] FROM
+': => {
+[] ¨ stream.GetChar[];  -- flush the ':
+IF (additive ¨ SELECT stream.PeekChar[] FROM
+'< => prefix,
+'> => suffix,
+ENDCASE => none)#none THEN [] ¨ stream.GetChar[];  --flush '< or '> if needed
+};
+ENDCASE => {
+DO
+SELECT stream.GetChar[ ! IO.EndOfStream => EXIT] FROM
+'\n, '\r, '\l => EXIT;
+ENDCASE;
+ENDLOOP;
+ReportInternal[msg: IO.PutFR1["missing : at [%d]", IO.int[position]]];
+LOOP;
+};
+DO
+list: LIST OF ROPE ¨ NIL;
+LocalToken[];
+IF token = NIL THEN EXIT;
+list ¨ LIST[token];
+IF tail = NIL
+THEN {tail ¨ tokens ¨ list}
+ELSE {tail.rest ¨ list; tail ¨ list};
+ENDLOOP;
+IF key.Equal["Include", FALSE] THEN {	--Insert a profile slice
+FOR each: LIST OF ROPE ¨ tokens, each.rest UNTIL each=NIL DO
+profileSlice: IO.STREAM ¨ NIL;
+profileName: ROPE ¨ Rope.Concat[profileDir, each.first];
+profileSlice ¨ PFS.StreamOpen[PFS.PathFromRope[profileName], read ! PFS.Error => CONTINUE];
+IF profileSlice # NIL
+THEN {
+[] ¨ SymTab.Store[x: profile.filesUsed, key: profileName, val: $Child];
+ParseProfileInternal[profile, profileSlice];
+}
+ELSE ReportInternal[
+entry: NEW[ProfileRecord ¨ [each.first, tokens, position]],
+msg: "File not found."
+];
+ENDLOOP;
+}
+ELSE {				--Add a profile entry
+SELECT additive FROM
+prefix => tokens ¨ Cat[tokens, LookupTokens[key]];
+suffix => tokens ¨ Cat[LookupTokens[key], tokens];
+ENDCASE => IF LookupInternal[profile, key] # NIL THEN
+ReportInternal[
+entry: LookupInternal[profile, key],
+msg: IO.PutFR["%g also appears at [%d]", [rope[key]], [integer[position]]]
+];
+[] ¨ SymTab.Store[x: profile.entries, key: key, val: NEW[ProfileRecord ¨ [key, tokens, position]]]
+};
+ENDLOOP;
+IO.Close[stream];
+};
+
+Error: PUBLIC ERROR [reason: ROPE] ~ CODE;
+Report: PUBLIC ENTRY PROC [entry: ProfileEntry ¨ NIL, msg: ROPE] = {
+ENABLE UNWIND => NULL;
+ReportInternal[entry, msg];
+};
+
+ReportInternal: INTERNAL PROC [entry: ProfileEntry ¨ NIL, msg: ROPE] = {
+ENABLE RuntimeError.UNCAUGHT => CONTINUE;
+msg ¨ IO.PutFR1["\n\n%g", [rope[msg]]];
+IF entry#NIL THEN msg ¨ IO.PutFLR["%g, at %g [%d]", LIST[[rope[msg]], [rope[entry.key]], [integer[entry.position]]]];
+Error[msg];
+};
+
+ProfileChangeList: TYPE ~ LIST OF ProfileChangedItem;
+
+AddToList: ENTRY PROC [profile: Profile, item: ProfileChangedItem] ~ {
+dummy: ProfileChangeList ¨ CONS[[NIL, NIL], profile.changeWatchers];
+FOR each: ProfileChangeList ¨ dummy, each.rest DO
+IF each.rest=NIL THEN {each.rest¨LIST[item]; EXIT};	--Append to end
+ENDLOOP;
+profile.changeWatchers ¨ dummy.rest;
+};
+
+CopyList: ENTRY PROC [toCopy: LIST OF ProfileChangedItem] RETURNS [LIST OF ProfileChangedItem] ~ {
+RETURN [IF toCopy=NIL THEN NIL ELSE CONS[toCopy.first, CopyList[toCopy.rest]]];
+};
+
+CallWhenProfileChanges: PUBLIC PROC [profile: Profile, proc: Profiles.ProfileChangedProc, clientData: REF] = {
+item: ProfileChangedItem ~ [proc, clientData];
+IF profile.keepFresh THEN AddToList[profile, item];
+DoIt[profile, item, firstTime];
+};
+
+ProfileChanged: PUBLIC ProfileChangedProc = {
+ParseProfile[profile: profile ! RuntimeError.UNCAUGHT => CONTINUE];
+FOR each: ProfileChangeList ¨ CopyList[profile.changeWatchers], each.rest UNTIL each=NIL DO
+DoIt[profile, each.first, reason];
+ENDLOOP;
+};
+
+DoIt: PROC [profile: Profile, item: ProfileChangedItem, reason: Profiles.ProfileChangeReason] = {
+item.proc[
+profile: profile,
+reason: reason,
+clientData: item.clientData
+! RuntimeError.UNCAUGHT => {
+Report[msg: "Problem while executing ProfileChangedProc"];
+CONTINUE
+}
+];
+};
+
+
+END.
+  ú  
+ProfilesImpl.mesa
+Copyright ” 1984, 1985, 1986, 1987, 1988, 1991 by Xerox Corporation.  All rights reserved.
+Bob Hagmann May 22, 1985 4:50:10 pm PDT
+Russ Atkinson (RRA) November 28, 1988 10:48:34 pm PST
+Hal Murray, January 14, 1986 4:22:44 am PST
+Doug Wyatt, June 10, 1987 5:09:27 pm PDT
+Eric Nickell, May 17, 1988 4:47:12 pm PDT
+Bob Coleman, August 29, 1989 12:44:50 pm PDT
+Dave Rumph, January 8, 1990 12:02:55 pm PST
+Michael Plass, November 25, 1991 11:28 am PST
+UXIO USING [CreateFileStream, Error];
+
+
+Global Data
+Creating the Profile
+Parses a set of profile files and returns the data structure which can be used to access the values.
+
+Parses a set of profile files and returns the data structure which can be used to access the values.
+IF keepFresh THEN freshProfiles _ CONS[profile, freshProfiles];	--Always FALSE
+
+Parses a set of profile files and returns the data structure which can be used to access the values.
+
+
+Accessing profile
+
+[key: ROPE, val: SymTab.Val] RETURNS [quit: BOOL _ FALSE]
+
+Building profileList
+stream _ UXIO.CreateFileStream[profileName, read ! UXIO.Error => CONTINUE];
+Given an open stream, parse the profile and close the stream.  Successive calls "overwrite" previous entries.
+it is not a comment
+the end of a comment is either a '\n or a double -
+Only flush the \n if it was requested
+key was NOT followed by ':, so flush to the end of line and report the error
+profileSlice _ UXIO.CreateFileStream[profileName, read ! UXIO.Error => CONTINUE];
+
+Reporting errors
+
+When the profile changes
+Note that registration order is important; procs must be called in the same order in which they were registered (otherwise deadlocks may occur at rollback time).
+
+ ù U  ñ(cedarcode) styleïNewlineDelimiter
+ô codeöœcôKöú
+œeúOôZKô'Kô5Köœy+ô+Kô(Kô)Kô,Kô+Kô-óò öœk	ò	Köú†ú#ò,Kò	KòKöú†ú"ò7Köú†úòKö†úòKöú†ú†ú,ò<Köú†ú†úòKöú†ú4ò@Kö†ú†úô%Kò óóKò öœbú†ú†òKö†ú
+†ú†úù
+ò>Kö†úò#Köú†òKö†úò Kô óKô ôKöú†ú†úòKöú†ú†ú†úò%Kò óôKöú	†ú†ú†úò&Köú†ú†úò5Köú†ú&ò>Kò öœnú†ú†ú	†ú†ú†ú†ú†ú†úò`Kôdö¢ú†ú	†ú†ú†ú†ú
+†ú†úòSKö	ú†ú†ú	†ú†úò)Köú†ú†úòö†ú†ú†ú†ú†ú†ú†ò;Köú†ú ò8Kö†úòóKö†úòKòóöú
+†úòKöú	†úùò$KïStartOfExpansion&[mod: NAT _ 17, case: BOOL _ TRUE]öú†úò&Köú#ò#KòKöúòóKòKö†ú†ú†úò?KöúòKô óö¢ú†ú†ú
+†ú†ú†ú†úòQKôdö¢ú†ú
+†ú†ú†ú†ú†ú†úòHKö	ú†ú†ú	†ú†úò)Köú†ú†úòö†ú†ú†ú†ú†ú†ú†ò<Köú†úò.Kö†úòóKö†úòKòóöú
+†úòKöú	†úùò$Kñ&[mod: NAT _ 17, case: BOOL _ TRUE]öú†úò&Köú ò Köú†òKöúòóKòKö†ú†ú†ú†ôNKöúòKô óö¢ú†ú†ú
+†ú†ú†ú†ú†úòlKôdöú
+†úòKöú	†úùò$Kñ&[mod: NAT _ 17, case: BOOL _ TRUE]öú†úò&KöúòKòKöúòóKòKö†ú†ú†úò?KöúòKô óö¢ú†ú†ú†úò<ö†ú†úòKö	ú†ú†ú†ú†úò2ö	†ú†ú†ú†úùòEö†ú†úò!KòKö†úòKöúòóKö†úòóKöú†úòKöúòóKòKò óKô óôKô ö¢ú†ú†ú†ú†ú†ú†ú	†úòcKòKöú†úò
+KòKöúòKö†ú†ú†ú†úò#Kö
+†ú†ú†ú†ú†úò/Kö
+†ú†ú†ú†ú†úò1Kò/Kö†úòKòKò óö¢ú†ú†ú†ú†ú†ú	†úòXKò+Köú†úòKö†ú†ú†ú†úò#öúòöú†úòKöúòKò,Kö†úò	KöúòóKöúòóKòóKò ö¢ú†ú†ú†ú†ú†ú	†úòYKò+Köú†úòKö†ú†ú†ú†ú
+ò#KòKòKò óö¢ú†ú†ú†ú†ú†ú†ú†ú	†ú†ú†úòpKò+Kö†ú	†ú†ú†ú†ú†úò@KòKò óö¢ú†ú†ú†ú†ú†ú	†úòXKò+Kö†ú	†ú†ú†úò%ö†ú†ú†ú†ú†ú†ú†ò;Kö†ú	†ú†ú†ò(Kò Kö†úòóKòKò óö¢ú†ú†úòPñ= -- [key: ROPE, val: SymTab.Val] RETURNS [quit: BOOL _ FALSE]ö¢úòKö–ck9ô9Kñ6[pattern: ROPE, object: ROPE, case: BOOL _ TRUE]ö†ú1†ú†ú†úòRKòóKñ2[x: SymTab.Ref, action: SymTab.EachPairAction]ò4KòKò óö¢ú†ú†ú†ú†ú†ú†úòLKö†ú†ú†úòKö†ú%ò+KòKò óö¢ú†ú†ú†ú†ú†úòRKö†ú†ú†úòKö†úò%KöúòKò óö
+¢ú†ú†ú†ú†úòVKö†ú†ú#ò1KòKò óö¢ú†ú†ú†ú	†ú†ú†úòbKñ[x: SymTab.Ref, key: ROPE]öúFòFKòKò óö
+¢ú†ú†ú	†ú†úòDKö†ú	†ú†ú†ú†ú†ú†úò7KòKö†ú†ú†ú)òHKòKò óö¢ú†ú†ú†ú†ú†úòLKö†úòKöúòKò óö¢ú†ú†ú†ú†ú†ú†úòJKöú†ú†ú†ú†ú†úò Köú†ú†ú†ú	òö†ú†ú†ú#†ú†ú†òEö†ú†ú†òKöú-†úòGKö†úòóKö†úòóKö†úòKöúòKò óKô óôò Kò óö
+¢	ú†ú†ú†ú†úò/Kñ>[s1: ROPE, s2: ROPE, pos1: INT _ 0, case: BOOL _ TRUE]ö†ú?òEKòKò óö¢ú†ú†úò/Kö†ú†ú†úòö¢
+ú†ú†úò,Köú†ú†ú†úòö†ú†ú†òKñ)[rope: ROPE, oldStream: STREAM _ NIL]öú†ú†úò7öúòKöú†ú+ò<Köú	†ú&†ú
+†úôKKö	ú	†ú†ú2†ú
+†úònKö†ú
+†ú†ú†úòKñ1[x: SymTab.Ref, key: ROPE, val: SymTab.Val]òHKöúòóKö†ú†úòóKöú&ò&KòóKñ&[mod: NAT _ 17, case: BOOL _ TRUE]öú&†úò-Kñ&[mod: NAT _ 17, case: BOOL _ TRUE]öú(†úò/ö†ú†ú†ú#†ú†ú†òEKòKö†úòóKòKò óö
+¢ú†ú†ú†ú†úòMKöúmômö†òö†úòKöú†ú†úòKö†ú†úòKòóö¢	ú†ú†ú†ú†ú†úò@ö†òKö
+†ú†ú†ú†ú†úò.Köúòö†ú†òKö	ú†ú†ú†ú†úò/KöúòöúùòKöúòö†ú†úò KöúôKöúòKö†úòKòóö†òKöú2ô2Köúòö†ú†òöúòKöú%ô%KöúòKö†ú†ú†úòKö†úòKöúòóKöú†ú†ú†úò*Kö†úòóKö†úòóKòóKö†ú†úòóKöúòKö†úòóKö†úòKòóö¢
+ú†ú†ú†úò/Köú†úò#KöúòKöú†úòö†ú†òKöú†úòKöú&ò&Kö†ú1ò8óKòóöú†úòö†ú†ú†òKö	†ú†ú†ú†ùú	òKö†ú†ú†ú†úòKö†ú	òKòóKöúòóö¢ú†ú†ú†ú†ú†ú†ú†ú†úò9Kö†ú†ú†ú†ú†ú†úò<Kòóö¢ú†ú†ú†ú†ú
+†ú†ú†úòJKò3Kö†ú†ú†ú†ú†ú†úò1KòóKöú†ú†úòKö	ú†ú†ú†ú†úò!Köú
+†úòKöú†ú†úòKò!Köú†úòKö†ú†ú†ú†úò!ö†ú†òöúòKöúùò'ö†ú†ú†ò,KöúòKöúòKö†ú†úùòMóKöúòóö†úòKöúLôLö†òö†ú†ú†ú†ò5Köú†úòKö†úòóKö†úòóKöú†ú†úòFKö†úòKöúòóóö†òKö	ú†ú†ú†ú†úòKöúòKö†ú	†ú†ú†úòKöú†úòö†ú†òKö†úòKö†ú!ò%óKö†úòóñ-[s1: ROPE, s2: ROPE, case: BOOL _ TRUE]ö†ú†ú†úùò>ö†ú†ú†ú†ú†ú†ú†ò<Kñ [fileName: ROPE, accessOptions: FS.AccessOptions _ read, streamOptions: FS.StreamOptions _ (3)[TRUE, TRUE, TRUE], keep: CARDINAL _ 1B (1), createByteCount: FS.ByteCount _ 2560, streamBufferParms: FS.StreamBufferParms _ [vmPagesPerBuffer: 8, nBuffers: 2], extendFileProc: FS.ExtendFileProc, wantedCreatedTime: GMT _ nullGMT, remoteCheck: BOOL _ TRUE, wDir: ROPE _ NIL, checkFileType: BOOL _ FALSE, fileType: FS.FileType _ [0B (0)]]öú†ú†ú†úòKöú†ú'ò8Köú†ú&†ú
+†úôQKö	ú†ú†ú#†ú
+†úò[ö†ú†òö†úòKöúGòGKöú,ò,Köúòóö†úòKöú†ú1ò;Kñù[format: ROPE _ NIL, v1: IO.Value _ [null[]], v2: IO.Value _ [null[]], v3: IO.Value _ [null[]], v4: IO.Value _ [null[]], v5: IO.Value _ [null[]]]òKöúòóóKö†úòóKöúòóö†úùòö†ú
+†òKöú2ò2Köú2ò2ö†ú†ú †ú†ò5öúòKöú$ò$Köú†úCòJKöúòóóóKñ1[x: SymTab.Ref, key: ROPE, val: SymTab.Val]öú5†ú*òbKöúòóKö†úòóKö†úòKöúòóóKô ôKò Kö
+¢ú†ú†ú
+†ú†úò*ö¢ú†ú†ú†ú†ú†úòDKö†ú†ú†úòKöúòKöúòóKò ö
+¢ú†ú†ú†ú†úòHKö†ú†ú†úò)Kñù[format: ROPE _ NIL, v1: IO.Value _ [null[]], v2: IO.Value _ [null[]], v3: IO.Value _ [null[]], v4: IO.Value _ [null[]], v5: IO.Value _ [null[]]]öú†úò'Kñù[format: ROPE _ NIL, v1: IO.Value _ [null[]], v2: IO.Value _ [null[]], v3: IO.Value _ [null[]], v4: IO.Value _ [null[]], v5: IO.Value _ [null[]]]ö
+†ú†ú†ú†ú†ú=òuKòKöúòóóKô öúôKô°Kò Köú†ú†ú†úò5Kò ö¢	ú†ú†ú1òFKöú†ú†ú†úòDö†ú,†ò1Kö†ú†ú†ú†ú†úùòCKö†úòóKöú$ò$KòKò óö¢ú†ú†ú
+†ú†ú†ú†ú†úòbKö†ú†ú†ú†ú†ú†ú†ú'òOKòKò óö¢ú†ú†úC†úònKöú.ò.Kö†ú†úò3KöúòKòóKò ö¢ú†úò-Köú-†ú†úòCö†úG†ú†ú†ò[Kò"Kö†úòóKòóKò ö¢ú†úWòaöú
+ò
+KòKòKòöú†úòKöú:ò:Kö†òKöúòóKöúòóKöúòóKò óKò Kö†úòKô ó Öó    -D  M5  

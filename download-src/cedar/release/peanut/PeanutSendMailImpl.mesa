@@ -1,0 +1,786 @@
+
+DIRECTORY
+BasicTime USING [GMT, Now],
+Convert USING [RopeFromTimeRFC822],
+IO,
+Icons USING [IconFlavor],
+MailAnswer USING [MakeHeader],
+MailBasics USING [ItemType, RName, RNameList],
+MailBasicsItemTypes USING [header, multinationalNote, plainTextForFormatting, tioga1],
+MailParse USING [endOfInput, FinalizeParse, GetFieldBody, GetFieldName, InitializeParse, ParseError, ParseHandle, NameList],
+MailSend USING [AddRecipient, AddToItem, Create, MailSendHandle, Send, SendingCredentials, SendingCredentialsList, StartItem, StartSend],
+MailUtilsBackdoor USING [GetCRTiogaContents, WritePlainCR],
+PeanutCredentials USING [sendingCredentials, simpleUserName, userRNameList],
+PeanutParse USING [MessageFieldIndex, MessageInfo],
+PeanutProfile USING [ccField, ccToSelf, fixupXNSAddresses, messageNodeFormat, outgoingMailFile, toBeforeSubject, recipients, signature],
+PeanutSendMail USING [],
+PeanutWindow USING [dirtyMailMessageIcon, dirtyMessageSetIcon, mailMessageIcon, messageSetIcon, OutputRope, CopyMessages],
+Prop,
+Rope,
+TextNode, EditSpanSupport,
+TiogaAccess USING [CopyNode, Create, DoneWith, EndOf, FromNode, Looks, Nest, Put, Reader, SkipToNextNode, TiogaChar, Writer],
+TiogaAccessViewers USING [FromViewer, WriteViewer],
+TiogaOps,
+TiogaOpsDefs USING [],
+ViewerClasses USING [Lock, Viewer],
+ViewerEvents USING [RegisterEventProc, ViewerEvent],
+ViewerOps USING [CloseViewer, DestroyViewer, OpenIcon, PaintViewer],
+ViewerTools USING [GetSelectedViewer, MakeNewTextViewer, SelPosRec, SetSelection, TiogaContents];
+
+PeanutSendMailImpl: CEDAR MONITOR
+IMPORTS BasicTime, Convert, IO, MailAnswer, MailParse, MailSend, MailUtilsBackdoor, PeanutCredentials, PeanutProfile, PeanutWindow, Rope, TextNode, EditSpanSupport, TiogaAccess, TiogaAccessViewers, TiogaOps, ViewerEvents, ViewerOps, ViewerTools
+EXPORTS PeanutSendMail, PeanutParse
+= BEGIN
+
+Viewer: TYPE = ViewerClasses.Viewer;
+ROPE: TYPE = Rope.ROPE;
+RName: TYPE = MailBasics.RName;
+
+SendMsgRecObject: TYPE = RECORD[
+fullText: ROPE, -- text to be sent
+from: MailBasics.RName, -- The From: field
+to: LIST OF MailBasics.RName,
+cc: LIST OF MailBasics.RName,
+subject: ROPE, -- The Subject: field
+voiceID: ROPE ¨ NIL, -- the ID for a voice message
+replyTo: BOOL ¨ FALSE, -- is this field present
+numRecipients: INT ¨ 0,
+numDLs: INT ¨ 0,
+endHeadersPos: INT ¨ 0 -- for adding Reply-To: field
+];
+
+SendingRec: TYPE = REF SendMsgRecObject;
+
+SendParseStatus: TYPE = {ok, includesPublicDL, includesPrivateDL, fieldNotAllowed, syntaxError};
+
+messageParseArray: PUBLIC ARRAY PeanutParse.MessageFieldIndex OF PeanutParse.MessageInfo ¨ [
+replyToF: ["Reply-To", simpleRope], -- this is really wrong, a special case for now
+senderF: ["Sender", simpleRope],
+fromF: ["From", simpleRope],
+toF: ["To", rNameList],
+ccF: ["cc", rNameList],
+cF: ["c", rNameList],
+bccF: ["bcc", rNameList],
+dateF: ["Date", simpleRope],
+subjectF: ["Subject", simpleRope],
+categoriesF: ["Categories", rCatList],
+inReplyToF: ["In-Reply-To", simpleRope],
+voiceF: ["VoiceFileID", simpleRope]
+];
+
+CreateMessageRope: PUBLIC PROC [parent: TextNode.Ref] RETURNS [r: Rope.ROPE] = {
+firstMessageNode: TextNode.Ref ~ TiogaOps.FirstChild[parent];
+length: INT ~ TextNode.LocOffset[[firstMessageNode, 0], TextNode.LastLocWithin[parent]];
+RETURN[Rope.MakeRope[base: firstMessageNode, size: length, fetch: FetchFromMessageRope]];
+};
+
+FetchFromMessageRope: PROC [data: REF, index: INT] RETURNS [CHAR] = {
+RETURN [FetchFromNode[NARROW[data], index]];
+};
+
+FetchFromNode: PROC [node: TextNode.Ref, index: INT] RETURNS [CHAR] = {
+loc: TextNode.Location = TextNode.LocRelative[[node, 0], index];
+IF loc.node = NIL THEN
+RETURN[0C]
+ELSE IF loc.where >= Rope.Size[loc.node.rope] THEN -- It's the node-break character
+RETURN ['\r]
+ELSE
+RETURN [Rope.Fetch[loc.node.rope, loc.where]];
+};
+
+TopParent: PROC [node, root: TiogaOps.Ref ¨ NIL] RETURNS [parent: TiogaOps.Ref] = {
+IF node=NIL THEN
+RETURN [NIL];
+IF root=NIL THEN
+root ¨ TiogaOps.Root[node];
+DO
+parent ¨ TiogaOps.Parent[node];
+IF parent = root THEN
+RETURN [node];
+node ¨ parent;
+ENDLOOP 
+};
+
+MailMessageHasBeenEdited: PROC [viewer: ViewerClasses.Viewer, event: ViewerEvents.ViewerEvent, before: BOOL] RETURNS[abort: BOOL ¨ FALSE] = {
+IF before THEN {
+viewer.icon ¨ PeanutWindow.dirtyMailMessageIcon;
+IF viewer.iconic THEN ViewerOps.PaintViewer[viewer: viewer, hint: all]; 
+};
+};
+
+MailMessageHasBeenSaved: PROC [viewer: ViewerClasses.Viewer, event: ViewerEvents.ViewerEvent, before: BOOL] RETURNS[abort: BOOL ¨ FALSE] = {
+IF NOT before AND viewer.file # NIL THEN {
+viewer.icon ¨ PeanutWindow.mailMessageIcon;
+IF viewer.iconic THEN ViewerOps.PaintViewer[viewer: viewer, hint: all]; 
+};
+};
+
+PeanutCheckForReset: TiogaOps.CommandProc = {
+oldIcon: Icons.IconFlavor ~ viewer.icon;
+SELECT oldIcon FROM
+PeanutWindow.dirtyMailMessageIcon => viewer.icon ¨ PeanutWindow.mailMessageIcon;
+PeanutWindow.dirtyMessageSetIcon => viewer.icon ¨ PeanutWindow.messageSetIcon;
+ENDCASE;
+IF viewer.iconic AND viewer.icon#oldIcon THEN ViewerOps.PaintViewer[viewer, all];
+};
+
+NewForm: PROC [write: PROC[TiogaAccess.Writer]] = {
+writer: TiogaAccess.Writer ~ TiogaAccess.Create[];
+newForm: Viewer ¨ NIL;
+write[writer];
+newForm ¨ ViewerTools.MakeNewTextViewer[info: [name: "Message", icon: PeanutWindow.mailMessageIcon, iconic: FALSE]];
+TiogaAccessViewers.WriteViewer[writer: writer, viewer: newForm];
+[] ¨ ViewerEvents.RegisterEventProc[proc: MailMessageHasBeenEdited, event: edit, filter: newForm, before: TRUE];
+[] ¨ ViewerEvents.RegisterEventProc[proc: MailMessageHasBeenSaved, event: save, filter: newForm, before: FALSE];
+ViewerTools.SetSelection[newForm, NEW[ViewerTools.SelPosRec¨ [0, 0]]];
+newForm.class.notify[newForm, LIST[$NextPlaceholder]]; 
+};
+
+PutRope: PROC [writer: TiogaAccess.Writer, rope: ROPE, looks: TiogaAccess.Looks ¨ ALL[FALSE]] ~ {
+tiogaChar: TiogaAccess.TiogaChar ¨ [charSet: 0, char: '\000, looks: ALL[FALSE], format: NIL, comment: FALSE, endOfNode: FALSE, deltaLevel: 0, propList: NIL];
+Action: PROC [c: CHAR] RETURNS [quit: BOOL ¨ FALSE] -- Rope.ActionType -- ~ {
+charLooks: TiogaAccess.Looks ¨ looks;
+SELECT c FROM
+'\001, '\002 => charLooks['r] ¨ charLooks['t] ¨ TRUE;
+ENDCASE;
+tiogaChar.char ¨ c;
+tiogaChar.looks ¨ charLooks;
+TiogaAccess.Put[writer, tiogaChar];
+};
+
+[] ¨ Rope.Map[base: rope, action: Action];
+};
+
+EndNode: PROC [writer: TiogaAccess.Writer, format: ATOM ¨ NIL, comment: BOOL ¨ FALSE] ~ {
+tiogaChar: TiogaAccess.TiogaChar ¨ [charSet: 0, char: '\000, looks: ALL[FALSE], format: format, comment: comment, endOfNode: TRUE, deltaLevel: 0, propList: NIL];
+TiogaAccess.Put[writer, tiogaChar];
+};
+
+PutNode: PROC [writer: TiogaAccess.Writer, rope: ROPE ¨ NIL, format: ATOM ¨ NIL] ~ {
+PutRope[writer, rope];
+EndNode[writer, format];
+};
+
+PutFromViewer: PROC [writer: TiogaAccess.Writer, viewer: Viewer] ~ {
+reader: TiogaAccess.Reader ~ TiogaAccessViewers.FromViewer[viewer];
+
+[] ¨ TiogaAccess.SkipToNextNode[reader]; -- skip the root
+UNTIL TiogaAccess.EndOf[reader] DO
+[] ¨ TiogaAccess.CopyNode[writer, reader];
+ENDLOOP;
+TiogaAccess.Nest[writer, 1]; -- make up for skipping root
+TiogaAccess.DoneWith[reader];
+};
+
+PutField: PROC [writer: TiogaAccess.Writer, key, val: ROPE, format: ATOM ¨ NIL] ~ {
+keyLooks: TiogaAccess.Looks ¨ ALL[FALSE];
+
+keyLooks['b] ¨ keyLooks['s] ¨ TRUE;
+PutRope[writer, key, keyLooks];
+PutRope[writer, ": "];
+PutRope[writer, val];
+EndNode[writer, format];
+};
+
+PutFromHeader: PROC [writer: TiogaAccess.Writer, header: ROPE] ~ {
+size: INT ~ Rope.Size[header];
+key, colon, val, cr: INT ¨ 0;
+
+WHILE key < size DO
+colon ¨ Rope.Find[s1: header, s2: ": ", pos1: key];
+val ¨ colon + 2;
+cr ¨ Rope.Find[s1: header, s2: "\r", pos1: key];
+IF colon < 0 OR cr < 0 OR cr < val THEN
+EXIT;
+PutField[writer: writer, key: Rope.Substr[base: header, start: key, len: colon - key],
+val: Rope.Substr[base: header, start: val, len: cr - val]];
+key ¨ cr + 1;
+ENDLOOP;
+};
+
+CopyDoc: PROC [root: TextNode.Ref] RETURNS [TextNode.Ref] ~ {
+copy: TextNode.Ref ~ TextNode.Root[EditSpanSupport.CopySpan[[
+start: TextNode.MakeNodeLoc[TextNode.FirstChild[root]],
+end: TextNode.MakeNodeLoc[TextNode.LastWithin[root]]
+]].start.node];
+RETURN [copy]
+};
+
+AnswerMsg: PUBLIC PROC [includeOriginal: BOOL, transport: ATOM] = {
+GetChar: PROC[pos: INT] RETURNS [CHAR] = {
+ch: CHAR ~ FetchFromNode[messageNode, pos];
+IF ch = '\l THEN RETURN['\r] ELSE RETURN[ch];
+};
+Writer: PROC [writer: TiogaAccess.Writer] ~ {
+PutFromHeader[writer: writer, header: answer];
+PutNode[writer: writer]; -- empty node
+IF includeOriginal THEN {
+TiogaAccess.Nest[writer, 1]; -- this makes up for skipping the message header
+UNTIL TiogaAccess.EndOf[reader] DO
+[] ¨ TiogaAccess.CopyNode[writer, reader];
+ENDLOOP;
+PutNode[writer: writer]; -- empty node
+TiogaAccess.DoneWith[reader];
+};
+PutNode[writer: writer, rope: "\001Message\002", format: PeanutProfile.messageNodeFormat];
+PutSignatureField[writer];
+};
+notOk: BOOL;
+length, errorIndex: INT;
+answer: ROPE;
+start: TiogaOps.Location;
+messageViewer: Viewer;
+messageNode: TiogaOps.Ref;
+thisUser: MailBasics.RName ¨ [$none, NIL];
+reader: TiogaAccess.Reader;
+
+[viewer: messageViewer, start: start] ¨ TiogaOps.GetSelection[];
+messageNode ¨ TopParent[start.node];
+IF messageNode = NIL THEN {
+PeanutWindow.OutputRope["\nSelect message to be answered."];
+RETURN;
+};
+
+length ¨ TextNode.LocOffset[[messageNode, 0], TextNode.LastLocWithin[messageNode]];
+IF includeOriginal THEN {
+reader ¨ TiogaAccess.FromNode[CopyDoc[messageNode]];
+IF TiogaOps.FirstChild[messageNode] # NIL THEN -- skip header node
+[] ¨ TiogaAccess.SkipToNextNode[reader];
+};
+
+IF transport # NIL THEN {
+FOR rL: MailBasics.RNameList ¨ PeanutCredentials.userRNameList, rL.rest UNTIL rL = NIL DO
+IF transport # rL.first.ns THEN LOOP;
+thisUser ¨ rL.first;
+EXIT;
+ENDLOOP;
+};
+
+[notOk, answer, errorIndex] ¨ MailAnswer.MakeHeader[which: transport, getChar: GetChar, inputLength: length, userRName: thisUser];
+
+IF notOk THEN {
+PeanutWindow.OutputRope[IO.PutFR1[
+"\nSyntax error in line previous to line containing pos %g",
+[integer[TextNode.LocNumber[TextNode.LocRelative[[messageNode, 0], errorIndex]]]]]];
+IF answer.Length[] = 0 THEN
+RETURN;
+PeanutWindow.OutputRope["\n***** Partial answer has been generated *****"];
+};
+
+NewForm[Writer];
+};
+
+ForwardMsg: PUBLIC PROC ~ {
+Maker: PROC [writer: TiogaAccess.Writer] ~ {
+PutHeaderFields[writer];
+PutNode[writer: writer, rope: "\001CoveringMessage\002",
+format: PeanutProfile.messageNodeFormat];
+PutSignatureField[writer];
+PutNode[writer: writer]; -- empty node
+PutNode[writer: writer,
+rope: "------------------------------------------------------------"];
+UNTIL TiogaAccess.EndOf[reader] DO
+[] ¨ TiogaAccess.CopyNode[writer, reader];
+ENDLOOP;
+TiogaAccess.Nest[writer, 1]; -- make up for skipping message header
+PutNode[writer: writer,
+rope: "------------------------------------------------------------"];
+};
+messageViewer: ViewerClasses.Viewer;
+start, end: TiogaOps.Location;
+messageHeader, endHeader: TiogaOps.Ref;
+reader: TiogaAccess.Reader;
+
+[viewer: messageViewer, start: start, end: end] ¨ TiogaOps.GetSelection[];
+messageHeader ¨ TopParent[start.node];
+endHeader ¨ TopParent[end.node];
+
+IF messageHeader = NIL OR messageHeader # endHeader THEN {
+PeanutWindow.OutputRope["\nSelect a single message to be forwarded."];
+RETURN;
+};
+
+reader ¨ TiogaAccess.FromNode[CopyDoc[messageHeader]];
+IF TiogaOps.FirstChild[messageHeader] # NIL THEN  -- skip header node
+[] ¨ TiogaAccess.SkipToNextNode[reader];
+NewForm[Maker];
+TiogaAccess.DoneWith[reader];
+};
+
+PutToField: PROC [writer: TiogaAccess.Writer] = {
+PutField[writer: writer, key: "To", val: Rope.Cat["\001", PeanutProfile.recipients, "\002"]];
+};
+
+PutSubjectField: PROC [writer: TiogaAccess.Writer] = {
+PutField[writer: writer, key: "Subject", val: "\001Topic\002"];
+};
+
+PutSignatureField: PROC [writer: TiogaAccess.Writer] = {
+IF NOT Rope.IsEmpty[PeanutProfile.signature] THEN
+PutNode[writer: writer, rope: PeanutProfile.signature];
+};
+
+PutHeaderFields: PROC [writer: TiogaAccess.Writer] = {
+IF PeanutProfile.toBeforeSubject THEN {
+PutToField[writer];
+PutSubjectField[writer];
+}
+ELSE {
+PutSubjectField[writer];
+PutToField[writer];
+};
+IF PeanutProfile.ccField THEN
+PutField[writer: writer, key: "Cc",
+val:
+IF PeanutProfile.ccToSelf THEN
+PeanutCredentials.simpleUserName.first
+ELSE
+"\001Copies To\002"];
+PutField[writer: writer, key: "Reply-To", val: PeanutCredentials.simpleUserName.first];
+EndNode[writer: writer]; -- empty node
+};
+
+NewMsgForm: PUBLIC PROC ~ {
+NewFormWriter: PROC [writer: TiogaAccess.Writer] ~ {
+PutHeaderFields[writer];
+PutNode[writer: writer, rope: "\001Message\002", format: PeanutProfile.messageNodeFormat];
+PutSignatureField[writer];
+};
+NewForm[NewFormWriter];
+};
+
+abortSend: BOOL ¨ FALSE;
+
+AbortSend: PUBLIC PROC ~ {
+abortSend ¨ TRUE;
+};
+
+CheckForAbort: PROC ~ {
+IF abortSend THEN
+ERROR ABORTED;
+};
+
+Debug: PROC [REF ¨ NIL] ~ {ENABLE ABORTED => CONTINUE; ERROR};
+
+SendMsg: PUBLIC PROC[transport: ATOM] = {
+senderV: Viewer ¨ NIL;
+oldLabel: ROPE ¨ NIL;
+restore: BOOL ¨ FALSE;
+Restore: PROC [delNodes: BOOL] = {
+root, first, second: TiogaOps.Ref;
+prevV: Viewer;
+prevStart, prevEnd: TiogaOps.Location;
+prevLevel: TiogaOps.SelectionGrain;
+cb, pd: BOOL;
+
+senderV.label ¨ oldLabel;
+ViewerOps.OpenIcon[senderV];
+IF delNodes THEN {
+[prevV, prevStart, prevEnd, prevLevel, cb, pd] ¨ TiogaOps.GetSelection[primary];
+root ¨ TiogaOps.ViewerDoc[senderV];
+first ¨ TiogaOps.FirstChild[root];
+second ¨ TiogaOps.StepForward[first];
+TiogaOps.SelectNodes[viewer: senderV, start: first, end: second];
+TiogaOps.Delete[];
+IF prevV # senderV AND prevV # NIL THEN
+TiogaOps.SetSelection[prevV, prevStart, prevEnd, prevLevel, cb, pd];
+};
+};
+
+BEGIN
+ENABLE {
+UNWIND =>
+IF restore THEN
+Restore[FALSE];
+ABORTED => {
+Restore[FALSE];
+PeanutWindow.OutputRope["Sending ABORTED."];
+GO TO Return;
+};
+};
+
+status: SendParseStatus;
+sPos, mPos: INT;
+formatting: ROPE;
+smr: SendingRec;
+writer: TiogaAccess.Writer ¨ NIL;
+contents: ViewerTools.TiogaContents;
+
+abortSend ¨ FALSE;
+
+senderV ¨ ViewerTools.GetSelectedViewer[];
+IF senderV = NIL THEN {
+PeanutWindow.OutputRope["\nSelect message to be sent."];
+RETURN
+};
+ViewerOps.CloseViewer[senderV];
+
+IF Rope.Length[PeanutProfile.outgoingMailFile] > 0 THEN {
+TiogaOps.SelectDocument[senderV];
+PeanutWindow.CopyMessages[to: PeanutProfile.outgoingMailFile, delete: FALSE];
+};
+
+oldLabel ¨ senderV.label;
+senderV.label ¨ "Sending"; restore ¨ TRUE;
+
+smr ¨ NEW[SendMsgRecObject ¨
+[fullText: CreateMessageRope[TiogaOps.ViewerDoc[senderV]]]];
+PeanutWindow.OutputRope["\nParsing... "];
+[status, sPos, mPos] ¨ ParseTextToBeSent[smr, transport];
+
+IF status # ok AND status # includesPublicDL THEN {
+SELECT status FROM
+fieldNotAllowed => 
+IF sPos # mPos THEN {
+PeanutWindow.OutputRope[Rope.Substr[smr.fullText, sPos, mPos - sPos - 1]];
+PeanutWindow.OutputRope["field is not allowed."]
+}
+ELSE
+PeanutWindow.OutputRope[IO.PutFR1["Field at pos %g is not allowed.", [integer[sPos]]]];
+syntaxError => 
+IF sPos # mPos THEN {
+PeanutWindow.OutputRope["Syntax error on line beginning with "];
+PeanutWindow.OutputRope[Rope.Substr[smr.fullText, sPos, mPos - sPos - 1]]
+}
+ELSE
+PeanutWindow.OutputRope[IO.PutFR1["Syntax error at position %g.", [integer[sPos]]]];
+includesPrivateDL =>
+PeanutWindow.OutputRope["Private DLs are not yet implemented."];
+ENDCASE => ERROR;
+Restore[FALSE];
+RETURN;
+};
+
+CheckForAbort[];
+
+writer ¨ TiogaAccess.Create[];
+PutField[writer, "Date", Convert.RopeFromTimeRFC822[BasicTime.Now[]]];
+FOR rL: MailBasics.RNameList ¨ PeanutCredentials.userRNameList, rL.rest UNTIL rL=NIL DO
+IF rL.first.ns = transport THEN {
+PutField[writer, IF smr.from.name = NIL THEN "From" ELSE "Sender", rL.first.name];
+PutFromViewer[writer, senderV];
+TiogaAccessViewers.WriteViewer[writer, senderV];
+EXIT;
+};
+
+REPEAT
+FINISHED => {
+Restore[FALSE];
+PeanutWindow.OutputRope["Cannot find appropriate name for sender."];
+RETURN;
+};
+ENDLOOP;
+
+{
+textNodeRef: TextNode.Ref ~ TiogaOps.ViewerDoc[senderV];
+contents ¨  MailUtilsBackdoor.GetCRTiogaContents[textNodeRef];
+
+IF transport = $xns THEN {
+smr.fullText ¨ MailUtilsBackdoor.WritePlainCR[textNodeRef];
+formatting ¨ contents.formatting;
+}
+ELSE {
+last: INT;
+Debug[];
+last ¨ contents.contents.Length[] - 1;
+IF contents.contents.Fetch[last] = '\000 THEN {		-- NULL for padding
+smr.fullText ¨ Rope.Substr[contents.contents, 1, last-1];
+formatting ¨ Rope.Concat["\000", contents.formatting]
+}
+ELSE { 
+smr.fullText ¨ Rope.Substr[contents.contents, 1];
+formatting ¨ contents.formatting;
+};
+};
+};
+
+smr.endHeadersPos ¨ Rope.Find[smr.fullText, "\r\r", 0];
+IF smr.endHeadersPos < 0 THEN
+smr.endHeadersPos ¨ smr.fullText.Length[]
+ELSE
+smr.endHeadersPos ¨ smr.endHeadersPos + 2;
+PeanutWindow.OutputRope["Sending message... "];
+IF Send[smr, formatting, contents.contents, transport] THEN {
+PeanutWindow.OutputRope["Message has been delivered."];
+IF senderV.file # NIL AND senderV.newVersion THEN
+Restore[FALSE]
+ELSE
+ViewerOps.DestroyViewer[senderV];
+}
+ELSE {
+Restore[TRUE];
+PeanutWindow.OutputRope["Message NOT sent."] 
+};
+
+EXITS
+Return => RETURN;
+END;
+};
+
+dotRope: ROPE = ".";
+colonRope: ROPE = ":";
+atSignRope: ROPE = "@";
+percentRope: ROPE = "%";
+FixupXNSAddresses: PROC [rn: RName] RETURNS [nrn: RName] ~ {
+FixAtBreak: PROC [break: ROPE, rn: RName] RETURNS [fixed: BOOL _ FALSE] = {
+whereBreak: INT _ Rope.FindBackward[rn.name, break]; -- last position of break in rName
+IF whereBreak < 1 OR whereBreak=Rope.Length[rn.name] THEN RETURN [FALSE];
+IF whereDot > whereBreak THEN { -- final dot is after the break, not in the "user name"
+domain: ROPE _ Rope.Substr[rn.name, whereDot+1]; -- get the value of t
+FOR r: LIST OF ROPE _ PeanutProfile.fixupXNSAddresses, r.rest UNTIL r=NIL DO
+nextDomain: ROPE _ r.first;
+IF Rope.Equal[domain, nextDomain, FALSE] THEN {
+nrn.name _ Rope.Replace[rn.name, whereDot, 1, colonRope];
+fixed _ TRUE;
+RETURN;
+};
+ENDLOOP;
+};
+};
+
+fixed: BOOL _ FALSE;
+whereDot: INT _ -1;
+nrn _ [rn.ns, rn.name]; -- in case RETURNS early
+IF rn.ns#$xns THEN RETURN; -- only for xns transport
+IF Rope.Find[rn.name, colonRope]#-1 THEN RETURN; -- don't even try to fix up rNames that already have colons in them
+whereDot _ Rope.FindBackward[rn.name, dotRope]; -- last position of a dot in rName
+IF whereDot < 1 OR whereDot=Rope.Length[rn.name] THEN RETURN;
+fixed _ FixAtBreak[atSignRope, rn]; -- fix up addresses with @ in them FIRST
+IF NOT fixed THEN [] _ FixAtBreak[percentRope, rn]; -- THEN try to fix up addresses with % in them
+};
+Send: PROC [smr: SendingRec, formatting, textForFormatting: ROPE, transport: ATOM]
+RETURNS [sent: BOOLEAN] = {
+msH: MailSend.MailSendHandle ~ MailSend.Create[];
+stepper: LIST OF RName;
+numRecips: INT ¨ 0;
+failureReason: ROPE;
+invalidRecipients: MailBasics.RNameList;
+bugNote: Prop.PropList ¨ NIL;
+BugNote: PROC [what: ATOM, item: ROPE] RETURNS [ROPE] ~ {
+bugNote ¨ CONS[[what, item], bugNote];
+RETURN [item]
+};
+
+
+sent ¨ FALSE;
+MailSend.StartSend[msH: msH, credentialsList: PeanutCredentials.sendingCredentials];
+FOR rL: LIST OF RName _ smr.to, rL.rest UNTIL rL = NIL DO
+IF rL.first.name # NIL THEN {
+thisrN: RName _ rL.first;
+IF PeanutProfile.fixupXNSAddresses#NIL THEN thisrN _ FixupXNSAddresses[thisrN];
+MailSend.AddRecipient[msH, thisrN];
+numRecips _ numRecips + 1;
+};
+ENDLOOP;
+CheckForAbort[];
+
+FOR rL: LIST OF RName _ smr.cc, rL.rest UNTIL rL = NIL DO
+IF rL.first.name # NIL THEN {
+thisrN: RName _ rL.first;
+IF PeanutProfile.fixupXNSAddresses#NIL THEN thisrN _ FixupXNSAddresses[thisrN];
+MailSend.AddRecipient[msH, thisrN];
+numRecips _ numRecips + 1;
+};
+ENDLOOP;
+CheckForAbort[];
+
+PeanutWindow.OutputRope[IO.PutFR["Sending to %g recipient%g... ", [integer[numRecips]], [rope[IF numRecips = 1 THEN "" ELSE "s"]]]];
+MailSend.StartItem[msH, MailBasicsItemTypes.header];
+MailSend.AddToItem[msH, BugNote[$header, Rope.Substr[smr.fullText, 0, smr.endHeadersPos]]];
+MailSend.StartItem[msH, MailBasicsItemTypes.multinationalNote];
+MailSend.AddToItem[msH, BugNote[$multinationalNote, Rope.Substr[smr.fullText, smr.endHeadersPos]]];
+
+IF formatting # NIL THEN { -- send the formatting info as a second item
+IF transport # $gv THEN {
+MailSend.StartItem[msH, MailBasicsItemTypes.plainTextForFormatting];
+MailSend.AddToItem[msH, BugNote[$plainTextForFormatting, textForFormatting]];
+};
+MailSend.StartItem[msH, MailBasicsItemTypes.tioga1];
+MailSend.AddToItem[msH, BugNote[$tioga1, formatting]] 
+};
+CheckForAbort[];
+[sent, failureReason, invalidRecipients] ¨ MailSend.Send[msH: msH, validate: TRUE, sendEvenIfInvalidNames: FALSE, transport: transport];
+IF NOT sent THEN {
+IF invalidRecipients = NIL THEN
+PeanutWindow.OutputRope[failureReason]
+ELSE {
+PeanutWindow.OutputRope["\nThe following are invalid recipients: "];
+FOR rL: MailBasics.RNameList ¨ invalidRecipients, rL.rest UNTIL rL = NIL DO
+PeanutWindow.OutputRope[IO.PutFR["(%g) %g", [atom[rL.first.ns]], [rope[rL.first.name]]]];
+IF rL.rest # NIL THEN 
+PeanutWindow.OutputRope[", "];
+ENDLOOP;
+};
+};
+};
+
+debugData: Prop.PropList ¨ NIL;
+GetDebugData: PROC RETURNS [Prop.PropList] ~ { RETURN [debugData] };
+
+
+ParseTextToBeSent: PROC [msg: SendingRec, transport: ATOM] RETURNS [status: SendParseStatus, sPos, mPos: INT] = {  
+mLF: PeanutParse.MessageInfo;
+tHeaders: LIST OF ROPE¨ NIL;
+msgText: ROPE ¨ msg.fullText;
+lastCharPos: INT ¨ msgText.Length[] - 1;
+lastCharIsCR: BOOL ¨ (msgText.Fetch[lastCharPos] = '\r);
+countOfRecipients, dlCount: INT ¨ 0;
+
+GetNextMsgChar: PROC RETURNS [ch: CHAR] = {
+IF mPos <= lastCharPos THEN ch¨ Rope.Fetch[msgText, mPos]
+ELSE IF (mPos=lastCharPos+1) AND ~lastCharIsCR THEN ch ¨ '\r
+ELSE ch ¨ MailParse.endOfInput;
+mPos¨ mPos + 1;
+};
+
+RNameListField: PROC[index: PeanutParse.MessageFieldIndex] = {
+fieldBody, fbEnd: LIST OF RName ¨ NIL;
+AnotherRName: PROC[rName: RName] RETURNS [ROPE] = {
+IF fbEnd=NIL THEN fbEnd ¨ fieldBody ¨ CONS[rName, NIL]
+ELSE fbEnd ¨ fbEnd.rest ¨ CONS[rName, NIL];
+IF rName.ns = $file THEN status ¨ includesPrivateDL
+ELSE IF rName.name.Find["^"] < 0 THEN countOfRecipients ¨ countOfRecipients + 1
+ELSE {
+IF status # includesPrivateDL THEN status¨ includesPublicDL;
+dlCount¨ dlCount + 1
+};
+RETURN[NIL]; 
+};
+
+MailParse.NameList[pH, transport, GetNextMsgChar, AnotherRName, NIL];
+SELECT index FROM
+toF => msg.to ¨ Append[msg.to, fieldBody];
+ccF, cF, bccF => msg.cc ¨ Append[msg.cc, fieldBody];
+fromF => IF fieldBody # NIL THEN msg.from ¨ fieldBody.first;
+ENDCASE => ERROR;
+};
+
+Append: PROC [a, b: LIST OF RName] RETURNS [LIST OF RName] ~ {
+RETURN [IF a = NIL THEN b ELSE CONS[a.first, Append[a.rest, b]]]
+};
+
+pH: MailParse.ParseHandle;
+field: ROPE ¨ NIL;
+fieldNotRecognized: BOOL;
+mPos ¨ 0;		-- where we are in the fulltext, for parsing
+status ¨ ok;		-- start with good status
+
+pH ¨ MailParse.InitializeParse[];
+
+DO
+sPos ¨ mPos;
+field ¨ MailParse.GetFieldName[pH, GetNextMsgChar ! MailParse.ParseError =>
+{ MailParse.FinalizeParse[pH]; GOTO errorExit}];
+IF field = NIL THEN EXIT;		-- end of headers
+IF Rope.Equal[field, "Sender", FALSE] OR Rope.Equal[field, "Date", FALSE] THEN {
+RETURN[fieldNotAllowed, sPos, mPos];
+};
+fieldNotRecognized ¨ TRUE;
+
+FOR i: PeanutParse.MessageFieldIndex IN PeanutParse.MessageFieldIndex DO
+{ mLF ¨ messageParseArray[i];
+IF Rope.Equal[messageParseArray[i].name, field, FALSE] THEN	-- ignore case
+{ fieldNotRecognized¨ FALSE;
+SELECT mLF.fType FROM
+simpleRope =>
+SELECT i FROM
+fromF => RNameListField[i ! MailParse.ParseError => GOTO errorExit];
+replyToF => {msg.replyTo ¨ TRUE;
+[]¨ MailParse.GetFieldBody[pH, GetNextMsgChar, TRUE]
+};
+subjectF => msg.subject ¨ MailParse.GetFieldBody[pH, GetNextMsgChar];
+voiceF => msg.voiceID ¨ MailParse.GetFieldBody[pH, GetNextMsgChar];
+ENDCASE => [] ¨ MailParse.GetFieldBody[pH, GetNextMsgChar, TRUE];
+rCatList => [] ¨ MailParse.GetFieldBody[pH, GetNextMsgChar, TRUE];
+rNameList => RNameListField[i ! MailParse.ParseError => GOTO errorExit];
+ENDCASE =>	ERROR;
+EXIT
+};
+};
+ENDLOOP;
+IF fieldNotRecognized THEN [] ¨ MailParse.GetFieldBody[pH, GetNextMsgChar]; -- skip anything not recognized
+ENDLOOP;
+
+MailParse.FinalizeParse[pH];
+msg.endHeadersPos ¨ mPos - 1;
+
+msg.numRecipients ¨ countOfRecipients; 
+msg.numDLs ¨ dlCount;
+EXITS
+errorExit => RETURN[syntaxError, sPos, mPos];
+};
+
+
+TiogaOps.RegisterCommand[name: $RedReset, proc: PeanutCheckForReset, before: FALSE];
+TiogaOps.RegisterCommand[name: $YellowReset, proc: PeanutCheckForReset, before: FALSE];
+TiogaOps.RegisterCommand[name: $BlueReset, proc: PeanutCheckForReset, before: FALSE];
+
+END.
+  
+  PeanutSendMailImpl.mesa
+Copyright ” 1985, 1989, 1990, 1992 by Xerox Corporation.  All rights reserved.
+Created by Paxton, April 1, 1983 3:02 pm
+Last Edited by: Pausch, July 18, 1983 2:13 pm
+Last Edited by: Willie-Sue, May 4, 1989 3:36:59 pm PDT
+Last Edited by: Gasbarro October 9, 1985 6:30:55 pm PDT
+Doug Wyatt, August 29, 1985 4:40:59 pm PDT
+Bertrand Serlet June 25, 1986 5:35:26 pm PDT
+Michael Plass, February 19, 1993 11:44 am PST
+Willie-sue Orr,  March 26, 1990 1:39 pm PST
+Last changed by Pavel on March 8, 1990 5:33 pm PST
+Jules Bloomenthal July 1, 1992 1:58 pm PDT
+Kenneth A. Pier, July 6, 1992 5:09 pm PDT
+
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * 
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+For now, if the transport is $xns, we cannot send formatting, on the off chance that the message will need to traverse the GGW, which will reject the message because it has unsupported body parts.
+note that there is guaranteed to be formatting since we added some to make things look nice
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+fix the common problem in which XNS wants the domain name (say, t) to be preceded by a colon but the name in the field is preceded by a dot.
+return if no break or if break is first char or if break is last char (probably malformed address)
+rName is of the form mumble@a.b.c. ... .t. If t matches a UserProfile specification of domains to be colonized, do so.
+return if no dot or if dot is first char or if dot is last char (probably malformed address)
+debugData ¨ bugNote; -- uncomment this to enable debugData
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+now we are positioned at the beginning of the body of the message
+ ù y  ñ(cedarcode) styleïNewlineDelimiter
+ò codeöúôKöú
+œeúCôNKöú(ô(Köú-ô-Köú6ô6Kô7Köú*ô*Kô,Kô-Kô+Kô2Kô*Kô)Kô óöœk	ò	Köú
+ûúûúòKöúûúò#KöûúòKöúûúòKöúûúòKöúûúò.Köúûú=òVKöú
+ûúmò|Köú	ûú{òâKöúûú$ò;Köúûú5òLKöúûú"ò3KöúûúuòàKöúûúòKöúûúhòzKòKòKòKöúûúlò}Köúûúò3Kò	KöúûúòKöúûúò#Köúûú"ò4Köú
+ûú5òDKöúûúPòaóKò Kö–lnúûúûò!Köûúûú÷òÙKöûúò#KöúûòKò Köúûúò$KöûúûúûúòKöúûúòKò öúûúûúò Köú
+ûúœcò"Köú†ò*KöúûúûúòKöúûúûúòKöú	ûú†ò$Köú	ûúûú†ò2Köú	ûúûú†ò/KöúûúòKöúûúòKöúûú†ò4KòKò óKöúûúûúò(Kò öúûúKò`Kò óöúûúûúûúò\Köú$†/òSKò KòKòKòKòKòKòKò"Kò&Kò(Kò#KòóKò Köú<ô<ö
+œnúûúûúûú
+ûúòPKöú=ò=KöúûúMòXKöûúSòYKòKò óö°úûúûú	ûúûúûúòEKöûúûúò,KòKò óö
+°úûúûúûúûúòGKò@öûúûúûòKöûúò
+óöûúûú'ûú† òSKöûúòóöûòKöûú(ò.óKòKò óö°	úûúûúûúòSöûúûúûòKöûúûúòóöûúûúûòKòóöûòKòöûúûòKöûúòóKòKöûúòóKòóKò Köú9ô9ö°úûúIûúûúûúûúòçöûúûúòKò0Köûúûú3òHKòóKòKò óö°úûúIûúûúûúûúòåö
+ûúûúûúûúûúò*Kò+Köûúûú3òHKòóKòKò óö°úò-Kò(öûú	ûòKòPKòNKöûúòóKöûúûúûú$òQKòKò óö°úûú	ûúò3Kò2KöúûúòKòKöúlûúòtKò@KöújûúòpKöúiûúòpKöú"ûú!òFKöúûúò7KòKò óKöú9ô9ö
+°úûú$ûúûúûúòaKöúDûúûúûúûúûúûúòùö°úûúûúûúûúûú†úòMKò%öûúûòKöú0ûúò5KöûúòóKòKòKò#KòóKò Kò*KòKò óö°úûú&ûúûúûúûúòYKö	úDûúûú0ûúûúò°Kò#KòKò óö°úûú$ûúûú
+ûúûúòTKöúòKöúòKòKò óö°úûú1òDKòCKò Köú)†ò9öûúûò"Kò*KöûúòóKöú†ò9KöúòKòKò óö
+°úûú(ûú
+ûúûúòSKöúûúûúò)Kò Köúûúò#KöúòKöúòKöúòKöúòKòKò óö°úûú&ûúòBKöúûúòKöúûúòKò öûúûòKò3KòKò0öûúûúûú
+ûò'KöûúòóKöúíòíKòKöûúòóKòKò óKöú9ô9ö°úûúûúò=ò=Kò7Kò4KòóKöûúòKòKò óö
+°	úûúûúûúûúòCö
+°úûúûúûúûúò*Köúûú#ò+Kö
+ûú
+ûúûúûúûúò-Kòóö°úûú!ò-Köú.ò.Köú†ò&öûúûúòKöú†0òMöûúûò"Kò*KöûúòóKöú†ò&KöúòKöúòóKöúZòZKöúòKòóKöúûúòKöúûúòKöúûúòKòKòKòKöú%ûúò*KöúòKò Kò@Kò$öûúûúûúòKöú<ò<KöûúòKòóKò KòSöûúûúòKò4öûú$ûúûú†òBKò(óKöúòóKò öûúûúûúòöûúEûúûúûòYKöûúûúûúò%KòKöûúòKöûúòóKòóKò KòÇKò öûúûúòöúûúò"Köú<ò<KöúTòTóöûúûòKöûúòóKöúKòKKòóKò KöúòKòKò óKöú9ô9ö°
+úûúûúòö°úûú!ò,KöúòKöúbòbKöúòKöú†ò&Köú^ò^öûúûò"Kò*KöûúòóKöú†&òCKöú^ò^KòóKò$KòKò'KöúòKò KòJKò&Kò Kò öûúûúûúûúò:KöúFòFKöûúòKöúòóKò Kò6öûú&ûúûú†òEKò(óKòKöúòKòKò óKöú9ô9ö°
+úûú!ò1Köú]ò]KòKò óö°úûú!ò6Köú?ò?KòKò óö°úûú!ò8öûúûú'ûò1Köú7ò7óKòKò óö°úûú!ò6öûúûúò'KöúòKöúòKòóöûúòKöúòKöúòKöúòóöûúûòöú#ò#öúòöûúûòKöú&ò&óöûòKöúòóóóóKöúWòWKöú†ò&KòKò óö°
+úûúûúòö°úûú!ò4KöúòKöúZòZKöúòKòóKöúòKòKò óKöú9ô9KöúûúûúòKò ö°	úûúòKöúûúòKòóKò ö°úûúòöûúûòKöûúûúòóKòóKò ö°úûúûúûúûúûúûúûúò>Kò óö°úûúûúûúò)KöúûúòKöú
+ûúûúòKöú	ûúûúòö°úûúûúò"Kò"KòKöú&ò&Köú#ò#KöúûúòKò KòKòöûú
+ûúòKòPKò#Kò"Kò%KöúAòAKöúòöûúûú	ûúûò'KöúDòDóKöúòóKòóKò öûòöûúòöûúò	öûú	ûòKöúûúòóóöûúòKöúûúòKöú,ò,KöûúûúòKòóKòóKò KòKöúûúòKöúûúòKòKöúûúò!Kò$Kò KöúûúòKò Kò*öûúûúûúòKöú8ò8KöûòKöúòóKòKò öûú1ûúò9Köú!ò!KöúFûúòMKòóKò KòKöú%ûúò*Kò KöúûúPòYKöú)ò)Kò9Kò öûúûúûúò3öûúûòòöûúûúòKöúJòJKöú0ò0KòóöûòKöúûú=òWóóòöûúûúòKöú@ò@KöúIòIKòóöûòKöúûú:òTóóöúòKöú@ò@óKöûúûúòóKöúûúòKöûúòKòóKò KöúòKò KòKöúFòFöûúEûúûúûòWöûúûúò!Kö	úûúûúûúûúòRKöúòKò0KöûúòKöúòóKò öûòöûúòKöúûúòKöúDòDKöûúòKòóóKöûúòóKò KôƒòKöú8ò8Kò>Kò öûúûúòKò;Kò!KòóöûúòKöúûúò
+Köú[ô[KòKò&öûú'ûú†òDKò9Kò5KòóöûúòKò1Kò!KòóKòóKòóKò Kò7öûúûòKò)óöûòKò*óKöú/ò/öûú5ûúò=Köú7ò7öûúûúûúûò1KöúûúòóöûòKöú!ò!óKòóöûúòKöúûúòKöú-ò-KòóKò öûòKöú
+ûúòóKöûúòóKòKò óKöúOôOKöú	ûúòKöúûúòKöúûúòKöúûúòö°úûúûúò<Kôåö°
+úûú	ûúûú	ûúûúòKKöúûú&†"òWö
+ûúûú!ûúûúûúòIKö†bôbóöûúûú†7òWKôvKöúûú%†òFöûúûúûúûú+ûúûúûòLKöúûúòöûú ûúûúò/Köú9ò9KöúûúòKöûúòKòóKöûúòóKòóKòKò óKöúûúòKöú
+ûúòKöú†ò0Köûúûúûú†ò4Köûú"ûúûú†CòtKöú0†"òRöûúûúûúûúò=Kö†\ô\óKöú$†(òLKöûúûúûú#†.òbKòóö°úûú2ûúûúûúûúònKöú1ò1Köú	ûúûúòKöúûúòKöúûúòKöú(ò(Köúûúòö°úûúûúûúûúûúò9Köú
+ûúò&KöûúòKöúòóKò Kò KöúûúòKöúTòTöûúûúûúûúûúûò9öûúûúûúòKöúòKöûú!ûúûú$òOKöú#ò#KòKòóKöûúòóKöúòKò öûúûúûúûúûúûò9öûúûúûúòKöúòKöûú!ûúûú$òOKöú#ò#KòKòóKöûúòóKöúòKò Kö	úûúDûúûúûú	òÑKò4Kò[Kò?KòcKò öûúûúûú†,òGöûúûúòKòDKòMKòóKò4Kò6KòóKòKô:KöúKûúûúòàöûúûúûúòöûúûúûòKöú&ò&óöûúòKöúDòDöûú7ûúûúûòKKöúûú?òYöûúûúûúòKöúòóKöûúòóKòóKöúòóKòKò óKöúûúòKö°úûúûúûúòDKò Kò KöúOôOö
+°úûúûúûú'ûúòsKòKö	ú
+ûúûúûúûúòKöú	ûúòKöúûúò(Köúûú%ò8Köúûúò$Kò ö°úûúûúûúò+öûúûúò9Köûúûúûúûú	ò<KöûúòóKòKòóKò ö°úûú*ò>Köúûúûú	ûúò&ö°úûúûúûúò3ö
+ûúûúûúûúûúò6Köûúûúûúò+óöûúûúò3Köûúûúûú*òOöûúòKöûúûúò<KòKòóóKöûúûúòKòóKò Köú@ûúòEöûúûòKò*Kò4Köú	ûúûúûúò<KöûúûúòóKòKò óö°úûúûúûúûûúûúûúò>Köûúûúûúûúûúûúò@KöúòóKò KöúòKöúûúûúòKöúûúòKöú†,ò7Köú†ò'Kò Kò!Kò öûòKòòKKöúûúò0óKö	ûú	ûúûúûú†ò,ö
+ûúûúûúûúûúòPKöûúò$KòóKöúûúòKò öûú"ûúûòHòKöûú.ûúûú†òJöúûúòöûúûòKòöûúûòKöú4ûúòDöúûúò Köú/ûúò4KòóKòEKòCKöûú4ûúòAóKöú<ûúòBKöú8ûúòHKöûúûúòóKöûòKòóKòóKöûúòóKöûúûú2†òkKöûúòóKò KöúAôAKöúòKòKò Kò'KòöûòKöúûúò-óKòKò óKò KöúMûúòTKöúPûúòWKöúNûúòUKò Köûúòó Öó    ^`  „  

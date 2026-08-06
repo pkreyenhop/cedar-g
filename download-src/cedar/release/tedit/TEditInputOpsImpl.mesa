@@ -1,0 +1,772 @@
+DIRECTORY
+CharOps USING [XAlphaNumeric],
+EditSpan USING [ChangeLooks, ChangeNesting, CannotDoEdit, Copy, Delete, InsertTextNode, Merge, Move, MoveOnto, Place, Replace, SaveForPaste, SavedForPaste, Split, Transpose],
+EditSpanSupport USING [Apply],
+MessageWindow USING [Append, Blink],
+Rope USING [ROPE, Substr, Concat],
+TEditDisplay USING [EstablishLine],
+TEditDocument USING [BeforeAfter, Selection, SelectionId, SelectionGrain, SelectionPoint, TEditDocumentData],
+TEditPrivate USING [CaretAtEnd],
+TEditInput USING [currentEvent],
+TEditInputOps USING [GoToPreviousNode, ModifyOp],
+TEditLocks USING [Access, Lock, LockBoth, LockRef, Unlock],
+TEditOps USING [],
+TEditProfile USING [editTypeScripts],
+TEditSelection USING [Alloc, Copy, Free, Deselect, GetSelectionGrain, InsertionPoint, LockBothSelections, LockSel, MakeSelection, MakePointSelection, nilSel, oldSel, pSel, SelectionRoot, sSel, UnlockBothSelections, UnlockDocAndPSel, UnlockSel],
+TextEdit USING [DeleteText, FetchChar, FetchLooks, FromRope, Size],
+TextLooks USING [Look, Looks, allLooks, noLooks, ModifyLooks],
+TextNode USING [EndPos, FirstChild, LastLocWithin, Level, Location, MakeNodeLoc, MakeNodeSpan, NodeItself, nullSpan, Parent, Ref, RefTextNode, Root, Span, StepForward, StepBackward],
+TypeScript USING [ModifyLooks],
+ViewerClasses USING [Viewer];
+
+TEditInputOpsImpl: CEDAR PROGRAM
+IMPORTS CharOps, EditSpan, MessageWindow, EditSpanSupport, Rope, TextEdit, TextLooks, TextNode, TEditDisplay, TEditPrivate, TEditInput, TEditInputOps, TEditLocks, TEditProfile, TEditSelection, TypeScript
+EXPORTS TEditInputOps, TEditOps
+= BEGIN OPEN TEditDocument, TEditSelection;
+
+RefTextNode: TYPE ~ TextNode.RefTextNode;
+
+CallWithLocks: PUBLIC PROC [proc: PROC [root: RefTextNode, tSel: Selection], access: TEditLocks.Access ¬ write] = {
+root: RefTextNode;
+tSel: Selection ¬ NIL;
+lockRef: TEditLocks.LockRef ¬ NIL;
+{
+ENABLE UNWIND => {
+UnlockSel[primary];
+IF lockRef # NIL THEN TEditLocks.Unlock[root];
+IF tSel # NIL THEN Free[tSel];
+};
+LockSel[primary, "CallWithLocks"];
+IF (access=write AND ~CheckReadonly[pSel]) OR (root ¬ SelectionRoot[pSel])=NIL THEN {
+UnlockSel[primary];
+RETURN };
+lockRef ¬ TEditLocks.Lock[root, "CallWithLocks", access];
+tSel ¬ Alloc[];
+TEditSelection.Copy[source: pSel, dest: tSel];
+proc[root, tSel];
+Free[tSel];
+tSel ¬ NIL;
+UnlockDocAndPSel[root];
+};
+};
+
+CallWithBothLocked: PUBLIC PROC [
+proc: PROC [sourceRoot, destRoot: RefTextNode, tSel, srcSel, targetSel: Selection],
+targetSel, srcSel: Selection, sourceAccess: TEditLocks.Access] = {
+sourceRoot, destRoot: RefTextNode;
+tSel, tSel1, tSel2: Selection ¬ NIL;
+lockRef: TEditLocks.LockRef ¬ NIL;
+Cleanup: PROC = {
+IF lockRef # NIL THEN { TEditLocks.Unlock[sourceRoot]; TEditLocks.Unlock[destRoot] };
+IF tSel # NIL THEN Free[tSel];
+IF tSel1 # NIL THEN Free[tSel1];
+IF tSel2 # NIL THEN Free[tSel2];
+UnlockBothSelections[]
+};
+{
+ENABLE UNWIND => Cleanup[];
+LockBothSelections["CallWithBothLocked"];
+IF srcSel.viewer=NIL OR targetSel.viewer=NIL THEN { UnlockBothSelections[]; RETURN };
+IF ~CheckReadonly[targetSel] OR -- don't edit a readonly document
+(sourceAccess=write AND ~CheckReadonly[srcSel]) THEN {
+Deselect[$secondary]; UnlockBothSelections[]; RETURN };
+tSel1 ¬ Alloc[]; tSel2 ¬ Alloc[]; tSel ¬ Alloc[];
+TEditSelection.Copy[source: srcSel, dest: tSel1];
+TEditSelection.Copy[source: targetSel, dest: tSel2];
+TEditSelection.Copy[source: targetSel, dest: tSel];
+sourceRoot ¬ SelectionRoot[srcSel];
+destRoot ¬ SelectionRoot[targetSel];
+[lockRef, ----] ¬ TEditLocks.LockBoth[
+sourceRoot, destRoot, "CallWithBothLocked", sourceAccess, write];
+Deselect[$secondary]; 
+Deselect[$primary];
+proc[sourceRoot: sourceRoot, destRoot: destRoot, tSel: tSel, srcSel: tSel1, targetSel: tSel2];
+};
+Cleanup[];
+};
+
+pdelNode: RefTextNode = TextEdit.FromRope["!"];
+
+DoPendingDelete: PUBLIC PROC = {
+PendingDelete: PROC [root: RefTextNode, tSel: Selection] = {
+pSel.pendingDelete ¬ TRUE;
+tSel­ ¬ nilSel­;
+tSel.granularity ¬ char;
+tSel.looks ¬ pSel.looks;
+tSel.start.pos ¬ tSel.end.pos ¬ [pdelNode,0];
+tSel.pendingDelete ¬ FALSE;
+CopyToDoc[targetSel: pSel, srcSel: tSel, target: primary, lock: FALSE];
+Delete[saveForPaste: FALSE];
+};
+CallWithLocks[PendingDelete]
+};
+
+EditFailed: PUBLIC PROC [msg: Rope.ROPE ¬ NIL] = {
+MessageWindow.Append[IF msg=NIL THEN "Can't do it." ELSE msg, TRUE];
+MessageWindow.Blink[];
+};
+
+CaretLoc: PUBLIC PROC [s: Selection ¬ NIL] RETURNS [TextNode.Location] = {
+IF s=NIL THEN s ¬ pSel;
+IF GetSelectionGrain[s] = node
+THEN SELECT s.insertion FROM
+before => RETURN[[s.start.pos.node, TextNode.NodeItself]];
+after => RETURN[[s.end.pos.node, TextNode.NodeItself]];
+ENDCASE => ERROR
+ELSE SELECT s.insertion FROM
+before => RETURN[s.start.pos];
+after => RETURN[[s.end.pos.node, s.end.pos.where+1]];
+ENDCASE => ERROR;
+};
+
+NodeSpanFromSelection: PROC[sel: Selection] RETURNS[span: TextNode.Span] = {
+RETURN[TextNode.MakeNodeSpan[first: sel.start.pos.node, last: sel.end.pos.node]]
+};
+
+SelectionSpan: PROC[sel: Selection] RETURNS[span: TextNode.Span] = {
+IF GetSelectionGrain[sel]=node THEN RETURN[NodeSpanFromSelection[sel]]
+ELSE RETURN[[start: sel.start.pos, end: sel.end.pos]];
+};
+
+Delete: PUBLIC PROC [saveForPaste: BOOL ¬ TRUE] = {
+DoDelete: PROC [root: RefTextNode, tSel: Selection] = {
+Deselect[$primary];
+tSel.pendingDelete ¬ FALSE;
+SELECT GetSelectionGrain[tSel] FROM
+point => NULL;
+node => { -- this is complex because must worry about deleting all of the document
+newSelNode: RefTextNode ¬ TextNode.StepForward[tSel.end.pos.node];
+newSelText: RefTextNode ¬ newSelNode;
+newSelInsertion: BeforeAfter;
+IF newSelNode=NIL THEN { -- deleting the last node of the doc
+newSelNode ¬ TextNode.StepBackward[tSel.start.pos.node];
+IF newSelNode=NIL OR newSelNode=root THEN { -- deleting all the nodes
+child: RefTextNode ¬ TextNode.FirstChild[root];
+tSel.start.pos.node ¬ child;
+newSelNode ¬ EditSpan.InsertTextNode[root: root, old: child,
+where: before, inherit: FALSE, event: TEditInput.currentEvent];
+};
+newSelText ¬ newSelNode;
+newSelInsertion ¬ IF newSelText#NIL AND TextEdit.Size[newSelText] > 0 THEN after ELSE before }
+ELSE { newSelInsertion ¬ before };
+EditSpan.Delete[
+root: SelectionRoot[tSel], del: NodeSpanFromSelection[tSel],
+event: TEditInput.currentEvent, saveForPaste: saveForPaste
+! EditSpan.CannotDoEdit => GOTO Bad];
+IF newSelText # NIL THEN {
+tSel.start.pos.node ¬ tSel.end.pos.node ¬ newSelText;
+tSel.start.pos.where ¬ tSel.end.pos.where ¬ 
+IF newSelInsertion=before THEN 0
+ELSE TextEdit.Size[newSelText] -- -1? --;
+tSel.granularity ¬ point }
+ELSE { -- the new selection node is not a text node
+tSel.start.pos ¬ tSel.end.pos ¬ TextNode.MakeNodeLoc[newSelNode];
+tSel.granularity ¬ node };
+tSel.insertion ¬ newSelInsertion;
+};
+ENDCASE => {
+EditSpan.Delete[
+root: SelectionRoot[tSel], del: [tSel.start.pos, tSel.end.pos],
+event: TEditInput.currentEvent, saveForPaste: saveForPaste
+! EditSpan.CannotDoEdit => GOTO Bad];
+tSel.end.pos ¬ tSel.start.pos;
+tSel.granularity ¬ point;
+tSel.insertion ¬ before;
+};
+MakeSelection[selection: primary, new: tSel];
+EXITS Bad => { MakeSelection[selection: primary, new: tSel]; EditFailed[] }
+};
+CallWithLocks[DoDelete];
+};
+
+BackSpace: PUBLIC PROC [count: INT ¬ 1] = {
+DoBackSpace: PROC [root: RefTextNode, tSel: Selection] = {
+node: RefTextNode;
+flush: TextNode.Location ¬ InsertionPoint[tSel];
+IF flush.where=TextNode.NodeItself THEN GOTO Bad;
+IF (node ¬ flush.node)=NIL THEN GOTO Bad;
+IF flush.where=0 THEN { Join[]; RETURN }; -- already at start of node; do a Join
+IF (count ¬ MIN[count,flush.where]) <= 0 THEN GOTO Bad;
+Deselect[$primary];
+flush.where ¬ flush.where-count;
+TextEdit.DeleteText[root, node, flush.where, count, TEditInput.currentEvent];
+MakePointSelection[tSel, flush];
+EXITS Bad => EditFailed[]
+};
+IF count > 0 THEN CallWithLocks[DoBackSpace];
+};
+
+FindPrevWord: PUBLIC PROC [node: RefTextNode, offset: INT] RETURNS [nChars: CARDINAL] = {
+Alpha: PROC [index: INT] RETURNS [BOOL] ~ {
+RETURN [CharOps.XAlphaNumeric[TextEdit.FetchChar[node, index]]];
+};
+nChars ¬ 0;
+WHILE offset>0 AND NOT Alpha[offset-1] DO
+offset ¬ offset - 1; nChars ¬ nChars + 1; ENDLOOP;
+WHILE offset>0 AND Alpha[offset-1] DO
+offset ¬ offset - 1; nChars ¬ nChars + 1; ENDLOOP;
+};
+
+BackWord: PUBLIC PROC [count: INT ¬ 1] = {
+DoBackWord: PROC [root: RefTextNode, tSel: Selection] = {
+node: RefTextNode;
+nChars: CARDINAL ¬ 0;
+pos: TextNode.Location ¬ InsertionPoint[tSel];
+IF (node ¬ pos.node)=NIL THEN GOTO Bad;
+IF pos.where = TextNode.NodeItself THEN GOTO Bad;
+Deselect[$primary];
+FOR garbage:INT IN [0..count) DO
+wChars: CARDINAL ¬ FindPrevWord[node,pos.where];
+pos.where ¬ pos.where - wChars;
+nChars ¬ nChars + wChars;
+ENDLOOP;
+TextEdit.DeleteText[root, node, pos.where, nChars, TEditInput.currentEvent];
+MakePointSelection[tSel, pos];
+EXITS Bad => EditFailed[];
+};
+IF count > 0 THEN CallWithLocks[DoBackWord];
+};
+
+GoToPreviousWord: PUBLIC PROC [count: INT ¬ 1] = {
+DoGoToPreviousWord: PROC [root: RefTextNode, tSel: Selection] = {
+pos: TextNode.Location;
+node: RefTextNode;
+nChars: CARDINAL;
+pos ¬ InsertionPoint[tSel];
+FOR garbage:INT IN [0..count) DO
+IF (node ¬ pos.node)=NIL OR
+pos.where=TextNode.NodeItself OR pos.where=0 THEN {
+TEditInputOps.GoToPreviousNode; RETURN };
+nChars ¬ FindPrevWord[node,pos.where];
+pos.where ¬ pos.where - nChars;
+ENDLOOP;
+MakePointSelection[tSel,pos];
+};
+IF count > 0 THEN CallWithLocks[DoGoToPreviousWord, read];
+};
+
+CopyToTypeScript: PROC [targetSel: Selection, source: TextNode.Span] = {
+TSCopy: PROC [node: RefTextNode, start, len: INT]
+RETURNS [stop: BOOL] = {
+rope: Rope.ROPE ¬ Rope.Substr[node.rope, start, len];
+IF node # source.end.node THEN rope ¬ Rope.Concat[rope, "\n"]; -- add CR's between nodes
+targetSel.viewer.class.notify[targetSel.viewer, LIST[rope]];
+RETURN [FALSE];
+};
+EditSpanSupport.Apply[source,TSCopy];
+};
+
+UnConvertNodeSelects: PROC [sel: Selection] = {
+SELECT GetSelectionGrain[sel] FROM
+char => {
+IF sel.end.pos.node=sel.start.pos.node AND sel.end.pos.where<sel.start.pos.where THEN {
+sel.end.pos.where ¬ sel.start.pos.where; sel.granularity ¬ point;
+};
+};
+node => {
+sel.start.pos.where ¬ 0;
+sel.end.pos.where ¬ TextNode.EndPos[sel.end.pos.node];
+};
+ENDCASE;
+};
+
+CopyToDoc: PROC [targetSel, srcSel: Selection, target: SelectionId, lock: BOOL ¬ TRUE] = {
+DoCopyToDoc: PROC [sourceRoot, destRoot: RefTextNode, tSel, srcSel, targetSel: Selection] = {
+IF tSel.pendingDelete THEN { -- replace target by source
+[start: tSel.start.pos, end: tSel.end.pos] ¬ EditSpan.Replace[
+destRoot: destRoot, sourceRoot: sourceRoot,
+dest: SelectionSpan[tSel], source: SelectionSpan[srcSel],
+saveForPaste: TRUE, event: TEditInput.currentEvent
+! EditSpan.CannotDoEdit => GOTO Bad].result;
+tSel.pendingDelete ¬ FALSE;
+}
+ELSE { -- source goes to target caret
+loc: TextNode.Location ¬ InsertionPoint[tSel];
+unnest: INTEGER ¬ 0; -- amount to unnest by if copying nodes after
+where: EditSpan.Place ¬ IF tSel.insertion = before THEN before ELSE after;
+IF GetSelectionGrain[srcSel]=node THEN { -- don't copy nodes into target node
+IF where=before AND loc.where>0
+AND loc.where=TextEdit.Size[loc.node] THEN
+where ¬ after; -- caret at end of node, so copy after
+loc.where ¬ TextNode.NodeItself;
+IF where=after AND tSel.start.pos.node#tSel.end.pos.node THEN
+unnest ¬ TextNode.Level[tSel.end.pos.node]-TextNode.Level[tSel.start.pos.node];
+};
+[start: tSel.start.pos, end: tSel.end.pos] ¬ EditSpan.Copy[
+destRoot: destRoot, sourceRoot: sourceRoot,
+dest: loc, source: SelectionSpan[srcSel],
+where: where, nesting: 0, event: TEditInput.currentEvent
+! EditSpan.CannotDoEdit => GOTO Bad].result;
+IF unnest > 0 THEN -- unnest so that copied span starts at same level as start of dest span
+[start: tSel.start.pos, end: tSel.end.pos] ¬ EditSpan.ChangeNesting[
+root: destRoot, span: [tSel.start.pos, tSel.end.pos],
+change: -unnest, event: TEditInput.currentEvent
+! EditSpan.CannotDoEdit => CONTINUE].new;
+};
+tSel.granularity ¬ srcSel.granularity;
+UnConvertNodeSelects[tSel];
+tSel.insertion ¬ after;
+MakeSelection[selection: primary, new: tSel];
+TEditSelection.Copy[source: tSel, dest: oldSel]; -- save the copied selection for Repeat's
+EXITS Bad => {
+MakeSelection[selection: primary, new: IF target=primary THEN targetSel ELSE srcSel];
+EditFailed[] }
+};
+IF lock THEN CallWithBothLocked[DoCopyToDoc, targetSel, srcSel, read]
+ELSE { -- special hack for DoPendingDelete.
+tSel: Selection ¬ Alloc[];
+TEditSelection.Copy[source: targetSel, dest: tSel];
+DoCopyToDoc[SelectionRoot[srcSel], SelectionRoot[targetSel], tSel, srcSel, targetSel];
+Free[tSel];
+};
+};
+
+Copy: PUBLIC PROC [target: SelectionId ¬ primary] = {
+ENABLE UNWIND => UnlockBothSelections[];
+targetSel: Selection ¬ IF target=primary THEN pSel ELSE sSel;
+srcSel: Selection ¬ IF target=primary THEN sSel ELSE pSel;
+LockBothSelections["Copy"];
+IF srcSel.viewer#NIL AND targetSel.viewer#NIL THEN DoCopy[target, targetSel, srcSel];
+UnlockBothSelections[];
+};
+
+CheckReadonly: PUBLIC PROC [targetSel: Selection] RETURNS [BOOL] = {
+IF targetSel.viewer=NIL OR NOT targetSel.data.readOnly THEN RETURN [TRUE];
+EditFailed["Cannot modify read only document."];
+RETURN [FALSE];
+};
+
+DoCopy: PROC [target: SelectionId, targetSel, srcSel: Selection] = { 
+IF ~CheckReadonly[targetSel] THEN { Deselect[$secondary]; RETURN };
+IF targetSel.data.tsInfo#NIL
+AND (~TEditProfile.editTypeScripts OR TEditPrivate.CaretAtEnd[targetSel]) THEN {
+tSel: Selection ¬ Alloc[];
+tSel1: Selection ¬ Alloc[];
+span: TextNode.Span ¬ [srcSel.start.pos, srcSel.end.pos];
+TEditSelection.Copy[source: sSel, dest: oldSel]; -- save the secondary selection for Repeat's
+TEditSelection.Copy[source: targetSel, dest: tSel];
+tSel.insertion ¬ before;
+tSel.granularity ¬ point;
+tSel.start.pos ¬ tSel.end.pos ¬ TextNode.LastLocWithin[tSel.data.text];
+TEditSelection.Copy[source: srcSel, dest: tSel1]; srcSel ¬ tSel1;
+Deselect[$primary];
+Deselect[$secondary];
+CopyToTypeScript[tSel, span];
+IF target=primary THEN { -- leave primary as caret at end of typescript
+tSel.start.pos ¬ tSel.end.pos ¬ TextNode.LastLocWithin[tSel.data.text];
+MakeSelection[selection: primary, new: tSel];
+}
+ELSE MakeSelection[selection: primary, new: srcSel];
+Free[tSel]; Free[tSel1];
+}
+ELSE IF srcSel.pendingDelete THEN Move[target]
+ELSE CopyToDoc[targetSel, srcSel, target];
+};
+
+Paste: PUBLIC PROC = {
+DoPaste: PROC [root: RefTextNode, tSel: Selection] = {
+source: TextNode.Span ¬ EditSpan.SavedForPaste[];
+tdd: TEditDocument.TEditDocumentData ¬ tSel.data;
+IF source = TextNode.nullSpan OR tSel.viewer=NIL THEN GOTO Bad;
+IF tdd.tsInfo=NIL AND tSel.pendingDelete THEN {
+DoPendingDelete[];
+TEditSelection.Copy[source: pSel, dest: tSel] };
+Deselect[$secondary];
+tSel.start.pos ¬ source.start;
+tSel.end.pos ¬ source.end;
+IF source.start.where=TextNode.NodeItself OR source.end.where=TextNode.NodeItself
+THEN { tSel.granularity ¬ node; UnConvertNodeSelects[tSel] }
+ELSE tSel.granularity ¬ char;
+tSel.viewer ¬ pSel.viewer; -- else Copy will think there isn't a secondary selection
+tSel.data ¬ NIL;
+tSel.pendingDelete ¬ FALSE;
+DoCopy[primary, pSel, tSel];
+EXITS Bad => EditFailed[];
+};
+CallWithLocks[DoPaste];
+};
+
+Move: PUBLIC PROC [target: SelectionId ¬ primary] = {
+targetSel: Selection ¬ IF target=primary THEN pSel ELSE sSel;
+srcSel: Selection ¬ IF target=primary THEN sSel ELSE pSel;
+DoMove: PROC [sourceRoot, destRoot: RefTextNode, tSel, srcSel, targetSel: Selection] = {
+pDel: BOOL;
+srcGrain: TEditDocument.SelectionGrain ~ GetSelectionGrain[srcSel];
+IF srcGrain=node THEN { -- see if moving entire contents
+newSelNode: RefTextNode ¬ TextNode.StepForward[srcSel.end.pos.node];
+IF newSelNode=NIL THEN { -- moving the last node of the doc
+newSelNode ¬ TextNode.StepBackward[srcSel.start.pos.node];
+IF (newSelNode=NIL OR newSelNode=sourceRoot) AND destRoot # sourceRoot THEN {
+child: RefTextNode ¬ TextNode.FirstChild[sourceRoot];
+srcSel.start.pos.node ¬ child; -- make sure doesn't include the root
+[] ¬ EditSpan.InsertTextNode[
+root: sourceRoot, old: child, where: before, inherit: FALSE,
+event: TEditInput.currentEvent];
+};
+};
+};
+IF (pDel ¬ tSel.pendingDelete) THEN { -- move source onto target
+IF srcGrain=point THEN {
+EditSpan.Delete[
+root: destRoot, del: SelectionSpan[tSel],
+event: TEditInput.currentEvent, saveForPaste: TRUE
+! EditSpan.CannotDoEdit => GOTO Bad];
+tSel.end.pos ¬ tSel.start.pos;
+tSel.granularity ¬ point;
+}
+ELSE {
+[start: tSel.start.pos, end: tSel.end.pos] ¬ EditSpan.MoveOnto[
+destRoot: destRoot, sourceRoot: sourceRoot,
+dest: SelectionSpan[tSel], source: SelectionSpan[srcSel],
+saveForPaste: TRUE, event: TEditInput.currentEvent
+! EditSpan.CannotDoEdit => GOTO Bad].result;
+};
+tSel.pendingDelete ¬ FALSE;
+}
+ELSE { -- move source to target caret
+loc: TextNode.Location ¬ InsertionPoint[tSel];
+where: EditSpan.Place ¬ (IF tSel.insertion = before THEN before ELSE after);
+unnest: INTEGER ¬ 0; -- amount to unnest by if moving nodes after
+IF srcGrain=node THEN { -- don't move nodes into target node
+IF where = before AND loc.where > 0
+AND loc.where = TextEdit.Size[loc.node] THEN
+where ¬ after; -- caret at end of node, so move after
+loc.where ¬ TextNode.NodeItself;
+IF where=after AND tSel.start.pos.node#tSel.end.pos.node THEN
+unnest ¬ TextNode.Level[tSel.end.pos.node]-TextNode.Level[tSel.start.pos.node];
+};
+IF srcGrain=point THEN {
+tSel.end.pos ¬ tSel.start.pos ¬ loc;
+tSel.granularity ¬ point;
+}
+ELSE {
+[start: tSel.start.pos, end: tSel.end.pos] ¬ EditSpan.Move[
+destRoot: destRoot, sourceRoot: sourceRoot,
+dest: loc, source: SelectionSpan[srcSel],
+where: where, nesting: 0, event: TEditInput.currentEvent
+! EditSpan.CannotDoEdit => GOTO Bad].result;
+};
+IF unnest > 0 THEN -- unnest so that moved span starts at same level as start of dest span
+[start: tSel.start.pos, end: tSel.end.pos] ¬ EditSpan.ChangeNesting[
+root: destRoot, span: [tSel.start.pos, tSel.end.pos],
+change: -unnest, event: TEditInput.currentEvent
+! EditSpan.CannotDoEdit => CONTINUE].new;
+};
+
+tSel.granularity ¬ srcSel.granularity;
+UnConvertNodeSelects[tSel];
+tSel.insertion ¬ after;
+TEditSelection.Copy[source: tSel, dest: oldSel]; -- save for Repeat's
+oldSel.pendingDelete ¬ (target=primary) OR (target=secondary AND pDel);
+tSel.pendingDelete ¬ FALSE;
+MakeSelection[selection: primary, new: tSel];
+EXITS Bad => { MakeSelection[selection: primary, new: tSel]; EditFailed[] }
+};
+
+CallWithBothLocked[DoMove, targetSel, srcSel, write];
+};
+
+Transpose: PUBLIC PROC [target: SelectionId ¬ primary] = {
+targetSel: Selection ¬ IF target=primary THEN pSel ELSE sSel;
+srcSel: Selection ¬ IF target=primary THEN sSel ELSE pSel;
+DoTranspose: PROC [sourceRoot, destRoot: RefTextNode, tSel, srcSel, targetSel: Selection] = {
+[start: srcSel.start.pos, end: srcSel.end.pos] ¬ EditSpan.Transpose[
+alphaRoot: destRoot, betaRoot: sourceRoot,
+alpha: SelectionSpan[targetSel], beta: SelectionSpan[srcSel],
+event: TEditInput.currentEvent
+! EditSpan.CannotDoEdit => GOTO Bad].newAlpha;
+UnConvertNodeSelects[srcSel];
+srcSel.pendingDelete ¬ FALSE;
+MakeSelection[selection: primary, new: srcSel];
+TEditSelection.Copy[source: srcSel, dest: oldSel]; -- save for Repeat's
+EXITS Bad => {
+MakeSelection[selection: primary, new: IF target=primary THEN targetSel ELSE srcSel];
+EditFailed[] }
+};
+CallWithBothLocked[DoTranspose, targetSel, srcSel, write];
+};
+
+Break: PUBLIC PROC = {
+DoBreak: PROC [root: RefTextNode, tSel: Selection] = {
+null: BOOL ¬ FALSE;
+caret: TextNode.Location;
+newNode: RefTextNode;
+IF tSel.pendingDelete THEN {
+DoPendingDelete[];
+TEditSelection.Copy[source: pSel, dest: tSel] };
+caret ¬ InsertionPoint[pSel];
+Deselect[$primary];
+newNode ¬ EditSpan.Split[root,
+caret, TEditInput.currentEvent ! EditSpan.CannotDoEdit => GOTO Bad];
+IF newNode # NIL AND TextEdit.Size[caret.node]=0 AND
+TextEdit.Size[newNode] > 0 THEN null ¬ TRUE -- caret was at front of nonempty node
+ELSE tSel.start.pos.node ¬ newNode; -- move caret to start of new node
+tSel.start.pos.where ¬ 0;
+tSel.end.pos ¬ tSel.start.pos;
+tSel.granularity ¬ point;
+tSel.insertion ¬ before;
+tSel.pendingDelete ¬ FALSE;
+tSel.looks ¬ TextLooks.noLooks;
+MakeSelection[selection: primary, new: tSel];
+CheckStartLine[viewer: tSel.viewer, old: caret, new: [newNode,0], null: null];
+EXITS Bad => { MakeSelection[selection: primary, new: tSel]; EditFailed[] }
+};
+CallWithLocks[DoBreak];
+};
+
+Join: PUBLIC PROC = {
+DoJoin: PROC [root: RefTextNode, tSel: Selection] = {
+loc: TextNode.Location;
+pred: RefTextNode;
+node: RefTextNode ¬ InsertionPoint[].node;
+IF node=NIL OR (pred ¬ TextNode.StepBackward[node])=NIL OR
+TextNode.Parent[pred]=NIL --i.e., pred is root-- THEN { EditFailed[]; RETURN };
+Deselect[$primary];
+loc ¬ EditSpan.Merge[root, node, TEditInput.currentEvent !
+EditSpan.CannotDoEdit => GOTO Bad];
+MakePointSelection[tSel, loc];
+CheckStartLine[viewer: tSel.viewer, old: [node,0], new: loc];
+EXITS Bad => { MakeSelection[selection: primary, new: tSel]; EditFailed[] }
+};
+CallWithLocks[DoJoin];
+};
+
+CheckStartLine: PROC [viewer: ViewerClasses.Viewer, old, new: TextNode.Location, null: BOOL ¬ FALSE] = {
+FOR v: ViewerClasses.Viewer ¬ viewer, v.link UNTIL v=NIL DO
+WITH v.data SELECT FROM
+tdd: TEditDocument.TEditDocumentData => {
+vloc: TextNode.Location ¬ tdd.lineTable.lines[0].pos;
+IF vloc.node = old.node AND vloc.where >= old.where THEN {
+vnew: TextNode.Location ¬ [new.node, new.where+vloc.where-old.where];
+IF null AND vnew.where = 0 THEN vnew.node ¬ old.node;
+TEditDisplay.EstablishLine[tdd, vnew];
+};
+};
+ENDCASE;
+IF v.link = viewer THEN EXIT;
+ENDLOOP;
+};
+
+SaveForPaste: PUBLIC PROC = {
+DoSaveForPaste: PROC [root: RefTextNode, tSel: Selection] = {
+EditSpan.SaveForPaste[SelectionSpan[tSel], TEditInput.currentEvent];
+};
+CallWithLocks[DoSaveForPaste, read];
+};
+
+SaveSpanForPaste: PUBLIC PROC [
+startLoc, endLoc: TextNode.Location, grain: TEditDocument.SelectionGrain] = {
+root: RefTextNode = TextNode.Root[startLoc.node];
+lockRef: TEditLocks.LockRef ¬ NIL;
+{
+ENABLE UNWIND => { IF lockRef # NIL THEN TEditLocks.Unlock[root] };
+lockRef ¬ TEditLocks.Lock[root, "SaveSpanForPaste", read];
+IF grain=node OR grain=branch THEN {
+startLoc.where ¬ TextNode.NodeItself; endLoc.where ¬ TextNode.NodeItself };
+EditSpan.SaveForPaste[[startLoc, endLoc], TEditInput.currentEvent];
+TEditLocks.Unlock[root];
+};
+};
+
+Nest: PUBLIC PROC = { ChangeNesting[1] };
+
+UnNest: PUBLIC PROC = { ChangeNesting[-1] };
+
+ChangeNesting: PROC [change: INTEGER] = {
+DoChangeNesting: PROC [root: RefTextNode, tSel: Selection] = {
+Deselect[$primary];
+[] ¬ EditSpan.ChangeNesting[root: root,
+span: TextNode.MakeNodeSpan[tSel.start.pos.node, tSel.end.pos.node],
+change: change, event: TEditInput.currentEvent
+! EditSpan.CannotDoEdit => GOTO Bad];
+tSel.pendingDelete ¬ FALSE;
+MakeSelection[selection: primary, new: tSel];
+EXITS Bad => { MakeSelection[selection: primary, new: tSel]; EditFailed[] }
+};
+CallWithLocks[DoChangeNesting];
+};
+
+ModifyLook: PUBLIC PROC [look: TextLooks.Look, op: TEditInputOps.ModifyOp] = {
+DoModifyLook: PROC [root: RefTextNode, tSel: Selection] = {
+remLooks, addLooks: TextLooks.Looks ¬ TextLooks.noLooks;
+IF tSel.granularity#point THEN {
+Deselect[$primary];
+IF op=add THEN addLooks[look] ¬ TRUE ELSE remLooks[look] ¬ TRUE;
+EditSpan.ChangeLooks[root: root,
+span: [tSel.start.pos, tSel.end.pos],
+remove: remLooks, add: addLooks,
+event: TEditInput.currentEvent];
+tSel.pendingDelete ¬ FALSE;
+MakeSelection[selection: primary, new: tSel];
+};
+ModifyCaretLook[look, op];
+};
+CallWithLocks[DoModifyLook];
+};
+
+ModifyCaretLook: PUBLIC PROC [look: TextLooks.Look, op: TEditInputOps.ModifyOp] = {
+remLooks, addLooks: TextLooks.Looks ¬ TextLooks.noLooks;
+IF op=add THEN addLooks[look] ¬ TRUE ELSE remLooks[look] ¬ TRUE;
+LockSel[primary, "ModifyCaretLook"];
+pSel.looks ¬ TextLooks.ModifyLooks[old: pSel.looks, remove: remLooks, add: addLooks];
+AdjustTypeScriptLooks[targetSel: pSel, add: addLooks, remove: remLooks];
+UnlockSel[primary];
+};
+
+GetSelLooks: PROC [sel: Selection] RETURNS [looks: TextLooks.Looks] = {
+first: BOOL ¬ TRUE;
+GetSelLooks: PROC [node: RefTextNode, start, len: INT]
+RETURNS [stop: BOOL] = {
+end: INT ¬ MIN[TextEdit.Size[node],start+len];
+FOR i: INT IN [start..end) DO
+lks: TextLooks.Looks ¬ TextEdit.FetchLooks[node,i];
+IF first THEN { first ¬ FALSE; looks ¬ lks }
+ELSE IF lks#looks THEN {
+OPEN MessageWindow;
+Append["Selection does not have uniform looks.",TRUE];
+Append["  Using looks from first char."];
+Blink[]; RETURN [TRUE] };
+ENDLOOP;
+RETURN [FALSE];
+};
+EditSpanSupport.Apply[span: [sel.start.pos, sel.end.pos], proc: GetSelLooks];
+IF first THEN looks ¬ sel.looks; -- null selection, use caret
+};
+
+ChangeLooks: PUBLIC PROC [add, remove: TextLooks.Looks] = {
+DoChangeLooks: PROC [root: RefTextNode, tSel: Selection] = {
+Deselect[$primary];
+ChangeSelLooks[add, remove, tSel];
+MakeSelection[tSel, primary];
+};
+CallWithLocks[DoChangeLooks];
+};
+
+CopyLooks: PUBLIC PROC [target: SelectionId ¬ primary] = {
+targetSel: Selection ¬ IF target=primary THEN pSel ELSE sSel;
+srcSel: Selection ¬ IF target=primary THEN sSel ELSE pSel;
+DoCopyLooks: PROC [sourceRoot, destRoot: RefTextNode, tSel, srcSel, targetSel: Selection] = {
+TEditSelection.Copy[source: srcSel, dest: oldSel];  -- save the secondary selection for Repeat's
+ChangeSelLooks[add: GetSelLooks[srcSel], remove: TextLooks.allLooks, targetSel: targetSel];
+MakeSelection[IF target=primary THEN targetSel ELSE srcSel, primary];
+};
+CallWithBothLocked[DoCopyLooks, targetSel, srcSel, read];
+};
+
+TransposeLooks: PUBLIC PROC [target: SelectionId ¬ primary] = {
+targetSel: Selection ¬ IF target=primary THEN pSel ELSE sSel;
+srcSel: Selection ¬ IF target=primary THEN sSel ELSE pSel;
+DoTransLooks: PROC [sourceRoot, destRoot: RefTextNode, tSel, srcSel, targetSel: Selection] = {
+srcLooks, targetLooks: TextLooks.Looks;
+srcLooks ¬ GetSelLooks[srcSel];
+targetLooks ¬ GetSelLooks[targetSel];
+TEditSelection.Copy[source: srcSel, dest: oldSel];  -- save for Repeat's
+Deselect[$primary]; Deselect[$secondary];
+ChangeSelLooks[add: srcLooks, remove: targetLooks, targetSel: targetSel];
+ChangeSelLooks[add: targetLooks, remove: srcLooks, targetSel: srcSel];
+MakeSelection[IF target=primary THEN targetSel ELSE srcSel, primary];
+};
+CallWithBothLocked[DoTransLooks, targetSel, srcSel, write];
+};
+
+ChangeSelLooks: PROC [add, remove: TextLooks.Looks, targetSel: Selection] = {
+IF targetSel.granularity # point THEN {
+EditSpan.ChangeLooks[
+root: SelectionRoot[targetSel], span: [targetSel.start.pos, targetSel.end.pos],
+remove: remove, add: add, event: TEditInput.currentEvent];
+targetSel.pendingDelete ¬ FALSE;
+};
+targetSel.looks ¬ TextLooks.ModifyLooks[targetSel.looks, remove, add];
+AdjustTypeScriptLooks[targetSel, add, remove];
+};
+
+ChangeCaretLooks: PUBLIC PROC [add, remove: TextLooks.Looks] = {
+LockSel[primary, "ChangeCaretLooks"];
+pSel.looks ¬ TextLooks.ModifyLooks[pSel.looks, remove, add];
+AdjustTypeScriptLooks[pSel, add, remove];
+UnlockSel[primary];
+};
+
+SelAtEndOfTypeScript: PROC [targetSel: Selection] RETURNS [BOOL] = {
+tdd: TEditDocumentData;
+IF targetSel.viewer=NIL THEN RETURN [FALSE];
+tdd ¬ NARROW[targetSel.viewer.data];
+IF tdd = NIL OR tdd.tsInfo=NIL THEN RETURN [FALSE]; -- not a typescript
+IF ~TEditPrivate.CaretAtEnd[targetSel] THEN RETURN [FALSE];
+RETURN [TRUE];
+};
+
+AdjustTypeScriptLooks: PROC [targetSel: Selection, add, remove: TextLooks.Looks] = {
+IF SelAtEndOfTypeScript[targetSel] THEN {
+TypeScript.ModifyLooks[ts: targetSel.viewer, remove: remove, add: add];
+};
+};
+
+END.
+
+   †  
+TEditInputOpsImpl.mesa
+Copyright Ó 1985, 1987, 1988, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Edited by Paxton on February 8, 1983 9:34 am
+Edited by McGregor on July 30, 1982 3:15 pm
+Last Edited by: Maxwell, January 14, 1983 1:58 pm
+Russ Atkinson (RRA) June 17, 1985 11:47:36 pm PDT
+Michael Plass, April 29, 1987 6:36:27 pm PDT
+Doug Wyatt, April 23, 1992 11:38 am PDT
+
+Calls a procedure that operates on the primary selection.
+root is the root for the primary selection
+tSel is a copy of the primary selection
+Calls a procedure that operates on the primary and secondary selections.
+sourceRoot is the root for the source selection
+destRoot is the root for the target selection
+tSel is a copy of the target selection
+srcSel is a copy of the source selection
+targetSel is another copy of the target selection
+[DKW: Note the calls on LockBothSelections and Deselect; they suggest that trouble will ensue unless (targetSel=pSel AND srcSel=sSel) OR (targetSel=sSel AND srcSel=pSel).]
+like a replace of pSel by a single character, then delete that character.
+same as calling Delete for pSel a text selection, but NOT for pSel a node/branch selection.
+-- shove it in as though typed...
+DKW: some EditSpan operations (such as a Move that moves zero characters) can return a reversed span. This crock tries to fix up the reversed selection so produced. 
+special copy to typescript unless we are editing typescripts like regular Tioga documents and the target caret is at the end
+-- force selection to end of typescript
+-- now create a phony secondary selection for Copy
+-- moving all the nodes to different tree
+-- move the selection to a deeper nesting level in the tree
+-- move the selection to a shallower nesting level in the tree
+The bane of Dan Swinehart:
+IF TEditSelection.CaretVisible[] THEN TEditRefresh.ScrollToEndOfSel[tSel.viewer, TRUE];
+-- Transpose the looks of the primary and secondary selections
+ ÊØ  –(cedarcode) style•NewlineDelimiter
+™ codešœ™Kšœ
+ÏeœI™TKšœ,™,Kšœ+™+K™1K™1K™,K™'K™ —šÏk	˜	Kšœžœ˜Kšœ	žœ ˜®Kšœžœ	˜Kšœžœ˜$Kšœžœžœ˜"Kšœžœ˜#KšœžœZ˜mKšœžœ˜ Kšœžœ˜ Kšœžœ˜1Kšœžœ+˜;Kšœ	žœ˜Kšœžœ˜%Kšœžœà˜ôKšœ	žœ5˜CKšœ
+žœ/˜>Kšœ	žœ¨˜¶Kšœžœ˜Kšœžœ
+˜—K˜ šÏnœžœž˜ KšžœÄ˜ËKšžœ˜Kšœžœžœ˜+—K˜ Kšœžœ˜)K˜ šŸœžœžœžœM˜sšœ9™9Kšœ*™*Kšœ'™'—Kšœ˜Kšœžœ˜Kšœžœ˜"šœ˜šžœžœ˜Kšœ˜Kšžœžœžœ˜.Kšžœžœžœ˜Kšœ˜—Kšœ"˜"š
+žœžœžœžœžœ˜UKšœ˜Kšžœ˜	—Kšœ9˜9Kšœ˜K˜.K˜Kšœ˜Kšœžœ˜Kšœ˜Kšœ˜—Kšœ˜K˜ —šŸœžœžœ	žœŒ˜¸šœH™HKšœ/™/Kšœ-™-Kšœ&™&Kšœ(™(Kšœ1™1—Kšœ«™«Kšœ"˜"Kšœ žœ˜$Kšœžœ˜"šŸœžœ˜Kšžœžœžœ@˜UKšžœžœžœ˜Kšžœ	žœžœ˜ Kšžœ	žœžœ˜ Kšœ˜Kšœ˜—šœ˜Kšžœžœ˜Kšœ)˜)Kšžœžœžœžœžœžœ˜UšžœžœÏc!˜Ašœžœžœ˜6Kšœ.žœ˜7——Kšœ1˜1K˜1K˜4K˜3K˜#K˜$šœ
+ œ˜&KšœA˜A—K˜K˜Kšœ^˜^Kšœ˜—Kšœ
+˜
+Kšœ˜K˜ —Kšœ/˜/K˜ šŸœžœžœ˜ KšœI™IKšœ[™[šŸœžœ)˜<Kšœžœ˜K˜K˜K˜K˜-Kšœžœ˜Kšœ@žœ˜GKšœžœ˜Kšœ˜—Kšœ˜Kšœ˜K˜ —š
+Ÿ
+œžœžœžœžœ˜2Kšœžœžœžœžœžœ˜DKšœ˜Kšœ˜K˜ —š
+Ÿœžœžœžœžœ˜JKšžœžœžœ
+˜šžœ˜šžœž˜Kšœ
+žœ*˜:Kšœ	žœ(˜7Kšžœž˜—šžœžœž˜Kšœ
+žœ˜Kšœ	žœ&˜5Kšžœžœ˜——Kšœ˜K˜ —šŸœžœžœ˜LKšžœJ˜PK˜K˜ —šŸœžœžœ˜DKšžœžœžœ˜FKšžœžœ+˜6K˜K˜ —š
+Ÿœžœžœžœžœ˜3šŸœžœ)˜7K˜Kšœžœ˜šžœž˜#Kšœ	žœ˜šœ
+ H˜RKšœB˜BKšœ%˜%K˜šžœžœžœ $˜=K˜8š	žœžœžœžœ ˜EKšœ/˜/K˜šœ<˜<Kšœžœ"˜?—Kšœ˜—K˜Kšœžœžœžœžœžœ	˜^—Kšžœ˜"šœ˜Kšœ<˜<Kšœ:˜:Kšœžœ˜%—šžœžœžœ˜K˜5˜,Kšžœžœ˜ Kšžœ 	œ˜)—K˜—šžœ ,˜3K˜AK˜—K˜!Kšœ˜—šžœ˜˜K˜?Kšœ:˜:Kšœžœ˜%—K˜K˜K˜Kšœ˜——Kšœ-˜-KšžœF˜KKšœ˜—Kšœ˜Kšœ˜K˜ —šŸ	œžœžœ	žœ	˜+šŸœžœ)˜:Kšœ˜Kšœ0˜0Kšžœ!žœžœ˜1Kšžœžœžœžœ˜)Kšžœžœžœ &˜PKšžœ
+žœžœžœ˜7K˜K˜ KšœM˜MKšœ ˜ Kšžœ˜Kšœ˜—Kšžœžœ˜-K˜K˜ —šŸœžœžœžœžœ
+žœ˜Yš
+Ÿœžœ	žœžœžœ˜+Kšžœ:˜@Kšœ˜—K˜šžœ
+žœžœž˜)Kšœ*žœ˜2—šžœ
+žœž˜%Kšœ*žœ˜2—K˜K˜ —šŸœžœžœ	žœ	˜*šŸ
+œžœ)˜9Kšœ˜Kšœžœ˜Kšœ.˜.Kšžœžœžœžœ˜'Kšžœ!žœžœ˜1K˜šžœ	žœžœž˜ Kšœžœ ˜0K˜K˜Kšžœ˜—K˜LKšœ˜Kšžœ˜Kšœ˜—Kšžœžœ˜,Kšœ˜K˜ —šŸœžœžœ	žœ	˜2šŸœžœ)˜AK˜Kšœ˜Kšœžœ˜Kšœ˜šžœ	žœžœž˜ šžœžœž˜šœžœžœ˜3Kšœ žœ˜)——K˜&K˜Kšžœ˜—Kšœ˜Kšœ˜—Kšžœžœ)˜:Kšœ˜K˜ —šŸœžœ2˜HšŸœžœ!žœ˜1Kšžœžœ˜Kšœžœ&˜5Kšžœžœ! ˜XKšœ!™!Kšœ0žœ˜<Kšžœžœ˜Kšœ˜—K˜%K˜K˜ —šŸœžœ˜/šžœž˜"šœ	˜	Kšœ¥™¥šžœ%žœ'žœ˜WKšœA˜AK˜—K˜—šœ	˜	K˜Kšœ6˜6K˜—Kšžœ˜—Kšœ˜K˜ —šŸ	œžœ;žœžœ˜ZšŸœžœL˜]šžœžœ ˜8šœ>˜>Kšœ+˜+Kšœ9˜9Kšœžœ ˜2Kšœžœ˜,—Kšœžœ˜Kšœ˜—šžœ ˜%K˜.Kšœžœ -˜BKšœžœžœžœ˜Jšžœ žœ $˜MKšžœžœ˜šžœ#ž˜*Kšœ &˜5—K˜ šžœžœ'ž˜=KšœO˜O—K˜—˜;Kšœ+˜+Kšœ)˜)Kšœ8˜8Kšœžœ˜,—šžœžœ H˜[šœD˜DKšœ5˜5Kšœ/˜/Kšœžœ˜)——K˜—K˜&K˜K˜K˜-Kšœ1 )˜Zšžœ	˜Kšœ'žœžœžœ	˜UK˜—K˜—Kšžœžœ9˜Ešžœ $˜+Kšœ˜K˜3KšœV˜VKšœ˜Kšœ˜—Kšœ˜K˜ —šŸœžœžœ$˜5Kšžœžœ˜(Kšœžœžœžœ˜=Kšœžœžœžœ˜:Kšœ˜Kš
+žœžœžœžœžœ#˜UKšœ˜Kšœ˜K˜ —š
+Ÿœžœžœžœžœ˜DKšžœžœžœžœžœžœžœ˜JK˜0Kšžœžœ˜Kšœ˜K˜ —šŸœžœ9˜EKšžœžœžœ˜CKšžœž˜šžœ žœ%žœ˜PKšœ|™|Kšœ˜Kšœ˜K˜9Kšœ1 ,˜]Kšœ'™'Kšœ3˜3K˜K˜K˜GKšœA˜AK˜K˜K˜šžœžœ .˜GK˜GK˜-K˜—Kšžœ0˜4K˜Kšœ˜—Kšžœžœžœ˜.Kšžœ&˜*K˜K˜ —šŸœžœžœ˜šŸœžœ)˜6K˜1Kšœ1˜1Kš
+žœžœžœžœžœ˜?šžœžœžœžœ˜/Kšœ˜K˜0—K˜Kšœ2™2K˜K˜šžœ(žœ%˜QKšžœ8˜<Kšžœ˜—Kšœ 9˜TKšœžœ˜Kšœžœ˜Kšœ˜Kšžœ˜Kšœ˜—K˜K˜K˜ —šŸœžœžœ$˜5Kšœžœžœžœ˜=Kšœžœžœžœ˜:šŸœžœL˜XKšœžœ˜KšœC˜Cšžœžœ  ˜8KšœD˜Dšžœžœžœ "˜;K˜:š
+žœžœžœžœžœ˜MKšœ)™)Kšœ5˜5Kšœ %˜Dšœ˜Kšœ6žœ˜<Kšœ ˜ —Kšœ˜—Kšœ˜—Kšœ˜—šžœžœ ˜@šžœžœ˜šœ˜Kšœ)˜)Kšœ.ž˜2Kšœžœ˜%—K˜K˜K˜—šžœ˜šœ?˜?Kšœ+˜+Kšœ9˜9Kšœžœ ˜2Kšœžœ˜,—K˜—Kšœžœ˜Kšœ˜—šžœ ˜%K˜.Kšœžœžœžœ˜LKšœžœ ,˜Ašžœžœ $˜<Kšžœžœ˜#šžœ%ž˜,Kšœ &˜5—K˜ šžœžœ'ž˜=KšœO˜O—K˜—šžœžœ˜K˜$K˜K˜—šžœ˜šœ;˜;Kšœ+˜+Kšœ)˜)Kšœ8˜8Kšœžœ˜,—K˜—šžœžœ G˜ZšœD˜DKšœ5˜5Kšœ/˜/Kšœžœ˜)——K˜K˜ —K˜&K˜K˜Kšœ1 ˜EKšœ(žœžœ˜GKšœžœ˜K˜-KšžœF˜KKšœ˜—K˜ Kšœ5˜5Kšœ˜K˜ —šŸ	œžœžœ$˜:Kšœžœžœžœ˜=Kšœžœžœžœ˜:šŸœžœL˜]šœD˜DKšœ*˜*Kšœ=˜=Kšœ˜Kšœžœ˜.—K˜Kšœžœ˜K˜/Kšœ3 ˜Gšžœ	˜Kšœ'žœžœžœ	˜UKšœ˜—Kšœ˜—Kšœ:˜:Kšœ˜K˜ —šŸœžœžœ˜šŸœžœ)˜6Kšœžœžœ˜K˜Kšœ˜šžœžœ˜Kšœ˜K˜0—K˜K˜˜Kšœ:žœ˜D—šžœžœžœž˜4Kšœžœžœ &˜R—Kšžœ  "˜FK˜K˜K˜K˜Kšœžœ˜K˜K˜-K˜NKšžœF˜KKšœ˜—K˜K˜K˜ —šŸœžœžœ˜šŸœžœ)˜5K˜Kšœ˜Kšœ*˜*š	žœžœžœ&žœž˜:Kš	œžœ œžœžœ˜O—K˜˜:Kšœžœ˜#—Kšœ˜K˜=KšžœF˜KKšœ˜—K˜K˜K˜ —šŸœžœCžœžœ˜hšžœ*žœžœž˜;šžœžœž˜šœ)˜)K˜5šžœžœžœ˜:K˜EKšžœžœžœ˜5K˜&K˜—K˜—Kšžœ˜—Kšžœžœžœ˜Kšžœ˜—šœ˜K˜ ——šŸœžœžœ˜šŸœžœ)˜=KšœD˜DKšœ˜—K˜$K˜K˜ —šŸœžœžœ˜KšœM˜MKšœ1˜1Kšœžœ˜"šœ˜Kš
+žœžœžœžœžœ˜CKšœ:˜:šžœžœžœ˜$KšœK˜K—KšœC˜CKšœ˜Kšœ˜—Kšœ˜K˜ —šŸœžœžœ˜)Kšœ;™;K˜ —šŸœžœžœ˜,Kšœ>™>K˜ —šŸœžœ
+žœ˜)šŸœžœ)˜>K˜˜'K˜DKšœ.˜.Kšœžœ˜%—Kšœžœ˜K˜-™Kšžœžœ,žœ™W—KšžœF˜KKšœ˜—Kšœ˜Kšœ˜K˜ —šŸ
+œžœžœ7˜NšŸœžœ)˜;K˜8šžœžœ˜ K˜Kš
+žœžœžœžœžœ˜@˜ K˜%K˜ K˜ —Kšœžœ˜K˜-K˜—K˜K˜—Kšœ˜Kšœ˜K˜ —šŸœžœžœ7˜SK˜8Kš
+žœžœžœžœžœ˜@Kšœ$˜$KšœU˜UKšœH˜HKšœ˜Kšœ˜K˜ —šŸœžœžœ˜GKšœžœžœ˜šŸœžœ!žœ˜6Kšžœžœ˜Kšœžœžœ ˜.šžœžœžœž˜K˜3Kšžœžœžœ˜,šžœžœžœ˜Kšžœ˜Kšœ0žœ˜6K˜)Kšœ	žœžœ˜—Kšžœ˜—Kšžœžœ˜Kšœ˜—K˜MKšžœžœ ˜=K˜K˜ —šŸœžœžœ#˜;šŸœžœ)˜<K˜K˜"K˜K˜—Kšœ˜Kšœ˜K˜ —šŸ	œžœžœ$˜:Kšœžœžœžœ˜=Kšœžœžœžœ˜:šŸœžœL˜]Kšœ4 ,˜`K˜[Kšœžœžœžœ˜EKšœ˜—Kšœ9˜9Kšœ˜K˜ —šŸœžœžœ$˜?Kšœ>™>Kšœžœžœžœ˜=Kšœžœžœžœ˜:šŸœžœL˜^K˜'K˜K˜%Kšœ4 ˜HK˜)K˜IK˜FKšœžœžœžœ˜EKšœ˜—Kšœ;˜;Kšœ˜K˜ —šŸœžœ9˜Mšžœžœ˜'šœ˜KšœO˜OKšœ:˜:—Kšœžœ˜ Kšœ˜—K˜FKšœ.˜.Kšœ˜K˜ —šŸœžœžœ#˜@Kšœ%˜%Kšœ<˜<Kšœ)˜)Kšœ˜Kšœ˜K˜ —šŸœžœžœžœ˜DKšœ˜Kš
+žœžœžœžœžœ˜,Kšœžœ˜$Kšžœžœžœžœžœžœžœ ˜GKšžœ%žœžœžœ˜;Kšžœžœ˜Kšœ˜K˜ —šŸœžœ9˜Tšžœ!žœ˜)KšœG˜GK˜—Kšœ˜K˜ —Kšžœ˜K˜ — …—    j  Œ`  

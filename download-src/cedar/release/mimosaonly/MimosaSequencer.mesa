@@ -1,0 +1,534 @@
+DIRECTORY
+Alloc USING [AddNotify, Chunkify, Create, Destroy, Failure, Handle, Notifier, Reset, TableInfo],
+CompilerOps USING [LetterSwitches, StreamId, Transaction],
+CompilerUtil USING [EndObjectFile, InstallParseTables, P1Unit, P2Unit, P3Postlude, P3Unit, P4Unit, P5module, PrefillSymbols, PrintBodies, PrintSymbols, PrintTree, StartObjectFile, TableOut],
+IO USING [Flush, Put, PutChar, PutRope, STREAM],
+LiteralOps USING [Finalize, Initialize],
+Literals USING [ltTag, stTag],
+Loader USING [BCDBuildTime],
+MimData USING [base, checks, compilerVersion, interface, nErrors, nWarnings, objectStamp, objectVersion, ownSymbols, pattern, source, sourceTokens, switches, textIndex],
+MimosaCopier USING [FileInit, FileReset],
+MimosaEvents,
+MimosaLog USING [Error],
+MimSysOps USING [Close],
+MimZones USING [permZone, RegisterForReset],
+MobDefs USING [VersionStamp],
+OSMiscOps USING [bytesPerFilePage, GenerateUniqueId, MergeStamps, StampToTime, TimeToStamp, WordAnd, WordOr],
+Rope USING [ROPE],
+RuntimeError USING [UNCAUGHT],
+SourceMap USING [Cons, Init, Reset],
+SymbolOps USING [Finalize, Initialize, own],
+Symbols USING [htTag, seTag],
+SymbolSegment USING [Tables, treeType],
+SymLiteralOps USING [Finalize, Initialize],
+Tree USING [Link, treeTag],
+TreeOps USING [Finalize, Initialize, PopTree, Reset];
+MimosaSequencer: PROGRAM
+IMPORTS Alloc, MimData, CompilerUtil, IO, LiteralOps, Loader, MimosaCopier, MimosaLog, MimSysOps, MimZones, OSMiscOps, RuntimeError, SourceMap, SymbolOps, SymLiteralOps, TreeOps
+EXPORTS CompilerOps, CompilerUtil, MimData, MimosaEvents = {
+OPEN MimosaEvents;
+
+ROPE: TYPE = Rope.ROPE;
+STREAM: TYPE = IO.STREAM;
+
+table: PUBLIC Alloc.Handle ¨ NIL;
+
+
+StreamId: TYPE = CompilerOps.StreamId;
+TransactionPtr: TYPE = REF CompilerOps.Transaction;
+
+getStream: PROC [StreamId] RETURNS [STREAM] ¨ NIL;
+
+StreamInfo: TYPE = RECORD [
+access: {read, write},
+stream: STREAM,
+status: RECORD [count: NAT, open: BOOL]];
+
+streamInfo: ARRAY StreamId[$source .. $log] OF StreamInfo ¨ [
+[access: $read, stream: NIL, status: [count: 0, open: FALSE]],
+[access: $write, stream: NIL, status: [count: 0, open: FALSE]],
+[access: $write, stream: NIL, status: [count: 0, open: FALSE]]
+];
+
+AcquireStream: PUBLIC PROC [id: StreamId] RETURNS [stream: STREAM] = {
+IF streamInfo[id].stream = NIL THEN {
+streamInfo[id].stream ¨ getStream[id];
+streamInfo[id].status ¨ [count: 0, open: TRUE];
+};
+stream ¨ streamInfo[id].stream;
+IF streamInfo[id].status = [count: 0, open: FALSE] THEN
+streamInfo[id].status.open ¨ TRUE;
+streamInfo[id].status.count ¨ streamInfo[id].status.count + 1;
+};
+
+ReleaseStream: PUBLIC PROC [id: StreamId] = {
+count: CARDINAL ¨ streamInfo[id].status.count;
+SELECT count FROM
+0 => ERROR;
+1 => {
+st: STREAM = streamInfo[id].stream;
+IF st # NIL AND streamInfo[id].access = $write THEN IO.Flush[st];
+streamInfo[id].status.open ¨ FALSE;
+};
+ENDCASE => streamInfo[id].status.count ¨ count-1;
+};
+
+
+DefaultSwitches: PUBLIC PROC RETURNS [CompilerOps.LetterSwitches] = {
+RETURN [[
+FALSE,	-- A	[c2c] true => use dbx-style source macros
+TRUE,	-- B	true => emit bounds checking
+FALSE,	-- C	[c2c] true => c2c.c extension, false => c extension
+FALSE,	-- D	true => call Debugger on error, false => just log error
+FALSE,	-- E	[c2c] reserved
+TRUE,	-- F	[c2c] true => generate inline floating point
+FALSE,	-- G	[c2c] true => leave garbage (don't break cycles)
+TRUE,	-- H	true => for new-style exception Handling (obsolete)
+FALSE,	-- I	true => output intermediate code to icd file
+FALSE,	-- J	reserved
+TRUE,	-- K	true => emit smaller initialization code
+TRUE,	-- L	[c2c] true => use LF (012C) for newlines
+FALSE,	-- M	true => Mimosa only (no c2c generation)
+TRUE,	-- N	true => emit NIL checking
+TRUE,	-- O	[c2c] reserved
+FALSE,	-- P	true => punt on warning or error (stops compilation)
+FALSE,	-- Q	[c2c] true => generate calls for counted assignments
+FALSE,	-- R	[c2c] make certain procedures extern callable (obsolete)
+FALSE,	-- S	reserved (historical usage => sort variables)
+FALSE,	-- T	[c2c] reserved
+TRUE,	-- U	true => check for uninitialized variables
+FALSE,	-- V	[c2c] true => generate line # file (no source macros)
+TRUE ,	-- W	true => log Warning messages
+FALSE,	-- X	reserved (for experimental purposes)
+FALSE,	-- Y	reserved (for experimental purposes)
+FALSE	-- Z	reserved (for experimental purposes)
+]]
+};
+importantSwitches: CompilerOps.LetterSwitches = [
+FALSE, TRUE, FALSE, FALSE, FALSE, FALSE,	-- B in ABCDEF
+FALSE, FALSE, FALSE, FALSE, FALSE, FALSE,	-- none in GHIJKL
+FALSE, TRUE, TRUE, FALSE, FALSE, TRUE,	-- N,O,R in MNOPQR
+FALSE, FALSE, FALSE, FALSE, FALSE, FALSE,	-- none in STUVWX
+FALSE, FALSE];			-- none in YZ
+
+AppendHerald: PUBLIC PROC [s: STREAM] = {
+s.Put[[rope["Mimosa of "]], [time[Loader.BCDBuildTime[]]]];
+};
+
+
+pass: CHAR ¨ 0C;
+
+ExtendedTables: TYPE = SymbolSegment.Tables;
+
+Initialize: PROC = {
+max: INT = 16000;
+weights: ARRAY ExtendedTables OF Alloc.TableInfo ¨ [	-- empirical
+[Tree.treeTag, 256, max],		-- 0	treeType
+[Symbols.seTag, 256, max],	-- 1	seType
+[Symbols.htTag, 64, max],	-- 2	htType
+[0, 64, max],		-- 3	ssType
+[0, 64, max],		-- 4	ctxType
+[0, 64, max],		-- 5	mdType
+[0, 64, max],		-- 6	bodyType
+[Literals.ltTag, 64, max],		-- 7	ltType
+[Literals.stTag, 64, max],		-- 8	stType
+[0, 64, max],		-- 9	extType
+[0, 64, max],		-- 10	atType
+[0, 64, max]			-- 11	constType
+];
+IF table = NIL
+THEN {
+table ¨ Alloc.Create[weights: DESCRIPTOR[weights]]; 
+table.Chunkify[table: SymbolSegment.treeType, firstSmall: 4, nSmall: 7];
+Alloc.AddNotify[table, AllocRelocate];
+}
+ELSE table.Reset[];
+CauseEvent[startFile];
+SymbolOps.Initialize[table, NIL];
+MimData.ownSymbols ¨ SymbolOps.own;
+LiteralOps.Initialize[table];
+TreeOps.Initialize[table];
+SourceMap.Init[];
+};
+
+Finalize: PROC [parms: TransactionPtr, oops: BOOL] = {
+unitsPerPage: CARDINAL = OSMiscOps.bytesPerFilePage / BYTES[UNIT];
+parms.objectVersion ¨ MimData.objectVersion;
+parms.interface ¨ MimData.interface;
+parms.sourceTokens ¨ MimData.sourceTokens;
+parms.nErrors ¨ MimData.nErrors;
+parms.nWarnings ¨ MimData.nWarnings;
+CompilerUtil.EndObjectFile[MimData.nErrors = 0 AND NOT oops];
+IF streamInfo[$object].stream # NIL THEN {
+parms.closeStream[object];
+[] ¨ MimSysOps.Close[streamInfo[$object].stream];
+streamInfo[$object].stream ¨ NIL;
+};
+CauseEvent[endFile];
+SourceMap.Reset[];
+TreeOps.Finalize[];
+LiteralOps.Finalize[];
+SymbolOps.Finalize[];
+IF table # NIL THEN table.Reset[];
+};
+
+Debug: PROC [tree, symbols: PROC [Alloc.Handle]] = {
+tree[table];
+symbols[table];
+};
+
+Punt: PUBLIC ERROR = CODE;
+
+started: BOOL ¨ FALSE;
+resetTable: BOOL ¨ FALSE;
+
+Start: PUBLIC PROC = {
+ENABLE UNWIND => NULL;
+IF started AND table # NIL AND resetTable THEN {
+Alloc.Destroy[table];
+table ¨ NIL;
+};
+started ¨ TRUE;
+CauseEvent[startup];
+};
+
+Stop: PUBLIC PROC = {
+IF started THEN {
+started ¨ FALSE;
+IF table # NIL AND resetTable THEN {Alloc.Destroy[table]; table ¨ NIL};
+};
+CauseEvent[cleanup];
+};
+
+DoTransaction: PUBLIC PROC [parms: TransactionPtr] = {
+root: Tree.Link;
+debug: BOOL;
+nParseErrors: CARDINAL;
+parsed, aborted: BOOL;
+
+PrintTreeRoot: PROC [table: Alloc.Handle] = {
+CompilerUtil.PrintTree[table, root];
+};
+PrintSymbols: PROC [table: Alloc.Handle] = {
+CompilerUtil.PrintSymbols[table, MimData.interface];
+};
+
+TestPass: PROC [passN: NAT] RETURNS [BOOL] = {
+parms.nErrors ¨ MimData.nErrors;
+parms.nWarnings ¨ MimData.nWarnings;
+IF parms.startPass # NIL AND ~parms.startPass[passN] THEN RETURN [TRUE];
+pass ¨ '0 + passN;
+RETURN [FALSE];
+};
+
+IF ~started THEN RETURN WITH ERROR Punt[];
+getStream ¨ parms.getStream;
+MimData.source ¨ parms.source;
+MimData.switches ¨ parms.switches;
+MimData.checks ¨ parms.checks;
+MimData.pattern ¨ parms.pattern;
+debug ¨ MimData.switches['d];
+
+MimData.objectVersion ¨ OSMiscOps.GenerateUniqueId[];
+MimData.objectStamp ¨ OSMiscOps.TimeToStamp[MimData.source.version];
+{
+sw: CARD ¨ 0;
+FOR c: CHAR['a..'z] IN CHAR['a..'z] DO
+sw ¨ sw + sw;
+IF importantSwitches[c] AND MimData.switches[c] THEN sw ¨ sw + 1;
+ENDLOOP;
+MimData.objectStamp ¨ OSMiscOps.MergeStamps[
+MimData.objectStamp, OSMiscOps.TimeToStamp[[0, sw]]];
+MimData.objectStamp ¨ OSMiscOps.MergeStamps[
+MimData.objectStamp, OSMiscOps.TimeToStamp[MimData.compilerVersion]];
+};
+
+MimData.nErrors ¨ MimData.nWarnings ¨ 0;
+aborted ¨ FALSE;
+streamInfo[$source] ¨
+[access: $read, stream: parms.sourceStream, status: [count: 0, open: FALSE]];
+streamInfo[$object] ¨ streamInfo[$log] ¨
+[access: $write, stream: NIL, status: [count: 0, open: FALSE]];
+Initialize[];
+{ ENABLE {
+   UNWIND => Finalize[parms, TRUE];
+Alloc.Failure => {IF ~debug THEN GO TO storageFull};
+RuntimeError.UNCAUGHT => {IF ~debug THEN GOTO uncaughtSignal};
+};
+
+CompilerUtil.PrefillSymbols[];
+MimData.textIndex ¨ SourceMap.Cons[0];
+
+IF TestPass[1] THEN GO TO cancel;
+parsed ¨ CompilerUtil.P1Unit[];
+nParseErrors ¨ MimData.nErrors;
+CauseEvent[pass1];
+IF ~parsed THEN GO TO failed;
+root ¨ TreeOps.PopTree[];
+TreeOps.Reset[];
+IF parms.debugPass <= 1 THEN Debug[PrintTreeRoot, PrintSymbols];
+
+IF TestPass[2] THEN GO TO cancel;
+root ¨ CompilerUtil.P2Unit[root];
+IF parms.debugPass <= 2 THEN Debug[PrintTreeRoot, PrintSymbols];
+CauseEvent[pass2];
+
+IF MimData.nErrors # 0 THEN GO TO failed;
+IF TestPass[3] THEN GO TO cancel;
+SymLiteralOps.Initialize[table];
+{ ENABLE UNWIND => SymLiteralOps.Finalize[];
+
+MimosaCopier.FileInit[
+[MimData.objectVersion, parms.objectName], table, parms.fileParms];
+{ ENABLE UNWIND => MimosaCopier.FileReset[];
+{
+ENABLE Alloc.Failure => {
+MimosaCopier.FileReset[];
+SymLiteralOps.Finalize[];
+GO TO storageFull;
+};
+root ¨ CompilerUtil.P3Unit[root];
+CompilerUtil.P3Postlude[MimData.nErrors <= nParseErrors];
+
+IF parms.debugPass <= 3 THEN Debug[PrintTreeRoot, PrintSymbols];
+CauseEvent[pass3];
+IF MimData.nErrors > nParseErrors THEN GO TO deleteFiles;
+
+MimData.objectVersion ¨ OSMiscOps.StampToTime[MimData.objectStamp];
+parms.fileParms.Forget[[MimData.objectVersion, parms.objectName]];
+
+IF TestPass[4] THEN {
+MimosaCopier.FileReset[];
+SymLiteralOps.Finalize[];
+GO TO cancel;
+};
+CompilerUtil.StartObjectFile[AcquireStream[$object]];
+CompilerUtil.P4Unit[root];
+IF parms.debugPass <= 4 THEN Debug[CompilerUtil.PrintBodies, PrintSymbols];
+CauseEvent[pass4];
+
+EXITS
+deleteFiles => NULL;
+};
+};
+MimosaCopier.FileReset[];
+
+IF MimData.nErrors # 0 THEN {SymLiteralOps.Finalize[]; GO TO failed};
+
+IF ~MimData.interface THEN {
+IF TestPass[5] THEN {
+SymLiteralOps.Finalize[];
+GO TO cancel;
+};
+CompilerUtil.P5module[];
+CauseEvent[pass5];
+};
+};
+SymLiteralOps.Finalize[];
+
+IF TestPass[6] THEN GO TO cancel;
+CompilerUtil.TableOut[table];
+CauseEvent[pass6];
+IF MimData.nErrors # 0 THEN GO TO failed;
+
+EXITS
+failed => aborted ¨ TRUE;
+cancel => {MimosaLog.Error[aborted]; aborted ¨ TRUE};
+uncaughtSignal => {
+errorStream: IO.STREAM = AcquireStream[$log];
+aborted ¨ TRUE;
+MimosaLog.Error[compilerError];
+IO.PutRope[errorStream, "Uncaught signal/error in Pass "];
+IO.PutChar[errorStream, pass];
+IO.PutChar[errorStream, '\n];
+ReleaseStream[$log];
+};
+storageFull => {
+errorStream: STREAM = AcquireStream[$log];
+aborted ¨ TRUE;
+MimData.nErrors ¨ MimData.nErrors+1;
+IO.PutRope[errorStream, "\nStorage "];
+IO.PutRope[errorStream, "overflow"];
+IO.PutRope[errorStream, " in Pass "];
+IO.PutChar[errorStream, pass];
+IO.PutChar[errorStream, '\n];
+ReleaseStream[$log];
+};
+};
+Finalize[parms, FALSE];
+};
+
+lastAdded: REF RegisteredProc ¨ NIL;
+registeredList: REF RegisteredProc ¨ NIL;
+freeList: REF RegisteredProc ¨ NIL;
+RegisteredProc: TYPE = RECORD [
+next: REF RegisteredProc,
+proc: Callback,
+trigger: Trigger];
+
+EventAnd: PROC [t1, t2: Trigger] RETURNS [Trigger] = {
+RETURN [LOOPHOLE [OSMiscOps.WordAnd[LOOPHOLE[t1, WORD], LOOPHOLE[t2, WORD]]]];
+};
+
+EventOr: PROC [t1, t2: Trigger] RETURNS [Trigger] = {
+RETURN [LOOPHOLE [OSMiscOps.WordOr[LOOPHOLE[t1, WORD], LOOPHOLE[t2, WORD]]]];
+};
+
+Register: PUBLIC PROC [proc: Callback, class: EventsClass] = {
+IF lastAdded # NIL AND lastAdded.proc = proc
+THEN
+lastAdded.trigger[class] ¨ TRUE
+ELSE {
+trigger: Trigger ¨ nullTrigger;
+trigger[class] ¨ TRUE;
+RegisterSet[proc, trigger];
+};
+};
+
+RegisterSet: PUBLIC PROC [proc: Callback, trigger: Trigger] = {
+elem: REF RegisteredProc ¨ registeredList;
+SELECT TRUE FROM
+proc = NIL => ERROR;
+trigger = nullTrigger => {
+reg: REF RegisteredProc ¨ registeredList;
+lag: REF RegisteredProc ¨ NIL;
+WHILE reg # NIL DO
+next: REF RegisteredProc ¨ reg.next;
+IF reg.proc = proc THEN {
+reg.next ¨ freeList;
+freeList ¨ reg;
+IF reg = lastAdded THEN lastAdded ¨ NIL;
+IF lag = NIL THEN registeredList ¨ next ELSE lag.next ¨ next;
+EXIT;
+};
+lag ¨ reg;
+reg ¨ next;
+ENDLOOP;
+RETURN;
+};
+ENDCASE => {
+new: REF RegisteredProc ¨ NIL;
+IF lastAdded # NIL AND lastAdded.proc = proc THEN {
+elem ¨ lastAdded;
+GO TO merge;
+};
+DO
+IF elem = NIL THEN EXIT;
+IF elem.proc = proc THEN {lastAdded ¨ elem; GO TO merge};
+IF elem.next = NIL THEN EXIT;
+elem ¨ elem.next;
+ENDLOOP;
+IF freeList # NIL
+THEN {
+new ¨ freeList;
+freeList ¨ freeList.next;
+new≠ ¨ [NIL, proc, trigger];
+}
+ELSE
+new ¨ MimZones.permZone.NEW[RegisteredProc ¨ [NIL, proc, trigger]];
+IF elem = NIL THEN registeredList ¨ new ELSE elem.next ¨ new;
+lastAdded ¨ new;
+EXITS merge => elem.trigger ¨ EventOr[elem.trigger, trigger];
+};
+IF trigger[relocate] AND MimData.base # NIL THEN proc[relocate];
+};
+
+CauseEvent: PUBLIC PROC [class: EventsClass] = {
+mask: Trigger ¨ nullTrigger;
+mask[class] ¨ TRUE;
+IF class = relocate AND MimData.base = NIL THEN RETURN;
+FOR each: REF RegisteredProc ¨ registeredList, each.next WHILE each # NIL DO
+IF EventAnd[mask, each.trigger] = mask THEN each.proc[class];
+ENDLOOP;
+};
+
+ZoneReset: PROC = {CauseEvent[zoneReset]};
+AllocRelocate: Alloc.Notifier = {
+MimData.base ¨ base;
+CauseEvent[relocate];
+};
+
+
+-- initialize STRING variables, etc.
+
+MimData.compilerVersion ¨ [0, 0F0000107h];
+
+MimZones.RegisterForReset[ZoneReset];
+CompilerUtil.InstallParseTables[NIL];
+
+
+}.
+  ¸  
+MimosaSequencer.mesa
+Copyright ” 1985, 1986, 1987, 1988, 1989, 1990, 1991 by Xerox Corporation.  All rights reserved.
+Satterthwaite, June 10, 1986 3:04:13 pm PDT
+Russ Atkinson (RRA) February 7, 1992 6:11 pm PST
+Bob Hagmann March 24, 1986 8:50:18 am PST
+JKF August 15, 1988 1:47:31 pm PDT
+Foote, May 18, 1993 4:38 pm PDT
+
+Exported to MimData.table
+stream management
+compiler inquiries
+Pass4B, Pass4S, Pass4Xa
+Pass4B, Pass4S, Pass4Xa, Pass4Xb
+MimosaInterface
+Pass3B, Pass4B, Pass4L
+Pass3I
+MimosaLogImpl
+Note: change this array when changing any default switches that should affect the functional version stamp of the output file.
+compiler sequencing
+encode important switches, compiler version (see DIRECTORY processing also)
+Accumulate the switches numerically for portability
+first pass
+second pass
+There is no need to go further if we can't even parse it!
+
+third and fourth passes
+fifth pass
+
+Stuff exported to MimosaEvents
+
+Tricky quick kill for repeated events
+Delete the registration
+Move the registration to the free list
+Tricky quick kill for repeated events
+Add the registration to the end of the list
+Can get the new element from the free list
+Need to have a new free element
+* * * * * *  M A I N   B O D Y   C O D E  * * * * * *
+low byte => Compiler Release
+
+ ù t  ñ(cedarcode) styleïNewlineDelimiter
+ô codeôKöú
+œeúUô`Köœy+ô+Kô0Kô)Kô"KôKô öœk	ò	KöúüúUò`Köúüú)ò:Köúüú¨òæKöüúüú üúò0Köúüúò(Köú	üúòKöúüúòKöúüúúò©Köúüúò)KöúòKöú
+üú	òKöú
+üú	òKöú	üúò,KöúüúòKöú
+üú^òmKöúüúüúòKöúüúüúòKöú
+üúò$Köú
+üúò,KöúüúòKöúüúò'Köúüúò+KöúüúòKöúüú(ò5óóheadöœnúüòKöüúüúâò±Köüú5ò<KöüúòKò KöüúüúüúòKöüúüúüúüúòKò öúüúüúò!KöúôóKò óKôò Köú
+üúò&Köúüúüúò3Kò Kö	úüúüúüúüúò2Kò öúüúüúòKòKöúüúòKöúüú	üúüúò)Kò óöúüúüúò=Köúüúüúò>Köúüúüúò?Köúüúüúò>KòKò óö
+†úüúüúüú
+üúòFöüúüúüúò%Kò&Köú(üúò/KöúòóKòöüú*üúüò7Köúüúò"óKò>KòKò óö†úüúüúò-Köúüúò.öüúüòKöúüúòòKöúüúò#Kö
+üúüúüú üúüúòAKöúüúò#KòóKöüú*ò1óKòKò óóKôò ö†úüúüúüú!òEñ0.65 in tabStopsöüúò	Kñ0.65 in tabStopsöüúœc.ò5ñ0.65 in tabStopsöüú°!ò'Kñ0.65 in tabStopsöúôóKñ0.65 in tabStopsöüú°8ò?Kñ0.65 in tabStopsöüú°<òCKñ0.65 in tabStopsöüú°òKñ0.65 in tabStopsöüú°1ò7Kñ0.65 in tabStopsöüú°5ò<Kñ0.65 in tabStopsöüú°8ò>Kñ0.65 in tabStopsöüú°1ò8Kñ0.65 in tabStopsöüú°°°°°òKñ0.65 in tabStopsöüú°-ò3Kñ0.65 in tabStopsöüú°-ò3Kñ0.65 in tabStopsöüú°,ò3ñ0.65 in tabStopsöüú°ò$Kñ0.65 in tabStopsöú ô óKñ0.65 in tabStopsöüú°òñ0.65 in tabStopsöüú°9ò@Kñ0.65 in tabStopsöúôóKñ0.65 in tabStopsöüú°9ò@Kñ0.65 in tabStopsöüú°=òDñ0.65 in tabStopsöüú°2ò9Kñ0.65 in tabStopsôóKñ0.65 in tabStopsöüú°òñ0.65 in tabStopsöüú°.ò4Kñ0.65 in tabStopsôóKñ0.65 in tabStopsöüú°:òAñ0.65 in tabStopsöüú°!ò(Kñ0.65 in tabStopsöúôóKñ0.65 in tabStopsöüú°)ò0Kñ0.65 in tabStopsöüú°)ò0Kñ0.65 in tabStopsöüú°)ò/Kñ0.65 in tabStopsòóKòöú1ò1Köüúüúüúüúüúüú°–cfò7Köüúüúüúüúüúüú°¢ò;Köüúüúüúüúüúüú°¢ò9Köüúüúüúüúüúüú°¢ò;Köüúüú°¢
+òKöœbúzô~Kò óóö†úüúüúüúò)Köú;ò;KòKò óóKôò KöúüúòKò Köúüúò,Kò ö†
+úüúòKöúüú	òöú	üúüú°òAKöú°ò(Köú°ò&Köú°ò%Köú°òKöú°òKöú°òKöú°òKöú°ò'Köú°ò'Köú°òKöú°òKöú°òKòóöüú	üòöüúòKöúü
+úò4KòHKöú&ò&KòóKöüúòóKöúòKöúüúò!Kò#KòKòKòKòKò óö†úüúüúò6Köúüú üúüúòBKò,Kò$Kò*Kò Kò$Köú/üúüúò=öüúüúüúò*KöúòKöú1ò1Köúüúò!KöúòóKöúòKòKòKòKòKöüú	üúüúò"KòKò óö†úüúüúò4KòKòKòKò óKöúüúüúüúòKò Köú	üúüúòKöúüúüúòKò ö†úüúüúòKöüúüúüúòö
+üú	üú	üúüúüúò0KöúòKöúüúòKòóKöú
+üúòKöúòKòKò óö†úüúüúòöüú	üúòKöú
+üúòKö
+üú	üúüúüú üúòGKöúòóKòòKò óóö†úüúüúò6KòKöúüúòKöúüúòKöúüúòKò ö†úüúò-Köú$ò$Köúòóö†úüúò,Kò4KòKò óö
+†úüú	üúüúüúò.Kò Kò$KöüúüúüúüúüúüúòHKöúòKöüúüúòKòKò óKö
+üú
+üúüúüúüúò*KòKòKò"KöúòKò KòKò Kò5KòDòKöú1ü	úôKKöúüúòö	üúüú	üúüú	üò&Kô3KöúòKöüúüúüúòAKöüúòóò,Köú5ò5óò,KòEóòKò óóKöú(ò(Köú
+üúòòKöúEüúòMóò(Köúüúüúò?óKòöúüúò
+öúüúüúò#Köúüúüúüúò4Kö	úüúüúüúüúò>KòóKò Kòò&Kò óKô
+Köüúüúüúüúò!KòKòKòKöüú	üúüúòKòKòöüúüú$ò@Kò óKôKöüúüúüúüúò!Kò!Köüúüú$ò@KòKò öüúüúüúüúò)Kô9Kô óKôKöüúüúüúüúò!Kò öúüúüúò,Kò KòZöúüúüúò,òöüúòKöúòKöúòKöüúüúòKöúòóKò!Kò9Kò Köüúüú$ò@KòKöüú üúüúò9Kò KòCKòBKò öüúüúòKöúòKöúòKöüúüúòKöúòóKò5KòKöüúüú/òKKòKò öüòKöúüúòóKòóKöúòóòKò óöüúüúüú	òEKò óKô
+öüúüúòöüúüúòKöúòKöüúüúòKöúòóKòKòKòóKöúòóKòKò Köüúüúüúò!KòKòKô Köüúüúüúò)Kò öüòKöúüúòKöú/üúò5òKöúüúüúò-Köú
+üúòKöúòKöüú8ò:KöüúòKöüúòKòKöúòóòKöúüúò*Köú
+üúòKò$Köüú$ò&Köüú"ò$Köüú#ò%KöüúòKöüúòKòKòóóKöúòóóKöúüúòKòKò óôKô Köúüúüúò$Köúüúüúò)Köú
+üúüúò#öúüúüúòKöúüúòKöúòKöúòKò óö†úüúüúò6KöüúüúüúüúüúüúòNKöúòKò óö†úüúüúò5KöüúüúüúüúüúüúòMKöúòóKò ö†úüúüú)ò>öüúüúüúò,öüòKô%KöúüòóöüúòKöúòKöúüúòKöúòKòóóKòKò óö†úüúüú'ò?Köúüú!ò*öüúüúüòKöúüúüúòöúòKôKöúüú!ò)KöúüúüúòöüúüúüòKöúüúò$öüúüúòKô&KöúòKöúòKöüúüúüúò(Köüúüúüúüúò=KöüúòKòóKöú
+ò
+KöúòKöüúòóKöüúòKöúòóöüúòKöúüúüúòöüúüúüúüúò3Kô%KöúòKöüúüúòKòóöüòKöüúüúüúüúòKöüúüúüúüúò9KöüúüúüúüúòKöúòKöüúòóKô+öüúüòöüúòKô*KöúòKöúòKöúüúòKòóöüòKôKöúüúüúòCóóKöüúüúüúüúò=KöúòKöüú8ò=KòóóKöüúüúüúüúò@KòKò óö†
+úüúüúò0KöúòKöúüúòKö
+üúüúüúüúüúò7ö	üúüú,üúüúüòLKöüú%üúò=KöüúòóKòKò óKö†	úüúò*ö†úò!KöúòKöúòKöúòóKò óKô5ò Kö°$ò$Kò öú*ò*KôóKò Köú%ò%Köú üúò%Kò Kò óKòKô ó Öó    5p  N‡  

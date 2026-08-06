@@ -1,0 +1,398 @@
+
+DIRECTORY
+CedarProcess USING [SetPriority], 
+EditNotify USING [Change],
+InputFocus USING [GetInputFocus, SetInputFocus],
+List USING [Reverse],
+MessageWindow USING [Append, Blink],
+MonitoredQueue USING [Add, Create, MQ, Remove],
+Process USING [Detach],
+TEditDocument USING [GetViewerForRoot, Selection, SelectionId, SelectionRec, TEditDocumentData, RecordViewerForRoot],
+TEditHistory USING [],
+TEditInput USING [CheckSelection, CommandProc, InterpInput, interpreterNesting, Register],
+TEditInputOps USING [CallWithLocks],
+TEditLocks USING [Lock, LockOrder, Unlock],
+TEditSelection USING [Copy, Deselect, LockBothSelections, MakeSelection, pSel, UnlockBothSelections],
+TextNode USING [Root, DestroyTree],
+Tioga USING [Node],
+UndoEvent USING [Create, Empty, Event, EventRep, Reset, SubEvent, Undo],
+UserProfile USING [Number],
+ViewerClasses USING [Viewer];
+
+TEditInputEventsImpl: CEDAR MONITOR
+IMPORTS CedarProcess, InputFocus, List, MessageWindow, MonitoredQueue, Process, TEditDocument, TEditInput, TEditInputOps, TEditLocks, TEditSelection, TextNode, UndoEvent, UserProfile
+EXPORTS TEditInput, TEditHistory, Tioga
+= BEGIN
+
+Node: TYPE ~ Tioga.Node;
+Event: TYPE ~ UndoEvent.Event;
+EventRep: PUBLIC TYPE ~ UndoEvent.EventRep;
+Change: TYPE ~ EditNotify.Change;
+
+
+currentEvent: PUBLIC Event;
+editEvent: EditEvent; -- the current edit event
+eventNumber: INT ¨ 0; -- event number for current editEvent
+EditEvent: TYPE = REF EditEventRec;
+EditEventRec: TYPE = RECORD [
+prev, next: EditEvent, -- links to adjacent events in edit history
+undo: UndoEvent.Event, -- stuff to undo for this event
+repeatList: LIST OF REF ANY, -- the command list for this event
+chars: REF TEXT, -- to hold first set of input chars for this event
+savePSel: TEditDocument.Selection -- primary selection when event started
+];
+
+repeatList: PUBLIC LIST OF REF ANY;
+charsClosed, charsUsed: PUBLIC BOOL ¨ FALSE;
+chars: PUBLIC REF TEXT; -- buffer for typein
+
+RootAction: TYPE ~ PROC [root: Node] RETURNS [quit: BOOL ¨ FALSE];
+
+MapRootsInSubEvents: PROC [subevents: UndoEvent.SubEvent, action: RootAction] 
+RETURNS [quit: BOOL ¨ FALSE] ~ {
+Do1: PROC [node: Node] ~ {
+root: Node ~ TextNode.Root[node];
+quit ¨ action[root];
+};
+Do2: PROC [node1, node2: Node] ~ {
+root1: Node ~ TextNode.Root[node1];
+root2: Node ~ TextNode.Root[node2];
+quit ¨ action[root1];
+IF root2#root1 AND NOT quit THEN quit ¨ action[root2];
+};
+FOR sub: UndoEvent.SubEvent ¨ subevents, sub.next UNTIL quit OR sub=NIL DO
+WITH sub.undoRef SELECT FROM
+x: REF Change.ChangingText => Do1[x.text];
+x: REF Change.ChangingProp => Do1[x.node];
+x: REF Change.MovingNodes => Do2[x.dest, x.pred];
+x: REF Change.NodeNesting => Do1[x.first];
+x: REF Change.InsertingNode => Do1[x.new];
+ENDCASE;
+ENDLOOP;
+};
+
+CloseEventNow: PUBLIC ENTRY PROC = {
+ENABLE UNWIND => NULL;
+BetweenEvents: PROC RETURNS [BOOL] = {
+RETURN [repeatList = NIL AND UndoEvent.Empty[currentEvent]];
+};
+freeList: LIST OF Node ¨ NIL;
+CheckForDeletedRoot: RootAction ~ {
+IF root#NIL AND root.deleted THEN {
+FOR lst: LIST OF Node ¨ freeList, lst.rest UNTIL lst=NIL DO
+IF lst.first = root THEN RETURN;
+ENDLOOP;
+freeList ¨ CONS[root, freeList];
+};
+};
+IF BetweenEvents[] THEN {
+TEditSelection.Copy[source: TEditSelection.pSel, dest: editEvent.savePSel];
+RETURN;
+}; -- already closed
+editEvent.repeatList ¨ repeatList; repeatList ¨ NIL;
+editEvent ¨ editEvent.next;
+TEditSelection.Copy[source: TEditSelection.pSel, dest: editEvent.savePSel];
+editEvent.repeatList ¨ NIL;
+charsClosed ¨ charsUsed ¨ FALSE;
+chars ¨ editEvent.chars;
+currentEvent ¨ editEvent.undo;
+[] ¨ MapRootsInSubEvents[currentEvent.subevents, CheckForDeletedRoot];
+UndoEvent.Reset[currentEvent];
+eventNumber ¨ eventNumber+1;
+FOR lst: LIST OF Node ¨ freeList, lst.rest UNTIL lst=NIL DO FreeTree[lst.first] ENDLOOP;
+};
+
+RecordInt: PUBLIC ENTRY PROC [i: INT] = { 
+ENABLE UNWIND => NULL;
+IF TEditInput.interpreterNesting > 1 THEN RETURN;
+IF charsUsed THEN charsClosed ¨ TRUE;
+repeatList ¨ CONS[NEW[LONG INTEGER ¨ i],repeatList];
+};
+
+RecordChar: PUBLIC ENTRY PROC [c: CHAR] = {
+ENABLE UNWIND => NULL;
+IF TEditInput.interpreterNesting > 1 THEN RETURN;
+IF ~charsClosed THEN {
+IF ~charsUsed THEN {
+charsUsed ¨ TRUE; chars.length ¨ 0;
+repeatList ¨ CONS[chars,repeatList] };
+chars[chars.length] ¨ c;
+IF (chars.length ¨ chars.length+1) = chars.maxLength THEN charsClosed ¨ TRUE }
+ELSE repeatList ¨ CONS[NEW[CHAR ¨ c],repeatList] };
+
+RecordRef: PUBLIC ENTRY PROC [ref: REF ANY] = {
+ENABLE UNWIND => NULL;
+IF TEditInput.interpreterNesting > 1 THEN RETURN;
+IF charsUsed THEN charsClosed ¨ TRUE;
+repeatList ¨ CONS[ref, repeatList];
+};
+
+treeQueue: MonitoredQueue.MQ ~ MonitoredQueue.Create[];
+
+FreeTree: PUBLIC PROC [root: Node] = {
+thisRoot: Node ~ root;
+Check: RootAction ~ { RETURN[root=thisRoot] };
+IF root=NIL OR root.deleted THEN RETURN;
+root.deleted ¨ TRUE;
+FOR event: EditEvent ¨ editEvent.next, event.next UNTIL event = editEvent DO
+IF MapRootsInSubEvents[editEvent.undo.subevents, Check] THEN RETURN;
+ENDLOOP;
+MonitoredQueue.Add[root, treeQueue];
+};
+
+FreeTrees: PROC = {
+CedarProcess.SetPriority[background];
+DO -- forever
+WITH MonitoredQueue.Remove[treeQueue] SELECT FROM
+root: Node => DoFreeTree[root ! ABORTED => CONTINUE];
+ENDCASE;
+ENDLOOP;
+};
+DoFreeTree: PROC [root: Node] = {
+IF root=NIL OR root.child=NIL THEN RETURN; -- has already been freed
+DO
+[] ¨ TEditLocks.Lock[root, "DoFreeTree", write];
+IF TEditDocument.GetViewerForRoot[root] = NIL THEN EXIT;
+TEditDocument.RecordViewerForRoot[NIL, root];
+TEditLocks.Unlock[root];
+ENDLOOP;
+TextNode.DestroyTree[root];
+};
+
+Cancel: PUBLIC TEditInput.CommandProc = {
+CloseEventNow[]; Undo[eventNumber-1]; RETURN [FALSE];
+};
+
+Undo: PUBLIC PROC [eventNum: INT] = {
+e, first, last: EditEvent;
+viewer: ViewerClasses.Viewer;
+num, undone: INT;
+selectionsLocked: BOOL ¨ FALSE;
+docList, lockedList: LIST OF Node;
+Cleanup: PROC = {
+IF selectionsLocked THEN TEditSelection.UnlockBothSelections[];
+FOR list: LIST OF Node ¨ lockedList, list.rest UNTIL list=NIL DO -- release the locks
+TEditLocks.Unlock[list.first]; ENDLOOP;
+};
+
+CloseEventNow[];
+TEditSelection.LockBothSelections["Undo"]; selectionsLocked ¨ TRUE;
+{ ENABLE UNWIND => Cleanup[];
+list: LIST OF Node;
+num ¨ eventNumber; first ¨ e ¨ editEvent;
+UNTIL (num ¨ num-1) < eventNum DO -- find all the documents to be changed
+Add: RootAction = {
+doc: Node ~ root;
+prev: LIST OF Node;
+IF doc=NIL THEN RETURN;
+FOR list: LIST OF Node ¨ docList, list.rest UNTIL list=NIL DO
+IF list.first = doc THEN RETURN; ENDLOOP;
+IF docList=NIL OR TEditLocks.LockOrder[doc, docList.first] THEN { -- doc goes at start
+docList ¨ CONS[doc, docList];
+RETURN };
+prev ¨ docList;
+FOR list: LIST OF Node ¨ docList, list.rest UNTIL list=NIL DO
+IF TEditLocks.LockOrder[doc, list.first] THEN { -- doc goes after prev and before this
+prev.rest ¨ CONS[doc, list.rest];
+RETURN };
+prev ¨ list;
+ENDLOOP;
+prev.rest ¨ CONS[doc, NIL]; -- put it at the end of the list
+};
+IF (e ¨ e.prev) = first THEN EXIT;
+[] ¨ MapRootsInSubEvents[e.undo.subevents, Add];
+ENDLOOP;
+list ¨ docList;
+WHILE list # NIL DO  -- get write locks for them 
+rest: LIST OF Node ¨ list.rest;
+[] ¨ TEditLocks.Lock[list.first, "Undo", write];
+list.rest ¨ lockedList; lockedList ¨ list; -- move item to list of locked documents
+list ¨ rest;
+ENDLOOP;
+viewer ¨ TEditSelection.pSel.viewer;
+TEditSelection.Deselect[primary]; -- get rid of the primary selection
+TEditSelection.Deselect[secondary]; -- get rid of secondary selection
+TEditSelection.Deselect[feedback]; -- get rid of feedback selection
+num ¨ eventNumber; undone ¨ 0; first ¨ e ¨ editEvent;
+UNTIL (num ¨ num-1) < eventNum DO
+IF (e ¨ e.prev) = first THEN EXIT; -- have undone all the saved events
+UndoEvent.Undo[e.undo, currentEvent];
+last ¨ e; undone ¨ undone+1;
+ENDLOOP;
+IF TEditInput.CheckSelection[last.savePSel] THEN
+TEditSelection.MakeSelection[selection: primary, new: last.savePSel]
+ELSE { -- give up the input focus
+if: ViewerClasses.Viewer = InputFocus.GetInputFocus[].owner;
+IF if=viewer THEN InputFocus.SetInputFocus[NIL] };
+RecordInt[undone];
+RecordRef[$Undone];
+CloseEventNow[];
+Cleanup[];
+}};
+
+CurrentEventNumber: PUBLIC PROC RETURNS [INT] = {
+RETURN [eventNumber] };
+
+CountEvents: PROC RETURNS[number: INT] = {
+number ¨ 1;
+FOR e: EditEvent ¨ editEvent.next, e.next UNTIL e=editEvent DO
+number ¨ number+1; ENDLOOP;
+};
+
+GetEvent: PROC [number: INT] RETURNS [event: EditEvent] = {
+IF eventNumber < number THEN RETURN [NIL];
+IF (number ¨ eventNumber-number) = 0 THEN RETURN [editEvent];
+FOR e: EditEvent ¨ editEvent.prev, e.prev DO
+IF e = editEvent THEN EXIT; -- have gone past
+IF (number ¨ number-1) = 0 THEN RETURN [e];
+ENDLOOP;
+RETURN [NIL] };
+
+SliceSize: PUBLIC ENTRY PROC RETURNS [number: INT] = {
+ENABLE UNWIND => NULL;
+RETURN[CountEvents[]];
+};
+
+NewSliceSize: PUBLIC ENTRY PROC [number: INT] = {
+ENABLE UNWIND => NULL;
+delta: INT;
+number ¨ MAX[MIN[number,200],2]; -- limit to [2..200] 
+delta ¨ number-CountEvents[];
+SELECT delta FROM
+= 0 => NULL;
+< 0 => FOR e: EditEvent ¨ editEvent.next, e.next DO -- reduce size
+IF (delta ¨ delta+1) > 0 THEN { -- connect to e
+editEvent.next ¨ e; e.prev ¨ editEvent; RETURN };
+ENDLOOP;
+ENDCASE => -- increase size
+FOR i: INT IN [0..delta) DO 
+e: EditEvent ¨ CreateEvent[];
+e.next ¨ editEvent.next; e.next.prev ¨ e;
+e.prev ¨ editEvent; editEvent.next ¨ e;
+ENDLOOP };
+
+Known: PUBLIC ENTRY PROC [number: INT] RETURNS [BOOL] = {
+ENABLE UNWIND => NULL;
+e: EditEvent ¨ GetEvent[number];
+RETURN [ e # NIL AND (e.repeatList # NIL OR NOT UndoEvent.Empty[e.undo]) ] };
+
+Repeat: PUBLIC TEditInput.CommandProc = {
+list: LIST OF REF ANY;
+IF TEditSelection.pSel = NIL OR TEditSelection.pSel.granularity = point THEN {
+MessageWindow.Append["Make selection for repeat",TRUE];
+MessageWindow.Blink[] }
+ELSE IF (list ¨ GetRepeatSequence[]) = NIL THEN {
+MessageWindow.Append["Nothing saved for repeat",TRUE];
+MessageWindow.Blink[] }
+ELSE {
+DoRepeat: PROC [root: Node, tSel: TEditDocument.Selection] = {
+TEditInput.InterpInput[viewer, list, FALSE] };
+TEditInputOps.CallWithLocks[DoRepeat] };
+RETURN [FALSE] };
+
+GetRepeatList: PUBLIC ENTRY PROC [number: INT] RETURNS [LIST OF REF ANY] = {
+ENABLE UNWIND => NULL;
+e: EditEvent ¨ GetEvent[number];
+RETURN [IF e = NIL THEN NIL ELSE List.Reverse[e.repeatList]] };
+
+GetRepeatSequence: PUBLIC PROC RETURNS [params: LIST OF REF ANY] = {
+num: INT;
+CloseEventNow[];
+num ¨ eventNumber;
+WHILE Known[num ¨ num-1] DO -- get list to repeat
+IF (params ¨ GetRepeatList[num]) = NIL THEN LOOP; -- skip over empty entries
+IF params.rest # NIL AND params.rest.rest = NIL AND params.rest.first = $Undone
+THEN { params ¨ NIL; LOOP }; -- skip over Undo commands
+RETURN;
+ENDLOOP };
+
+closeEvent: PUBLIC BOOL ¨ FALSE;
+
+CreateEvent: PROC RETURNS [e: EditEvent] = {
+e ¨ NEW[EditEventRec];
+e.undo ¨ UndoEvent.Create[];
+e.chars ¨ NEW[TEXT[64]];
+e.savePSel ¨ NEW[TEditDocument.SelectionRec];
+};
+
+InitEvents: PROC = {
+num: INT ¨ MAX[MIN[UserProfile.Number["Tioga.EditHistory", 20],200],2]; -- force to [2..200]
+first: EditEvent ¨ CreateEvent[];
+prev: EditEvent ¨ first;
+FOR i: INT IN [1..num) DO
+next: EditEvent ¨ CreateEvent[];
+next.prev ¨ prev;
+prev.next ¨ next;
+prev ¨ next;
+ENDLOOP;
+first.prev ¨ prev; prev.next ¨ first; -- close the ring
+editEvent ¨ first;
+chars ¨ editEvent.chars;
+currentEvent ¨ editEvent.undo };
+
+RegisterCommandAtoms: PROC = {
+TEditInput.Register[$Repeat, Repeat];
+TEditInput.Register[$Undo, Cancel];
+};
+
+RegisterCommandAtoms[];
+InitEvents[];
+Process.Detach[FORK FreeTrees[]];
+
+END.
+     
+TEditInputEventsImpl.mesa
+Copyright ” 1985, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Russ Atkinson (RRA) June 17, 1985 2:28:28 pm PDT
+Michael Plass, March 29, 1985 5:48:59 pm PST
+Doug Wyatt, February 28, 1992 10:19 am PST
+Global variables
+
+now move to the next editEvent
+check for pending deletes in undo list for event
+
+must make sure no one still reading it. never unlock it.
+If there was no associated viewer when we locked, then we can leave the document locked against possible access bugs (the caller will stall)
+If there was a viewer, then remove its association
+To release the lock on the locked viewer (if any)
+Not on list.  Insert it in appropriate order for locking.
+Because of the way docList was created, can lock in order without danger of deadlock.
+-- this counter is incremented at the end of each event
+-- the size of the edit history buffer (number of events remembered)
+-- can change history length dynamically
+-- returns true if event is still remembered
+-- returns the atoms and other args stored for the event
+ ù Â  ñ(cedarcode) styleïNewlineDelimiter
+ô codeöúôKöú	œeú<ôHKô0Kô,Kô*Kò óöœk	ò	Köúûúò"Köúûú
+òKöúûú ò0KöúûúòKöúûúò$Köúûúûú
+ò/Köúûú
+òKöúûúbòuKöúûúòKöúûúJòZKöúûúò$Köúûúò+KöúûúQòeKöú	ûúò#KöúûúòKöú
+ûú9òHKöúûú
+òKöúûú
+òóKò öœnúûúûò#KöûúØò∂Köûú ò'KöúûòKò KöúûúòKöúûúòKöú
+ûúûúò+Köúûúò!óKò öúôKò KöúûúòKöúœcò/Köúûú†%ò;Köúûúûúò#öúûúûúòKöú†+òBKöú†ò6Kö
+úûúûúûúûú†"ò?Köúûúûú†2òCKöú"†'òIKòóKò Köúûúûúûúûúûúò#Köúûúûúûúò,Köúûúûúûú†ò,Kò óöúûúûúûúûúûúòBKò óö
+üúûú5ûúûúûúòoöüúûúòKöú!ò!KòKöúòóöüúûúò"Köú#ò#Köú#ò#KòKöûúûúûúûúò6Köúòóö	ûú/ûúûúûúûòJöûúûúûòKöúûú$ò*Köúûú$ò*Köúûú+ò1Köúûú$ò*Köúûú$ò*KöûúòóKöûúòóKöúòKò óöüúûúûúûúò$Köûúûúûúòöüúûúûúûúò&Köûúûúûú ò<KöúòóKöú
+ûúûúûúòöüúò#öûúûúûúûúò#öûúûúûúûúûúûò;Köûúûúûúò KöûúòóKöúûúò KòóKöúòóöûúûúòKòKKöûúòKöú†òóKöú0ûúò4Kô Kö†ôKòKòKKöúûúòKöúûúò KòKòòFKöú0ô0óKòKòKöûúûúûúûúûúûúûúòXKòKò óö
+ü	úûúûúûúûúò*KöûúûúûúòKöûú#ûúûúò1Köûúûúûúò%Kö	úûúûúûúûúò4KöúòKò óö
+ü
+úûúûúûúûúò+KöûúûúûúòKöûú#ûúûúò1öûúûúòöûúûúòKöúûúò#Köúûúò&óKòKöûú3ûúûúòNóKöûúûúûúûúò3Kò óöü	úûúûúûúûúûúò/KöûúûúûúòKöûú#ûúûúò1Köûúûúûúò%Köúûúò#KöúòKò óKöúûúò7Kò öüúûúûúò&KòKöüúûúò.Kö
+ûúûúûúûúûúò(Köúûúòöûú/ûúûòLKöûú6ûúûúòDKöûúòóKò$KòKò óöü	úûúòKöú%ò%öûú†
+òöûú"ûúûò1Köú ûúûúò5KöûúòóKöûúòóKöúòKô óöü
+úûúò!Köûúûúûúûúûúûú†òDöûòöú0ò0Köú8ô8óöûú(ûúûúûúò8Köúåôåóöú"ûúò-Kô2óöúòKöú1ô1óKöûúòóKòöúòKò óóöüúûúò)Köú&ûúûúò5KöúòóKò öüúûúûúûúò%KòKòKöúûúòKöúûúûúòKöúûúûúò"öüúûúòKöûúûú'ò?öûúûúûúûúûúûú†òUKöúûúò'óKòKò óKòKöú>ûúòCKöúûúûúòKöúûúûúòKò)öûúûú†'òIöüúòKòKöúûúûúòKöûúûúûúûúòöûúûúûúûúûúûò=Köûúûúûúûúò)óKô9ö	ûú	ûúûú*ûú†òVKöú
+ûúòKöûúò	óKöúòöûúûúûúûúûúûò=öûú'ûú†&òVKöúûúò!Köûúò	óKòKöûúòóKöúûúûú† ò<KöúòóKöûúûúûúò"Kò0KöûúòóKöúòöûúûúûú†ò1KôUKöúûúûúòKöú0ò0Köú+†(òSKöúòKöûúòóKöú$ò$Köú"†#òEKöú$†!òEKöú#† òCKò5öûúûò!Köûúûúûú†#òFKò%KòKöûúòóöûú*ûò0KöúDòDóöûú†ò!Kò<Köûúûúûúò2óKòKòKòKò
+KòKò óö
+üúûúûúûúûúò1Köú7ô7KöûúòKò óöüúûúûú	ûúò*Kòöûú'ûúûò>KöúûúòóöúòKò óóöüúûú
+ûúûúò;Köûúûúûúûúò*Köûú#ûúûúò=öûú'ûò,Köûúûúûú†ò-Köûúûúûúò+KöûúòóKöûúûúòKò óöü	úûúûúûúûú
+ûúò6KöúDôDKöûúûúûúòKöûúòöúòKò óóö
+üúûúûúûú
+ûúò1Köú(ô(KöûúûúûúòKöúûúòKöú	ûúûú†ò6KöúòöûúûòKöúûúòöúûú'ûú†òBöûúûú†ò/Köú(ûúò1óKöûúòóöûú†òöûúûúûúûúòKòKò)Kò'Köûúò
+Kò óóóóöüúûúûúûú
+ûúûúûúò9Köú,ô,KöûúûúûúòKò KöûúûúûúûúûúûúòMKò óöúûúò)Kö	úûúûúûúûúòöûúûúûú)ûúòNKöú1ûúò7Kòóöûúûú ûúûúò1Köú0ûúò6Kòóöûúòöüúûú0ò>Köú%ûúò.óKò(óKöûúûúòKò óöüúûúûúûú
+ûúûúûúûúûúûúòLKöú8ô8KöûúûúûúòKò Köûúûúûúûúûúûúò?Kò óöüúûúûúûú
+ûúûúûúûúòDKöúûúò	KòKòöûúûú†ò1Kö	ûú!ûúûúûú†òLö
+ûúûúûúûúûúòOKöûúûúûú†ò7óKöûúòKöûúò
+Kò óóKöúûúûúûúò Kò öüúûúûúò,KöúûúòKòKöú
+ûúûúòKöúûúò-KòKò óöü
+úûúòKöúûúûúûú6†ò\Kò!Kòöûúûúûú
+ûòKò KòKòKòKöûúòóKöú&†ò7KòKòKò Kò óöüúûúòKöú%ò%Köú#ò#KòKò óKòKòKöúûúò!Kò Köûúòó Öó    ,f  @i  

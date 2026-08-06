@@ -1,0 +1,1303 @@
+
+DIRECTORY
+AuthenticationP14V2 USING [AuthenticationError, CallError, CallProblem, ChangeSimpleKey, ChangeStrongKey, CheckSimpleCredentials, CreateSimpleKey, CreateStrongKey, CredentialsPackage, DeleteSimpleKey, DeleteStrongKey, GetStrongCredentials, HashedPassword, Problem, SeqWords, SeqWordsObject, StrongCredentials, StrongVerifier, Which],
+Basics USING [BITXOR, HWORD, LongNumber, Word16],
+BasicTime USING [earliestGMT, FromNSTime, GetClockPulses, GMT, latestGMT, Now, OutOfRange, Period, TimeNotKnown, ToNSTime, Unpack, Unpacked, Update],
+CrRPC USING [CreateClientHandle, DestroyClientHandle, Error, Handle, MarshalledRopeHWords],
+DESFace USING [Block, Blocks, CBCCheckDecrypt, CBCCheckEncrypt, CorrectParity, EncryptBlock, Key, nullKey],
+Finalize USING [Handle, HandleToObject],
+FinalizeOps USING [CallQueue, CreateCallQueue, EnableFinalization, FinalizeProc],
+Process USING [Detach, PauseMsec],
+RefText USING [InlineAppendChar, ObtainScratch, ReleaseScratch],
+Rope USING [Equal, FromRefText, Fetch, Length, ROPE],
+TimeP15V2 USING [Time],
+XNS USING [Address, GetThisHost, Host, unknownHost, unknownSocket],
+XNSAuth USING [Credentials, CredentialsType, HashedPassword, Key, Name, Verifier],
+XNSRouter USING [GetHops, Hops],
+XNSServerLocation USING [EachAddressProc, LocateServers, StopBroadcast],
+XNSWKS USING [authenticationInfo]
+;
+
+XNSAuthImpl: CEDAR MONITOR
+LOCKS lock USING lock: Lock
+IMPORTS AuthenticationP14V2, Basics, BasicTime, CrRPC, DESFace, Finalize, FinalizeOps, Process, RefText, Rope, XNS, XNSRouter, XNSServerLocation
+EXPORTS XNSAuth
+~ {
+OPEN Auth: AuthenticationP14V2, Time: TimeP15V2;
+
+authPgmNum: CARD32 ~ 14;
+authVersionNum: CARD16 ~ 2;
+
+SeqWords: TYPE ~ Auth.SeqWords;
+SeqWordsObject: TYPE ~ Auth.SeqWordsObject;
+GMT: TYPE ~ BasicTime.GMT;
+Block: TYPE ~ DESFace.Block;
+ROPE: TYPE ~ Rope.ROPE;
+NSTime: TYPE ~ Time.Time;
+Credentials: TYPE ~ XNSAuth.Credentials;
+CredentialsType: TYPE ~ XNSAuth.CredentialsType;
+HashedPassword: TYPE ~ XNSAuth.HashedPassword;
+Key: TYPE ~ XNSAuth.Key;
+Name: TYPE ~ XNSAuth.Name;
+Verifier: TYPE ~ XNSAuth.Verifier;
+HostNumber: TYPE ~ XNS.Host;
+
+
+myHostNumber: HostNumber ¨ XNS.GetThisHost[];
+
+authSvcName: Name ¨ ["CHServers", "CHServers", "Authentication Service"];
+
+initialStrongVerifier: Auth.StrongVerifier ~ [BasicTime.ToNSTime[BasicTime.earliestGMT], 0];
+
+oneMinuteOfSeconds: INT ~ 60;
+oneHourOfSeconds: INT ~ INT[60]*oneMinuteOfSeconds;
+oneDayOfSeconds: INT ~ INT[24]*oneHourOfSeconds;
+oneWeekOfSeconds: INT ~ INT[7]*oneDayOfSeconds;
+
+strongCredentialsLifetime: INT ~ oneDayOfSeconds;
+strongVerifierTimeout: INT ~ oneMinuteOfSeconds;
+
+msecBetweenSweeps: INT ¨ INT[10]*oneMinuteOfSeconds*INT[1000];
+
+unknownTime: GMT ¨ BasicTime.Update[BasicTime.earliestGMT, oneWeekOfSeconds];
+
+Now: PROC RETURNS [now: GMT] ~ INLINE {
+now ¨ BasicTime.Now[
+! BasicTime.TimeNotKnown => { now ¨ unknownTime; CONTINUE } ] };
+
+AuthenticationError: PUBLIC ERROR [problem: Auth.Problem]
+¨ Auth.AuthenticationError;
+CallError: PUBLIC ERROR[problem: Auth.CallProblem, whichArg: Auth.Which]
+¨ Auth.CallError;
+
+MarshallError: PRIVATE ERROR ~ CODE;
+
+CantContactAuthServer: PROC ~ {
+ERROR CallError[problem~other, whichArg~notApplicable] };
+
+Lock: TYPE ~ REF LockObject;
+LockObject: TYPE ~ MONITORED RECORD [];
+
+SimpleIdentity: TYPE ~ REF SimpleIdentityObject;
+SimpleIdentityObject: TYPE ~ RECORD [
+name: Name,
+password: ROPE,
+valid: BOOL ¨ TRUE,
+credentials: Credentials,
+verifier: Verifier
+];
+
+StrongIdentity: TYPE ~ REF StrongIdentityObject;
+StrongIdentityObject: TYPE ~ RECORD [
+next: Finalize.Handle,
+conversations: StrongConversation,
+name: Name,
+password: ROPE,	-- optional, if present must agree with key
+valid: BOOL ¨ TRUE,
+key: Key
+];
+
+Identity: TYPE ~ REF;	-- SimpleIdentityObject U StrongIdentityObject
+
+initiatorCacheLock: Lock ~ NEW[LockObject ¨ []];
+strongIdentities: Finalize.Handle ¨ NIL;
+
+IdFromH: PROC [it: Finalize.Handle] RETURNS [id: StrongIdentity] ~ INLINE {
+id ¨ NARROW[Finalize.HandleToObject[it]] };
+
+AddNewStrongIdentity: ENTRY PROC [lock: Lock ¨ initiatorCacheLock, newIDHandle: Finalize.Handle] ~ {
+IdFromH[newIDHandle].next ¨ strongIdentities;
+strongIdentities ¨ newIDHandle };
+
+RemoveOldStrongIdentity: ENTRY PROC [lock: Lock ¨ initiatorCacheLock, oldIDHandle: Finalize.Handle] ~ {
+h, hPrev: Finalize.Handle;
+h ¨ strongIdentities;  hPrev ¨ NIL;
+WHILE (h # NIL) AND (h # oldIDHandle) DO
+hPrev ¨ h;
+h ¨ IdFromH[h].next;
+ENDLOOP;
+IF h # NIL THEN {
+IF hPrev # NIL
+THEN IdFromH[hPrev].next ¨ IdFromH[h].next
+ELSE strongIdentities ¨ IdFromH[h].next 
+};
+};
+
+strongIdentityFinalizerQueue: FinalizeOps.CallQueue ¨ FinalizeOps.CreateCallQueue[StrongIdentityFinalizer];
+
+droppedStrongIdentities: CARD ¨ 0;
+
+StrongIdentityFinalizer: FinalizeOps.FinalizeProc ~ {
+RemoveOldStrongIdentity[oldIDHandle~handle];
+droppedStrongIdentities ¨ droppedStrongIdentities.SUCC;
+};
+
+MakeIdentity: PUBLIC PROC[name: Name, password: ROPE,
+credentialsType: CredentialsType ¨ strong, check: BOOL ¨ TRUE]
+RETURNS [identity: Identity]
+~ {
+SELECT credentialsType FROM
+simple => {
+simpleID: SimpleIdentity;
+simpleID ¨ NEW[SimpleIdentityObject ¨ [name~name, password~password, credentials~CredentialsFromName[name], verifier~VerifierFromHashedPassword[SimpleKeyFromPassword[password]]]];
+identity ¨ simpleID;
+IF check THEN CheckSimple[simpleID.credentials, simpleID.verifier];
+};
+strong => {
+strongID: StrongIdentity ¨ NEW[StrongIdentityObject ¨ [name~name, password~password, key~StrongKeyFromPassword[password]]];
+{ h: Finalize.Handle ¨ FinalizeOps.EnableFinalization[strongID, strongIdentityFinalizerQueue];
+AddNewStrongIdentity[newIDHandle~h];
+};
+identity ¨ strongID;
+IF check THEN Terminate[Initiate[identity, authSvcName, 60]];
+};
+ENDCASE => ERROR;
+};
+
+MakeStrongIdentityUsingKey: PUBLIC PROC[name: Name, key: Key,
+check: BOOL ¨ TRUE]
+RETURNS [identity: Identity]
+~ {
+strongID: StrongIdentity;
+TRUSTED { DESFace.CorrectParity[LOOPHOLE[LONG[@key]]] };
+strongID ¨ NEW[StrongIdentityObject ¨ [name~name, password~NIL, key~key]];
+{ h: Finalize.Handle ¨ FinalizeOps.EnableFinalization[strongID, strongIdentityFinalizerQueue];
+AddNewStrongIdentity[newIDHandle~h];
+};
+identity ¨ strongID;
+IF check THEN Terminate[Initiate[identity, authSvcName, 60]];
+};
+
+DestroyIdentity: PUBLIC PROC [identity: Identity] ~ {
+IF identity = NIL THEN RETURN;
+WITH identity SELECT FROM
+simpleID: SimpleIdentity => {
+simpleID.valid ¨ FALSE;
+simpleID.password ¨ NIL;
+simpleID.verifier ¨ VerifierFromHashedPassword[SimpleKeyFromPassword[NIL]];
+};
+strongID: StrongIdentity => {
+strongID.valid ¨ FALSE;
+strongID.conversations ¨ NIL;
+strongID.password ¨ NIL;
+strongID.key ¨ StrongKeyFromPassword[NIL];
+};
+ENDCASE => ERROR;
+};
+
+nullIdentity: Identity ¨ NIL;
+nullIdentityLock: Lock ~ NEW[LockObject ¨ []];
+
+GetNullIdentity: PUBLIC PROC RETURNS [Identity] ~ {
+RETURN [EntryGetNullIdentity[]] };
+
+EntryGetNullIdentity: ENTRY PROC [lock: Lock ¨ nullIdentityLock]
+RETURNS [Identity] ~ {
+IF nullIdentity = NIL THEN nullIdentity ¨ MakeIdentity[name~["", "", ""], password~"", credentialsType~simple, check~FALSE];
+RETURN [nullIdentity] };
+
+NonNilIdentity: PROC [in: Identity] RETURNS [out: Identity] ~ INLINE {
+out ¨ IF in # NIL THEN in ELSE GetNullIdentity[] };
+SimpleConversation: TYPE ~ REF SimpleConversationObject;
+SimpleConversationObject: TYPE ~ RECORD [
+initiatorID: SimpleIdentity,
+recipientName: Name
+];
+
+StrongConversation: TYPE ~ REF StrongConversationObject;
+StrongConversationObject: TYPE ~ RECORD [
+next: StrongConversation,
+initiatorID: StrongIdentity,
+timeStamp: GMT,
+referenced: BOOL ¨ TRUE,
+recipientName: Name,
+recipientHostNumber: HostNumber,
+credentials: Credentials,
+conversationKey: Key,
+lastStrongVerifier: Auth.StrongVerifier
+];
+
+Conversation: TYPE ~ REF;	-- SimpleConversationObject U StrongConversationObject
+
+
+StrongConversationCacheGet: ENTRY PROC[lock: Lock ¨ initiatorCacheLock,
+id: StrongIdentity, name: Name] RETURNS[StrongConversation]
+~ {
+ENABLE UNWIND => NULL;
+p, prev: StrongConversation;
+prev ¨ NIL;  p ¨ id.conversations;
+WHILE (p # NIL) AND (NOT EqualNames[name, p.recipientName]) DO
+prev ¨ p;  p ¨ p.next;
+ENDLOOP;
+IF p # NIL THEN {
+IF prev # NIL THEN prev.next ¨ p.next ELSE id.conversations ¨ p.next;
+p.next ¨ NIL };
+RETURN [p] };
+
+StrongConversationCachePut: ENTRY PROC[lock: Lock ¨ initiatorCacheLock,
+c: StrongConversation, id: StrongIdentity]
+~ {
+ENABLE UNWIND => NULL;
+c.next ¨ id.conversations;
+id.conversations ¨ c };
+
+SweepStrongConversationCache: ENTRY PROC[lock: Lock ¨ initiatorCacheLock] ~ {
+ENABLE UNWIND => NULL;
+FOR h: Finalize.Handle ¨ strongIdentities, IdFromH[h].next WHILE h # NIL DO
+strongID: StrongIdentity ¨ IdFromH[h];
+p, prev: StrongConversation;
+p ¨ strongID.conversations; prev ¨ NIL;
+WHILE p # NIL DO
+IF NOT p.referenced
+THEN -- delete the entry -- {
+p ¨ p.next;
+IF prev = NIL THEN strongID.conversations ¨ p ELSE prev.next ¨ p }
+ELSE -- leave the entry alone -- {
+p.referenced ¨ FALSE;
+prev ¨ p;
+p ¨ p.next };
+ENDLOOP;
+ENDLOOP;
+};
+Initiate: PUBLIC PROC [identity: Identity, recipientName: Name, seconds: CARD]
+RETURNS [conversation: Conversation]
+~ {
+identity ¨ NonNilIdentity[identity];
+WITH identity SELECT FROM
+simpleID: SimpleIdentity => {
+c: SimpleConversation ¨  NEW[SimpleConversationObject ¨ [initiatorID~simpleID, recipientName~recipientName]];
+conversation ¨ c };
+strongID: StrongIdentity => {
+c: StrongConversation;
+c ¨ StrongConversationCacheGet[id~strongID, name~recipientName];
+IF c = NIL THEN
+c ¨ NEW[StrongConversationObject ¨ [timeStamp~BasicTime.earliestGMT, recipientName~recipientName, recipientHostNumber~XNS.unknownHost, credentials~[strong,NIL], conversationKey~, lastStrongVerifier~initialStrongVerifier]];
+c.initiatorID ¨ strongID;
+c.referenced ¨ TRUE;
+Refresh[c, seconds];
+conversation ¨ c };
+ENDCASE => ERROR;
+};
+
+Refresh: PUBLIC PROC [conversation: Conversation, seconds: CARD]
+~ {
+IF conversation = NIL THEN ERROR;
+WITH conversation SELECT FROM
+simpleC: SimpleConversation => {
+NULL };
+strongC: StrongConversation => {	
+seqWords: SeqWords;
+credentialsPackage: Auth.CredentialsPackage;
+nonce: CARD;
+DoGetStrongCredentials: PROC [h: CrRPC.Handle, host: HostNumber] ~ {
+seqWords ¨ Auth.GetStrongCredentials[h, strongC.initiatorID.name, strongC.recipientName, nonce] };
+IF (BasicTime.Period[from~strongC.timeStamp, to~Now[]] + INT[seconds]) <= strongCredentialsLifetime THEN RETURN;
+nonce ¨ BasicTime.GetClockPulses[];
+CallRemote[DoGetStrongCredentials];
+seqWords ¨ DecryptSeqWords[strongC.initiatorID.key, seqWords];
+[cp~credentialsPackage] ¨ FetchCredentialsPackageFromSeqWords[seqWords, 0
+! MarshallError => GOTO Bad];
+IF credentialsPackage.nonce # nonce THEN GOTO Bad;
+strongC.recipientName ¨ credentialsPackage.recipient;
+strongC.credentials ¨ credentialsPackage.credentials;
+strongC.conversationKey ¨ credentialsPackage.conversationKey;
+strongC.lastStrongVerifier ¨ initialStrongVerifier;
+strongC.timeStamp ¨ Now[];
+EXITS
+Bad => ERROR AuthenticationError[credentialsInvalid];
+};
+ENDCASE => ERROR;
+};
+
+Terminate: PUBLIC PROC [conversation: Conversation]
+~ {
+IF conversation = NIL THEN ERROR;
+WITH conversation SELECT FROM
+simpleC: SimpleConversation => {
+NULL };
+strongC: StrongConversation => {	
+strongID: StrongIdentity ~ strongC.initiatorID;
+strongC.initiatorID ¨ NIL;
+StrongConversationCachePut[c~strongC, id~strongID] };
+ENDCASE => ERROR;
+};
+
+GetCredentials: PUBLIC PROC [conversation: Conversation]
+RETURNS [credentials: Credentials]
+~ {
+IF conversation = NIL THEN ERROR;
+WITH conversation SELECT FROM
+simpleC: SimpleConversation => {
+credentials ¨ simpleC.initiatorID.credentials };
+strongC: StrongConversation => {	
+credentials ¨ strongC.credentials };
+ENDCASE => ERROR;
+};
+
+SetRecipientHostNumber: PUBLIC PROC [conversation: Conversation,
+recipientHostNumber: HostNumber]
+~ {
+IF conversation = NIL THEN ERROR;
+WITH conversation SELECT FROM
+simpleC: SimpleConversation => {
+NULL };
+strongC: StrongConversation => {	
+strongC.recipientHostNumber ¨ recipientHostNumber };
+ENDCASE => ERROR;
+};
+
+GetNextVerifier: PUBLIC PROC [conversation: Conversation]
+RETURNS [verifier: Verifier]
+~ {
+IF conversation = NIL THEN ERROR;
+WITH conversation SELECT FROM
+simpleC: SimpleConversation => {
+verifier ¨ simpleC.initiatorID.verifier };
+strongC: StrongConversation => {
+now: GMT ~ Now[];
+IF BasicTime.Period[
+from~BasicTime.FromNSTime[strongC.lastStrongVerifier.timeStamp],
+to~now ] > 0
+THEN strongC.lastStrongVerifier ¨ [timeStamp~BasicTime.ToNSTime[now], ticks~0]
+ELSE strongC.lastStrongVerifier ¨ IncrementStrongVerifier[strongC.lastStrongVerifier];
+verifier ¨ EncryptedVerifierFromStrongVerifier[strongC.conversationKey, LOOPHOLE[strongC.recipientHostNumber], strongC.lastStrongVerifier];
+};
+ENDCASE => ERROR;
+};
+
+ReplyVerifierChecks: PUBLIC PROC [conversation: Conversation, verifier: Verifier]
+RETURNS [ok: BOOL]
+~ {
+IF conversation = NIL THEN ERROR;
+WITH conversation SELECT FROM
+simpleC: SimpleConversation => {
+ERROR AuthenticationError[inappropriateCredentials] };
+strongC: StrongConversation => {
+ENABLE MarshallError => { ok ¨ FALSE; CONTINUE };
+sV: Auth.StrongVerifier ~ StrongVerifierFromEncryptedVerifier[ strongC.conversationKey, LOOPHOLE[strongC.recipientHostNumber], verifier];
+ok ¨ (sV = IncrementStrongVerifier[strongC.lastStrongVerifier]);
+IF ok THEN strongC.lastStrongVerifier ¨ sV };
+ENDCASE => ERROR;
+};
+RSimpleConversation: TYPE ~ REF RSimpleConversationObject;
+RSimpleConversationObject: TYPE ~ RECORD [
+next: RSimpleConversation,
+referenced: BOOL ¨ TRUE,
+initiatorName: Name,
+credentials: Credentials,
+verifier: Verifier
+];
+
+rSimpleConversationCacheLock: Lock ¨ NEW[LockObject ¨ []];
+rSimpleConversationCache: RSimpleConversation ¨ NIL;
+
+RSimpleConversationCacheGet: ENTRY PROC [
+lock: Lock ¨ rSimpleConversationCacheLock,
+credentials: Credentials] RETURNS [RSimpleConversation] ~ {
+ENABLE UNWIND => NULL;
+p, prev: RSimpleConversation;
+IF credentials.type # simple THEN ERROR;
+prev ¨ NIL;  p ¨ rSimpleConversationCache;
+WHILE (p # NIL) AND (NOT EqualSeqWords[credentials.value, p.credentials.value]) DO
+prev ¨ p;  p ¨ p.next;
+ENDLOOP;
+IF p # NIL THEN {
+IF prev # NIL THEN prev.next ¨ p.next ELSE rSimpleConversationCache ¨ p.next;
+p.next ¨ NIL;
+p.referenced ¨ TRUE };
+RETURN [p] };
+
+RSimpleConversationCachePut: ENTRY PROC[
+lock: Lock ¨ rSimpleConversationCacheLock,
+conversation: RSimpleConversation] ~ {
+ENABLE UNWIND => NULL;
+conversation.next ¨ rSimpleConversationCache;
+rSimpleConversationCache ¨ conversation };
+
+SweepRSimpleConversationCache: ENTRY PROC[lock: Lock ¨ rSimpleConversationCacheLock] ~ {
+ENABLE UNWIND => NULL;
+p, prev: RSimpleConversation;
+p ¨ rSimpleConversationCache; prev ¨ NIL;
+WHILE p # NIL DO
+IF p.referenced
+THEN {
+p.referenced ¨ FALSE;
+prev ¨ p;
+p ¨ p.next }
+ELSE {
+p ¨ p.next;
+IF prev = NIL THEN rSimpleConversationCache ¨ p ELSE prev.next ¨ p };
+ENDLOOP;
+};
+RStrongConversation: TYPE ~ REF RStrongConversationObject;
+RStrongConversationObject: TYPE ~ RECORD [
+next: RStrongConversation,
+referenced: BOOL ¨ TRUE,
+credentials: Credentials,
+decryptedStrongCredentials: Auth.StrongCredentials,
+lastStrongVerifier: Auth.StrongVerifier
+];
+
+rStrongConversationCacheLock: Lock ¨ NEW[LockObject ¨ []];
+rStrongConversationCache: RStrongConversation ¨ NIL;
+
+RStrongConversationCacheGet: ENTRY PROC [
+lock: Lock ¨ rStrongConversationCacheLock,
+credentials: Credentials] RETURNS [RStrongConversation] ~ {
+ENABLE UNWIND => NULL;
+p, prev: RStrongConversation;
+IF credentials.type # strong THEN ERROR;
+prev ¨ NIL;  p ¨ rStrongConversationCache;
+WHILE (p # NIL) AND (NOT EqualSeqWords[credentials.value, p.credentials.value]) DO
+prev ¨ p;  p ¨ p.next;
+ENDLOOP;
+IF p # NIL THEN {
+IF prev # NIL THEN prev.next ¨ p.next ELSE rStrongConversationCache ¨ p.next;
+p.next ¨ NIL;
+p.referenced ¨ TRUE };
+RETURN [p] };
+
+RStrongConversationCachePut: ENTRY PROC[
+lock: Lock ¨ rStrongConversationCacheLock,
+conversation: RStrongConversation] ~ {
+ENABLE UNWIND => NULL;
+conversation.next ¨ rStrongConversationCache;
+rStrongConversationCache ¨ conversation };
+
+SweepRStrongConversationCache: ENTRY PROC[lock: Lock ¨ rStrongConversationCacheLock] ~ {
+ENABLE UNWIND => NULL;
+p, prev: RStrongConversation;
+p ¨ rStrongConversationCache; prev ¨ NIL;
+WHILE p # NIL DO
+IF p.referenced
+THEN {
+p.referenced ¨ FALSE;
+prev ¨ p;
+p ¨ p.next }
+ELSE {
+p ¨ p.next;
+IF prev = NIL THEN rStrongConversationCache ¨ p ELSE prev.next ¨ p };
+ENDLOOP;
+};
+
+InvalidateRecipientCaches: PROC ~ {
+rSimpleConversationCache ¨ NIL;
+rStrongConversationCache ¨ NIL;
+};
+Authenticate: PUBLIC PROC [myIdentity: Identity,
+hisCredentials: Credentials, hisVerifier: Verifier,
+allowSimpleCredentials: BOOL,
+useExpiredCredentials: BOOL]
+RETURNS [hisName: Name]
+~ {
+myIdentity ¨ NonNilIdentity[myIdentity];
+SELECT hisCredentials.type FROM
+simple => {
+IF NOT allowSimpleCredentials THEN ERROR AuthenticationError[inappropriateCredentials];
+hisName ¨ AuthenticateSimple[hisCredentials, hisVerifier] };
+strong => {
+[hisName~hisName] ¨ AuthenticateStrong[myIdentity~myIdentity, hisCredentials~hisCredentials, hisVerifier~hisVerifier, useExpiredCredentials~useExpiredCredentials, computeReplyVerifier~FALSE] };
+ENDCASE => ERROR;
+};
+
+AuthenticateAndReply: PUBLIC PROC [myIdentity: Identity,
+hisCredentials: Credentials, hisVerifier: Verifier,
+useExpiredCredentials: BOOL]
+RETURNS [hisName: Name, replyVerifier: Verifier] ~ {
+myIdentity ¨ NonNilIdentity[myIdentity];
+SELECT hisCredentials.type FROM
+simple => {
+ERROR AuthenticationError[inappropriateCredentials];
+};
+strong => {
+[hisName, replyVerifier] ¨ AuthenticateStrong[myIdentity~myIdentity, hisCredentials~hisCredentials, hisVerifier~hisVerifier, useExpiredCredentials~useExpiredCredentials, computeReplyVerifier~TRUE];
+};
+ENDCASE => ERROR;
+};
+
+AuthenticateSimple: PROC [hisCredentials: Credentials, hisVerifier: Verifier]
+RETURNS [hisName: Name]
+~ {
+rSimpleC: RSimpleConversation;
+rSimpleC ¨ RSimpleConversationCacheGet[credentials~hisCredentials];
+IF (rSimpleC = NIL) OR (NOT EqualSeqWords[hisVerifier, rSimpleC.verifier]) THEN {
+CheckSimple[hisCredentials, hisVerifier];
+rSimpleC ¨ NEW[RSimpleConversationObject ¨ [initiatorName~FetchNameFromSeqWords[hisCredentials.value, 0].name, credentials~hisCredentials, verifier~hisVerifier]];
+};
+hisName ¨ rSimpleC.initiatorName;
+RSimpleConversationCachePut[conversation~rSimpleC];
+};
+
+verifierTimeout: INT ~ 60;
+
+AuthenticateStrong: PROC [myIdentity: Identity,
+hisCredentials: Credentials, hisVerifier: Verifier,
+useExpiredCredentials: BOOL ¨ FALSE, computeReplyVerifier: BOOL ¨ FALSE]
+RETURNS [hisName: Name, replyVerifier: Verifier ¨ NIL] ~ {
+rStrongC: RStrongConversation;
+WITH myIdentity SELECT FROM
+myStrongID: StrongIdentity => {
+rStrongC ¨ RStrongConversationCacheGet[credentials~hisCredentials];
+IF rStrongC = NIL THEN {
+ENABLE MarshallError => CONTINUE;
+temp: SeqWords ¨ DecryptSeqWords[key~myStrongID.key, seqWords~hisCredentials.value];
+rStrongC ¨ NEW[RStrongConversationObject ¨ [credentials~hisCredentials, decryptedStrongCredentials~FetchStrongCredentialsFromSeqWords[temp,0].sc, lastStrongVerifier~initialStrongVerifier]];
+};
+IF rStrongC = NIL THEN ERROR AuthenticationError[credentialsInvalid];
+IF NOT useExpiredCredentials THEN {
+expired: BOOL ~ (BasicTime.Period[
+from~Now[],
+to~BasicTime.FromNSTime[rStrongC.decryptedStrongCredentials.expirationTime
+]] <= 0);
+IF expired THEN ERROR AuthenticationError[credentialsExpired] };
+{ ENABLE MarshallError, BasicTime.OutOfRange => GOTO Bad;
+temp: Auth.StrongVerifier ¨ StrongVerifierFromEncryptedVerifier[
+rStrongC.decryptedStrongCredentials.conversationKey, LOOPHOLE[myHostNumber], hisVerifier];
+IF NOT StrongVerifierGT[new~temp, old~rStrongC.lastStrongVerifier] THEN ERROR AuthenticationError[verifierReused];
+IF StrongVerifierExpired[temp] THEN ERROR AuthenticationError[verifierExpired];
+IF computeReplyVerifier
+THEN { rStrongC.lastStrongVerifier ¨ IncrementStrongVerifier[temp];
+replyVerifier ¨ EncryptedVerifierFromStrongVerifier[
+rStrongC.decryptedStrongCredentials.conversationKey, LOOPHOLE[myHostNumber], rStrongC.lastStrongVerifier] }
+ELSE {
+rStrongC.lastStrongVerifier ¨ temp };
+EXITS
+Bad => ERROR AuthenticationError[verifierInvalid];
+};
+hisName ¨ rStrongC.decryptedStrongCredentials.initiator;
+RStrongConversationCachePut[conversation: rStrongC];
+};
+mySimpleID: SimpleIdentity => {
+ERROR AuthenticationError[inappropriateCredentials] };
+ENDCASE => ERROR;
+};
+
+CheckSimple: PROC[credentials: Credentials, verifier: Verifier] ~ {
+okay: BOOL ¨ FALSE;
+DoCheckSimple: PROC [h: CrRPC.Handle, host: HostNumber]
+~ { okay ¨ Auth.CheckSimpleCredentials[h, credentials, verifier] };
+CallRemote[DoCheckSimple];
+IF NOT okay -- can this happen? -- THEN
+ERROR AuthenticationError[problem~credentialsInvalid];
+};
+ChangeMyPasswords: PUBLIC PROC [myIdentity: Identity, newPassword: ROPE,
+changeStrong: BOOL ¨ TRUE, changeSimple: BOOL ¨ TRUE] ~ {
+IF changeStrong THEN {
+newKey: Key ¨ StrongKeyFromPassword[newPassword];
+ChangeMyStrongKey[myIdentity, newKey] };
+IF changeSimple THEN {
+newKey: HashedPassword ¨ SimpleKeyFromPassword[newPassword];
+ChangeMySimpleKey[myIdentity, newKey] };
+};
+
+CreateStrongKey: PUBLIC PROC [myIdentity: Identity, name: Name, newKey: Key] ~ {
+c: Conversation;
+DoIt: PROC [h: CrRPC.Handle, host: HostNumber] ~ {
+SetRecipientHostNumber[c, host];
+Auth.CreateStrongKey[h, GetCredentials[c], GetNextVerifier[c], name, EncryptKey[GetConversationKey[c], newKey]] };
+myIdentity ¨ NonNilIdentity[myIdentity];
+c ¨ Initiate[myIdentity, authSvcName, oneMinuteOfSeconds];
+{ ENABLE UNWIND => Terminate[c];  CallRemote[DoIt] };
+Terminate[c];
+};
+
+ChangeMyStrongKey: PUBLIC PROC [myIdentity: Identity, newKey: Key] ~ {
+c: Conversation;
+DoIt: PROC [h: CrRPC.Handle, host: HostNumber] ~ {
+SetRecipientHostNumber[c, host];
+Auth.ChangeStrongKey[h, GetCredentials[c], GetNextVerifier[c], EncryptKey[GetConversationKey[c], newKey]] };
+myIdentity ¨ NonNilIdentity[myIdentity];
+c ¨ Initiate[myIdentity, authSvcName, oneMinuteOfSeconds];
+{ ENABLE UNWIND => Terminate[c];  CallRemote[DoIt] };
+Terminate[c];
+};
+
+DeleteStrongKey: PUBLIC PROC [myIdentity: Identity, name: Name] ~ {
+c: Conversation;
+DoIt: PROC [h: CrRPC.Handle, host: HostNumber] ~ {
+SetRecipientHostNumber[c, host];
+Auth.DeleteStrongKey[h, GetCredentials[c], GetNextVerifier[c], name] };
+myIdentity ¨ NonNilIdentity[myIdentity];
+c ¨ Initiate[myIdentity, authSvcName, oneMinuteOfSeconds];
+{ ENABLE UNWIND => Terminate[c];  CallRemote[DoIt] };
+Terminate[c];
+};
+
+CreateSimpleKey: PUBLIC PROC [myIdentity: Identity, name: Name, newKey: HashedPassword] ~ {
+c: Conversation;
+DoIt: PROC [h: CrRPC.Handle, host: HostNumber] ~ {
+SetRecipientHostNumber[c, host];
+Auth.CreateSimpleKey[h, GetCredentials[c], GetNextVerifier[c], name, newKey] };
+myIdentity ¨ NonNilIdentity[myIdentity];
+c ¨ Initiate[myIdentity, authSvcName, oneMinuteOfSeconds];
+{ ENABLE UNWIND => Terminate[c];  CallRemote[DoIt] };
+Terminate[c];
+};
+
+ChangeMySimpleKey: PUBLIC PROC [myIdentity: Identity, newKey: HashedPassword] ~ {
+c: Conversation;
+DoIt: PROC [h: CrRPC.Handle, host: HostNumber] ~ {
+SetRecipientHostNumber[c, host];
+Auth.ChangeSimpleKey[h, GetCredentials[c], GetNextVerifier[c], newKey] };
+myIdentity ¨ NonNilIdentity[myIdentity];
+c ¨ Initiate[myIdentity, authSvcName, oneMinuteOfSeconds];
+{ ENABLE UNWIND => Terminate[c];  CallRemote[DoIt] };
+Terminate[c];
+};
+
+DeleteSimpleKey: PUBLIC PROC [myIdentity: Identity, name: Name] ~ {
+c: Conversation;
+DoIt: PROC [h: CrRPC.Handle, host: HostNumber] ~ {
+SetRecipientHostNumber[c, host];
+Auth.DeleteSimpleKey[h, GetCredentials[c], GetNextVerifier[c], name] };
+myIdentity ¨ NonNilIdentity[myIdentity];
+c ¨ Initiate[myIdentity, authSvcName, oneMinuteOfSeconds];
+{ ENABLE UNWIND => Terminate[c];  CallRemote[DoIt] };
+Terminate[c];
+};
+StrongKeyFromPassword: PUBLIC PROC [password: ROPE] RETURNS [key: Key] ~ {
+index: INT;
+passwordLen: INT ~ Rope.Length[password];
+ki: DESFace.Key ¨ DESFace.nullKey;
+bi: Block;
+biPlus1: Block;
+FOR index ¨ 0, index + 4 WHILE index < passwordLen DO
+len: INT ~ MIN[4, passwordLen-index];
+TRUSTED {
+StoreSubropeInBlock[password, index, len, @bi, TRUE];
+DESFace.CorrectParity[@ki];
+DESFace.EncryptBlock[key~ki, from~@bi, to~@biPlus1];
+ki ¨ LOOPHOLE[biPlus1] };
+ENDLOOP;
+TRUSTED { DESFace.CorrectParity[@ki] };
+RETURN [ LOOPHOLE[ki] ];
+};
+
+SimpleKeyFromPassword: PUBLIC PROC [password: ROPE]
+RETURNS [hashVal: HashedPassword ¨ 0] ~ {
+c: CHAR;
+acc: Basics.LongNumber;
+FOR i: INT IN [0 .. Rope.Length[password]) DO
+c ¨ Rope.Fetch[password, i];
+SELECT c FROM
+IN ['A .. 'Z] => c ¨ 'a + (c - 'A);
+ENDCASE;
+acc.hi ¨ hashVal;  acc.lo ¨ ORD[c];
+hashVal ¨ acc.lc MOD 65357;
+ENDLOOP;
+};
+
+GetCredentialsType: PUBLIC PROC [credentials: Credentials]
+RETURNS [CredentialsType] ~ {
+RETURN [credentials.type] };
+
+GetConversationDetails: PUBLIC PROC [conversation: Conversation] RETURNS [
+recipientName: Name, recipientHostNumber: HostNumber, credentials: Credentials, conversationKey: Key, owner: Identity] ~ {
+IF conversation = NIL THEN ERROR;
+WITH conversation SELECT FROM
+simpleC: SimpleConversation => {
+recipientName ¨ simpleC.recipientName;
+recipientHostNumber ¨ XNS.unknownHost;
+credentials ¨ simpleC.initiatorID.credentials;
+conversationKey ¨ ALL[0];
+owner ¨ simpleC.initiatorID };
+strongC: StrongConversation => {
+recipientName ¨ strongC.recipientName;
+recipientHostNumber ¨ strongC.recipientHostNumber;
+credentials ¨ strongC.credentials;
+conversationKey ¨ strongC.conversationKey;
+owner ¨ strongC.initiatorID };
+ENDCASE => ERROR;
+};
+
+GetConversationKey: PROC [conversation: Conversation]
+RETURNS [conversationKey: Key] ~ {
+IF conversation = NIL THEN ERROR;
+WITH conversation SELECT FROM
+simpleC: SimpleConversation => ERROR AuthenticationError[inappropriateCredentials];
+strongC: StrongConversation => conversationKey ¨ strongC.conversationKey;
+ENDCASE => ERROR;
+};
+
+GetIdentityDetails: PUBLIC PROC [identity: Identity] RETURNS [
+name: Name, password: ROPE, credentialsType: CredentialsType] ~ {
+identity ¨ NonNilIdentity[identity];
+WITH identity SELECT FROM
+simpleI: SimpleIdentity => {
+name ¨ simpleI.name;
+password ¨ simpleI.password;
+credentialsType ¨ simple };
+strongI: StrongIdentity => {
+name ¨ strongI.name;
+password ¨ strongI.password;
+credentialsType ¨ strong };
+ENDCASE => ERROR;
+};
+
+GetCredentialsDetails: PUBLIC PROC [myKey: Key, hisCredentials: Credentials]
+RETURNS [ok: BOOL, credentialsType: CredentialsType, conversationKey: Key,
+expirationTime: GMT, hisName: Name] ~ {
+ok ¨ FALSE;
+SELECT hisCredentials.type FROM
+simple => {
+ENABLE MarshallError => CONTINUE;
+credentialsType ¨ simple;
+conversationKey ¨ ALL[0];
+expirationTime ¨ BasicTime.latestGMT;
+hisName ¨ FetchNameFromSeqWords[hisCredentials.value, 0].name;
+ok ¨ TRUE;
+};
+strong => {
+ENABLE MarshallError => CONTINUE;
+rStrongC: RStrongConversation;
+sC: Auth.StrongCredentials;
+credentialsType ¨ strong;
+rStrongC ¨ RStrongConversationCacheGet[credentials~hisCredentials];
+IF rStrongC # NIL
+THEN {
+sC ¨ rStrongC.decryptedStrongCredentials;
+RStrongConversationCachePut[conversation: rStrongC] }
+ELSE {
+temp: SeqWords ¨ DecryptSeqWords[key~myKey, seqWords~hisCredentials.value];
+[sc~sC] ¨ FetchStrongCredentialsFromSeqWords[temp,0] };
+conversationKey ¨ sC.conversationKey;
+expirationTime ¨ BasicTime.FromNSTime[sC.expirationTime];
+hisName ¨ sC.initiator;
+ok ¨ TRUE;
+};
+ENDCASE => ERROR;
+};
+Daemon: PROC ~ {
+DO
+Process.PauseMsec[msecBetweenSweeps];
+SweepStrongConversationCache[];
+SweepRStrongConversationCache[];
+ENDLOOP;
+};
+EqualNames: PROC [a: Name, b: Name] RETURNS [BOOL] ~ {
+RETURN[Rope.Equal[a.organization, b.organization, FALSE]
+AND Rope.Equal[a.domain, b.domain, FALSE]
+AND Rope.Equal[a.object, b.object, FALSE]] };
+
+EqualSeqWords: PROC [a, b: SeqWords] RETURNS [BOOL] ~ {
+IF a.length # b.length THEN RETURN [FALSE];
+FOR i: CARDINAL IN [0..a.length) DO
+IF a.body[i] # b.body[i] THEN RETURN [FALSE];
+ENDLOOP;
+RETURN [TRUE] };
+
+IncrementStrongVerifier: PROC [v: Auth.StrongVerifier]
+RETURNS [result: Auth.StrongVerifier] ~ {
+result.timeStamp ¨ v.timeStamp;
+IF (result.ticks ¨ v.ticks + 1) = 0
+THEN result.timeStamp ¨ result.timeStamp + 1;
+};
+
+StrongVerifierGT: PROC [new, old: Auth.StrongVerifier] RETURNS [gt: BOOL] ~ {
+deltaT: INT ~ BasicTime.Period[from~BasicTime.FromNSTime[old.timeStamp], to~BasicTime.FromNSTime[new.timeStamp]];
+SELECT deltaT FROM
+> 0 => RETURN [TRUE];
+< 0 => RETURN [FALSE];
+0 => RETURN [new.ticks > old.ticks];
+ENDCASE => RETURN [new.ticks > old.ticks];
+};
+
+StrongVerifierExpired: PROC [v: Auth.StrongVerifier] RETURNS [expired: BOOL] ~ {
+deltaT: INT ~ BasicTime.Period[from~BasicTime.FromNSTime[v.timeStamp], to~Now[]];
+RETURN [ deltaT > strongVerifierTimeout ] };
+
+FetchRopeFromSeqWords: PROC [s: SeqWords, where: CARDINAL]
+RETURNS [newWhere: CARDINAL, r: ROPE] ~ {
+i, count, seqLen: CARDINAL;
+w: Basics.Word16;
+buf: REF TEXT;
+seqLen ¨ s.length;
+IF where >= seqLen THEN ERROR MarshallError;
+count ¨ s.body[where];  where ¨ where + 1;
+buf ¨ RefText.ObtainScratch[count];
+i ¨ 0;
+WHILE i < count DO
+IF where >= seqLen THEN ERROR MarshallError;
+w.card ¨ s.body[where];  where ¨ where + 1;
+buf ¨ RefText.InlineAppendChar[buf, VAL[w.hi]];  i ¨ i + 1;
+IF i < count THEN { buf ¨ RefText.InlineAppendChar[buf, VAL[w.lo]];  i ¨ i + 1 };
+ENDLOOP;
+newWhere ¨ where;  r ¨ Rope.FromRefText[buf];
+RefText.ReleaseScratch[buf] };
+
+StoreRopeInSeqWords: PROC [r: ROPE, s: SeqWords, where: CARDINAL]
+RETURNS [newWhere: CARDINAL] ~ {
+i, length, seqLen: CARDINAL;
+w: Basics.Word16;
+length ¨ Rope.Length[r];
+seqLen ¨ s.length;
+IF where >= seqLen THEN ERROR MarshallError;
+s.body[where] ¨ length;  where ¨ where + 1;
+i ¨ 0;
+WHILE i < length DO
+w.hi ¨ ORD[Rope.Fetch[r,i]];  i ¨ i + 1;
+w.lo ¨ (IF i < length THEN ORD[Rope.Fetch[r,i]] ELSE 0);  i ¨ i + 1;
+IF where >= seqLen THEN ERROR MarshallError;
+s.body[where] ¨ w.card;  where ¨ where + 1; -- USED TO BE LOOPHOLE[w] ????
+ENDLOOP;
+RETURN [where] };
+
+FetchSeqWordsFromSeqWords: PROC [s: SeqWords, where: CARDINAL]
+RETURNS [newWhere: CARDINAL, result: SeqWords] ~ {
+n, seqLen: CARDINAL;
+seqLen ¨ s.length;
+IF where >= seqLen THEN ERROR MarshallError;
+n ¨ s.body[where];  where ¨ where + 1;
+IF (n+where) > seqLen THEN ERROR MarshallError;
+result ¨ NEW[SeqWordsObject[n]];
+FOR i: CARDINAL IN [0..n) DO
+result.body[i] ¨ s.body[where];  where ¨ where + 1;
+ENDLOOP;
+newWhere ¨ where;
+};
+
+StoreSeqWordsInSeqWords: PROC [s: SeqWords, arg: SeqWords, where: CARDINAL]
+RETURNS [newWhere: CARDINAL] ~ {
+n: CARDINAL ~ arg.length;
+seqLen: CARDINAL ~ s.length;
+IF (where+n+1) > seqLen THEN ERROR MarshallError;
+s.body[where] ¨ n;  where ¨ where + 1;
+FOR i: CARDINAL IN [0..n) DO
+s.body[where] ¨ arg.body[i];  where ¨ where + 1;
+ENDLOOP;
+newWhere ¨ where;
+};
+
+FetchBlockFromSeqWords: PROC [s: SeqWords, where: CARDINAL]
+RETURNS [newWhere: CARDINAL, block: Block] ~ {
+IF (newWhere ¨ where+4) > s.length THEN ERROR MarshallError;
+block[0] ¨ s.body[where];
+block[1] ¨ s.body[where+1];
+block[2] ¨ s.body[where+2];
+block[3] ¨ s.body[where+3];
+};
+
+StoreBlockInSeqWords: PROC [s: SeqWords, block: Block, where: CARDINAL]
+RETURNS [newWhere: CARDINAL] ~ {
+IF (newWhere ¨ where+4) > s.length THEN ERROR MarshallError;
+s.body[where] ¨ block[0];
+s.body[where+1] ¨ block[1];
+s.body[where+2] ¨ block[2];
+s.body[where+3] ¨ block[3];
+};
+
+FetchCredentialsFromSeqWords: PROC [s: SeqWords, where: CARDINAL]
+RETURNS [newWhere: CARDINAL, c: Credentials] ~ {
+type: CARDINAL;
+IF where >= s.length THEN ERROR MarshallError;
+type ¨ s.body[where];  where ¨ where + 1;
+SELECT type FROM
+ORD[CredentialsType.strong] => c.type ¨ strong;
+ORD[CredentialsType.simple] => c.type ¨ simple;
+ENDCASE => ERROR MarshallError;
+[newWhere~newWhere, result~c.value] ¨ FetchSeqWordsFromSeqWords[s, where];
+};
+
+FetchCard32FromSeqWords: PROC [s: SeqWords, where: CARDINAL]
+RETURNS [newWhere: CARDINAL, result: CARD32] ~ {
+n: Basics.LongNumber;
+IF(newWhere ¨ where+2) > s.length THEN ERROR MarshallError;
+n.hi ¨ s.body[where];
+n.lo ¨ s.body[where+1];
+result ¨ n.lc };
+
+FetchCredentialsPackageFromSeqWords: PROC [s: SeqWords, where: CARDINAL]
+RETURNS [newWhere: CARDINAL, cp: Auth.CredentialsPackage] ~ {
+[where, cp.credentials] ¨ FetchCredentialsFromSeqWords[s, where];
+IF cp.credentials.type # strong THEN ERROR AuthenticationError[inappropriateCredentials];
+[where, cp.nonce] ¨ FetchCard32FromSeqWords[s, where];
+[where, cp.recipient] ¨ FetchNameFromSeqWords[s, where];
+[where, cp.conversationKey] ¨ FetchBlockFromSeqWords[s, where];
+newWhere ¨ where };
+
+FetchStrongCredentialsFromSeqWords: PROC [s: SeqWords, where: CARDINAL]
+RETURNS [newWhere: CARDINAL, sc: Auth.StrongCredentials] ~ {
+[where, sc.conversationKey] ¨ FetchBlockFromSeqWords[s, where];
+[where, sc.expirationTime] ¨ FetchCard32FromSeqWords[s, where];
+[where, sc.initiator] ¨ FetchNameFromSeqWords[s, where];
+newWhere ¨ where };
+
+StoreSubropeInBlock: PROC [r: ROPE, index, len: INT,
+to: LONG POINTER TO Block, mapCase: BOOL ¨ TRUE] ~ {
+c: CHAR;
+blockIndex: INT ¨ 0;
+WHILE blockIndex < len DO
+c ¨ Rope.Fetch[r, index];
+IF mapCase THEN SELECT c FROM
+IN ['A .. 'Z] => c ¨ 'a + (c - 'A);
+ENDCASE;
+TRUSTED { to[blockIndex] ¨ ORD[c] };
+index ¨ index + 1;
+blockIndex ¨ blockIndex + 1;
+ENDLOOP;
+WHILE blockIndex < 4 DO
+TRUSTED { to[blockIndex] ¨ 0 };
+blockIndex ¨ blockIndex + 1;
+ENDLOOP;
+};
+
+FetchNameFromSeqWords: PROC [s: SeqWords, where: CARDINAL]
+RETURNS [newWhere: CARDINAL, name: Name] ~ {
+[where, name.organization] ¨ FetchRopeFromSeqWords[s, where];
+[where, name.domain] ¨ FetchRopeFromSeqWords[s, where];
+[where, name.object] ¨ FetchRopeFromSeqWords[s, where];
+newWhere ¨ where };
+
+StoreNameInSeqWords: PROC [name: Name, s: SeqWords, where: CARDINAL]
+RETURNS [newWhere: CARDINAL] ~ {
+where ¨ StoreRopeInSeqWords[name.organization, s, where];
+where ¨ StoreRopeInSeqWords[name.domain, s, where];
+where ¨ StoreRopeInSeqWords[name.object, s, where];
+RETURN [where] };
+
+MarshalledNameHwords: PROC [name: Name] RETURNS [hWords: CARDINAL] ~ {
+RETURN [CrRPC.MarshalledRopeHWords[name.organization] + CrRPC.MarshalledRopeHWords[name.domain] + CrRPC.MarshalledRopeHWords[name.object]] };
+
+SeqWordsFromName: PROC [name: Name] RETURNS [SeqWords] ~ {
+s: SeqWords ¨ NEW[SeqWordsObject[MarshalledNameHwords[name]]];
+[] ¨ StoreNameInSeqWords[name, s, 0];
+RETURN [s] };
+
+CredentialsFromName: PROC [name: Name] RETURNS [credentials: Credentials] ~ {
+RETURN[ [type~simple, value~SeqWordsFromName[name]] ] };
+
+VerifierFromHashedPassword: PROC [hashedPassword: HashedPassword]
+RETURNS [verifier: Verifier] ~ {
+verifier ¨ NEW[SeqWordsObject[1]];
+verifier.body[0] ¨ hashedPassword };
+
+EncryptKey: PROC [key: Key, data: Key] RETURNS [result: Key] ~ TRUSTED {
+DESFace.EncryptBlock[LOOPHOLE[key], LOOPHOLE[LONG[@data]], LOOPHOLE[LONG[@result]]] };
+
+EncryptSeqWords: PROC [key: Key, seqWords: SeqWords] RETURNS [result: SeqWords] ~ {
+nBlocks: CARDINAL ¨ (seqWords.length*BITS[CARD16] + BITS[Block] - 1) / BITS[Block];
+roundedLength: CARDINAL ¨ nBlocks * (BITS[Block]/BITS[CARD16]);
+result ¨ NEW[SeqWordsObject[roundedLength]];
+IF roundedLength # seqWords.length THEN {
+FOR i: CARDINAL IN [0..seqWords.length)
+DO result.body[i] ¨ seqWords.body[i] ENDLOOP;
+FOR i: CARDINAL IN [seqWords.length..roundedLength)
+DO result.body[i] ¨ 0 ENDLOOP;
+seqWords ¨ result };
+TRUSTED {
+blocksFrom: DESFace.Blocks ~ LOOPHOLE[
+LOOPHOLE[seqWords, LONG POINTER] + SIZE[SeqWordsObject[0]] ];
+blocksTo: DESFace.Blocks ~ LOOPHOLE[
+LOOPHOLE[result, LONG POINTER] + SIZE[SeqWordsObject[0]] ];
+DESFace.CBCCheckEncrypt[LOOPHOLE[key], nBlocks, blocksFrom, blocksTo, ALL[0]];
+};
+};
+
+DecryptSeqWords: PROC [key: Key, seqWords: SeqWords] RETURNS [result: SeqWords] ~ {
+nBlocks: CARDINAL ~ (seqWords.length*BITS[CARD16]) / BITS[Block];
+roundedLength: CARDINAL ¨ nBlocks * (BITS[Block]/BITS[CARD16]);
+IF seqWords.length # roundedLength THEN ERROR MarshallError;
+result ¨ NEW[SeqWordsObject[roundedLength]];
+TRUSTED {
+blocksFrom: DESFace.Blocks ~ LOOPHOLE[
+LOOPHOLE[seqWords, LONG POINTER] + SIZE[SeqWordsObject[0]] ];
+blocksTo: DESFace.Blocks ~ LOOPHOLE[
+LOOPHOLE[result, LONG POINTER] + SIZE[SeqWordsObject[0]] ];
+DESFace.CBCCheckDecrypt[LOOPHOLE[key], nBlocks, blocksFrom, blocksTo, ALL[0]];
+};
+};
+
+PackBytes: PROC[hi, lo: BYTE] RETURNS [CARD16] ~ INLINE { RETURN [256*hi + lo] };
+
+EncryptedVerifierFromStrongVerifier: PROC [conversationKey: Key,
+hostNumber: HostNumber, strongVerifier: Auth.StrongVerifier]
+RETURNS [verifier: Verifier] ~ {
+verifierInHWords: CARDINAL ~ BYTES[Auth.StrongVerifier]/BYTES[Basics.HWORD];
+seqWords: SeqWords ~ NEW[SeqWordsObject[verifierInHWords]];
+temp: Basics.LongNumber;
+temp.lc ¨ strongVerifier.timeStamp;
+seqWords.body[0] ¨ Basics.BITXOR[temp.hi, PackBytes[hostNumber.a, hostNumber.b]];
+seqWords.body[1] ¨ Basics.BITXOR[temp.lo, PackBytes[hostNumber.c, hostNumber.d]];
+temp.lc ¨ strongVerifier.ticks;
+seqWords.body[2] ¨ Basics.BITXOR[temp.hi, PackBytes[hostNumber.e, hostNumber.f]];
+seqWords.body[3] ¨ temp.lo;
+verifier ¨ EncryptSeqWords[key~LOOPHOLE[conversationKey], seqWords~seqWords];
+};
+
+StrongVerifierFromEncryptedVerifier: PROC [conversationKey: Key,
+hostNumber: HostNumber, verifier: Verifier]
+RETURNS [strongVerifier: Auth.StrongVerifier] ~ {
+temp: Basics.LongNumber;
+IF verifier.length # (BITS[Auth.StrongVerifier]/BITS[CARD16]) THEN ERROR MarshallError;
+verifier ¨ DecryptSeqWords[key~LOOPHOLE[conversationKey], seqWords~verifier];
+temp.hi ¨ Basics.BITXOR[verifier.body[0], PackBytes[hostNumber.a, hostNumber.b]];
+temp.lo ¨ Basics.BITXOR[verifier.body[1], PackBytes[hostNumber.c, hostNumber.d]];
+strongVerifier.timeStamp ¨ temp.lc;
+temp.hi ¨ Basics.BITXOR[verifier.body[2], PackBytes[hostNumber.e, hostNumber.f]];
+temp.lo ¨ verifier.body[3];
+strongVerifier.ticks ¨ temp.lc;
+};
+ServerInfo: TYPE ~ REF ServerInfoObject;
+ServerInfoObject: TYPE ~ RECORD [
+next: ServerInfo,
+refAddress: REF XNS.Address,	-- REF conforms to CrRPC.RefAddress
+hops: XNSRouter.Hops
+];
+
+serverInfoLock: Lock ¨ NEW[LockObject ¨ []];
+serverBroadcastLock: Lock ¨ NEW[LockObject ¨ []];
+serverInfo: ServerInfo ¨ NIL;
+serverInfoTimestamp: GMT;
+
+defaultServerHops: XNSRouter.Hops ~ 3;
+maxServerHops: XNSRouter.Hops ~ 6;
+secondsBetweenBroadcasts: INT ~ 600;
+
+broadcastPauseLimit: CARDINAL ¨ 3;
+broadcastPauseMsec: CARDINAL ¨ 11000;
+
+InvalidateServerCache: ENTRY PROC [lock: Lock ¨ serverInfoLock] ~ { serverInfo ¨ NIL };
+
+DeleteServer: ENTRY PROC [lock: Lock ¨ serverInfoLock, it: ServerInfo] ~ {
+ENABLE UNWIND => NULL;
+IF it = serverInfo THEN { serverInfo ¨ it.next; RETURN };
+FOR p: ServerInfo ¨ serverInfo, p.next WHILE p # NIL DO
+IF p.next = it THEN { p.next ¨ it.next; RETURN };
+ENDLOOP;
+};
+
+AddServerAddress: ENTRY PROC [lock: Lock ¨ serverInfoLock, addr: XNS.Address, hops: XNSRouter.Hops] ~ {
+ENABLE UNWIND => NULL;
+p, prev, new: ServerInfo;
+prev ¨ NIL;  p ¨ serverInfo;
+WHILE (p # NIL) AND (p.refAddress≠ # addr) DO { prev ¨ p;  p ¨ p.next } ENDLOOP;
+IF p = NIL
+THEN {
+new ¨ NEW[ServerInfoObject ¨ [
+next~NIL,
+refAddress~NEW[XNS.Address ¨ addr],
+hops~hops]]
+}
+ELSE { 
+IF prev # NIL THEN prev.next ¨ p.next ELSE serverInfo ¨ p.next;
+new ¨ p;  new.hops ¨ hops;
+};
+prev ¨ NIL;  p ¨ serverInfo;
+WHILE (p # NIL) AND (p.hops < hops) DO { prev ¨ p;  p ¨ p.next } ENDLOOP;
+new.next ¨ p;
+IF prev # NIL THEN prev.next ¨ new ELSE serverInfo ¨ new;
+};
+
+BroadcastForServers: ENTRY PROC [lock: Lock ¨ serverBroadcastLock,
+maxHops: CARDINAL, nWanted: CARDINAL ¨ 0, tryLimit: CARDINAL ¨ 0] ~ {
+ENABLE UNWIND => NULL;
+nGot: CARDINAL ¨ 0;
+EachAddress: XNSServerLocation.EachAddressProc -- [addr: XNS.Address] -- ~ {
+hops: XNSRouter.Hops;
+addr.socket ¨ XNS.unknownSocket;
+hops ¨ XNSRouter.GetHops[addr.net];
+AddServerAddress[addr~addr, hops~hops];
+IF (nGot ¨ nGot.SUCC) = nWanted THEN ERROR XNSServerLocation.StopBroadcast[] };
+XNSServerLocation.LocateServers[eachAddress~EachAddress, socket~XNSWKS.authenticationInfo, remotePgm~authPgmNum, remotePgmVersion~authVersionNum, maxHops~maxHops, tryLimit~tryLimit];
+serverInfoTimestamp ¨ Now[];
+};
+
+numBroadcastPauses: INT ¨ 0; -- DEBUG
+
+GetBestServer: PROC RETURNS [p: ServerInfo] ~ {
+nBroadcasts: CARDINAL ¨ 0;
+DO
+currentHops: XNSRouter.Hops;
+p ¨ serverInfo; -- ATOMIC
+SELECT TRUE FROM
+(p = NIL) => {
+BroadcastForServers[maxHops~maxServerHops, nWanted~1];
+nBroadcasts ¨ nBroadcasts.SUCC;
+IF ((p ¨ serverInfo) = NIL) AND (nBroadcasts <= broadcastPauseLimit) THEN {
+Process.PauseMsec[broadcastPauseMsec];
+numBroadcastPauses ¨ numBroadcastPauses.SUCC; -- DEBUG
+LOOP };
+TRUSTED { Process.Detach[ FORK BroadcastForServers[maxHops~defaultServerHops, tryLimit~1] ] };
+RETURN };
+((currentHops ¨ XNSRouter.GetHops[p.refAddress.net]) # p.hops) => {
+DeleteServer[it~p];
+AddServerAddress[addr~p.refAddress≠, hops~currentHops];
+LOOP };
+((p.hops > 0) AND (BasicTime.Period[from~serverInfoTimestamp, to~Now[]] > secondsBetweenBroadcasts)) =>
+TRUSTED { Process.Detach[ FORK BroadcastForServers[maxHops~MIN[(p.hops-1), defaultServerHops], tryLimit~1] ];
+RETURN };
+ENDCASE => {
+RETURN };
+ENDLOOP;
+};
+
+CallRemote: PROC [proc: PROC [CrRPC.Handle, HostNumber]] ~ {
+h: CrRPC.Handle ¨ NIL;
+p: ServerInfo;
+maxTries: CARDINAL ~ 10;
+CleanUp: PROC ~ { IF h # NIL THEN { CrRPC.DestroyClientHandle[h]; h ¨ NIL }};
+
+FOR try: CARDINAL IN [1..maxTries] DO
+BEGIN
+ENABLE {
+UNWIND => CleanUp[];
+CrRPC.Error => { CleanUp[]; DeleteServer[it~p]; LOOP };
+CallError => SELECT problem FROM
+tooBusy, databaseFull => { CleanUp[]; DeleteServer[it~p]; LOOP };
+ENDCASE => REJECT;
+};
+
+IF (p ¨ GetBestServer[]) = NIL THEN EXIT;
+h ¨ CrRPC.CreateClientHandle[class~$CMUX, remote~p.refAddress];
+proc[h, p.refAddress.host]; CleanUp[]; RETURN;
+
+END;
+ENDLOOP;
+
+CleanUp[]; CantContactAuthServer[];
+};
+GetStrongCredentialsLifetime: PROC [name: Name, password: ROPE]
+RETURNS [ok: BOOL ¨ FALSE, seconds: INT ¨ 0, from, to: BasicTime.Unpacked] ~ {
+ENABLE CallError, AuthenticationError => CONTINUE;
+id: Identity;
+c: Conversation;
+t1, t2, tExp: GMT;
+myKey: Key;
+hisCredentials: Credentials;
+id ¨ MakeIdentity[name, password, strong, FALSE];
+t1 ¨ Now[];
+c ¨ Initiate[id, name, 3600];
+t2 ¨ Now[];
+myKey ¨ StrongKeyFromPassword[password];
+[credentials~hisCredentials] ¨ GetConversationDetails[c];
+[ok~ok, expirationTime~tExp] ¨ GetCredentialsDetails[myKey~myKey, hisCredentials~hisCredentials];
+IF ok THEN {
+seconds ¨ (BasicTime.Period[from~t1, to~tExp] + BasicTime.Period[from~t2, to~tExp] + 1) / 2;
+from ¨ BasicTime.Unpack[t1];
+to ¨ BasicTime.Unpack[tExp];
+};
+Terminate[c];
+};
+
+AuthenticateToSelf: PROC [name: Name, password: ROPE, howMany: CARDINAL] ~ {
+count: CARDINAL ¨ 0;
+id: Identity;
+c: Conversation;
+credentials: Credentials;
+verifier: Verifier;
+replyVerifier: Verifier;
+myHostNumber: HostNumber;
+id ¨ MakeIdentity[name, password, strong, FALSE];
+c ¨ Initiate[id, name, 3600];
+myHostNumber ¨ XNS.GetThisHost[];
+SetRecipientHostNumber[c, myHostNumber];
+WHILE count < howMany DO
+credentials ¨ GetCredentials[c];
+verifier ¨ GetNextVerifier[c];
+[replyVerifier~replyVerifier] ¨ AuthenticateAndReply[id, credentials, verifier, FALSE];
+IF NOT ReplyVerifierChecks[c, replyVerifier] THEN ERROR AuthenticationError[verifierInvalid];
+count ¨ count + 1;
+ENDLOOP;
+Terminate[c];
+};
+InitialBroadcastForServers: PROC ~ TRUSTED {
+Process.Detach[ FORK BroadcastForServers[maxHops~defaultServerHops, nWanted~2]] };
+
+TRUSTED { Process.Detach[ FORK Daemon[]] };
+InitialBroadcastForServers[];
+}.
+ 
+     XNSAuthImpl.mesa
+Copyright ” 1989, 1991 by Xerox Corporation.  All rights reserved.
+Demers, November 15, 1989 12:27:33 pm PST
+Tim Diebert: December 4, 1989 5:19:04 pm PST
+
+NOTE: The observed behavior of authentication service is that new credentials expire in one day (!).  The refresh heuristics are designed around this, and will need to be fixed if the behvaior changes.
+PCedar Notes: SIZE[SeqWordObject[0]] really does seem to be the right thing and is portable.  SIZE[Auth.StrongVerifier] IS WRONG.
+Willie-s, December 10, 1991 10:43 am PST
+Christian Jacobi, July 24, 1992 1:50 pm PDT
+
+This isn't supposed to happen, but occasionally it does!
+Initiator
+Identities
+Conversations
+Note there is no simple conversation cache on the initiator's side, since creating a simple conversation does not require contacting the authentication service.
+Public Procedures
+Recipient
+Simple Conversations
+Strong Conversations
+Cache Invalidation on Rollback
+Public Procedures
+Private Utilities
+Just return if okay, else raise CallError or AuthenticationError.
+Key and Password Administration
+Public Utilities
+DESFace.EncryptBlock[key~ki, from~@bi, to~LOOPHOLE[LONG[@ki]]] };
+Daemon
+Private Utilities
+Store len chars in block using 16-bit encoding.
+???? Word size dependent. ????
+Locating Authentication Servers and Performing Remote Calls
+These are necessary for machines with only 3Mb Ethernets, because it can take so long for the routing and translation caches to fill.  They should go away after improvements are made in the underlying transport.
+Delete old entry for this address (hops may have changed)
+Add new entry in correct position (sorted by hops)
+Debugging Stuff
+Main Line Code
+Rollback: Booting.RollbackProc ~ {
+InvalidateRecipientCaches[];
+InvalidateServerCache[];
+InitialBroadcastForServers[];
+};
+
+ù +$  ñ(cedarcode) styleïNewlineDelimiter
+ò ôIcodeöú
+œeú7ôBJô)Kô,Jô Jô…JôÅJô(Jô+Jô óöœk	ò	Köúûú¥òÕKöúûúûúûúò1Köú
+ûú+ûúXòïKöúûúPò[Köúûú^òkKöú	ûúò(Köúûú@òQKöúûúò"Köúûú3ò@Köúûú%ûúò5Köú
+ûúòKöûúûú:òCKöúûúEòRKò Köúûú1òHKöûúûúò!KöúòKò óöœnúûúûòKöûúûúòKöûúhûúòêKöûúòKòKöûúüúüúò0Kò KöúûúòKöúûúòKò Köú
+ûúòKöúûúò+KöûúûúûúòKöúûúòKöûúûúûúòKöúûúòKöúûúò(Köúûúò0Köúûúò.KöúûúòKöúûúòKöú
+ûúò"KöúûúûúòKò Kò Köúûúò-Kò KòIKò Köú\ò\Kò KöúûúòKöúûúûúò3Köúûúûúò0Köúûúûúò/Kò Köúûúò1Köúûúò0Kò Köúûúûúûúò>Kò Köúûú=òMKò ö
+üúûúûúûúûúò'òKöú1ûúò@óóKò öüúûúò9Kòóöü	úûú1òHKòóKò Köüúûúûúò$Kò öüúûúòKô8Köûú4ò9óKò KöúûúûúòKöúûúû	úûúò'Kò headô	ô
+Köúûúûúò0öúûúûúò%KòKöú
+ûúòKöúûúûúòKòKòKòKò óKöúûúûúò0öúûúûúò%KòKò"KòKöú
+ûúœc+ò;KöúûúûúòKöúòKòKò óKöú
+ûúûú†–cm†òDKò Köúûúò0Köú$ûúò(Kò öüúûúûúûúòKKöúûú ò+Kò óöüúû
+úDòdKò-Kò!Kò óöüúûúûúDògKòKöúûúò#öûúûúûúûò(Kò
+KòKöûúòóöûúûúûúòöûú	ûòKöûú&ò*Köûú$ò(óKöúòóKòKò óKòkKò Köúûúò"Kò öüúúûúò5Kò,Köú2ûúò7KòKò óKö
+üúûúûú4ûúûúòtöûúòKòöûúûòòKöúòKöúûú•ò≥KòKöûúûú6òCKòóòKöúûú]ò{ò^Köú$ò$KòóKòKöûúûú0ò=KòóKöûúûúòóKòKò óKöüúûúûúûúòQöûúòKòKöúòKöûúûúûúò8Köúûú-ûúòJò^Köú$ò$KòóKòKöûúûú0ò=KòKò óöüúûúò5Köûúûúûúûúòöûú
+ûúûòòKöúûúòKöúûúòKöúEûúòKKòóòKöúûúòKöúûúòKöúûúòKöú%ûúò*KòóKöûúûúòóKòKò óKöúûúòKöúûúò.Kò öüúûúûúûúò3Köûúò"Kò óöüúûúûú!ûúòWKöûúûúûú[ûúò|KöûúòKò óöüúûúûúûúòFKö	úûúûúûúûúò3óóôKöúûúûúò8öúûúûúò)KöúòKòKòKò óKöúûúûúò8öúûúûúò)KöúòKöúòKöúûúòKöúûúûúòKòKöú ò KòKòKò'KòóKò Köúûúûú†°†òPKò Kô†Kò öüúûúûúBûúòÉKòKöûúûúûúòKöúòKöúûúò"ö	ûúûúûúûú$ûò>KòKöûúòóöûúûúûúòKöûúûúûúûúòEKöú	ûúòóKöûúòKò óöüúûúûúLòrKòKöûúûúûúòKòKòKò óöüúûúûú%òMKöûúûúûúòöûú8ûúûúûòKKò&KòKöú#ûúò'öûúûúûòöûúûúòöûú†úòKòKöûúûúûúûúòBóöûú†úò"KöúûúòKò	KòóóKöûúòóKöûúòóKòóóôö
+üúûúûú4ûúûúòsKöúòKò$öûú
+ûúûòòKöúûúQòmKòóòKòKò@öûúûúûòKöúûúîûú@òﬁóKòKöúûúòKöúòKòóKöûúûúòóKòKò óöüúûú'ûúò@KöúòKöûúûúûúûúò!öûúûúûòöú ò Köûúòóöú!ò!KòKò,Köúûúòöüúûú(òDKòbóKöûú7ûú(ûúûúòpKò#Köú#ò#Kò>òIKöúûúòóKöûú"ûúûúò2Kò5Kò5Kò=Kò3KòöûòKöúûú)ò5óKòóKöûúûúòóKòKò óöü	úûúò3KöúòKöûúûúûúûúò!öûúûúûòöú ò Köûúòóöú!ò!Köú/ò/KöúûúòKöú5ò5óKöûúûúòóKòKò óöüúûúûúò[KöúòKöûúûúûúûúò!öûúûúûòöú ò Kò0óöú!ò!Kò$óKöûúûúòóKòKò óöüúûúûú>òaKòKöûúûúûúûúò!öûúûúûòöú ò Köûúòóöú!ò!Kò4óKöûúûúòóKòKò óöüúûúûúûúòVKöúòKöûúûúûúûúò!öûúûúûòöú ò Kò*óöú ò Köúûú	òòbKöûúJòNKöûúRòVóKöúHûú;òãKöúòóKöûúûúòóKòKò óöüúûú2ûúûúòdKöúòKöûúûúûúûúò!öûúûúûòöú ò Köûú1ò6óöú ò Köûúûúûúò1KöúXûú)òâKò@Köûúûú#ò-óKöûúûúòóKòóóóô	ôKöúûúûúò:öúûúûúò*KòKöúûúûúòKòKòKòKòKò óKöú%ûúò:Köú0ûúò4Kò öüúû
+úHûúòêKöûúûúûúòKöúòKöûúûúûúò(Köúûú ò*ö	ûúûúûúûú8ûòRKòKöûúòóöûúûúûúòKöûúûúûúûú#òMKöú	ûúòKöúûúòóKöûúòKò óöüúûúûúSòzKöûúûúûúòKò-Kò*Kò óöüúûúûú/òXKöûúûúûúòKòKöú%ûúò)öûúûúûòöûúòöûúòKöúûúòKò	KòóöûúòKòKöûúûúûúûúòEóóKöûúòóKòóóôKöúûúûúò:öúûúûúò*KöúòKöúûúûúòKòKò3Kò'KòKò óKöú%ûúò:Köú0ûúò4Kò öüúû
+úHûúòêKöûúûúûúòKöúòKöûúûúûúò(Köúûú ò*ö	ûúûúûúûú8ûòRKòKöûúòóöûúûúûúòKöûúûúûúûú#òMKöú	ûúòKöúûúòóKöûúòKò óöüúûúûúSòzKöûúûúûúòKò-Kò*Kò óöüúûúûú/òXKöûúûúûúòKöúòKöú%ûúò)öûúûúûòöûúòöûúòKöúûúòKò	KòóöûúòKòKöûúûúûúûúòEóóKöûúòóKòKò óóôöüúûúò#KöúûúòKöúûúòKòóóôö
+üúûúdûúûúûúò∑KòKò(öûúûòòKöûúûúûúûú/òWKò<óòKöú∏ûúò¡óKöûúûúòóKòKò óö
+üúûúûúcûúûú-òæKò(öûúûòòKöûú/ò4KòóòKöúøûúò≈KòóKöûúûúòóKòKò óóôöüúûú6ûúòeKòKòKòCö
+ûúûúûúûú0ûúòQKöú)ò)Köúûúîò¢KòóKò!Köú3ò3KöúòKò óKöúûúòKò öüúûúcûúûúûúûúûú+ûúòÁKöúòöûúûúûòòKòCöûúûúûúòKöûúûúò!KòTKöúûúØòΩKòóKöûúûúûúûú)òEöûúûúûúò#öú	ûúò"KöúòKöúJòJKöú	ò	óKöûú	ûúûú+ò@óöúûú(ûúò9KöúvûúòõKöûúûú=û
+ú%òrKöûúûúûú&òOöûúòöûú?òCKöújûú.ò†óöûúòKò%óóöûòKöúûú&ò2óKòóKò8Köú4ò4KòóòKöûú1ò6óKöûúûúòóKòKò óöüúûú2òCKöúAôAKöúûúûúòöüúûú$ò7KòCóKöúòöûúûú†úûò'Köûú1ò6óKòóóóôöüúûú%ûúûúûúûúûúòÇöûúûúòKò1Köú(ò(óöûúûúòKò<Köú(ò(óKöúòKò óöüúûúûú4òPKöúòöüúûú(ò2Köú ò KöúròróKò(Kò:Köúûúûú&ò5KòKòKò óöüúûúûú(òFKöúòöüúûú(ò2Köú ò KöúlòlóKò(Kò:Köúûúûú&ò5KòKòKò óöüúûúûú'òCKöúòöüúûú(ò2Köú ò KöúGòGóKò(Kò:Köúûúûú&ò5KòKòKò óöüúûúûú?ò[Köúòöüúûú(ò2Köú ò KöúOòOóKò(Kò:Köúûúûú&ò5KòKòKò óöüúûú3òQKöúòöüúûú(ò2Köú ò KöúIòIóKò(Kò:Köúûúûú&ò5KòKòKò óöüúûú'òCKöúòöüúûú(ò2Köú ò KöúGòGóKò(Kò:Köúûúûú&ò5KòKòóóôö
+üúûúûúûúûúòJKöúûúòKöúûúò)Kò"Kò
+Kòöûúûúûò5Köúûúûúò%öûúò	Köú/ûúò5KöúòKöú*ûúûú
+ôAKöú4ò4KöúûúòóKöûúòóKöûú ò'KöûúûúòKòKò óö
+üúûúûúûúûú"ò]KöúûúòKòöûúûúûúûò-KòöûúûòKöûú!ò#KöûúòóKöúûúò#KöúûúòKöûúòóKòKò óöüúûúûúûúòXKöûúòKò óöüúûúûúûú}ò≈Köûúûúûúûúò!öûúûúûòöú ò Kò&Köúûúò&Kò.KöúûúòKòóöú ò Kò&Kò2Kò"Kò*KòóKöûúûúòóKòKò óöüúûúûúòXKöûúûúûúûúò!öûúûúûòKöúûú/òSKòIKöûúûúòóKòKò óö
+üúûúûúûúûú'òÄKò$öûú
+ûúûòòKòKòKòóòKòKòKòóKöûúûúòóKòKò óöüúûúûú+ûúûúJûúòøKöúûúòöûúûòòKöûúûúò!KòKöúûúòKò%Kò>Köúûúò
+KòóòKöûúûúò!KöúòKòKòKòCöûúûòöûúòKò)Köú5ò5óöûúòKòKKò7óóKò%Kò9KòKöúûúò
+KöúòóKöûúûúòóKòóóôöüúûúòöûòKò%KöúòKöú ò KöûúòóKòóóôöü
+úûúûúûúò6Köûú,ûúûú ûúûú ûúòêóKò öüúûúûúûúò7Köûúûúûúûúò+öûúûúûúûò#Köûúûúûúûúò-KöûúòóKöûúûúòKò óöüúûúûú"ò`Kòöûú!ò#Köûú)ò-óKòKò óöüúûú!ûúûúòMKöúûúfòqöûúûòKöúûúûúòKöúûúûúòKöúûúò$Köûúûúò*óKòKò óöüúûúûúûúòPKöúûúFòQKöûú&ò,Kò óöüúûúûúûúûúûúòdKöúûúòKòKöúûúûúòKòKöûúûúûúò,Kò*Kò#KòöûúûòKöûúûúûúò,Kò+Köú$ûúò;Köûúûú'ûúòQKöûúòóKò-KöúòKò óöüúûúûúûúûúûúòbKöúûúòKòKòKòKöûúûúûúò,Kò+KòöûúûòKöúûúò(Kö	úûúûúûúûúòDKöûúûúûúò,Köú,†òJKöûúòóKöûúòKò óö
+üúûúûúûúûúòqKöúûúòKòKöûúûúûúò,Kò&Köûúûúûúò/Köú	ûúò öûúûúûúûòKò3KöûúòóKòKòKò óö
+üúûú%ûúûúûúòlKöúû	úòKöúûúòKöûúûúûúò1Kò&öûúûúûúûòKò0KöûúòóKòKòKò óö
+üúûúûúûúûúòjKöûú!ûúûúò<KòKòKòKòKòKò óö
+üúûú$ûúûúûúòhKöûú!ûúûúò<KòKòKòKòKòKò óö
+üúûúûúûúûúòrKöúûúòKöûúûúûúò.Kò)öûúûòKöûú,ò/Köûú,ò/KöûúûúòóKòJKòKò óöüúûúûúûúûú
+ûúòmKòKöûú ûúûúò;KòKòKòKò óö
+ü#úûúûúûúûú"òÜKòAKöûúûúûú/òYKò6Kò8Kò?KòKò óö
+ü"úûúûúûúûú!òÑKò?Kò?Kò8KòKò óöüúûúûúûúûúûúûúûúûúòiKô/KöúûúòKöúûúòöûúûòKòöûú	ûúûúûòKöûú!ò#KöûúòóKöûúûúò$KòKòKöûúòóöûúûòKöûúòKòKöûúòóKòKò óö
+üúûúûúûúûúògKò=Kò7Kò7KòKò óö
+üúûú"ûúûúûúòeKò9Kò3Kò3KöûúòKò óöüúûúûú
+ûúòFKöûúáòçKò óöüúûúûúò:Köúûú-ò>Kò%KöûúòKò óöüúûúûúòMKöûú2ò8Kò óöüúûú"ûúòbKöúûúò"Kò$Kò óöü
+úûúûúûúòHKöúûúûúûú
+ûúûúòVKò óöüúûú ûúòSKöú	ûúûúûúûúûúòSKö	úûúûúûúûúò?Köú	ûú ò,öûú!ûúò)öûúûúûúò'Köûú#ûúò-óöûúûúûú!ò3KöûúûúòóKòóöûúò	KöúûúûúûúûúûúòdKöúûúûú	ûúûúûúò`Köúûú&ûúòNKòóKöúòKò óöüúûú ûúòSKôKö	ú	ûúûúûúûúòAKö	úûúûúûúûúò?Köûú!ûúûúò<Köú	ûú ò,öûúò	KöúûúûúûúûúûúòdKöúûúûú	ûúûúûúò`Köúûú&ûúòNKòóKöúòKò óKöü	úûú	ûúûúûúûúûúòQKò öü#úûúUûúòûKö	úûúûúûúûúòLKöúûú#ò;KòKò#Köúûú1òQKöúûú1òQKòKöúûú1òQKòKöúûú&òMKòKò óöü#úûúDûú*òûKòKöûúûúûúûúûúûúòWKöúûú&òMKöúûú:òQKöúûú:òQKò#Köúûú:òQKòKòKòóóô;Köúûúûúò(öúûúûúò!KöúòKöúûúûú
+†#ò@KòKòKò óKöúûúò,Köúûúò1KöúûúòKöúûúòKò Kò&Kò"Köúûúò$Kò Köúûúò"öúûú	ò%Kô”óKò öüúûúûú0ûúòWKò óöüúûúûú2òJKöûúûúûúòKöûúûúûúò9öûú$ûúûúûò7Köûúûúûúò1KöûúòóKòKò óöüúûúûú%ûú#ògKöûúûúûúòKöúòô9KöúûúòKö
+ûúûúûúûúûúòPöûúûò
+öûúòöúûúòKöúûúò	Köúûúûúò#KöúòóKöúòóöûúòKöûúûúûúûúò?KòKöúòóóóô2KöúûúòKö
+ûúûúûúûúûúòIKòKöûúûúûúûúò9óKòóKò öüúûúûú-ûúûúûú	òàKöûúûúûúòKöúûúòöüú$†úòLKöúòKöúûúò Kò#Kò'Köûúûúûúûú%òOóKöú@ûúpò∂KòKòKò óKöúûú†ò%Kò öüúûúûúò/KöúûúòöûòKöúòKöú†	òöûúûúûòöúûúòKöú6ò6Köúûúòöûúûúûú&ûúòKKöú&ò&Köú(ûú†ò6KöûúòóKöûúûú@ò^Köûúò	óòCKöúòKò7KöûúòóöúûúVògKöûúûúûú/òmKöûúò	óöûúòKöûúò	óóKöûúòóKöúòKò óöü
+úûúûú ò<KöúûúòKöúòKöú
+ûúòKöüúûúûúûúûú%ûúòMKò öûúûúûúûò%öûòöûúòKöûúòKöú0ûúò7öúûú	ûò Köú:ûúòAKöûúûúòóKöúòKò óKöûúûúûúûúò)Kò?Köú&ûúò.Kò KöûúòóKöûúòKò óKöú#ò#Köúòóóôöüúûúûúûúûúûúûú'òéKöûú#ûúò2KòKòKöúûúòKöúòKòKöú*ûúò1KòKòKòKò(Kò9KòaöûúûúòKò\KòKòKòóKòKòKò óöüúûúûúûúòLKöúûúòKòKòKòKòKòKòKöú*ûúò1KòKöúûúò!Köú(ò(öûúûòKò KòKöúPûúòWKöûúûú'ûúûú&ò]KòKöûúòóKòKòóóLôöüúûúûúò,Köúûú>òRKò óöüúô"KöúôKôKöúôKôKô óKöûúûúò+KöúòKòóKòó Öó    ßl  Ÿû  

@@ -1,0 +1,660 @@
+DIRECTORY CardTab, Convert, ForkOps, Process, RefText, Rope, SymTab, Xl, XlPredefinedAtoms, X11Tcl;
+
+X11TclImpl: CEDAR MONITOR  
+IMPORTS CardTab, Convert, ForkOps, Process, RefText, Rope, SymTab, Xl
+EXPORTS X11Tcl ~
+BEGIN OPEN X11Tcl; 
+
+
+ScanRef: TYPE = REF ScanRec;
+ScanRec: TYPE = RECORD [
+length: INT,
+next: INT,
+text: Rope.ROPE,
+error: BOOL
+];
+
+freeScannable: ScanRef ¨ NIL;
+
+NewScanable: ENTRY PROC [r: Rope.ROPE] RETURNS [s: ScanRef] = {
+s ¨ freeScannable;
+freeScannable ¨ NIL;
+IF s=NIL THEN s ¨ NEW[ScanRec];
+s.length ¨ Rope.Length[r];
+s.text ¨ r;
+s.next ¨ 0;
+s.error ¨ FALSE
+};
+
+TrustedDisposeScanable: PROC [s: ScanRef] = {
+freeScannable ¨ s;
+};
+
+NextExcept: PROC [s: ScanRef, stopAt: CHAR ¨ 0C] RETURNS [ch: CHAR]  = {
+IF s.next>=s.length THEN {s.error ¨ TRUE; RETURN [0C]};
+ch ¨ Rope.Fetch[s.text, s.next];
+IF ch#stopAt THEN s.next ¨ s.next+1 ELSE s.error ¨ TRUE; 
+}; 
+
+Next: PROC [s: ScanRef] RETURNS [ch: CHAR]  = {
+IF s.next>=s.length THEN {s.error ¨ TRUE; RETURN [0C]};
+ch ¨ Rope.Fetch[s.text, s.next];
+s.next ¨ s.next+1
+}; 
+
+Back: PROC [s: ScanRef] = {
+IF s.next<1 THEN s.error ¨ TRUE ELSE s.next ¨ s.next-1
+}; 
+
+ExpectSpaces: PROC [s: ScanRef, min: INT ¨ 1, stopAt: CHAR ¨ 0C] = {
+FOR i: INT IN [0..min) DO
+IF (NextExcept[s, stopAt]#' ) THEN {s.error ¨ TRUE; RETURN};
+ENDLOOP;
+WHILE NextExcept[s, stopAt]=' DO ENDLOOP;
+Back[s];
+};
+
+ExpectHex: PROC [s: ScanRef, stopAt: CHAR ¨ 0C] RETURNS [n: CARD32 ¨ 0]  = {
+HexVal: PROC [s: ScanRef, ch: CHAR] RETURNS [val: [0..16)¨0] =  {
+SELECT ch FROM
+IN ['0..'9] => RETURN [ORD[ch]-ORD['0]];
+IN ['A..'F] => RETURN [ORD[ch]-ORD['A]+10];
+IN ['a..'f] => RETURN [ORD[ch]-ORD['a]+10];
+ENDCASE  => s.error ¨ TRUE;
+};
+char: CHAR;
+char ¨ NextExcept[s, stopAt];
+n ¨ HexVal[s, char];
+FOR i: INT IN [0..7) DO
+char ¨ NextExcept[s, stopAt];
+IF (char=' ) THEN {Back[s]; RETURN [n]};
+n ¨ n*16+HexVal[s, char];
+ENDLOOP;
+char ¨ NextExcept[s, stopAt];
+IF (char=' ) THEN {Back[s]; RETURN [n]};
+s.error ¨ TRUE; 
+};
+
+max10: CARD32 ~ LAST[CARD32]/10;
+
+ExpectDec: PROC [s: ScanRef, stopAt: CHAR ¨ 0C] RETURNS [n: CARD32] = {
+DecVal: PROC [s: ScanRef, ch: CHAR] RETURNS [val: [0..10)¨0] =  {
+SELECT ch FROM
+IN ['0..'9] => RETURN [ORD[ch]-ORD['0]];
+ENDCASE  => s.error ¨ TRUE;
+};
+char: CHAR; 
+dig: CARD;
+n ¨ DecVal[s, NextExcept[s, stopAt]];
+DO
+char ¨ NextExcept[s, stopAt];
+IF (char=' ) THEN {Back[s]; RETURN [n]};
+IF n>max10 THEN {s.error ¨ TRUE; RETURN [0]};
+n ¨ n*10;
+dig ¨ DecVal[s, char];
+IF LAST[CARD32]-n<dig THEN {s.error ¨ TRUE; RETURN [0]};
+n ¨ n+dig;
+ENDLOOP;
+};
+
+ExpectInterpName: PROC [s: ScanRef, stopAt: CHAR ¨ 0C] RETURNS [interpName: Rope.ROPE] = {
+startPos: INT ¨ s.next;
+DO
+char: CHAR ¨ NextExcept[s, stopAt];
+IF char='| THEN RETURN [Rope.Substr[s.text, startPos, s.next-startPos-1]]
+ENDLOOP
+};
+
+Rest: PROC [s: ScanRef, stopAt: CHAR ¨ 0C] RETURNS [interpName: Rope.ROPE] = {
+startPos: INT ¨ s.next;
+DO
+char: CHAR ¨ Next[s];
+IF char=0C THEN RETURN [Rope.Substr[s.text, startPos, s.next-startPos-1]]
+ENDLOOP
+};
+
+myKey: REF INT ~ NEW[INT];
+
+ConnectionData: TYPE ~ RECORD [
+connection: Xl.Connection,
+nextSerial: CARD ¨ 0, --monitored
+sharedTQ: Xl.TQ,
+listenerWindow: Xl.Window,
+commAtom: Xl.XAtom,
+interpRegistryAtom: Xl.XAtom,
+interpRegistryContents: Rope.ROPE, --monitored with sharedTQ
+openReplies: CardTab.Ref,
+remoteInterpreters: SymTab.Ref, -- monitored with sharedTQ;  
+ownInterpreters: SymTab.Ref, 
+registryCacheOk: BOOL ¨ FALSE, --monitored with sharedTQ
+maxLength: INT --of requests; adjusted to include boiler plate
+];
+
+Interpreter: TYPE ~ RECORD [
+cd: REF ConnectionData ¨ NIL,
+listener: ListenerProc ¨ NIL,
+unregisterNotify: UnregisterNotifyProc ¨ NIL,
+replyOnPing: BOOL,
+clientData: REF,
+interpreterName: Rope.ROPE,
+thread: Xl.TQ ¨ NIL,
+refCounting: BOOL ¨ FALSE
+];
+
+CommandRec: TYPE ~ RECORD [
+i: REF Interpreter,
+windowId: CARD32,
+serial: CARD32,
+command: Rope.ROPE
+];
+
+detailsForSynchronous: Xl.Details ~ NEW[Xl.DetailsRec ¨ [synchronous: TRUE, localErrors: inline]];
+detailsForIgnoreErrors: PUBLIC Xl.Details ¨ NEW[Xl.DetailsRec ¨ [errorMatch: NEW[Xl.MatchRep ¨ [proc: IgnoreErrors, handles: NIL, tq: Xl.CreateTQ[]]]]];
+IgnoreErrors: Xl.EventProcType = {};
+
+
+cdCache: REF ConnectionData ¨ NEW[ConnectionData];
+
+GetConnectionData: PROC [c: Xl.Connection] RETURNS [REF ConnectionData] = {
+cd: REF ConnectionData ¨ cdCache;
+IF cd.connection=c 
+THEN RETURN [cd]
+ELSE {
+val: REF ~ Xl.GetConnectionPropAndInit[c, myKey, Init];
+cdCache ¨ cd ¨ NARROW[val];
+RETURN [cd];
+};
+};
+
+Init: Xl.InitializeProcType = {
+listenerEvents: Xl.EventFilter ~ Xl.CreateEventFilter[propertyNotify, destroyNotify];
+rootEvents: Xl.EventFilter ~ Xl.CreateEventFilter[propertyNotify];
+tq: Xl.TQ ~ Xl.CreateTQ[];
+cd: REF ConnectionData ~ NEW[ConnectionData];
+listenerMatch: Xl.Match ~ NEW[Xl.MatchRep ¨ [
+proc: ListenerEvent, handles: listenerEvents, tq: tq, data: cd
+]];
+rootMatch: Xl.Match ~ NEW[Xl.MatchRep ¨ [
+proc: RootEvent, handles: rootEvents, tq: tq, data: cd
+]];
+cd.sharedTQ ¨ tq;
+cd.connection ¨ c;
+cd.commAtom ¨ Xl.MakeAtom[c: c, name: "Comm"];
+cd.interpRegistryAtom ¨ Xl.MakeAtom[c: c, name: "InterpRegistry"];
+cd.openReplies ¨ CardTab.Create[];
+cd.ownInterpreters ¨ SymTab.Create[];
+cd.maxLength ¨ Xl.Info[cd.connection].maxRequestLengthBytes - 100;
+Xl.AddDispatch[c: c, window: Xl.FirstRoot[c], match: rootMatch, generate: [propertyChange: TRUE], details: detailsForIgnoreErrors]; 
+cd.listenerWindow ¨ Xl.CreateWindow[c: c, 
+matchList: LIST[listenerMatch], 
+class: inputOnly, 
+attributes: [eventMask: [structureNotify: TRUE, propertyChange: TRUE]], 
+details: detailsForIgnoreErrors
+];
+RETURN [cd];
+};
+
+NewSerial: ENTRY PROC [cd: REF ConnectionData] RETURNS [s: CARD32] = {
+s ¨ cd.nextSerial;
+cd.nextSerial ¨ cd.nextSerial+1;
+};
+
+RootEvent: Xl.EventProcType = {
+cd: REF ConnectionData ~ NARROW[clientData];
+WITH event SELECT FROM
+propertyNotify: Xl.PropertyNotifyEvent => 
+IF propertyNotify.state=newValue AND propertyNotify.atom=cd.interpRegistryAtom THEN { 
+cd.registryCacheOk ¨ FALSE;
+ReadRegistrations[cd];
+};
+ENDCASE => {};
+};
+
+ListenerEvent: Xl.EventProcType = {
+ENABLE Xl.XError => GOTO oops;
+cd: REF ConnectionData ~ NARROW[clientData];
+WITH event SELECT FROM
+propertyNotify: Xl.PropertyNotifyEvent => {
+IF propertyNotify.state=newValue AND propertyNotify.atom=cd.commAtom THEN {
+prr: Xl.PropertyReturnRec ~ Xl.GetProperty[c: event.connection, w: cd.listenerWindow, property: cd.commAtom, delete: TRUE];
+WITH prr.value SELECT FROM
+commands: Rope.ROPE => ScanEvent[cd, commands, event];
+ENDCASE => {};
+};
+};
+destroyNotify: Xl.DestroyNotifyEvent => {
+};
+ENDCASE => {};
+EXITS oops => {};
+};
+
+ScanEvent: PROC [cd: REF ConnectionData, commands: Rope.ROPE, event: Xl.Event ¨ NIL] = {
+s: ScanRef ~ NewScanable[commands];
+windowId: CARD32;
+serial: CARD32;
+code: CARD32;
+interpName: Rope.ROPE;
+WHILE s.next<s.length DO
+s.error ¨ FALSE;
+SELECT NextExcept[s] FROM
+'C => {
+c: REF CommandRec ¨ NEW[CommandRec];
+command: Rope.ROPE;
+ExpectSpaces[s, 1];
+windowId ¨ ExpectHex[s];
+ExpectSpaces[s, 1];
+serial ¨ ExpectHex[s];
+ExpectSpaces[s, 1];
+interpName ¨ ExpectInterpName[s];
+command ¨ Rest[s];
+IF ~s.error THEN ReceiveCommand[cd, windowId, serial, interpName, command, event];
+};
+'R => {
+response: Rope.ROPE;
+ExpectSpaces[s, 1];
+serial ¨ ExpectHex[s];
+ExpectSpaces[s, 1];
+code ¨ ExpectDec[s];
+ExpectSpaces[s, 1];
+response ¨ Rest[s];
+IF ~s.error THEN ReceiveResponse[cd, serial, LOOPHOLE[code], response];
+};
+ENDCASE => s.error ¨ TRUE; 
+IF s.error THEN {
+s.next ¨ Rope.SkipTo[s.text, s.next, "\000"];
+};
+ENDLOOP;
+TrustedDisposeScanable[s];
+};
+
+ForkOrEnqueue: PROC [tq: Xl.TQ, proc: Xl.EventProcType, data: REF ¨ NIL, event: Xl.Event ¨ NIL] = {
+IF tq=NIL 
+THEN TRUSTED {Process.Detach[FORK proc[event, data, NIL]]}
+ELSE Xl.Enqueue[tq, proc, data, event];
+}; 
+
+NotifyDeadness: Xl.EventProcType = {
+refCounting: BOOL ¨ FALSE;
+notify: UnregisterNotifyProc ¨ NIL;
+i: REF Interpreter ~ NARROW[clientData];
+Protected: ENTRY PROC [] = INLINE {
+notify ¨ i.unregisterNotify; i.unregisterNotify ¨ NIL;
+refCounting ¨ i.refCounting; i.refCounting ¨ FALSE;
+};
+IF i#NIL THEN {
+cd: REF ConnectionData ~ i.cd;
+Protected[];
+IF notify#NIL THEN
+[] ¨ notify[c: cd.connection, interpreterName: i.interpreterName, clientData: i.clientData];
+IF refCounting THEN Xl.DecRefCount[cd.connection, i];
+};
+};
+
+QueuedReceiveCommand: Xl.EventProcType = {
+comp: REF TEXT; --composed response to report to caller
+response: Rope.ROPE ¨ NIL; --direct response gotten from execution of command
+c: REF CommandRec ~ NARROW[clientData];
+i: REF Interpreter ~ c.i;
+cd: REF ConnectionData ~ i.cd;
+code: TclCode;
+IF i.replyOnPing AND Rope.SkipOver[s: c.command, skip: " "]>=Rope.Length[c.command]
+THEN {
+code ¨ ok; response ¨ "";
+} 
+ELSE {
+[code, response] ¨ c.i.listener[c: cd.connection, interpreterName: i.interpreterName, command: c.command, clientData: i.clientData];
+BEGIN  --Check response
+position: INT;
+IF Rope.Length[response] >= cd.maxLength THEN {
+code ¨ error; response ¨ "response too long";
+};
+position ¨ Rope.SkipTo[response, 0, "\000"];
+IF position<Rope.Length[response] THEN {
+response ¨ Rope.Substr[response, 0, position];
+};
+END;
+};
+comp ¨ RefText.ObtainScratch[RefText.page];
+comp ¨ RefText.AppendRope[comp, "R 0"];
+comp ¨ Convert.AppendCard[to: comp, from: c.serial, base: 16, showRadix: FALSE];
+comp ¨ RefText.AppendRope[comp, " 0"];
+comp ¨ Convert.AppendCard[to: comp, from: LOOPHOLE[code], base: 16, showRadix: FALSE];
+comp ¨ RefText.AppendChar[comp, ' ];
+comp ¨ RefText.AppendRope[comp, response];
+comp ¨ RefText.AppendChar[comp, 0C];
+Xl.ChangeProperty[c: cd.connection, w: LOOPHOLE[c.windowId], property: cd.commAtom, type: XlPredefinedAtoms.string, mode: append, data: comp, details: detailsForIgnoreErrors];
+RefText.ReleaseScratch[comp];
+};
+
+ReceiveCommand: PROC [cd: REF ConnectionData, windowId: CARD32, serial: CARD32, interpName: Rope.ROPE, command: Rope.ROPE, event: Xl.Event ¨ NIL] = {
+WITH SymTab.Fetch[cd.ownInterpreters, interpName].val SELECT FROM
+i: REF Interpreter => {
+c: REF CommandRec ¨ NEW[CommandRec ¨ [
+i: i,
+windowId: windowId,
+serial: serial,
+command: command
+]];
+ForkOrEnqueue[i.thread, QueuedReceiveCommand, c, event];
+};
+ENDCASE => {};
+};
+
+ReceiveResponse: PROC [cd: REF ConnectionData, serial: CARD32, code: TclCode, response: Rope.ROPE] = {
+WITH CardTab.Fetch[cd.openReplies, serial].val SELECT FROM
+promise: REF PromiseRec => {
+SetReply: ENTRY PROC [promise: REF PromiseRec, code: TclCode, response: Rope.ROPE] = {
+IF ~promise.timeout THEN {
+promise.code ¨ code;
+promise.response ¨ response;
+promise.ok ¨ TRUE;
+NOTIFY promise.condition
+};
+};
+SetReply[promise, code, response];
+};
+ENDCASE => {
+};
+};
+
+ReadRegistrationsProperty: PROC [cd: REF ConnectionData] RETURNS [val: Rope.ROPE ¨ NIL] = {
+prr: Xl.PropertyReturnRec;
+prr ¨ Xl.GetProperty[c: cd.connection, w: Xl.FirstRoot[cd.connection], property: cd.interpRegistryAtom ! Xl.XError => {prr.value ¨ NIL; CONTINUE}];
+WITH prr.value SELECT FROM
+r: Rope.ROPE => val ¨ r;
+ENDCASE => {}
+};
+
+ReadRegistrations: PROC [cd: REF ConnectionData] = {
+ReadGlobals: PROC [cd: REF ConnectionData] = {
+regs: Rope.ROPE ¨ ReadRegistrationsProperty[cd];
+interpreters: SymTab.Ref ~ SymTab.Create[];
+windowId: CARD32;
+interp: Rope.ROPE;
+s: ScanRef ¨ NewScanable[regs];
+cd.interpRegistryContents ¨ regs;
+WHILE s.next<s.length DO
+s.error ¨ FALSE;
+windowId ¨ ExpectHex[s];
+ExpectSpaces[s, 1];
+interp ¨ Rest[s];
+IF ~s.error THEN {
+[] ¨ SymTab.Insert[interpreters, interp, NEW[CARD32 ¨ windowId]];
+};
+ENDLOOP;
+cd.remoteInterpreters ¨ interpreters;
+TrustedDisposeScanable[s];
+};
+CheckLocals: PROC [cd: REF ConnectionData] = {
+Action: SymTab.EachPairAction = {
+name: Rope.ROPE ~ key;
+WITH SymTab.Fetch[cd.ownInterpreters, name].val SELECT FROM
+i: REF Interpreter => {
+gId: REF CARD32 ~ NARROW[val];
+IF gId#NIL AND gId≠#0 AND gId≠#illegalId AND gId≠#Xl.WindowId[cd.listenerWindow] THEN 
+ReplaceLocal[cd, name, NIL]
+};
+ENDCASE => {}; -- no local interpreter
+};
+[] ¨ SymTab.Pairs[cd.remoteInterpreters, Action];
+};
+ProtectedCheckInterpreters: PROC [] = {
+IF ~ cd.registryCacheOk THEN { 
+ReadGlobals[cd];
+CheckLocals[cd];
+cd.registryCacheOk ¨ TRUE;
+};
+};
+IF ~cd.registryCacheOk THEN {
+Xl.CallWithLock[cd.sharedTQ, ProtectedCheckInterpreters];
+};
+};
+
+
+WriteInterpreters: PROC [cd: REF ConnectionData, remoteInterpreters: SymTab.Ref] = {
+IF remoteInterpreters#NIL THEN {
+r: Rope.ROPE;
+p: REF TEXT ¨ RefText.ObtainScratch[RefText.page];
+Each: SymTab.EachPairAction = {
+rw: REF CARD32 ~ NARROW[val];
+IF rw≠#0 AND rw≠#illegalId THEN {
+p ¨ RefText.AppendRope[p, "0"];
+p ¨ Convert.AppendCard[to: p, from: rw≠, base: 16, showRadix: FALSE];
+p ¨ RefText.AppendChar[p, ' ];
+p ¨ RefText.AppendRope[p, key];
+p ¨ RefText.AppendChar[p, 0C];
+};
+};
+[] ¨ SymTab.Pairs[remoteInterpreters, Each];
+Xl.ChangeProperty[c: cd.connection, w: Xl.FirstRoot[cd.connection], property: cd.interpRegistryAtom, type: XlPredefinedAtoms.string, mode: replace, data: p, details: detailsForIgnoreErrors];
+RefText.ReleaseScratch[p];
+};
+};
+
+PromiseRec: TYPE = RECORD [
+ok: BOOL ¨ FALSE,
+timeout: BOOL ¨ FALSE,
+condition: CONDITION,
+code: TclCode ¨ timeout,
+response: Rope.ROPE ¨ NIL
+];
+
+TryTimingOut: ENTRY PROC [x: REF] = {
+pr: REF PromiseRec ~ NARROW[x];
+IF ~pr.ok THEN {
+pr.timeout ¨ TRUE;
+pr.code ¨ timeout;
+pr.response ¨ "Timed out"
+};
+NOTIFY pr.condition
+};
+
+WaitForAction: ENTRY PROC [promise: REF PromiseRec] = {
+WHILE ~promise.timeout AND ~promise.ok DO WAIT promise.condition ENDLOOP
+};
+
+BuildCommand: PROC [cd: REF ConnectionData, interpName: Rope.ROPE, command: Rope.ROPE] RETURNS [encoded: REF TEXT, serial: CARD32] = {
+serial ¨ NewSerial[cd];
+encoded ¨ RefText.ObtainScratch[RefText.line];
+encoded ¨ RefText.AppendRope[encoded, "C 0"];
+encoded ¨ Convert.AppendCard[to: encoded, from: Xl.WindowId[cd.listenerWindow], base: 16, showRadix: FALSE];
+encoded ¨ RefText.AppendRope[encoded, " 0"];
+encoded ¨ Convert.AppendCard[to: encoded, from: serial, base: 16, showRadix: FALSE];
+encoded ¨ RefText.AppendChar[encoded, ' ];
+encoded ¨ RefText.AppendRope[encoded, interpName];
+encoded ¨ RefText.AppendChar[encoded, '|];
+encoded ¨ RefText.AppendRope[encoded, command];
+encoded ¨ RefText.AppendChar[encoded, 0C];
+};
+
+illegalId: CARD32 ~ LAST[CARD32];
+
+GetRemoteListenerId: PROC [cd: REF ConnectionData, interpreterName: Rope.ROPE] RETURNS [id: CARD32 ¨ illegalId] = {
+ref: SymTab.Ref ¨ cd.remoteInterpreters;
+IF ref#NIL THEN 
+WITH SymTab.Fetch[ref, interpreterName].val SELECT FROM
+rc: REF CARD32 => id ¨ rc≠;
+ENDCASE => {};
+};
+
+ReplaceLocal: PROC [cd: REF ConnectionData, name: Rope.ROPE, interp: REF Interpreter] = {
+old: REF Interpreter ¨ NIL;
+Action: SymTab.UpdateAction = {
+IF interp=NIL 
+THEN op ¨ delete 
+ELSE {op ¨ store; new ¨ interp};
+IF found THEN old ¨ NARROW[val]; 
+};
+[] ¨ SymTab.Update[cd.ownInterpreters, name, Action];
+IF old#NIL THEN ForkOrEnqueue[old.thread, NotifyDeadness, old, NIL];
+IF interp#NIL AND interp.refCounting THEN Xl.IncRefCount[cd.connection, interp];
+};
+
+RegisterInterpreter: PUBLIC PROC [c: Xl.Connection, interpreterName: Rope.ROPE, listener: ListenerProc, unregisterNotify: UnregisterNotifyProc ¨ NIL, clientData: REF ¨ NIL, thread: Xl.TQ ¨ NIL, overwrite: BOOL ¨ FALSE, replyOnPing: BOOL, refCounting: BOOL] RETURNS [ok: BOOL ¨ FALSE] = {
+old: REF Interpreter;
+windowId: CARD32;
+cd: REF ConnectionData ~ GetConnectionData[c];
+rips: SymTab.Ref;
+IF Rope.SkipTo[s: interpreterName, skip: "|"]<Rope.Length[interpreterName] THEN RETURN [FALSE]; --no "|" character please
+IF ~cd.registryCacheOk THEN ReadRegistrations[cd]; 
+rips ¨ cd.remoteInterpreters;
+windowId ¨ GetRemoteListenerId[cd, interpreterName];
+IF listener=NIL 
+THEN {
+ReplaceLocal[cd, interpreterName, NIL];
+IF windowId=illegalId THEN RETURN [TRUE];
+IF windowId=LOOPHOLE[cd.listenerWindow] THEN overwrite ¨ TRUE;
+IF ~overwrite THEN RETURN [FALSE];
+[] ¨ SymTab.Delete[rips, interpreterName];
+}
+ELSE {
+replyCode: TclCode; 
+interp: REF Interpreter ~ NEW[Interpreter ¨ [
+interpreterName: interpreterName,
+clientData: clientData,
+cd: cd,
+listener: listener,
+unregisterNotify: unregisterNotify,
+thread: thread,
+replyOnPing: replyOnPing,
+refCounting: refCounting
+]]; 
+IF windowId=Xl.WindowId[cd.listenerWindow] THEN {
+ReplaceLocal[cd, interpreterName, interp];
+RETURN [TRUE]
+};
+IF windowId#illegalId THEN {
+replyCode ¨ SendCommand[cd, windowId, interpreterName, "", 2000].code;
+IF replyCode<noInterpreter AND ~overwrite THEN RETURN [FALSE];
+IF ~cd.registryCacheOk THEN {
+ReadRegistrations[cd];
+rips ¨ cd.remoteInterpreters;
+};
+};
+ReplaceLocal[cd, interpreterName, interp];
+[] ¨ SymTab.Store[rips, interpreterName, NEW[CARD32 ¨ Xl.WindowId[cd.listenerWindow]]];
+};
+WriteInterpreters[cd, rips]; --global locking missing also in Tcl
+ok ¨ TRUE;
+};
+SendCommand: PROC [cd: REF ConnectionData, windowId: CARD32, interpreterName: Rope.ROPE, command: Rope.ROPE, timeout: INT ¨ 2000] RETURNS [code: TclCode, reply: Rope.ROPE] = {
+promise: REF PromiseRec ~ NEW[PromiseRec];
+encoded: REF TEXT; serial: CARD32;
+[encoded, serial] ¨ BuildCommand[cd, interpreterName, command];
+IF timeout>0 THEN [] ¨ CardTab.Store[cd.openReplies, serial, promise];
+Xl.ChangeProperty[c: cd.connection, w: LOOPHOLE[windowId], property: cd.commAtom, type: XlPredefinedAtoms.string, mode: append, data: encoded, details: detailsForSynchronous 
+! Xl.XError => {
+IF timeout>0 THEN [] ¨ CardTab.Delete[cd.openReplies, serial];
+code ¨ noInterpreter;
+reply ¨ "interpreter window non existing";
+RefText.ReleaseScratch[encoded];
+GOTO Oops
+}
+];
+IF timeout>0 THEN {
+ForkOps.ForkDelayed[ms: timeout, proc: TryTimingOut, data: promise];
+WaitForAction[promise];
+[] ¨ CardTab.Delete[cd.openReplies, serial];
+};
+code ¨ promise.code;
+reply ¨ promise.response;
+RefText.ReleaseScratch[encoded];
+EXITS Oops => {};
+};
+
+Send: PUBLIC PROC [c: Xl.Connection, interpreterName: Rope.ROPE, command: Rope.ROPE ¨ NIL, timeout: INT] RETURNS [replyCode: TclCode, reply: Rope.ROPE] = {
+windowId: CARD32;
+cd: REF ConnectionData ~ GetConnectionData[c];
+IF ~cd.registryCacheOk THEN ReadRegistrations[cd]; 
+windowId ¨ GetRemoteListenerId[cd, interpreterName];
+IF windowId#illegalId  
+THEN [replyCode, reply] ¨ SendCommand[cd, windowId, interpreterName, command, timeout]
+ELSE {replyCode ¨ noInterpreter; reply ¨ "unknown interpreter"};
+};
+
+END.
+
+
+  L  
+X11TclImpl.mesa
+Copyright ” 1992, 1993 by Xerox Corporation.  All rights reserved.
+Created by Christian Jacobi, January 17, 1992 8:20:45 pm PST
+Christian Jacobi, April 19, 1993 10:37 am PDT
+
+=== Scanning ========
+--char _ NextExcept[s, stopAt];
+--IF char#'0 THEN {s.error _ TRUE; RETURN [0]};
+--char _ NextExcept[s, stopAt];
+--IF char#'x AND char#'X THEN {s.error _ TRUE; RETURN [0]};
+
+
+=== end Scanning ========
+-- name ==> (REF CARD32 ¨ WindowId)
+-- interpreterName ==> REF Interpreter
+--Registration changed
+--Got a request or reply
+???
+It would be nice to limit the maximal possible parallelism
+--Somebody was awaiting this reply
+--Nobody waits for this one
+--protected: get the reading and flag setting atomic
+--(We don't really care whether an application gets the previous or later contents; we DO care that each notification of contents change causes re-reading the property value) 
+--read in the remoteInterpreters from the property
+--check whether some local interpreters have been superceeded by foreign interpreters
+--OOPS: No locking of the root window property: But there is not much good in locking as Tcl doesn't lock it either
+Trusts caller to free up encoded afterwards
+--remove interpreter
+--a timeout happened; that is sufficently long so we better refresh our global cache.  This aint atomic but only for short time periods. 
+
+ ù ™  ïNewlineDelimiter
+ñ(cedarcode) styleô codeöúôKöú
+œeú7ôBKöú<ô<Kô-Kô óKöœk	úZòcKò öœn
+úûúûúòKöûú>òEKöûú	òóKöûúûú	òKò KôKò Köú	ûúûú	òöú	ûúûúòKöúûúòKöúûúò
+KöúûúòKöúûòKòKò óKöúûúòKò ö
+üúûúûú
+ûúûúò?KòKöúûúòKöûúûúûúûú
+òKòKòKòKöú
+ûòKòKò óöüúûúò-KòKöúòKò óö
+ü
+úûúûúûúûúòHKöûúûúûúûúò7Kò Köûúûúûúûúò9KöúòKò óöüúûúûúûúò/Köûúûúûúûúò7Kò KòKöúòKò óöüúûúòKöûú
+ûúûúûúò6KöúòóKò öüúûúûúûú
+òDöûúûúûú
+ûòKöûúûúûúûúò<KöûúòóKöûúûúûúò)KöúòKòóKò ö
+ü	úûúûúûúûú
+òLöüúûúûúûúòAöûúûòKöûúûúûúûúò(Köûúûúûúûú	ò+Köûúûúûúûú	ò+KöûúûúòóKòóKöúûúòJöúôJöûú	ûúûúûúô/JöúôJö
+ûú	ûú	ûúûúûúô;KòKòöûúûúûúûòKòKöûúûúûúò(KòKöûúòóKòKöûúûúûúò(Köú
+ûúòKöúòóKò Köúûúûúûúò Kò ö
+ü	úûúûúûúûúòGöüúûúûúûúòAöûúûòKöûúûúûúûúò(KöûúûúòóKòóKöúûúòKöúûúò
+Kò%öûòKòKöûúûúûúò(Köûú	ûúûúûúò-Kò	KòKöûúûúûúûúûúûúò8Kò
+KöûúòóKöúòóKò ö
+üúûúûúûúûúòZKöú
+ûú
+òöûòKöúûúò#Köûú	ûúûú3òIKöûòóKòóKò ö
+üúûúûúûúûúòNKöú
+ûú
+òöûòKöúûúòKöûú	ûúûú3òIKöûòóKòóKô Kô KôKò Kö	úûúûúûúûúòKò öúûúûúòKòKöúûúœcò!KòKòKòKöúòKöúûú†ò<Kòöú †ò=Kô#óòKô&óKöúûúûú†ò8Köúûú†/ò>KöúòKò óöúûúûúòKöúûúûúòKöúûúòKöú)ûúò-KöúûúòKöúûúòKöúûúòKöúûúûúòKöúûúûòKòóKò öúûúûúòKöúûúòKöú
+ûúòKöúûúòKöúûòKòóKò Köú$ûúûúòbö	úûúûúûú-ûúòòKöüúò$Kò óKò Köú	ûúûúò2Kò öüúûúûúûúòKKöúûúò!öûúòKöûúûúòöûúòKöúûú/ò7KöúûúòKöûúòKòóóKöúòKò óöüúòKòUKòBKöúûúòKöúûúûúò-öúûúò-Kò>Köúòóöúûúò)Kò6KöúòóKòKòKò.KòBKò"Kò%KòBKöú[ûú%òÑò*Köúûúò KöúòKöú*ûúûúòHKòKöúòóKöûúòKòóKò öü	úûúûúûúûúûúòFKòKò KöúòKò óöü	úòKôKöúûúûúò,öûúûúûòò*öûúûú+ûúòVKöúûúòKòKòóóKöûúòóKöúòóKò öüúò#KôKöûúûúòKöúûúûúò,öûúûúûòöú+ò+öûúûú!ûúòKKöúuûúò{öûúûúûòKöúûú#ò6KöûúòóKòóKòóöú)ò)KöúôKöúòóKöûúòóKöûúòKöúòóKò ö
+ü	úûúûú ûúûúòXKöú#ò#Köú
+ûúòKöúûúòKöúûúòKöúûúòöûúûòKöú
+ûúòöûúûòöúòKöúûúûúò$KöúûúòKöúòKòKöúòKòKöúòKò!KòKöûú
+ûúBòRKöúòóöúòKöúûúòKöúòKòKöúòKòKöúòKòKöûú
+ûúûúòGKöúòóKöûúûúòóöûú	ûúòKò-KòóKöûúòóKöúòKöúòKò óöüúûú	ûú ûúûúûúòcKöú:ô:öûúûúò
+Köûúûúûúûúò:Köûú#ò'óKöúòKò óöüúò$KöúûúûúòKöúûúò#Köúûúûúò(öü	úûúûúûúò#Köú2ûúò6Köú-ûúò3KöúòóöûúûúûúòKöúûúòJòöûúûúûòKò\óKöûúûú"ò5KòóKöúòKò óöüúò*Köúûúûú†'ò7Köúûúûú†2òMKöúûúûúò'KöúûúòKöúûúòKöúòöûúûú?òSöûúòKòKöúòóöûúòKòÑöûú†òKöú
+ûúòöûú'ûúò/Kò-KòóKò,öûú ûúò(Kò.KöúòóKöûúòóKòóóKò+Kò'KöúIûúòPKò&Köú*ûúûúòVKò$Kò*Kò$Köú'ûúÄòØKöúòKöúòóKò öüúûúûúûú
+ûúûúûúûúòïöûú2ûúûòAöúûúòöúûúûúò&KöúòKöúòKöúòKöúòKöúòóKöú8ò8KòóKöûúòóKòKò óö
+üúûúûúûú ûúòföûú+ûúûò:öú	ûúòJöú"ô"ö
+üúûúûúûú+ûúòVöûúûúòKòKòKöúûúòKöûúòKöúòóKöúòóKöú"ò"KöúòóöûúòJöúôKöúòóóKòóKò öüúûúûúûúûúûúò[KöúòKöúÉûúûúòìöûúûúûòKöúûúòKöûúòóKòóKò öüúûúûúò4Kô4KôØöüúûúûúò.Kô2Köúûú!ò0Kò+Köú
+ûúòKöúûúòKòKò!öûúûòKöú
+ûúòKòKöúòKòöûú
+ûúòKöú)ûúûúòAKòóKöûúòóKò%KöúòKòóöüúûúûúò.KôUö–bnúò!Köúûúòöûú,ûúûò;öúûúòKöúû
+úûúòöûúûúûúûúûú%ûúòVKöúûúòóKòóKöûú†ò&óKòóKò1Kòóöüúûúò'öûúûúòKòKòKöúûúòKòóKòóöûúûúòKò9KòóKòóKò Kò öüúûúûú4òTKöœbsôsöûúûúûúò KöúûúòKöúûúûú'ò2öüúòKöúûúûúûúòöûúûúûúò!KòKöú>ûúòEKòKòKòKòóKöúòóKò,KòæKöúòKòóKöúòóKò öúûúûúòKöúûúûúòKöú	ûúûúòKöúû	úòKòKöúûúûòKòKò óöüúûúûúûúò%KöúûúûúòöûúûúòKöúûúòKòKòKöúòóKöûúòKöúòKò óöüúûúûúûúò7Kö	ûúûúûúûúûòHKöúòóKò öüúûúûú"ûúûúûúûúûú
+ûúòÜKöú+ô+KòKò.Kò-KöúeûúòlKò,KöúMûúòTKò*Kò2Kò*Kò/Kò*KòóKò Köúûúûúûúò!Kò öüúûúûú'ûúûúûúòsKò(öûúûúûúòöûú(ûúûò7KöúûúûúòKöûúòóóKòóKò ö
+üúûúûúûú
+ûúòYKöúûúûúòöüúòöûúûúòKöûúòKöûúò óKöûúûúûúò!KòóKò5Köûúûúûú0ûúòDKöûúûúûúûú'òPKòóKò ö"üúûúûú*ûúûú)ûúûúûúûúûúûúûúûúûúûúûúûúòüKöúûúòKöú
+ûúòKöúûú'ò.KöúòKö	ûúIûúûúûú†òyKöûúûúò3KòKò4öûú
+ûúòöûúòKöúôKöú"ûúò'Köûúûúûúûúò)Köûú
+ûúûúûúò>Köûúûúûúûúò"Kò*KòóöûúòKöúòöúûúûúò-Köú!ò!KöúòKöúòKöúòKò#KöúòKòKòKöúòóöûú)ûúò1Kò*KöûúûúòKòóöûúûúòKòFKö
+ûúûúûúûúûúò>KôâöûúûòKòKòKòóKòóKò*Köú)ûúûú$òWKòóóKöú†$òAKöúûúò
+KòóKô öüúûúûúûúûúûúûú	ûúûúòØKöú	ûúûúò*Köú	ûúûú
+ûúò"Kò?Köûúûú5òFöú'ûúòÆöúòKöûúûú-ò>KòKò*Köú ò Köûúò	KòóKöúòóöûúûúòKòDKöúòKò,KòóKòKòKöú ò KöûúòKòKò óöüúûúûú*ûúûúûúûúûú"ûúòõKöú
+ûúòKöúûú'ò.Köûúûúò3Kò4öûúòKöûúRòVKöûú<ò@óKöúòóKò KöûúòKò Kò ó Öó    F¥  b™  

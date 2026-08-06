@@ -1,0 +1,1550 @@
+
+DIRECTORY
+LiteralOps USING [FindHeapString, Value],
+MimData USING [base, bitsToAlignment, idATOM, idBOOL, idCARDINAL, idCHAR, idDCARD, idDREAL, idINTEGER, idNAT, idREAL, idSTRING, idTEXT, ownSymbols, switches, typeAtomRecord],
+MimosaEvents USING [Callback, RegisterSet],
+MimosaLog USING [Error, ErrorHti, ErrorN, ErrorNode, ErrorNodeOp, ErrorSei, ErrorTree, ErrorTreeOp, ErrorType, Warning, WarningNode, WarningTree],
+MimP3 USING [AddrOp, All, And, Apply, Assignment, Attr, BoundNP, Case, CatchPhrase, ClearRefStack, Cons, Discrimination, Dot, emptyAttr, EnterType, Extract, fullAttr, Id, ListCons, MakeLongType, MakeRefType, MergeNP, MiscXfer, Narrowing, NarrowOp, New, NPUse, phraseNP, Range, RecordMention, SealRefStack, SearchCtxList, SequenceNP, TextForm, TextRep, TypeAppl, TypeExp, UnsealRefStack, voidAttr],
+MimP3S USING [ImplicitInfo, implicitRecord, safety, self],
+MimZones USING [permZone, tempZone],
+OSMiscOps USING [Copy],
+Pass3Attributes USING [BaseType, <<BodyForTree,>> Bundling, CanonicalType, IdentifiedType, IndexType, LongType, MarkedType, NewableType, OperandType, OrderedType, PermanentType, TargetType, TypeForTree, Unbundle],
+SymbolOps USING [ConstantId, DecodeBti, DecodeTreeIndex, EqTypes, FromType, MakeNonCtxSe, NormalType, own, RCType, ToBti, TypeForm, TypeRoot, UnderType, XferMode],
+Symbols USING [Base, bodyType, CBTIndex, CBTNull, codeANY, codeCHAR, CSEIndex, CSENull, ctxType, HTIndex, ISEIndex, ISENull, nullType, RecordSEIndex, RecordSENull, SERecord, seType, Type, typeANY],
+SymLiteralOps USING [EnterAtom, EnterText],
+Target: TYPE MachineParms USING [bitsPerPtr, bitsPerReal, bitsPerRef, bitsPerWord],
+Tree USING [Base, Index, Link, Map, NodePtr, NodeName, Null, nullIndex, SubInfo, treeType],
+TreeOps USING [FreeNode, GetHash, GetInfo, GetNode, GetTag, ListLength, OpName, PopTree, PushNode, PushTree, SetAttr, SetInfo, UpdateList],
+Types USING [Assignable, Equivalent, OpaqueValue, SymbolTableBase];
+Pass3Xb: PROGRAM
+IMPORTS LiteralOps, MimData, MimosaEvents, MimosaLog, MimP3, MimP3S, MimZones, Pass3Attributes, OSMiscOps, SymbolOps, SymLiteralOps, TreeOps, Types
+EXPORTS MimP3, MimP3S = {
+OPEN MimP3, Pass3Attributes, SymbolOps, Symbols, TreeOps;
+
+dontCareAboutSigns: BOOL ¬ TRUE;
+dontResolvePrecisions: BOOL ¬ TRUE;
+implicit: PUBLIC MimP3S.ImplicitInfo ¬ [type: nullType, tree: Tree.Null, attr: MimP3.emptyAttr];
+SERecord: TYPE = Symbols.SERecord;
+
+tb: Tree.Base ¬ NIL;		-- tree base address (local copy)
+seb: Symbols.Base ¬ NIL;	-- se table base address (local copy)
+ctxb: Symbols.Base ¬ NIL;	-- context table base address (local copy)
+bb: Symbols.Base ¬ NIL;	-- context table base address (local copy)
+
+own: Types.SymbolTableBase ¬ NIL;
+OperandDescriptor: TYPE = RECORD [
+type: Type,	-- type of operand
+attr: Attr];	-- attributes
+
+RStack: TYPE = RECORD [SEQUENCE length: NAT OF OperandDescriptor];
+rStack: REF RStack ¬ NIL;
+rI: INTEGER ¬ 0;	-- index into rStack
+
+RPush: PUBLIC PROC [type: Type, attr: Attr] = {
+rI ¬ rI + 1;
+WHILE rI >= rStack.length DO
+newLength: NAT = rStack.length + 16;
+newStack: REF RStack = MimZones.tempZone.NEW[RStack[newLength]];
+FOR i: INTEGER IN [0 .. rI) DO newStack[i] ¬ rStack[i] ENDLOOP;
+MimZones.tempZone.FREE[@rStack];
+rStack ¬ newStack;
+ENDLOOP;
+IF EqualTypes[type, MimData.idNAT] THEN attr.either ¬ TRUE;
+rStack[rI] ¬ [type: type, attr: attr];
+};
+
+RSet: PROC [type: Type, attr: Attr] = INLINE {
+IF EqualTypes[type, MimData.idNAT] THEN attr.either ¬ TRUE;
+rStack[rI] ¬ [type: type, attr: attr];
+};
+
+RPop: PUBLIC PROC = {IF rI < 0 THEN ERROR; rI ¬ rI-1};
+RPopAssured: PROC = INLINE {rI ¬ rI-1};
+
+RType: PUBLIC PROC RETURNS [Type] = {RETURN [rStack[rI].type]};
+
+RAttr: PUBLIC PROC RETURNS [Attr] = {RETURN [rStack[rI].attr]};
+
+RAttrPop: PUBLIC PROC RETURNS [attr: Attr] = {
+attr ¬ rStack[rI].attr;
+IF rI < 0 THEN ERROR;
+rI ¬ rI-1;
+};
+
+UType: PUBLIC PROC RETURNS [CSEIndex] = {
+RETURN [SymbolOps.UnderType[SymbolOps.own, rStack[rI].type]];
+};
+
+SetType: PUBLIC PROC [type: Type] = {
+SetInfo[SymbolOps.FromType[type]];
+};
+
+textType: ARRAY TextForm OF Type ¬ ALL[nullType];
+aggresiveBalance: BOOL ¬ TRUE;
+EqualTypes: PROC [type1, type2: Type] RETURNS [BOOL] = {
+RETURN [Types.Equivalent[
+[own, SymbolOps.UnderType[SymbolOps.own, type1]],
+[own, SymbolOps.UnderType[SymbolOps.own, type2]]]];
+};
+
+UnresolvedTypes: SIGNAL RETURNS [Type] = CODE;
+
+BalanceTypes: PROC [type1, type2: Type] RETURNS [type: Type] = {
+sei1: CSEIndex ¬ ClearType[type1, FALSE];
+sei2: CSEIndex ¬ ClearType[type2, FALSE];
+SELECT TRUE FROM
+(sei1 = sei2) => type ¬ type1;
+sei2 = typeANY => type ¬ type1;
+sei1 = typeANY => type ¬ type2;
+(aggresiveBalance AND Unspec[sei2]) => type ¬ type2;
+(aggresiveBalance AND Unspec[sei1]) => type ¬ type1;
+ENDCASE => {
+n1: CARDINAL ¬ Bundling[sei1];
+n2: CARDINAL ¬ Bundling[sei2];
+DO
+SELECT n1 FROM
+> n2 => {
+type1 ¬ Unbundle[LOOPHOLE[sei1]];
+sei1 ¬ ClearType[type1, FALSE];
+n1 ¬ n1-1;
+};
+< n2 => {
+type2 ¬ Unbundle[LOOPHOLE[sei2]];
+sei2 ¬ ClearType[type2, FALSE];
+n2 ¬ n2-1;
+};
+ENDCASE => EXIT;
+ENDLOOP;
+DO
+sei1 ¬ SymbolOps.UnderType[SymbolOps.own, type1 ¬ TargetType[type1]];
+sei2 ¬ SymbolOps.UnderType[SymbolOps.own, type2 ¬ TargetType[type2]];
+SELECT TRUE FROM
+Types.Assignable[[own, sei1], [own, sei2]] => {type ¬ type1; EXIT};
+Types.Assignable[[own, sei2], [own, sei1]] => {type ¬ type2; EXIT};
+ENDCASE;
+IF n1 = 0 THEN {
+WITH se1: seb[sei1] SELECT FROM
+signed, unsigned =>
+WITH se2: seb[sei2] SELECT FROM
+signed, unsigned => RETURN [type1];
+real => RETURN [type2];
+ENDCASE;
+real => WITH se2: seb[sei2] SELECT FROM
+signed, unsigned => RETURN [type1];
+real =>
+IF se1.length >= se2.length THEN RETURN [type1] ELSE RETURN [type2];
+ENDCASE;
+ENDCASE;
+GO TO Fail;
+};
+n1 ¬ n1-1;
+type1 ¬ Unbundle[LOOPHOLE[sei1]];
+type2 ¬ Unbundle[LOOPHOLE[sei2]];
+REPEAT
+Fail => type ¬ SIGNAL UnresolvedTypes;
+ENDLOOP;
+};
+};
+
+ForceType: PUBLIC PROC [t: Tree.Link, type: Type] RETURNS [Tree.Link] = {
+PushTree[t];
+IF t = Tree.Null
+THEN PushNode[cast, 1]
+ELSE WITH t SELECT GetTag[t] FROM
+subtree =>
+SELECT tb[index].name FROM
+construct, union, rowcons => PushNode[cast, 1];
+openx => PushNode[cast, 1];
+ENDCASE;
+ENDCASE => PushNode[cast, 1];
+SetType[type];
+RETURN [PopTree[]];
+};
+EvalNumeric: PROC [t: Tree.Link, op: Tree.NodeName ¬ $none] RETURNS [Tree.Link] = {
+rt: Type ¬ MimData.idINTEGER;
+val: Tree.Link = GenericRhs[t, rt];
+nt: CSEIndex = ClearType[rStack[rI].type, TRUE];
+IF nt # typeANY THEN
+SELECT seb[nt].typeTag FROM
+signed => rt ¬ MimData.idINTEGER;
+unsigned => rt ¬ MimData.idCARDINAL;
+real => rt ¬ MimData.idREAL;
+ENDCASE =>
+IF op # $none
+THEN MimosaLog.ErrorTreeOp[missingOp, val, op]
+ELSE MimosaLog.ErrorTree[typeClash, val];
+rStack[rI].type ¬ rt;
+RETURN [val];
+};
+
+ArithOp: PROC [node: Tree.Index] = {
+son1: Tree.Link ¬ tb[node].son[1] ¬ EvalNumeric[tb[node].son[1], tb[node].name];
+saveNP: NPUse ¬ phraseNP;
+son2: Tree.Link ¬ tb[node].son[2] ¬ EvalNumeric[tb[node].son[2]]; 
+BalanceAttributes[node];
+rStack[rI-1].attr ¬ And[rStack[rI-1].attr, rStack[rI].attr];
+IF tb[node].attr1 THEN rStack[rI-1].attr.const ¬ FALSE;
+RPopAssured[];
+phraseNP ¬ MergeNP[saveNP][phraseNP];
+};
+
+Plus: PROC [node: Tree.Index] = {
+son1: Tree.Link ¬ tb[node].son[1] ¬ GenericRhs[tb[node].son[1], typeANY];
+son2: Tree.Link ¬ tb[node].son[2];
+saveNP: NPUse ¬ phraseNP;
+lType: CSEIndex ¬ ClearType[rStack[rI].type, TRUE];
+rType: CSEIndex;
+lr: BOOL ¬ TRUE;
+target: Type ¬ typeANY;
+clash1: BOOL ¬ FALSE;
+clash2: BOOL ¬ FALSE;
+float: BOOL ¬ FALSE;
+IF lType # typeANY THEN {
+WITH se: seb[lType] SELECT FROM
+ref, relative => {
+clash1 ¬ SymbolOps.RCType[SymbolOps.own, lType] # none;
+WITH e: son2 SELECT GetTag[son2] FROM
+literal => MimosaLog.WarningNode[notPortable, node];
+ENDCASE;
+};
+enumerated => clash1 ¬ NOT EqualTypes[lType, MimData.idCHAR];
+basic => clash1 ¬ NOT se.ordered;
+real => {target ¬ lType; float ¬ TRUE};
+signed, unsigned => {target ¬ lType; lr ¬ FALSE};
+ENDCASE => clash1 ¬ TRUE;
+IF clash1 THEN {
+MimosaLog.ErrorTreeOp[missingOp, son1, plus];
+lr ¬ FALSE;
+};
+};
+son2 ¬ tb[node].son[2] ¬ GenericRhs[son2, target];
+rType ¬ ClearType[rStack[rI].type, TRUE];
+IF lr THEN target ¬ lType ELSE target ¬ rType;
+IF rType # typeANY THEN {
+WITH se: seb[rType] SELECT FROM
+real => IF NOT float THEN clash2 ¬ lr;
+signed, unsigned => {};
+ref, relative => clash2 ¬ SymbolOps.RCType[SymbolOps.own, rType] # none;
+enumerated => clash2 ¬ lr;
+basic => clash2 ¬ NOT se.ordered OR lr;
+ENDCASE => clash2 ¬ TRUE;
+IF clash2 THEN {
+MimosaLog.ErrorTree[typeClash, son2];
+target ¬ rStack[rI].type ¬ MimData.idINTEGER;
+};
+};
+BalanceAttributes[node];
+rStack[rI-1].attr ¬ And[rStack[rI-1].attr, rStack[rI].attr];
+IF tb[node].attr1 THEN rStack[rI-1].attr.const ¬ FALSE;
+IF NOT lr THEN target ¬ UType[];
+rStack[rI-1].type ¬ target;
+RPopAssured[];
+phraseNP ¬ MergeNP[saveNP][phraseNP];
+};
+
+Minus: PROC [node: Tree.Index] = {
+son1: Tree.Link ¬ tb[node].son[1] ¬ GenericRhs[tb[node].son[1], typeANY];
+son2: Tree.Link ¬ tb[node].son[2];
+saveNP: NPUse ¬ phraseNP;
+lType: CSEIndex ¬ ClearType[rStack[rI].type, TRUE];
+rType: CSEIndex;
+lr: BOOL ¬ TRUE;
+target: Type ¬ typeANY;
+clash1: BOOL ¬ FALSE;
+clash2: BOOL ¬ FALSE;
+float: BOOL ¬ FALSE;
+IF lType # typeANY THEN {
+WITH se: seb[lType] SELECT FROM
+ref, relative => {
+clash1 ¬ SymbolOps.RCType[SymbolOps.own, lType] # none;
+WITH e: son2 SELECT GetTag[son2] FROM
+literal => MimosaLog.WarningNode[notPortable, node];
+ENDCASE;
+};
+enumerated => clash1 ¬ NOT EqualTypes[lType, MimData.idCHAR];
+basic => clash1 ¬ NOT se.ordered;
+real => {target ¬ lType; float ¬ TRUE};
+signed, unsigned => {target ¬ lType; lr ¬ FALSE};
+ENDCASE => clash1 ¬ TRUE;
+IF clash1 THEN {
+MimosaLog.ErrorTreeOp[missingOp, son1, minus];
+lr ¬ FALSE;
+};
+};
+son2 ¬ tb[node].son[2] ¬ GenericRhs[son2, target];
+rType ¬ ClearType[rStack[rI].type, TRUE];
+IF lr THEN target ¬ lType ELSE target ¬ rType;
+SELECT TRUE FROM
+EqualTypes[lType, rType] => {
+lr ¬ TRUE;
+WITH se: seb[lType] SELECT FROM
+real, signed, unsigned => target ¬ lType;
+ENDCASE => target ¬ MimData.idINTEGER;
+};
+rType = typeANY => {lr ¬ TRUE};
+ENDCASE => {
+WITH se: seb[rType] SELECT FROM
+real => IF NOT float THEN clash2 ¬ lr;
+signed, unsigned => {};
+ENDCASE => clash2 ¬ TRUE;
+IF clash2 THEN {
+MimosaLog.ErrorTree[typeClash, son2];
+target ¬ rStack[rI].type ¬ MimData.idINTEGER;
+};
+};
+BalanceAttributes[node];
+rStack[rI-1].attr ¬ And[rStack[rI-1].attr, rStack[rI].attr];
+IF tb[node].attr1 THEN rStack[rI-1].attr.const ¬ FALSE;
+IF NOT lr THEN target ¬ UType[];
+rStack[rI-1].type ¬ target;
+RPopAssured[];
+phraseNP ¬ MergeNP[saveNP][phraseNP];
+};
+
+RelOp: PROC [node: Tree.Index, ordered: BOOL] = {
+son1: Tree.Link ¬ tb[node].son[1] ¬ GenericRhs[tb[node].son[1], typeANY];
+saveNP: NPUse ¬ phraseNP; 
+type: Type ¬ rStack[rI].type;
+target: Type ¬ BaseType[type];
+attr: Attr ¬ rStack[rI].attr;
+implicitOp: BOOL ¬ (son1 = Tree.Null);
+son2: Tree.Link ¬ tb[node].son[2] ¬ GenericRhs[tb[node].son[2], target];
+type ¬ BalanceTypes[target, BaseType[rStack[rI].type]
+! UnresolvedTypes => {
+MimosaLog.ErrorType[typeClash, son2, [MimData.ownSymbols, type]];
+RESUME[typeANY]}];
+IF (ordered AND ~OrderedType[type]) OR (~ordered AND ~IdentifiedType[type]) THEN
+MimosaLog.ErrorTreeOp[missingOp, son1, tb[node].name];
+BalanceAttributes[node];
+son1 ¬ tb[node].son[1];
+son2 ¬ tb[node].son[2];
+attr ¬ And[attr, rStack[rI].attr];
+SELECT SymbolOps.TypeForm[SymbolOps.own, type] FROM
+$basic, $enumerated, $signed, $unsigned => NULL;
+$transfer => {
+IF OperandInline[son1] THEN MimosaLog.ErrorTree[misusedInline, son1];
+IF OperandInline[son2] THEN MimosaLog.ErrorTree[misusedInline, son2];
+attr.const ¬ FALSE;
+};
+$real => attr.const ¬ FALSE;
+ENDCASE;
+RPopAssured[];
+RSet[MimData.idBOOL, attr];
+phraseNP ¬ MergeNP[saveNP][phraseNP];
+};
+
+In: PROC [node: Tree.Index] = {
+son1: Tree.Link ¬ tb[node].son[1] ¬ GenericRhs[tb[node].son[1], typeANY];
+saveNP: NPUse ¬ phraseNP;
+type: Type ¬ rStack[rI].type;
+son2: Tree.Link ¬ tb[node].son[2] ¬ Range[tb[node].son[2], CanonicalType[type]];
+cType: Type ¬ rStack[rI].type;
+[] ¬ BalanceTypes[BaseType[type], BaseType[cType]
+! UnresolvedTypes => {
+MimosaLog.ErrorType[typeClash, son1, [MimData.ownSymbols, cType]];
+RESUME[typeANY]}];
+BalanceAttributes[node, FALSE];
+rStack[rI-1].attr ¬ And[rStack[rI-1].attr, rStack[rI].attr];
+RPopAssured[];
+tb[node].info ¬ SymbolOps.FromType[rStack[rI].type ¬ MimData.idBOOL];
+phraseNP ¬ MergeNP[saveNP][phraseNP];
+};
+
+BoolOp: PROC [node: Tree.Index] = {
+attr: Attr;
+saveNP: NPUse;
+SealRefStack[];
+tb[node].son[1] ¬ Rhs[tb[node].son[1], MimData.idBOOL];
+attr ¬ rStack[rI].attr;
+saveNP ¬ phraseNP; 
+ClearRefStack[];
+tb[node].son[2] ¬ Rhs[tb[node].son[2], MimData.idBOOL]; 
+UnsealRefStack[];
+attr ¬ And[attr, rStack[rI].attr];
+RPopAssured[];
+RSet[MimData.idBOOL, attr];
+phraseNP ¬ SequenceNP[saveNP][phraseNP];
+};
+
+Interval: PUBLIC PROC [t: Tree.Link, target: Type, constant: BOOL] = {
+node: Tree.Index = GetNode[t];
+type: Type;
+attr: Attr;
+saveNP: NPUse;
+target ¬ TargetType[target];
+tb[node].son[1] ¬ BalancedRhs[tb[node].son[1], target];
+saveNP ¬ phraseNP;
+type ¬ rStack[rI].type ¬ CanonicalType[rStack[rI].type];
+attr ¬ rStack[rI].attr;
+IF constant AND ~attr.const THEN MimosaLog.ErrorTree[nonConstant, tb[node].son[1]];
+tb[node].son[2] ¬ BalancedRhs[tb[node].son[2], target];  
+rStack[rI].type ¬ CanonicalType[rStack[rI].type];
+type ¬ BalanceTypes[BaseType[type], BaseType[rStack[rI].type]
+! UnresolvedTypes => {
+MimosaLog.ErrorTree[typeClash, tb[node].son[2]];
+RESUME[typeANY];
+}];
+attr ¬ And[attr, rStack[rI].attr];
+IF constant AND ~rStack[rI].attr.const THEN
+MimosaLog.ErrorTree[nonConstant, tb[node].son[2]];
+SELECT tb[node].name FROM
+intOO, intOC, intCO, intCC => {
+ac: ArithClass ¬ AttrClass[type];
+IF ac.kind = real THEN BalanceAttributes[node];
+};
+ENDCASE => BalanceAttributes[node];
+IF tb[node].attr1 THEN attr.const ¬ FALSE;
+phraseNP ¬ MergeNP[saveNP][phraseNP];
+RPopAssured[];
+rStack[rI].attr ¬ attr;
+};
+
+BalancedTarget: PROC [target, type: Type] RETURNS [Type] = {
+SELECT TRUE FROM
+target = typeANY => {};
+EqualTypes[type, target] => RETURN [target];
+EqualTypes[ClearType[type, TRUE], target] => RETURN [target];
+ENDCASE => RETURN [target];
+RETURN [TargetType[type]];
+};
+
+ResolveTypes: PROC [type1, type2, target: Type, t: Tree.Link] RETURNS [type: Type] = {
+failed: BOOL ¬ target = typeANY;
+IF NOT failed THEN {
+ENABLE UnresolvedTypes => {failed ¬ TRUE; RESUME[typeANY]};
+type ¬ BalanceTypes[BalanceTypes[target, type1], BalanceTypes[target, type2]];
+};
+IF failed THEN {
+MimosaLog.ErrorType[typeClash, t, [MimData.ownSymbols, CanonicalType[type1]]];
+type ¬ typeANY;
+};
+};
+
+IfExp: PROC [node: Tree.Index, target: Type] = {
+type: Type;
+attr: Attr;
+entryNP: NPUse;
+saveNP: NPUse;
+son1: Tree.Link ¬ tb[node].son[1];
+son2: Tree.Link ¬ tb[node].son[2];
+son3: Tree.Link ¬ tb[node].son[3];
+SealRefStack[];
+son1 ¬ tb[node].son[1] ¬ Rhs[son1, MimData.idBOOL]; 
+attr ¬ rStack[rI].attr;  RPopAssured[];  entryNP ¬ phraseNP;
+UnsealRefStack[];
+son2 ¬ tb[node].son[2] ¬ BalancedRhs[son2, target];
+attr ¬ And[attr, rStack[rI].attr];
+saveNP ¬ SequenceNP[entryNP][phraseNP];
+type ¬ rStack[rI].type;
+RPopAssured[];
+target ¬ BalancedTarget[target, type];
+son3 ¬ tb[node].son[3] ¬ BalancedRhs[son3, target];
+attr ¬ And[attr, rStack[rI].attr];
+type ¬ BalanceTypes[type, rStack[rI].type
+! UnresolvedTypes => {
+RESUME[ResolveTypes[type, rStack[rI].type, target, son3]];
+}];
+IF SymbolOps.TypeForm[SymbolOps.own, type] = $transfer THEN {
+IF OperandInline[son2] THEN MimosaLog.ErrorTree[misusedInline, son2];
+IF OperandInline[son3] THEN MimosaLog.ErrorTree[misusedInline, son3];
+attr.const ¬ FALSE;
+};
+phraseNP ¬ BoundNP[saveNP][SequenceNP[entryNP][phraseNP]];
+RSet[type, attr];
+};
+
+SelectExp: PROC
+[node: Tree.Index, target: Type, driver: PROC [Tree.Index, Tree.Map], foldable: BOOL] = {
+Selection: Tree.Map = {
+subType: Type;
+entryNP: NPUse = phraseNP;
+v ¬ BalancedRhs[t, target];
+subType ¬ BalanceTypes[type, rStack[rI].type
+! UnresolvedTypes => {RESUME[ResolveTypes[type, rStack[rI].type, target, v]]}];
+IF SymbolOps.TypeForm[SymbolOps.own, subType] = $transfer
+AND OperandInline[v] THEN
+MimosaLog.ErrorTree[misusedInline, v];
+saveNP ¬ BoundNP[saveNP][SequenceNP[entryNP][phraseNP]];
+IF subType # typeANY THEN type ¬ subType;
+IF ~started THEN target ¬ BalancedTarget[target, type];
+attr ¬ And[attr, rStack[rI].attr];  RPopAssured[];
+started ¬ TRUE;
+};
+type: Type ¬ typeANY;
+attr: Attr ¬ fullAttr;
+started: BOOL ¬ FALSE;
+saveNP: NPUse ¬ none;
+driver[node, Selection];
+attr ¬ And[attr, rStack[rI].attr];
+attr.const ¬ foldable AND attr.const AND tb[node].attr2;
+RSet[type, attr];
+phraseNP ¬ saveNP;
+};
+
+MinMax: PROC [node: Tree.Index, target: Type] = {
+attr: Attr ¬ fullAttr;
+saveNP: NPUse ¬ none;
+started: BOOL ¬ FALSE;
+subType: Type ¬ typeANY;
+type: Type ¬ target;
+maxAc: ArithClass;
+SubMinMax: Tree.Map = {
+vType: Type;
+ac: ArithClass;
+v ¬ GenericRhs[t, target];
+saveNP ¬ MergeNP[saveNP][phraseNP];
+vType ¬ rStack[rI].type;
+ac ¬ AttrClass[vType];
+IF NOT started OR (attr.either AND ac.kind = unsigned)
+THEN {
+type ¬ vType;
+attr ¬ rStack[rI].attr;
+maxAc ¬ ac;
+}
+ELSE {
+attr ¬ And[attr, rStack[rI].attr];
+ac ¬ MaxClass[ac, maxAc];
+IF ac.kind # none THEN maxAc ¬ ac;
+IF maxAc.kind # none THEN type ¬ AttrClassToType[maxAc];
+};
+subType ¬ BalanceTypes[type, vType 
+! UnresolvedTypes => {RESUME[ResolveTypes[type, vType, target, v]]}];
+IF subType # typeANY THEN {
+SELECT TRUE FROM
+~started => {
+IF ~OrderedType[subType] THEN
+MimosaLog.ErrorTreeOp[missingOp, v, tb[node].name];
+target ¬ BalancedTarget[target, subType];
+started ¬ TRUE;
+};
+~SymbolOps.EqTypes[SymbolOps.own, type, subType]
+AND ~OrderedType[subType] =>
+MimosaLog.ErrorTree[typeClash, v];
+ENDCASE;
+type ¬ subType;
+};
+RPop[];
+};
+tb[node].son[1] ¬ UpdateList[tb[node].son[1], SubMinMax];
+SELECT SymbolOps.TypeForm[SymbolOps.own, type] FROM
+real => {tb[node].attr1 ¬ TRUE; tb[node].attr2 ¬ FALSE; attr.const ¬ FALSE};
+ENDCASE => tb[node].attr1 ¬ tb[node].attr2 ¬ FALSE;
+IF type = typeANY THEN type ¬ MimData.idINTEGER;
+RPush[type, attr];
+phraseNP ¬ saveNP;
+};
+
+TypeTest: PROC [node: Tree.Index, from, to: Type] = {
+subType: Type = CanonicalType[from];
+op: NarrowOp = Narrowing[type: subType, target: to];
+son1: Tree.Link ¬ tb[node].son[1];
+SELECT TRUE FROM
+op.error => MimosaLog.ErrorTree[typeClash, son1];
+op.computed => MimosaLog.ErrorTree[missingBinding, son1];
+op.unImpl => MimosaLog.Warning[opaqueTest];
+ENDCASE;
+IF NOT SymbolOps.EqTypes[SymbolOps.own, subType, from] THEN
+son1 ¬ tb[node].son[1] ¬ ForceType[son1, subType];
+tb[node].attr1 ¬ op.indirect;
+IF (tb[node].attr2 ¬ op.rtTest) THEN EnterType[MarkedType[to]];
+tb[node].attr3 ¬ op.tagTest;
+};
+
+Unspec: PROC [type: Type] RETURNS [BOOL] = {
+sei: CSEIndex = SymbolOps.UnderType[SymbolOps.own, type];
+WITH t: seb[sei] SELECT FROM
+basic => RETURN [t.code = codeANY];
+ENDCASE => RETURN [FALSE];
+};
+
+SafeForUnspec: PROC [target: Type] RETURNS [BOOL] = {
+RETURN [MimP3S.safety # checked OR SymbolOps.RCType[SymbolOps.own, target] = none];
+};
+
+Rhs: PUBLIC PROC [exp: Tree.Link, lhsType: Type] RETURNS [val: Tree.Link] = {
+rhsType: Type;
+lhsSei, rhsSei: CSEIndex;
+val ¬ Exp[exp, lhsType];
+rhsType ¬ rStack[rI].type;
+lhsSei ¬ SymbolOps.UnderType[SymbolOps.own, lhsType];
+rhsSei ¬ SymbolOps.UnderType[SymbolOps.own, rhsType];
+SELECT TRUE FROM
+(lhsSei = rhsSei), Unspec[lhsType] => NULL;
+ENDCASE => {
+UNTIL Types.Assignable[[own, lhsSei], [own, rhsSei]] DO
+WITH t: seb[rhsSei] SELECT FROM
+subrange =>
+rhsType ¬ SymbolOps.UnderType[SymbolOps.own, t.rangeType];
+record => {
+IF Bundling[rhsSei] = 0 THEN GO TO nomatch;
+rhsType ¬ Unbundle[LOOPHOLE[rhsSei, RecordSEIndex]];
+val ¬ ForceType[val, IF Unspec[rhsType] THEN typeANY ELSE rhsType];
+};
+basic => {
+IF Unspec[rhsSei] AND SafeForUnspec[lhsSei]
+THEN GO TO coerced
+ELSE GO TO nomatch;
+};
+signed => {
+rBits: INT ¬ t.length;
+WITH dst: seb[lhsSei] SELECT FROM
+signed => SELECT dst.length FROM
+< rBits => val ¬ Shorten[val, lhsType];
+> rBits => val ¬ Lengthen[val, lhsType];
+ENDCASE => ERROR;  -- how come no match ???
+unsigned => SELECT dst.length FROM
+> rBits => val ¬ Lengthen[val, lhsType];
+ENDCASE => val ¬ Shorten[val, lhsType];
+real => {
+val ¬ Float[val, rhsType, lhsType];
+rStack[rI].attr.const ¬ FALSE;
+};
+ENDCASE => GO TO nomatch;
+GO TO coerced;
+};
+unsigned => {
+rBits: INT ¬ t.length;
+WITH dst: seb[lhsSei] SELECT FROM
+signed => SELECT dst.length FROM
+> rBits => val ¬ Lengthen[val, lhsType];
+ENDCASE => val ¬ Shorten[val, lhsType];
+unsigned => SELECT dst.length FROM
+< rBits => val ¬ Shorten[val, lhsType];
+> rBits => val ¬ Lengthen[val, lhsType];
+ENDCASE => ERROR;  -- how come no match ???
+real => {
+val ¬ Float[val, rhsType, lhsType];
+rStack[rI].attr.const ¬ FALSE;
+};
+ENDCASE => GO TO nomatch;
+GO TO coerced;
+};
+real => {
+rBits: INT ¬ t.length;
+WITH tt: seb[lhsSei] SELECT FROM
+real =>
+SELECT tt.length FROM
+< rBits => val ¬ Shorten[val, lhsType];
+> rBits => val ¬ Lengthen[val, lhsType];
+ENDCASE => ERROR;  -- should have been assignable!
+ENDCASE => GO TO nomatch;
+GO TO coerced;
+};
+ENDCASE => GO TO nomatch;
+rhsSei ¬ SymbolOps.UnderType[SymbolOps.own, rhsType];
+REPEAT
+coerced => {
+rhsType ¬ lhsType;
+};
+nomatch => {
+MimosaLog.ErrorType[typeClash,
+IF exp = Tree.Null THEN implicit.tree ELSE val,
+[MimData.ownSymbols, lhsType]];
+rhsType ¬ lhsType;
+};
+ENDLOOP;
+rStack[rI].type ¬ rhsType;
+};
+IF val # Tree.Null
+AND SymbolOps.TypeForm[SymbolOps.own, rhsType] = $transfer
+AND OperandInline[val] THEN
+MimosaLog.ErrorTree[misusedInline, val];
+};
+
+GenericRhs: PROC [exp: Tree.Link, target: Type] RETURNS [Tree.Link] = {
+val: Tree.Link ¬ Exp[exp, target];
+type: Type ¬ rStack[rI].type;
+DO
+sei: CSEIndex = SymbolOps.UnderType[SymbolOps.own, type];
+WITH t: seb[sei] SELECT FROM
+subrange => type ¬ t.rangeType;
+record => {
+IF Bundling[sei] = 0 THEN EXIT;
+type ¬ Unbundle[LOOPHOLE[sei, RecordSEIndex]];
+val ¬ ForceType[val, type];
+};
+ENDCASE => EXIT;
+rStack[rI].type ¬ type;
+ENDLOOP;
+rStack[rI].type ¬ type;
+RETURN [val];
+};
+
+BalancedRhs: PROC [exp: Tree.Link, target: Type] RETURNS [Tree.Link] = {
+val: Tree.Link ¬ Exp[exp, target];
+type: Type ¬ rStack[rI].type;	-- for exp
+ac: ArithClass ¬ AttrClass[type];
+tac: ArithClass ¬ AttrClass[target];
+rac: ArithClass ¬ MaxClass[ac, tac];
+attr: Attr ¬ rStack[rI].attr;
+IF attr.either AND tac.kind = unsigned THEN {
+rac.kind ¬ ac.kind ¬ unsigned;
+rStack[rI].type ¬ type ¬ target;
+};
+IF rac.kind # none AND ac # rac THEN {
+target ¬ AttrClassToType[rac];
+IF rac.kind = real
+THEN {
+val ¬ Float[val, type, target];
+rStack[rI].type ¬ type ¬ target;
+}
+ELSE {
+IF MimData.switches['y] THEN {
+SELECT TRUE FROM
+rac.kind = signed AND ac.kind = unsigned AND NOT attr.const =>
+MimosaLog.WarningTree[mixedRepresentation, val];
+rac.kind = unsigned AND ac.kind = signed AND NOT attr.const =>
+MimosaLog.WarningTree[mixedRepresentation, val];
+ENDCASE;
+};
+val ¬ Lengthen[val, target];
+rStack[rI].type ¬ type ¬ target;
+};
+};
+SELECT TRUE FROM
+type = typeANY => rStack[rI].type ¬ type ¬ target;
+Unspec[type] AND SafeForUnspec[target] => rStack[rI].type ¬ type ¬ target;
+ENDCASE;
+RETURN [val];
+};
+
+SetAttributesPop: PROC [target: Type] RETURNS [t: Tree.Link] = {
+t ¬ PopTree[];
+IF t # Tree.Null THEN WITH e: t SELECT GetTag[t] FROM
+subtree => {SetAttributes[e.index, target]; RETURN};
+ENDCASE;
+ERROR;
+};
+
+SetAttributes: PROC [node: Tree.Index, target: Type] = {
+nt: CSEIndex = ClearType[target, TRUE];
+ac: ArithClass = AttrClass[nt];
+tp: Tree.NodePtr = @tb[node];
+tp.attr1 ¬ tp.attr2 ¬ FALSE;
+tp.subInfo ¬ ac.precision;
+WITH seb[nt] SELECT FROM
+real => tp.attr1 ¬ tp.attr3 ¬ TRUE;
+signed => tp.attr3 ¬ TRUE;
+ref => tp.attr2 ¬ TRUE;
+relative => tp.attr2 ¬ TRUE;
+ENDCASE;
+tp.info ¬ SymbolOps.FromType[target];
+};
+
+BalanceAttributes: PROC [node: Tree.Index, alterSon2: BOOL ¬ TRUE] = {
+type1: Type ¬ rStack[rI-1].type;	-- for son1
+ac1: ArithClass ¬ AttrClass[type1];
+type2: Type ¬ rStack[rI].type;	-- for son2
+ac2: ArithClass ¬ AttrClass[type2];
+target: Type ¬ type1;
+attr1: Attr ¬ rStack[rI-1].attr;
+attr2: Attr ¬ rStack[rI].attr;
+IF attr2.either THEN
+SELECT ac1.kind FROM
+unsigned => {ac2.kind ¬ unsigned; rStack[rI].type ¬ type2 ¬ target ¬ type1};
+signed => {ac2.kind ¬ signed; rStack[rI].type ¬ type2 ¬ target ¬ type1};
+ENDCASE;
+IF attr1.either THEN
+SELECT ac2.kind FROM
+unsigned => {ac1.kind ¬ unsigned; rStack[rI-1].type ¬ type1 ¬ target ¬ type2};
+signed => {ac1.kind ¬ signed; rStack[rI-1].type ¬ type1 ¬ target ¬ type2};
+ENDCASE;
+SELECT TRUE FROM
+dontCareAboutSigns AND ac1.precision = ac2.precision AND (ac1.kind = signed AND ac2.kind = unsigned OR ac1.kind = unsigned AND ac2.kind = signed) => {
+};
+ac1 # ac2 => {
+ac: ArithClass ¬ MaxClass[ac1, ac2];
+IF MimData.switches['y] THEN {
+SELECT TRUE FROM
+ac1.kind = signed AND ac2.kind = unsigned AND NOT attr2.const =>
+MimosaLog.WarningNode[mixedRepresentation, node];
+ac1.kind = unsigned AND ac2.kind = signed AND NOT attr1.const =>
+MimosaLog.WarningNode[mixedRepresentation, node];
+ENDCASE;
+};
+IF ac.kind # none THEN
+SELECT ac FROM
+ac1 => {
+son: Tree.Link ¬ tb[node].son[2];
+target ¬ type1;
+IF alterSon2 THEN {
+IF ac.kind = real
+THEN tb[node].son[2] ¬ Float[son, type2, target]
+ELSE tb[node].son[2] ¬ Lengthen[son, target];
+};
+rStack[rI].type ¬ target;
+};
+ac2 => {
+son: Tree.Link ¬ tb[node].son[1];
+target ¬ type2;
+IF ac.kind = real
+THEN tb[node].son[1] ¬ Float[son, type1, target]
+ELSE tb[node].son[1] ¬ Lengthen[son, target];
+rStack[rI-1].type ¬ target;
+};
+ENDCASE => target ¬ AttrClassToType[ac];
+};
+ENDCASE;
+SetAttributes[node, target];
+};
+
+Lengthen: PROC [t: Tree.Link, target: Type] RETURNS [Tree.Link] = {
+PushTree[t];
+PushNode[lengthen, 1];
+RETURN [SetAttributesPop[target]];
+};
+
+Shorten: PROC [t: Tree.Link, target: Type] RETURNS [Tree.Link] = {
+PushTree[t];
+PushNode[shorten, 1];
+RETURN [SetAttributesPop[target]];
+};
+
+Float: PROC [t: Tree.Link, type, target: Type] RETURNS [Tree.Link] = {
+nt: CSEIndex = ClearType[type, TRUE];
+bits: NAT ¬ Target.bitsPerReal;
+needsFloat: BOOL ¬ FALSE;
+cTarget: CSEIndex = ClearType[target, TRUE];
+WITH s: seb[nt] SELECT FROM
+signed => {bits ¬ s.length; needsFloat ¬ TRUE};
+unsigned => {bits ¬ s.length; needsFloat ¬ TRUE};
+real => bits ¬ s.length;
+ENDCASE => IF nt # typeANY THEN {MimosaLog.ErrorTree[typeClash, t]; RETURN [t]};
+IF needsFloat THEN {
+PushTree[t];
+PushNode[float, 1];
+t ¬ SetAttributesPop[target];
+bits ¬ Target.bitsPerReal;
+};
+WITH r: seb[cTarget] SELECT FROM
+real => IF bits < r.length THEN t ¬ Lengthen[t, target];
+ENDCASE;
+RETURN [t];
+};
+defaultAttr: Attr = [noAssign: TRUE, noXfer: TRUE, const: FALSE, either: FALSE];
+constAttr: Attr = [noAssign: TRUE, noXfer: TRUE, const: TRUE, either: FALSE];
+
+Exp: PUBLIC PROC [exp: Tree.Link, target: Type] RETURNS [val: Tree.Link] = {
+attr: Attr ¬ defaultAttr;
+type: Type ¬ typeANY;
+phraseNP ¬ none;
+val ¬ exp;
+IF exp = Tree.Null THEN {RPush[implicit.type, implicit.attr]; RETURN};
+WITH e: exp SELECT GetTag[exp] FROM
+symbol => {
+sei: ISEIndex = e.index;
+RecordMention[sei];
+type ¬ seb[sei].idType;
+SELECT ctxb[seb[sei].idCtx].ctxType FROM
+included =>
+IF ~(attr.const¬SymbolOps.ConstantId[sei]) THEN MimosaLog.ErrorSei[unimplemented, sei];
+imported => attr.const ¬ SymbolOps.ConstantId[sei];
+ENDCASE => attr.const ¬ seb[sei].constant;
+RPush[type, attr];
+};
+hash => {
+sei: CSEIndex = SymbolOps.UnderType[SymbolOps.own, target];
+WITH t: seb[sei] SELECT FROM
+enumerated => {
+sei: ISEIndex;
+IF ([sei: sei] ¬ SearchCtxList[e.index, t.valueCtx]).found THEN {
+RPush[target, fullAttr];
+RETURN [[symbol[sei]]];
+};
+};
+ENDCASE;
+val ¬ Id[e.index];
+};
+literal => {
+attr ¬ constAttr;
+type ¬ MimData.idINTEGER;
+SELECT LiteralOps.Value[e.index].class FROM
+either => attr.either ¬ TRUE;
+unsigned => type ¬ MimData.idCARDINAL;
+real => {type ¬ MimData.idREAL; attr ¬ defaultAttr};
+ENDCASE;
+RPush[type, attr];
+};
+string => {
+[val, type] ¬ StringRef[exp, target];
+RPush[type, attr];
+};
+subtree => {
+node: Tree.Index ¬ e.index;
+IF tb[node].free THEN ERROR;
+SELECT tb[node].name FROM
+dot => {
+node ¬ Dot[node, target];
+val ¬ [subtree[node]];
+};
+uparrow => {
+son1: Tree.Link ¬ tb[node].son[1] ¬ Exp[tb[node].son[1], typeANY];
+type: Type ¬ rStack[rI].type;
+attr: Attr ¬ rStack[rI].attr;
+nType: CSEIndex = ClearType[type, TRUE];
+RPopAssured[];
+attr.const ¬ FALSE;
+WITH t: seb[nType] SELECT FROM
+ref => {
+RPush[t.refType, attr];
+tb[node].attr2 ¬ LongType[type];
+IF MimP3S.safety = checked
+AND ~(t.counted OR PermanentType[t.refType]) THEN
+MimosaLog.ErrorNodeOp[unsafeOp, node, uparrow];
+};
+ENDCASE => {
+IF type # typeANY THEN
+MimosaLog.ErrorTreeOp[missingOp, tb[node].son[1], uparrow];
+RPush[typeANY, attr];
+};
+};
+apply => {
+node ¬ Apply[node, target, FALSE];
+val ¬ [subtree[node]];
+CheckNonVoid[node, target];
+};
+uminus, abs => {
+IF UniOperand[node] THEN {
+tb[node].son[1] ¬ EvalNumeric[tb[node].son[1], tb[node].name];
+SetAttributes[node, rStack[rI].type];
+IF tb[node].attr1 THEN rStack[rI].attr.const ¬ FALSE;
+}
+};
+plus => Plus[node];
+minus => Minus[node];
+times, div, mod, power => ArithOp[node];
+relE, relN => RelOp[node, FALSE];
+relL, relGE, relG, relLE => RelOp[node, TRUE];
+in, notin => In[node];
+not => tb[node].son[1] ¬ Rhs[tb[node].son[1], MimData.idBOOL];
+or, and => BoolOp[node];
+ifx => IfExp[node, target];
+casex => SelectExp[node, target, Case, TRUE];
+bindx => SelectExp[node, target, Discrimination, FALSE];
+assignx => Assignment[node];
+extractx => {Extract[node]; CheckNonVoid[node, target]};
+min, max => MinMax[node, target];
+pred, succ =>
+IF UniOperand[node] THEN {
+tb[node].son[1] ¬ GenericRhs[tb[node].son[1], target];
+SetAttributes[node, rStack[rI].type];
+IF NOT IndexType[rStack[rI].type] THEN {
+ut: CSEIndex ¬ SymbolOps.UnderType[SymbolOps.own, rStack[rI].type];
+DO
+WITH se: seb[ut] SELECT FROM
+relative => EXIT;
+ref => IF NOT se.counted THEN EXIT;
+ENDCASE;
+MimosaLog.ErrorTreeOp[missingOp, tb[node].son[1], tb[node].name];
+EXIT;
+ENDLOOP;
+};
+};
+addr, base, length, arraydesc => AddrOp[node, target];
+all => All[node, target];
+mwconst => RPush[MimData.idDCARD, fullAttr];
+void => RPush[target, voidAttr];
+clit => {attr.const ¬ TRUE; RPush[MimData.idCHAR, attr]};
+llit => RPush[MimData.idSTRING, attr];
+atom => {
+hti: HTIndex = GetHash[tb[node].son[1]];
+subTarget: CSEIndex = SymbolOps.UnderType[SymbolOps.own, target];
+WITH t: seb[subTarget] SELECT FROM
+enumerated => {
+sei: ISEIndex;
+IF ~([sei: sei]¬SearchCtxList[hti, t.valueCtx]).found THEN
+MimosaLog.ErrorHti[unknownId, hti];
+tb[node].son[1] ¬ Tree.Null;
+FreeNode[node];
+node ¬ Tree.nullIndex;
+val ¬ [symbol[index: sei]];
+RPush[target, fullAttr];
+};
+ENDCASE => {
+SymLiteralOps.EnterAtom[hti];
+EnterType[MimData.typeAtomRecord, FALSE];
+RPush[MimData.idATOM, attr];
+};
+};
+nil => {
+son1: Tree.Link ¬ tb[node].son[1];
+SELECT TRUE FROM
+(son1 # Tree.Null) => {
+son1 ¬ tb[node].son[1] ¬ TypeExp[son1];
+type ¬ TypeForTree[son1];
+IF ~NullableType[type] THEN
+MimosaLog.ErrorTreeOp[missingAttr, son1, nil];
+};
+~SymbolOps.EqTypes[SymbolOps.own, target, typeANY] => {
+type ¬ target;
+IF ~NullableType[type] THEN MimosaLog.ErrorTree[typeClash, val];
+};
+ENDCASE => type ¬ MakeRefType[typeANY, typeANY, Target.bitsPerPtr];
+RPush[type, fullAttr];
+};
+new => New[node, target];
+cons => node ¬ GetNode[val ¬ Cons[node, target]];
+listcons => ListCons[node, target];
+signalx, errorx, fork, joinx, create, startx => {
+val ¬ MiscXfer[node, target];
+node ¬ GetNode[val];
+CheckNonVoid[node, target];
+};
+syserrorx => {
+RPush[CSENull, emptyAttr];
+CheckNonVoid[node, target];
+};
+lengthen => {
+son1: Tree.Link ¬ tb[node].son[1] ¬ GenericRhs[tb[node].son[1], target];
+subType: CSEIndex ¬ SymbolOps.UnderType[SymbolOps.own, TargetType[rStack[rI].type]];
+IF subType # typeANY THEN
+SELECT seb[subType].typeTag FROM
+signed, unsigned, real, ref, arraydesc => {};
+ENDCASE => {
+MimosaLog.ErrorTreeOp[missingOp, son1, lengthen];
+subType ¬ typeANY;
+};
+rStack[rI].type ¬ MakeLongType[subType, target];
+};
+narrow => {
+son1: Tree.Link ¬ tb[node].son[1];
+son2: Tree.Link ¬ tb[node].son[2];
+IF son2 = Tree.Null
+THEN {
+IF target = typeANY THEN MimosaLog.ErrorNode[noTarget, node];
+type ¬ target;
+}
+ELSE {
+son2 ¬ tb[node].son[2] ¬ TypeExp[son2];
+type ¬ TypeForTree[tb[node].son[2]];
+};
+son1 ¬ tb[node].son[1] ¬ Exp[son1, TargetType[type]];
+TypeTest[node: node, from: rStack[rI].type, to: type];
+<<
+IF tb[node].attr3 AND ~tb[node].attr1 AND son2 = Tree.Null THEN
+MimosaLog.ErrorNode[noTarget, node];
+>>
+IF SymbolOps.RCType[SymbolOps.own, type] = simple THEN {
+nType: CSEIndex = SymbolOps.NormalType[SymbolOps.own, type];
+WITH t: seb[nType] SELECT FROM
+ref => EnterType[t.refType, FALSE];
+ENDCASE;
+};
+IF tb[node].nSons > 2 THEN [] ¬ CatchPhrase[tb[node].son[3]];
+rStack[rI].type ¬ type;
+rStack[rI].attr.const ¬ rStack[rI].attr.noXfer ¬ FALSE;
+};
+istype => {
+tb[node].son[1] ¬ Exp[tb[node].son[1], typeANY];
+tb[node].son[2] ¬ TypeExp[tb[node].son[2]];
+TypeTest[node: node, from: rStack[rI].type, to: TypeForTree[tb[node].son[2]]];
+rStack[rI].type ¬ MimData.idBOOL;
+rStack[rI].attr.const ¬ FALSE;
+};
+safen => tb[node].son[1] ¬ Exp[tb[node].son[1], target];
+loophole => {
+son1: Tree.Link ¬ tb[node].son[1] ¬ Exp[tb[node].son[1], typeANY];
+son2: Tree.Link ¬ tb[node].son[2];
+SELECT SymbolOps.TypeForm[SymbolOps.own, rStack[rI].type] FROM
+$transfer =>
+IF OperandInline[son1] THEN MimosaLog.ErrorTree[misusedInline, son1];
+$mode => MimosaLog.ErrorTree[typeClash, son1];
+ENDCASE;
+IF son2 = Tree.Null
+THEN {
+IF target = typeANY THEN MimosaLog.ErrorNode[noTarget, node];
+rStack[rI].type ¬ target;
+}
+ELSE {
+son2 ¬ tb[node].son[2] ¬ TypeExp[son2];
+target ¬ rStack[rI].type ¬ TypeForTree[son2];
+};
+IF SymbolOps.RCType[SymbolOps.own, target] # none THEN {
+rStack[rI].attr.const ¬ FALSE;
+IF MimP3S.safety = checked THEN
+MimosaLog.ErrorNodeOp[unsafeOp, node, loophole];
+}
+};
+size => {
+son1: Tree.Link ¬ tb[node].son[1] ¬ TypeAppl[tb[node].son[1]];
+son2: Tree.Link ¬ tb[node].son[2];
+attr: Attr ¬ rStack[rI].attr;
+RPopAssured[];
+IF ~NewableType[TypeForTree[son1]] THEN
+MimosaLog.ErrorTreeOp[missingAttr, son1, size];
+IF son2 # Tree.Null THEN {
+saveNP: NPUse = phraseNP;
+son2 ¬ tb[node].son[2] ¬ Rhs[son2, MimData.idCARDINAL];
+attr ¬ And[attr, rStack[rI].attr];
+RPopAssured[];
+phraseNP ¬ MergeNP[saveNP][phraseNP];
+};
+RPush[MimData.idCARDINAL, attr];
+};
+first, last => {
+son1: Tree.Link = tb[node].son[1] ¬ TypeExp[tb[node].son[1]];
+type: CSEIndex ¬ SymbolOps.UnderType[SymbolOps.own, TypeForTree[son1]];
+attr: Attr ¬ fullAttr;
+attr.either ¬ FALSE;
+{
+WITH seb[type] SELECT FROM
+basic => IF code = codeCHAR THEN GO TO ok;
+signed, unsigned => GO TO ok;
+enumerated, subrange, relative => GO TO ok;
+ENDCASE;
+MimosaLog.ErrorTreeOp[missingAttr, son1, tb[node].name];
+EXITS
+ok => {};
+};
+RPush[type, attr];
+};
+typecode => {
+son1: Tree.Link ¬ tb[node].son[1] ¬ TypeExp[tb[node].son[1]];
+attr: Attr ¬ fullAttr;
+attr.const ¬ FALSE;
+EnterType[TypeForTree[son1], FALSE];
+RPush[typeANY, attr];
+};
+self => {
+val ¬ MimP3S.self.tree;
+MimP3S.self.tree ¬ Tree.Null;
+phraseNP ¬ MimP3S.self.np;
+RPush[MimP3S.self.type, MimP3S.self.attr];
+FreeNode[node];
+node ¬ Tree.nullIndex;
+};
+cast => {
+tb[node].son[1] ¬ Exp[tb[node].son[1], target];
+rStack[rI].type ¬ target;
+};
+float =>
+IF UniOperand[node] THEN {
+son1: Tree.Link ¬ tb[node].son[1] ¬ GenericRhs[tb[node].son[1], typeANY];
+rStack[rI].type ¬ MimData.idREAL;
+};
+ord =>
+IF UniOperand[node] THEN {
+son1: Tree.Link ¬ tb[node].son[1] ¬ GenericRhs[tb[node].son[1], typeANY];
+vt: Type ¬ rStack[rI].type;
+tt: Type ¬ MimData.idCARDINAL;
+WITH s: son1 SELECT GetTag[son1] FROM
+string => {
+};
+ENDCASE => {
+DO
+sei: CSEIndex = SymbolOps.UnderType[SymbolOps.own, vt];
+WITH t: seb[sei] SELECT FROM
+basic, enumerated => {};
+subrange => {vt ¬ t.rangeType; LOOP};
+signed, unsigned => tt ¬ vt;
+ENDCASE => MimosaLog.ErrorTreeOp[missingOp, son1, ord];
+EXIT;
+ENDLOOP;
+};
+rStack[rI].type ¬ tt;
+SetAttributes[node, tt];
+};
+val =>
+IF UniOperand[node] THEN {
+IF NOT IndexType[target] THEN MimosaLog.ErrorNode[noTarget, node];
+tb[node].son[1] ¬ EvalNumeric[tb[node].son[1]];
+rStack[rI].type ¬ target;
+};
+stringinit => {
+son2: Tree.Link ¬ tb[node].son[2] ¬ Rhs[tb[node].son[2], MimData.idCARDINAL];
+IF ~rStack[rI].attr.const THEN MimosaLog.ErrorTree[nonConstant, son2];
+RSet[MimData.idSTRING, voidAttr];
+};
+item =>
+tb[node].son[2] ¬ Exp[tb[node].son[2], target];
+ENDCASE => {
+MimosaLog.Error[unimplemented];
+RPush[typeANY, emptyAttr];
+};
+IF node # Tree.nullIndex THEN tb[node].info ¬ SymbolOps.FromType[rStack[rI].type];
+};
+ENDCASE;
+};
+
+CheckNonVoid: PROC [node: Tree.Index, target: Type] = {
+IF rStack[rI].type = nullType THEN {
+SELECT tb[node].name FROM
+error => tb[node].name ¬ errorx;
+errorx, syserrorx => {};
+ENDCASE => {MimosaLog.ErrorNode[typeClash, node]; target ¬ typeANY};
+rStack[rI].type ¬ target;
+};
+};
+
+VoidExp: PUBLIC PROC [exp: Tree.Link] RETURNS [val: Tree.Link] = {
+val ¬ Exp[exp, typeANY];
+RPop[];
+};
+
+UniOperand: PROC [node: Tree.Index] RETURNS [valid: BOOL] = {
+l: CARDINAL = ListLength[tb[node].son[1]];
+IF ~(valid ¬ l=1) THEN {
+IF l > 1 THEN MimosaLog.ErrorN[listLong, l-1] ELSE MimosaLog.ErrorN[listShort, l+1];
+tb[node].son[1] ¬ UpdateList[tb[node].son[1], VoidExp];
+RPush[typeANY, emptyAttr];
+};
+};
+
+StringRef: PROC [t: Tree.Link, target: Type] RETURNS [v: Tree.Link, type: Type] = {
+type ¬ MimData.idSTRING;
+v ¬ t;
+IF SymbolOps.RCType[SymbolOps.own, target] # none THEN {
+nType: CSEIndex = SymbolOps.NormalType[SymbolOps.own, target];
+rType: Type = WITH t: seb[nType] SELECT FROM
+ref => t.refType,
+ENDCASE => MimData.idTEXT;
+form: TextForm = TextRep[rType];
+cType: Type = (IF form = text THEN MimData.idTEXT ELSE rType);
+type ¬ textType[form];
+IF type = CSENull THEN {
+type ¬ MakeRefType[
+cType: cType, hint: nType, bits: Target.bitsPerRef, counted: TRUE];
+textType[form] ¬ type;
+};
+EnterType[SymbolOps.TypeRoot[SymbolOps.own, cType], FALSE];
+WITH e: t SELECT GetTag[t] FROM
+string => {
+e.index ¬ LiteralOps.FindHeapString[
+e.index, SymbolOps.TypeRoot[SymbolOps.own, cType]];
+SymLiteralOps.EnterText[e.index, type];
+};
+ENDCASE;
+PushTree[t];
+PushNode[textlit, 1];
+SetAttr[2, TRUE];
+SetType[type];
+v ¬ PopTree[];
+};
+};
+ClearType: PUBLIC PROC [type: Type, normalize: BOOL] RETURNS [CSEIndex] = {
+DO
+sei: CSEIndex = SymbolOps.UnderType[SymbolOps.own, type];
+WITH t: seb[sei] SELECT FROM
+record => {
+IF NOT normalize THEN RETURN [sei];
+IF Bundling[sei] = 0 THEN RETURN [sei];
+type ¬ Unbundle[LOOPHOLE[sei, RecordSEIndex]];
+};
+subrange => {
+IF NOT normalize THEN RETURN [sei];
+type ¬ t.rangeType;
+};
+opaque => {
+nSei: CSEIndex ¬ Types.OpaqueValue[ [SymbolOps.own, sei], SymbolOps.own].sei;
+IF nSei = sei THEN RETURN [sei];
+type ¬ nSei;
+};
+ENDCASE => RETURN [sei];
+ENDLOOP;
+};
+
+NullableType: PROC [type: Type] RETURNS [BOOL] = {
+sei: CSEIndex = SymbolOps.NormalType[SymbolOps.own, type];
+WITH t: seb[sei] SELECT FROM
+relative, ref, transfer, arraydesc, zone => RETURN [TRUE];
+ENDCASE;
+RETURN [FALSE];
+};
+
+OperandInline: PROC [t: Tree.Link] RETURNS [BOOL] = {
+SELECT SymbolOps.XferMode[SymbolOps.own, Pass3Attributes.OperandType[t]] FROM
+$proc => {
+bti: Symbols.CBTIndex ¬ CBTNull;
+sei: ISEIndex ¬ ISENull;
+DO
+WITH t SELECT GetTag[t] FROM
+symbol => {
+sei ¬ index;
+SELECT TRUE FROM
+seb[sei].mark4 =>
+IF seb[sei].constant THEN bti ¬ SymbolOps.DecodeBti[seb[sei].idInfo];
+seb[sei].immutable => {
+node: Tree.Index ¬ SymbolOps.DecodeTreeIndex[seb[sei].idValue];
+IF OpName[tb[node].son[3]] = $body THEN
+bti ¬ LOOPHOLE[SymbolOps.ToBti[GetInfo[tb[node].son[3]]]];
+};
+ENDCASE;
+};
+subtree => {
+node: Tree.Index ¬ index;
+SELECT tb[node].name FROM
+$cdot, $dot, $dollar => {t ¬ tb[node].son[2]; LOOP};
+ENDCASE;
+};
+ENDCASE;
+EXIT;
+ENDLOOP;
+IF bti # Symbols.CBTNull AND bb[bti].inline THEN RETURN [TRUE];
+IF bti = Symbols.CBTNull AND sei # ISENull THEN
+IF seb[sei].extended AND seb[sei].constant THEN RETURN [TRUE];
+};
+ENDCASE;
+RETURN [FALSE];
+};
+AttrClass: PROC [type: Type] RETURNS [ac: ArithClass] = {
+sei: CSEIndex = ClearType[type, TRUE];
+bits: NAT ¬ 0;
+grain: NAT ¬ Target.bitsPerWord;
+ac ¬ [none, 0];
+IF binaryClassTable = NIL THEN InitClassTable[];
+WITH se: seb[sei] SELECT FROM
+signed => {bits ¬ se.length; ac.kind ¬ signed};
+unsigned => {bits ¬ se.length; ac.kind ¬ unsigned};
+real => {bits ¬ se.length; grain ¬ Target.bitsPerReal; ac.kind ¬ real};
+ENDCASE;
+IF NOT dontResolvePrecisions THEN
+WHILE bits > grain DO
+ac.precision ¬ ac.precision.SUCC;
+bits ¬ bits - grain;
+ENDLOOP;
+IF dontCareAboutSigns THEN SELECT ac.kind FROM
+signed => ac.kind ¬ either;
+unsigned => ac.kind ¬ either;
+ENDCASE;
+};
+
+generatedTypes: REF GenTypeSeq ¬ NIL;
+GenTypeSeq: TYPE = RECORD [
+len: NAT, elements: SEQUENCE max: NAT OF GenTypeEntry
+];
+GenTypeEntry: TYPE = RECORD [
+ac: ArithClass,
+type: Type
+];
+
+MakeEntry: PROC [ac: ArithClass, type: Type] = {
+len: NAT ¬ generatedTypes.len;
+IF len = generatedTypes.max THEN {
+new: REF GenTypeSeq ¬ MimZones.tempZone.NEW[GenTypeSeq[len+16]];
+new.len ¬ len;
+OSMiscOps.Copy[
+from: @generatedTypes[0],
+nwords: WORDS[GenTypeSeq[len]] - WORDS[GenTypeSeq[0]],
+to: @new[0]];
+MimZones.tempZone.FREE[@generatedTypes];
+generatedTypes ¬ new;
+};
+generatedTypes[len] ¬ [ac, type];
+generatedTypes.len ¬ len+1;
+};
+
+AttrClassToType: PROC [ac: ArithClass] RETURNS [Type] = {
+IF generatedTypes = NIL THEN {
+generatedTypes ¬ MimZones.tempZone.NEW[GenTypeSeq[16]];
+generatedTypes.len ¬ 0;
+MakeEntry[[either, 0], MimData.idNAT];
+MakeEntry[AttrClass[MimData.idINTEGER], MimData.idINTEGER];
+MakeEntry[AttrClass[MimData.idCARDINAL], MimData.idCARDINAL];
+MakeEntry[AttrClass[MimData.idREAL], MimData.idREAL];
+MakeEntry[AttrClass[MimData.idDREAL], MimData.idDREAL];
+};
+FOR i: NAT IN [0..generatedTypes.len) DO
+IF generatedTypes[i].ac = ac THEN RETURN [generatedTypes[i].type];
+ENDLOOP;
+SELECT ac.kind FROM
+either => ERROR;
+signed => {
+type: Type ¬ SymbolOps.MakeNonCtxSe[SERecord.cons.signed.SIZE];
+bits: NAT ¬ Target.bitsPerWord*(ac.precision+1);
+seb[type] ¬ [mark3: TRUE, mark4: TRUE, body: cons[
+align: MimData.bitsToAlignment[bits],
+typeInfo: signed[length: bits]]];
+RETURN [type];
+};
+unsigned => {
+type: Type ¬ SymbolOps.MakeNonCtxSe[SERecord.cons.unsigned.SIZE];
+bits: NAT ¬ Target.bitsPerWord*(ac.precision+1);
+seb[type] ¬ [mark3: TRUE, mark4: TRUE, body: cons[
+align: MimData.bitsToAlignment[bits],
+typeInfo: unsigned[length: bits]]];
+RETURN [type];
+};
+real => {
+type: Type ¬ SymbolOps.MakeNonCtxSe[SERecord.cons.real.SIZE];
+bits: NAT ¬ Target.bitsPerReal*(ac.precision+1);
+seb[type] ¬ [mark3: TRUE, mark4: TRUE, body: cons[
+align: MimData.bitsToAlignment[bits],
+typeInfo: real[length: bits]]];
+RETURN [type];
+};
+ENDCASE;
+RETURN [nullType];
+};
+
+ArithKind: TYPE = {none, address, either, signed, unsigned, real};
+ArithClassTable: TYPE = ARRAY ArithKind OF ARRAY ArithKind OF ArithKind;
+binaryClassTable: REF ArithClassTable ¬ NIL;
+InitClassTable: PROC = {
+binaryClassTable ¬ MimZones.permZone.NEW[ArithClassTable ¬ ALL[ALL[none]]];
+FOR i: ArithKind IN ArithKind DO
+binaryClassTable[i][i] ¬ i;
+ENDLOOP;
+FOR i: ArithKind IN ArithKind[signed..real] DO
+binaryClassTable[real][i] ¬ real;
+binaryClassTable[i][real] ¬ real;
+binaryClassTable[i][either] ¬ i;
+binaryClassTable[either][i] ¬ i;
+ENDLOOP;
+binaryClassTable[unsigned][signed] ¬ signed;
+binaryClassTable[signed][unsigned] ¬ signed;
+};
+
+MaxClass: PROC [dstAc: ArithClass, srcAc: ArithClass] RETURNS [rac: ArithClass] = INLINE {
+rac ¬ [binaryClassTable[dstAc.kind][srcAc.kind], MAX[dstAc.precision, srcAc.precision]];
+};
+
+Precision: TYPE = Tree.SubInfo;
+ArithClass: TYPE = RECORD [kind: ArithKind, precision: Precision];
+
+ExpNotify: MimosaEvents.Callback = {
+SELECT class FROM
+relocate => {
+seb ¬ MimData.base[seType];
+ctxb ¬ MimData.base[ctxType];
+tb ¬ MimData.base[Tree.treeType];
+bb ¬ MimData.base[Symbols.bodyType];
+};
+pass2 => {
+implicit ¬ [type: typeANY, tree: Tree.Null, attr: emptyAttr];
+MimP3S.implicitRecord ¬ RecordSENull;
+own ¬ MimData.ownSymbols;
+textType ¬ ALL[nullType];
+rStack ¬ MimZones.tempZone.NEW[RStack[32]];
+rI ¬ -1;
+};
+pass3, cleanup, zoneReset => {
+MimZones.tempZone.FREE[@generatedTypes];
+MimZones.tempZone.FREE[@rStack];
+};
+ENDCASE;
+};
+
+MimosaEvents.RegisterSet[ExpNotify, ALL[TRUE]];
+ExpNotify[pass2]; -- first time is special
+}.
+
+  z  
+Pass3Xb.mesa
+Copyright Ó 1985, 1986, 1987, 1988, 1989, 1990, 1991 by Xerox Corporation.  All rights reserved.
+Satterthwaite, June 25, 1986 9:29:20 am PDT
+Russ Atkinson (RRA) August 3, 1990 0:20:43 am PDT
+Options
+If TRUE, then wait for Pass4 processing to handle signed/unsigned
+If TRUE, then wait for Pass4 processing to handle size conversions
+Exported variables
+implied attributes of Tree.Null
+exported to MimP3S
+Internal variables
+Intermediate result bookkeeping
+RPopAssured should be used internally just after referencing something from the stack.  When bounds checking is on (the normal case) this ensures that we will not have popped too far, and the quick decrement is assured to work.
+could be an interface inline
+a hint for text literals
+Type manipulation
+RRA: This is here to make it easy to test the effects of using Unspec inside of BalanceTypes instead of typeANY.
+
+check bundling
+No bundling left, handling floating point as special case
+(this should not be true, but we would need work to avoid it)
+All fixed-point checking happens in Pass 4
+Arithmetic expression manipulation
+May change son[1] or son[2].
+IF implicitOp AND son1 # Tree.Null THEN MimosaLog.ErrorTree[typeClash, son2];
+No need to balance signed/unsigned yet
+Here we do the evaluations and to gather up the maximum type.  We do not convert to the maximum type until it exists.  Conversions are deferred until Pass4.
+The first time that we have a definitive type.
+Accumulate a "maximum" type.
+immediate matching is inconclusive
+coercion is complete
+no coercion is possible
+put value in canonical form
+A cheap coercion
+Need to augment val
+We are being asked to emit warnings about possibly unexpected conversions between signed & unsigned numbers.  We don't bother to check conversions of constants, because that will be done in Pass 4.
+We rely on Pass 4 processing to determine the correct kind of arithmetic to use
+We are being asked to emit warnings about possibly unexpected conversions between signed & unsigned numbers.  We don't bother to check conversions of constants, because that will be done in Pass 4.
+Need to augment son[2]
+Need to augment son[1]
+Expressions
+Note: can modify tb[node].son[1], but not the other sons
+RRA: this makes no sense to me.  I think that it is perfectly OK to NARROW a variant record to a more tightly bound variant record.
+DON'T let this be treated as a compile-time constant (it isn't)
+We are converting something to be a REAL or DREAL, although we don't try to distinguish between them until Pass4.
+Presumably we got this from the parser because it was too large to parse.  In any case we just pass it along, since Pass4 has to deal with these things.
+Overloaded string literals
+Tree & type utilities (formerly in Pass3AttributesImpl)
+bti: Symbols.CBTIndex _ Pass3Attributes.BodyForTree[t];
+IF bti # Symbols.CBTNull AND bb[bti].inline THEN RETURN [TRUE];
+Possibly a MACHINE CODE procedure!
+Binary arithmetic class determination
+Try to resolve precisions in Pass3 (historical)
+Make the initial table and fill it with common arithmetic types
+The kind indicates the properties of the arithmetic and the precision gives the number of words of precision-1.
+Initialization
+ Ê-™  •NewlineDelimiter
+–(cedarcode) style™ head™Icodešœ
+ÏeœU™`LšÏy+™+L™1L˜ šÏk	˜	LšœŸœ˜)LšœŸœ¡˜®LšœŸœ˜+Lšœ
+Ÿœƒ˜’LšœŸœ‚˜LšœŸœ.˜:Lšœ	Ÿœ˜$Lšœ
+Ÿœ˜LšœŸœÀ˜ÕLšœ
+Ÿœ”˜£LšœŸœ¸˜ÅLšœŸœ˜+LšœŸœŸœ4˜SLšœŸœQ˜[LšœŸœ~˜‹LšœŸœ8˜C——šÏnœŸ˜LšŸœŒ˜“LšŸœ˜LšŸœ5˜9L˜ —™šœŸœŸœ˜ LšœŸœ:™A—šœŸœŸœ˜#LšœŸœ;™B——™šœ
+ŸœP˜`Lšœ™L™——™Lšœ
+Ÿœ˜"L˜ LšœŸœÏc!˜7LšœŸœ¡%˜>LšœŸœ¡*˜DLšœŸœ¡*˜BL˜ LšœŸœ˜!—™šœŸœŸœ˜"Lšœ¡˜Lšœ¡˜L˜ —LšœŸœŸœŸœ	ŸœŸœ˜BLšœŸœ
+Ÿœ˜LšœŸœ¡˜%L˜ š œŸœŸœ˜/L˜šŸœŸ˜LšœŸœ˜$Lšœ
+ŸœŸœ˜@Lš
+ŸœŸœŸœŸœŸœ˜?LšœŸœ
+˜ L˜LšŸœ˜—LšŸœ!ŸœŸœ˜;L˜&L˜L˜ —š œŸœŸœ˜.LšŸœ!ŸœŸœ˜;L˜&L˜L˜ —š œŸœŸœŸœŸœŸœ˜6š œŸœŸœ˜'L™ã——L˜ Lš
+ œŸœŸœŸœŸœ˜?L˜ Lš
+ œŸœŸœŸœŸœ˜?L˜ š œŸœŸœŸœ˜.L˜LšŸœŸœŸœ˜L˜
+L˜—L˜ š œŸœŸœŸœ˜)LšŸœ7˜=Lšœ˜—L˜ š œŸœŸœ˜%Lšœ™L˜"L˜L˜ —šœ
+Ÿœ
+ŸœŸœ˜1Lšœ™——™šœŸœŸœ˜LšŸœm™pL™ —š 
+œŸœŸœŸœ˜8LšŸœy˜L˜L˜ —š œŸœŸœ
+Ÿœ˜.L˜ —š œŸœŸœ˜@Lšœ"Ÿœ˜)Lšœ"Ÿœ˜)šŸœŸœŸ˜Lšœ˜Lšœ˜Lšœ˜LšœŸœ˜4LšœŸœ˜4šŸœ˜LšœŸœ˜LšœŸœ˜šŸ˜šŸœŸ˜šœ	˜	LšœŸœ˜!LšœŸœ˜Lšœ
+˜
+Lšœ˜—šœ	˜	LšœŸœ˜!LšœŸœ˜Lšœ
+˜
+Lšœ˜—LšŸœŸœ˜—LšŸœ˜—L™šŸ˜L˜EL˜EšŸœŸœŸ˜Lšœ=Ÿœ˜CLšœ=Ÿœ˜CLšŸœ˜—šŸœŸœ˜™9L™=—šŸœŸœŸ˜šœ˜šŸœŸœŸ˜šœŸœ	˜#L™*—LšœŸœ	˜LšŸœ˜——šœŸœŸœŸ˜'LšœŸœ	˜#šœ˜Lš
+ŸœŸœŸœ	ŸœŸœ	˜D—LšŸœ˜—LšŸœ˜—LšŸœŸœ˜L˜—L˜
+LšœŸœ˜!LšœŸœ˜!šŸ˜LšœŸœ˜&—LšŸœ˜—Lšœ˜——L˜L˜ —š 	œŸœŸœŸœ˜IL˜šŸœ˜LšŸœ˜šŸœŸœŸœŸ˜!˜
+šŸœŸ˜L˜/L˜LšŸœ˜——LšŸœ˜——L˜LšŸœ˜L˜——™"š œŸœ+Ÿœ˜SLšœ˜Lšœ#˜#Lšœ*Ÿœ˜0šŸœŸ˜šŸœŸ˜L˜!L˜$L˜šŸœ˜
+šŸœ˜LšŸœ*˜.LšŸœ%˜)————L˜LšŸœ˜L˜L˜ —š œŸœ˜$LšœP˜PL˜LšœB˜BL˜L˜<LšŸœŸœŸœ˜7L˜L˜%L˜L˜ —š œŸœ˜!LšœI˜ILšœ"˜"Lšœ˜Lšœ-Ÿœ˜3Lšœ˜LšœŸœŸœ˜Lšœ˜LšœŸœŸœ˜LšœŸœŸœ˜LšœŸœŸœ˜šŸœŸœ˜šŸœŸœŸ˜šœ˜Lšœ7˜7šŸœ	ŸœŸ˜%Lšœ4˜4LšŸœ˜—L˜—LšœŸœ#˜=LšœŸœ˜!Lšœ!Ÿœ˜'Lšœ*Ÿœ˜1LšŸœŸœ˜—šŸœŸœ˜Lšœ-˜-LšœŸœ˜Lšœ˜—L˜—Lšœ2˜2Lšœ#Ÿœ˜)LšŸœŸœŸœ˜.šŸœŸœ˜šŸœŸœŸ˜LšœŸœŸœŸœ˜&L˜LšœH˜HLšœ˜LšœŸœŸœ˜'LšŸœŸœ˜—šŸœŸœ˜Lšœ%˜%Lšœ-˜-Lšœ˜—L˜—L˜L˜<LšŸœŸœŸœ˜7LšŸœŸœŸœ˜ Lšœ˜L˜L˜%L˜L˜ —š œŸœ˜"LšœI˜ILšœ"˜"Lšœ˜Lšœ-Ÿœ˜3Lšœ˜LšœŸœŸœ˜Lšœ˜LšœŸœŸœ˜LšœŸœŸœ˜LšœŸœŸœ˜šŸœŸ˜šŸœŸœŸ˜šœ˜Lšœ7˜7šŸœ	ŸœŸ˜%Lšœ4˜4LšŸœ˜—L˜—LšœŸœ#˜=LšœŸœ˜!Lšœ!Ÿœ˜'Lšœ*Ÿœ˜1LšŸœŸœ˜—šŸœŸœ˜Lšœ.˜.LšœŸœ˜Lšœ˜—L˜—Lšœ2˜2Lšœ#Ÿœ˜)LšŸœŸœŸœ˜.šŸœŸœŸ˜šœ˜LšœŸœ˜
+šŸœŸœŸ˜Lšœ)˜)LšŸœ˜&—Lšœ˜—LšœŸœ˜šŸœ˜šŸœŸœŸ˜LšœŸœŸœŸœ˜&L˜LšŸœŸœ˜—šŸœŸœ˜Lšœ%˜%Lšœ-˜-Lšœ˜—L˜——L˜L˜<LšŸœŸœŸœ˜7LšŸœŸœŸœ˜ Lšœ˜L˜L˜%L˜L˜ —š œŸœŸœ˜1L˜IL˜L˜L˜L˜LšœŸœ˜&L˜H˜5˜L˜ALšŸœ˜——š	Ÿœ
+ŸœŸœŸœŸ˜PL˜6—˜L™—L˜L˜L˜"LšŸœŸœŸœ&™MšŸœ)Ÿ˜3Lšœ+Ÿœ˜0˜LšŸœŸœ*˜ELšŸœŸœ*˜ELšœŸœ˜L˜—LšœŸœ˜LšŸœ˜—L˜Lšœ˜L˜%L˜L˜ —š œŸœ˜L˜IL˜Lšœ˜L˜PLšœ˜šœ1˜1˜LšœB˜BLšŸœ˜——LšœŸœ˜L˜<L˜L˜EL˜%L˜L˜ —š œŸœ˜#L˜L˜L˜L˜7L˜L˜L˜L˜8L˜L˜"L˜Lšœ˜L˜(L˜L˜ —š œŸœŸœ(Ÿœ˜FL˜L˜L˜L˜L˜L˜7L˜L˜8L˜LšŸœ
+ŸœŸœ3˜SL˜9L˜1˜=šœ˜Lšœ0˜0LšŸœ
+˜Lšœ˜——L˜"šŸœ
+ŸœŸ˜+Lšœ2˜2—šŸœŸ˜šœ˜L™&L˜!LšŸœŸœ˜/Lšœ˜—LšŸœ˜#—LšŸœŸœŸœ˜*L˜%L˜L˜L˜L˜ —š œŸœŸœ˜<šŸœŸœŸ˜Lšœ˜LšœŸœ
+˜,LšœŸœŸœ
+˜=LšŸœŸœ
+˜—LšŸœ˜˜L˜ ——š œŸœ,Ÿœ˜VLšœŸœ˜ šŸœŸœŸœ˜LšŸœŸœŸœ˜;L˜NL˜—šŸœŸœ˜L˜NL˜L˜—L˜L˜ —š œŸœ%˜0L˜L˜L˜L˜Lšœ"˜"Lšœ"˜"Lšœ"˜"L˜Lšœ4˜4L˜<L˜Lšœ3˜3L˜"L˜'L˜L˜L˜&Lšœ3˜3L˜"˜)šœ˜LšŸœ4˜:Lšœ˜——šŸœ5Ÿœ˜=LšŸœŸœ*˜ELšŸœŸœ*˜ELšœŸœ˜Lšœ˜—L˜:L˜L˜L˜ —š 	œŸœ)Ÿœ#Ÿœ˜iš 	œ˜L˜L˜L˜˜,LšœŸœ3˜O—šŸœ8ŸœŸ˜SL˜&—L˜8LšŸœŸœ˜)LšŸœ
+Ÿœ'˜7L˜2Lšœ
+Ÿœ˜L˜—L˜L˜Lšœ	ŸœŸœ˜L˜L˜L˜"LšœŸœŸœ˜8Lšœ˜L˜L˜L˜ —š œŸœ%˜1L˜L˜Lšœ	ŸœŸœ˜L˜L˜L˜š 	œ˜L™œL˜L˜Lšœ˜L˜#Lšœ˜Lšœ˜šŸœŸœ	ŸœŸœ˜6šŸœ˜L™.Lšœ˜L˜L˜L˜—šŸœ˜L™L˜"L˜LšŸœŸœ˜"LšŸœŸœ˜8L˜——šœ#˜#LšœŸœ)˜E—šŸœŸœ˜šŸœŸœŸ˜˜šŸœŸ˜Lšœ3˜3—L˜)Lšœ
+Ÿœ˜L˜—šœ1Ÿœ˜ML˜"—LšŸœ˜—L˜L˜—L˜L˜—L˜9šŸœ)Ÿ˜3LšœŸœŸœŸœ˜LLšŸœ&Ÿœ˜3—LšŸœŸœ˜0L˜L˜L˜L˜ —š œŸœ'˜5L˜$L˜4L˜"šŸœŸœŸ˜L˜1L˜9L˜+LšŸœ˜—šŸœŸœ1Ÿ˜;L˜2—L˜LšŸœŸœ˜?L˜L˜L˜ —š œŸœŸœŸœ˜,L˜9šŸœŸœŸ˜Lšœ	Ÿœ˜#LšŸœŸœŸœ˜—˜L˜ ——š œŸœŸœŸœ˜5LšŸœŸœ1˜SL˜L˜ —š œŸœŸœ!Ÿœ˜ML˜L˜L˜L˜L˜5L˜5šŸœŸœŸ˜Lšœ&Ÿœ˜+šŸœ˜L™"šŸœ0Ÿ˜7šŸœŸœŸ˜˜L˜:—˜LšŸœŸœŸœŸœ	˜+LšœŸœ˜4LšœŸœŸœ	Ÿœ
+˜CL˜—˜
+šŸœŸœ˜+LšŸœŸœŸœ˜LšŸœŸœŸœ	˜—L˜—˜LšœŸœ˜šŸœŸœŸ˜!šœ
+ŸœŸ˜ L˜'L˜(LšŸœŸœ¡˜+—šœŸœŸ˜"L˜(LšŸœ ˜'—˜	L˜#LšœŸœ˜L˜—LšŸœŸœŸœ	˜—LšŸœŸœ	˜L˜—˜LšœŸœ˜šŸœŸœŸ˜!šœ
+ŸœŸ˜ L˜(LšŸœ ˜'—šœŸœŸ˜"L˜'L˜(LšŸœŸœ¡˜+—˜	L˜#LšœŸœ˜L˜—LšŸœŸœŸœ	˜—LšŸœŸœ	˜L˜—˜	LšœŸœ˜šŸœŸœŸ˜ ˜šŸœŸ˜L˜'L˜(LšŸœŸœ¡˜2——LšŸœŸœŸœ	˜—LšŸœŸœ	˜L˜—LšŸœŸœŸœ	˜—L˜5šŸ˜˜L™L˜L˜—˜L™˜LšŸœŸœŸœ˜/L˜—L˜L˜——LšŸœ˜—L˜L˜——šŸœŸœ8ŸœŸ˜iL˜(—L˜L˜ —š 
+œŸœ Ÿœ˜GL˜"L˜L™šŸ˜L˜9šŸœŸœŸ˜L˜˜LšŸœŸœŸœ˜LšœŸœ˜.L˜L˜—LšŸœŸœ˜—L˜LšŸœ˜—Lšœ˜LšŸœ˜L˜L˜ —š œŸœ Ÿœ˜HL˜"Lšœ¡
+˜(L˜!L˜$L˜$L˜šŸœŸœŸœ˜-L™Lšœ˜Lšœ ˜ L˜—šŸœŸœ
+Ÿœ˜&L™L˜šŸœ˜šŸœ˜Lšœ˜Lšœ ˜ L˜—šŸœ˜šŸœŸœ˜L™ÅšŸœŸœŸ˜šœŸœŸœŸœ˜>Lšœ0˜0—šœŸœŸœŸœ˜>Lšœ0˜0—LšŸœ˜—L˜—Lšœ˜Lšœ ˜ L˜——L˜—šŸœŸœŸ˜Lšœ2˜2LšœŸœ:˜JLšŸœ˜—LšŸœ˜L˜L˜ —š œŸœŸœ˜@L˜š	ŸœŸœŸœŸœŸ˜5Lšœ,Ÿœ˜4LšŸœ˜—LšŸœ˜L˜L˜ —š œŸœ%˜8Lšœ!Ÿœ˜'L˜Lšœ˜LšœŸœ˜L˜šŸœ	ŸœŸ˜LšœŸœ˜#LšœŸœ˜LšœŸœ˜LšœŸœ˜LšŸœ˜—L˜%˜L˜ ——š œŸœŸœ˜FLšœ!¡˜,L˜#Lšœ¡˜*L˜#L˜L˜ L˜šŸœŸ˜šŸœ
+Ÿ˜LšœL˜LLšœH˜HLšŸœ˜——šŸœŸ˜šŸœ
+Ÿ˜LšœN˜NLšœJ˜JLšŸœ˜——šŸœŸœŸ˜šœŸœŸœŸœŸœŸœ˜–L™OLšœ˜—šœ˜L˜$šŸœŸœ˜L™ÅšŸœŸœŸ˜šœŸœŸœŸœ˜@Lšœ1˜1—šœŸœŸœŸœ˜@Lšœ1˜1—LšŸœ˜—L˜—šŸœŸ˜šŸœŸ˜šœ˜L™L˜!L˜šŸœŸœ˜šŸœ˜LšŸœ,˜0LšŸœ)˜-—L˜—L˜L˜—˜L™L˜!L˜šŸœ˜LšŸœ,˜0LšŸœ)˜-—L˜L˜—LšŸœ!˜(——L˜—LšŸœ˜—L˜˜L˜ ——š œŸœŸœ˜CL˜L˜LšŸœ˜"L˜L˜ —š œŸœŸœ˜BL˜L˜LšŸœ˜"L˜L˜ —š œŸœ$Ÿœ˜FLšœŸœ˜%LšœŸœ˜LšœŸœŸœ˜Lšœ&Ÿœ˜,šŸœŸœŸ˜Lšœ)Ÿœ˜/Lšœ+Ÿœ˜1L˜LšŸœŸœŸœ%Ÿœ˜P—šŸœŸœ˜L˜L˜L˜L˜L˜—šŸœŸœŸ˜ LšœŸœŸœ˜8LšŸœ˜—LšŸœ˜L˜——™Lš	œŸœ
+Ÿœ	Ÿœ
+Ÿœ˜PLš	œŸœ
+Ÿœ	Ÿœ
+Ÿœ˜ML˜ š œŸœŸœ Ÿœ˜LL˜L˜L˜L˜
+LšŸœŸœ'Ÿœ˜FšŸœŸœŸ˜#˜L˜L˜L˜šŸœŸ˜(˜LšŸœ)Ÿœ(˜W—L˜3LšŸœ#˜*—L˜L˜—˜	L˜;šŸœŸœŸ˜˜L˜šŸœ9Ÿœ˜AL˜LšŸœ˜L˜—L˜—LšŸœ˜—L˜L˜—˜L˜L˜šŸœ!Ÿ˜+LšœŸœ˜L˜&Lšœ$Ÿœ˜4LšŸœ˜—L˜L˜—˜L˜%L˜L˜—˜L˜LšŸœŸœŸœ˜šŸœŸ˜˜L˜L˜L˜—˜L˜BL˜L˜Lšœ"Ÿœ˜(L˜LšœŸœ˜šŸœŸœŸ˜˜L˜L˜ šŸœŸœŸœŸ˜LL˜/—L˜—šŸœ˜šŸœŸ˜Lšœ;˜;—L˜Lšœ˜——L˜—˜
+LšœŸœ˜"Lšœ˜L˜L˜—˜šŸœŸœ˜L˜>L˜%LšŸœŸœŸœ˜5L˜—L˜—L˜L˜L˜(LšœŸœ˜!Lšœ(Ÿœ˜.L˜L˜>L˜L˜Lšœ'Ÿœ˜-Lšœ1Ÿœ˜8L˜L˜8L˜!˜šŸœŸœ˜L˜6L˜%šŸœŸœŸœ˜(L˜CšŸ˜šŸœŸœŸ˜LšœŸœ˜Lš	œŸœŸœŸœŸœ˜#LšŸœ˜—L˜ALšŸœ˜LšŸœ˜—L˜—L˜——L˜6L˜Lšœ,˜,L˜ LšœŸœ˜9L˜&˜	L˜(L˜AšŸœŸœŸ˜"˜L˜šŸœ4Ÿ˜:L˜#—L˜L˜L˜L˜L˜L˜—šŸœ˜Lšœ˜Lšœ"Ÿœ˜)L˜L˜——L˜—˜Lšœ"˜"šŸœŸœŸ˜šœ˜Lšœ'˜'Lšœ˜šŸœŸ˜Lšœ.˜.—L˜—˜7L˜LšŸœŸœ%˜@L˜—LšŸœ<˜C—L˜L˜—L˜L˜1L˜#˜1L˜L˜L˜L˜—˜L˜L˜L˜—˜LšœH˜HL˜TšŸœŸ˜šŸœŸ˜ Lšœ-˜-šŸœ˜Lšœ1˜1Lšœ˜L˜———Lšœ0˜0L˜—˜Lšœ"˜"Lšœ"˜"šŸœ˜šŸœ˜LšŸœŸœ%˜=L˜L˜—šŸœ˜Lšœ'˜'Lšœ$˜$L˜——Lšœ5˜5˜6Lšœ8™8—šœ˜Lšœƒ™ƒšŸœŸœŸœŸ˜?Lšœ$˜$—Lšœ˜—šŸœ0Ÿœ˜8L˜<šŸœŸœŸ˜LšœŸœ˜#LšŸœ˜—Lšœ˜—LšŸœŸœ#˜=L˜Lšœ1Ÿœ˜7L˜—˜Lšœ0˜0Lšœ+˜+LšœN˜NL˜!LšœŸœ˜L˜—L˜8˜L˜BL˜"šŸœ4Ÿ˜>šœ˜LšŸœŸœ*˜E—Lšœ.˜.LšŸœ˜—šŸœ˜šŸœ˜LšŸœŸœ%˜=L˜L˜—šŸœ˜Lšœ'˜'Lšœ-˜-L˜——šŸœ0Ÿœ˜8LšœŸœ˜šŸœŸ˜Lšœ0˜0—L˜—L˜—˜	Lšœ>˜>Lšœ"˜"L˜L˜šŸœ!Ÿ˜'Lšœ/˜/—šŸœŸœ˜L˜Lšœ7˜7L˜"L˜L˜%L˜—Lšœ ˜ L˜—˜L˜=L˜GLšœ˜LšœŸœ˜˜šŸœŸœŸ˜Lš	œ	ŸœŸœŸœŸœ˜*LšœŸœŸœ˜Lšœ"ŸœŸœ˜+LšŸœ˜—L˜8šŸ˜L˜	—L˜—Lšœ˜L˜—˜L˜=Lšœ˜šœŸœ˜L™?—LšœŸœ˜$Lšœ˜L˜—˜	L˜L˜L˜L˜*L˜L˜L˜—˜	L˜/L˜L˜—˜šŸœŸœ˜Lšœ$ŸœŸœ@™qL˜ILšœ!˜!L˜——˜šŸœŸœ˜L˜ILšœ˜Lšœ˜šŸœ	ŸœŸ˜%šœ˜L™˜Lšœ˜—šŸœ˜šŸ˜L˜7šŸœŸœŸ˜Lšœ˜LšœŸœ˜%Lšœ˜LšŸœ0˜7—LšŸœ˜LšŸœ˜—L˜——Lšœ˜Lšœ˜L˜——˜šŸœŸœ˜LšŸœŸœŸœ%˜BL˜/L˜L˜——˜L˜MLšŸœŸœ(˜FL˜!L˜—˜Lšœ/˜/—šŸœ˜Lšœ˜Lšœ˜Lšœ˜——LšŸœŸœ5˜RL˜—LšŸœ˜—L˜—L˜ š œŸœ%˜7šŸœŸœ˜$šŸœŸ˜L˜ L˜LšŸœ=˜D—L˜L˜—˜L˜ ——š œŸœŸœŸœ˜BL˜L˜L˜L˜ —š 
+œŸœŸœ	Ÿœ˜=LšœŸœ˜*šŸœŸœ˜LšŸœŸœ!Ÿœ"˜TL˜7L˜L˜—L˜L˜ ——™š 	œŸœŸœ˜SL˜L˜šŸœ/Ÿœ˜8L˜>šœŸœŸœŸ˜,L˜LšŸœ˜—L˜ LšœŸœŸœŸœ˜>L˜šŸœŸœ˜LšœQŸœ˜WL˜L˜—Lšœ4Ÿœ˜;šŸœŸœŸ˜˜L˜XL˜'L˜—LšŸœ˜—L˜L˜LšœŸœ˜L˜L˜L˜—L˜——™7š
+ 	œŸœŸœŸœŸœ˜KšŸ˜L˜9šŸœŸœŸ˜šœ˜LšŸœŸœŸœŸœ˜#LšŸœŸœŸœ˜'LšœŸœ˜.L˜—šœ˜LšŸœŸœŸœŸœ˜#Lšœ˜L˜—˜LšœM˜MLšŸœŸœŸœ˜ Lšœ˜L˜—LšŸœŸœ˜—LšŸœ˜—˜L˜ ——š œŸœŸœŸœ˜2L˜:šŸœŸœŸ˜Lšœ,ŸœŸœ˜:LšŸœ˜—LšŸœŸœ˜L˜L˜ —š œŸœŸœŸœ˜5šŸœCŸ˜M˜
+Lšœ7™7Lš
+ŸœŸœŸœŸœŸœ™?Lšœ ˜ L˜šŸ˜šŸœŸœŸ˜˜L˜šŸœŸœŸ˜˜LšŸœŸœ,˜E—˜L˜?šŸœ!Ÿ˜'LšœŸœ,˜:—L˜—LšŸœ˜—L˜—˜L˜šŸœŸ˜Lšœ.Ÿœ˜4LšŸœ˜—L˜—LšŸœ˜—LšŸœ˜LšŸœ˜—Lš
+ŸœŸœŸœŸœŸœ˜?šŸœŸœŸ˜/L™"Lš
+ŸœŸœŸœŸœŸœ˜>—L˜—LšŸœ˜—LšŸœŸœ˜L˜——™%š 	œŸœŸœ˜9Lšœ Ÿœ˜&LšœŸœ˜LšœŸœ˜ L˜LšŸœŸœŸœ˜0šŸœŸœŸ˜Lšœ/˜/L˜3L˜GLšŸœ˜—šŸœŸœŸ˜!L™/šŸœŸ˜LšœŸœ˜!L˜LšŸœ˜——šŸœŸœŸœ	Ÿ˜.Lšœ˜Lšœ˜LšŸœ˜—L˜L˜ —LšœŸœŸœ˜%šœŸœŸœ˜Lš	œŸœŸœŸœŸœ˜5L˜—šœŸœŸœ˜L˜L˜
+L˜L˜ —š 	œŸœ!˜0LšœŸœ˜šŸœŸœ˜"LšœŸœ Ÿœ˜@L˜Lšœ2ŸœŸœ˜nLšœŸœ˜(L˜L˜—L˜!L˜L˜L˜ —š œŸœŸœ˜9šŸœŸœŸœ˜L™?Lšœ#Ÿœ˜7L˜L˜&L˜;L˜=L˜5L˜7L˜—šŸœŸœŸœŸ˜(LšŸœŸœŸœ˜BLšŸœ˜—šŸœ	Ÿ˜Lšœ
+Ÿœ˜˜Lšœ9Ÿœ˜?LšœŸœ'˜0šœŸœ	Ÿœ˜2Lšœ%˜%Lšœ!˜!—LšŸœ˜L˜—˜Lšœ;Ÿœ˜ALšœŸœ'˜0šœŸœ	Ÿœ˜2Lšœ%˜%Lšœ#˜#—LšŸœ˜L˜—˜	Lšœ7Ÿœ˜=LšœŸœ'˜0šœŸœ	Ÿœ˜2Lšœ%˜%Lšœ˜—LšŸœ˜L˜—LšŸœ˜—LšŸœ˜L˜L˜ —LšœŸœ3˜BLšœŸœŸœŸœŸœŸœ˜HLšœŸœŸœ˜,š œŸœ˜Lšœ%ŸœŸœŸœ	˜KšŸœŸœŸ˜ L˜LšŸœ˜—šŸœŸœŸ˜.L˜!L˜!L˜ L˜ LšŸœ˜—L˜,L˜,L˜L˜ —š œŸœ(ŸœŸœ˜ZLšœ1Ÿœ$˜XL˜L˜ —LšœŸœ˜šœŸœŸœ)˜BL™oL˜ ——™š 	œ˜$šŸœŸ˜˜L˜L˜L˜!Lšœ$˜$L˜—˜
+L˜=L˜%Lšœ˜LšœŸœ˜LšœŸœ˜+L˜L˜—šœ˜LšœŸœ˜(LšœŸœ
+˜ Lšœ˜—LšŸœ˜—L˜L˜ —Lšœ$ŸœŸœ˜/Lšœ¡˜*—˜L˜ —— …—    ª&  ä9  

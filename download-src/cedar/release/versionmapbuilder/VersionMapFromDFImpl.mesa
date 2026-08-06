@@ -1,0 +1,834 @@
+
+
+DIRECTORY
+Basics,
+BasicTime USING [GMT, Now, nullGMT, ToNSTime],
+CedarProcess,
+Commander USING [CommandProc, Handle, Register],
+CommanderOps,
+DFUtilities USING [Date, RemoveVersionNumber],
+FS,
+GenerateDFClosure USING [ActionProc, ClosureInfo, GenerateClosureToProc],
+GenMapIO USING [CreateOutputStreams, CloseTeeStream, PutRopes],
+IO, 
+MobDefs,
+PFS,
+Process USING [CheckForAbort, Pause, SecondsToTicks],
+Rope,
+SystemNames USING [CedarDir],
+VersionMap,
+VersionMapBuilding,
+VersionMapClassify;
+
+VersionMapFromDFImpl: CEDAR MONITOR
+LOCKS myData USING myData: MyData
+IMPORTS BasicTime, CedarProcess, Commander, CommanderOps, DFUtilities, FS, GenerateDFClosure, GenMapIO, IO, PFS, Process, Rope, SystemNames, VersionMap, VersionMapBuilding, VersionMapClassify
+SHARES IO, VersionMap
+= BEGIN
+
+
+Date: TYPE = DFUtilities.Date;
+LORA: TYPE = LIST OF REF ANY;
+GMT: TYPE = BasicTime.GMT;
+Map: TYPE = VersionMap.Map;
+MapList: TYPE = VersionMap.MapList;
+MapEntry: TYPE = VersionMap.MapEntry;
+MapRep: TYPE = VersionMap.MapRep;
+MyStamp: TYPE = VersionMap.MyStamp;
+NullStamp: MyStamp = VersionMap.nullStamp;
+MyStampAsHex: TYPE = PACKED ARRAY [0..2*BYTES[MyStamp]) OF [0..16);
+ROPE: TYPE = Rope.ROPE;
+RopeList: TYPE = LIST OF ROPE;
+STREAM: TYPE = IO.STREAM;
+VersionStamp: TYPE = VersionMap.VersionStamp;
+NullVersion: VersionStamp = VersionMapClassify.NullVersion;
+BadVersion: VersionStamp = VersionMapClassify.BadVersion;
+
+FileEntry: TYPE = REF FileEntryRep;
+FileEntryRep: TYPE = RECORD [
+name: ROPE, date: Date, version: VersionStamp, from: ROPE];
+
+NameSeq: TYPE = REF NameSeqRep;
+NameSeqRep: TYPE = RECORD [
+SEQUENCE len: NAT OF NameEntry];
+NameEntry: TYPE = RECORD [hasPrefix: BOOL, name: ROPE];
+
+WhichMap: TYPE ~ VersionMapClassify.KindSet;
+WhichMapData: TYPE = RECORD[
+muc: VersionMapBuilding.MapUnderConstruction ¨ NIL,
+numFiles, numOld: INT ¨ 0,
+mapName: PFS.PATH,
+oldMap: MapList ¨ NIL];
+WhichMapArray: TYPE = ARRAY WhichMap OF WhichMapData;
+
+MyData: TYPE = REF MyDataRep;
+MyDataRep: TYPE = MONITORED RECORD [
+mapData: WhichMapArray ¨ ALL[],
+prefixList: RopeList ¨ NIL,
+warningMatch: ROPE ¨ NIL,
+errs: STREAM ¨ NIL,
+totalFiles, totalOld: INT ¨ 0,
+checkRemote: BOOL ¨ TRUE,
+abortRequested, mobStamps: BOOL ¨ FALSE
+];
+
+
+pauseForServerGlitch: [0..3600] ¨ 90; -- seconds to pause if server busy
+triesForServerGlitch: NAT ¨ 12; -- times to retry if server busy
+forkers: NAT ¨ 2; -- # of processes to fork
+veryVerbose: BOOL ¨ FALSE;
+outLog: IO.STREAM ¨ NIL;
+pacifyPeriod: INTEGER ¨ 250;
+
+EachFile: GenerateDFClosure.ActionProc = {
+myData: MyData ¨ NARROW[data];
+which: WhichMap ¨ unknown;
+CheckAbort[myData];
+SELECT kind FROM
+file => {
+needsVersion: BOOL ¨ FALSE;
+entry: FileEntryRep ¨ [
+name: name, date: date, version: NullVersion, from: from];
+triesLeft: NAT ¨ triesForServerGlitch;
+which ¨ unknown;
+IF Rope.Match[myData.warningMatch, name, FALSE] THEN
+GenMapIO.PutRopes[myData.errs,
+"Warning match\n  for ", name, "\n  from ", from];
+which ¨ VersionMapClassify.Classify[name];
+
+IF NOT Rope.Match["[]*", name] THEN {
+pos: INT ¨ Rope.Find[name, ">"];
+prefix: ROPE ¨ Rope.Flatten[name, 0, pos+1];
+lag: RopeList ¨ NIL;
+FOR each: RopeList ¨ myData.prefixList, each.rest WHILE each # NIL DO
+IF Rope.Equal[prefix, each.first, FALSE] THEN GO TO found;
+lag ¨ each;
+ENDLOOP;
+IF lag = NIL THEN myData.prefixList ¨ LIST[prefix] ELSE lag.rest ¨ LIST[prefix];
+EXITS found => {};
+};
+DO
+ENABLE
+FS.Error => {
+SELECT error.code FROM
+$serverInaccessible => {
+GenMapIO.PutRopes[myData.errs, "Server glitch: ", name];
+Process.Pause[Process.SecondsToTicks[pauseForServerGlitch]];
+IF (triesLeft ¨ triesLeft - 1) # 0 THEN LOOP;
+};
+ENDCASE;
+GenMapIO.PutRopes[
+myData.errs, "File not found: ", name,
+IO.PutFR["\n  from: %g\n  reason: %g\n",
+[rope[from]], [rope[error.explanation]]]];
+IF error.group # bug THEN EXIT ELSE REJECT;
+};
+IF myData.mobStamps THEN SELECT which FROM
+unknown, source => FillInSourceVersion[which, myData, entry, myData.checkRemote];
+intermediate, sparc, sparcOpt => FillInObjectVersion[which, myData, entry, myData.checkRemote];
+ENDCASE => ERROR
+ELSE FillInSourceVersion[which, myData, entry, myData.checkRemote];
+EXIT;
+ENDLOOP;
+};
+ENDCASE;
+};
+
+FillInSourceVersion: PROC [which: WhichMap, myData: MyData, entry: FileEntryRep, checkRemote: BOOL ¨ TRUE] = {
+created: BasicTime.GMT ¨ entry.date.gmt;
+initName: ROPE ¨ entry.name;
+full: ROPE ¨ initName;
+attached: ROPE ¨ NIL;
+version: VersionStamp;
+useFileSystem: BOOL ¨ FALSE;
+IF entry.date.format = explicit AND created # BasicTime.nullGMT
+THEN {
+version ¨ CreatedToMimosaVersionStamp[created];
+IF checkRemote THEN {
+IF myData.mapData[which].oldMap = NIL
+THEN useFileSystem ¨ TRUE
+ELSE {
+valid: BOOL;
+fromMap: ROPE;
+[valid, fromMap, ] ¨ VersionMapClassify.MapListLookup[myData.mapData[which].oldMap, full, created, TRUE, FALSE, TRUE];
+IF valid THEN full ¨ fromMap ELSE useFileSystem ¨ TRUE;
+};
+};
+}
+ELSE {
+useFileSystem ¨ TRUE;
+created ¨ BasicTime.nullGMT;
+checkRemote ¨ TRUE;
+};
+IF useFileSystem THEN {
+IF created = BasicTime.nullGMT THEN full ¨ DFUtilities.RemoveVersionNumber[full];
+[created: created, fullFName: full, attachedTo: attached] ¨
+FS.FileInfo[name: full, wantedCreatedTime: created, remoteCheck: checkRemote];
+version ¨ CreatedToMimosaVersionStamp[created];
+};
+IF attached # NIL THEN entry.name ¨ attached ELSE entry.name ¨ full;
+IF Rope.Length[entry.name] = 0
+THEN {
+GenMapIO.PutRopes[
+myData.errs, "Warning, failed to get source version for ", initName];
+}
+ELSE {
+myData.mapData[which].muc.AddFile[[entry.name, entry.from, created, version]];
+IncCount[which, myData, NOT useFileSystem];
+};
+};
+
+IncCount: PROC [which: WhichMap, myData: MyData, old: BOOL] ~ {
+myData.mapData[which].numFiles ¨ myData.mapData[which].numFiles + 1;
+IF old THEN {
+myData.mapData[which].numOld ¨ myData.mapData[which].numOld + 1;
+myData.totalOld ¨ myData.totalOld.SUCC};
+IF (myData.totalFiles ¨ myData.totalFiles + 1) MOD pacifyPeriod = 0 THEN
+GenMapIO.PutRopes[myData.errs, IO.PutFR["%g'th file (%g old) processed at %g.", [integer[myData.totalFiles]], [integer[myData.totalOld]], [time[BasicTime.Now[]]] ]];
+RETURN};
+
+FillInObjectVersion: PROC [which: WhichMap, myData: MyData, entry: FileEntryRep, checkRemote: BOOL ¨ TRUE] = {
+outerCreated: BasicTime.GMT ¨ entry.date.gmt;
+full: ROPE ¨ entry.name;
+attached, whyNot, warning: ROPE ¨ NIL;
+valid: BOOL ¨ FALSE;  -- indicates validity of version stamp
+{
+SELECT TRUE FROM
+Rope.SkipTo[full, 0, "!"] = Rope.Length[full] => {
+valid ¨ FALSE;
+};
+entry.date.format # explicit OR outerCreated = BasicTime.nullGMT => {
+valid ¨ FALSE;
+};
+myData.mapData[which].oldMap # NIL => {
+[valid, , entry.version] ¨ VersionMapClassify.MapListLookup[myData.mapData[which].oldMap, full, outerCreated, FALSE, TRUE, FALSE];
+IF valid THEN GOTO enter;
+};
+ENDCASE => {
+valid ¨ FALSE;
+};
+
+outerCreated ¨ BasicTime.nullGMT;
+full ¨ DFUtilities.RemoveVersionNumber[full];
+
+[created: outerCreated, fullFName: full, attachedTo: attached] ¨ FS.FileInfo[
+name: full, wantedCreatedTime: outerCreated, remoteCheck: checkRemote];
+entry.date ¨ [format: explicit, gmt: outerCreated];
+IF attached # NIL THEN full ¨ attached;
+entry.name ¨ full;
+
+[valid, , entry.version] ¨ VersionMapClassify.MapListLookup[myData.mapData[which].oldMap, full, BasicTime.nullGMT, FALSE, FALSE, TRUE];
+IF NOT valid THEN [entry.version, whyNot, warning] ¨ VersionMapClassify.ReadVersionStamp[which, full, outerCreated, TRUE];
+IF warning#NIL THEN GenMapIO.PutRopes[myData.errs, "Note: ", warning, "."];
+IF whyNot#NIL THEN GenMapIO.PutRopes[myData.errs, "Warning: can't read version stamp because ", whyNot, "."];
+EXITS enter => valid ¨ valid;
+};
+myData.mapData[which].muc.AddFile[[entry.name, entry.from, entry.date.gmt, entry.version]];
+IncCount[which, myData, valid];
+RETURN};
+
+VsToMs: PROC [vs: VersionStamp] RETURNS [MyStamp] = {
+l0: Basics.LongNumber ~ [card[vs[0]]];
+l1: Basics.LongNumber ~ [card[vs[1]]];
+RETURN [[lo: l1.hi, num: l0.lo, hi: l0.hi, extra: l1.lo]]};
+
+MsToVs: PROC [ms: MyStamp] RETURNS [VersionStamp] = {
+l0: Basics.LongNumber ~ [pair[lo: ms.num, hi: ms.hi]];
+l1: Basics.LongNumber ~ [pair[lo: ms.extra, hi: ms.lo]];
+RETURN [[l0.card, l1.card]]};
+
+CreatedToMimosaVersionStamp: PUBLIC PROC [created: BasicTime.GMT] RETURNS [VersionStamp] = {
+RETURN [[BasicTime.ToNSTime[created], 0]]};
+
+WriteMapToFile: PROC [lm: VersionMapBuilding.LimitedMap, name: ROPE] = {
+map: Map ~ lm.map;
+prefix: ROPE ¨ NIL;
+st: IO.STREAM ¨ FS.StreamOpen[name, create];
+count: NAT ¨ lm.limit;
+names: ROPE ¨ map.names;
+firstCR: INT ¨ names.Index[0, "\n"];
+Process.CheckForAbort[];
+prefix ¨ names.Flatten[0, firstCR];
+st.PutRope[prefix];
+st.PutRope["\n"];
+FOR i: NAT IN [0..count) DO
+entry: MapEntry ¨ map[i];
+index: INT ¨ entry.index;
+stamp: MyStamp ¨ entry.stamp;
+PutStampAsHex[st, stamp];
+st.PutRope[" "];
+DO
+c: CHAR ¨ names.Fetch[index];
+index ¨ index + 1;
+st.PutChar[c];
+IF c = '\n THEN EXIT;
+ENDLOOP;
+ENDLOOP;
+st.PutRope["\n"];
+IO.SetLength[st, IO.GetIndex[st]]; -- force goddamm truncation already!!!
+IO.Close[st];
+};  
+
+IndexToShortName: PROC [map: Map, index: INT] RETURNS [ROPE] = {
+names: ROPE ¨ map.names;
+end: INT ¨ names.SkipTo[index, "!\n"];
+pos: INT ¨ end;
+WHILE pos > index DO
+SELECT names.Fetch[pos] FROM
+'/, '], '> => EXIT;
+ENDCASE;
+pos ¨ pos - 1;
+ENDLOOP;
+RETURN [names.Substr[pos, end-pos]];
+};
+
+PutStampAsHex: PROC [st: IO.STREAM, stamp: MyStamp] = {
+hex: MyStampAsHex ¨ LOOPHOLE[stamp];
+FOR index: CARDINAL IN [0..2*BYTES[MyStamp]) DO
+x: CARDINAL [0..15] ¨ hex[index];
+c: CHAR ¨ IF x IN [0..9] THEN '0 + x ELSE 'A + (x-10);
+st.PutChar[c];
+ENDLOOP;
+};
+
+ScanName: PROC [name: ROPE] RETURNS [pos,bang,dot: INT] = {
+len: INT = Rope.Length[name];
+pos ¨ bang ¨ dot ¨ len;
+WHILE pos > 0 DO
+posM: INT = pos-1;
+SELECT Rope.Fetch[name, posM] FROM
+'! => bang ¨ dot ¨ posM;
+'. => dot ¨ posM;
+'>, '/, '] => RETURN;
+ENDCASE;
+pos ¨ posM;
+ENDLOOP;
+};
+
+CheckAbort: ENTRY PROC [myData: MyData] = {
+ENABLE UNWIND => myData.abortRequested ¨ TRUE;
+IF myData.abortRequested THEN RETURN WITH ERROR ABORTED;
+Process.CheckForAbort[];
+};
+
+CheckAbortInternal: INTERNAL PROC [myData: MyData] = {
+ENABLE UNWIND => myData.abortRequested ¨ TRUE;
+IF myData.abortRequested THEN RETURN WITH ERROR ABORTED;
+Process.CheckForAbort[];
+};
+
+hashMark: ROPE = Rope.Cat["@(", "#)mob", "_version ["]; --broken up to avoid spurrious one
+sourceStampByteLimit: INT ¨ 8000;
+headerBytes: INT = 4+4*7; -- size of header for .o files
+textSizeOffset: INT = 4; -- byte offset of text size field in .o files
+
+
+
+ShortName: PROC [full: ROPE] RETURNS [ROPE] = {
+pos: INT ¨ Rope.Length[full];
+lim: INT ¨ pos;
+WHILE pos > 0 DO
+c: CHAR = Rope.Fetch[full, pos¨pos-1];
+SELECT c FROM
+'! => lim ¨ pos;
+'>, '] => {pos ¨ pos + 1; EXIT};
+ENDCASE;
+ENDLOOP;
+RETURN [Rope.Flatten[full, pos, lim-pos]];
+};
+
+RopeFromWhich: PROC[which: WhichMap] RETURNS[ROPE] = {
+RETURN[SELECT which FROM
+source => "Source",
+intermediate => "Intermediate",
+sparc => "SparcExecutable",
+sparcOpt => "SparcOptExecutable",
+ENDCASE => "Unknown"
+];
+};
+
+
+
+Quit: ERROR = CODE;
+GenMap: Commander.CommandProc = {
+dump: BOOL ¨ TRUE;
+dumpDebug: BOOL ¨ TRUE;
+namesOnly: BOOL ¨ FALSE;
+remoteOpened: BOOL ¨ FALSE;
+pos, bang, dot: INT ¨ 0;
+inName, sourceName, derivedName, outPrefix: ROPE ¨ NIL;
+command: ROPE ¨ cmd.command;
+results: GenerateDFClosure.ClosureInfo;
+myData: MyData;
+newMaps: ARRAY WhichMap OF VersionMapBuilding.LimitedMap ¨ ALL[[NIL,0]];
+checkRemote: BOOL ¨ TRUE;
+genMaps: BOOL ¨ FALSE;	-- gen regular version maps if TRUE
+trustOld: BOOL ¨ FALSE;		-- trust old version maps if TRUE
+prefix: ROPE ¨ NIL;		-- the first prefix seen
+oldPath: ROPE ¨ SystemNames.CedarDir[release: previous]; -- the previous release
+switches: PACKED ARRAY CHAR['a..'z] OF BOOL ¨ ALL[FALSE];
+logFileName: ROPE ¨ "VersionMapBuilder.log";
+
+ProcessArgument: PROC = {
+[pos,bang,dot] ¨ ScanName[inName];
+IF bang = Rope.Size[inName] -- no version stuff
+AND (bang-dot # 3 OR Rope.Run[inName, dot, ".df", 0, FALSE] # 3)  -- no DF extension
+THEN inName ¨ Rope.Concat[inName, ".df"];
+inName ¨ FS.FileInfo[inName
+! FS.Error =>
+IF error.group # bug THEN {
+IO.PutF[
+cmd.out, "\nCan't open %g\n  %g\n",
+[rope[inName]], [rope[error.explanation]]];
+ERROR Quit;
+};
+].fullFName;
+
+outLog ¨ GenMapIO.CreateOutputStreams[logFileName, IF switches['t] THEN cmd.out ELSE NIL];
+[pos,bang,dot] ¨ ScanName[inName];
+outPrefix ¨ Rope.Flatten[inName, pos, dot-pos];
+outLog.PutF1["\nVersion Maps for Cedar Builder started at %g", [time[BasicTime.Now[]]]];
+outLog.PutF1["\n\nInput from: %g\n", [rope[inName]]];
+{
+SELECT cmd.procData.clientData FROM
+$GenMap => {
+genMaps ¨ TRUE;
+};
+$GenMapX => {
+genMaps ¨ TRUE;
+veryVerbose ¨ TRUE;
+};
+$MergeMap => {
+trustOld ¨ genMaps ¨ TRUE;
+};
+$GenCedarMap => {
+genMaps ¨ TRUE;
+outPrefix ¨ "Cedar";
+};
+$MergeCedarMap => {
+trustOld ¨ genMaps ¨ TRUE;
+outPrefix ¨ "Cedar";
+};
+ENDCASE;
+myData ¨ NEW[MyDataRep ¨ [
+errs: outLog,
+checkRemote: checkRemote,
+mobStamps: switches['l]
+]];
+
+IF myData.mobStamps
+THEN outLog.PutRope["\nExtracting Mimosa-style version stamps, and writing 64-bit-version-format files."]
+ELSE outLog.PutRope["\nUsing create dates as version stamps, and writing 48-bit-version-format files."];
+IF switches['d]
+THEN outLog.PutRope["\nAllowing duplicates."]
+ELSE outLog.PutRope["\nSuppressing duplicates."];
+
+FOR i: WhichMap IN [source .. sparcOpt] DO
+myData.mapData[i].muc ¨ VersionMapBuilding.StartConstruction[2000];
+myData.mapData[i].mapName ¨ PFS.PathFromRope[IO.PutFR["%g%g.VersionMap", [rope[outPrefix]], [rope[RopeFromWhich[i]]]] ];
+ENDLOOP;
+SELECT cmd.procData.clientData FROM
+$GenCedarMap, $MergeCedarMap =>
+myData.warningMatch ¨ Rope.Concat[oldPath, "*.df*"];
+ENDCASE;
+IF trustOld THEN {
+outLog.PutRope["\nReading old maps."];
+FOR i: WhichMap IN [source .. sparcOpt] DO
+myData.mapData[i].oldMap ¨ LIST[
+VersionMap.RestoreMapFromFile[myData.mapData[i].mapName,
+! FS.Error => {
+outLog.PutRope["\nWarning, can't read "];
+outLog.PutRope[ PFS.RopeFromPath[myData.mapData[i].mapName] ];
+CONTINUE}] ]
+ENDLOOP;
+};
+
+CheckAbort[myData];
+outLog.PutRope["\nGenerating DF closure."];
+results ¨ GenerateDFClosure.GenerateClosureToProc[
+inName, outLog, EachFile, myData, [toFork: forkers, followImports: NOT switches['s]]];
+};
+{
+outLog.PutF1["\n\n%g DF files", [integer[results.dfFiles]] ];
+FOR which: WhichMap IN [source .. sparcOpt] DO
+num: INT = myData.mapData[which].numFiles;
+IF num = 0 THEN LOOP;
+outLog.PutF[", %g %g files (%g from old map)", [integer[num]], [rope[RopeFromWhich[which]]], [integer[myData.mapData[which].numOld]] ];
+ENDLOOP;
+outLog.PutRope["\nPrefixes seen:"];
+FOR each: RopeList ¨ myData.prefixList, each.rest WHILE each # NIL DO
+IF prefix = NIL THEN prefix ¨ each.first;
+outLog.PutF1["\n  %g", [rope[each.first]]];
+ENDLOOP;
+FOR which: WhichMap IN [source .. sparcOpt] DO
+ReportDuplicate: PROC [a, b: VersionMapBuilding.ConsTuple] ~ {
+dc: VersionMapBuilding.DifferenceClass ~ VersionMapBuilding.ClassifyDifference[a, b];
+IF dc#identicalModExtensionAndCreated THEN IO.PutFL[outLog,
+"\n%g, duplicate versions for\n  %g\n    from: %g\n  %g\n    from: %g",
+LIST[ [rope[IF dc=identical THEN "Note" ELSE "Warning"]], [rope[a.name]], [rope[a.from]], [rope[b.name]], [rope[b.from]]] ];
+RETURN};
+thisName: ROPE ~ RopeFromWhich[which];
+thisFile: ROPE;
+IF myData.mapData[which].numFiles = 0 THEN {
+outLog.PutF1["\n\nWarning: %gMap empty\n", [rope[thisName]] ];
+LOOP;
+};
+outLog.PutF1["\n\nMaking short name index for %g map.", [rope[RopeFromWhich[which]]] ];
+newMaps[which] ¨ VersionMapBuilding.FinishLimitedConstruction[myData.mapData[which].muc, prefix, ReportDuplicate, NOT switches['d]];
+CheckAbort[myData];
+thisFile ¨ IO.PutFR["%g%g.VersionMap", [rope[outPrefix]], [rope[thisName]] ];
+outLog.PutRope["\n\nWriting "];
+outLog.PutRope[thisFile];
+outLog.PutRope["\n"];
+IF genMaps
+THEN VersionMapBuilding.LimitedSave[newMaps[which], PFS.PathFromRope[thisFile], switches['l]]
+ELSE WriteMapToFile[newMaps[which], thisFile];
+ENDLOOP;
+outLog.PutF1["\n\nVersion maps built at %g\n\n", [time[BasicTime.Now[]]]];
+IF NOT switches['t] THEN outLog.Close[] ELSE GenMapIO.CloseTeeStream[];
+};
+};
+ProcessSwitches: PROC [arg: ROPE] = {
+sense: BOOL ¨ TRUE;
+FOR index: INT IN [0..Rope.Length[arg]) DO
+char: CHAR ¨ Rope.Fetch[arg, index];
+SELECT char FROM
+'- => LOOP;
+'~ => {sense ¨ NOT sense; LOOP};
+IN ['a..'z] => switches[char] ¨ sense;
+IN ['A..'Z] => switches[char + ('a-'A)] ¨ sense;
+ENDCASE;
+sense ¨ TRUE;
+ENDLOOP;
+};
+argv: CommanderOps.ArgumentVector ¨ CommanderOps.Parse[cmd: cmd
+! CommanderOps.Failed => {msg ¨ errorMsg; GO TO failed}];
+
+veryVerbose ¨ FALSE;
+FOR i: NAT IN [1..argv.argc) DO
+arg: ROPE = argv[i];
+IF Rope.Length[arg] = 0 THEN LOOP;
+IF Rope.Fetch[arg, 0] = '- THEN {
+ProcessSwitches[arg];
+LOOP;
+};
+inName ¨ arg;
+CedarProcess.DoWithPriority[background, ProcessArgument
+! Quit, ABORTED => GO TO quit];
+ENDLOOP;
+
+IF inName = NIL THEN {
+inName ¨ "Cedar.df";
+CedarProcess.DoWithPriority[background, ProcessArgument
+! Quit, ABORTED => GO TO quit];
+};
+EXITS
+quit => {};
+failed => result ¨ $Failed;
+};
+
+GenMapFromPatterns: Commander.CommandProc = {
+dump: BOOL ¨ TRUE;
+dumpDebug: BOOL ¨ TRUE;
+namesOnly: BOOL ¨ FALSE;
+remoteOpened: BOOL ¨ FALSE;
+pos, bang, dot: INT ¨ 0;
+startName, sourceName, derivedName, outPrefix: ROPE ¨ NIL;
+command: ROPE ¨ cmd.command;
+npats: INT ¨ 0;
+myData: MyData;
+newMaps: ARRAY WhichMap OF VersionMapBuilding.LimitedMap ¨ ALL[[NIL,0]];
+checkRemote: BOOL ¨ TRUE;
+genMaps: BOOL ¨ TRUE;		-- gen regular version maps if TRUE
+trustOld: BOOL ¨ FALSE;		-- trust old version maps if TRUE
+long: BOOL ¨ FALSE;		-- use mob stamps, and write long
+suppressDuplicates: BOOL ¨ TRUE;
+toTypescript: BOOL ¨ FALSE;	-- output to ts instead of viewer
+prefix: ROPE ¨ NIL;		-- the first prefix seen
+logFileName: ROPE ¨ "VersionMapBuilder.log";
+oldPath: ROPE ¨ SystemNames.CedarDir[release: previous]; -- the previous release
+recursive: BOOL ¨ FALSE;
+Setup: PROC = {
+outLog ¨ GenMapIO.CreateOutputStreams[logFileName, IF toTypescript THEN cmd.out ELSE NIL];
+
+outLog.PutF1["\nVersion Maps for Cedar Builder started at %g", [time[BasicTime.Now[]]]];
+
+myData ¨ NEW[MyDataRep ¨ [
+errs: outLog,
+checkRemote: checkRemote,
+mobStamps: long
+]];
+
+IF myData.mobStamps
+THEN outLog.PutRope["\nExtracting Mimosa-style version stamps, and writing 64-bit-version-format files."]
+ELSE outLog.PutRope["\nUsing create dates as version stamps, and writing 48-bit-version-format files."];
+IF suppressDuplicates
+THEN outLog.PutRope["\nSuppressing duplicates."]
+ELSE outLog.PutRope["\nAllowing duplicates."];
+
+FOR i: WhichMap IN [source .. sparcOpt] DO
+myData.mapData[i].muc ¨ VersionMapBuilding.StartConstruction[2000];
+myData.mapData[i].mapName ¨ PFS.PathFromRope[IO.PutFR["%g%g.VersionMap", [rope[outPrefix]], [rope[RopeFromWhich[i]]]] ];
+ENDLOOP;
+
+IF trustOld THEN {
+outLog.PutRope["\nReading old maps."];
+FOR i: WhichMap IN [source .. sparcOpt] DO
+myData.mapData[i].oldMap ¨ LIST[
+VersionMap.RestoreMapFromFile[myData.mapData[i].mapName,
+! FS.Error => {
+outLog.PutRope["\nWarning, can't read "];
+outLog.PutRope[ PFS.RopeFromPath[myData.mapData[i].mapName] ];
+CONTINUE}] ]
+ENDLOOP;
+};
+};
+
+ProcessArgument: PROC = { DoProcessArgument[startName] };
+DoProcessArgument: PROC[inName: ROPE] = {
+PassInfo: PROC [fullFName, attachedTo: ROPE, created: BasicTime.GMT, bytes: INT, keep: CARDINAL, fileType: FS.FileType] RETURNS [continue: BOOL] --FS.InfoProc-- ~ {
+CheckAbort[myData];
+SELECT TRUE FROM
+( fileType = FS.tDirectory ) AND recursive =>
+DoProcessArgument[Rope.Concat[fullFName, ">*"]];
+( bytes>=0 ) => EachFile[myData, file, fullFName, [explicit, created], inName];
+ENDCASE;
+RETURN [TRUE]
+};
+CheckAbort[myData];
+outLog.PutF1["\n\nEnumerating %g\n", [rope[inName]]];
+FS.EnumerateForInfo[inName, PassInfo !FS.Error => {
+outLog.PutF["\nFS.Error[%g, %g] while enumerating %g; enumeration aborted.\n", [atom[error.code]], [rope[error.explanation]], [rope[inName]] ];
+CONTINUE}];
+npats ¨ npats + 1};
+WriteResults: PROC = {
+outLog.PutF1["\n\n%g patterns", [integer[npats]] ];
+FOR which: WhichMap IN [source .. sparcOpt] DO
+num: INT = myData.mapData[which].numFiles;
+IF num = 0 THEN LOOP;
+outLog.PutF[", %g %g files (%g from old map)", [integer[num]], [rope[RopeFromWhich[which]]], [integer[myData.mapData[which].numOld]] ];
+ENDLOOP;
+outLog.PutRope["\nPrefixes seen:"];
+FOR each: RopeList ¨ myData.prefixList, each.rest WHILE each # NIL DO
+IF prefix = NIL THEN prefix ¨ each.first;
+outLog.PutF1["\n  %g", [rope[each.first]]];
+ENDLOOP;
+FOR which: WhichMap IN [source .. sparcOpt] DO
+ReportDuplicate: PROC [a, b: VersionMapBuilding.ConsTuple] ~ {
+dc: VersionMapBuilding.DifferenceClass ~ VersionMapBuilding.ClassifyDifference[a, b];
+IF dc#identicalModExtensionAndCreated THEN IO.PutFL[outLog,
+"%g, duplicate versions for\n  %g\n    from: %g\n  %g\n    from: %g\n",
+LIST[ [rope[IF dc=identical THEN "Note" ELSE "Warning"]], [rope[a.name]], [rope[a.from]], [rope[b.name]], [rope[b.from]]] ];
+RETURN};
+thisName: ROPE ~ RopeFromWhich[which];
+thisFile: ROPE;
+IF myData.mapData[which].numFiles = 0 THEN {
+outLog.PutF1["\n\nWarning: %gMap empty\n", [rope[thisName]] ];
+LOOP;
+};
+outLog.PutF1["\n\nMaking short name index for %g map.", [rope[RopeFromWhich[which]]] ];
+newMaps[which] ¨ VersionMapBuilding.FinishLimitedConstruction[myData.mapData[which].muc, prefix, ReportDuplicate, suppressDuplicates];
+CheckAbort[myData];
+thisFile ¨ IO.PutFR["%g%g.VersionMap", [rope[outPrefix]], [rope[thisName]] ];
+outLog.PutRope["\n\nWriting "];
+outLog.PutRope[thisFile];
+outLog.PutRope["\n"];
+IF genMaps
+THEN VersionMapBuilding.LimitedSave[newMaps[which], PFS.PathFromRope[thisFile], long]
+ELSE WriteMapToFile[newMaps[which], thisFile];
+ENDLOOP;
+outLog.PutF1["\n\nVersion maps built at %g\n\n", [time[BasicTime.Now[]]]];
+IF NOT toTypescript THEN outLog.Close[] ELSE GenMapIO.CloseTeeStream[];
+};
+ProcessSwitches: PROC [arg: ROPE] = {
+sense: BOOL ¨ TRUE;
+FOR index: INT IN [0..Rope.Length[arg]) DO
+char: CHAR ¨ Rope.Fetch[arg, index];
+SELECT char FROM
+'- => LOOP;
+'~ => {sense ¨ NOT sense; LOOP};
+'d, 'D => suppressDuplicates ¨ NOT sense;
+'l, 'L => long ¨ sense;
+'m, 'M => trustOld ¨ sense;
+'r, 'R => recursive ¨ sense;
+'t, 'T => toTypescript ¨ sense;
+'x, 'X => veryVerbose ¨ sense;
+ENDCASE;
+sense ¨ TRUE;
+ENDLOOP;
+};
+argv: CommanderOps.ArgumentVector ¨ CommanderOps.Parse[cmd: cmd
+! CommanderOps.Failed => {msg ¨ errorMsg; GO TO failed}];
+committed: BOOL ¨ FALSE;
+
+IF argv.argc < 3 THEN RETURN [$Failed, "Usage: GenMapFromPatterns  Root (-(d|l|m|t|x)*)* pattern+"];
+
+outPrefix ¨ argv[1];
+veryVerbose ¨ FALSE;
+
+FOR i: NAT IN [2..argv.argc) DO
+arg: ROPE = argv[i];
+IF Rope.Length[arg] = 0 THEN LOOP;
+IF Rope.Fetch[arg, 0] = '- THEN {
+IF committed
+THEN cmd.err.PutF1["Don't give switches (like %g) after patterns.\n", [rope[arg]]]
+ELSE ProcessSwitches[arg];
+LOOP;
+};
+IF NOT committed THEN {
+CedarProcess.DoWithPriority[background, Setup
+! Quit, ABORTED => GO TO quit];
+committed ¨ TRUE;
+};
+startName ¨ arg;
+CedarProcess.DoWithPriority[background, ProcessArgument
+! Quit, ABORTED => GO TO quit];
+ENDLOOP;
+
+IF committed
+THEN CedarProcess.DoWithPriority[background, WriteResults
+! Quit, ABORTED => GO TO quit]
+ELSE cmd.err.PutRope["No work to do!\n"];
+
+EXITS
+quit => {};
+failed => result ¨ $Failed;
+};
+
+ReadVersionStampCommand: PROC [cmd: Commander.Handle] RETURNS [result: REF ANY ¨ NIL, msg: ROPE ¨ NIL] --Commander.CommandProc-- ~ {
+argv: CommanderOps.ArgumentVector ~ CommanderOps.Parse[cmd];
+FOR i: NAT IN (0 .. argv.argc) DO
+name: ROPE ~ argv[i];
+kind: VersionMapClassify.Kind ~ VersionMapClassify.Classify[name];
+created: BasicTime.GMT;
+stamp: VersionStamp;
+whyNot, warning: ROPE;
+created ¨ FS.FileInfo[name !FS.Error => {cmd.err.PutF["FS.FileInfo[%g] => FS.Error[%g, %g]\n", [rope[name]], [atom[error.code]], [rope[error.explanation]] ]; LOOP}].created;
+[stamp, whyNot, warning] ¨ VersionMapClassify.ReadVersionStamp[kind, name, created, FALSE];
+IO.PutFL[cmd.out, "ReadVersionStamp[%g] => (%g) %08x%08x",
+LIST[ [rope[name]], [rope[VersionMapClassify.KindName[kind]]], [cardinal[stamp[0]]], [cardinal[stamp[1]]]] ];
+IF whyNot#NIL THEN IO.PutF1[cmd.out, ", whyNot: %g", [rope[whyNot]] ];
+IF warning#NIL THEN IO.PutF1[cmd.out, ", warning: %g", [rope[warning]] ];
+IO.PutRope[cmd.out, ".\n"];
+ENDLOOP;
+RETURN};
+
+Commander.Register[
+"ReadVersionStamp", ReadVersionStampCommand, "reads version stamp from given files"];
+
+Commander.Register[
+"GenMap", GenMap, "Generate version maps", $GenMap];
+Commander.Register[
+"GenMapX", GenMap, "Generate version maps", $GenMapX];
+Commander.Register[
+"MergeMap", GenMap, "Merge version maps", $MergeMap];
+Commander.Register[
+"GenCedarMap", GenMap, "Generate Cedar version maps", $GenCedarMap];
+Commander.Register[
+"MergeCedarMap", GenMap, "Merge Cedar version maps", $MergeCedarMap];
+
+Commander.Register[
+"GenMapFromPatterns", GenMapFromPatterns, "Root (-(d|l|m|r|t|x)*)* pattern+ --- generates version maps from file name patterns"];
+
+END.
+     VersionMapFromDFImpl.mesa
+Copyright ” 1984, 1985, 1986, 1987, 1990, 1992 by Xerox Corporation.  All rights reserved.
+Russ Atkinson (RRA) June 25, 1985 7:23:40 pm PDT
+Doug Wyatt, January 26, 1987 2:46:58 pm PST
+Bill Jackson (bj) August 16, 1988 4:40:15 pm PDT
+Willie-Sue, February 9, 1990 1:01:47 pm PST
+Willie-s, March 16, 1992 2:37 pm PST
+Spreitze, August 17, 1990 2:55 pm PDT
+Mna, October 25, 1990 4:13 pm PDT
+Laurie Horton, November 1, 1990 9:53 am PST
+T Y P E S
+Global variables
+Single file processing
+
+[data: REF, kind: {file, notFound, syntaxError}, name: ROPE, date: Date, from: ROPE]
+We need to merge this prefix in with the rest
+There is an explicit date in the DF file
+We have been instructed to verify the DF file date, either through the remote server OR through the old source version map.
+We have been instructed to TRUST the old map (if the file is present).  However, to guard against bogus matches for names that have the same versions, we also check the name for agreement up to the version.
+For a non-explicit date, we can't trust anything.
+
+At this point, created = BasicTime.nullGMT if we are supposed to check the remote file server.  If this check fails, it is the caller's responsibility to handle the error.
+
+At this point, created # BasicTime.nullGMT, and the full name is presumed correct (although attached may take precedence as the 'real' name).  So it is time to insert this file entry into the priority queue.
+I wonder how this happened?
+Put the entry into the priority queue for later handling
+Read the version number from the .mob, .c, or .o.  Too bad we have to get the whole file (in DCedar) !
+How did this happen?
+Don't trust the version map, we have to look at the server.
+We have an explicit date with which we can check the existing version map
+For object files we are not sure whether we can trust the version number, so we MUST ask the file system.  We use the resulting full file name as the truth when searching the old object map.  As a side effect, the date in the entry is now explicit.
+Display the entry.
+Return the name without the prefix or version
+Routines to use the old maps for verification of names
+Main command routine
+[cmd: Handle] RETURNS [result: REF _ NIL, msg: ROPE _ NIL]
+Setup the old maps (if any); also make an index for the derived map.
+When parsing the command line, be prepared for failure.  The error is reported to the user
+Each argument can either be a switch specification or a genuine argument to be processed.  The first argument (argv[0]) is not examined, because by convention it is the name of the command as given by the user.
+Ignore null arguments (it is not easy to generate them, even).
+This argument sets switches for the remaining patterns.  By convention, switches are normally "sticky", in that they stay set until explicitly changed.
+[cmd: Handle] RETURNS [result: REF _ NIL, msg: ROPE _ NIL]
+Setup the old maps (if any); also make an index for the derived map.
+When parsing the command line, be prepared for failure.  The error is reported to the user
+Each argument can either be a switch specification or a genuine argument to be processed.  The first argument (argv[0]) is not examined, because by convention it is the name of the command as given by the user.
+Ignore null arguments (it is not easy to generate them, even).
+This argument sets switches for the remaining patterns.  By convention, switches are normally "sticky", in that they stay set until explicitly changed.
+stores to *Source.VersionMap, *Intermediate.VersionMap, *SparcExecutable.VersionMap , & *SparcOptExecutable.VersionMap
+stores to *Source.VersionMap, *Intermediate.VersionMap, *SparcExecutable.VersionMap , & *SparcOptExecutable.VersionMap
+stores to *Source.VersionMap, *Intermediate.VersionMap, *SparcExecutable.VersionMap , & *SparcOptExecutable.VersionMap
+stores to CedarSource.VersionMap, CedarIntermediate.VersionMap, CedarSparcExecutable.VersionMap, & CedarSparcOptExecutable.VersionMap
+stores to CedarSource.VersionMap, CedarIntermediate.VersionMap, CedarSparcExecutable.VersionMap, & CedarSparcOptExecutable.VersionMap
+ù z  ïNewlineDelimiter
+ñ(cedarcode) styleò codeôKöú
+œeúOôZKô0Kô+Kô0Kô+Kô$Kô%Kô!Kô+óKò öœk	ò	KòKöú
+ûúûúò.KöúòKöú
+ûú!ò0KòKöúûúò.KöûúòKöúûú2òIKöú	ûú1ò?KöûúòKòKöûúòKöúûú(ò5KöúòKöúûúòKöúòKòKòKò óöœnúûúûò#Köûúûúò!Köûú@ûúûúûúPòøKöûúûúòKöúûòKò óöú	ô	Kò KöúûúòKöûúûúûúûúûúûúòKöûúûúûúòKöúûúòKöú	ûúò#Köú
+ûúò%Köúûúò!öú	ûúò#Köü	ú!ò*óKöúûúûúûúûúûú	òCKöûúûúûúòKö	ú
+ûúûúûúûúòKöûúûúûúûúòöúûúò-Köüú0ò;Köü
+ú/ò9óKò Köúûúûúò#öúûúûúòKöúûú+ûúò;Kò óKöú	ûúûúòöúûúûúòKöûúûúûúò óö	úûúûúûúûúò7Kò óKöú
+ûúò,öúûúûúòKöú/ûúò3KöúûúòKöú	ûúûúòKöúûúòóKöúûúûú
+ûúò5Kò Köúûúûúòöúûúû	úûúò$KöúûúòKöúûúòKöúûúûúòKöúûúûúòKöúûúòKöúûúûúòKöúûúûò'KöúòKò óóöúôKò Köú&œc"òHKöúûú† ò@Köú	ûú†ò+KöúûúûúòKöúûúûúûúòKöúûúòKò óôKô öüú"ò*Köúûú-ûúûúôTKöúûúòKòKöúòöûúûòöú	ò	KöúûúûúòòKöú:ò:óKöúûúò&Kòöûú'ûúûò4òKöú2ò2óóKò*Kò öûúûúûúò%Köú-ô-Köúûúò Köúûú ò,Köúûúòöûú/ûúûúûòEKö
+ûú ûúûúûúûúò:KòKöûúòóKöûúûúûúûú	ûúûú	òPKöûúòKòóöûòöûòöûúòöûúûòöúòKò8Köú<ò<Köûú!ûúûúò-KòóKöûúòóòKöú&ò&öûú&ò(Köú*ò*óóKö
+ûúûúûúûúûúò+Kòóóöûúûúûúûò*KöúQòQKöú_ò_KöûúûòóKöûú?òCKöûúòKöûúòóKòóKöûúòóKöúòKò óöüúûúEûúûúònKöúûúò(Köú
+ûúòKöúûúòKöú
+ûúûúòKöúòKöúûúûúòöûúûúò?öûúòKöú!ûúô(Kò/öûúûúòKöú&ûú-ûú$ô{öûú ûò%KöûúûòöûúòKöúŒôŒKöúûúòKöú	ûúòKöúcûúûúûúòvKöûúûúûúûúò7KòóóKòóKòóöûúòKöú1ô1KöúûúòKòKöúûúòKòóóKô Köú´ô´öûúûúòKöûúûú.òQKöú<ûúLòäKò/KòóKô KöúœôœKöûúûúûúûúòDöûúòöûúòKöúôòKöúEòEóKòóöûúòKöú8ô8KöúNòNKöúûúò+KòóóKòKò óöüúûú(ûúò?KòDöûúûúòKò@Köú"ûúò(óöûú-ûúûòHKöúûúÑò•óKöûúòKò óöüúûúEûúûúònKöúfôfKöúûúò-KöúûúòKöúûúûúò&Köúûúûú†&ò<Köúòöûúûúûòöú2ò2KöúôKöúûúòKòóöúûú&òEKöú;ô;KöúûúòKòóöúûúò'KôIKöúnûúûúûúòÇKöûúûúûúòKòóöûúòKöúûúòKöúòóKò óKò!Kò-Kò Köú¯ô¯öúAûú
+òMKöúGòGóKò3Köûúûúûúò'KòKò KöúsûúûúûúòáKöûúûúûúcûúòzKöûú	ûúûú8òKKöûúûúûú[òmKöûúòKòKöú[ò[KöúòKöûúòKò óöüúûúûúò5Kò&Kò&Köûú5ò;Kò óöüúûúûúò5Kò6Kò8KöûúòKò óö
+üúûúûúûúûúò\Köûú%ò+Kò óöüúûú+ûúòHKòKöúûúûúòKöúûúûúûúò,KöúûúòKöúûúòKöú	ûúò$KòKò#KöúòKöúòöûúûúûúûòKöúôKòKöúûúòKòKòKöúòöûòKöúûúòKòKöúòKöûú	ûúûúòKöûúòóKöûúòóKöúòKöûúûú†&òIKöûúòKòKò óö
+üúûúûúûúûúò@Köú-ô-KöúûúòKöúûúò&KöúûúòöûúûòöûúûòKöúûúòKöûúòóKòKöûúòóKöûúò$KòKò óöüúûúûúûúò7Köúûúò$ö	ûúûúûúûúûò/Köúûúò!Köúûúûúûúûúûúò6KöúòKöûúòóKòKò óö
+üúûúûúûúûúò;KöúûúòKòöûú	ûòKöúûú	òöûúûò"KòKòKöúûúòKöûúòóKòKöûúòóKòKò óöü
+úûúûúò+Köûúûúûúò.Köûúûúûúûúûúûúò8KòKòKò óöüúûúûúò6Köûúûúûúò.Köûúûúûúûúûúûúò8KòKòKò óKöú
+ûú*†"òZKöúûúò!Köúûú
+†ò8Köúûú†-òFKò Kò óöú6ô6Kò óö
+ü	úûúûúûúûúò/KöúûúòKöúûúòöûú	ûòKöúûúò&öûúûòKòKöúûúò KöûúòóKöûúòóKöûú$ò*KòKò óöüúûúûúûúò6öûúûúûòKòKòKöúòKöú!ò!KöûúòKòóòKò óKò óöúôKò Köüúûúûúòöüúò!Köúûú
+ûúûúûúûúô:KöúûúûúòKöúûúûúòKöúûúûúòKöúûúûúòKöúûúòKöú,ûúûúò7Köú	ûúòKöú'ò'KòKö	ú	ûú
+ûú!ûúûúòHKöúûúûúòKöú	ûúûú†#ò:Köú
+ûúûú†!ò:Köúûúûú†ò-Köú	ûú,†òPKöú
+ûúûúûú	ûúûúûúûúò9Köúûúò,Kò öüúûúòKò"öûú†ò/Köûúûú!ûú†òTKöûú%ò)óöú	ûúòöúûú	òöûúûúòöûúòKöú#ò#Köú+ò+óKöûúòKòóóKöúòóKò Köú3ûúûúûòZKò"Kò/KòXKò5öúòöûúûò#òKöú
+ûúòKòóòKöú
+ûúòKöúûúòKòóòKöúûúòKòóòKöú
+ûúòKòKòóòKöúûúòKòKòóKöûúòóöú	ûúòKöúòKòKòKöúòKò óöûúòKöûúeòiKöûúdòhóöûúòKöûú)ò-Köûú-ò1óKò öûúûúûò*KòCKöúûúûúIòxKöûúòóöûúûò#òKò4óKöûúòóöûú
+ûúòKöúDôDKöú&ò&öûúûúûò*öúûúò öú8ò8öúûúòKöú)ò)Köúûú+ò>KöûúòóóóKöûúòóKòóKò KöúòKöú+ò+ò2KöúCûúòVóKòóòKò=öûúûúûò.Köúûú"ò*Köûú	ûúûúòKöúáòáKöûúòóKöú#ò#öûú/ûúûúûòEKöûú
+ûúûúò)Kò+Köûúòóöûúûúûò.öüúûú)ò>KöúUòUöûú$ûúûúò;KöúGòGKöûúûúûúûúPò|óKöûúòóKöú
+ûúò&Köú
+ûúòöûú$ûúò,Kò>KöûúòKòóKòWKöúrûúòÑKöúòKöúûú@òMKöúòKöúòKöúòöûúò
+öûú0ûú&ò]Köûú*ò.óóKöûúòóKòJKöûúûúûúûúòGKòóKòóöüúûúûúò%Köúûúûúòöûúûúûúûò*Köúûúò$öûúûòKöúûúòKöúûúûúò Köûú$ò&Köûú.ò0KöûúòóKöúûúòKöûúòóKòóïStartOfExpansionI[cmd: Commander.Handle, starExpand: BOOL _ FALSE, switchChar: CHAR]ò?Köú*ûúûú
+ò9KöúZôZóKò KöúûúòöûúûúûúûòKöú“ô“Köúûúòöûúûúûúò"Köú>ô>óöûúûúò!KöúóôóKöúòKöûúòKöúòóKòò7KöúûúûúûúòóKöûúòKò óöûú
+ûúûúòKòò7KöúûúûúûúòóKòóöûòKöúòKòóKöúòKò óöüúò-Köúûú
+ûúûúûúûúô:KöúûúûúòKöúûúûúòKöúûúûúòKöúûúûúòKöúûúòKöú/ûúûúò:Köú	ûúòKöúûúòKòKö	ú	ûú
+ûú!ûúûúòHKöúûúûúòKöú	ûúûú†#ò:Köú
+ûúûú†!ò:Köúûúûú†!ò6Köúûúûúò Köúûúûú†!ò=Köúûúûú†ò-Köúûúò,Köú	ûú,†òPKöúûúûúòöüúûúòKöú3ûúûúûòZKò KòXKò öú	ûúòKöúòKòKöúòKöúòKò óöûúòKöûúeòiKöûúdòhóöûúòKöûú,ò0Köûú*ò.óKò öûúûúûò*KòCKöúûúûúIòxKöûúòóKò öûú
+ûúòKöúDôDKöú&ò&öûúûúûò*öúûúò öú8ò8öúûúòKöú)ò)Köúûú+ò>KöûúòóóóKöûúòóKòóKòóKò Köüúûú$ò9öüúûú	ûúò)öüúûúûúûú	ûúûúûúûúûú†úò§KöúòöûúûúûòKöúûúûú>ò^KöúOòOKöûúòóKöûúûúòKöúòóKöúòKò5öûú$ûúò3KòèKöûúòóKòóöüúûúòKò3öûúûúûò.Köúûú"ò*Köûú	ûúûúòKöúáòáKöûúòóKöú#ò#öûú/ûúûúûòEKöûú
+ûúûúò)Kò+Köûúòóöûúûúûò.öüúûú)ò>KöúUòUöûú$ûúûúò;KöúGòGKöûúûúûúûúPò|óKöûúòóKöú
+ûúò&Köú
+ûúòöûú$ûúò,Kò>KöûúòKòóKòWKòÜKöúòKöúûú@òMKöúòKöúòKöúòöûúò
+Köûú0ûúòUKöûú*ò.óKöûúòóKòJKöûúûúûúûúòGKòóöüúûúûúò%Köúûúûúòöûúûúûúûò*Köúûúò$öûúûòKöúûúòKöúûúûúò Köúûúò)KòKòKòKòKòKöûúòóKöúûúòKöûúòóKòóñI[cmd: Commander.Handle, starExpand: BOOL _ FALSE, switchChar: CHAR]ò?Köú*ûúûú
+ò9KöúZôZóKöúûúûúòKò KöûúûúûúHòdKò KòKöúûúòKò öûúûúûúûòKöú“ô“Köúûúòöûúûúûúò"Köú>ô>óöûúûúò!Köúóôóöûú
+òKöûúNûúòmóKöûúòKöúòóöûúûúûúòöú-ò-KöúûúûúûúòóKöúûúòKòóKòò7KöúûúûúûúòóKöûúòKò óöûú
+òöûú5ò9KöúûúûúûúòóKöûú%ò)óKò öûòKöúòKòóKöúòKò óöüúûúûú
+ûúûúûúûúûú†úòÑKò<öûúûúûúûò!KöúûúòKöúBòBKöúûúòKöúòKöúûúòKöú
+ûúûúÄûúò≠KöúTûúò[Köûú9ûúiò®Köûúûúûúûú1òFKöûú	ûúûúûú3òIKöûúòKöûúòóKöûúòóKò öúòKöúUòUóKò öúòKò4KôvóöúòKò6KôvóöúòKò5KôvóöúòKòDKôÖóöúòKòEKôÖóKò öúòKòÅóóKò Köûúòó Öó    `V  é–  

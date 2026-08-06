@@ -1,0 +1,1165 @@
+
+DIRECTORY
+AccessCH USING [NSNameFromRope],
+AdobeCommon USING [AdobeViewerDataRec, ButtonSeqObject, CatchErrors, DependentsSequenceRec, EnumeratedTypes, EnumeratedTypesRec, GetNextAR, Handle, InitialSetStatus, PostMessage, PostNumber, SelectionsSequence, SetStatus, StringArray, validRelations],
+AdobeCommonInternal USING [InstanceData, InstanceDataHandle],
+AdobeOps USING [ARSystemHandle, ARNumber, FieldItemObject, FieldItemObjectRec, FieldType, nilARNumber, nilEnum, QLHandle, QLObject, QueryList, QueryListBody, SetOfARs, SetOfARsObject, ToolType, ArFIO, DateFIO, NumFIO, FixFIO, EnumFIO, StrFIO],
+AdobeServer USING [FieldItemValueRec, FieldItemQueryValue],
+AdobeP75V2,
+AdobeTool,
+AdobeUI,
+Ascii USING [CR, NUL, SP, TAB],
+BasicTime USING [GMT],
+Convert USING [Error, CardFromRope, RopeFromChar, TimeFromRope],
+Rope USING [Concat, Equal, Fetch, IsEmpty, Length, ROPE],
+XNSAdobeClientOps USING [LookupARs, ReadLastARNumber];
+
+
+AdobeToolImplB: CEDAR MONITOR
+IMPORTS 
+AccessCH, AdobeCommon, AdobeP75V2, AdobeTool,  Convert,  Rope, XNSAdobeClientOps
+EXPORTS 
+AdobeCommon, --AdobeCommonInternal, --AdobeTool =
+{
+
+EnumeratedFIH: TYPE = REF enumerated
+AdobeOps.FieldItemObjectRec;
+
+backStr: Rope.ROPE ¬ NIL;  --for NilFormProc
+
+queryPos: CARDINAL = 0;
+clearFormPos: CARDINAL = 1;
+showElemPos: CARDINAL = 2;
+resetQLPos: CARDINAL = 3;
+qyBkgdPos: CARDINAL = 4;
+qlNamePos: CARDINAL = 5;
+nQueryParams: CARDINAL = 6;
+
+UnterminatedQuote: PUBLIC SIGNAL = CODE;
+nonQuote: CHARACTER = Ascii.NUL;
+SkipMode: TYPE = {none, whiteSpace, nonToken};
+GetCharProcType: TYPE = PROCEDURE [h: LSHandle, e: REF BoolRec ¬ NIL] RETURNS [c: CHARACTER];
+QuoteProcType: TYPE = PROCEDURE [c: CHARACTER] RETURNS [closing: CHARACTER];
+FilterProcType: TYPE = PROCEDURE [c: CHARACTER, data: FilterState, extra: CHAR ¬ ' ] 
+RETURNS [inClass: BOOLEAN];
+FilterState: TYPE = REF StandardFilterState;
+StandardFilterState: TYPE = ARRAY [0..2) OF UNSPECIFIED;
+Handle: TYPE = REF Object;
+Object: TYPE = RECORD [
+getChar: GetCharProcType, break: CHAR ¬ NULL];
+
+StringToHandle: PROCEDURE [s: Rope.ROPE, offset: CARDINAL ¬ 0] 
+RETURNS [h: LSHandle] ~ {
+h ¬ NEW[LSObject ¬ [[getChar: StringGetChar, break: NULL], s, offset]]
+};
+
+StringGetChar: GetCharProcType ~ {
+IF h.i < Rope.Length[h.s] THEN { 
+c ¬ Rope.Fetch[h.s, h.i];
+h.i ¬ h.i + 1}
+ELSE c ¬ Ascii.NUL;
+};
+
+
+WhiteSpaceInline: PROCEDURE [c: CHARACTER] RETURNS [BOOLEAN] = INLINE { 
+RETURN[SELECT c FROM Ascii.SP, Ascii.TAB, Ascii.CR => TRUE, ENDCASE => FALSE]; };
+
+QuoteFilter: FilterProcType = {
+IF c = Ascii.NUL THEN {SIGNAL UnterminatedQuote; RETURN [FALSE]}
+ELSE RETURN[c # extra]};
+
+MaybeQuoted: PROCEDURE [h: LSHandle, data: FilterState, filter: FilterProcType, 
+isQuote: QuoteProcType, skip: SkipMode ¬ whiteSpace, temporary: BOOLEAN ¬ TRUE] 
+RETURNS [value: Rope.ROPE] = {
+closeQuote: CHARACTER;
+ApplyFilter: FilterProcType ¬ filter;
+
+IF data # NIL THEN
+data ¬ NIL;
+
+value ¬ NIL;
+DO
+IF (h.object.break ¬ h.object.getChar[h]) = Ascii.NUL THEN RETURN;
+IF skip = whiteSpace AND WhiteSpaceInline[h.object.break] THEN LOOP;
+IF (closeQuote ¬ isQuote[h.object.break]) # nonQuote THEN
+IF (h.object.break ¬ h.object.getChar[h]) = closeQuote THEN {
+h.object.break ¬ h.object.getChar[h]; 
+IF h.object.break = closeQuote THEN EXIT; -- doubling close quote is literal quote character
+RETURN}
+ELSE {
+IF h.object.break = Ascii.NUL THEN {SIGNAL UnterminatedQuote; RETURN};
+ApplyFilter ¬ QuoteFilter; EXIT};
+IF filter[h.object.break, data] THEN EXIT;
+IF skip = none OR skip = whiteSpace THEN RETURN;
+ENDLOOP;
+{
+ENABLE 
+UNWIND => NULL;
+WHILE h.object.break # Ascii.NUL DO
+value ¬ value.Concat[Convert.RopeFromChar[h.object.break, FALSE]];
+IF ~ApplyFilter[h.object.break ¬ h.object.getChar[h], data, closeQuote] THEN {
+IF ApplyFilter = QuoteFilter THEN {
+h.object.break ¬ h.object.getChar[h]; -- get next character
+IF h.object.break = closeQuote THEN LOOP}; -- of closeQuote, include character in token
+EXIT;
+};
+ENDLOOP;
+};
+};
+
+ParseError: SIGNAL [errType: ParseErrorType] = CODE;  --make more specific later
+ParseErrorType: TYPE = {
+badNumber, badDate, notValidEnumerated, strayQuote,
+badQuerySyntax};
+LSHandle: TYPE = REF LSObject;
+LSObject: TYPE = RECORD [
+object: Object, s: Rope.ROPE, i: INT];
+TokenType: TYPE = {op, string, andor};
+QueryItemHandle: TYPE = REF QueryItemSeq ¬ NIL;
+QueryItemSeq: TYPE = RECORD [
+fLIndex: CARDINAL, seq: SEQUENCE len: CARDINAL OF REF ANY];
+DistilledToken: TYPE = RECORD [
+SELECT type: TokenType FROM
+op => [op: AdobeP75V2.Relation],
+string => [s: Rope.ROPE],
+andor => [andOr: {and, or}]
+ENDCASE];
+OpDT: TYPE ~ REF op DistilledToken;
+StringDT: TYPE ~ REF string DistilledToken;
+AndOrDT: TYPE ~ REF andor DistilledToken;
+ParseStateType: TYPE = {start, op, andor, string, end};
+ProcessedQueryHandle: TYPE = REF ProcessedQuery;
+ProcessedQuery: TYPE = RECORD [
+seq: SEQUENCE len: CARDINAL OF QueryItemHandle];
+FieldItemHandle: TYPE = REF FieldItemSeq;
+FieldItemSeq: TYPE = RECORD [
+seq: SEQUENCE len: CARDINAL OF AdobeServer.FieldItemQueryValue];
+
+GetValidRelations: PUBLIC PROCEDURE [
+type: AdobeOps.FieldType]
+RETURNS [relStrings: REF AdobeCommon.StringArray] =
+{
+numValid, index: CARDINAL ¬ 0;
+op: AdobeP75V2.Relation;
+FOR op IN AdobeP75V2.Relation DO
+IF AdobeCommon.validRelations[type][op] THEN
+numValid ¬ numValid + 1;
+ENDLOOP;
+IF type = enumerated THEN numValid ¬ numValid + 2  --OR, AND #
+ELSE numValid ¬ numValid + 3;  --OR, AND, NIL
+relStrings ¬ NEW[AdobeCommon.StringArray[numValid]];
+FOR op IN AdobeP75V2.Relation DO
+IF AdobeCommon.validRelations[type][op] THEN {
+relStrings[index] ¬ 
+SELECT op FROM
+equal => " = ",
+notEqual => " # ",
+lessThan => " < ",
+lessThanOrEqual => " <= ",
+greaterThan => " > ",
+greaterThanOrEqual => " >= ",
+in => " HAS ",
+notIn => " ~HAS ",
+ENDCASE => "";
+index ¬ index + 1};
+ENDLOOP;
+relStrings[index] ¬ " OR ";
+IF type = enumerated THEN
+relStrings[index ¬ index + 1] ¬ " AND # "
+ELSE {
+relStrings[index ¬ index + 1] ¬ " AND ";
+relStrings[index ¬ index + 1] ¬ " NIL "};
+};
+
+GetPossibilities: PUBLIC PROCEDURE [bh: AdobeCommon.EnumeratedTypes]
+RETURNS [possibilities: LIST OF Rope.ROPE] =
+{
+IF bh.currentMenu >= bh.allSelections.length THEN
+RETURN [LIST["Nil"]];
+RETURN[bh.allSelections[bh.currentMenu].ropes];
+};
+
+CountARs:  PUBLIC PROCEDURE [set: AdobeOps.SetOfARs]
+RETURNS [n: LONG CARDINAL] = 
+{
+n ¬ 0;
+FOR i: CARDINAL IN [0..set.len) DO
+n ¬ n + set[i].runLength; ENDLOOP;
+};
+
+
+
+
+SetUpQueryTool: PUBLIC PROC [handle: AdobeCommon.Handle] = {
+thisViewer: REF ANY ¬ handle.fieldViewer.outer;
+thisSH: AdobeOps.ARSystemHandle ¬ handle.systemHandle;
+thisField: AdobeCommon.EnumeratedTypes ¬ NIL;
+x,y,w,h: CARD;
+lineIndex: INTEGER ¬ 0;
+fieldIndex: CARD ¬ 0;
+fieldHeight: CARDINAL ¬ 14;
+numFields: CARD ¬ thisSH.fieldList.length;
+instanceData: AdobeCommonInternal.InstanceDataHandle ¬ NARROW[handle.instanceData];
+stringCount: CARD _ 0;
+
+IF handle.fieldViewer.buttons # NIL THEN AdobeTool.EmptyFieldViewer[handle];
+
+FOR field: CARDINAL IN [0..thisSH.fieldList.length) DO
+WITH thisSH.fieldList[field] SELECT FROM
+it: AdobeOps.StrFIO => numFields ¬ numFields - 1;
+ENDCASE;
+ENDLOOP;
+
+handle.fieldViewer.buttons ¬ NEW[AdobeCommon.ButtonSeqObject[numFields]];
+
+WITH instanceData SELECT FROM
+it: REF AdobeCommonInternal.InstanceData.query =>
+it.queryStrings ¬ NEW[AdobeCommon.StringArray[numFields]];
+ENDCASE;
+
+FOR field: CARDINAL IN [0..thisSH.fieldList.length) DO
+WITH thisSH.fieldList[field] SELECT FROM
+it: AdobeOps.StrFIO => {
+stringCount _ stringCount + 1;
+};
+ENDCASE => {
+handle.fieldViewer.buttons[fieldIndex] ¬ NEW[AdobeCommon.EnumeratedTypesRec];
+handle.fieldViewer.buttons[fieldIndex].mainViewer ¬ handle;
+};
+IF fieldIndex < handle.fieldViewer.buttons.length THEN
+thisField ¬ handle.fieldViewer.buttons[fieldIndex];
+WITH thisSH.fieldList[field] SELECT FROM
+it: AdobeOps.EnumFIO => {
+numSubMenus, saveKey, currentEnum: CARD ¬ 0;
+thisField.type ¬ enumerated;
+thisField.dependentsSequence ¬ NEW[AdobeCommon.DependentsSequenceRec[5]];
+
+IF it.field # LAST[CARD16] THEN {
+currentSubMenu: CARD ¬ 0;
+thisField.dependentOn ¬ handle.fieldViewer.buttons[it.field - stringCount];
+numSubMenus ¬ AdobeTool.CountRopes[thisField.dependentOn.allSelections[0].ropes];
+AdobeTool.BumpNumOfDeps[handle.fieldViewer.buttons[fieldIndex], handle.fieldViewer.buttons[it.field - stringCount]];
+thisField.currentMenu ¬ numSubMenus - 1;
+thisField.allSelections ¬ NEW[AdobeCommon.SelectionsSequence[numSubMenus]];
+
+WITH thisSH.fieldList[it.field] SELECT FROM
+dep: AdobeOps.EnumFIO => {
+did: BOOL ¬ FALSE;
+FOR index: CARD IN [0..dep.possibilities[0].enumRecs.length) DO
+did ¬ FALSE;
+FOR itIndex: CARD IN [0..it.possibilities.length) DO
+IF it.possibilities[itIndex].keyedDependency = 
+dep.possibilities[0].enumRecs[index].item THEN {
+thisField.allSelections[currentSubMenu].num ¬ index;
+FOR i: CARD IN [0..it.possibilities[itIndex].enumRecs.length) DO
+thisField.allSelections[currentSubMenu].ropes ¬ CONS[it.possibilities[itIndex].enumRecs[it.possibilities[itIndex].enumRecs.length - i - 1].tag, thisField.allSelections[currentSubMenu].ropes];
+ENDLOOP;
+currentSubMenu ¬ currentSubMenu + 1;
+did ¬ TRUE;
+EXIT;
+};
+ENDLOOP;
+IF ~ did THEN {
+thisField.allSelections[currentSubMenu] ¬ [index, LIST["Nil"]];
+currentSubMenu ¬ currentSubMenu + 1;
+};
+ENDLOOP;
+};
+ENDCASE => ERROR;
+}
+ELSE {
+thisField.dependentOn ¬ NIL;
+thisField.currentMenu ¬ 0;
+thisField.allSelections ¬ NEW[AdobeCommon.SelectionsSequence[1]];
+thisField.allSelections[0].num ¬ it.possibilities[0].enumRecs[0].item;
+FOR index: CARD IN [0..it.possibilities[0].enumRecs.length) DO
+thisField.allSelections[0].ropes ¬ 
+CONS[
+it.possibilities[0].enumRecs[it.possibilities[0].enumRecs.length - index - 1].tag, thisField.allSelections[0].ropes];
+ENDLOOP;
+thisField.currentSelection ¬ it.possibilities[0].enumRecs.length - 1;
+};
+
+thisField.button ¬ handle.makeButton[
+parent: thisViewer,
+x: 0,
+y: lineIndex * fieldHeight,
+name: Rope.Concat[it.name, ": "],
+data: handle.fieldViewer.buttons[fieldIndex],
+scrollable: TRUE,
+proc: $HintMenuProc,
+cData: handle.fieldViewer.buttons[fieldIndex]
+];
+[x, y, w, h] ¬ handle.getBoxGeometry[thisField.button];
+thisField.controllerOf ¬ handle.newFieldBox[
+parent: thisViewer,
+x: w+5,
+y: lineIndex * fieldHeight,
+w: 400,
+h: h,
+border: FALSE,
+scrollable: FALSE
+];
+fieldIndex ¬ fieldIndex + 1;
+};
+it: AdobeOps.ArFIO => {
+handle.fieldViewer.buttons[fieldIndex].type ¬ arId;
+handle.fieldViewer.buttons[fieldIndex].button ¬ handle.makeButton[
+parent: thisViewer,
+x: 0,
+y: lineIndex * fieldHeight,
+name: Rope.Concat[it.name, ": "],
+data: handle.fieldViewer.buttons[fieldIndex],
+scrollable: TRUE,
+proc: $HintMenuProc,
+cData: handle.fieldViewer.buttons[fieldIndex]
+];
+[x, y, w, h] ¬ handle.getBoxGeometry[handle.fieldViewer.buttons[fieldIndex].button];
+handle.fieldViewer.buttons[fieldIndex].controllerOf ¬ handle.newFieldBox[
+parent: thisViewer,
+x: w+5,
+y: lineIndex * fieldHeight,
+w: 400,
+h: h,
+border: FALSE,
+scrollable: FALSE
+];
+handle.setContents[handle.fieldViewer.buttons[fieldIndex].controllerOf, "> 0"];
+fieldIndex ¬ fieldIndex + 1;
+};
+it: AdobeOps.DateFIO => {
+handle.fieldViewer.buttons[fieldIndex].type ¬ dateTime;
+handle.fieldViewer.buttons[fieldIndex].button ¬ handle.makeButton[
+parent: thisViewer,
+x: 0,
+y: lineIndex * fieldHeight,
+name: Rope.Concat[it.name, ": "],
+data: handle.fieldViewer.buttons[fieldIndex],
+proc: $HintMenuProc,
+cData: handle.fieldViewer.buttons[fieldIndex]
+];
+[x, y, w, h] ¬ handle.getBoxGeometry[handle.fieldViewer.buttons[fieldIndex].button];
+handle.fieldViewer.buttons[fieldIndex].controllerOf ¬ handle.newFieldBox[
+parent: thisViewer,
+x: w+5,
+y: lineIndex * fieldHeight,
+w: 400,
+h: h,
+border: FALSE,
+scrollable: FALSE
+];
+fieldIndex ¬ fieldIndex + 1;
+};
+it: AdobeOps.NumFIO => {
+handle.fieldViewer.buttons[fieldIndex].type ¬ numeric;
+handle.fieldViewer.buttons[fieldIndex].button ¬ handle.makeButton[
+parent: thisViewer,
+x: 0,
+y: lineIndex * fieldHeight,
+name: Rope.Concat[it.name, ": "],
+data: handle.fieldViewer.buttons[fieldIndex],
+proc: $HintMenuProc,
+cData: handle.fieldViewer.buttons[fieldIndex]
+];
+[x, y, w, h] ¬ handle.getBoxGeometry[handle.fieldViewer.buttons[fieldIndex].button];
+handle.fieldViewer.buttons[fieldIndex].controllerOf ¬ handle.newFieldBox[
+parent: thisViewer,
+x: w+5,
+y: lineIndex * fieldHeight,
+w: 400,
+h: h,
+border: FALSE,
+scrollable: FALSE
+];
+fieldIndex ¬ fieldIndex + 1;
+};
+it: AdobeOps.FixFIO => {
+handle.fieldViewer.buttons[fieldIndex].type ¬ fixedLengthString;
+handle.fieldViewer.buttons[fieldIndex].button ¬ handle.makeButton[
+parent: thisViewer,
+x: 0,
+y: lineIndex * fieldHeight,
+name: Rope.Concat[it.name, ": "],
+data: handle.fieldViewer.buttons[fieldIndex],
+scrollable: FALSE,
+proc: $HintMenuProc,
+cData: handle.fieldViewer.buttons[fieldIndex]
+];
+[x, y, w, h] ¬ handle.getBoxGeometry[handle.fieldViewer.buttons[fieldIndex].button];
+handle.fieldViewer.buttons[fieldIndex].controllerOf ¬ handle.newFieldBox[
+parent: thisViewer,
+x: w+5,
+y: lineIndex * fieldHeight,
+w: 20*it.maxLength,
+h: h,
+border: FALSE,
+scrollable: FALSE
+];
+fieldIndex ¬ fieldIndex + 1;
+};
+it: AdobeOps.StrFIO => lineIndex ¬ lineIndex - 1;
+ENDCASE;
+lineIndex ¬ lineIndex + 1;
+ENDLOOP;
+handle.paintBox[thisViewer, $all];
+};
+
+QueryCommandProc: PUBLIC PROCEDURE [h: AdobeCommon.Handle] =
+{
+windowData: AdobeCommon.Handle ¬ h;
+IF windowData.system = LAST[CARD] --OR windowData.context = NIL --OR windowData.knownSystems = NIL OR windowData.knownSystems.next = 0 THEN {
+AdobeCommon.PostMessage[
+windowData, TRUE, "No available systems"];
+RETURN};
+IF windowData.isBusy THEN
+AdobeCommon.PostMessage[windowData, TRUE, 
+"Adobe system is Busy.  Please try again later. "]
+ELSE {
+windowData.isBusy ¬ TRUE;
+AdobeCommon.CatchErrors[
+windowData, --item, index, windowData, --ChooseQueryCmd]}--};
+};
+
+ChooseQueryCmd: PROC[windowData: AdobeCommon.Handle] =
+{
+{ ENABLE UNWIND => windowData.isBusy ¬ FALSE;
+--queryPos => --QueryProc[windowData];
+windowData.isBusy ¬ FALSE;
+};
+};
+
+QueryProc: PROCEDURE [data: AdobeCommon.Handle] =
+{
+ql: AdobeOps.QueryList;
+usingSysQL: BOOLEAN;
+qH: ProcessedQueryHandle;
+ok: BOOLEAN;
+instanceData: AdobeCommonInternal.InstanceDataHandle ¬
+NARROW[data.instanceData];
+--AdobeCommonInternal.SetTheDefaults[data, TRUE];
+WITH instanceData SELECT FROM
+queryData: REF AdobeCommonInternal.InstanceData.query => {
+queryData.qlName ¬ data.getContents[data.editors[1]];
+usingSysQL ¬
+(queryData.qlName = NIL OR queryData.qlName.Length = 0
+OR Rope.Equal[queryData.qlName, "SysQL", FALSE]);
+[ok, qH] ¬ ParseQueryGiven[data];
+IF ok THEN {
+AdobeCommon.PostMessage[data, FALSE, "Querying into "];
+AdobeCommon.PostMessage[data, FALSE, 
+IF usingSysQL THEN "SysQL" ELSE queryData.qlName];
+AdobeCommon.PostMessage[data, FALSE, " ... "]
+};
+IF ~ok THEN RETURN;
+ql ¬ PerformQuery[qH, data ! ParseError => GOTO quit];
+IF ql = NIL THEN {
+ql ¬ NEW[AdobeOps.QueryListBody];
+ql.name ¬ NIL; ql.list ¬ NIL;
+AdobeCommon.PostMessage[data, FALSE, "0 matches... "];
+}
+ELSE {
+AdobeCommon.PostNumber[data, FALSE, CountARs[ql.list]];
+AdobeCommon.PostMessage[data, FALSE, " matches... "]};
+IF usingSysQL THEN
+ql.name ¬ "SysQL"
+ELSE
+ql.name ¬ queryData.qlName;
+IF usingSysQL THEN {data.systemHandle.sysQL ¬ ql}
+ELSE AddToOtherQLList[data.systemHandle, ql];
+AdobeCommon.PostMessage[data, TRUE, "Done."]
+};
+ENDCASE => ERROR;  --shouldn't happen
+EXITS quit => NULL;
+};
+
+ParseQueryGiven: PROCEDURE [data: AdobeCommon.Handle]
+RETURNS [goodParse: BOOLEAN, processedQH: ProcessedQueryHandle] =
+{
+queryCount: CARDINAL ¬ 0;
+current: CARD ¬ 0;
+instanceData: AdobeCommonInternal.InstanceDataHandle ¬
+NARROW[data.instanceData];
+goodParse ¬ TRUE;
+WITH instanceData SELECT FROM
+queryData: REF AdobeCommonInternal.InstanceData.query => {
+FOR i: CARDINAL IN [0..queryData.queryStrings.length) DO
+queryData.queryStrings[i] ¬ data.getContents[data.fieldViewer.buttons[i].controllerOf];
+ENDLOOP;
+
+FOR i: CARDINAL IN [0..queryData.queryStrings.length) DO
+IF ~Rope.IsEmpty[queryData.queryStrings[i]]THEN
+queryCount ¬ queryCount + 1;
+ENDLOOP;
+processedQH ¬ NEW[ProcessedQuery [queryCount]];
+queryCount ¬ 0;
+FOR i: CARDINAL IN [0..queryData.queryStrings.length) DO
+WHILE data.systemHandle.fieldList[current].type = string DO
+current ¬ current + 1;
+ENDLOOP;
+IF ~Rope.IsEmpty[queryData.queryStrings[i]] THEN {
+[goodParse, processedQH[queryCount]] ¬ ParseQueryItem[
+queryData.queryStrings[i], data.systemHandle.fieldList[current]];
+IF goodParse THEN {
+processedQH[queryCount].fLIndex ¬ current;
+queryCount ¬ queryCount + 1}
+ELSE {
+AdobeCommon.PostMessage[data, FALSE, "Query for "];
+AdobeCommon.PostMessage[data, FALSE, data.systemHandle.fieldList[current].name];
+AdobeCommon.PostMessage[data, TRUE, " is illegal"];
+EXIT}};
+current ¬ current + 1;
+ENDLOOP};
+ENDCASE;
+};
+
+MyGetChar: GetCharProcType = {
+IF h.i < Rope.Length[h.s] THEN {
+c ¬ Rope.Fetch[h.s, h.i];
+h.i ¬ h.i + 1;
+IF c = '' THEN
+IF h.i >= Rope.Length[h.s] THEN
+ERROR ParseError[strayQuote]
+ELSE {c ¬ Rope.Fetch[h.s, h.i]; h.i ¬ h.i + 1; e.b ¬ TRUE}}
+ELSE c ¬ Ascii.NUL};
+
+BoolRec: TYPE = RECORD[
+b: BOOLEAN ¬ FALSE];
+
+ParseQueryItem: PROCEDURE [
+s: Rope.ROPE, fItem: AdobeOps.FieldItemObject]
+RETURNS [ok: BOOLEAN, queryTokens: QueryItemHandle] =
+{
+
+collected: Rope.ROPE;
+last, current: ParseStateType;
+tempQueryTokens: QueryItemHandle ¬ NEW[QueryItemSeq [10]];
+qtIndex: CARDINAL ¬ 0;
+lastWasString: BOOLEAN ¬ FALSE;
+escaped: REF BoolRec ¬ NEW[BoolRec ¬ [FALSE]];
+
+MyUngetChar: PROCEDURE [h: LSHandle] = {
+h.i ¬ h.i - 1};
+
+DoubleQuote: QuoteProcType = {
+IF c = '" THEN RETURN['"] ELSE RETURN[nonQuote]};
+
+NonQueryChars: FilterProcType = {
+IF escaped.b THEN {  --char preceded by apostrophe; don't check it
+escaped.b ¬ FALSE;  --reset 
+RETURN[TRUE]};
+RETURN[
+SELECT c FROM
+Ascii.SP, Ascii.TAB, Ascii.CR, '=, '>, '<, '#, '" => FALSE,
+ENDCASE => TRUE]};
+
+AnalyzeTokenAndAdd: PROCEDURE = {
+SELECT TRUE FROM
+Rope.Equal["HAS", collected, FALSE] => {
+IF lastWasString THEN qtIndex ¬ qtIndex + 1;
+tempQueryTokens[qtIndex] ¬ NEW[DistilledToken ¬ [op[in]]];
+lastWasString ¬ FALSE;
+qtIndex ¬ qtIndex + 1};
+Rope.Equal["~HAS", collected, FALSE] => {
+IF lastWasString THEN qtIndex ¬ qtIndex + 1;
+tempQueryTokens[qtIndex] ¬ NEW[DistilledToken ¬ [op[notIn]]];
+lastWasString ¬ FALSE;
+qtIndex ¬ qtIndex + 1};
+Rope.Equal["AND", collected, FALSE] => {
+IF lastWasString THEN qtIndex ¬ qtIndex + 1;
+tempQueryTokens[qtIndex] ¬ NEW[DistilledToken ¬ [andor[and]]];
+lastWasString ¬ FALSE;
+qtIndex ¬ qtIndex + 1};
+Rope.Equal["OR", collected, FALSE] => {
+IF lastWasString THEN qtIndex ¬ qtIndex + 1;
+tempQueryTokens[qtIndex] ¬ NEW[DistilledToken ¬ [andor[or]]];
+lastWasString ¬ FALSE;
+qtIndex ¬ qtIndex + 1};
+ENDCASE => {
+IF lastWasString THEN
+WITH tempQueryTokens[qtIndex] SELECT FROM
+x: StringDT => {
+x.s ¬ x.s.Concat[" "];
+x.s ¬ x.s.Concat[collected]};
+ENDCASE
+ELSE
+tempQueryTokens[qtIndex] ¬ NEW[DistilledToken ¬ [
+string[--String.CopyToNewString[--collected--, z]--]]];
+lastWasString ¬ TRUE};
+};
+
+nextChar: CHARACTER ¬ Ascii.NUL;
+sH: LSHandle ¬ StringToHandle[s];
+sH.object.getChar ¬ MyGetChar;
+collected ¬ MaybeQuoted[
+h: sH, data: NIL, filter: NonQueryChars, isQuote: DoubleQuote];
+DO
+IF collected # NIL THEN {
+IF qtIndex >= tempQueryTokens.len - 2 THEN
+tempQueryTokens ¬ GrowQueryItemSeq[tempQueryTokens];
+AnalyzeTokenAndAdd[];
+}
+ELSE {
+IF qtIndex >= tempQueryTokens.len THEN
+tempQueryTokens ¬ GrowQueryItemSeq[tempQueryTokens];
+IF lastWasString THEN qtIndex ¬ qtIndex + 1;
+SELECT sH.object.break FROM
+'< => {
+nextChar ¬ sH.object.getChar[sH, escaped];
+IF nextChar = '= THEN 
+tempQueryTokens[qtIndex] ¬ NEW[DistilledToken ¬ [op[lessThanOrEqual]]]
+ELSE {
+MyUngetChar[sH];
+tempQueryTokens[qtIndex] ¬ NEW[DistilledToken ¬ [op[lessThan]]]};
+qtIndex ¬ qtIndex + 1};
+'> => {
+nextChar ¬ sH.object.getChar[sH, escaped];
+IF nextChar = '= THEN
+tempQueryTokens[qtIndex] ¬ NEW[DistilledToken ¬ [op[greaterThanOrEqual]]]
+ELSE {
+MyUngetChar[sH];
+tempQueryTokens[qtIndex] ¬ NEW[DistilledToken ¬ [op[greaterThan]]]};
+qtIndex ¬ qtIndex + 1};
+'" => MyUngetChar[sH];  --put back so MaybeQuoted finds it
+'= => {
+tempQueryTokens[qtIndex] ¬ NEW[DistilledToken ¬ [op[equal]]];
+qtIndex ¬ qtIndex + 1};
+'# => {
+tempQueryTokens[qtIndex] ¬ NEW[DistilledToken ¬ [op[notEqual]]];
+qtIndex ¬ qtIndex + 1};
+Ascii.NUL => {--[] ¬ Token.FreeTokenString[collected];-- EXIT};
+ENDCASE};
+
+collected ¬ MaybeQuoted[
+h: sH, data: NIL, filter: NonQueryChars,
+isQuote: DoubleQuote];
+ENDLOOP;
+ok ¬ TRUE;
+last ¬ start;
+IF qtIndex = 0 THEN ok ¬ FALSE;
+FOR i: CARDINAL IN [0..qtIndex) DO
+WITH tempQueryTokens[i] SELECT FROM
+qt: OpDT => {
+current ¬ op;
+IF ~ValidOperator[fItem, qt.op] THEN {ok ¬ FALSE; EXIT}};
+qt: StringDT => current ¬ string;
+qt: AndOrDT => current ¬ andor;
+ENDCASE;
+ParseNextToken[
+last, current, fItem ! ParseError => {ok ¬ FALSE; EXIT}];
+last ¬ current;
+ENDLOOP;
+ParseNextToken[
+last, end, fItem ! ParseError => {ok ¬ FALSE; CONTINUE}];
+IF ok THEN {  --trim to size needed 
+queryTokens ¬ NEW[QueryItemSeq [qtIndex]];
+FOR i: CARDINAL IN [0..qtIndex) DO
+queryTokens[i] ¬ tempQueryTokens[i]; ENDLOOP}
+ELSE queryTokens ¬ NIL;
+};
+
+ParseNextToken: PROCEDURE [
+last, this: ParseStateType, item: AdobeOps.FieldItemObject] =
+{
+SELECT last FROM
+start =>
+SELECT this FROM
+andor => ERROR ParseError[badQuerySyntax];
+ENDCASE;
+op =>
+SELECT this FROM
+op, andor, end => ERROR ParseError[badQuerySyntax];
+ENDCASE;
+andor =>
+SELECT this FROM
+andor, end => ERROR ParseError[badQuerySyntax];
+ENDCASE;
+string =>
+SELECT this FROM
+op => ERROR ParseError[badQuerySyntax];
+ENDCASE;
+ENDCASE;
+};
+
+<<
+Parsing table used:
+last|  this ->
+ V				op		andor		string						end
+start			yes	no			yes(implied = before)	yes
+op				no		no			yes						no
+-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=--=-=-=-=-=-=-==-=-==-=-=-=
+andor			yes	no			yes(implied = before)	no
+-=-==-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+string			no		yes		yes						yes
+-=-==-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+>>
+
+ValidOperator: PROCEDURE [
+item: REF ANY --AdobeOps.FieldItemObject--, op: AdobeP75V2.Relation]
+RETURNS [valid: BOOLEAN ¬ FALSE] =
+{
+WITH item SELECT FROM
+i: AdobeOps.ArFIO => RETURN[AdobeCommon.validRelations[arId][op]];
+i: AdobeOps.DateFIO => RETURN[AdobeCommon.validRelations[dateTime][op]];
+i: AdobeOps.NumFIO => RETURN[AdobeCommon.validRelations[numeric][op]];
+i: AdobeOps.FixFIO =>
+RETURN[AdobeCommon.validRelations[fixedLengthString][op]];
+i: AdobeOps.EnumFIO =>
+RETURN[AdobeCommon.validRelations[enumerated][op]];
+i: AdobeOps.StrFIO => NULL;  --not currently allowed
+ENDCASE;
+};
+
+GrowQueryItemSeq: PROCEDURE [h: QueryItemHandle] 
+RETURNS [newH: QueryItemHandle] =
+{
+newH ¬ NEW[QueryItemSeq [h.len + 5]];
+FOR i: CARDINAL IN [0..h.len) DO newH[i] ¬ h[i]; ENDLOOP;
+RETURN[newH]
+};
+
+PerformQuery: PROCEDURE [
+qH: ProcessedQueryHandle, data: AdobeUI.Handle]
+RETURNS [qL: AdobeOps.QueryList] =
+{
+ENABLE {
+AdobeP75V2.CourierTimedOut => AdobeCommon.PostMessage[data, TRUE, "CTO"];
+AdobeP75V2.TooManyConnections => AdobeCommon.PostMessage[data, TRUE, "TMC"];
+AdobeP75V2.SystemAlreadyExists => AdobeCommon.PostMessage[data, TRUE, "SAE"];
+AdobeP75V2.IllegalLogin => AdobeCommon.PostMessage[data, TRUE, "IL"];
+AdobeP75V2.Xxx => AdobeCommon.PostMessage[data, TRUE, "xxx"];
+AdobeP75V2.Error => AdobeCommon.PostMessage[data, TRUE, "Err"];
+AdobeP75V2.ServerDown => AdobeCommon.PostMessage[data, TRUE, "SD"];
+AdobeP75V2.ServerUnreachable => AdobeCommon.PostMessage[data, TRUE, "SU"];
+AdobeP75V2.ParameterInconsistency => AdobeCommon.PostMessage[data, TRUE, "PI"];
+AdobeP75V2.SystemNotRegistered => AdobeCommon.PostMessage[data, TRUE, "SNR"];
+AdobeP75V2.FileNotFound => AdobeCommon.PostMessage[data, TRUE, "FNF"];
+AdobeP75V2.NoAdobeServiceAtServer => AdobeCommon.PostMessage[data, TRUE, "NASAS"];
+AdobeP75V2.CommunicationError => AdobeCommon.PostMessage[data, TRUE, "CE"];
+AdobeP75V2.Spare1 => AdobeCommon.PostMessage[data, TRUE, "S1"];
+AdobeP75V2.Spare2 => AdobeCommon.PostMessage[data, TRUE, "S2"];
+AdobeP75V2.SysDescChanging => AdobeCommon.PostMessage[data, TRUE, "SDC"];
+AdobeP75V2.UnknownSystem => AdobeCommon.PostMessage[data, TRUE, "US"];
+AdobeP75V2.ObsoleteVersion => AdobeCommon.PostMessage[data, TRUE, "OV"];
+AdobeP75V2.CantDetermineLocOfARs => AdobeCommon.PostMessage[data, TRUE, "CDLOR"];
+AdobeP75V2.Others => AdobeCommon.PostMessage[data, TRUE, "Oth"];
+};
+local: Rope.ROPE ¬ NIL;
+qHIndex: CARDINAL ¬ 0;
+queryItem: QueryItemHandle;
+queryValue: FieldItemHandle;
+numberOfEnum, itemIndex: CARDINAL;
+boolOp: {and, or, new};
+fieldSet, set: AdobeOps.SetOfARs ¬ NIL;
+{ ENABLE UNWIND =>  {IF qL # NIL THEN {
+qL ¬ NIL};
+IF queryValue # NIL THEN queryValue ¬ NIL};
+qL ¬ NEW[AdobeOps.QueryListBody ¬ [NIL, NIL]];
+qL.list ¬ NEW[AdobeOps.SetOfARsObject[1]];
+queryValue ¬ NEW[FieldItemSeq[3]];
+local ¬ AccessCH.NSNameFromRope[data.knownSystems.system[data.system]].local;
+qL.list[0] ¬ [
+startValue: 1,
+runLength: XNSAdobeClientOps.ReadLastARNumber[
+server: data.systemHandle.service,
+system: local]];  --initial
+FOR qHIndex IN [0..qH.len) DO
+queryItem ¬ qH[qHIndex];
+itemIndex ¬ 0;
+boolOp ¬ new;
+DO  --make queries for this field
+WITH queryItem[itemIndex] SELECT FROM
+x: OpDT => {
+queryValue[0].relationalOp ¬ x.op;
+itemIndex ¬ itemIndex + 1};
+x: StringDT => queryValue[0].relationalOp ¬ equal;
+ENDCASE;
+numberOfEnum ¬ 0;
+WITH queryItem[itemIndex] SELECT FROM
+x: StringDT =>
+numberOfEnum ¬ MakeFieldItemValue[
+x.s, data.systemHandle.fieldList[queryItem.fLIndex], queryValue ! 
+ParseError => SELECT errType FROM
+badNumber => {
+AdobeCommon.PostMessage[data, FALSE, "Invalid Number in "];
+AdobeCommon.PostMessage[data, TRUE,  data.systemHandle.fieldList[queryItem.fLIndex].name]};
+badDate => {
+AdobeCommon.PostMessage[data, FALSE, "Invalid Date in "];
+AdobeCommon.PostMessage[data, TRUE,  data.systemHandle.fieldList[queryItem.fLIndex].name]};
+ENDCASE => {
+AdobeCommon.PostMessage[data, FALSE, "Unknown problem with "];
+AdobeCommon.PostMessage[data, TRUE, data.systemHandle.fieldList[queryItem.fLIndex].name]}];
+ENDCASE;
+itemIndex ¬ itemIndex + 1;
+IF numberOfEnum > 0 THEN set ¬ GetEnumeratedSet[data, qL.list, queryItem.fLIndex, numberOfEnum, queryValue]
+ELSE 
+set ¬ XNSAdobeClientOps.LookupARs[
+data.systemHandle.service, AccessCH.NSNameFromRope[data.knownSystems.system[data.system]].local,
+data.systemHandle.version,
+data.systemHandle.fieldList[queryItem.fLIndex].name,
+queryValue[0], qL.list];
+SELECT boolOp FROM
+new => fieldSet ¬ set;
+and => fieldSet ¬ AndSets[fieldSet, set];
+or => fieldSet ¬ OrSets[fieldSet, set];
+ENDCASE;
+IF itemIndex = queryItem.len THEN EXIT;
+WITH queryItem[itemIndex] SELECT FROM
+qi: AndOrDT =>
+boolOp ¬ SELECT qi.andOr FROM and => and, ENDCASE => or;  --has to be if not and
+ENDCASE;
+itemIndex ¬ itemIndex + 1;
+ENDLOOP;
+qL.list ¬ AndSets[qL.list, fieldSet];
+IF qL.list = NIL THEN  --no AR's fit criteria
+RETURN[NIL];
+ENDLOOP;
+};
+};
+
+GetEnumeratedSet: PROCEDURE[data: AdobeUI.Handle, list: AdobeOps.SetOfARs, flIndex, numberOfEnum: CARDINAL, fieldItem: FieldItemHandle] RETURNS [fieldSet: AdobeOps.SetOfARs] =
+{
+local: Rope.ROPE ¬ AccessCH.NSNameFromRope[data.knownSystems.system[data.system]].local;
+set: AdobeOps.SetOfARs ¬ NIL;
+FOR i: CARDINAL IN [0..numberOfEnum) DO
+set ¬ XNSAdobeClientOps.LookupARs[
+data.systemHandle.service, local,
+data.systemHandle.version,
+data.systemHandle.fieldList[flIndex].name,
+fieldItem[i], list];
+IF i = 0 THEN fieldSet ¬ set
+ELSE {
+IF fieldItem[0].relationalOp = equal THEN
+fieldSet ¬ OrSets[fieldSet, set]
+ELSE IF fieldItem[0].relationalOp = notEqual THEN
+fieldSet ¬ AndSets[fieldSet, set]};
+ENDLOOP;
+};
+
+MakeFieldItemValue: PROCEDURE [
+s: Rope.ROPE, fLItem: AdobeOps.FieldItemObject, f: FieldItemHandle]
+RETURNS [numberOfEnum: CARDINAL ¬ 0] =
+{
+ENABLE Convert.Error => {};  --do something here
+fIndex: CARDINAL ¬ 0;
+IF Rope.Equal[s, "NIL", FALSE] THEN  --want empties
+WITH fLItem SELECT FROM
+x: AdobeOps.ArFIO => f[fIndex].value ¬ NEW [AdobeServer.FieldItemValueRec ¬ [arId[AdobeOps.nilARNumber]]];
+x: AdobeOps.DateFIO => f[fIndex].value ¬ NEW [AdobeServer.FieldItemValueRec ¬ [dateTime[LOOPHOLE[LONG[0], BasicTime.GMT]]]];
+x: AdobeOps.NumFIO => f[fIndex].value ¬ NEW [AdobeServer.FieldItemValueRec ¬ [numeric[LONG[0]]]];
+x: AdobeOps.FixFIO => f[fIndex].value ¬ NEW [AdobeServer.FieldItemValueRec ¬ [fixedLengthString[NIL, x.maxLength]]];
+x: AdobeOps.EnumFIO => f[fIndex].value ¬ NEW [AdobeServer.FieldItemValueRec ¬ [enumerated[AdobeOps.nilEnum]]];
+ENDCASE
+ELSE
+WITH fLItem SELECT FROM
+x: AdobeOps.ArFIO => f[fIndex].value ¬ NEW[AdobeServer.FieldItemValueRec ¬ [arId[Convert.CardFromRope[s ! Convert.Error => ParseError[badNumber]]]]];
+x: AdobeOps.DateFIO => f[fIndex].value ¬ NEW[AdobeServer.FieldItemValueRec ¬ [dateTime[ConvertDate[s]]]];
+x: AdobeOps.NumFIO =>
+f[fIndex].value ¬ NEW[AdobeServer.FieldItemValueRec ¬ [numeric[Convert.CardFromRope[s !
+Convert.Error => ParseError[badNumber]]]]];
+x: AdobeOps.FixFIO => f[fIndex].value ¬ NEW[AdobeServer.FieldItemValueRec ¬ [fixedLengthString[s, x.maxLength]]];
+x: AdobeOps.EnumFIO =>
+numberOfEnum ¬ ObtainEnumeratedValue[s, fLItem, NEW[FieldItemHandle ¬ f]];
+ENDCASE;
+
+};
+
+ConvertDate: PROCEDURE [s: Rope.ROPE]
+RETURNS [dt: BasicTime.GMT] =
+{
+ENABLE
+Convert.Error => {
+temp: Rope.ROPE ¬ NIL;
+temp ¬ temp.Concat[s];
+temp ¬ temp.Concat[" 00:00:00"];
+dt ¬ Convert.TimeFromRope[
+temp !
+Convert.Error => {GOTO badDate}];
+GOTO ok};
+dt ¬ Convert.TimeFromRope[s];
+EXITS badDate => ERROR ParseError[badDate]; ok => NULL;  --return dt
+};
+
+ObtainEnumeratedValue: PROCEDURE [
+s: Rope.ROPE, item: AdobeOps.FieldItemObject, fieldSeq: REF FieldItemHandle]
+RETURNS [numberOfEnum: CARDINAL ¬ 0] =
+{
+temp, tempFieldSeq: FieldItemHandle;
+WITH item SELECT FROM
+it: AdobeOps.EnumFIO => {
+FOR i: CARDINAL IN [0..it.possibilities.length) DO
+FOR j: CARDINAL IN [0..it.possibilities[i].enumRecs.length) DO
+IF Rope.Equal[s, it.possibilities[i].enumRecs[j].tag]
+THEN {
+IF numberOfEnum >= fieldSeq.len THEN {
+tempFieldSeq ¬ NEW[FieldItemSeq[fieldSeq.len + 10]];
+FOR k: CARDINAL IN [0..numberOfEnum) DO
+tempFieldSeq[k].value ¬ fieldSeq[k].value;
+tempFieldSeq[k].relationalOp ¬ fieldSeq[k].relationalOp;
+ENDLOOP;
+temp ¬ fieldSeq­;
+fieldSeq­ ¬ tempFieldSeq};
+fieldSeq[numberOfEnum].value ¬ 
+NEW[AdobeServer.FieldItemValueRec ¬ [enumerated[it.possibilities[i].enumRecs[j].item]]];
+fieldSeq[numberOfEnum].relationalOp ¬ fieldSeq[0].relationalOp;
+numberOfEnum ¬ numberOfEnum + 1};
+ENDLOOP;
+ENDLOOP;
+IF numberOfEnum = 0 THEN ERROR ParseError[notValidEnumerated]};
+ENDCASE;
+};
+
+AndSets: PUBLIC PROCEDURE [set1, set2: AdobeOps.SetOfARs]
+RETURNS [resultSet: AdobeOps.SetOfARs] =
+{
+ar1, ar2: AdobeOps.ARNumber;
+set1Status, set2Status: AdobeCommon.SetStatus ¬
+AdobeCommon.InitialSetStatus;
+resultState: CARDINAL ¬ 0;
+tempSet: AdobeOps.SetOfARs;
+IF set1 = NIL THEN RETURN[NIL]
+ELSE IF set2 = NIL THEN RETURN[NIL];
+tempSet ¬ NEW[AdobeOps.SetOfARsObject[MAX[set1.len, set2.len]]];
+[ar1, set1Status] ¬ AdobeCommon.GetNextAR[set1, set1Status];
+[ar2, set2Status] ¬ AdobeCommon.GetNextAR[set2, set2Status];
+FOR i: CARDINAL IN [0..tempSet.len) DO
+tempSet[i] ¬ [0, 0]; ENDLOOP;
+WHILE set1Status.setIndex < set1.len
+AND set2Status.setIndex < set2.len DO
+SELECT TRUE FROM
+ar1 = ar2 => {
+resultState ¬ AddToSet[ar1, NEW[AdobeOps.SetOfARs ¬ tempSet], resultState];
+[ar2, set2Status] ¬ AdobeCommon.GetNextAR[set2, set2Status];
+[ar1, set1Status] ¬ AdobeCommon.GetNextAR[
+set1, set1Status]};
+ar1 > ar2 =>
+[ar2, set2Status] ¬ AdobeCommon.GetNextAR[set2, set2Status];
+ar1 < ar2 =>
+[ar1, set1Status] ¬ AdobeCommon.GetNextAR[set1, set1Status];
+ENDCASE;
+ENDLOOP;
+IF resultState = 0 AND tempSet[0].startValue = 0 THEN RETURN[NIL];
+IF resultState + 1 = MAX[set1.len, set2.len] THEN RETURN[tempSet]
+ELSE {
+resultSet ¬ NEW[
+AdobeOps .SetOfARsObject[resultState + 1]];
+FOR i: CARDINAL IN [0..resultSet.len) DO
+resultSet[i] ¬ tempSet[i]; ENDLOOP};
+};
+
+OrSets: PUBLIC PROCEDURE [set1, set2: AdobeOps.SetOfARs]
+RETURNS [resultSet: AdobeOps.SetOfARs] =
+{
+ar1, ar2: AdobeOps.ARNumber;
+set1Status, set2Status: AdobeCommon.SetStatus ¬ [0, 0];
+resultState: CARDINAL ¬ 0;
+tempSet: AdobeOps.SetOfARs;
+IF set1 = NIL THEN RETURN[set2];
+IF set2 = NIL THEN RETURN[set1];
+tempSet ¬ NEW[
+AdobeOps .SetOfARsObject[set1.len + set2.len]];
+ar1 ¬ set1[0].startValue;
+ar2 ¬ set2[0].startValue;
+FOR i: CARDINAL IN [0..tempSet.len) DO
+tempSet[i] ¬ [0, 0]; ENDLOOP;
+WHILE set1Status.setIndex < set1.len
+AND set2Status.setIndex < set2.len DO
+SELECT TRUE FROM
+ar1 = ar2 => {  --add only once
+resultState ¬ AddToSet[ar1, NEW[AdobeOps.SetOfARs ¬ tempSet], resultState];
+[ar2, set2Status] ¬ AdobeCommon.GetNextAR[set2, set2Status];
+[ar1, set1Status] ¬ AdobeCommon.GetNextAR[
+set1, set1Status]};
+ar1 > ar2 => {
+resultState ¬ AddToSet[ar2, NEW[AdobeOps.SetOfARs ¬ tempSet], resultState];
+[ar2, set2Status] ¬ AdobeCommon.GetNextAR[
+set2, set2Status]};
+ar1 < ar2 => {
+resultState ¬ AddToSet[ar1, NEW[AdobeOps.SetOfARs ¬ tempSet], resultState];
+[ar1, set1Status] ¬ AdobeCommon.GetNextAR[
+set1, set1Status]};
+ENDCASE;
+ENDLOOP;
+IF set1Status.setIndex < set1.len THEN  --add rest of set1
+WHILE set1Status.setIndex < set1.len DO
+resultState ¬ AddToSet[ar1, NEW[AdobeOps.SetOfARs ¬ tempSet], resultState];
+[ar1, set1Status] ¬ AdobeCommon.GetNextAR[set1, set1Status];
+ENDLOOP
+ELSE  --add rest of set2
+WHILE set2Status.setIndex < set2.len DO
+resultState ¬ AddToSet[ar2, NEW[AdobeOps.SetOfARs ¬ tempSet], resultState];
+[ar2, set2Status] ¬ AdobeCommon.GetNextAR[set2, set2Status];
+ENDLOOP;
+IF resultState + 1 = (set1.len + set2.len) THEN RETURN[tempSet]
+ELSE {
+resultSet ¬ NEW[
+AdobeOps.SetOfARsObject[resultState + 1]];
+FOR i: CARDINAL IN [0..resultSet.len) DO
+resultSet[i] ¬ tempSet[i]; ENDLOOP};
+};
+
+AddToSet: PUBLIC PROCEDURE [
+arNum: AdobeOps.ARNumber, set: REF AdobeOps.SetOfARs,
+lastRef: CARDINAL] RETURNS [thisRef: CARDINAL] =
+{
+thisRef ¬ lastRef;
+IF set[lastRef].startValue = 0 THEN set[lastRef] ¬ [arNum, 1]
+ELSE
+IF (set[lastRef].startValue + set[lastRef].runLength) = arNum
+THEN set[lastRef].runLength ¬ set[lastRef].runLength + 1
+ELSE {
+thisRef ¬ thisRef + 1;
+IF thisRef >= set.len THEN GrowSet[set];
+set[thisRef].startValue ¬ arNum;
+set[thisRef].runLength ¬ 1};
+};
+
+GrowSet: PUBLIC PROCEDURE [
+oldSet: REF AdobeOps.SetOfARs] =
+{
+newSet: REF AdobeOps.SetOfARs ¬ 
+NEW[AdobeOps.SetOfARs ¬ 
+NEW[AdobeOps.SetOfARsObject[oldSet.len + 50]]];
+FOR i: CARDINAL IN [0..oldSet.len) DO
+newSet[i] ¬ oldSet[i]; ENDLOOP;
+oldSet­ ¬ newSet­;
+};
+
+AddToOtherQLList: PUBLIC PROCEDURE [
+arSH: AdobeOps.ARSystemHandle, ql: AdobeOps.QueryList] =
+{
+qlIndex: AdobeOps.QLHandle ¬ arSH.otherQLs;
+DO
+SELECT TRUE FROM
+qlIndex = NIL => {
+arSH.otherQLs ¬ NEW[AdobeOps.QLObject ¬ [ql, NIL]];
+EXIT};
+Rope.Equal[qlIndex.qL.name, ql.name] => {qlIndex.qL ¬ ql; EXIT};
+qlIndex.next = NIL => {
+qlIndex.next ¬ NEW[AdobeOps.QLObject ¬ [ql, NIL]];
+EXIT;}
+ENDCASE;
+qlIndex ¬ qlIndex.next;
+ENDLOOP;
+};
+
+}. . .
+
+17-Jul-87 13:54:56 - rlc - Use String.StringToLongNumber rather than LONG[String.StringToNumber]. Good Grief CB!
+
+  
+v  
+File: AdobeToolsB.mesa
+Copyright Ó 1991, 1992 by Xerox Corporation.  All rights reserved.
+Philip James, June 24, 1991 10:47 am PDT
+Pjames, March 3, 1992 7:08 pm PST
+Foote, June 24, 1992 8:42 am PDT
+globals for query
+from Token
+First handle (possible) skip
+Then accumulate all inClass characters
+value _ GetString[initialLength];
+String.AppendChar[value, h.object.break];
+IF ~temporary THEN {
+old: Rope.ROPE _ value;
+value _ old;
+FreeString[old]};
+types for query
+Query routines  
+don't make fields for string items 
+border: FALSE,
+border: FALSE,
+border: FALSE,
+border: FALSE,
+border: FALSE,
+windowData: AdobeCommon.DataHandle _ AdobeCommon.GetDataSW[sw];
+instanceData: AdobeCommonInternal.InstanceDataHandle _
+windowData.instanceData;
+MsgSW.Clear[windowData.msgSW];
+IF instanceData.background THEN
+Process.Detach[
+windowData.processID _ FORK AdobeCommon.CatchErrors[
+sw, item, index, windowData, ChooseQueryCmd]]
+ELSE {--
+windowData.processID _ Process.GetCurrent[];
+windowData: AdobeUI.Handle _ NARROW[clientData];
+SELECT index FROM
+clearFormPos => ClearQueryForm[windowData];
+showElemPos => ShowElementsProc[windowData];
+resetQLPos => ResetQLProc[windowData];
+ENDCASE => ERROR;
+windowData.processID _ NIL;
+IF UserInput.UserAbort[data.window] THEN ERROR ABORTED;
+IF UserInput.UserAbort[data.window] THEN {ERROR ABORTED};
+find out how many items are being queried on 
+FOR i: CARDINAL IN [0..queryCount) DO
+data.heap.FREE[@processedQH[i]]; ENDLOOP;
+data.heap.FREE[@processedQH];
+String.AppendCharAndGrow[@s, Ascii.SP, z];
+String.AppendStringAndGrow[@s, collected, z, 10]};
+compare with tempQueryTokens.len-2 because if collected is a 
+string operator, qtIndex is incremented and then the assignment 
+is done.
+[] _ Token.FreeTokenString[collected]
+all done with this string
+need to do something special with enumerated items
+-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+AdobeOps.z.FREE[@qL.list];
+AdobeOps.z.FREE[@qL]};
+AdobeOps.z.FREE[@queryValue]};
+IF UserInput.UserAbort[data.window] THEN {
+qL _ NIL; ERROR ABORTED}; --leaks!
+for now, we're using implicit AND's between fields. Need different scheme if we allow choice of AND/OR between fields.
+want to add code to recognize special strings
+if necessary, grow fieldSeq by 10
+assume that ARs given are in numeric order
+initialize temp
+For AND, when one set is exhausted, we've got all that are
+common to both so can just exit knowing we're done
+prune to just fit
+assume that ARs given are in numeric order
+initialize temp
+For OR, when one set is exhausted, we've got to append what 
+remains of the unexhausted set to the result.
+ Ê'ž  –(cedarcode) style•NewlineDelimiter
+™ šœ™Jšœ
+Ïeœ7™BJšœ(™(J™!J™ —Icode˜ šÏk	˜	Kšœ	žœ˜ Kšœžœê˜ûKšœžœ$˜=Kšœ	žœå˜óKšœžœ*˜;Kšœ˜Kšœ
+˜
+Kšœ˜Kšœžœžœžœžœžœ˜Kšœ
+žœžœ˜Kšœžœ3˜@Kšœžœ)žœ˜9Kšœžœ˜6—K˜ K˜ šÏnœžœž˜KšžœR˜YKšžœÏcœ˜:Kšœ˜K˜ šœžœžœ˜$K˜—K˜ Kšœžœžœ ˜,K˜ Jšœ™Kšœ
+žœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜K˜ Jšœ
+™
+KšŸœžœžœžœ˜(Kšœ
+ž	œ	žœ˜ Kšœ
+žœ ˜.Kšœžœž	œžœžœžœž	œ˜]Kšœžœž	œž	œžœž	œ˜LKšœžœž	œž	œžœžœžœ˜qKšœžœžœ˜,Kš	œžœžœžœžœ˜8Kšœžœžœ˜šœžœžœ˜Kšœ!žœžœ˜.—K˜ š
+Ÿœž	œ
+žœ
+žœžœ˜YKšœžœ-žœ˜FKšœ˜—K˜ šŸœ˜"šžœžœ˜!K˜K˜—Kšžœžœ˜K˜—K˜ K˜ šŸœž	œž	œžœžœžœ˜HKšžœžœžœžœžœžœžœžœžœ˜QK˜ —šŸœ˜Kšžœžœžœžœžœžœ˜@Kšžœžœ˜K˜ —šŸœž	œ{žœžœžœžœ˜ÀKšœž	œ˜KšŸœ˜%K˜ šžœžœž˜Kšœžœ˜K˜ —Kšœžœ˜Jšœ™šž˜Kšžœ0žœžœžœ˜BKšžœžœ"žœžœ˜Dšžœ3ž˜9šžœ5žœ˜=K˜&Kšžœžœžœ 2˜\Kšžœ˜—šžœ˜Kš
+žœžœžœžœžœ˜FKšœžœ˜!——Kšžœžœžœ˜*Kšžœžœžœžœ˜0Kšžœ˜—Jšœ&™&Jšœ!™!šœ˜šžœ˜Kšžœžœ˜—šžœžœž˜#šœ:žœ˜BJšœ)™)—šžœFžœ˜Nšžœžœ˜#Kšœ& ˜;Kšžœžœžœ ,˜W—Kšžœ˜Kšœ˜Kšžœ˜—šžœžœ™Jšœ
+žœ	™Jšœ™Jšœ™——Kšœ˜—Kšœ˜K˜ —Jšœ™KšŸ
+œžœžœ ˜Pšœžœ˜K˜3K˜—Kšœ
+žœžœ
+˜šœ
+žœžœ˜Kšœžœžœ˜&—Kšœžœ˜&Kšœžœžœžœ˜/šœžœžœ˜Kšœ	žœžœžœžœžœžœ˜;—šœžœžœ˜Kšžœž˜K˜ Kšœžœ˜K˜Kšžœ˜	—Kšœžœžœ˜#Kšœ
+žœžœ˜+Kšœ	žœžœ˜)Kšœžœ#˜7Kšœžœžœ˜0šœžœžœ˜Kšœžœžœžœ˜0—Kšœžœžœ˜)šœžœžœ˜Kšœžœžœžœ"˜@—K˜ šŸœžœž	œ˜%Kšœ˜Kšžœžœ˜3Kšœ˜Kšœžœ˜K˜šžœžœž˜ šžœ&ž˜,K˜—Kšžœ˜—Kšžœžœ ˜>Kšžœ ˜-Kšœžœ$˜4šžœžœž˜ šžœ&žœ˜.˜šžœž˜K˜K˜K˜K˜K˜K˜K˜K˜Kšžœ˜——K˜—Kšžœ˜—K˜šžœž˜K˜)—šžœ˜K˜(K˜)—Kšœ˜—K˜ šŸœžœž	œ"˜DKšžœžœžœžœ˜,Kšœ˜šžœ+ž˜1Kšžœžœ	˜—Kšžœ)˜/Kšœ˜—K˜ šŸœžœž	œ˜4Kšžœžœžœ˜Kšœ˜K˜šžœžœžœž˜"Kšœžœ˜"—Kšœ˜—K˜ K˜ K˜ Jšœ™K˜ šŸœžœ!˜<Kšœžœžœ˜/K˜6Kšœ)žœ˜-Kšœ	žœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜*Kšœ7žœ˜SJ˜K˜ Kšžœžœžœ$˜LK˜ Jšœ#™#šžœžœžœž˜6šžœžœž˜(K˜1Kšžœ˜—Kšžœ˜K˜ —Kšœžœ)˜IK˜ šžœžœž˜šœžœ*˜1Kšœžœ%˜:—Kšžœ˜—K˜ šžœžœžœž˜6šžœžœž˜(˜J˜K˜—šžœ˜Kšœ)žœ!˜MK˜;K˜——šžœ0ž˜6K˜3—šžœžœž˜(šœ˜Kšœ#žœ˜,K˜Kšœžœ'˜IK˜ šžœžœžœžœ˜!Kšœžœ˜K˜KK˜QK˜tK˜(Kšœžœ.˜KK˜ šžœžœž˜+˜Kšœžœžœ˜šžœžœžœ+ž˜?Kšœžœ˜šžœ
+žœžœž˜4šžœXžœ˜`K˜4šžœžœžœ0ž˜@Kšœ0žœ‹˜¿Kšžœ˜—K˜$Kšœžœ˜Kšžœ˜K˜—Kšžœ˜—šžœžœ˜Kšœ2žœ	˜?K˜$K˜—Kšžœ˜—K˜—Kšžœžœ˜—K˜—šžœ˜Kšœžœ˜K˜Kšœžœ$˜AK˜Fšžœžœžœ*ž˜>Kšœ$žœw˜ŸKšžœ˜—K˜EK˜K˜ —˜%K˜K˜Kšœ˜Kšœ!˜!Jšœ™Kšœ-˜-Kšœžœ˜Kšœ˜Kšœ-˜-K˜—K˜7˜,K˜Kšœ˜Kšœ˜K˜Kšœ˜Kšœžœ˜Kšœž˜K˜—K˜K˜—šœ˜K˜3˜BKšœ˜K˜Kšœ˜Kšœ!˜!Jšœ™Kšœ-˜-Kšœžœ˜Kšœ˜Kšœ-˜-K˜—K˜T˜IK˜Kšœ˜Kšœ˜K˜Kšœ˜Kšœžœ˜Kšœž˜K˜—KšœO˜OK˜K˜—šœ˜K˜7˜BKšœ˜K˜Kšœ˜Kšœ!˜!Jšœ™Kšœ-˜-Kšœ˜Kšœ-˜-K˜—K˜T˜IK˜Kšœ˜Kšœ˜K˜Kšœ˜Kšœžœ˜Kšœž˜K˜—K˜K˜—šœ˜K˜6˜BKšœ˜K˜Kšœ˜Kšœ!˜!Jšœ™Kšœ-˜-Kšœ˜Kšœ-˜-K˜—K˜T˜IK˜Kšœ˜Kšœ˜K˜Kšœ˜Kšœžœ˜Kšœž˜K˜—K˜K˜—šœ˜K˜@˜BKšœ˜K˜Kšœ˜Kšœ!˜!Jšœ™Kšœ-˜-Kšœž˜Kšœ˜Kšœ-˜-K˜—K˜T˜IK˜Kšœ˜Kšœ˜K˜Kšœ˜Kšœžœ˜Kšœž˜K˜—K˜K˜—K˜1Kšžœ˜—K˜Kšžœ˜K˜"—K˜—K˜ šŸœžœž	œ˜<Kšœ˜J™?™6J™—K˜#J™šžœžœžœ  žœžœžœ"žœ˜˜Kšœžœ˜*—Kšžœ˜—šžœž˜Kšœ$žœ5˜]—šžœ˜Kšœžœ˜šžœž™™šœžœ™4J™-———šœ™Jšœ,™,˜Kšœ œ ˜=———Kšœ˜—K˜ šŸœžœ"˜6Kšœ˜Jšœžœ™0Kšœžœžœžœ˜-šœ™Kš œ
+ 
+œ˜&Jšœ+™+Jšœ,™,Jšœ&™&Jšœ™—Kšœžœ˜Jšœ™Kšœ˜Kšœ˜—K˜ šŸ	œž	œ˜1Kšœ˜K˜Kšœžœ˜K˜Kšœžœ˜˜6Kšžœ˜—Kšœ+žœ˜1šžœžœž˜šœžœ,˜:K˜5˜šœžœžœ˜6Kšžœ'žœ˜1——K˜!Jšžœ"žœžœžœ™7šžœžœ˜Kšœžœ˜7šœžœ˜%Kšžœžœ	žœ˜2—Kšœžœ
+˜-Kšœ˜—Kšžœžœžœ˜Kšœ+žœ˜6Jšžœ"žœžœžœ™9šžœžœžœ˜Kšœžœ˜!Kšœ
+žœžœ˜Kšœžœ˜6K˜—šžœ˜Kšœžœ˜7Kšœžœ˜6—šžœž˜K˜—šž˜K˜—Kšžœžœ˜1Kšžœ)˜-Kšœžœ
+˜,Kšœ˜—Kšžœžœ ˜%Kšžœ	žœ˜—Kšœ˜—K˜ šŸœž	œ˜5Kšžœžœ&˜AKšœ˜Kšœžœ˜Kšœ	žœ˜˜6Kšžœ˜—Kšœžœ˜šžœžœž˜šœžœ,˜:Jšœ-™-šžœžœžœ$ž˜8K˜WKšžœ˜—K˜ šžœžœžœ$ž˜8šžœ)ž˜/K˜—Kšžœ˜—Kšœžœ˜/K˜šžœžœžœ$ž˜8šžœ4ž˜;K˜Kšžœ˜—šžœ*žœ˜2˜6KšœA˜A—šžœžœ˜K˜*K˜—šžœ˜Kšœžœ˜3Kšœžœ-˜PKšœžœ˜3šžœžœžœž™%Jšœ
+žœžœ™)—Jšœ
+žœ™Kšžœ˜——K˜Kšžœ˜	——Kšžœ˜—Kšœ˜—K˜ šŸ	œ˜šžœžœ˜ K˜K˜šžœž˜šžœž˜Kšžœ˜—Kšžœ1žœ˜;——Kšžœžœ˜—K˜ šœ	žœž˜Kšœžœž˜K˜ —šŸœž	œ˜Kšœžœ"˜.Kšžœžœ!˜5Kšœ˜K˜ Kšœžœ˜K˜Kšœ#žœ˜:Kšœ	žœ˜Kšœžœžœ˜Kšœ	žœžœžœ˜.K˜ šŸœž	œ˜(K˜—K˜ šŸœ˜Kš
+žœžœžœžœžœ˜1—K˜ šŸœ˜!šžœžœ -˜BKšœžœ ˜Kšžœžœ˜—šžœ˜šžœž˜Kš	œžœžœžœžœ˜;Kšžœžœ˜———K˜ šŸœž	œ˜!šžœžœž˜šœžœ˜(Kšžœžœ˜,Kšœžœ˜:Kšœžœ˜K˜—šœžœ˜)Kšžœžœ˜,Kšœžœ˜=Kšœžœ˜K˜—šœžœ˜(Kšžœžœ˜,Kšœžœ ˜>Kšœžœ˜K˜—šœžœ˜'Kšžœžœ˜,Kšœžœ˜=Kšœžœ˜K˜—šžœ˜šžœž˜šžœžœž˜)˜˜Jšœ#žœ™*—˜J™2——Kšž˜——šž˜šœžœ˜1Kšœ œ	 œ˜7——Kšœžœ˜——Kšœ˜K˜ —Kšœ
+ž	œ	žœ˜ K˜!K˜˜Kšœžœ/˜?—šž˜šžœžœžœ˜Jšœ=™=Jšœ@™@Jšœ™šžœ$ž˜*K˜4—K˜J™%K˜—šžœ˜šžœ ž˜&K˜4—Kšžœžœ˜,šžœž˜˜K˜*šžœžœ˜Kšœžœ(˜F—šžœ˜K˜Kšœžœ#˜A—K˜—˜K˜*šžœž˜Kšœžœ+˜I—šžœ˜K˜Kšœžœ&˜D—K˜—Kšœ "˜:˜Kšœžœ˜=K˜—˜Kšœžœ"˜@K˜—Kš	œžœ œ $œžœ˜?Jšœ™Kšžœ˜	———K˜ ˜Kšœžœ˜(K˜—Kšžœ˜Kšœžœ˜
+Jšœ2™2K˜Kšžœžœžœ˜šžœžœžœž˜"šžœžœž˜#˜K˜Kšžœžœžœžœ˜9—K˜!K˜Kšžœ˜—˜Kšœ+žœžœ˜9—K˜Kšžœ˜—˜Kšœ'žœžœ˜9—šžœžœ ˜$Kšœžœ˜*šžœžœžœž˜"Kšœ%žœ˜-——Kšžœžœ˜Kšœ˜—K˜ šŸœž	œ˜K˜=Kšœ˜šžœž˜˜šžœž˜Kšœ	žœ˜*Kšžœ˜——˜šžœž˜Kšœžœ˜3Kšžœ˜——˜šžœž˜Kšœžœ˜/Kšžœ˜——˜	šžœž˜Kšœžœ˜'Kšžœ˜——Kšžœ˜—Kšœ˜—K˜ K˜K˜K˜K˜ JšœC™CK˜*JšœC™CK˜Kšœ* ˜EK˜)K˜EK˜K˜EK˜K˜ šŸœž	œ˜Kšœžœžœ œ˜DKšžœ	žœžœ˜"Kšœ˜šžœžœž˜Kšœžœ'˜BKšœžœ+˜HKšœžœ*˜Fšœ˜Kšžœ4˜:—šœ˜Kšžœ-˜3—Kšœžœ ˜4Kšžœ˜—Kšœ˜—K˜ šŸœž	œžœ˜SKšœ˜Kšœžœ˜%Kš
+žœžœžœžœžœ˜9Kšžœ˜Kšœ˜—K˜ šŸœž	œ˜K˜/Kšžœ˜"Kšœ˜šžœ˜Kšœ<žœ	˜IKšœ?žœ	˜LKšœ@žœ	˜MKšœ9žœ˜EKšœ0žœ	˜=Kšœ2žœ	˜?Kšœ7žœ˜CKšœ>žœ˜JKšœCžœ˜OKšœ@žœ	˜MKšœ9žœ	˜FKšœCžœ˜RKšœ?žœ˜KKšœ3žœ˜?Kšœ3žœ˜?Kšœ<žœ	˜IKšœ:žœ˜FKšœ<žœ˜HKšœBžœ˜QKšœ3žœ	˜@K˜—Kšœžœžœ˜Kšœ	žœ˜K˜K˜Kšœžœ˜"K˜Kšœ#žœ˜'šœžœžœžœžœžœ˜'šœžœ˜
+Jšœžœ™Jšœžœ™—šžœžœžœžœ˜+Jšœžœ™——Kšœžœžœžœ˜.Kšœ
+žœ˜*Kšœžœ˜"K˜M˜K˜K˜.K˜"Kšœ 	˜—šžœ	žœž˜K˜K˜K˜šžœ ˜!šžœ"žœ™*Jšœžœžœžœ ™"—šžœžœž˜%˜K˜"K˜—K˜2Kšžœ˜—K˜šžœžœž˜%˜˜"K˜Bšœžœ	ž˜!˜Kšœžœ˜;Kšœžœ9˜[—˜Kšœžœ˜9Kšœžœ9˜[—šžœ˜Kšœžœ˜>Kšœžœ9˜[————Kšžœ˜—K˜KšžœžœS˜kKšžœ˜˜"K˜`K˜K˜4K˜—šžœž˜K˜K˜)K˜'Kšžœ˜—Kšžœžœžœ˜'šžœžœž˜%˜Kšœ	žœ
+žœžœ	 ˜P—Kšžœ˜—K˜Kšžœ˜—Jšœv™vK˜%šžœžœžœ ˜-Kšžœžœ˜—Kšžœ˜—Kšœ˜Kšœ˜K˜ —šŸœž	œGžœžœ ˜¯Kšœ˜KšœžœH˜XKšœžœ˜šžœžœžœž˜'˜"K˜!K˜K˜*K˜—Kšžœžœ˜šžœ˜šžœ#ž˜)K˜ —šžœžœ&ž˜1K˜#——Kšžœ˜—Kšœ˜—K˜ šŸœž	œ˜Kšœžœ7˜CKšžœžœ˜&Kšœ˜Kšžœ ˜0Jšœ-™-Kšœžœ˜šžœžœžœ ˜3šžœžœž˜Kšœ'žœ@˜jKš	œ)žœ,žœžœžœ˜|Kšœ(žœ+žœ˜aKšœ(žœ5žœ˜tKšœ)žœB˜nKšž˜——šž˜šžœžœž˜Kšœ'žœk˜•Kšœ)žœ=˜išœ˜šœžœB˜WKšœ+˜+——Kšœ(žœF˜qšœ˜Kšœ0žœ˜J—Kšžœ˜——K˜ Kšœ˜—K˜ šŸœž	œ
+žœ˜%Kšžœžœ˜Kšœ˜šž˜šœ˜Kšœžœžœ˜K˜K˜ ˜K˜Kšœžœ˜!—Kšžœ˜	——K˜Kšžœžœžœ ˜DKšœ˜—K˜ šŸœž	œ˜"Kšœžœ,žœ˜LKšžœžœ˜&Kšœ˜K˜$šžœžœž˜šœ˜šžœžœžœž˜2šžœžœžœ*ž˜>šžœ3˜5šžœ˜Jšœ!™!šžœžœ˜&Kšœžœ"˜4šžœžœžœž˜'K˜*K˜8Kšžœ˜—K˜K˜—˜KšžœU˜X—K˜?K˜!——Kšžœ˜—Kšžœ˜—Kšžœžœžœ!˜?—Kšžœ˜—Kšœ˜—K˜ šŸœžœž	œ ˜9Kšžœ!˜(Kšœ˜Jšœ*™*K˜˜/K˜—Kšœžœ˜K˜Kš
+žœžœžœžœžœ˜Kšžœžœžœžœžœžœ˜$Kšœ
+žœžœ˜@K˜<K˜<Jšœ™šžœžœžœž˜&Kšœžœ˜—Jšœ:™:Jšœ2™2šžœ˜$Kšžœ ž˜%šžœžœž˜˜Kšœžœ,˜KK˜<˜*K˜——˜K˜<—˜K˜<—Kšžœ˜—Kšžœ˜—Kš
+žœžœžœžœžœ˜BJšœ™Kšžœžœžœžœ	˜Ašžœ˜šœžœ˜K˜+—šžœžœžœž˜(Kšœžœ˜$——Kšœ˜—K˜ šŸœžœž	œ ˜8Kšžœ!˜(Kšœ˜Jšœ*™*K˜K˜7Kšœžœ˜K˜Kšžœžœžœžœ˜ Kšžœžœžœžœ˜ šœ
+žœ˜K˜/—K˜K˜Jšœ™šžœžœžœž˜&Kšœžœ˜—Jšœ<™<Jšœ-™-šžœ˜$Kšžœ ž˜%šžœžœž˜šœ ˜Kšœžœ,˜KK˜<˜*K˜——˜Kšœžœ,˜K˜*K˜——˜Kšœžœ,˜K˜*K˜——Kšžœ˜—Kšžœ˜—šžœ žœ ˜:šžœ ž˜'Kšœžœ,˜KK˜<Kšž˜——šžœ ˜šžœ ž˜'Kšœžœ,˜KK˜<Kšžœ˜——Kšžœ)žœžœ	˜?šžœ˜šœžœ˜K˜*—šžœžœžœž˜(Kšœžœ˜$——Kšœ˜—K˜ šŸœžœž	œ˜Kšœžœ˜5Kšœ	žœžœžœ˜0Kšœ˜K˜Kšžœžœ˜=šž˜šžœ;˜=Kšžœ4˜8—šžœ˜K˜Kšžœžœ˜(K˜ K˜——Kšœ˜—K˜ šŸœžœž	œ˜Kšœžœ˜ Kšœ˜Kšœžœžœžœ,˜išžœžœžœž˜%Kšœžœ˜—K˜Kšœ˜—K˜ šŸœžœž	œ˜$K˜8Kšœ˜K˜+šž˜šžœžœž˜šœ
+žœ˜Kšœžœžœ˜3Kšžœ˜—Kšœ:žœ˜@šœžœ˜Kšœžœžœ˜2Kšžœ˜—Kšžœ˜—K˜Kšžœ˜—Kšœ˜—K˜ Kšœ˜K˜ —KšœEžœ$žœ˜pK˜ — …—    ‡"  ¹6  

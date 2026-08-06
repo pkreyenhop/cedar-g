@@ -1,0 +1,923 @@
+
+DIRECTORY
+BasicTime USING [GMT, nullGMT],
+DFUtilities USING [Date, DateToStream, DifferenceOfUsingLists, DirectoryItem, FileItem, Filter, ImportsItem, IncludeItem, ParseFromStream, ProcessItemProc, RemoveVersionNumber, SortUsingList, SyntaxError, UsingForm, UsingList],
+FS USING [Error, FileInfo, GetInfo, GetName, Open, OpenFile, StreamFromOpenFile],
+GenerateDFClosure USING [ActionKind, ActionProc, ClosureInfo, Options],
+GenMapIO USING [PutMsg, PutRopes],
+IO USING [Close, PutRope, STREAM],
+Process USING [CheckForAbort, Detach],
+Rope USING [Concat, Equal, Fetch, Length, ROPE],
+SafeStorage USING [ReclaimCollectibleObjects],
+SymTab USING [Create, EachPairAction, Fetch, Pairs, Ref, Store];
+
+GenerateDFClosureImpl: CEDAR MONITOR
+LOCKS state USING state: State
+IMPORTS DFUtilities, FS, GenMapIO, IO, Process, Rope, SafeStorage, SymTab
+EXPORTS GenerateDFClosure
+= BEGIN
+
+
+ActionKind: TYPE = GenerateDFClosure.ActionKind;
+ActionProc: TYPE = GenerateDFClosure.ActionProc;
+ClosureInfo: TYPE = GenerateDFClosure.ClosureInfo;
+Date: TYPE = DFUtilities.Date;
+DirectoryItem: TYPE = DFUtilities.DirectoryItem;
+FileItem: TYPE = DFUtilities.FileItem;
+FileItemList: TYPE = LIST OF FileItem;
+Filter: TYPE = DFUtilities.Filter;
+AllFilter: Filter = [FALSE, all, all, all, NIL];
+FutureImportsItem: TYPE = RECORD [imp: REF ImportsItem, from: REF];
+ImportsItem: TYPE = DFUtilities.ImportsItem;
+IncludeItem: TYPE = DFUtilities.IncludeItem;
+LORA: TYPE = LIST OF REF ANY;
+Options: TYPE = GenerateDFClosure.Options;
+ROPE: TYPE = Rope.ROPE;
+RopeList: TYPE = LIST OF ROPE;
+STREAM: TYPE = IO.STREAM;
+UsingForm: TYPE = DFUtilities.UsingForm;
+UsingList: TYPE = DFUtilities.UsingList;
+
+ImportsPair: TYPE = RECORD [
+from: ROPE,		-- the original source of this import
+needed: REF ImportsItem,	-- the imports not yet done for this DF file
+doing: REF ImportsItem	-- the imports in progress (or done) for this DF file
+];
+
+InclDefList: TYPE = LIST OF InclDefItem;
+InclDefItem: TYPE = RECORD[incl: REF, from: REF, filter: Filter];
+
+ImpDefList: TYPE = LIST OF ImpDefItem;
+ImpDefItem: TYPE = RECORD[imp: REF ImportsItem, from: REF, filter: Filter];
+
+State: TYPE = REF StateRep;
+StateRep: TYPE = MONITORED RECORD [
+head,tail: LORA ¨ NIL,		-- head and tail of file list
+inclHead,inclTail: InclDefList ¨ NIL,	-- head&tail for deferred include processing
+impHead,impTail: ImpDefList ¨ NIL,	-- head&tail for deferred imports processing
+errs: STREAM ¨ NIL,		-- error reporting stream (can be NIL)
+action: ActionProc ¨ NIL,	-- the client's callback proc
+actionData: REF ¨ NIL,		-- the data for the client's callback proc
+tab: SymTab.Ref ¨ NIL,		-- table of DF files (ImportsPair & IncludeItem objects)
+forked,started,finished: INT ¨ 0,	-- counts associated with forked processes
+files: INT ¨ 0,		-- files in the closure (including DF files)
+dfFiles: INT ¨ 0,		-- DF files examined
+notFound: INT ¨ 0,		-- # of DF files not found
+maxProcesses: NAT ¨ 16,		-- # of forked processes besides main process
+serverRetries: NAT ¨ 10,		-- # of times to retry when server is unavailable
+abortRequested: BOOL ¨ FALSE,	-- TRUE if an abort was requested
+followImports: BOOL ¨ FALSE,	-- TRUE if imports are followed
+messages: BOOL ¨ FALSE,		-- TRUE if debug info goes in message window
+ProcessStarted: CONDITION,	-- BROADCAST for every forked process start
+ProcessFinished: CONDITION	-- BROADCAST for every forked process finish
+];
+
+GenerateClosureToProc: PUBLIC PROC [dfName: ROPE, errs: STREAM, action: ActionProc, data: REF, options: Options ¨ []] RETURNS [info: ClosureInfo ¨ [0, 0, 0]] = {
+state: State ¨ NEW[StateRep ¨ [
+action: action, actionData: data, errs: errs, messages: options.messages, followImports: options.followImports, maxProcesses: options.toFork, serverRetries: options.serverRetries]];
+{
+ENABLE UNWIND => NoteAborting[state];
+GenerateClosure[state, dfName];
+info ¨ [state.files, state.dfFiles, state.notFound];
+};
+SmashTheState[state];
+PutMsg[state, "Done."];
+};
+
+GenerateClosureToStream: PUBLIC PROC [dfName: ROPE, errs: STREAM, out: STREAM, options: Options ¨ [], verbose: BOOL ¨ FALSE] RETURNS [info: ClosureInfo ¨ [0, 0, 0]] = {
+state: State ¨ NEW[StateRep ¨ [
+errs: errs, messages: options.messages, maxProcesses: options.toFork, serverRetries: options.serverRetries]];
+IF out # NIL THEN {
+ENABLE UNWIND => NoteAborting[state];
+GenerateClosure[state, dfName];
+info ¨ [state.files, state.dfFiles, state.notFound];
+DumpFiles[state, state.head, out, verbose];
+};
+SmashTheState[state];
+PutMsg[state, "Done."];
+};
+
+
+GenerateClosure: PROC [state: State, dfName: ROPE] = {
+lag: LORA ¨ NIL;
+IF state.tab = NIL THEN state.tab ¨ SymTab.Create[361, FALSE];
+
+DoProcessInclude[
+state: state,
+incl: NEW[IncludeItem ¨ [dfName, [omitted], NIL, FALSE]],
+from: NIL,
+filter: AllFilter];
+WaitForIncludesDone[state];
+DO
+processPair: SymTab.EachPairAction = {
+quit ¨ FALSE;
+WITH val SELECT FROM
+impP: REF ImportsPair => {
+needed: REF ImportsItem ¨ impP.needed;
+copy: REF ImportsItem ¨ NIL;
+nList: REF UsingList ¨ needed.list;
+nForm: UsingForm = needed.form;
+IF nForm = list AND (nList = NIL OR nList.nEntries = 0) THEN RETURN;
+IF (copy ¨ NoteDoing[state, impP]) # NIL THEN {
+anyChanged ¨ TRUE;
+SELECT nForm FROM
+all => {
+ProcessInclude[state, needed, impP.from, [filterB: public]];
+RETURN;
+};
+exports =>
+ProcessInclude[state, needed, impP.from, [filterB: public]];
+ENDCASE;
+IF nList # NIL AND nList.nEntries # 0 THEN
+ProcessInclude[state, copy, impP.from, [list: nList]];
+};
+};
+ENDCASE;
+};
+anyChanged: BOOL ¨ FALSE;
+oldTail: LORA ¨ state.tail;
+
+IF lag # oldTail THEN {
+PutMsg[state, "Finding possible imports."];
+IF lag = NIL THEN lag ¨ state.head ELSE lag ¨ lag.rest;
+FOR each: LORA ¨ lag, each.rest WHILE each # NIL DO
+WITH each.first SELECT FROM
+impF: REF FutureImportsItem => {
+ProcessImport[state, impF.imp, impF.from, AllFilter];
+};
+ENDCASE;
+lag ¨ each;
+ENDLOOP;
+WaitForIncludesDone[state];
+anyChanged ¨ oldTail # state.tail;
+};
+
+PutMsg[state, "Fetching imports."];
+[] ¨ SymTab.Pairs[state.tab, processPair];
+WaitForImportsDone[state];
+IF NOT anyChanged THEN EXIT;
+
+ENDLOOP;
+};
+
+DumpFiles: PROC [state: State, list: LORA, out: STREAM, verbose: BOOL ¨ FALSE] = {
+putFile: PROC [name: ROPE, date: Date, plus: BOOL ¨ FALSE] = {
+IF plus THEN IO.PutRope[out, "+"];
+IO.PutRope[out, name];
+IO.PutRope[out, "\t\t"];
+DFUtilities.DateToStream[out, date];
+};
+putImp: PROC [imp: REF ImportsItem, future: BOOL ¨ FALSE] = {
+usingRope: ROPE ¨ "\n    USING [";
+list: REF UsingList ¨ imp.list;
+IF future
+THEN {IO.PutRope[out, "\n  -- FUTURE IMPORTS "]; usingRope ¨ "\n    -- USING ["}
+ELSE IO.PutRope[out, "\n\nIMPORTS "];
+putFile[imp.path1, imp.date];
+SELECT imp.form FROM
+exports => {IO.PutRope[out, usingRope]; IO.PutRope[out, "PUBLIC]"]};
+all => {IO.PutRope[out, usingRope]; IO.PutRope[out, "ALL]"]};
+ENDCASE;
+IO.PutRope[out, usingRope];
+IF list # NIL THEN
+FOR i: NAT IN [0..list.nEntries) DO
+IF i > 0 THEN IO.PutRope[out, ", "];
+IF list[i].verifyRoot THEN IO.PutRope[out, "+"];
+IO.PutRope[out, list[i].name];
+ENDLOOP;
+IO.PutRope[out, "]"];
+};
+PutMsg[state, "Dumping list of files."];
+WHILE list # NIL DO
+ENABLE UNWIND => IO.Close[out];
+CheckAbort[state];
+WITH list.first SELECT FROM
+file: REF FileItem => {
+IO.PutRope[out, "\n  "];
+putFile[file.name, file.date, file.verifyRoot];
+};
+ENDCASE;
+IF verbose THEN
+WITH list.first SELECT FROM
+file: REF FileItem => {};
+imp: REF ImportsItem => {
+putImp[imp];
+};
+impF: REF FutureImportsItem => {
+putImp[impF.imp, TRUE];
+};
+incl: REF IncludeItem => {
+IO.PutRope[ out, "\n\nINCLUDES "];
+putFile[incl.path1, incl.date];
+};
+ENDCASE =>
+IO.PutRope[out, "\n  ????"];
+list ¨ list.rest;
+ENDLOOP;
+IO.PutRope[out, "\n\n"];
+};
+
+ProcessInclude: ENTRY PROC [state: State, incl: REF, from: REF, filter: Filter] = TRUSTED {
+ENABLE UNWIND => state.abortRequested ¨ TRUE;
+new: InclDefList = LIST[[incl, from, filter]];
+CheckAbortInternal[state];
+IF state.inclHead = NIL
+THEN state.inclHead ¨ new
+ELSE state.inclTail.rest ¨ new;
+state.inclTail ¨ new;
+IF state.forked-state.finished < state.maxProcesses THEN {
+state.forked ¨ state.forked + 1;
+Process.Detach[FORK ProcessIncludeBase[state]];
+WHILE state.forked > state.started DO
+CheckAbortInternal[state];
+WAIT state.ProcessStarted;
+ENDLOOP;
+};
+};
+
+ProcessIncludeBase: PROC [state: State] = {
+ENABLE {
+UNWIND => Unwind[state];
+ABORTED => {Unwind[state]; GO TO abort};
+};
+BumpStarted[state];
+DO
+list: InclDefList ¨ RemInclude[state, TRUE];
+IF list = NIL THEN RETURN;
+DoProcessInclude[state, list.first.incl, list.first.from, list.first.filter];
+ENDLOOP;
+EXITS abort => {};
+};
+
+WaitForIncludesDone: PROC [state: State] = {
+DO
+list: InclDefList = RemInclude[state];
+IF list = NIL THEN EXIT;
+DoProcessInclude[state, list.first.incl, list.first.from, list.first.filter];
+ENDLOOP;
+WaitForForkedDoneOrAbort[state];
+};
+
+RemInclude: ENTRY PROC [state: State, finish: BOOL ¨ FALSE] RETURNS [list: InclDefList ¨ NIL] = {
+ENABLE UNWIND => state.abortRequested ¨ TRUE;
+CheckAbortInternal[state];
+list ¨ state.inclHead;
+IF list # NIL THEN {
+IF (state.inclHead ¨ list.rest) = NIL THEN state.inclTail ¨ NIL;
+list.rest ¨ NIL;
+RETURN;
+};
+IF finish THEN BumpFinishedInternal[state];
+};
+
+DoProcessInclude: PROC [state: State, incl: REF, from: REF, filter: Filter] = {
+subHead: LORA ¨ LIST[incl];
+subTail: LORA ¨ subHead;
+currentDirectory: REF DirectoryItem ¨ NIL;
+inStream: STREAM ¨ NIL;
+nFiles: INT ¨ 0;
+selfSeen: BOOL ¨ FALSE;
+anySeen: BOOL ¨ FALSE;
+processItem: DFUtilities.ProcessItemProc = {
+CheckAbort[state];
+WITH item SELECT FROM
+dir: REF DirectoryItem => {
+currentDirectory ¨ dir;
+};
+file: REF FileItem => {
+IF currentDirectory # NIL THEN
+file.name ¨ Rope.Concat[currentDirectory.path1, file.name];
+IF state.action = NIL
+THEN {
+subTail.rest ¨ LIST[file];
+subTail ¨ subTail.rest;
+}
+ELSE {
+state.action[state.actionData, file, file.name, file.date, fullName];
+};
+nFiles ¨ nFiles + 1;
+anySeen ¨ TRUE;
+IF Rope.Equal[file.name, fullName, FALSE] OR Rope.Equal[file.name, initName, FALSE]
+THEN selfSeen ¨ TRUE;
+};
+imp: REF ImportsItem => {
+SELECT TRUE FROM
+NOT state.followImports => RETURN;
+filter.filterB = public AND NOT imp.exported => RETURN;
+filter.list # NIL => {imp.form ¨ list; imp.list ¨ filter.list};
+ENDCASE;
+subTail.rest ¨ LIST[NEW[FutureImportsItem ¨ [imp: imp, from: incl]]];
+subTail ¨ subTail.rest;
+};
+inclP: REF IncludeItem => {
+ProcessInclude[state, inclP, incl, filter];
+};
+ENDCASE;
+};
+initName, fullName: ROPE ¨ NIL;
+kind: ROPE;
+tab: SymTab.Ref ¨ state.tab;
+date: Date;
+isIncluded: BOOL ¨ FALSE;
+checkRemote: BOOL ¨ FALSE;
+
+WITH incl SELECT FROM
+incl1: REF IncludeItem => {date ¨ incl1.date; initName ¨ incl1.path1; isIncluded ¨ TRUE};
+imp1: REF ImportsItem => {date ¨ imp1.date; initName ¨ imp1.path1};
+ENDCASE => RETURN;
+IF date.format # explicit THEN {
+checkRemote ¨ TRUE;
+initName ¨ DFUtilities.RemoveVersionNumber[initName];
+IF CheckPreviousInclusion[state, initName] THEN RETURN;
+};
+
+[inStream, fullName, date] ¨ OpenRead[state, initName, date];
+
+IF inStream = NIL THEN {
+BumpNotFound[state];
+PutMsg[state, initName, " (not found)"];
+IF state.action # NIL THEN
+state.action[state.actionData, notFound, initName, date, ParentName[from]];
+RETURN;
+};
+IF CheckPreviousInclusion[state, fullName] THEN RETURN;
+
+WITH incl SELECT FROM
+incl1: REF IncludeItem => {incl1.path1 ¨ fullName};
+imp1: REF ImportsItem => {imp1.path1 ¨ fullName};
+ENDCASE => RETURN;
+
+SELECT TRUE FROM
+isIncluded => {
+kind ¨ " (all)";
+[] ¨ SymTab.Store[tab, fullName, incl];
+IF checkRemote THEN
+[] ¨ SymTab.Store[tab, initName, incl];
+};
+filter.filterB = public => kind ¨ " (public)";
+filter.list # NIL => kind ¨ " (list)";
+ENDCASE => kind ¨ " ??";
+PutMsg[state, fullName, kind];
+
+initName ¨ DFUtilities.RemoveVersionNumber[fullName];
+DFUtilities.ParseFromStream[inStream, processItem, filter
+! DFUtilities.SyntaxError => {
+PutRopes[state, "Syntax error in ", fullName, "\n  ", reason];
+IF state.action # NIL THEN
+state.action[state.actionData, syntaxError, fullName, date, ParentName[from]];
+CONTINUE;
+}];
+IO.Close[inStream];
+SpliceFileList[state, subHead, subTail, nFiles, 1];
+};
+
+
+ProcessImport: ENTRY PROC [state: State, imp: REF ImportsItem, from: REF, filter: Filter] = TRUSTED {
+ENABLE UNWIND => state.abortRequested ¨ TRUE;
+new: ImpDefList = LIST[[imp, from, filter]];
+CheckAbortInternal[state];
+IF state.impHead = NIL
+THEN state.impHead ¨ new
+ELSE state.impTail.rest ¨ new;
+state.impTail ¨ new;
+IF state.forked-state.finished < state.maxProcesses THEN {
+state.forked ¨ state.forked + 1;
+Process.Detach[FORK ProcessImportBase[state]];
+WHILE state.forked > state.started DO
+CheckAbortInternal[state];
+WAIT state.ProcessStarted;
+ENDLOOP;
+};
+};
+
+ProcessImportBase: PROC [state: State] = {
+ENABLE {
+UNWIND => Unwind[state];
+ABORTED => {Unwind[state]; GO TO abort};
+};
+BumpStarted[state];
+DO
+list: ImpDefList ¨ RemImport[state, TRUE];
+IF list = NIL THEN RETURN;
+DoProcessImport[state, list.first.imp, list.first.from, list.first.filter];
+ENDLOOP;
+EXITS abort => {};
+};
+
+WaitForImportsDone: PROC [state: State] = {
+DO
+list: ImpDefList = RemImport[state];
+IF list = NIL THEN EXIT;
+DoProcessImport[state, list.first.imp, list.first.from, list.first.filter];
+ENDLOOP;
+WaitForIncludesDone[state];
+};
+
+RemImport: ENTRY PROC [state: State, finish: BOOL ¨ FALSE] RETURNS [list: ImpDefList ¨ NIL] = {
+ENABLE UNWIND => state.abortRequested ¨ TRUE;
+list ¨ state.impHead;
+CheckAbortInternal[state];
+IF list # NIL THEN {
+IF (state.impHead ¨ list.rest) = NIL THEN state.impTail ¨ NIL;
+list.rest ¨ NIL;
+RETURN;
+};
+IF finish THEN BumpFinishedInternal[state];
+};
+
+DoProcessImport: PROC [state: State, imp: REF ImportsItem, from: REF, filter: Filter] = {
+initName: ROPE ¨ imp.path1;
+fullName: ROPE ¨ initName;
+attached: ROPE;
+created: BasicTime.GMT ¨ imp.date.gmt;
+ok: BOOL ¨ TRUE;
+checkRemote: BOOL ¨ imp.date.format # explicit;
+tab: SymTab.Ref = state.tab;
+ExcludeFilterAndMerge: PROC [impP: REF ImportsPair] = {
+SELECT TRUE FROM
+imp.form = list AND (imp.list = NIL OR imp.list.nEntries = 0) => RETURN;
+filter.list # NIL => {
+IF imp.form = list THEN {
+common: REF UsingList ¨ filter.list;
+diff: REF UsingList ¨ DFUtilities.DifferenceOfUsingLists[common, imp.list];
+IF diff # NIL THEN common ¨ DFUtilities.DifferenceOfUsingLists[filter.list, diff];
+IF common = NIL OR common.nEntries = 0 THEN RETURN;
+imp ¨ NEW[ImportsItem ¨ imp≠];
+imp.list ¨ common;
+};
+};
+filter.filterB = public AND NOT imp.exported => RETURN;
+ENDCASE;
+MergeUsingLists[state, impP, imp];
+};
+
+IF imp.list # NIL THEN DFUtilities.SortUsingList[imp.list, TRUE];
+IF checkRemote THEN {
+imp.path1 ¨ initName ¨ fullName ¨ DFUtilities.RemoveVersionNumber[initName];
+created ¨ BasicTime.nullGMT;
+WITH SymTab.Fetch[tab, initName].val SELECT FROM
+incl: REF IncludeItem => {
+RETURN;
+};
+impP: REF ImportsPair => {
+ExcludeFilterAndMerge[impP];
+RETURN;
+};
+ENDCASE;
+};
+{ENABLE FS.Error => IF error.group # bug THEN GO TO noGot;
+PutMsg[state, "Checking ", fullName];
+[fullFName: fullName, attachedTo: attached, created: created] ¨
+FS.FileInfo[fullName, created, checkRemote];
+IF attached # NIL THEN fullName ¨ attached;
+imp.path1 ¨ fullName;
+imp.date ¨ [explicit, created];
+WITH SymTab.Fetch[tab, fullName].val SELECT FROM
+incl: REF IncludeItem => {
+RETURN;
+};
+impP: REF ImportsPair => {
+ExcludeFilterAndMerge[impP];
+RETURN;
+};
+ENDCASE;
+{
+needed: REF ImportsItem ¨ NEW[ImportsItem ¨ imp≠];
+doing: REF ImportsItem ¨ NEW[ImportsItem ¨ imp≠];
+fromName: ROPE ¨ ParentName[from];
+impPair: REF ImportsPair ¨
+NEW[ImportsPair ¨ [from: fromName, needed: needed, doing: doing]];
+doing.list ¨ NIL;
+doing.form ¨ list;
+[] ¨ SymTab.Store[tab, fullName, impPair];
+IF state.action = NIL
+THEN {
+file: REF FileItem ¨ NEW[FileItem ¨ [name: fullName, date: imp.date, verifyRoot: FALSE]];
+list: LORA ¨ LIST[file];
+SpliceFileList[state, list, list, 1, 0];
+}
+ELSE {
+state.action[state.actionData, file, fullName, imp.date, fullName];
+state.files ¨ state.files + 1;
+};
+IF checkRemote THEN [] ¨ SymTab.Store[tab, initName, impPair];
+};
+EXITS noGot => {
+PutRopes[state, "Import not found: ", fullName, "\n  from: ", ParentName[from]];
+};
+};
+};
+
+
+SpliceFileList: ENTRY PROC [state: State, subHead,subTail: LORA, nFiles,ndfFiles: INT ¨ 0] = {
+ENABLE UNWIND => state.abortRequested ¨ TRUE;
+IF state.head = NIL THEN state.head ¨ subHead ELSE state.tail.rest ¨ subHead;
+state.tail ¨ subTail;
+state.files ¨ state.files + nFiles;
+state.dfFiles ¨ state.dfFiles + ndfFiles;
+};
+
+BumpStarted: ENTRY PROC [state: State] = {
+ENABLE UNWIND => state.abortRequested ¨ TRUE;
+state.started ¨ state.started + 1;
+BROADCAST state.ProcessStarted;
+CheckAbortInternal[state];
+};
+
+BumpFinished: ENTRY PROC [state: State] = {
+ENABLE UNWIND => state.abortRequested ¨ TRUE;
+BumpFinishedInternal[state];
+};
+
+BumpFinishedInternal: INTERNAL PROC [state: State] = {
+state.finished ¨ state.finished + 1;
+BROADCAST state.ProcessFinished;
+CheckAbortInternal[state]
+};
+
+BumpNotFound: ENTRY PROC [state: State] = {
+state.notFound ¨ state.notFound + 1;
+};
+
+BumpFiles: ENTRY PROC [state: State] = {
+state.files ¨ state.files + 1;
+};
+
+WaitForForkedDone: ENTRY PROC [state: State] = {
+WHILE state.forked > state.finished DO WAIT state.ProcessFinished; ENDLOOP;
+};
+
+WaitForForkedDoneOrAbort: ENTRY PROC [state: State] = {
+ENABLE UNWIND => state.abortRequested ¨ TRUE;
+WHILE state.forked > state.finished DO
+CheckAbortInternal[state];
+WAIT state.ProcessFinished;
+ENDLOOP;
+};
+
+Unwind: ENTRY PROC [state: State] = {
+state.abortRequested ¨ TRUE;
+state.finished ¨ state.finished + 1;
+BROADCAST state.ProcessFinished;
+WHILE state.forked > state.finished DO WAIT state.ProcessFinished; ENDLOOP;
+};
+
+OpenRead: PROC [state: State, name: ROPE, date: Date] RETURNS [in: STREAM ¨ NIL, fullName: ROPE ¨ NIL, realDate: Date] = {
+attached: ROPE ¨ NIL;
+created: BasicTime.GMT ¨ BasicTime.nullGMT;
+checkRemote: BOOL ¨ date.format # explicit;
+why: ROPE ¨ NIL;
+retries: NAT ¨ 0;
+file: FS.OpenFile;
+realDate ¨ date;
+IF checkRemote
+THEN fullName ¨ DFUtilities.RemoveVersionNumber[name]
+ELSE {fullName ¨ name; created ¨ date.gmt};
+DO
+file ¨ FS.Open[fullName, $read, created, checkRemote
+! FS.Error => {
+SELECT error.code FROM
+$serverInaccessible => {
+PutRopes[state, "Server glitch: ", fullName];
+retries ¨ retries + 1;
+IF retries <= state.serverRetries THEN LOOP;
+};
+ENDCASE;
+PutRopes[state, "Can't open ", fullName, "\n  ", error.explanation];
+IF error.group # bug THEN GO TO noGot;
+}];
+in ¨ FS.StreamFromOpenFile[file, $read];
+EXIT;
+ENDLOOP;
+[fullFName: fullName, attachedTo: attached] ¨ FS.GetName[file];
+created ¨ FS.GetInfo[file].created;
+IF attached # NIL THEN fullName ¨ attached;
+IF created # BasicTime.nullGMT THEN realDate ¨ [format: explicit, gmt: created];
+EXITS noGot => {};
+};
+
+MergeUsingLists: ENTRY PROC [state: State, impP: REF ImportsPair, imp: REF ImportsItem] = {
+ENABLE UNWIND => state.abortRequested ¨ TRUE;
+needed: REF ImportsItem ¨ impP.needed;
+doing: REF ImportsItem ¨ impP.doing;
+impList: REF UsingList ¨ CopyUsingList[imp.list];
+CheckAbortInternal[state];
+IF impList # NIL THEN {
+IF needed.list # NIL THEN 
+impList ¨ DFUtilities.DifferenceOfUsingLists[impList, needed.list];
+IF doing.list # NIL AND impList # NIL THEN
+impList ¨ DFUtilities.DifferenceOfUsingLists[impList, doing.list];
+IF impList = NIL OR impList.nEntries = 0 THEN RETURN;
+};
+SELECT imp.form FROM
+all => {needed.form ¨ all; needed.list ¨ NIL};
+exports => IF needed.form = list THEN needed.form ¨ exports;
+list => {
+nList: REF UsingList = impList;
+oList: REF UsingList = needed.list;
+SELECT TRUE FROM
+nList = NIL => {};
+oList = NIL => needed.list ¨ nList;
+ENDCASE => {
+diff: REF UsingList = DFUtilities.DifferenceOfUsingLists[nList, oList];
+IF diff # NIL THEN {
+dLen: NAT = diff.nEntries;
+oLen: NAT = oList.nEntries;
+SELECT TRUE FROM
+dLen = 0 => {};
+oLen = 0 => needed.list ¨ diff;
+ENDCASE => {
+nnlist: REF UsingList ¨ needed.list ¨ NEW[UsingList[oLen+dLen]];
+nnlist.nEntries ¨ oLen+dLen;
+FOR i: NAT IN [0..oLen) DO nnlist[i] ¨ oList[i]; ENDLOOP;
+FOR j: NAT IN [0..dLen) DO nnlist[j+oLen] ¨ diff[j]; ENDLOOP;
+DFUtilities.SortUsingList[nnlist, oLen > dLen];
+};
+};
+};
+};
+ENDCASE => ERROR;
+};
+
+NoteDoing: ENTRY PROC [state: State, impP: REF ImportsPair] RETURNS [REF ImportsItem ¨ NIL] = {
+ENABLE UNWIND => state.abortRequested ¨ TRUE;
+needed: REF ImportsItem ¨ impP.needed;
+nList: REF UsingList ¨ needed.list;
+nLen: NAT ¨ IF nList = NIL THEN 0 ELSE nList.nEntries;
+nForm: UsingForm ¨ needed.form;
+doing: REF ImportsItem ¨ impP.doing;
+dList: REF UsingList ¨ doing.list;
+dLen: NAT ¨ IF dList = NIL THEN 0 ELSE dList.nEntries;
+Copy: PROC RETURNS [toDo: REF ImportsItem ¨ NIL] = {
+toDo ¨ NEW[ImportsItem ¨ needed≠];
+toDo.list ¨ nList;
+toDo.form ¨ nForm;
+};
+needed.list ¨ NIL;
+needed.form ¨ list;
+SELECT doing.form FROM
+all => RETURN;
+exports => {
+SELECT nForm FROM
+all => {
+doing.form ¨ all; doing.list ¨ NIL;
+RETURN [doing];
+};
+ENDCASE => {
+nForm ¨ list;
+IF nLen = 0 THEN RETURN;
+};
+};
+list => {
+SELECT nForm FROM
+all => {
+doing.form ¨ all; doing.list ¨ NIL;
+RETURN [doing];
+};
+exports => {
+doing.form ¨ exports;
+IF nLen = 0 THEN RETURN [Copy[]];
+};
+list => {
+IF nLen = 0 THEN RETURN;
+};
+ENDCASE;
+};
+ENDCASE;
+IF dLen = 0
+THEN
+doing.list ¨ nList
+ELSE {
+diff: REF UsingList = DFUtilities.DifferenceOfUsingLists[nList, dList];
+delta: NAT = IF diff = NIL THEN 0 ELSE diff.nEntries;
+IF delta = 0 THEN RETURN;
+nLen ¨ dLen+delta;
+nList ¨ doing.list ¨ NEW[UsingList[nLen]];
+nList.nEntries ¨ nLen;
+FOR i: NAT IN [0..dLen) DO nList[i] ¨ dList[i]; ENDLOOP;
+FOR j: NAT IN [0..delta) DO nList[j+dLen] ¨ diff[j]; ENDLOOP;
+DFUtilities.SortUsingList[nList, delta <= dLen];
+};
+RETURN [Copy[]];
+};
+
+CopyUsingList: PROC [old: REF UsingList] RETURNS [new: REF UsingList ¨ NIL] = {
+IF old # NIL THEN {
+size: NAT = old.nEntries;
+new ¨ NEW[UsingList[size]];
+new.nEntries ¨ size;
+FOR i: NAT IN [0..size) DO new[i] ¨ old[i]; ENDLOOP;
+};
+};
+
+ParentName: PROC [from: REF] RETURNS [parent: ROPE] = {
+parent ¨ "??";
+WITH from SELECT FROM
+rope: ROPE => parent ¨ rope;
+imp: REF ImportsItem => parent ¨ imp.path1;
+inclP: REF IncludeItem => parent ¨ inclP.path1;
+ENDCASE;
+};
+
+CheckPreviousInclusion: PROC [state: State, name: ROPE, msg: BOOL ¨ FALSE] RETURNS [BOOL] = {
+WITH SymTab.Fetch[state.tab, name].val SELECT FROM
+incl: REF IncludeItem => {
+IF msg THEN PutMsg[state, name, " (skipped)"];
+RETURN [TRUE];
+};
+ENDCASE => RETURN [FALSE];
+};
+
+NoteAborting: PROC [state: State] = {
+state.abortRequested ¨ TRUE;
+PutRopes[state, "Aborting...\n\n"];
+WaitForForkedDone[state];
+SmashTheState[state];
+};
+
+SmashTheState: ENTRY PROC [state: State] = {
+ENABLE UNWIND => NULL;
+list: LORA ¨ state.head;
+WHILE list # NIL DO
+rest: LORA ¨ list.rest;
+list.rest ¨ NIL;
+list ¨ rest;
+ENDLOOP;
+state.head ¨ NIL;
+state.tail ¨ NIL;
+state.tab ¨ NIL;
+SafeStorage.ReclaimCollectibleObjects[];
+};
+
+PutRopes: PROC [state: State, r1,r2,r3,r4: ROPE ¨ NIL] = {
+ENABLE UNWIND => state.abortRequested ¨ TRUE;
+IF state.abortRequested THEN RETURN WITH ERROR ABORTED;
+GenMapIO.PutRopes[state.errs, r1,r2,r3,r4];
+};
+
+PutMsg: PROC [state: State, r1,r2,r3,r4: ROPE ¨ NIL] = {
+ENABLE UNWIND => state.abortRequested ¨ TRUE;
+IF state.abortRequested THEN RETURN WITH ERROR ABORTED;
+GenMapIO.PutMsg[r1,r2,r3,r4];
+};
+
+CheckAbort: ENTRY PROC [state: State] = {
+ENABLE UNWIND => NULL;
+CheckAbortInternal[state];
+};
+
+CheckAbortInternal: INTERNAL PROC [state: State] = {
+ENABLE UNWIND => {
+state.abortRequested ¨ TRUE;
+BROADCAST state.ProcessFinished;
+BROADCAST state.ProcessStarted;
+};
+IF state.abortRequested THEN {
+BROADCAST state.ProcessFinished;
+BROADCAST state.ProcessStarted;
+RETURN WITH ERROR ABORTED;
+};
+Process.CheckForAbort[];
+};
+
+ScanName: PROC [name: ROPE] RETURNS [pos,bang,dot: INT] = {
+len: INT = Rope.Length[name];
+pos ¨ bang ¨ dot ¨ len;
+WHILE pos > 0 DO
+posM: INT = pos-1;
+SELECT Rope.Fetch[name, posM] FROM
+'! => bang ¨ dot ¨ posM;
+'. => dot ¨ posM;
+'>, '/, '] => RETURN;
+ENDCASE;
+pos ¨ posM;
+ENDLOOP;
+};
+
+END.
+
+     
+GenerateDFClosureImpl.mesa
+Copyright ” 1985, 1986, 1992 by Xerox Corporation.  All rights reserved.
+Russ Atkinson (RRA) April 30, 1986 5:43:59 pm PDT
+Mna, October 29, 1990 11:32 am PST
+Willie-s, January 22, 1992 5:40 pm PST
+T Y P E S
+PUBLIC routines
+
+... generates the closure of files mentioned by the given DF file.  Files may appear in the closure twice, although this is not frequent for well-structured DF files.  For each file in the closure, the caller's action routine is invoked with the file name and other information (see above).  The action routine may be invoked from as many as 1+options.toFork processes, so the client may need to be careful about concurrent actions.
+... performs roughly the same actions as GenerateClosureToProc, except that the closure so generated is written to the given output stream (which is left open at the end).  If verbose = TRUE, then information about IMPORTS and INCLUDES is also written to the file.
+Main routines
+Generates the closure of the given DF file under the given filter.
+The first thing to do is to expand the included files, so we see the maximum number of DF files in the first pass.  This will cut off unnecessary processing of includes and imports in later stages.
+
+At this point we need to fill in the imports that are outstanding.  This takes place in two repeated phases:  the first one processes FutureImportsItem objects on the list into ImportsPair objects in the DF table.  The second phase turns ImportsPair objects into FileItem objects on the list.  We stop when there has been a pass without any changes.
+[key: Key, val: Val] RETURNS [quit: BOOL]
+There is an ImportsPair object to be processed.  We first capture the needed using list.  Then we move the needed using list to the doing using list to prevent excess processing.  Finally, we use ProcessInclude to handle whatever items pass the filter.
+There are some new imports to be handled.
+There are FutureImportsItem objects on the list that we have not yet processed.  Therefore, we scan the unprocessed section of the list for such items, and process them, which merges the various imports lists, and leaves ImportsPair items in the DF table for imported DF files that were NOT included in the first pass.
+Generate the ImportsPair items in the DF table, filling in the imports as necessary.
+... dumps the list to the named file.  If NOT verbose, then only file names will be dumped.  Otherwise, all items on the list will be printed in some form.
+Include processing
+
+Base of forked process to process an included DF file
+Whether or not there are other processes to help us, the current process can help make progress towards removing some of the queued imports processing.
+... removes an entry from the deferred includes list.  NIL will be returned if there are no more entries.  To avoid races between testing for no entries and insertion of new entries, if finish is TRUE, then the customary finish processing is performed when the returned value is NIL.
+... processes an include or imports item under the given filter.  For each item found in the given file under the filter, we take the following actions:
+DirectoryItem => set current directory (within this invocation of DoProcessInclude)
+FileItem => add file to the list
+ImportsItem => add the ImportsItem to the list (for more processing)
+IncludeItem => recursively process the inclusion
+[item: REF ANY] RETURNS [stop: BOOL _ FALSE]
+The version number is a hint, but we don't really want that hint stored.  In this case we can check for a previous inclusion of the file.
+Try to open the file for reading.  At the same time, we get the REAL full name for the file.
+Complain about the file not being there!
+
+Try for a previous inclusion of this file.
+For a full inclusion of this file, we enter the inclusion into the table to cut off further unnecessary inclusions and imports of this file.
+we will find this file under the initial name whenever we try for it
+
+Imports processing
+Base of forked process to process an imported DF file
+Whether or not there are other processes to help us, the current process can help make progress towards removing some of the queued imports processing.
+The imports processing may have added some new includes.  So we wait for it to have subsided.
+... removes an entry from the deferred includes list.  NIL will be returned if there are no more entries.  To avoid races between testing for no entries and insertion of new entries, if finish is TRUE, then the customary finish processing is performed when the returned value is NIL.
+Now we toss out whatever we can due to the filter given us.
+Now, merge the using lists.
+The version number is useless, so let's strip it off so we don't have further problems.
+In this case, the imported file has already been included.
+In this case, the imported file has been previously imported, so we just merge the using lists.
+The file must be checked for explicit version number.  Therefore, we first get the real name from the file system.  This includes following what the file is attached to.
+In this case, the imported file has already been included, so we do not need to further process it.  However, we do note that it has been already processed.
+In this case, the imported file has been previously imported, so we just merge the using lists.
+create the imports pair for table insertion
+Every DF file imported should be in the enumeration
+
+Utilities
+... waits for all forked processes to complete.  Aborts are not recognized.
+... waits for all forked processes to complete OR for an abort to be requested.
+... opens the given name with the given date, and returns an open stream (or NIL if the file could not be opened) and the real full name of the file.
+This is an entry procedure to keep from blundering into multiple merges of using lists.  The using list of impP.needed is modified to include the using list of imp (minus the current lists of impP.needed and impP.doing).  We assume that imp.list # NIL <=> imp.form = list.
+Cast out the entries from the USING lists of both the known need and the known doing imports items.  If we are left with no new items, then return.
+Merge the new and old lists.
+... transfers the using list from impP.needed to impP.doing.  We return a new ImportsItem if there is something to do.  NoteDoing is an entry procedure to keep from blundering into multiple merges of using lists.
+Do various quick kill tests to determine if there is something new to do.
+Nothing was happening for this import, so just move the needed list.
+Sigh, there are items in the doing using list.  We need to merge in the non-common items from the needed using list (provided that there are non-common items).
+Merge the new and old lists.  Remember that we have to keep the new list sorted.
+... checks the table for previous inclusion of the given name.  If msg, then put out a message if this file was included.
+This procedure vigorously throws away the file list and the DF table.  It helps in recovering storage, since it is likely that the conservative scan will hold onto some cell in the list, thereby causing numerous others to be held.
+.. puts out the given ropes to the command output stream.  This is an entry procedure to keep from confusing the STREAM abstraction, which is not protected against concurrent access.
+... puts out the given ropes to the MessageWindow.  This is an entry procedure to keep the message in the MessageWindow consistent.
+ù "ö  ñ(cedarcode) styleïNewlineDelimiter
+ô codeöúôKöú	œeú<ôHKô1Kô"Kô&óò öœk	ò	Köú
+ûúûúòKöúûú“ò„KöûúûúIòQKöúûú0òGKöú	ûúò"Köûúûúûúò"Köúûúò&Köúûú ûúò0Köúûúò.Köúûú4ò@Kò óóöœnúûúûò$KöûúûúòKöûúûúú
+ûú$òIKöûúòKöúûòKò óöú	ô	Kò Köúûú ò0Köúûú ò0Köúûú!ò2KöúûúòKöúûúò0Köú
+ûúò&Köúûúûúûú
+ò&öúûúò"Köúûúûúò0óKö	úûúûúûúûúòCKöúûúò,Köúûúò,KöûúûúûúûúûúûúòKöú	ûúò*KöûúûúûúòKö	ú
+ûúûúûúûúòKöûúûúûúûúòKöúûúò(Köúûúò(Kò öúûúûúòKöúûúœc%ò2Köúûú†,òEKöúûú†5òLKòKò óKöúûúûúûúò(Kö	úûúûúûúûúòAKò Köúûúûúûúò&Kö	úûúûúûúûúòKKò Köúûúûú
+òöú
+ûúû	úûúò#Köúûúûú†ò5Köú!ûú†,òRKöúûú†,òOKöúûúûú†&ò;Köúûú†ò7Köúûúûú†*òBKöúûú†8òPKöúûú†*òLKöúûú†,ò=Köú	ûú†ò'Köú
+ûú†ò.Köúûú†-òFKöúûú†1òKKöúûúûú†!ò?Köúûúûú†ò<Köú
+ûúûú†,òEKöúû	ú†+òFKöúû	ú†,òGKöúòóKò óKöûú	ôô öüúûú
+ûúûúûúûú$ò°Köú:ûúaûúëô∞öúûúòKöúµòµóöúòKöûúûúò%KöúòKò4KöúòóKöúòKòKòKò óöüúûúûú
+ûúûúûú"ûúûúûú$ò®KöúàôàöúûúòKöúmòmóöûúûúûúòKöûúûúò%KöúòKò4Köú+ò+KòóKöúòKòKòKò óóöúôKò öüúûúûúò6KöúBôBKöúûúûúòKöûúûúûú ûúò>Kò Köú≈ô≈öúòKòKöúûú#ûúûúò9Köúûúò
+KöúòóKöúòKô Köú›ô›öûòöú&ò&Köú)ô)KöúûúòöûúûúûòöúûúòKöú¸ô¸Köúûúò&KöúûúûúòKöúûúò#KöúòKöûúûú
+ûúûúûúûúòDöûú#ûúûúò/Köú)ô)KöúûúòöûúûòöúòKöú<ò<KöûúòKòóöú
+ò
+Köú<ò<óKöûúòóöûú	ûúûúûò*Köú6ò6óKòóKöúòóKöûúòóKöúòóKöúûúûúòKöú	ûúòKò öûúûúòKöúæôæKöú+ò+Köûúûúûúûúò7ö	ûúûúûúûúûò3öûúûúûòöúûúò Köú5ò5KòóKöûúòóKòKöûúòóKöúòKò"KòóKò KöúTôTKöú#ò#Kò*KöúòKöûúûúûúûúòKò KöûúòóKòKò óöü	úûúûúûúûúûúòRKöú*ûúnôõö	ú	ûúûúûúûúò>Köûúûúûúò"KöûúòKöûúòKöú$ò$Kòóö	úûúûúûúûúò=Köúûúò"Köúûúòöûúò	KöûúûúHòPKöûúûúò%óKöúòöûú
+ûòKöúûúûúòDKöúûúûúò=KöûúòKöûúòóöûúûúûòöûúûúûúûò#Köûúûúûúò$Köûúûúûúò0KöûúòKöûúòóóKöûúòKòóKöú(ò(öûúûúûòKöûúûúûúòKöúòöûúûúûòöúûúòKöûúòKöú/ò/KòóKöûúòóöûú	ûòöûúûúûòKöúûúòöúûúòKöúòKöúòóöúûúò KöúûúòKòóöúûúòKöûú ò"KöúòKòóöûúò
+KöûúòóóóKòKöûúòóKöûúòKòóKò óöúôKô öüúûúûúûúûúûúò[Köûúûúûúò-Köúûúò.KöúòöûúûòKöûúòKöûúòóKòöûú2ûúò:Kò Köúûúò/öûúûò%KöúòKöûúòKöûúòóKòóKòKò óöüúûúò+öûúòKöûúòKöûúûúûúò(KòóKöú5ô5KöúòöûòKöú&ûúò,KöûúûúûúûúòKöúMòMKöûúòóKöûúòKòKò óöüúûúò,öûòKöúóôóKöú&ò&KöûúûúûúûúòKöúMòMKöûúòóKöú ò KöúòKò óöü
+úûúûúûúûúûúûúòaKöú7ûúäûúOûúôõKöûúûúûúò-KöúòKòöûúûúûúòKöûú ûúûúûúò@KöúûúòKöûúòKòóKöûúûúò+KöúòKò óöüúûúûúûúòOöúòôòKöúSôSKöú ô KöúDôDKöú0ô0óKöú	ûúûúòKöú	ûúòKöúûúûúò*Köú
+ûúûúòKöúûúòKöú
+ûúûúòKöú	ûúûúòöú,ò,Köúûúûúûúûúûúô,KöúòöûúûúûòöúûúòKòKòóöúûúòöûúûúûòKò;óöûúûòöûúòKöúûúòKòKòóöûúòKöúEòEKòóóKòKöú
+ûúòöûú!ûúûú!ûúòSKöûúûúòóKòóöúûúòöûúûúûòKöûúûúò"Köúûúûúûúò7Köúûú.ò?KöûúòóKöúûúûú.òEKòKòóöúûúòKöú+ò+KòóKöûúòóKòóKöúûúûúòKöúûúòKòKòKöúûúûúòKöúûúûúòKò öûúûúûòKöúûúIûúòYKöúûú:òCKöûúûúòóöûúûúò KöúâôâKöúûúòKò5Köûú)ûúûúò7KòKò óKöú\ô\Kò=Kò öûúûúûúòKöú(ô(KòKöú(ò(öûúûúûòKöúKòKóKöûúòKòóKô Köú*ô*Köûú)ûúûúò7Kò öûúûúûòKöúûú)ò3Köúûú(ò1KöûúûúòKò óöûúûúûòöúòKöúåôåKòKò'öûúûòKöúDôDKò'óKöúòóKò.Köúûúò&KöûúòóKöúòKò Kò5öú9ò9öúòKöú>ò>öûúûúûòKöúNòNóKöûúò	KöúòóóKöûúòKöú3ò3KòKò óóKô öúôKò öüúûúûúûúûúûúòeKöûúûúûúò-Köúûúò,KöúòöûúûòKöûúòKöûúòóKòöûú2ûúò:Kò Köúûúò.öûúûò%KöúòKöûúòKöûúòóKòóKòKò óöüúûúò*öûúòKöûúòKöûúûúûúò(KòóKöú5ô5KöúòöûòKöú$ûúò*KöûúûúûúûúòKöúKòKKöûúòóKöûúòKòKò óöüúûúò+öûòKöúóôóKöú$ò$KöûúûúûúûúòKöúKòKKöûúòóKöú]ô]KöúòKöúòKò óöü	úûúûúûúûúûúûúò_Köú7ûúäûúOûúôõKöûúûúûúò-KòKöúòöûúûúûúòKöûúûúûúûúò>KöúûúòKöûúòKòóKöûúûúò+KöúòKò óöüúûúûúûúòYKöú
+ûúòKöú
+ûúòKöú
+ûúòKöúûúò&KöúûúûúòKöúûúò/Köúòöüúûúûúò7Köú;ô;öûúûúûòKö	úûúûúûúûúòHöúûúòöûúûúòKöúûúò$KöúûúBòKKöûúûúûú@òRKö
+ûú
+ûúûúûúûúò3KöúûúòKòKòóKòóKöúûúûúûúò7KöûúòóKöúôKöú"ò"KòóKò Köûúûúûú%ûúòAöûúûúòKöúWôWKòLKòöûú!ûúûò0öúûúòKöú:ô:KöûúòKòóöúûúòKöú_ô_KöúòKöûúòKòóKöûúòóKòóKöú©ô©öúûúûú
+ûúûúûúûúò:Köú%ò%ò?Köûú*ò,óKöûúûúûúò+KòKòöûú!ûúûò0öúûúòKöúúôúKöûúòKòóöúûúòKöú_ô_KöúòKöûúòKòóKöûúòóöúòKöú+ô+Köúûúûúò2Köúûúûúò1Köú
+ûúò"öú	ûúòKöûú?òBóKöúûúòKòKò*Köú3ô3öûúûòöûúòKöúûúûú9ûúòYKöúûúûúòKöú(ò(KòóöûúòKöúCòCKòKòóóKöûúûú+ò>KòóöûúòKöúPòPKöúòóKòóKòKò óóKô öú	ô	Kò ö
+üúûúûú!ûúûú	ò^Köûúûúûúò-KöûúûúûúûúòMKòKò#Kò)KòKò óöüúûúûúò*Köûúûúûúò-Kò"Köû	úòKöúòKöúòKò óöüúûúûúò+Köûúûúûúò-KöúòKöúòKò óöüúûúûúò6Kò$Köû	úò KöúòKöúòKò óöüúûúûúò+Kò$KöúòKò óöü	úûúûúò(KòKöúòKò óöüúûúûúò0KöúKôKKöûúûúûúûúòKKöúòKò óöüúûúûúò7Köú/ûúôOKöûúûúûúò-öûúûò&KöúòKöûúòKöûúòóKöúòKò óöüúûúûúò%KöúûúòKò$Köû	úò KöûúûúûúûúòKKòKò óöüúûúûúûúûúûúûúûúòzKöúïôïKöú
+ûúûúòKöúûúò+Köúûúò+KöúûúûúòKöú	ûúòKöúòKòöûúòKöûú1ò5Köûú'ò+óöûòò4öúûúòöûúûòöúòKöú-ò-KòKöûú ûúûúò,KòóKöûúòóKöúDòDKöûúûúûúûúò&KöúòóóKöúûú!ò(KöûúòKöûúòóKöú.ûúò?Köú
+ûúò#Köûúûúûúò+Köûúûú-òPKöûúòKòKò óö
+üúûúûúûúûúò[Köú¯ûúôêKöûúûúûúò-Köúûúò&Köúûúò$Köú	ûú%ò1KöúòöûúûúûúòKöúìôìöûúûúûúòKòCóö	ûúûúûúûúûò*KòBóKö
+ûúûúûúûúûúò5Kòóöûú
+ûòKöú)ûúò.Köúûúûúò<ò	KöúûúòKöúûúò#öûúûúûòKöúûúòKöúûúò#öûúòKöúûú>òGöûúûúûúòKöúûúòKöúûúòöûúûúûòKöúòKòöûúòKöúôKöúûúûúò@KòKö
+ûúûúûúûúûúò9Kö
+ûúûúûúûúûúò=Köú/ò/KòóóKòóKòóóKòóKöûúûúòóKòKò óöü	úûúûúûúûúûúûúò_Köú‘ô‘Köûúûúûúò-Köúûúò&Köúûúò#Köúûúûú	ûúûúûúò6KòKöúûúò$Köúûúò"Köúûúûú	ûúûúûúò6ö
+üúûúûúûúûúò4Köúûúò"KòKòKòóKöúûúòKòKöúIôIöûúûòKöúûúòöúòöûúûòöúòKöúûúò#Köûú	òKöúòóöûúòKòKöûú
+ûúûúòKòóóKòóöú	ò	öûúûòöúòKöúûúò#Köûú	òKöúòóöúòKòKöûú
+ûúûú
+ò!Kòóöú	ò	Köûú
+ûúûúòKòóKöûúòóKòóKöûúòóöûú	òöûòKöúDôDKòóöûúòKöúüôüKöúûú>òGKöúûúûúûúûúûúò5KöûúûúûúòKöúPôPKòKöúûúò*KòKö
+ûúûúûúûúûúò8Kö
+ûúûúûúûúûúò=Köú0ò0KòóóKöûú
+òKòKò óöüúûúûúûúûúûúòOöûúûúûúòKöúûúòKöúûúòKòKö
+ûúûúûúûúûúò4KòóKòKò óö
+ü
+úûúûúûú
+ûúò7KòöûúûúûòKöúûúòKöúûú#ò+Köúûú%ò/KöûúòóKöúòKò óöüúûúûúûúûúûúûúò]Köúyôyöûú#ûúûò2öúûúòKöûúûú#ò.KöûúûúòKöúòóKöûúûúûúòóKòKò óöüúûúò%KöúûúòKöú#ò#KöúòKöúòKòKò óöüúûúûúò,KöúÊôÊKöûúûúûúòKöúûúòöûúûúûòKöúûúòKöúûúòKòKöûúòóKöúûúòKöúûúòKöúûúòKöú(ò(KòKò óöüúûúûúûúò:Köú∂ô∂Köûúûúûúò-Köûúûúûúûúûúûúò7Kò+KòKò óöüúûúûúûúò8KöúÉôÉKöûúûúûúò-Köûúûúûúûúûúûúò7KòKòKò óöü
+úûúûúò)KöûúûúûúòKöúòKòKò óöüúûúûúò4öûúûúòKöúûúòKöû	úò Köû	úòKòóöûúûúòKöû	úò Köû	úòKöûúûúûúûúòKòóKöúòKòKò óö
+üúûúûúûúûúò;KöúûúòKòöûú	ûòKöúûú	òöûúûò"KòKòKöúûúòKöûúòóKòKöûúòóKòKò óóKöûúòKò ó Öó    \z  ú"  

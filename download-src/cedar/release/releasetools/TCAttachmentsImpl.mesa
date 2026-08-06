@@ -1,0 +1,850 @@
+
+
+DIRECTORY
+Basics USING [Comparison, PartialComparison, UnsafeBlock],
+BasicTime USING [GMT, Now, nullGMT],
+CedarProcess USING [DoWithPriority, Priority],
+Commander USING [CommandProc, Handle, Register],
+CommanderOps USING [Failed, NextArgument],
+DFUtilities USING [DirectoryItem, FileItem, Filter, IncludeItem, ParseFromStream, ProcessItemProc, UsingList],
+FileNames,
+IO,
+PFS,
+PFSNames,
+PFSPrefixMap,
+Process USING [CheckForAbort, GetPriority, Pause, Priority, SecondsToTicks],
+RedBlackTree USING [Compare, Create, Delete, DestroyTable, EachNode, EnumerateIncreasing, GetKey, Insert, Lookup, Table],
+Rope;
+
+TCAttachmentsImpl: CEDAR MONITOR
+IMPORTS BasicTime, CedarProcess, Commander, CommanderOps, DFUtilities, FileNames, IO, PFS, PFSNames, PFSPrefixMap, Process, RedBlackTree, Rope
+
+= BEGIN
+GMT: TYPE = BasicTime.GMT;
+ROPE: TYPE = Rope.ROPE;
+STREAM: TYPE = IO.STREAM;
+PATH: TYPE = PFS.PATH;
+
+Switches: TYPE = PACKED ARRAY CHAR['a..'z] OF BOOL;
+TCType: TYPE = { fullDirectory, oneDF, allDFs, individualDFs };
+
+TCInfoList: TYPE = LIST OF TCInfo;
+TCInfo: TYPE = REF TCInfoRec;
+TCInfoRec: TYPE = RECORD[
+prefix, fromTranslation, toTranslation: ROPE,
+fromTranslationPath: PATH,
+otherArg: ROPE,	-- for oneDF and allDFs
+prefixPath: PATH, 
+fromPTable, toPTable: PFSPrefixMap.PrefixTableList,
+switches: Switches, 	-- switches in effect at argument capture time
+useCopy: BOOL ¬ TRUE,	-- rather than retrieve
+tcType: TCType ¬ fullDirectory
+];
+
+FileEntry: TYPE = REF FileEntryRep;
+FileEntryRep: TYPE = RECORD [
+fullSrcName: ROPE,
+fullSrcNamePath: PATH,
+uid: PFS.UniqueID,
+len: INT,
+state: FileEntryState
+];
+FileEntryState: TYPE = {init, fetching, storing, moved};
+dirDoc: ROPE = " srcDir dstDir
+  moves files from srcDir to dstDir
+  -a fileName: append output messages to fileName
+  -b: bestEfforts (ignore unknown prefixes)
+  -d: debug (inhibits file transfer)
+  -o fileName: output messages to new fileName
+  -r: retrieve rather than copy
+  -v: verify (no transfers, messages only for missing files)
+  -x: debugging output
+";
+allDfsDoc: ROPE = "prefixMapEntry fromTranslation toTranslation {subdirForDfs}
+  moves files from srcDir to dstDir
+  -a fileName: append output messages to fileName
+  -b: bestEfforts (ignore unknown prefixes)
+  -d: debug (inhibits file transfer)
+  -m: move dfs even if errors
+  -o fileName: output messages to new fileName
+  -r: retrieve rather than copy
+  -v: verify (no transfers, messages only for missing files)
+  -x: debugging output
+";
+oneDfDoc: ROPE = "prefixMapEntry fromTranslation toTranslation subDirAndDfName
+  moves files from srcDir to dstDir
+  -a fileName: append output messages to fileName
+  -b: bestEfforts (ignore unknown prefixes)
+  -d: debug (inhibits file transfer)
+  -l: localDF (assumes df name is local or full ({not prefixMapEntry relative})
+  -m: move dfs even if errors
+  -o fileName: output messages to new fileName
+  -r: retrieve rather than copy
+  -v: verify (no transfers, messages only for missing files)
+  -x: debugging output
+";
+courierMaxRetries: NAT ¬ 150;
+courierRetrySeconds: NAT ¬ 5*60;
+maxRetries: NAT ¬ 10;
+retrySeconds: NAT ¬ 20;
+repeatSeconds: NAT ¬ 1800;
+secondsBetweenMoves: NAT ¬ 0;
+
+maxPauseTime: NAT = 1800;
+
+tempDFPath: PATH ~ PFS.PathFromRope["/tmp/TrickleChargeTemp.df"];
+bangH: ROPE ~ "!H";
+DoIt: PROC [tcInfo: TCInfo, table: RedBlackTree.Table, out: STREAM] = {
+bestEfforts: BOOL ¬ tcInfo.switches['b];
+doFlush: BOOL ¬ tcInfo.switches['a] OR tcInfo.switches['o];
+debug: BOOL ¬ tcInfo.switches['d];
+verify: BOOL ¬ tcInfo.switches['v];
+localDF: BOOL ¬ tcInfo.switches['l];
+outputForDebugging: BOOL ¬ tcInfo.switches['x];
+useRetrieve: BOOL ¬ tcInfo.switches['r];
+moveDfsEvenIfErrors: BOOL ¬ tcInfo.switches['m];
+enumerateForDfFiles: BOOL ¬ tcInfo.tcType = allDFs;
+dfList: LIST OF FileEntry ¬ NIL;
+errorsEncountered: BOOL ¬ FALSE;
+processingImports: BOOL ¬ tcInfo.switches['e];
+filter: DFUtilities.Filter ¬ [FALSE, all, all, IF ( processingImports ) THEN all ELSE defining];
+EachEntry: RedBlackTree.EachNode = {
+WITH data SELECT FROM
+entry: FileEntry => {
+IF entry.state # moved THEN {
+ext: ROPE ¬ FindExt[entry.fullSrcName];
+IF Rope.Equal[ext, "df", FALSE] THEN dfList ¬ CONS[entry, dfList]
+ELSE MoveFile[entry];
+};
+RETURN;
+};
+ENDCASE => ERROR;
+};
+
+MoveFile: PROC [entry: FileEntry] = {
+isOnDst: BOOL ¬ FALSE;
+dstBytes: INT ¬ 0;
+dstUID: PFS.UniqueID ¬ PFS.nullUniqueID;
+fullDstPath: PATH ¬ PFSPrefixMap.Translate[entry.fullSrcNamePath, tcInfo.toPTable];
+Process.CheckForAbort[];
+[uniqueID: dstUID, bytes: dstBytes] ¬ PFS.FileInfo[fullDstPath
+! PFS.Error => CONTINUE
+];
+IF EqualUIDs[dstUID, entry.uid] AND dstBytes = entry.len THEN {
+isOnDst ¬ TRUE;
+filesAlreadyThere ¬ CheckCount[filesAlreadyThere, out, doFlush];
+};
+SELECT TRUE FROM
+debug => {
+ShowEntry[out, entry];
+IF isOnDst THEN out.PutRope["    (already on destination)\n"];
+out.PutF1["~~fullDstPath: %g\n", [rope[PFS.RopeFromPath[fullDstPath]]] ];
+};
+isOnDst => {
+entry.state ¬ moved;
+};
+verify => {
+ShowEntry[out, entry];
+out.PutRope["    (NOT on destination)\n"];
+};
+ENDCASE => {
+dstName: ROPE = PFS.RopeFromPath[fullDstPath];
+retriedCount: INT ¬ 0;
+Yes: PFS.NameConfirmProc ~ { RETURN[TRUE] };
+DO
+ENABLE PFS.Error => {
+sleepSec: NAT ¬ 0;
+out.PutF["PFS.Error when storing %g\n  %g\n",
+[rope[dstName]], [rope[error.explanation]] ];
+IF doFlush THEN out.Flush[];
+SELECT error.code FROM
+$connectionRejected => sleepSec ¬ retrySeconds;
+$CrRPC => sleepSec ¬ courierRetrySeconds;
+$quotaExceeded, $volumeFull => REJECT;
+ENDCASE;
+SELECT error.code FROM
+$connectionRejected =>
+IF retriedCount < maxRetries THEN {
+retriedCount ¬ retriedCount + 1;
+Process.Pause[Process.SecondsToTicks[retrySeconds]];
+LOOP;
+};
+$CrRPC =>
+IF retriedCount < courierMaxRetries THEN {
+retriedCount ¬ retriedCount + 1;
+Process.Pause[Process.SecondsToTicks[courierRetrySeconds]];
+LOOP;
+};
+$connectionTimedOut =>
+IF retriedCount < maxRetries THEN {
+retriedCount ¬ retriedCount + 1;
+LOOP;
+};
+ENDCASE;
+GO TO failed;
+};
+
+IF NOT useRetrieve THEN {
+[] ¬ PFS.Attach[attachedFile: entry.fullSrcNamePath, attachment: fullDstPath, wantedUniqueID: entry.uid, remoteCheck: TRUE];
+EXIT
+};
+ENDLOOP;
+entry.state ¬ moved;
+filesMoved ¬ filesMoved + 1;
+out.PutF["Attached %g\n   to %g\n", [rope[PFS.RopeFromPath[fullDstPath]]], [rope[PFS.RopeFromPath[entry.fullSrcNamePath]]] ];
+IF doFlush THEN out.Flush[];
+IF secondsBetweenMoves # 0 THEN
+Process.Pause[Process.SecondsToTicks[secondsBetweenMoves]];
+EXITS failed => { errorsEncountered ¬ TRUE };
+};
+};
+
+VisitEntry: PROC [name: PATH, uid: PFS.UniqueID] = {
+new: FileEntry ¬ NIL;
+bytes: INT ¬ 0;
+isa: BOOL;
+suffix: PATH ¬ NIL;
+ropeName: ROPE ¬ PFS.RopeFromPath[name];
+xFromName, fileInfoName: PATH;
+Process.CheckForAbort[];
+WITH RedBlackTree.Lookup[table, ropeName] SELECT FROM
+entry: FileEntry => IF EqualUIDs[entry.uid, uid] THEN RETURN;
+ENDCASE;
+[isa, suffix] ¬ PFSNames.IsAPrefix[tcInfo.prefixPath, name];
+IF NOT isa OR Rope.Match["fs.13.*", PFSNames.ComponentRope[PFSNames.ShortName[name]] ] THEN {
+IF reportIgnoring THEN out.PutF1["\t**Ignoring the file %g\n", [rope[ropeName]] ];
+RETURN;
+};
+xFromName ¬ PFSPrefixMap.Translate[name, tcInfo.fromPTable];
+
+[fullFName: fileInfoName, uniqueID: uid, bytes: bytes] ¬ PFS.FileInfo[name: xFromName, wantedUniqueID: uid ! 
+PFS.Error => IF ( error.code = $unknownFile ) OR ( error.code = $unknownUniqueID ) OR ( error.code = $unknownCreatedTime ) OR ( error.code = $unknownServer AND bestEfforts ) THEN {
+out.PutF["\n*PFS.Error[%g]\n\tasking for %g(%g)\n", [rope[error.explanation]], [rope[PFS.RopeFromPath[xFromName]]], IF uid.egmt.gmt = BasicTime.nullGMT THEN [rope["nullGMT"]] ELSE [time[uid.egmt.gmt]] ];
+IF doFlush THEN out.Flush[];
+fileInfoName ¬ NIL;
+CONTINUE;
+}
+ELSE REJECT];
+IF fileInfoName = NIL THEN RETURN;
+WITH RedBlackTree.Lookup[table, ropeName] SELECT FROM
+entry: FileEntry => {
+IF EqualUIDs[entry.uid, uid] THEN RETURN;
+[] ¬ RedBlackTree.Delete[table, ropeName];
+};
+ENDCASE;
+new ¬ NEW[FileEntryRep ¬ [
+fullSrcName: ropeName,
+fullSrcNamePath: fileInfoName,
+uid: uid,
+len: bytes,
+state: init]];
+RedBlackTree.Insert[table, new, ropeName];
+filesSeenDuringEnumeration ¬ CheckCount[filesSeenDuringEnumeration, out, doFlush];
+bytesSeenDuringEnumeration ¬ bytesSeenDuringEnumeration + bytes;
+};
+
+VisitClosure: PROC [tcInfo: TCInfo, dfName: PATH, uid: PFS.UniqueID,
+visitor: PROC [name: PATH, uid: PFS.UniqueID],
+usingList: REF DFUtilities.UsingList ¬ NIL] = {
+ENABLE PFS.Error => IF ( error.code = $unknownServer ) OR
+( error.code = $unknownFile ) THEN {
+out.PutF["\n****PFS.Error[%g], in dfFile: %g\n", [rope[error.explanation]], [rope[PFS.RopeFromPath[dfName]]] ];
+IF doFlush THEN out.Flush[];
+};
+
+EachItem: DFUtilities.ProcessItemProc = {
+WITH item SELECT FROM
+dir: REF DFUtilities.DirectoryItem => prefix ¬ PFS.PathFromRope[dir.path1];
+file: REF DFUtilities.FileItem => {
+name: PATH = PFSNames.ExpandName[PFS.PathFromRope[file.name], prefix];
+visitor[name, UIDFromGMT[file.date.gmt]];
+};
+incl: REF DFUtilities.IncludeItem => {
+thisUID: PFS.UniqueID = UIDFromGMT[incl.date.gmt];
+path1: PATH ¬ PFS.PathFromRope[incl.path1];
+visitor[path1, thisUID];
+VisitClosure[tcInfo, path1, thisUID, visitor];
+};
+ENDCASE => { i: INT ¬ 0; }; -- handy for setting breakpoints - (bj)
+};
+
+prefix: PATH ¬ NIL;
+in: STREAM;
+fileNamePath: PATH ¬ PFSPrefixMap.Translate[dfName, tcInfo.fromPTable];
+in ¬ PFS.StreamOpen[
+fileName: fileNamePath,
+wantedUniqueID: uid
+! PFS.Error => IF error.code = $unknownFile THEN {
+out.PutF["PFS.Error[%g] - from dfFile %g\n", [rope[error.explanation]],
+[rope[PFS.RopeFromPath[dfName]]] ];
+IF doFlush THEN out.Flush[];
+in ¬ NIL;
+CONTINUE;
+}
+ELSE REJECT
+];
+IF in#NIL THEN {
+filter.list ¬ usingList;
+DFUtilities.ParseFromStream[in, EachItem, filter -- global variable, hack for now! - (bj)
+! UNWIND => in.Close[]];
+in.Close[]
+};
+};
+
+
+filesMoved: INT ¬ 0;
+filesInCache: INT ¬ 0;
+filesAlreadyThere: INT ¬ 0;
+
+filesSeenDuringEnumeration: INT ¬ 0;
+bytesSeenDuringEnumeration: INT ¬ 0;
+
+RedBlackTree.DestroyTable[table];	-- clear the table from the last run
+
+IF tcInfo.otherArg # NIL THEN
+out.PutF["\n\tMoving files (%g) from %g to %g\n", [rope[tcInfo.otherArg]], [rope[tcInfo.fromTranslation]], [rope[tcInfo.toTranslation]] ]
+ELSE out.PutF["\n\tMoving files from %g to %g\n", [rope[tcInfo.fromTranslation]], [rope[tcInfo.toTranslation]] ];
+
+
+out.PutF1["\n***** Building file table at %g\n", [time[BasicTime.Now[]]] ];
+IF doFlush THEN out.Flush[];
+SELECT tcInfo.tcType FROM
+oneDF =>  {
+IF localDF THEN VisitClosure[tcInfo, PFS.PathFromRope[tcInfo.otherArg.Concat[bangH]], PFS.nullUniqueID, VisitEntry]
+ELSE VisitClosure[tcInfo, PFS.PathFromRope[tcInfo.prefix.Cat[tcInfo.otherArg, bangH]], PFS.nullUniqueID, VisitEntry];
+};
+allDFs => {	
+EachDfFile: PFS.InfoProc = {
+dstUID: PFS.UniqueID ¬ PFS.nullUniqueID;
+doTheEnumerate: BOOL ¬ FALSE;
+isa: BOOL;
+suffix: PATH;
+Process.CheckForAbort[];
+IF outputForDebugging THEN
+out.PutF1["~~%g\n", [rope[PFS.RopeFromPath[fullFName]]] ];
+[isa, suffix] ¬ PFSNames.IsAPrefix[tcInfo.fromTranslationPath, fullFName];
+IF NOT isa THEN {
+out.PutF["\t*** %g is not a prefix of %g => ignoring\n",
+[rope[tcInfo.fromTranslation]], [rope[PFS.RopeFromPath[fullFName]]] ];
+IF doFlush THEN out.Flush[];
+RETURN;
+};
+[uniqueID: dstUID] ¬ PFS.FileInfo[PFSPrefixMap.Translate[fullFName, tcInfo.toPTable]
+! PFS.Error => IF error.group=user THEN
+{ doTheEnumerate ¬ TRUE; CONTINUE }];
+IF NOT EqualUIDs[dstUID, uniqueID] THEN doTheEnumerate ¬ TRUE;
+IF doTheEnumerate THEN VisitClosure[tcInfo: tcInfo, dfName: fullFName, uid: PFS.nullUniqueID, visitor: VisitEntry];
+};
+who: ROPE ~ tcInfo.prefix.Concat["/Top/*.df!H"];
+IF outputForDebugging THEN out.PutF1["$$doing %g\n", [rope[who]] ];
+PFS.EnumerateForInfo[PFSPrefixMap.Translate[PFS.PathFromRope[who], tcInfo.fromPTable], EachDfFile];
+};
+fullDirectory => {		-- Trickling a whole directory.
+bangH: PATH ~ PFS.PathFromRope["*!h"];
+depth: INT ¬ 1;
+EachFile: PFS.InfoProc = {
+isa: BOOL;
+suffix: PATH;
+ropeName: ROPE;
+Process.CheckForAbort[];
+IF fileType=PFS.tDirectory THEN {
+newPath: PATH;
+short: ROPE ¬ PFSNames.ComponentRope[PFSNames.ShortName[fullFName]];
+IF short.Equal["."] OR short.Equal[".."] THEN RETURN; 
+newPath ¬ PFSNames.Cat[fullFName, bangH];
+PFS.EnumerateForInfo[newPath, EachFile];
+RETURN;
+};
+[isa, suffix] ¬ PFSNames.IsAPrefix[tcInfo.prefixPath, fullFName];
+IF isa THEN {
+new: FileEntry ¬ NIL;
+ropeName ¬ PFS.RopeFromPath[fullFName];
+WITH RedBlackTree.Lookup[table, ropeName] SELECT FROM
+entry: FileEntry => {
+IF EqualUIDs[entry.uid, uniqueID] THEN RETURN;
+[] ¬ RedBlackTree.Delete[table, ropeName];
+};
+ENDCASE;
+new ¬ NEW[FileEntryRep ¬ [
+fullSrcName: ropeName,
+fullSrcNamePath: PFSPrefixMap.Translate[fullFName, tcInfo.fromPTable],
+uid: uniqueID,
+len: bytes,
+state: init]];
+RedBlackTree.Insert[table, new, ropeName];
+filesSeenDuringEnumeration ¬ CheckCount[filesSeenDuringEnumeration, out, doFlush];
+bytesSeenDuringEnumeration ¬ bytesSeenDuringEnumeration + bytes;
+};
+};
+PFS.EnumerateForInfo[PFS.PathFromRope[tcInfo.fromTranslation.Concat["*!h"]], EachFile];
+};
+ENDCASE => {
+out.PutRope["***unknown case - exiting\n"];
+RETURN;
+};
+
+out.PutF["\nEnumerated new files: %g, bytes: %g\n",
+[integer[filesSeenDuringEnumeration]], [integer[bytesSeenDuringEnumeration]] ];
+
+out.PutF1["\n***** Moving files at %g\n", [time[BasicTime.Now[]]] ];
+IF doFlush THEN out.Flush[];
+RedBlackTree.EnumerateIncreasing[table, EachEntry];
+
+IF errorsEncountered AND NOT moveDfsEvenIfErrors THEN
+out.PutRope["There were errors so no df's will be moved\n"]
+ELSE {
+IF dfList # NIL THEN {
+IF errorsEncountered AND moveDfsEvenIfErrors THEN
+out.PutRope["\n***There were errors; df's will be moved anyway\n"];
+out.PutRope["\n Starting to move df's\n"];
+FOR entryList: LIST OF FileEntry ¬ dfList, entryList.rest WHILE entryList # NIL DO
+MoveFile[entryList.first];
+ENDLOOP;
+};
+};
+out.PutF1["\n{Done at %g}\n", [time[BasicTime.Now[]]] ];
+out.PutF["\tFiles moved: %g, alreadyRemote: %g\n\n",
+[integer[filesMoved]], [integer[filesAlreadyThere]] ];
+IF doFlush THEN out.Flush[];
+};
+
+EqualUIDs: PROC[uid1, uid2: PFS.UniqueID] RETURNS[BOOL] = {
+RETURN[ ( uid1.egmt.gmt = uid2.egmt.gmt ) ];	-- all for now
+};
+
+UIDFromGMT: PROC [gmt: BasicTime.GMT] RETURNS [PFS.UniqueID] ~ INLINE {
+RETURN [[egmt: [gmt: gmt, usecs: 0]]]
+};
+
+CheckCount: PROC[num: INT, out: STREAM, doFlush: BOOL] RETURNS[res: INT] = {
+IF ( res ¬ num + 1 ) MOD 10 = 0 THEN IF res MOD 100 = 0 THEN {
+out.PutF1["(%g) ", [integer[res]] ];
+IF doFlush THEN out.Flush[];
+}
+ELSE out.PutChar['.];
+};
+
+FindExt: PROC[name: ROPE] RETURNS[ext: ROPE] = {
+short: ROPE ¬ FileNames.GetShortName[name, TRUE];
+pos: INT ¬ Rope.FindBackward[short, "."];
+IF pos = -1 THEN RETURN[short];
+RETURN[Rope.Substr[short, pos+1]];
+};
+
+ShowTable: PROC [out: STREAM, table: RedBlackTree.Table] = {
+EachEntry: RedBlackTree.EachNode = {
+WITH data SELECT FROM
+entry: FileEntry => ShowEntry[out, entry];
+ENDCASE => ERROR;
+};
+RedBlackTree.EnumerateIncreasing[table, EachEntry];
+};
+
+ShowEntry: PROC [out: STREAM, entry: FileEntry] = {
+IO.PutF[out, "[name: %g, date: %g, len: %g, state: ",
+[rope[PFS.RopeFromPath[entry.fullSrcNamePath]]], [time[entry.uid.egmt.gmt]], [integer[entry.len]] ];
+SELECT entry.state FROM
+init => out.PutRope["init]\n"];
+fetching => out.PutRope["fetching]\n"];
+storing => out.PutRope["storing]\n"];
+moved => out.PutRope["moved]\n"];
+ENDCASE;
+};
+
+GetKey: RedBlackTree.GetKey = {
+RETURN [data];
+};
+
+Compare: RedBlackTree.Compare = {
+key: ROPE ¬ NIL;
+WITH k SELECT FROM
+ent: FileEntry => key ¬ ent.fullSrcName;
+rope: ROPE => key ¬ rope;
+ENDCASE => ERROR;
+WITH data SELECT FROM
+ent: FileEntry => RETURN [Rope.Compare[key, ent.fullSrcName, FALSE]];
+ENDCASE;
+ERROR;
+};
+
+ConvertPCom: PROC[pCom: Basics.PartialComparison] RETURNS[Basics.Comparison] = {
+SELECT pCom FROM
+incomparable, less => RETURN[less];
+equal => RETURN[equal];
+greater => RETURN[greater];
+ENDCASE => RETURN[less];
+};
+
+AllDfsCmdProc: Commander.CommandProc = { [result, msg] ¬ Common[allDFs, cmd] };
+
+OneDfCmdProc: Commander.CommandProc = { [result, msg] ¬ Common[oneDF, cmd] };
+
+IndDfCmdProc: Commander.CommandProc = { [result, msg] ¬ Common[individualDFs, cmd] };
+
+DirCmdProc: Commander.CommandProc = { [result, msg] ¬ Common[fullDirectory, cmd] };
+
+Common: PROC[tcType: TCType, cmd: Commander.Handle, useRetrieve: BOOL ¬ FALSE]
+RETURNS[result: REF, msg: ROPE] = {
+ProcessSwitches: PROC [arg: ROPE] RETURNS[Switches]= {
+sense: BOOL ¬ TRUE;
+switches: Switches ¬ ALL[FALSE];
+FOR index: INT IN [0..Rope.Length[arg]) DO
+char: CHAR ¬ Rope.Fetch[arg, index];
+SELECT char FROM
+'- => LOOP;
+'~ => {sense ¬ NOT sense; LOOP};
+'a, 'A => { outFileName ¬ CommanderOps.NextArgument[cmd]; switches[char] ¬ sense };
+'o, 'O => { outFileName ¬ CommanderOps.NextArgument[cmd]; switches[char] ¬ sense };
+IN ['a..'z] => switches[char] ¬ sense;
+IN ['A..'Z] => switches[char + ('a-'A)] ¬ sense;
+ENDCASE;
+sense ¬ TRUE;
+ENDLOOP;
+RETURN[switches];
+};
+out: STREAM ¬ cmd.out;
+outFileName: ROPE;
+oldPriority: Process.Priority ¬ Process.GetPriority[];
+table: RedBlackTree.Table ¬ RedBlackTree.Create[getKey: GetKey, compare: Compare];
+
+this: TCInfo ¬ NEW[TCInfoRec];
+this.tcType ¬ tcType;
+
+DO
+arg: ROPE ¬ CommanderOps.NextArgument[cmd ! CommanderOps.Failed => { msg ¬ errorMsg; GO TO failed } ];
+ch: CHAR;
+Process.CheckForAbort[];
+IF arg = NIL THEN EXIT;
+ch ¬ Rope.Fetch[arg, 0];
+SELECT TRUE FROM
+( ch = '- ) AND ( arg.Length[] = 2 ) =>	-- switch
+this.switches ¬ ProcessSwitches[arg];
+( ch = '{ ) => LOOP;	-- ignore
+( ch = '} ) => LOOP;	-- ignore
+( ch = '$ ) => LOOP;	-- ignore
+ENDCASE => {	-- translations or other things
+IF this.prefix = NIL THEN {
+this.prefix ¬ arg;
+this.prefixPath ¬ PFS.PathFromRope[this.prefix];
+LOOP;
+};
+IF this.fromTranslation = NIL THEN {
+this.fromTranslation ¬ arg;
+this.fromTranslationPath ¬ PFS.PathFromRope[arg];
+LOOP;
+};
+IF this.toTranslation = NIL THEN {
+this.toTranslation ¬ arg;
+LOOP;
+};
+SELECT TRUE FROM
+( this.otherArg # NIL) => {
+msg ¬ IO.PutFR1["Extra argument (%g)", [rope[arg]] ];
+GO TO failed;
+};
+ENDCASE => this.otherArg ¬ arg;
+};
+ENDLOOP;
+
+IF ( this.prefix = NIL ) OR ( this.fromTranslation = NIL ) OR ( this.toTranslation = NIL ) THEN
+{ msg ¬ "Not enough arguments given.\n"; GOTO failed };
+IF useRetrieve THEN this.switches['r] ¬ TRUE;
+IF outFileName # NIL THEN {
+outPath: PFS.PATH ~ PFS.PathFromRope[outFileName];
+outStream: STREAM;
+appending: BOOL ~ this.switches['a];
+outStream ¬ PFS.StreamOpen[outPath, IF appending THEN $append ELSE $create ! PFS.Error => {
+out.PutRope[error.explanation]; CONTINUE} ];
+IF outStream # NIL THEN {
+out.PutF["Messages will be %g %g\n",
+[rope[IF appending THEN "appended to" ELSE "written on"]],
+[rope[outFileName]] ];
+out ¬ outStream;
+};
+};
+
+{
+Action: PROC = {
+this.fromPTable ¬ PFSPrefixMap.InsertIntoNewPTable[
+PFS.PathFromRope[this.prefix],
+PFS.PathFromRope[this.fromTranslation] ];
+this.toPTable ¬ PFSPrefixMap.InsertIntoNewPTable[
+PFS.PathFromRope[this.prefix],
+PFS.PathFromRope[this.toTranslation] ];
+this.toPTable ¬ PFSPrefixMap.Insert[
+PFS.PathFromRope[this.fromTranslation],
+PFS.PathFromRope[this.toTranslation],
+this.toPTable ];
+IF this.tcType = individualDFs THEN IndividualDFs[this, table, out]
+ELSE DoIt[this, table, out 
+! PFS.Error => {
+out.PutF["PFS.Error[%g], stopping this round.\n\t\t(at %g)\n\n", [rope[error.explanation]], [time[BasicTime.Now[]]] ];
+IF outFileName # NIL THEN out.Flush[];
+CONTINUE;
+};
+];
+IF outFileName # NIL THEN out.Close[];
+};
+CedarProcess.DoWithPriority[background, Action];
+};
+
+EXITS
+failed => {result ¬ $Failure};
+};
+
+IndividualDFs: PROC[tcInfo: TCInfo, table: RedBlackTree.Table, out: STREAM] = {
+doFlush: BOOL ¬ tcInfo.switches['a] OR tcInfo.switches['o];
+dfList: LIST OF ROPE ¬ NIL;
+filter: DFUtilities.Filter ¬ [FALSE, all, all, defining];
+
+VisitClosure1: PROC [tcInfo: TCInfo, dfName: PATH, uid: PFS.UniqueID,
+visitor: PROC [name: PATH, uid: PFS.UniqueID],
+usingList: REF DFUtilities.UsingList ¬ NIL] = {
+ENABLE PFS.Error => IF ( error.code = $unknownServer ) OR
+( error.code = $unknownFile ) THEN {
+out.PutF["\n****PFS.Error[%g], in dfFile: %g\n", [rope[error.explanation]], [rope[PFS.RopeFromPath[dfName]]] ];
+IF doFlush THEN out.Flush[];
+};
+
+EachItem1: DFUtilities.ProcessItemProc = {
+WITH item SELECT FROM
+dir: REF DFUtilities.DirectoryItem => prefix ¬ PFS.PathFromRope[dir.path1];
+file: REF DFUtilities.FileItem => {
+out.PutF1["\n*** fileName found in IndividualDF driver file (%g)", [rope[file.name]]];
+out.PutRope["\n\tit will be ignored\n"];
+};
+incl: REF DFUtilities.IncludeItem =>
+dfList ¬ CONS[incl.path1, dfList];
+ENDCASE => { i: INT ¬ 0; }; -- handy for setting breakpoints - (bj)
+};
+
+prefix: PATH ¬ NIL;
+in: STREAM;
+fileNamePath: PATH ¬ PFSPrefixMap.Translate[dfName, tcInfo.fromPTable];
+in ¬ PFS.StreamOpen[
+fileName: fileNamePath,
+wantedUniqueID: uid
+! PFS.Error => IF error.code = $unknownFile THEN {
+out.PutF["PFS.Error[%g] - from dfFile %g\n", [rope[error.explanation]],
+[rope[PFS.RopeFromPath[dfName]]] ];
+IF doFlush THEN out.Flush[];
+in ¬ NIL;
+CONTINUE;
+}
+ELSE REJECT
+];
+IF in#NIL THEN {
+filter.list ¬ usingList;
+DFUtilities.ParseFromStream[in, EachItem1, filter -- global variable, hack for now! - (bj)
+! UNWIND => in.Close[]];
+in.Close[]
+};
+};
+
+IF tcInfo.switches['l] THEN VisitClosure1[tcInfo, PFS.PathFromRope[tcInfo.otherArg.Concat[bangH]], PFS.nullUniqueID, NIL]
+ELSE VisitClosure1[tcInfo, PFS.PathFromRope[tcInfo.prefix.Cat[tcInfo.otherArg, bangH]], PFS.nullUniqueID, NIL];
+
+tcInfo.tcType ¬ oneDF;	-- doing one df
+tcInfo.switches['l] ¬ TRUE;	-- make it look like a local df (this is a full name
+FOR rL: LIST OF ROPE ¬ dfList, rL.rest UNTIL rL = NIL DO
+tcInfo.otherArg ¬ rL.first;
+DoIt[tcInfo, table, out
+! PFS.Error => {
+out.PutF["PFS.Error[%g]; problems with %g.\n\t\t(at %g)\n\n", [rope[error.explanation]], [rope[rL.first]], [time[BasicTime.Now[]]] ];
+IF doFlush THEN out.Flush[];
+CONTINUE;
+};
+];
+ENDLOOP;
+};
+
+Path: PROC[pt: PFS.PATH] RETURNS[rp: ROPE] ~ { RETURN[PFS.RopeFromPath[pt] ] };
+
+Translate: PROC[name: PATH, pTable: PFSPrefixMap.PrefixTableList] RETURNS [rp: ROPE] =
+{ RETURN[PFS.RopeFromPath[PFSPrefixMap.Translate[name, pTable]]] };
+
+reportIgnoring: BOOL ¬ FALSE;
+
+ATReportIgnores: ENTRY Commander.CommandProc ~ { reportIgnoring ¬ TRUE };
+
+ATDontReportIgnores: ENTRY Commander.CommandProc ~ { reportIgnoring ¬ FALSE };
+Commander.Register[ key: "AttachOneDF", proc: OneDfCmdProc,
+doc: oneDfDoc, interpreted: TRUE];
+
+Commander.Register[ key: "AttachAllDFs", proc: AllDfsCmdProc,
+doc: allDfsDoc, interpreted: TRUE];
+
+Commander.Register[ key: "AttachDirectory", proc: DirCmdProc,
+doc: dirDoc, interpreted: TRUE];
+
+Commander.Register[ key: "ATReportIgnores", proc: ATReportIgnores];
+
+Commander.Register[ key: "ATDontReportIgnores", proc: ATDontReportIgnores];
+
+
+END.
+
+
+
+
+  ê  TCAttachmentsImpl.mesa
+Copyright Ó 1985, 1988, 1990, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Russ Atkinson (RRA) June 20, 1985 12:54:23 pm PDT
+Dave Rumph, September 13, 1988 6:28:12 pm PDT
+Bob Hagmann July 18, 1985 4:38:42 pm PDT
+Rick Beach, January 23, 1986 1:37:04 pm PST
+Eric Nickell February 25, 1986 12:10:10 pm PST
+Carl Hauser, October 20, 1987 2:20:57 pm PDT
+Bill Jackson (bj) April 14, 1988 8:41:57 pm PDT
+Willie-Sue, October 19, 1988 4:20:11 pm PDT
+Last edited by: Mik Lamming - January 26, 1989 4:09:53 pm GMT
+Mik Lamming,  January 27, 1989 10:17:50 am GMT
+Willie-Sue Orr,  March 28, 1990 4:29:38 pm PST -0100 -0100 -0100 -0100 -0100 -0100 -0100 -0100 -0100 -0100 -0100 -0100 -0100 -0100 -0100
+Willie-s, August 10, 1992 4:44 pm PDT
+
+Implementation points:
+1.  Version numbers should be retained in order to keep the validity of the hints in DF files.  
+2.  Don't move files that are already there.
+Types
+includes version number
+really just create date of the file for now
+byte count of the file (useful redundancy)
+indicates the state of the file (obvious)
+Documentation
+Option variables
+# of times to retry CrRPC error
+wait a while before retrying CrRPC error
+# of times to retry connectionRejected from STP
+# of seconds between retry attemps
+# of seconds between repeats (when using the R switch)
+# of seconds to wait after a file transfer (to keep IFS load down)
+Command Procedures
+A Programmer's quick hack
+if you want to experiment, you can try other values here! -  (bj)
+
+[data: RedBlackTree.UserData] RETURNS [stop: BOOL _ FALSE]
+called for each item in the table to do the moving. 
+df files are collected and moved last as a "commit" of the successful completion of the tricklecharge pass.
+The remote file is already present, so we don't need to move it
+We are verifying stuff and the entry is NOT on the destination
+Sigh, we actually have to ship the bits
+It may be worth retrying later
+It may be worth retrying later
+Retry, this time establishing the connection first
+This procedure is used to visit each file in a simple DF closure, where the imports are NOT followed, but the inclusions ARE followed.
+This is to deal with generated files that have been "abandoned" while being written - the name starts with fs.13.
+imports: REF DFUtilities.ImportsItem => { -- this stuff is for me - (bj)
+IF ( processingImports ) THEN {
+file: ROPE _ TranslateHost[tcInfo, imports.path1];
+IF ( NOT imports.exported ) THEN { ERROR };
+IF imports.exported THEN -- fix to make export chasing work
+SELECT imports.form FROM
+exports => {
+the Exports Imports Using ALL case
+visitor[file, thisUID];
+VisitClosure[tcInfo, file, thisUID, visitor];
+};
+list => { 
+the Exports Imports Using [list] case
+IF ( imports.list = NIL ) THEN ERROR; -- interface claims this can't happen
+visitor[file, imports.date.gmt];
+VisitClosure[tcInfo, file, thisUID, visitor, imports.list];
+};
+all => { ERROR };
+ENDCASE => { ERROR };
+};
+};
+The mainline of DoIt
+Phase1, build up data base.  Don't move any files.
+Trickling a df file together with the files it controls
+out.PutF["oneDF\n"];
+Trickling df files in a directory together with the files controlled by those df files.  
+[fullFName: attachedTo: PATH, uniqueID: UniqueID, bytes: INT, mutability: Mutability, fileType: FileType] RETURNS [continue: BOOL]
+make sure we get who from the correct place
+[fullFName: attachedTo: PATH, uniqueID: UniqueID, bytes: INT, mutability: Mutability, fileType: FileType] RETURNS [continue: BOOL]
+IF ( depth _ depth + 1 ) > 10 THEN {
+out.PutF["depth: %g, path: %g\n", [integer[depth]], [rope[PFS.RopeFromPath[newPath]]] ];
+RETURN;
+};
+IF Rope.Match["!*", PFS.RopeFromPath[suffix]] THEN RETURN;
+This is likely to be the controlling file entry for an IFS
+(or it could just be a bogus file to be ignored)
+out.PutF["fulldirectory\n"];
+Phase2, move files.  Don't change the entries (except for the 'moved' field).
+
+Phase2 1/2: move df files last.
+RETURN[ ( uid1.egmt.time = uid2.egmt.time ) AND ( uid1.egmt.usecs = uid2.egmt.usecs )
+AND ( uid1.host.a = uid2.host.a ) AND ( uid1.host.a = uid2.host.a ) ];
+[data: RedBlackTree.UserData] RETURNS [stop: BOOL _ FALSE]
+[data: RedBlackTree.UserData] RETURNS [RedBlackTree.Key]
+[k: RedBlackTree.Key, data: RedBlackTree.UserData] RETURNS [Basics.Comparison]
+ent: FileEntry => {
+pCom: Basics.PartialComparison _ PFSNames.Compare[key, ent.fullSrcNamePath];
+RETURN [ConvertPCom[pCom]];
+};
+[cmd: Handle] RETURNS [result: REF _ NIL, msg: ROPE _ NIL]
+CommandObject = [in, out, err: STREAM, commandLine, command: ROPE, ...]
+When parsing the command line, be prepared for failure.  The error is reported to the user
+Initialization
+Rick Beach, January 23, 1986 1:34:16 pm PST
+changes to: action (local of TrickleCommandProc) changed timeLeft: NAT to INT because timeLeft could go negative!
+Carl Hauser, February 3, 1987 10:44:11 am PST
+Register the command in the local directory, not ///Commands/
+Last edited by: Mik Lamming - January 25, 1989 7:36:42 pm GMT
+Removed ERROR clause that makes export chasing fail.
+changes to: imports (local of EachItem, local of VisitClosure, local of DoIt) 
+
+Ê½  •NewlineDelimiter
+–(cedarcode) style˜ codešœ™Kšœ
+ÏeœI™TK™1K™-K™(K™+K™.K™,K™/K™+K™=K™.K™ˆK™%K™ ™K™`K™,—K˜ —šÏk	˜	Kšœžœ.˜:Kšœ
+žœžœ˜$Kšœžœ˜.Kšœ
+žœ!˜0Kšœžœ˜*Kšœžœ]˜nK˜
+Kšžœ˜Kšžœ˜Kšœ	˜	K˜Kšœžœ?˜LKšœžœg˜yKšœ˜—K˜ šÐlnœžœž˜ KšžœKžœžœ5˜ŽK˜ Kšœž˜—head™Kšžœžœžœ˜Kšžœžœžœ˜Kšžœžœžœžœ˜Kšžœžœžœžœ˜K˜ Kšœ
+žœžœžœžœ	žœžœ˜3Kšœžœ3˜?K˜ Kšœžœžœžœ˜"Kšœžœžœ˜šœžœžœ˜Kšœ(žœ˜-Kšœžœ˜Kšœ
+žœÏc˜'Kšœžœ˜K˜3Kšœ .˜CKšœ	žœžœ ˜-K˜Kšœ˜K˜ —Kšœžœžœ˜#šœžœžœ˜šœžœ˜Kšœ™—Kšœžœ˜šœžœ
+˜K™+—šœžœ˜	K™*—šœ˜K™)—K˜—Kšœžœ$˜8—™Kšœžœß˜ëKšœžœª˜¹Kšœ
+žœû˜‰—šœ™šœžœ˜Kšœ™—šœžœ˜ Kšœ(™(—šœžœ˜Kšœ/™/—šœžœ˜Kšœ"™"—šœžœ˜K™6—šœžœ˜K™B—K˜ Kšœžœ˜K˜ Kšœžœžœ+˜AKšœžœ˜—™šÏnœžœ2žœ˜GKšœžœ˜(Kšœ	žœžœ˜;Kšœžœ˜"Kšœžœ˜#Kšœ	žœ˜$Kšœžœ˜/Kšœžœ˜(Kšœžœ˜0Kšœžœ˜3Kšœžœžœžœ˜ Kšœžœžœ˜ ™Kšœžœ˜.š	œžœžœžœžœ˜`K™AK™ ——•StartOfExpansion> -- [data: RedBlackTree.UserData] RETURNS [stop: BOOL _ FALSE]šÏb	œ˜$KšÐck:™:K™4šžœžœž˜˜šžœžœ˜K™kKšœžœ˜'šžœžœžœ
+žœ˜AKšžœ˜—K˜—Kšžœ˜K˜—Kšžœžœ˜—K˜K˜ —š¡œžœ˜%Kšœ	žœžœ˜Kšœ
+žœ˜Kšœžœžœ˜(KšœžœB˜SKšœ˜šœ&žœ˜>Kšœžœ
+ž˜Kšœ˜—šžœžœžœ˜?Kšœ
+žœ˜K˜@K˜—šžœžœž˜šœ
+˜
+Kšœ˜Kšžœ	žœ/˜>Kšœ'žœ˜IK˜—šœ˜Kšœ?™?K˜K˜—šœ˜Kšœ>™>Kšœ˜Kšœ*˜*K˜—šžœ˜Kšœ'™'Kšœ	žœžœ˜.Kšœžœ˜K–* -- [FSBackdoor.Version] RETURNS [BOOLEAN]š¡œžœžœžœ˜,šž˜šžœžœ˜Kšœ
+žœ˜šœ-˜-Kšœ-˜-—Kšžœ	žœ˜šžœž˜K˜/K˜)Kšœžœ˜&Kšžœ˜—šžœž˜˜Kšœ™šžœžœ˜#K˜ K˜4Kšžœ˜K˜——˜	Kšœ™šžœ"žœ˜*K˜ K˜;Kšžœ˜K˜——šœ˜K™2šžœžœ˜#K˜ Kšžœ˜K˜——Kšžœ˜—Kšžœžœ˜K˜—K˜ —šžœžœžœ˜Kšœžœnžœ˜|Kšž˜K˜—Kšžœ˜K˜K˜Kšœ*žœ$žœ)˜}Kšžœ	žœ˜Kšžœžœ<˜[Kšžœ!žœ˜-K˜——K˜K˜ —š¡
+œžœžœžœ˜4KšœXÏsœ¤œ
+™†Kšœžœ˜Kšœžœ˜Kšœžœ˜
+Kšœžœžœ˜Kšœ
+žœžœ˜(Kšœžœ˜Kšœ˜šžœ&žœž˜5Kšœžœžœžœ˜=Kšžœ˜—K˜<šžœžœžœIžœ˜]K™qKšžœžœ<˜RKšžœ˜K˜—K˜<K˜ šœ9žœ1˜mšžœ
+žœžœ#žœ&žœžœžœ˜´Kš	œUžœžœ"žœžœ˜ËKšžœ	žœ˜Kšœžœ˜Kšžœ˜	K˜Kšžœžœ˜——Kšžœžœžœžœ˜"šžœ&žœž˜5šœ˜Kšžœžœžœ˜)K˜*K˜—Kšžœ˜—šœžœ˜Kšœ˜Kšœ˜Kšœ	˜	Kšœ˜Kšœ˜—Kšœ*˜*K˜RK˜@K˜K˜ —š¡œžœžœžœžœžœžœžœžœ˜£š
+žœžœ
+žœ!žœžœ˜^KšœRžœ˜oKšžœ	žœ˜K˜K˜ —šÐbnœ!˜)šžœžœž˜Kšœžœ'žœ˜Kšœžœ˜#Kšœžœžœ"˜FKšœ)˜)K˜—šœžœ˜&Kšœ2˜2Kšœžœžœ˜+Kšœ˜Kšœ.˜.K˜—šœ	žœ ™Hšžœžœ™Kšœžœ(™2Kšžœžœžœžœ™+šžœž(™;šžœž™šœ™Kšœžœ™"Kšœ™Kšœ-™-Kšœ™—šœ
+™
+Kšœ%™%Kš	žœžœžœžœ %™KKšœ ™ Kšœ;™;Kšœ™—Kšœ	žœ™Kšžœžœ™——Kšœ™—K™—Kšžœ	žœ	 '˜C—K˜K˜ —Kšœžœžœ˜Kšœžœ˜Kšœžœ5˜Gšœžœ˜Kšœ˜šœ˜šœžœ
+žœžœ˜2KšœNžœ˜kKšžœ	žœ˜Kšœž˜	Kšžœ˜	K˜——Kšžœž˜Kšœ˜—šžœžœžœ˜K˜šœ1 (˜YKšœžœ˜—Kšœ
+˜
+Kšœ˜—K˜K˜ —K™K˜ Kšœžœ˜Kšœžœ˜Kšœžœ˜K˜ Kšœžœ˜$Kšœžœ˜$K˜ Kšœ" $˜FK˜ šžœžœžœŠ˜§Kšžœm˜qK˜ K˜ —Kšœ2™2KšœK˜KKšžœ	žœ˜šžœž˜šœ˜K™7Kšœ™šžœ	žœžœ.žœ˜sKšžœžœ:žœ˜u—K˜—šœ˜Kš Y™Yš¢
+œžœ˜Kš£œ£œ£œ£™‚Kšœžœžœ˜(Kšœžœžœ˜Kšœžœ˜
+Kšœžœ˜Kšœ˜Kšžœžœžœ˜UK˜J–O[s1: ROPE, pos1: INT _ 0, s2: ROPE, pos2: INT _ 0, case: BOOL _ TRUE]šžœžœžœ˜Kšœ_žœ˜Kšžœ	žœ˜Kšžœ˜K˜—K–9[base: ROPE, start: INT _ 0, len: INT _ 2147483647]šœžœ?žœ
+žœžœžœžœ˜¢Kšžœžœžœžœ˜>Kšžœžœ]˜sK˜—Kšœžœ'˜0Kšžœžœ)˜CK™+Kšžœ)žœ4˜cKšœ˜—šœ ˜3Kšœžœžœ˜&Kšœžœ˜–j -- [fullFName: ROPE, attachedTo: ROPE, created: GMT, bytes: INT, keep: CARDINAL] RETURNS [continue: BOOL]š¢œžœ˜Kš£œ£œ£œ£™‚Kšœžœ˜
+Kšœžœ˜Kšœ
+žœ˜Kšœ˜šžœ
+žœžœ˜!Kšœ	žœ˜Kšœžœ9˜DKšžœžœžœžœ˜6K˜)šžœžœ™$Kšœ:žœ™XKšžœ™K™—Kšžœ%˜(Kšžœ˜Kšœ˜—K˜Ašžœžœ˜Kšœžœ˜Kšœžœ˜'šžœ&žœž˜5˜Kšžœ žœžœ˜.K˜*K˜—Kšžœ˜—šžœžœžœžœ™:šœ:™:K™0——Kšœžœ™˜¢Kšœ*˜*K˜RK˜@K˜—K˜—K™Kšžœžœ?˜WK˜—šžœ˜K˜+Kšžœ˜Kšœ˜K˜ ——Kšœƒ˜ƒK˜ KšœM™MKšœD˜DKšžœ	žœ˜Kšœ3˜3K™ K™K˜ šžœžœžœžœ<˜qšžœ˜šžœ
+žœžœ˜KšžœžœžœD˜uKšœ*˜*šžœžœžœ$žœžœž˜RK˜Kšžœ˜—K˜—K˜——Kšœ8˜8Kšœk˜kKšžœ	žœ˜K˜K˜ —š
+¡	œžœžœžœžœ˜;Kšžœ' ˜;Kšžœ&žœ'žœžœ!™œK˜K˜ —š¡
+œžœžœžœžœžœ˜GKšžœ˜%Kšœ˜K˜ —š¡
+œžœžœžœžœžœžœ˜Lšžœžœžœžœžœ	žœ˜>K˜$Kšžœ	žœ˜K˜Kšžœ˜—K˜K˜ —š
+¡œžœžœžœžœ˜0Kšœžœ žœ˜1Kšœžœ!˜)Kšžœ
+žœžœ˜Kšžœ˜"K˜K˜ —š¡	œžœžœ ˜<–> -- [data: RedBlackTree.UserData] RETURNS [stop: BOOL _ FALSE]šœ$˜$Kš£:™:šžœžœž˜Kšœ*˜*Kšžœžœ˜—K˜—Kšœ3˜3K˜K˜ —š¡	œžœžœ˜3Kšžœ:žœ[˜ššžœž˜Kšœ˜Kšœ'˜'Kšœ%˜%Kšœ!˜!Kšžœ˜—K˜K˜ —–< -- [data: RedBlackTree.UserData] RETURNS [RedBlackTree.Key]š¡œ˜Kš£8™8Kšžœ˜K˜K˜ —–R -- [k: RedBlackTree.Key, data: RedBlackTree.UserData] RETURNS [Basics.Comparison]š¡œ˜!Kš£N™NKšœžœžœ˜šžœžœž˜K˜(Kšœžœ˜Kšžœžœ˜—šžœžœž˜Kšœžœ%žœ˜Ešœ™K™LKšžœ™K™—Kšžœ˜—Kšžœ˜K˜K˜ —š¡œžœ!žœ˜Pšžœž˜Kšœžœ˜#Kšœ	žœ˜Kšœžœ
+˜Kšžœžœ˜—K˜K˜ —š¡œB˜OK˜ —š¡œA˜MK˜ —š¡œI˜UK˜ —š¡
+œI˜SK˜ —š¡œžœ5žœžœžœ	žœžœ˜ršœžœ
+žœžœžœžœ™:Kšœžœžœ™G—š¡œžœžœžœ˜6Kšœžœžœ˜Kšœžœžœ˜ šžœžœžœž˜*Kšœžœ˜$šžœž˜Kšœžœ˜Kšœžœžœ˜ K˜SK˜SKšžœ$˜&Kšžœ.˜0Kšžœ˜—Kšœžœ˜Kšžœ˜—Kšžœ˜K˜—Kšœžœ˜Kšœžœ˜K˜6–@[getKey: RedBlackTree.GetKey, compare: RedBlackTree.Compare]˜RK˜ —Kšœžœ˜K˜K˜ šž˜šœžœLžœžœ˜fKšœZ™Z—Kšœžœ˜	K˜Kšžœžœžœžœ˜K˜šžœžœž˜šœžœ 	˜1K˜%—Kšœžœ 	˜Kšœžœ 	˜Kšœžœ 	˜šžœ ˜,šžœžœžœ˜K˜Kšœžœ˜0Kšžœ˜K˜—šžœžœžœ˜$K˜Kšœžœ˜1Kšžœ˜K˜—šžœžœžœ˜"K˜Kšžœ˜K˜—šžœžœž˜šœžœ˜Kšœžœ-˜5Kšžœžœ˜K˜—Kšžœ˜—K˜—Kšžœ˜K˜ ——Kšžœžœžœžœžœžœžœ*žœ	˜—Kšžœžœžœ˜-šžœžœžœ˜Kšœ	žœžœžœ˜2Kšœžœ˜Kšœžœ˜$Kšœžœžœžœ	žœžœ,žœ˜ˆšžœžœžœ˜Kšœ+žœžœžœ'˜vK˜K˜—K˜K˜ —˜š¢œžœ˜Kšœ4žœžœ&˜|Kšœ2žœžœ$˜xKšœ%žœ%žœ3˜ƒšžœžœ ˜Cšžœ˜šœžœ˜Kšœv˜vKšžœžœžœ˜&Kšžœ˜	K˜—Kšœ˜——Kšžœžœžœ˜&K˜—K˜0K˜—K˜ šž˜K˜—K˜K˜ —š¡œžœ1žœ˜OKšœ	žœžœ˜;Kš	œžœžœžœžœ˜Kšœžœ˜9K˜ š¡œžœžœžœžœžœžœžœžœ˜¤š
+žœžœ
+žœ!žœžœ˜^KšœRžœ˜oKšžœ	žœ˜K˜K˜ —š¥	œ!˜*šžœžœž˜Kšœžœ'žœ˜Kšœžœ˜#KšœV˜VK˜(K˜—šœžœ˜$Kšœ	žœ˜"—Kšžœ	žœ	 '˜C—K˜K˜ —Kšœžœžœ˜Kšœžœ˜Kšœžœ5˜Gšœžœ˜Kšœ˜šœ˜šœžœ
+žœžœ˜2KšœNžœ˜kKšžœ	žœ˜Kšœž˜	Kšžœ˜	K˜——Kšžœž˜Kšœ˜—šžœžœžœ˜K˜šœ2 (˜ZKšœžœ˜—Kšœ
+˜
+Kšœ˜—K˜K˜ —š
+žœžœžœ.žœžœ˜yKšžœžœ:žœžœ˜o—K˜ Kšœ ˜&Kšœžœ 4˜Pšžœžœžœžœžœžœž˜8K˜šœ˜šœžœ˜Kšœ…˜…Kšžœ	žœ˜Kšžœ˜	K˜—Kšœ˜—Kšžœ˜—K˜K˜ —š¡œžœžœžœžœžœžœžœ˜OK˜ —š
+¡	œžœžœ(žœžœ˜VKšœžœžœ7˜CK˜ —šœžœžœ˜K˜ —š¡¡œžœ,žœ˜IK˜ —Kš¡¡œžœ,žœ˜N—–x[key: ROPE, proc: Commander.CommandProc, doc: ROPE _ NIL, clientData: REF ANY _ NIL, interpreted: BOOL _ TRUE]™šœXžœ˜^K˜ —šœ[žœ˜aK˜ —KšœXžœ˜^K˜ ˜CK˜ —˜KK˜ ——K˜ Kšžœ˜K˜ Kšœ˜™+Kš
+œÏrœœ
+
+Ðekœ§œ$™q—™-K™=—™=K™4Kšœ¦œ;™N—K™ — …—    X  Š«  

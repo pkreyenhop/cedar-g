@@ -1,0 +1,485 @@
+
+DIRECTORY
+CedarProcess USING [CheckAbort, SetPriority],
+Feedback USING [Append, PutF],
+FeedbackOps USING [GetLabel],
+FitBasic USING [Handle],
+FitState USING [AddSample, Create, CurrentJoints, CurrentSamples, ResetData],
+FitStateUtils USING [ForAllSamples, SampleProc],
+GeometricLogicOps USING [ANDs, MaskFill, MINUSs, NOTs, ORs, PathActionProc, Scale, ScaleRec, Set, SetToFlatPath, XORs],
+GGBasicTypes USING [Point],
+GGFromImager USING [Capture],
+GGHistory USING [NewCapture, PushCurrent],
+GGInterfaceTypes USING [GGData],
+GGModelTypes USING [BoundBox, Scene, Slice, SliceDescriptor, Traj, TrajData],
+GGOutline USING [CreateOutline, HasHoles],
+GGParent USING [FirstChild],
+GGParseIn USING [ReadWNAT, ReadWReal, ReadWRope, SyntaxError],
+GGRefresh USING [InterpressEntireScene],
+GGRefreshTypes,
+GGScene USING [AddSlice, BoundBoxOfSelected, DeleteAllSelected, MergeScenes, WalkSelectedSlices],
+GGSegment USING [MakeBezier, MakeLine],
+GGSegmentTypes USING [Segment],
+GGSelect USING [DeselectAll, SelectAll],
+GGSliceOps USING [BuildPath, GetBoundBox, GetFillColor, GetType, IsCompleteParts, WalkSegments],
+GGState USING [GetDefaultFillColor],
+GGTraj USING [AddSegment, CloseByDistorting, CreateTraj],
+GGUserInput USING [ArgumentType, RegisterAction, UserInputProc],
+GGWindow USING [RestoreScreenAndInvariants],
+Imager USING [ClipRectangle, Color, Context, MaskFill, PathProc, SetColor, SetStrokeWidth, TranslateT],
+ImagerBox USING [Rectangle, RectangleFromBox],
+ImagerPixel USING [MakePixelMap],
+ImagerSample USING [Fill, Get, ObtainScratchMap, ReleaseScratchMap, SampleMap],
+ImagerSmoothContext USING [Create, SetOutputBuffer],
+ImagerTransformation USING [Transformation],
+IO USING [PutFR, RIS, STREAM],
+LSPiece USING [Metrics, MetricsRec],
+Outline USING [GetOutline, Handle, OutlineEdge, Rec],
+PBasics USING [IsBound],
+PiecewiseFit USING [Cubic2Proc, Data, DataRec, GrowSpline],
+PotentialKnots USING [CircleTangents, DynPoly],
+Real USING [Ceiling, Round],
+Rope USING [ROPE],
+SF USING [Vec];
+
+GGEventImplG: CEDAR PROGRAM
+IMPORTS CedarProcess, Feedback, FeedbackOps, FitState, FitStateUtils, GeometricLogicOps, GGFromImager, GGHistory, GGOutline, GGParent, GGParseIn, GGRefresh, GGScene, GGSegment, GGSelect, GGSliceOps, GGState, GGTraj, GGUserInput, GGWindow, Imager, ImagerBox, ImagerPixel, ImagerSample, ImagerSmoothContext, IO, Outline, PBasics, PiecewiseFit, PotentialKnots, Real
+EXPORTS GGInterfaceTypes = BEGIN
+
+BoundBox: TYPE = GGModelTypes.BoundBox;
+GGData: TYPE = GGInterfaceTypes.GGData;
+Point: TYPE = GGBasicTypes.Point;
+RefreshDataObj: PUBLIC TYPE = GGRefreshTypes.RefreshDataObj;
+ROPE: TYPE = Rope.ROPE;
+Scene: TYPE = GGModelTypes.Scene;
+Segment: TYPE = GGSegmentTypes.Segment;
+Slice: TYPE = GGModelTypes.Slice;
+SliceDescriptor: TYPE = GGModelTypes.SliceDescriptor;
+Traj: TYPE = GGModelTypes.Traj;
+TrajData: TYPE = GGModelTypes.TrajData;
+Transformation: TYPE = ImagerTransformation.Transformation;
+UserInputProc: TYPE = GGUserInput.UserInputProc;
+
+EdgeData: TYPE = REF EdgeDataObj;
+EdgeDataObj: TYPE = RECORD [
+sampleMap: ImagerSample.SampleMap,
+trans: Point,
+edgeCount: CARD,
+height: INTEGER,
+ggData: GGData
+];
+
+BadThreshold: SIGNAL = CODE;
+
+CheckThreshold: PROC [r: REAL] RETURNS [REAL] = {
+IF r NOT IN (0.0 .. 1.0) THEN SIGNAL BadThreshold;
+RETURN[r];
+};
+
+GetSample: PROC [client: REF, x,y: INT] RETURNS [INT] = {
+edgeData: EdgeData ¬ NARROW[client];
+sample: WORD ¬ ImagerSample.Get[edgeData.sampleMap, [f: x, s: edgeData.height-y]];
+RETURN[sample];
+};
+
+FeedBackEdge: PROC [client: REF, x0,y0,x1,y1: REAL] RETURNS [abort: BOOL ¬ FALSE] = {
+edgeData: EdgeData ¬ NARROW[client];
+ggData: GGData ¬ edgeData.ggData;
+ggData.refresh.spotPoint ¬ [x0+edgeData.trans.x, y0+edgeData.trans.y]; --back to ggworld coordinates
+ggData.refresh.hitPoint ¬ [x1+edgeData.trans.x, y1+edgeData.trans.y];
+edgeData.edgeCount ¬ edgeData.edgeCount+1;
+CedarProcess.CheckAbort[];
+IF edgeData.edgeCount MOD 20 = 0 THEN Feedback.PutF[ggData.router, middle, $Feedback, "."];
+GGWindow.RestoreScreenAndInvariants[paintAction: $FitFeedback, ggData: ggData, remake: none, edited: FALSE, okToSkipCapture: TRUE];
+};
+
+DoFit: PROC[ggData: GGData, makeCurves: BOOL ¬ TRUE] = {
+thisTraj: Traj;
+fit: FitBasic.Handle;
+lastPt: Point ¬ [0,0];
+h: Outline.Handle;
+edgeData: EdgeData;
+contourCount: NAT ¬ 0;
+NewPoint: PROC [x,y: REAL] = {
+pt: Point ¬ [x+edgeData.trans.x, y+edgeData.trans.y];
+FitState.AddSample[fit, pt.x, pt.y];
+};
+NewCubic: PiecewiseFit.Cubic2Proc = {
+IF thisTraj = NIL THEN thisTraj ¬ GGTraj.CreateTraj[bezier.b0];
+CedarProcess.CheckAbort[];
+Feedback.PutF[ggData.router, middle, $Feedback, "."];
+[] ¬ GGTraj.AddSegment[thisTraj, hi, GGSegment.MakeBezier[bezier.b0, bezier.b1, bezier.b2, bezier.b3, NIL], lo];
+};
+ContourFromSelection: PROC = {
+selectedBox: BoundBox ¬ GGScene.BoundBoxOfSelected[ggData.scene, normal];
+rect: ImagerBox.Rectangle ¬ ImagerBox.RectangleFromBox[[selectedBox.loX, selectedBox.loY, selectedBox.hiX, selectedBox.hiY] ];	--gg type to Imager type
+size: SF.Vec ~ [s: Real.Ceiling[rect.h], f: Real.Ceiling[rect.w]];
+context: Imager.Context ¬ ImagerSmoothContext.Create[size: size];
+sampleMap: ImagerSample.SampleMap ¬ ImagerSample.ObtainScratchMap[box: [max: size], bitsPerSample: 8];
+ImagerSample.Fill[sampleMap, [max: size], 255];
+ImagerSmoothContext.SetOutputBuffer[context: context, pixelMap: ImagerPixel.MakePixelMap[s0: sampleMap], components: LIST[$Intensity]];
+Imager.TranslateT[context, [-rect.x, -rect.y]];  --move lower left corner to origin
+Imager.ClipRectangle[context,rect];	--clip in Gargoyle world coordinates
+Feedback.PutF[ggData.router, oneLiner, $Feedback, "Fit: rendering selected region for thresholding"];
+GGRefresh.InterpressEntireScene[dc: context, ggData: ggData]; -- not really Interpress.  Means just draw the objects.
+edgeData ¬ NEW[EdgeDataObj ¬ [sampleMap, [rect.x, rect.y], 0, 0, ggData]];
+h ¬ NEW[Outline.Rec];
+h.tValue ¬ ggData.fitData.threshold*255.0;
+IF h.tValue=Real.Round[h.tValue] THEN h.tValue ¬ h.tValue+0.0001; -- can't use integer thresholds
+h.border ¬ 255;
+h.xStart ¬ 0;
+h.yStart ¬ 0;
+h.xPixels ¬ size.f;
+h.yPixels ¬ size.s;
+edgeData.height ¬ h.yPixels-1;
+h.get ¬ GetSample;
+h.newEdge ¬ FeedBackEdge;
+h.client ¬ edgeData;
+Feedback.PutF[ggData.router, oneLiner, $Feedback, "Fit: finding edges in selected region"];
+contourCount ¬ Outline.OutlineEdge[h];
+ImagerSample.ReleaseScratchMap[map: sampleMap]; sampleMap ¬ NIL; context ¬ NIL;
+};
+CedarProcess.SetPriority[background];
+GGHistory.NewCapture["Fit", ggData]; -- capture scene BEFORE UPDATE
+ContourFromSelection[];	--local proc rather than inline for readability
+Feedback.PutF[ggData.router, begin, $Feedback, "Fit: %g contours found. Begin fitting", [integer[contourCount]]];
+BEGIN
+lineLength: REAL ¬ 10;	--minimum line length to trigger corner check in DynPoly
+thisOutline: Slice;
+data: PiecewiseFit.Data;
+metrics: LSPiece.Metrics ¬ NEW[LSPiece.MetricsRec ¬ [
+maxItr: ggData.fitData.maxIterations, maxDev: ggData.fitData.tolerance, sumErr: 0, deltaT: 0]];
+checkSamples: PROC RETURNS[ok: BOOLEAN] = {
+count: NAT ¬ 0;
+proc: FitStateUtils.SampleProc = {count ¬ count+1};
+FitStateUtils.ForAllSamples[fit.slist, proc];
+IF count > 3 THEN RETURN[TRUE] ELSE RETURN[FALSE];
+};
+checkJoints: PROC RETURNS[ok: BOOLEAN] = {
+count: NAT ¬ 0;
+proc: FitStateUtils.SampleProc = {
+IF s.jointType#none THEN count ¬ count+1};
+FitStateUtils.ForAllSamples[fit.slist, proc];
+IF count > 2 THEN RETURN[TRUE] ELSE RETURN[FALSE];
+};
+fit ¬ FitState.Create[];
+fit.closed ¬ TRUE;
+fit.minDist ¬ ggData.fitData.minDistance;
+FOR i: CARD IN [0..contourCount) DO
+thisTraj ¬ NIL;
+Outline.GetOutline[h.data, NewPoint, i];  -- make a FitState.Handle 
+IF NOT checkSamples[] THEN {	-- do this here as minDistance filter affects total
+Feedback.PutF[ggData.router, oneLiner, $Feedback, "Fit: less than 3 samples in outline.  Skipping outline"];
+LOOP;
+};
+PotentialKnots.DynPoly[fit, ggData.fitData.polyPenalty, lineLength, ggData.fitData.angle];  -- set potential knots
+IF makeCurves THEN {
+IF NOT checkJoints[] THEN {
+Feedback.PutF[ggData.router, oneLiner, $Feedback, "Fit: less than 2 potential knots in outline.  Skipping outline"];
+LOOP;
+};
+Feedback.PutF[ggData.router, oneLiner, $Feedback, "Fit: potential knots found.   Start curve finding"];
+PotentialKnots.CircleTangents[fit, ggData.fitData.angle];   --set the tangents at the potential knots
+data ¬ NEW[PiecewiseFit.DataRec ¬ [
+samples: FitState.CurrentSamples[fit],
+closed: TRUE,
+joints: NIL, tangents: NIL]];
+[data.joints, data.tangents] ¬ FitState.CurrentJoints[fit];
+PiecewiseFit.GrowSpline[data, metrics, NewCubic];
+Feedback.PutF[ggData.router, oneLiner, $Feedback, "Fit: new curve outline found"];
+}
+ELSE {
+lastPoint: Point ¬ [0,0];
+sampleProc: FitStateUtils.SampleProc = {
+IF s.jointType#none THEN {
+p: Point ¬ [s.xy.x, s.xy.y];
+IF thisTraj=NIL THEN thisTraj ¬ GGTraj.CreateTraj[p]
+ELSE {
+newLine: Segment ¬ GGSegment.MakeLine[lastPoint, p, NIL];
+[] ¬ GGTraj.AddSegment[thisTraj, hi, newLine, lo];
+};
+lastPoint ¬ p;
+};
+};
+IF NOT checkJoints[] THEN {
+Feedback.PutF[ggData.router, oneLiner, $Feedback, "Fit: less than 2 vertices in outline.  Skipping outline"];
+LOOP;
+};
+FitStateUtils.ForAllSamples[fit.slist, sampleProc];
+Feedback.PutF[ggData.router, oneLiner, $Feedback, "Fit: new Polygon found"];
+};
+GGTraj.CloseByDistorting[thisTraj, lo];  --no distortion should be necessary
+thisOutline ¬ GGOutline.CreateOutline[thisTraj, NIL];
+GGScene.AddSlice[ggData.scene, thisOutline, -1];
+ggData.refresh.addedObject ¬ thisOutline;
+ggData.refresh.startBoundBox­ ¬ GGSliceOps.GetBoundBox[thisOutline]­;
+GGWindow.RestoreScreenAndInvariants[paintAction: $ObjectAdded, ggData: ggData, remake: none, edited: FALSE, okToSkipCapture: TRUE];
+FitState.ResetData[fit, samples];	--cleanup after fit
+FitState.ResetData[fit, links];
+ENDLOOP;
+END;
+GGHistory.PushCurrent[ggData];  -- push captured history event onto history list
+CedarProcess.SetPriority[normal];
+Feedback.PutF[ggData.router, oneLiner, $Feedback, "Fit: completed.  %g outlines added to scene", [integer[contourCount]]];
+GGWindow.RestoreScreenAndInvariants[paintAction: $PaintEntireScene, ggData: ggData, remake: triggerBag, edited: TRUE, okToSkipCapture: FALSE];
+};
+
+FitIsLoaded: PROC [ggData: GGData] RETURNS [BOOL ¬ FALSE] = TRUSTED {
+IF PBasics.IsBound[LOOPHOLE[Outline.GetOutline]] AND PBasics.IsBound[LOOPHOLE[ImagerSmoothContext.Create]] THEN RETURN[TRUE];
+Feedback.Append[ggData.router, oneLiner, $Complaint, "Fit failed: please install Fit and ImagerSmooth, then retry this operation"];
+};
+
+FitLines:  UserInputProc = {
+IF FitIsLoaded[ggData] THEN DoFit[ggData, FALSE];
+};
+
+FitCurves:  UserInputProc = {
+IF FitIsLoaded[ggData] THEN DoFit[ggData, TRUE];
+};
+
+SetFitParameters:  UserInputProc = {
+ENABLE GGParseIn.SyntaxError=> GOTO SyntaxError;
+tolerance, minDistance, threshold, angle, polyPenalty: REAL;
+maxIterations: NAT;
+s: IO.STREAM ¬ IO.RIS[NARROW[event.rest.first]]; -- same form as ShowFitParameters
+GGParseIn.ReadWRope[s, "Fit: threshold:"];
+threshold ¬ GGParseIn.ReadWReal[s];
+GGParseIn.ReadWRope[s, "minDistance:"];
+minDistance ¬ GGParseIn.ReadWReal[s];
+GGParseIn.ReadWRope[s, "polyPenalty:"];
+polyPenalty ¬ GGParseIn.ReadWReal[s];
+GGParseIn.ReadWRope[s, "tolerance:"];
+tolerance ¬ GGParseIn.ReadWReal[s];
+GGParseIn.ReadWRope[s, "angle:"];
+angle ¬ GGParseIn.ReadWReal[s];
+GGParseIn.ReadWRope[s, "iterations:"];
+maxIterations ¬ GGParseIn.ReadWNAT[s];
+ggData.fitData.threshold ¬ CheckThreshold[threshold ! BadThreshold => GOTO Abort];
+ggData.fitData.minDistance ¬ minDistance;
+ggData.fitData.polyPenalty ¬ polyPenalty;
+ggData.fitData.tolerance ¬ tolerance;
+ggData.fitData.angle ¬ angle;
+ggData.fitData.maxIterations ¬ maxIterations;
+ShowFitParameters[ggData, NIL];
+EXITS
+Abort => {
+Feedback.Append[ggData.router, oneLiner, $Complaint, "Fit failed: fit threshold must be greater than 0.0 and less than 1.0"];
+};
+SyntaxError => {
+Feedback.Append[ggData.router, oneLiner, $Complaint, "Fit failed: syntax error while parsing Fit parameters: use exact format from ShowFitParameters"];
+};
+};
+
+ShowFitParameters:  UserInputProc = {
+rope: ROPE ¬ IO.PutFR["Fit: threshold: %g minDistance: %g polyPenalty: %g", [real[ggData.fitData.threshold]], [real[ggData.fitData.minDistance]], [real[ggData.fitData.polyPenalty]] ];
+Feedback.PutF[ggData.router, oneLiner, $Show, "%g tolerance: %g angle: %g iterations: %g", [rope[rope]], [real[ggData.fitData.tolerance]], [real[ggData.fitData.angle]], [integer[ggData.fitData.maxIterations]]]; 
+};
+
+reallyBigReal: REAL = 1.0e37;
+
+SetFitTolerance:  UserInputProc = {
+r: REAL ¬ NARROW[event.rest.first, REF REAL]­;
+IF r>reallyBigReal THEN {
+Feedback.Append[ggData.router, oneLiner, $Complaint, "SetFit failed: select a reasonable value for fit tolerance"];
+RETURN;
+};
+ggData.fitData.tolerance ¬ r;
+ShowFitParameters[ggData, NIL];
+};
+
+SetFitMinDistance:  UserInputProc = {
+r: REAL ¬ NARROW[event.rest.first, REF REAL]­;
+IF r>reallyBigReal THEN {
+Feedback.Append[ggData.router, oneLiner, $Complaint, "SetFit failed: select a reasonable value for fit min distance"];
+RETURN;
+};
+ggData.fitData.minDistance ¬ r;
+ShowFitParameters[ggData, NIL];
+};
+
+SetFitIterations:  UserInputProc = {
+i: INT ¬ NARROW[event.rest.first, REF INT]­;
+IF i=LAST[INT] THEN {
+Feedback.Append[ggData.router, oneLiner, $Complaint, "SetFit failed: select a reasonable value for fit iterations"];
+RETURN;
+};
+ggData.fitData.maxIterations ¬ i;
+ShowFitParameters[ggData, NIL];
+};
+
+SetFitThreshold:  UserInputProc = {
+threshold: REAL ¬ NARROW[event.rest.first, REF REAL]­;
+ggData.fitData.threshold ¬ CheckThreshold[threshold ! BadThreshold => GOTO Abort];
+ShowFitParameters[ggData, NIL];
+EXITS
+Abort => {
+Feedback.Append[ggData.router, oneLiner, $Complaint, "SetFit failed: fit threshold must be greater than 0.0 and less than 1.0"];
+};
+};
+
+SetFitAngle:  UserInputProc = {
+r: REAL ¬ NARROW[event.rest.first, REF REAL]­;
+IF r>reallyBigReal THEN {
+Feedback.Append[ggData.router, oneLiner, $Complaint, "SetFit failed: select a reasonable value for fit angle"];
+RETURN;
+};
+ggData.fitData.angle ¬ r;
+ShowFitParameters[ggData, NIL];
+};
+
+SetFitPolyPenalty:  UserInputProc = {
+r: REAL ¬ NARROW[event.rest.first, REF REAL]­;
+IF r>reallyBigReal THEN {
+Feedback.Append[ggData.router, oneLiner, $Complaint, "SetFit failed: select a reasonable value for fit poly penalty"];
+RETURN;
+};
+ggData.fitData.polyPenalty ¬ r;
+ShowFitParameters[ggData, NIL];
+};
+
+SetCombine:  UserInputProc ~ {
+IF PBasics.IsBound[LOOPHOLE[GeometricLogicOps.SetToFlatPath]] THEN {
+DoCombine: PROC [nextD: SliceDescriptor] RETURNS [done: BOOL ¬ FALSE] = {
+IsClosed: PROC [slice: Slice] RETURNS [BOOL] = {
+firstChild: Slice;
+RETURN[GGSliceOps.GetType[slice]#$Outline OR GGOutline.HasHoles[slice] OR (GGSliceOps.GetType[(firstChild ¬ GGParent.FirstChild[slice, first])]=$Traj AND NARROW[firstChild.data, TrajData].role#open)];
+};
+IsLineSegment: PROC [seg: Segment, transform: Transformation] RETURNS [keep: BOOL] = {
+keep ¬ seg.class.type=$Line;
+};
+linesD: SliceDescriptor ¬ GGSliceOps.WalkSegments[nextD.slice, IsLineSegment];
+IF GGSliceOps.IsCompleteParts[nextD] AND GGSliceOps.IsCompleteParts[linesD] AND IsClosed[nextD.slice] THEN {
+SlicePath: Imager.PathProc = {
+GGSliceOps.BuildPath[nextD.slice, NIL, NIL, moveTo, lineTo, curveTo, conicTo, arcTo];
+};
+nextSet ¬ GeometricLogicOps.MaskFill[SlicePath, FALSE, compositeScale];
+opSet ¬ IF opSet=NIL THEN nextSet ELSE
+SELECT opAtom FROM
+$NOTs => GeometricLogicOps.NOTs[nextSet],
+$ANDs => GeometricLogicOps.ANDs[opSet, nextSet],
+$ORs => GeometricLogicOps.ORs[opSet, nextSet],
+$MINUSs => GeometricLogicOps.MINUSs[opSet, nextSet],
+$XORs => GeometricLogicOps.XORs[opSet, nextSet],
+ENDCASE => ERROR;
+lastD ¬ nextD;
+}
+ELSE Feedback.Append[ggData.router, oneLiner, $Complaint, "Combine failed: only complete closed objects composed solely of straight line segments are combined"];
+};
+
+lastD: SliceDescriptor; -- describes the last legitimate slice participating in Combine
+compositeScale: GeometricLogicOps.Scale ¬ NEW[GeometricLogicOps.ScaleRec];
+nextSet, opSet: GeometricLogicOps.Set;
+opAtom: ATOM ¬ NARROW[event.rest.first]; -- what GeometricLogic operation to perform
+deleteAtom: ATOM ¬ NARROW[event.rest.rest.first]; -- optional delete of selected objects
+bBox: BoundBox;
+GGHistory.NewCapture["Geometric combine", ggData]; -- capture scene BEFORE UPDATE
+bBox ¬ GGScene.BoundBoxOfSelected[scene: ggData.scene, selectClass: normal, sliceLevel: TRUE];
+compositeScale­ ¬ [minX: bBox.loX, minY: bBox.loY, maxX: bBox.hiX, maxY: bBox.hiY];
+ggData.refresh.startBoundBox­ ¬ bBox­;
+[] ¬ GGScene.WalkSelectedSlices[ggData.scene, first, DoCombine, normal, $Outline];
+[] ¬ GGScene.WalkSelectedSlices[ggData.scene, first, DoCombine, normal, $Box];
+IF opSet#NIL THEN {
+SceneAction: PROC [context: Imager.Context] = {
+MaskSetProc: GeometricLogicOps.PathActionProc = { -- PROC [path: Imager.PathProc]
+Imager.MaskFill[context: context, path: path, oddWrap: FALSE];
+};
+Imager.SetStrokeWidth[context, 0.0];
+Imager.SetColor[context, IF fillColor#NIL THEN fillColor ELSE GGState.GetDefaultFillColor[ggData] ];
+GeometricLogicOps.SetToFlatPath[opSet, MaskSetProc];
+};
+
+fillColor: Imager.Color ¬ GGSliceOps.GetFillColor[lastD.slice, NIL].color;
+scene: Scene ¬ GGFromImager.Capture[action: SceneAction, camera: ggData.camera]; -- get a scene containing only the combined object
+IF deleteAtom=$DeleteSelected THEN [] ¬ GGScene.DeleteAllSelected[ggData.scene] ELSE GGSelect.DeselectAll[ggData.scene, normal];
+GGSelect.SelectAll[scene, normal];
+ggData.scene ¬ GGScene.MergeScenes[ggData.scene, scene]; -- is this all it takes ??
+GGHistory.PushCurrent[ggData];  -- push captured history event onto history list
+Feedback.PutF[ggData.router, oneLiner, $Feedback, "Combine: combined object added to scene"];
+GGWindow.RestoreScreenAndInvariants[paintAction: $ObjectChangedBoundBoxProvided, ggData: ggData, remake: triggerBag, edited: TRUE, okToSkipCapture: FALSE];
+}
+ELSE Feedback.Append[ggData.router, oneLiner, $Complaint, "Combine failed: no legitimate selections for Combine"];
+}
+ELSE Feedback.Append[ggData.router, oneLiner, $Complaint, "Combine failed: please install GeometricLogicOps, then retry this operation"];
+};
+
+RegisterAction: PROC [atom: ATOM, eventProc: GGUserInput.UserInputProc, argType: GGUserInput.ArgumentType, causeMouseEventsToComplete: BOOL ¬ TRUE, ensureUnique: BOOL ¬ TRUE] = GGUserInput.RegisterAction;
+
+RegisterEventProcs: PROC = {
+RegisterAction[$FitCurves, FitCurves, none];
+RegisterAction[$ShowFitParameters, ShowFitParameters, none];
+RegisterAction[$FitLines, FitLines, none];
+RegisterAction[$FitTolerance, SetFitTolerance, refReal];
+RegisterAction[$SetFitParameters, SetFitParameters, rope];
+RegisterAction[$SetFitPolyPenalty, SetFitPolyPenalty, refReal];
+RegisterAction[$SetFitAngle, SetFitAngle, refReal];
+RegisterAction[$SetFitThreshold, SetFitThreshold, refReal];
+RegisterAction[$SetFitIterations, SetFitIterations, refInt];
+RegisterAction[$SetFitMinDistance, SetFitMinDistance, refReal];
+
+RegisterAction[$SetCombine, SetCombine, none];
+};
+
+RegisterEventProcs[];
+
+END.
+  î  GGEventImplG.mesa
+Copyright Ó 1986, 1987, 1988, 1989, 1992 by Xerox Corporation.  All rights reserved.
+Bier, July 29, 1992 3:01 pm PDT
+Kurlander, July 21, 1987 10:52:27 am PDT
+Eisenman, August 11, 1987 5:36:57 pm PDT
+Pier, November 30, 1990 1:22 pm PST
+Maureen Stone, October 5, 1987 11:15:23 am PDT
+Doug Wyatt, December 7, 1989 3:14:41 pm PST
+
+Contents: stuff implemented in DCedar but not PCedar (yet)
+EdgeFit operations extracted from GGEventImplC.mesa
+SetCombine extracted from GGEventImplA.mesa
+
+EdgeFit (formerly in GGEventImplC)
+
+EdgeFit Menu
+
+Paint the object for feedback
+Here if you didn't get a syntax error
+SetCombine (formerly in GGEventImplA)
+
+SliceDescriptorWalkProc.  Called for each selected slice.
+nextD should be a complete descriptor for closed objects containing only $Line segments.  We verify:
+linesD is a descriptor for all the straight line segments in nextD.slice
+i.e. every part was selected and every segment is a line segment of a closed shape
+Registration
+EdgeFit Menu
+ Êö  •NewlineDelimiter
+–(cedarcode) style˜ codešœ™Kšœ
+ÏeœI™TK™Kšœ%Ïk™(Kšœ%ž™(Kšœ#™#Kšœ.™.K™+K™ KšÏnœ2™:Kšœ3™3Kšœ+™+K™ —šž	˜	Kšœžœ˜-Kšœ	žœ˜Kšœžœ˜Kšœ	žœ
+˜Kšœ	žœ?˜MKšœžœ˜0Kšœžœ`˜wKšœžœ	˜Kšœžœ˜Kšœ
+žœ˜*Kšœžœ
+˜ Kšœžœ;˜MKšœ
+žœ˜*Kšœ	žœ˜Kšœ
+žœ/˜>Kšœ
+žœ˜(Kšœ˜KšœžœT˜aKšœ
+žœ˜'Kšœžœ˜Kšœ	žœ˜(KšœžœP˜`Kšœžœ˜$Kšœžœ-˜9Kšœžœ/˜@Kšœ	žœ˜,Kšœžœ[˜gKšœ
+žœ˜.Kšœžœ˜!Kšœžœ=˜OKšœžœ˜4Kšœžœ˜,Kšžœžœ	žœžœ˜Kšœžœ˜$Kšœžœ(˜5Kšœžœ˜Kšœžœ)˜;Kšœžœ˜/Kšœžœ˜Kšœžœžœ˜Kšžœžœ˜K˜ —šŸœžœž˜Kšžœ«žœ6˜êKšžœž˜ K˜ Kšœ
+žœ˜'Kšœžœ˜'Kšœžœ˜!Kšœžœžœ!˜<Kšžœžœžœ˜Kšœžœ˜!Kšœ	žœ˜'Kšœžœ˜!Kšœžœ ˜5Kšœžœ˜Kšœ
+žœ˜'Kšœžœ'˜;Kšœžœ˜0—K˜ default™"L™ Kšœ™K™ Kšœ
+žœžœ˜!šœžœžœ˜Kšœ"˜"K˜Kšœžœ˜Kšœžœ˜Kšœ˜Kšœ˜K˜ —šŸœžœžœ˜K˜ ——š
+Ÿœžœžœžœžœ˜1Kš
+žœžœžœžœžœ˜2Kšžœ˜
+K˜K˜ —šŸ	œžœ
+žœžœžœžœ˜9Kšœžœ	˜$KšœžœF˜RKšžœ	˜Kšœ˜K˜ —šÐbnœžœ
+žœžœžœ	žœžœ˜UKšœžœ	˜$K˜!KšœGÏc˜dK˜EK˜*K˜Kšžœžœžœ6˜[Kšœežœžœ˜ƒKšœ˜K˜ —šŸœžœžœžœ˜8K˜K˜K˜Kšœ˜Kšœ˜Kšœžœ˜šŸœžœžœ˜K˜5K˜$Kšœ˜—šŸœ˜%Kšžœžœžœ)˜?K˜Kšœ5˜5Kšœfžœ˜pKšœ˜—šŸœžœ˜K•StartOfExpansionT[scene: GGModelTypes.Scene, selectClass: GGSegmentTypes.SelectionClass _ normal]šœ Ïbœ˜IK–[ImagerBox.Box]šœ¡˜—Kšœžœ:˜BK˜AK–X[box: SF.Box, bitsPerSample: ImagerSample.BitsPerSample _ 1, bitsPerLine: INT _ 0]˜fKšœ/˜/K–´[s0: ImagerSample.SampleMap _ NIL, s1: ImagerSample.SampleMap _ NIL, s2: ImagerSample.SampleMap _ NIL, s3: ImagerSample.SampleMap _ NIL, s4: ImagerSample.SampleMap _ NIL]šœužœ˜‡Kšœ1¡"˜SKšœ$¡$˜HK–Q[screen: Imager.Context, ggData: GGInterfaceTypes.GGData, showColors: BOOL]˜eKšœ>¡7˜uKšœžœ<˜JKšœžœ˜K˜*Kšžœžœ¡˜aK˜K˜K˜K˜K˜K˜K˜K˜K˜K–Q[screen: Imager.Context, ggData: GGInterfaceTypes.GGData, showColors: BOOL]˜[K˜&K–[map: ImagerSample.SampleMap]šœ<žœžœ˜OK˜—K˜%Kšœ
+Ÿ
+œ¡˜CKšœ¡/˜GKšœq˜qšž˜Kšœžœ¡1Ïi˜OKšœ˜K˜šœžœ˜5Kšœ_˜_—šœžœžœžœ˜+Kšœžœ˜K˜3K˜-Kšžœžœžœžœžœžœžœ˜2K˜—šœžœžœžœ˜*Kšœžœ˜˜"Kšžœžœ˜*—K˜-Kšžœžœžœžœžœžœžœ˜2K˜—K˜Kšœžœ˜K˜)šžœžœžœž˜#Kšœžœ˜Kšœ*¡˜Dšžœžœžœ¡3˜PK˜lKšžœ˜K˜—Kšœ\¡˜ršžœžœ˜šžœžœžœ˜K˜tKšžœ˜K˜—K–Q[screen: Imager.Context, ggData: GGInterfaceTypes.GGData, showColors: BOOL]˜gKšœ<¡)˜ešœžœ˜#K˜&Kšœžœ˜Kšœžœžœ˜—K˜;Kšœ1˜1K–Q[screen: Imager.Context, ggData: GGInterfaceTypes.GGData, showColors: BOOL]˜RK˜—šžœ˜K˜šœ(˜(šžœžœ˜K˜Kšžœ
+žœžœ ˜4šžœ˜Kšœ4žœ˜9K˜2K˜—K˜K˜—K˜—šžœžœžœ˜K˜mKšžœ˜K˜—Kšœ3˜3K–Q[screen: Imager.Context, ggData: GGInterfaceTypes.GGData, showColors: BOOL]˜LK˜—Kšœ)¡#˜LKšœ0žœ˜5Kšœ0˜0K™K˜)K˜EKšœežœžœ˜ƒKšœ"¡˜5K˜Kšžœ˜—Kšžœ˜—Kš¢œ¡0˜PKšœ!˜!Kšœz˜zKšœpžœžœ˜ŽKšœ˜K˜ —šŸœžœžœžœžœžœ˜EKšžœžœžœžœžœžœžœ˜}Kšœƒ˜ƒK˜K˜ —šŸœ˜Kšžœžœžœ˜1Kšœ˜K˜ —šŸ	œ˜Kšžœžœžœ˜0Kšœ˜K˜ —šŸœ˜$Kšžœžœ˜0Kšœ7žœ˜<Kšœžœ˜Kšœžœžœžœžœžœ¡!˜RKšœ*˜*K˜#Kšœ'˜'K˜%Kšœ'˜'K˜%Kšœ%˜%K˜#Kšœ!˜!K˜Kšœ&˜&˜&Kš¢%™%—KšÏtœ7žœ˜RK˜)Kš¤œ˜)K˜%Kš¤œ˜Kš¤œ˜-Kšœžœ˜šž˜˜
+Kšœ}˜}K˜—šœ˜Kšœ—˜—K˜——Kšœ˜K˜ —šŸœ˜%Kšœžœžœ[¤œ"¤œ"¤œ˜·Kš
+œf¤œ¤œ	¤œ¤œ%¤˜ÓKšœ˜K˜ —šœžœ
+˜K˜ —šŸœ˜#Kš	œžœžœžœžœ˜.šžœ¤œžœ˜Kšœs˜sKšžœ˜K˜—K˜Kšœžœ˜Kšœ˜K˜ —š ¢œ˜%Kš	œžœžœžœžœ˜.šžœ¤œžœ˜Kšœv˜vKšžœ˜K˜—K˜Kšœžœ˜Kšœ˜K˜ —š ¢
+œ˜$Kš	œžœžœžœžœ˜,š
+žœ¤œžœžœžœ˜Kšœt˜tKšžœ˜K˜—K˜!Kšœžœ˜Kšœ˜K˜ —šŸœ˜#Kš	œžœžœžœžœ˜6KšœFžœ˜RKšœžœ˜šž˜˜
+Kšœ€˜€K˜——Kšœ˜K˜ —šŸœ˜Kš	œžœžœžœžœ˜.šžœ¤œžœ˜Kšœo˜oKšžœ˜K˜—K˜Kšœžœ˜Kšœ˜K˜ —šŸœ˜%Kš	œžœžœžœžœ˜.šžœ¤œžœ˜Kšœv˜vKšžœ˜K˜—K˜Kšœžœ˜Kšœ˜—K˜ šœ%™%L™ —šŸ
+œ˜šžœžœ#žœ˜Dš
+Ÿ	œžœžœžœžœ˜IKšœ9™9šŸœžœžœžœ˜0Kšœ˜Kš
+žœ$žœžœMžœžœ(˜ÈK˜—šŸœžœ+žœžœ˜VK˜K˜—Kšœ¢	œU™d˜NK™H—šžœ#žœ$žœžœ˜lK™RšŸ	œ˜Kšœ"žœžœ+˜UK˜—Kšœ0žœ˜Gšœžœžœžœ	ž˜&šžœž˜KšœŸœŸœ
+˜)KšœŸœŸœ˜0KšœŸœŸœ˜.KšœŸœŸœ˜4KšœŸœŸœ˜0Kšžœžœ˜——K˜K˜—Kšžœ˜¡K˜—K˜ Kšœ¡?˜WKšœ*žœ˜JKšœ&˜&Kšœžœžœ¡+˜TKšœžœžœ¡&˜XK–j[scene: GGModelTypes.Scene, selectClass: GGSegmentTypes.SelectionClass _ normal, full: BOOL _ FALSE]šœ˜Kšœ
+Ÿ
+œ¤œ¡˜QK–j[scene: GGModelTypes.Scene, selectClass: GGSegmentTypes.SelectionClass _ normal, full: BOOL _ FALSE]šœXžœ˜^K˜SK˜&K˜RK˜Nšžœžœžœ˜šŸœžœ˜/–P[context: Imager.Context, path: ImagerPath.PathProc, closed: BOOL _ FALSE]šŸœ'¡˜QK–Q[context: Imager.Context, path: ImagerPath.PathProc, oddWrap: BOOL _ FALSE]šœ7žœ˜>K˜—K–0[context: Imager.Context, strokeWidth: REAL]šœ$˜$K–7[context: Imager.Context, color: ImagerColor.Color]š	œžœžœžœžœ'˜dKšœ ¢œ˜4K˜—K˜ Kšœ?žœ˜JKšœQ¡2˜ƒK–K[scene: GGModelTypes.Scene, selectClass: GGSegmentTypes.SelectionClass]šžœžœ.žœ,˜€Kšœ	Ÿ	œ˜"Kšœ9¡˜SKšœ	¢œ¡0˜PK–Ý[feedback: Feedback.FeedbackData, msgType: Feedback.MsgType, format: ROPE _ NIL, v1: IO.Value _ [null[]], v2: IO.Value _ [null[]], v3: IO.Value _ [null[]], v4: IO.Value _ [null[]], v5: IO.Value _ [null[]]]šœ]˜]Kšœ}žœžœ˜›Kšœ˜—Kšžœn˜rKšœ˜—Kšžœ…˜‰K˜—K˜ L™KšŸœžœžœgžœžœžœžœ˜ÌK˜ šŸœžœ˜K™Kšœ,˜,Kšœ<˜<Kšœ*˜*Kšœ8˜8Kšœ:˜:Kšœ?˜?Kšœ3˜3Kšœ;˜;Kšœ<˜<Kšœ?˜?K˜ Kšœ.˜.K˜—K˜ K˜K˜ Kšžœ˜— …—    J  dæ  

@@ -1,0 +1,298 @@
+
+DIRECTORY
+IO USING [Backup, CharsAvail, Close, CreateStream, CreateStreamProcs, EndOf, EndOfStream, EraseChar, Flush, GetBlock, GetChar, PeekChar, PutBlock, PutChar, Reset, SP, STREAM, StreamProcs, UnsafeBlock, UnsafeGetBlock, UnsafePutBlock],
+IOClasses USING [],
+IOUtils USING [closedStreamProcs],
+RefText USING [ObtainScratch, ReleaseScratch];
+
+IOClassesImpl: CEDAR PROGRAM  
+IMPORTS IO, IOUtils, RefText
+EXPORTS IOClasses
+SHARES IO --for representation of StreamProcs
+= BEGIN
+
+STREAM: TYPE = IO.STREAM;
+StreamProcs: TYPE = IO.StreamProcs;
+UnsafeBlock: TYPE = IO.UnsafeBlock;
+
+
+Copy: PUBLIC PROC [from, to: STREAM, closeFrom, closeTo: BOOL, bufferByteCount: NAT] = {
+scratchLen: NAT = MAX[bufferByteCount, 1];
+buffer: REF TEXT ¨ RefText.ObtainScratch[scratchLen];
+DO
+nBytes: NAT ¨ IO.GetBlock[from, buffer, 0, scratchLen ! IO.EndOfStream => EXIT];
+IO.PutBlock[to, buffer, 0, nBytes];
+IF nBytes # scratchLen THEN EXIT;
+ENDLOOP;
+IF closeFrom THEN IO.Close[from];
+IF closeTo THEN IO.Close[to];
+RefText.ReleaseScratch[buffer];
+};
+
+
+FilterCommentsStreamData: TYPE = REF FilterCommentsStreamRecord; 
+FilterCommentsStreamRecord: TYPE = RECORD [
+inStringLiteral: BOOL ¨ FALSE,
+inCharLiteral: BOOL ¨ FALSE,
+inExtendedChar: BOOL ¨ FALSE
+];
+FilterCommentsStreamProcs: REF IO.StreamProcs = IO.CreateStreamProcs[
+variety: $input, class: $CommentFilter,
+getChar: FilterCommentsStreamGetChar
+];
+
+CreateCommentFilterStream: PUBLIC PROC [input: STREAM] RETURNS [STREAM] = { 
+RETURN[IO.CreateStream[
+streamProcs: FilterCommentsStreamProcs, backingStream: input,
+streamData: NEW[FilterCommentsStreamRecord ¨ []]]];
+};
+
+FilterCommentsStreamGetChar: PROC [self: STREAM] RETURNS [char: CHAR] = {
+data: FilterCommentsStreamData = NARROW[self.streamData];
+char ¨ self.backingStream.GetChar[];
+SELECT TRUE FROM
+data.inExtendedChar => {
+data.inExtendedChar ¨ FALSE; -- not really, but rest of extended char can't contain '"
+};
+data.inCharLiteral => {
+data.inCharLiteral ¨ FALSE;
+IF char = '\\ THEN data.inExtendedChar ¨ TRUE;
+};
+data.inStringLiteral => {
+SELECT char FROM
+'\\ => data.inExtendedChar ¨ TRUE;
+'\" => data.inStringLiteral ¨ FALSE; -- not really, but if following char is '" it will look like a new string literal, which is ok
+ENDCASE;
+};
+ENDCASE =>
+SELECT char FROM
+'\" => data.inStringLiteral ¨ TRUE;
+'\' => data.inCharLiteral ¨ TRUE;
+'<, '\253 => {
+nest: INT ¨ 1;
+IF char = '< THEN {
+IF self.backingStream.EndOf[] THEN GO TO notComment;
+IF self.backingStream.PeekChar[] # '< THEN GO TO notComment;
+char ¨ self.backingStream.GetChar[];
+};
+DO
+char ¨ self.backingStream.GetChar[];
+SELECT char FROM
+'< =>
+IF self.backingStream.PeekChar[] = '< THEN {
+char ¨ self.backingStream.GetChar[];
+nest ¨ nest + 1;
+};
+'> =>
+IF self.backingStream.PeekChar[] = '> THEN {
+char ¨ self.backingStream.GetChar[];
+nest ¨ nest - 1;
+IF nest <= 0 THEN GO TO endComment;
+};
+'\253 => nest ¨ nest + 1;
+'\273 => {nest ¨ nest - 1; IF nest <= 0 THEN GO TO endComment};
+ENDCASE;
+ENDLOOP;
+EXITS
+notComment => {};
+endComment => {char ¨ IO.SP};
+};
+'- => IF NOT self.backingStream.EndOf[]
+AND self.backingStream.PeekChar[] = '- THEN {
+[] ¨ self.backingStream.GetChar[];
+DO
+SELECT (char ¨ self.backingStream.GetChar[]) FROM
+'\l, '\r => EXIT;
+'- => IF self.backingStream.GetChar[] = '- THEN {
+char ¨ IO.SP; EXIT };
+ENDCASE;
+ENDLOOP;
+}
+ENDCASE;
+};
+
+
+CatInputStreamData: TYPE = REF CatInputStreamRecord; 
+CatInputStreamRecord: TYPE = RECORD [
+input1, input2: STREAM,
+state: CatInputStreamState];
+CatInputStreamState: TYPE = { initial, swapped, closed };
+CatInputStreamProcs: REF IO.StreamProcs = IO.CreateStreamProcs[
+variety: $input, class: $Concatenated,
+getChar: CatInputStreamGetChar,
+getBlock: CatInputStreamGetBlock,
+unsafeGetBlock: CatInputStreamUnsafeGetBlock,
+charsAvail: CatInputStreamCharsAvail,
+backup: CatInputStreamBackup,
+endOf: CatInputStreamEndOf,
+reset: CatInputStreamReset,
+close: CatInputStreamClose
+];
+
+CreateCatInputStream: PUBLIC PROC [input1, input2: STREAM] RETURNS [STREAM] = {
+RETURN[IO.CreateStream[streamProcs: CatInputStreamProcs, streamData: NEW[CatInputStreamRecord ¨ [input1: input1, input2: input2, state: $initial]]]];
+};
+
+CatInputStreamGetChar: PROC [self: STREAM] RETURNS [CHAR] = {
+data: CatInputStreamData = NARROW[self.streamData];
+{
+ENABLE IO.EndOfStream => IF data.state = $initial THEN GOTO nextStream;
+RETURN[data.input1.GetChar[]];
+EXITS nextStream => {
+SwapStreams[data];
+RETURN[data.input1.GetChar[]];
+}
+}
+};
+
+SwapStreams: PROC [data: CatInputStreamData] = {
+temp: STREAM ¨ data.input1;
+IF data.state # $initial THEN ERROR;
+data.input1 ¨ data.input2;
+data.input2 ¨ temp;
+data.state ¨ $swapped;
+};
+
+CatInputStreamGetBlock: PROC [self: STREAM, block: REF TEXT, startIndex: NAT, count: NAT] RETURNS [nBytesRead: NAT] = {
+data: CatInputStreamData = NARROW[self.streamData];
+nBytesRead ¨ data.input1.GetBlock[block, startIndex, count];
+IF nBytesRead > 0 OR data.state = $swapped THEN RETURN [nBytesRead];
+SwapStreams[data];
+RETURN[data.input1.GetBlock[block, startIndex, count]];
+};
+
+CatInputStreamUnsafeGetBlock: PROC [self: STREAM, block: UnsafeBlock] RETURNS [nBytesRead: INT] = TRUSTED {
+data: CatInputStreamData = NARROW[self.streamData];
+nBytesRead ¨ data.input1.UnsafeGetBlock[block];
+IF nBytesRead > 0 OR data.state = $swapped THEN RETURN [nBytesRead];
+SwapStreams[data];
+RETURN[data.input1.UnsafeGetBlock[block]];
+};
+
+CatInputStreamEndOf: PROC [self: STREAM] RETURNS [BOOL] = {
+data: CatInputStreamData = NARROW[self.streamData];
+IF NOT data.input1.EndOf[] THEN RETURN [FALSE];
+IF data.state = $swapped THEN RETURN [TRUE];
+SwapStreams[data];
+RETURN [data.input1.EndOf[]];
+};
+
+CatInputStreamCharsAvail: PROC [self: STREAM, wait: BOOL] RETURNS [INT] = {
+data: CatInputStreamData = NARROW[self.streamData];
+RETURN[data.input1.CharsAvail[wait]];
+};
+
+CatInputStreamBackup: PROC [self: STREAM, char: CHAR] = {
+data: CatInputStreamData = NARROW[self.streamData];
+data.input1.Backup[char];
+};
+
+CatInputStreamReset: PROC [self: STREAM] = {
+data: CatInputStreamData = NARROW[self.streamData];
+data.input1.Reset[];
+data.input2.Reset[];
+};
+
+CatInputStreamClose: PROC [self: STREAM, abort: BOOL] = {
+data: CatInputStreamData = NARROW[self.streamData];
+data.input1.Close[];
+data.input2.Close[];
+data.state ¨ $closed;
+self.streamProcs ¨ IOUtils.closedStreamProcs;
+};
+
+
+DribbleStreamData: TYPE = REF DribbleStreamRecord;
+DribbleStreamRecord: TYPE = RECORD [outputStream: STREAM];
+DribbleStreamProcs: REF StreamProcs ¨ IO.CreateStreamProcs[
+variety: $output, class: $Dribble,
+putChar: DribbleStreamPutChar,
+putBlock: DribbleStreamPutBlock,
+unsafePutBlock: DribbleStreamUnsafePutBlock,
+flush: DribbleStreamFlush,
+eraseChar: DribbleStreamEraseChar,
+reset: DribbleStreamReset,
+close: DribbleStreamClose
+];
+
+CreateDribbleOutputStream: PUBLIC PROC [output1, output2: STREAM] RETURNS [STREAM] = {
+RETURN[IO.CreateStream[
+streamProcs: DribbleStreamProcs,
+streamData: NEW[DribbleStreamRecord ¨ [outputStream: output2]],
+backingStream: output1]];
+};
+
+DribbleStreamPutChar: PROC [self: STREAM, char: CHAR] = {
+data: DribbleStreamData = NARROW[self.streamData];
+self.backingStream.PutChar[char];
+data.outputStream.PutChar[char];
+};
+
+DribbleStreamPutBlock: PROC [self: STREAM, block: REF READONLY TEXT, startIndex: NAT, count: NAT] = {
+data: DribbleStreamData = NARROW[self.streamData];
+self.backingStream.PutBlock[block, startIndex, count];
+data.outputStream.PutBlock[block, startIndex, count];
+};
+
+DribbleStreamUnsafePutBlock: PROC [self: STREAM, block: IO.UnsafeBlock] = {
+data: DribbleStreamData = NARROW[self.streamData];
+self.backingStream.UnsafePutBlock[block];
+data.outputStream.UnsafePutBlock[block];
+};
+
+DribbleStreamFlush: PROC [self: STREAM] = {
+data: DribbleStreamData = NARROW[self.streamData];
+self.backingStream.Flush[];
+data.outputStream.Flush[];
+};
+
+DribbleStreamEraseChar: PROC [self: STREAM, char: CHAR] = {
+data: DribbleStreamData = NARROW[self.streamData];
+self.backingStream.EraseChar[char];
+data.outputStream.EraseChar[char];
+};
+
+DribbleStreamReset: PROC [self: STREAM] = {
+data: DribbleStreamData = NARROW[self.streamData];
+self.backingStream.Reset[];
+data.outputStream.Reset[];
+};
+
+DribbleStreamClose: PROC [self: STREAM, abort: BOOL] = {
+data: DribbleStreamData = NARROW[self.streamData];
+self.backingStream.Close[abort];
+data.outputStream.Close[abort];
+};
+
+END.
+   ¥  
+IOClassesImpl.mesa
+Copyright ” 1985, 1986, 1988, 1990, 1991 by Xerox Corporation.  All rights reserved.
+MBrown on January 13, 1984 1:32 pm
+Russ Atkinson (RRA) May 10, 1985 4:24:56 pm PDT
+Eduardo Pelegri-Llopart December 5, 1988 2:29:20 pm PST
+Willie-sue, April 6, 1990 5:12 pm PDT
+Copy
+scratchLen: NAT = 128;
+Comment-filtered Input Stream
+May raise IO.EndOfStream.
+Skip over the comment.  Return ending CR, LF, or SP if ends without CR, or raise IO.EndOfStream if comment ends with end of input.
+Concatenated Input Stream
+we preserve the information for debugging purposes
+Dribble Output Stream 
+Eduardo Pelegri-Llopart December 5, 1988 2:28:45 pm PST
+Treats CR and LFs identically.
+
+ ù A  ïNewlineDelimiter
+ñ(cedarcode) styleô codeöúôKöú
+œeúIôTKöú
+œcô"Jô/Kô7Kô%óKò öœk	ò	Köüúüúõüúüú<òÈKöú
+üúòKöúüúò"Köúüú!ò.Kò óöœbúüúüúòKöüúüúòKöüú
+òKöüúüúû#ò-KöüòKò KöüúüúüúüúòKöúüúüúò#Köúüúüúò#Kò óôKò öœnúüúüúüúüúüúòXKöúüúôKöúüúüúò*Köúüúüú%ò5öüòKö	úüúüú(üúüúòPKöüú!ò#Köüúüúüúò!KöüúòóKöüúüúüúò!Köüú	üúüúòKöúòKöúòóKò óôKò KöúüúüúòAöúüúüúò+KöúüúüúòKöúüúüúòKöúüúüòKòóöúüúüúüúòEKöú'ò'Kò$KöúòKò óö°úüúüú	üúüúüúòLöüúüúòKöú=ò=Köúüú$ò3óKöúòKò óö
+°úüúüúüúüúòIKöú!üúò9öú$ò$Köú
+üúôóöüúüúüòöúòKöúüúû9òVKöúòóöúòKöúüúòKöüúüúüúò.KöúòóöúòöüúüòKöúüúò"Köúüúû^òÉKöüúòóKöúòóöüúò
+öüúüòKöúüúò#Köúüúò!öúòKöúüúòöüúüúòKöüúüúüúüúò4Köüú$üúüúüúò<Köú$ò$KòóöüòKöú$ò$öüúüòöúòöüú$üúò,Köú$ò$KòKòóóöúòöüú$üúò,Köú$ò$KòKöüúüúüúüúò#KòóóKöúòKö	úüúüúüúüúò?KöüúòóKöüúòóöüòKöúòKöúüúüúòóKòóöúüúüúò'öüú$üúò-Kö	ú&üú	üúüúüú/ôÇKöú"ò"öüòöüú'üò1Köúüúòöúüú#üúò1KöúüúüúüúòóKöüúòóKöüúòóKòóóKöüúòóóóKòKò óóôKò Köúüúüúò5öúüúüúò%KöúüòKöúòóKöúüú ò9öúüúüú$ò?Köú&ò&KöúòKöú!ò!Köú-ò-Köú%ò%KöúòKöúòKöúòKöúòKöúòKò óö°úüúüúüúüúüúòOKöüúüú<üúMòïKöúòKò óö
+°úüúüúüúüúò=Köúüúò3òKö
+üúüúüúüúüúòGKöüúòöüúòKòKöüúòKòóKòóKòKò óö°úüúò0Köú2ô2KöúüúòKöüúüúüúò$KöúòKöúòKòKòKò óö°úüúüú	üúüúüú	üúüúüúòwKöúüúò3Köú<ò<KöüúüúüúüúòDKòKöüú1ò7KöúòKò óö°úüúüúüúüúüúòkKöúüúò3Köú/ò/KöüúüúüúüúòDKòKöüú$ò*KöúòKò óö
+°úüúüúüúüúò;Köúüúò3Kö
+üúüúüúüúüúò/Köüúüúüúüúò,KöúòKöüúòKòKò óö°úüúüúüúüúüúòKKöúüúò3Köüúò%KòKò óö°úüúüúüúò9Köúüúò3KöúòKòKò óö°úüúüúò,Köúüúò3KöúòKòKòKò óö°úüúüú	üúò9Köúüúò3KöúòKòKöúòKò-KòKò óóôKò Kö°úüúüúò2Kö°úüúüúüúò:öúüúüúò;Kò"KòKò Kò,KòKò"KöúòKòKöúòKò óö°úüúüúüúüúüúòVöüúüúòKò Köúüú0ò?KöúòóKöúòKò óö°úüúüúüúò9Köúüúò2Köú!ò!Köú ò KöúòKò óö°úüúüú	üúüúüúüú	üúòeKöúüúò2Köú6ò6Köú5ò5KöúòKò óö°úüúüúòKKöúüúò2Köú)ò)Köú(ò(KöúòKò óö°úüúüúò+Köúüúò2KöúòKöúòKöúòKò óö°úüúüúüúò;Köúüúò2Köú#ò#Köú"ò"KöúòKò óö°úüúüúò+Köúüúò2KöúòKöúòKöúòKò óö°úüúüú	üúò8Köúüúò2Köú ò KöúòKöúòóóKò Köüúòô7KôóKô ó Öó     H  .=  

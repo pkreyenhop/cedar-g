@@ -1,0 +1,488 @@
+DIRECTORY
+BasicTime USING [Now],
+FS,
+MailBasics,
+MailBasicsFileTypes,
+MailBasicsItemTypes,
+MailMessage USING [ReadOneMessage],
+MailRetrieve USING [Failed, Handle, MBXState, ServerState, Accept, Close, Create, MailboxState, NextMessage, NextServer, NewUser, ServerName, StartMessage],
+MailUtils USING [Credentials],
+Idle USING [IdleHandler, IdleRegistration, RegisterIdleHandler],
+IO,
+Process USING [Detach, Pause, SecondsToTicks],
+RefText,
+Rope,
+WalnutKernelDefs,
+WalnutNewMail USING [],
+WalnutDefs USING [CheckReportProc, Error, RetrieveState, ServerResponse, WalnutOpsHandle],
+WalnutOps USING [ EndNewMail],
+WalnutOpsInternal,
+WalnutRoot USING [FlushMailStream, GetOpsHandleList, RootHandle, RootHandleRec],
+WalnutStream USING [AbortStream, IdOnFileWithSender, WriteEntry];
+
+WalnutNewMailImpl: CEDAR MONITOR
+
+IMPORTS BasicTime, FS, Idle, IO, MailMessage, MailRetrieve, Process, Rope, WalnutDefs, WalnutOps, WalnutRoot, WalnutStream
+
+EXPORTS
+WalnutDefs, WalnutNewMail
+
+= BEGIN
+
+ROPE: TYPE = Rope.ROPE;
+STREAM: TYPE = IO.STREAM;
+CheckReportProc: TYPE = WalnutDefs.CheckReportProc;
+WalnutOpsHandle: TYPE = WalnutDefs.WalnutOpsHandle;
+RootHandle: TYPE = WalnutRoot.RootHandle;
+RootHandleRec: PUBLIC TYPE = WalnutRoot.RootHandleRec;
+KernelHandle: TYPE = WalnutOpsInternal.KernelHandle;
+KernelHandleRec: PUBLIC TYPE = WalnutOpsInternal.KernelHandleRec;
+
+TiogaCTRL: MailBasics.ItemType = MailBasicsItemTypes.tioga1;
+
+MailHandle: TYPE = WalnutOpsInternal.MailHandle;
+MailHandleObject: PUBLIC TYPE = WalnutOpsInternal.MailHandleObject;
+copyBuffer: REF TEXT ¨ NEW[TEXT[RefText.page]];
+newMailCreateMsg: WalnutKernelDefs.MsgLogEntry ¨ NEW[CreateMsg WalnutKernelDefs.LogEntryObject];
+
+idled: BOOL ¨ FALSE; -- this is true if the machine has been put in the idle state
+idleReg: Idle.IdleRegistration;
+
+msgPollingInterval: INT ¨ 300;		-- seconds between pollings
+checkingRope: ROPE = "Checking for new mail ...";
+
+EnableMailRetrieval: PUBLIC ENTRY PROC[
+opsHandle: WalnutOpsHandle,
+registeredUsers: LIST OF MailUtils.Credentials,
+reportProc, progressProc: CheckReportProc,
+getMailLog: PROC[WalnutOpsHandle] RETURNS[STREAM],
+recordMailInfo: PROC[opsHandle: WalnutOpsHandle, logLen: INT, server: ROPE, num: INT] RETURNS[BOOL],
+notifyWhenMailRetrieved: PROC[opsHandle: WalnutOpsHandle, ok: BOOL, someMail: BOOL] ] = {
+ENABLE UNWIND => NULL;
+
+this: MailHandle;
+IF idleReg = NIL THEN idleReg ¨ Idle.RegisterIdleHandler[NewMailIdleProc];
+IF opsHandle.kernelHandle.mailHandle # NIL THEN RETURN;
+
+this ¨ NEW[WalnutOpsInternal.MailHandleObject ¨ [
+procForReporting: reportProc,
+procForProgress: progressProc,
+notifyProc: notifyWhenMailRetrieved,
+registeredUsers: registeredUsers,
+lastStatus: checkingRope,
+getMailLogProc: getMailLog,
+recordMailInfoProc: recordMailInfo,
+mrHandle: MailRetrieve.Create[ msgPollingInterval, WatchMailBox ]
+] ];
+
+opsHandle.kernelHandle.mailHandle ¨ this;
+TRUSTED{ Process.Detach[ FORK StartIt[this.mrHandle, this.registeredUsers] ] }
+};
+
+StartIt: PROC[mH: MailRetrieve.Handle, users: LIST OF MailUtils.Credentials] = {
+FOR rnL: LIST OF MailUtils.Credentials ¨ users, rnL.rest UNTIL rnL = NIL DO
+MailRetrieve.NewUser[mH, rnL.first.rName, rnL.first.password]
+ENDLOOP;
+};
+
+DisableMailRetrieval: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle] = {
+ENABLE UNWIND => NULL;
+this: MailHandle = opsHandle.kernelHandle.mailHandle;
+opsHandle.kernelHandle.mailHandle ¨ NIL;
+IF this # NIL THEN
+IF this.mailInProgress THEN this.needsClosing ¨ TRUE
+ELSE {
+this.hasBeenClosed ¨ TRUE;
+TRUSTED { Process.Detach[ FORK MailRetrieve.Close[this.mrHandle] ] }
+};
+};
+
+GetLastMailBoxStatus: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle]
+RETURNS[mbxState: MailRetrieve.MBXState, status: ROPE] = {
+ENABLE UNWIND => NULL;
+this: MailHandle = opsHandle.kernelHandle.mailHandle;
+IF this = NIL THEN RETURN[unknown, NIL];
+RETURN[this.lastStateReported, this.lastStatus]
+};
+
+CheckMailBoxes: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle] = {
+ENABLE UNWIND => NULL;
+this: MailHandle = opsHandle.kernelHandle.mailHandle;
+IF ( this = NIL ) OR ( this.mailInProgress ) THEN RETURN;
+this.tryForNewMail ¨ FALSE;
+this.mailInProgress ¨ TRUE;
+TRUSTED { Process.Detach[FORK AutoNewMailProc[opsHandle, this]] }
+};
+
+CheckMailReport: CheckReportProc = {
+this: MailHandle = opsH.kernelHandle.mailHandle;
+IF ( this # NIL ) AND ( this.procForReporting # NIL ) THEN this.procForReporting[opsH, format, v1, v2, v3];
+};
+
+ProgressReport: CheckReportProc = {
+this: MailHandle = opsH.kernelHandle.mailHandle;
+IF this = NIL THEN RETURN;	-- race condition
+IF this.procForProgress # NIL THEN this.procForProgress[opsH, format, v1, v2, v3];
+};
+
+NewMailIdleProc: ENTRY Idle.IdleHandler = {
+ENABLE UNWIND => NULL;
+idled ¨ reason = becomingIdle;
+FOR wL: LIST OF WalnutOpsHandle ¨ WalnutRoot.GetOpsHandleList[], wL.rest UNTIL wL = NIL DO
+this: MailHandle;
+opsH: WalnutOpsHandle = wL.first;
+IF ( opsH.kernelHandle = NIL ) OR ( ( this ¨ opsH.kernelHandle.mailHandle ) = NIL ) THEN LOOP;
+IF this.tryForNewMail AND NOT idled THEN TRUSTED {
+this.tryForNewMail ¨ FALSE;
+this.mailInProgress ¨ TRUE;
+Process.Detach[FORK AutoNewMailProc[wL.first, this]]
+};
+ENDLOOP;
+}; 
+
+WatchMailBox: ENTRY PROC[mrH: MailRetrieve.Handle, newState: MailRetrieve.MBXState] = {
+ENABLE UNWIND => NULL;
+status: ROPE;
+this: MailHandle;
+opsH: WalnutOpsHandle;
+IF newState = unknown THEN RETURN;
+opsH ¨ FindOpsHandle[mrH];
+IF ( opsH = NIL ) OR ( this ¨ opsH.kernelHandle.mailHandle ) = NIL THEN RETURN;
+IF ( this.lastStateReported = notEmpty ) AND
+( ( newState = someEmpty ) OR ( newState = allEmpty ) ) THEN
+status ¨ "New mail was read"
+ELSE
+{ SELECT newState FROM
+badName   => status ¨ "Your user name is invalid, please log in";
+badPwd    => status ¨ "Your password is invalid";
+cantAuth  => status ¨ "Can't check your credentials at this time";
+userOK    => status ¨ "Your credentials are OK";
+allDown   => status ¨ "All of the mail servers are down";
+someEmpty => status ¨ "All of the mail servers checked are empty";
+allEmpty  => status ¨ "There is no new mail";
+notEmpty  => status ¨ "You have new mail";
+ENDCASE   => status ¨ "Bad State!";
+};
+this.lastStateReported ¨ newState;
+this.lastStatus ¨ status;
+this.tryForNewMail ¨ NOT this.mailInProgress AND
+( ( this.tryForNewMail ) OR ( newState = notEmpty ) );
+IF ( this.tryForNewMail ) AND ( NOT idled ) THEN TRUSTED {
+this.tryForNewMail ¨ FALSE;
+this.mailInProgress ¨ TRUE;
+Process.Detach[FORK AutoNewMailProc[FindOpsHandle[mrH], this]] };
+};
+
+MailFetchDone: ENTRY PROC[this: MailHandle] = {
+IF ( this.needsClosing ) AND ( NOT this.hasBeenClosed ) THEN {
+this.hasBeenClosed ¨ TRUE;
+TRUSTED { Process.Detach[ FORK MailRetrieve.Close[this.mrHandle] ]};
+};
+this.mailInProgress ¨ FALSE
+};
+
+AutoNewMailProc: PROC[opsH: WalnutOpsHandle, this: MailHandle] = {
+ok, someMail: BOOL;
+IF this.registeredUsers = NIL THEN RETURN;
+DO
+[ok, someMail] ¨ DoNewMail[opsH, this];
+IF ok THEN EXIT;
+IF ( this.notifyProc # NIL ) THEN this.notifyProc[opsH, ok, someMail];
+Process.Pause[Process.SecondsToTicks[60]];
+ENDLOOP;
+MailFetchDone[this];
+IF ( this.notifyProc # NIL ) THEN this.notifyProc[opsH, ok, someMail];
+};
+
+FindOpsHandle: PROC[mrH: MailRetrieve.Handle] RETURNS[opsH: WalnutOpsHandle] = {
+FOR opsL: LIST OF WalnutOpsHandle ¨ WalnutRoot.GetOpsHandleList[], opsL.rest UNTIL opsL = NIL DO
+IF ( opsL.first.kernelHandle.mailHandle # NIL ) AND
+( opsL.first.kernelHandle.mailHandle.mrHandle = mrH ) THEN RETURN[opsL.first];
+ENDLOOP;
+RETURN[NIL];
+};
+
+DoNewMail: PROC[opsH: WalnutOpsHandle, mH: MailHandle] RETURNS[ok: BOOL, someMail: BOOL] = {
+mailStream: STREAM;
+serverKnown: BOOL ¨ FALSE;
+sr: WalnutDefs.ServerResponse;
+errMsg: ROPE;
+err: ROPE = " during new mail; retrieval abandoned";
+someMail ¨ FALSE;
+ok ¨ FALSE;
+
+BEGIN ENABLE BEGIN
+WalnutDefs.Error => {
+errMsg ¨ "\n WalnutDefs Error during New Mail; retrieval abandoned";
+GOTO noGood;
+};
+FS.Error => { errMsg ¨ error.explanation.Concat[err]; GOTO noGood};
+IO.Error => {
+ed: FS.ErrorDesc;
+<<ed ¨ FS.ErrorFromStream[stream ! IO.Error, FS.Error => CONTINUE];>>
+IF ed.explanation # NIL THEN
+errMsg ¨ ed.explanation.Concat[err]
+ELSE errMsg ¨ "IO Error during new mail; retrieval abandoned";
+GOTO noGood
+};
+END;
+
+IF CheckForStopping[mH] THEN RETURN[TRUE, FALSE];
+
+IF mH.getMailLogProc = NIL THEN RETURN[FALSE, FALSE];	-- had been shut down
+IF ( mailStream ¨ mH.getMailLogProc[opsH] ) = NIL THEN {
+ProgressReport[opsH, "\tCan't get newMailLog for %g @ %g\n", [rope[mH.registeredUsers.first.rName.name]], [time[BasicTime.Now[]]] ];
+RETURN[FALSE, FALSE]
+};
+
+IF CheckForStopping[mH] THEN RETURN[TRUE, FALSE];
+
+ProgressReport[opsH, "\n ~~~ Retrieving mail for %g @ %g\n", [rope[mH.registeredUsers.first.rName.name]], [time[BasicTime.Now[]]] ];
+mailStream.SetIndex[mailStream.GetLength[]];
+
+SELECT MailRetrieve.MailboxState[mH.mrHandle] FROM
+badName => {
+msg: ROPE ~ "\nSome mailbox reported badName - possibly no mailBox\n";
+CheckMailReport[opsH, "%g\n", [rope[errMsg]] ];
+ProgressReport[opsH, "%g\n", [rope[msg]] ];
+};
+badPwd => {
+msg: ROPE ~ "\nSome mailbox reported badPwd\n";
+CheckMailReport[opsH, "%g\n", [rope[errMsg]] ];
+ProgressReport[opsH, "%g\n", [rope[msg]] ];
+};
+cantAuth => {
+msg: ROPE ~ "\nSome server not found\n";
+CheckMailReport[opsH, "%g\n", [rope[errMsg]] ];
+ProgressReport[opsH, "%g\n", [rope[msg]] ];
+};
+ENDCASE; --ok to try
+
+DO 			-- Loops over servers.
+state: WalnutDefs.RetrieveState;
+num: INT ¨ 0;		-- the number of messages read from server.
+noMore: BOOLEAN;			-- TRUE if no more servers.
+serverState: MailRetrieve.ServerState;	-- The state of the server.
+thisServer: MailBasics.RName;
+
+BEGIN
+ENABLE UNWIND => {
+DO
+[noMore, serverState] ¨ MailRetrieve.NextServer[mH.mrHandle];	-- cycle thru servers
+IF ~noMore THEN LOOP;
+ENDLOOP;
+};
+-- Step through the servers.
+IF CheckForStopping[mH] THEN RETURN[TRUE, FALSE];
+
+[noMore, serverState] ¨ MailRetrieve.NextServer[mH.mrHandle];
+IF noMore THEN EXIT;			-- Last server?  Then done.
+serverKnown ¨ TRUE;
+
+thisServer ¨ MailRetrieve.ServerName[mH.mrHandle];
+ProgressReport[opsH, "(%g) %g: ", [atom[thisServer.ns]], [rope[thisServer.name]] ];
+SELECT serverState FROM
+unknown => state ¨ $didNotRespond;
+empty => state ¨ $OK;
+notEmpty => {
+curPos: INT ¨ mailStream.GetLength[];
+[num, state] ¨ DrainServer[mailStream, opsH, mH];
+IF num = -1 THEN {
+mailStream.SetLength[curPos];
+WalnutRoot.FlushMailStream[opsH]
+};
+};
+ENDCASE;
+
+IF serverState = notEmpty AND state = $OK AND okToFlush THEN {
+sr.state ¨ state;
+sr.num ¨ num;
+IF num # -1 THEN {
+IF ~mH.recordMailInfoProc[opsH, mailStream.GetLength[], thisServer.name, num]
+THEN { ReleaseNewMail[opsH, mailStream]; ok ¨ FALSE; RETURN };
+MailRetrieve.Accept[mH.mrHandle ! MailRetrieve.Failed => {state ¨ $FlushFailed; CONTINUE}];
+someMail ¨ TRUE;
+};
+};
+
+IF mH.procForProgress # NIL THEN {
+SELECT serverState FROM
+unknown => ProgressReport[opsH, " did not respond\n"];
+empty => ProgressReport[opsH, " empty\n"];
+notEmpty =>
+IF num = -1 THEN ProgressReport[opsH, " retrieval abandoned\n"]
+ELSE ProgressReport[opsH, " %g messages\n", [integer[num]] ];
+ENDCASE;
+IF state = $FlushFailed THEN
+ProgressReport[opsH, "\n   Flush of (%g) %g failed; you may get some messages again\n", [atom[thisServer.ns]], [rope[thisServer.name]] ];
+};
+END;
+ENDLOOP;	-- End of servers loop, exit.
+
+ok ¨ TRUE;
+WalnutOps.EndNewMail[opsH];		-- release the newMailLog
+IF NOT serverKnown THEN CheckMailReport[opsH, "NoMailboxes\n"];
+EXITS
+noGood => {
+CheckMailReport[opsH, "%g\n", [rope[errMsg]] ];
+ProgressReport[opsH, "%g\n", [rope[errMsg]] ];
+ReleaseNewMail[opsH, mailStream];  -- release the newMailLog
+};
+
+END;
+};
+
+ReleaseNewMail: PROC[opsH: WalnutOpsHandle, strm: STREAM] = {
+IF strm # NIL THEN
+WalnutStream.AbortStream[strm ! IO.Error, FS.Error => CONTINUE]; -- ignore errors
+WalnutOps.EndNewMail[opsH ! WalnutDefs.Error => CONTINUE];
+};
+
+okToFlush: BOOL ¨ TRUE;		-- for debugging
+
+DrainServer: PROC[strm: STREAM, opsH: WalnutOpsHandle, mH: MailHandle]
+	RETURNS[num: INT, state: WalnutDefs.RetrieveState] = {
+ENABLE UNWIND => NULL;
+msgState: MsgState;
+num ¨ 0;
+DO
+[msgState, state] ¨ ReadMessageItems[strm, opsH, mH];
+SELECT msgState FROM
+noMore => EXIT;
+OK, wasDeleted => NULL;
+retrieveFailed => {num ¨ -1; EXIT};
+ENDCASE => ERROR;
+IF NOT (msgState = wasDeleted) THEN {
+IF (num ¨ num + 1) MOD 10 = 0 THEN ProgressReport[opsH, "! "]
+ELSE ProgressReport[opsH, "."];		-- report progress
+};
+ENDLOOP;
+};
+
+MsgState: TYPE = {OK, retrieveFailed, noMore, wasDeleted};
+
+ReadMessageItems: PROC[strm: STREAM, opsH: WalnutOpsHandle, mH: MailHandle]
+RETURNS [msgState: MsgState, state: WalnutDefs.RetrieveState] = {
+-- This routine reads the next message on this connection, returning MsgState = noMore when there aren't any more.
+ENABLE MailRetrieve.Failed => {
+state ¨ why;
+GOTO thisFailed;
+};
+
+msgExists, archived, deleted, ok: BOOLEAN;
+timeStamp: MailBasics.Timestamp;
+sender: MailBasics.RName;
+
+IF CheckForStopping[mH] THEN {
+ProgressReport[opsH, "  stopping retrieval\n"];
+RETURN[retrieveFailed, $OK];
+};
+
+msgState ¨ OK;
+state ¨ $OK;
+
+[msgExists, archived, deleted] ¨ MailRetrieve.NextMessage[mH.mrHandle];
+
+IF deleted THEN { msgState ¨ wasDeleted; RETURN};
+IF NOT msgExists THEN { msgState ¨ noMore; RETURN};
+
+-- Now read all the items in the message, terminating on the LastItem, and skipping the ones that we're not yet interested in.
+
+[timeStamp, sender, ] ¨ MailRetrieve.StartMessage[mH.mrHandle] ;
+ok ¨ MsgToStream[strm, timeStamp, sender, opsH, mH];
+IF ~ok THEN msgState ¨ retrieveFailed;
+
+EXITS
+thisFailed => msgState ¨ retrieveFailed;
+};
+
+CheckForStopping: ENTRY PROC[mH: MailHandle] RETURNS[stop: BOOL] = {
+IF (stop ¨ mH.needsClosing) AND ~mH.hasBeenClosed THEN {
+mH.hasBeenClosed ¨ TRUE;
+TRUSTED { Process.Detach[ FORK MailRetrieve.Close[mH.mrHandle] ] };
+};
+};
+
+MsgToStream: PROC[strm: STREAM, timeStamp: MailBasics.Timestamp, sender: MailBasics.RName, opsH: WalnutOpsHandle, mH: MailHandle]
+RETURNS[ok: BOOL] = {
+curPos: INT;
+msg: ROPE = WalnutStream.IdOnFileWithSender[timeStamp, sender];
+newMailCreateMsg.msg ¨ msg;
+	-- other fields are set later & entry is re-written
+curPos ¨ WalnutStream.WriteEntry[strm, newMailCreateMsg, -1];
+[ , , newMailCreateMsg.textLen, newMailCreateMsg.formatLen, ] ¨
+MailMessage.ReadOneMessage[mH.mrHandle, timeStamp, sender.name, strm];
+
+IF newMailCreateMsg.textLen = -1 THEN { strm.SetLength[curPos]; RETURN[FALSE]};
+[] ¨ WalnutStream.WriteEntry[strm, newMailCreateMsg, curPos];
+WalnutRoot.FlushMailStream[opsH];
+RETURN[TRUE];
+};
+
+
+END.
+  ˛  
+WalnutNewMailImpl.mesa
+Copyright ” 1984, 1988, 1989, 1992 by Xerox Corporation.  All rights reserved.
+Willie-Sue, November 27, 1989 4:16:54 pm PST
+
+Walnut New Mail Operations Implementation
+Terry, August 30, 1990 11:40 am PDT
+Willie-s, August 12, 1993 11:11 am PDT
+
+WalnutSendOps USING [TiogaCTRL],
+
+
+Types
+TiogaCTRL: MailBasics.ItemType = WalnutSendOps.TiogaCTRL;
+
+Variables
+
+
+Procedures
+
+Watch the mailbox & retrieve mail when available
+make sure that only one idle proc is registered here!
+This is called when the condition of the mailbox changes
+If there is new mail, then tryForNewMail is true, unless idle is FALSE and the new mail retrieval process succeeds
+
+Cycle through the servers, until you find one that has mail.
+now we can flush the server
+Reads mail from the next grapevine server via mH.
+Write a message on the newMailLog stream
+writes a createMsg entry, then copies the message from grapevine to the stream, returns ok if there were no errors; flushes the stream; catches errors and returns FALSE
+ù G  ïNewlineDelimiter
+ñ(cedarcode) styleô codeöœbôKöú
+œeúCôNKô,Kô Köú)ô)Kô#Kô&Kô óöœk	ò	Köú
+üúòKöüúòKöúòKòKòKöúüúò#KöúüúäòúKöú
+üúòKöúüú6ò@KöüúòKöúüú!ò.KöúòKöúòKòKöúüúòKöúüúJòZKöú
+üúòKöúòKöúüú@òPKöúüúô Köúüú/òAKò óöùúüúüò Kò öüúüúüú[òzKò óöüòKöúòKò óKöúüòKô Kô öùôKò KöüúüúüúòKöüúüúüúüúòKöúüúò3Köúüúò3Köúüúò)Köúüúò6Köúüú"ò4Köúüúüú%òAKò Kô9Kò<Kò Köúüú ò0Köúüúüú&òCóKô öù	ô	Kô Kö	úüúüúüúüúò/öú1üú,ò`Kò óKöúüúüúœc=òRöúòKò óKöúüú	†ò;Köúüúò1óKô Köù
+ô
+Kô öù0ô0Kò ö$œnúüúüúüú/üúüúOüúüúüúüú%üú
+üúüúüúüúüú!üúüúòêKöüúüúüúòKò KòKöüúüúüú5òJKöú5ô5Köüú%üúüúüúò7Kò öúüúÃò÷Kò óKò)Köüúüú1òNKòKò óö°úüú!üúüúòPöüúüúüú)üúüúüòKKöú=ò=KöüúòóKòóKò ö°úüúüúüú òGKöüúüúüúòKöú5ò5Köú$üúò(öüúüúüòKöüúüúüò4öüúòKöúüúòKöüúüú&òDKòóóKòóKò ö°úüúüúüúüú*üúò~KöüúüúüúòKöú5ò5Kö
+üúüúüúüú
+üúò(Köüú)ò/KöúòóKò ö°úüúüúüú òAKöüúüúüúòKöú5ò5Kö
+üú
+üúüúüúüúò9KöúüúòKöúüúòKöüúüú$òAKòóKò ö°úò$Köú0ò0Kö
+üú
+üúüúüúüú1òkKöúòóKò ö°úò#Köú0ò0Kö	üúüúüúüú†ò,Köüúüúüú0òRKöúòóKò ö°úüúò+KöüúüúüúòKòöüúüúüú:üúüúüòZKöúòKöú!ò!Köüúüúüú-üúüúüúò^ö
+üúüúüúüúüúò2KöúüúòKöúüúòKöúüú!ò4KöúòóKöüúòóKöúòóKò ö°úüúüú?òWKöú8ô8KôrKöüúüúüúòKöúüúòKòKòKöüúüúüúò"KòKöüú
+üúüú+üúüúüúòOöüú'üúüúüòiKòöüòöúüú
+üòKòAKò1KòBKò0Kò9KòBKò-Kò*Köüúò#óKòóóKò"KòKöúüúüúüúògö
+üúüúüú	üúüúò:KöúüúòKöúüúòKöúüú.òAóKöúòóKò ö°úüúüúò/öüúüúüúüúò>KöúüúòKöüúüú&òDKòóKöúüòKöúòóKò ö°úüú-òBKöúüúòKöüúüúüúüúò*öüòKò'KöüúüúüúòKöüúüúüú%òFKöú*ò*KöüúòóKöúòKöüúüúüú%òFKöúòKò óö°úüúüúòPöüúüúüú<üúüúüò`Kö
+üú(üúüú7üúüúòÇKöüúòóKöüúüúòKòKò óö
+°	úüú(üúüúüúò\KöúüúòKöúüúüúòKòKöúüúòKöúüú+ò4KöúüúòKöúüúòKò öüúüúüòöúòKòDKöüúòKòóKöüú4üú	òCöüúòKöúüúòKö	úüúüúüú
+üúòEöüúüúüòKò#Köüú:ò>óKöüúòKòóKöüúòóKò Kö
+üúüúüúüúüúò1Kò Köüúüúüúüúüúüú†òKöüú,üúüúò8KöúÑòÑKöüúüúüúòKòóKò Kö
+üúüúüúüúüúò1Kò KöúÑòÑKöú,ò,Kò öüú(üò2öúòKöúüú=òFKöú/ò/Köú+ò+KòóöúòKöúüú&ò/Köú/ò/Köú+ò+KòóöúòKöúüúò(Köú/ò/Köú+ò+KòóKöüú†òóKò öüú†òKöú ò Köúüú†+ò:óKô öú<ô<Köúüú†ò.Köú'†òBKöúòKò KöüòöüúüúòöüòKöú>†òSKöüú	üúüúòKöüúòóKöúòóKö†òKö
+üúüúüúüúüúò1Kò Kò=Köüúüúüú†ò2KöúüúòKò Kò2KöúSòSöüúüòKò"KòöúòKöúüúò%Kò1öüú
+üúòKöúòKöú ò KòóKòóKöüúòóKò öüúüúüúüúò>KòKòöüú
+üúòöüúKòMKöüú*üúüúò>óKöúôKöúPüúò[KöúüúòKòóKòóKò öüúüúüúò"öüúüòKöú6ò6Köú*ò*öúòöüú
+üú/ò?Köüú9ò=óóKöüúòóKöüúüúäò¶KòóKöüúòóKöüú†ò&Kò Köúüúò
+Köú†ò6Köüúüúüú(ò?öüòöúòKöú/ò/Köú.ò.Köú#†ò<KòóóKò KöüúòKòóKò ö°úüúüúò=Köüúüúüú!üúüú
+üú†òdKöú0üúò:KòóKò Köúüúüú†ò)Kò ö°úüúüú(òFKöúüúüú&ò7Köú1ô1KöüúüúüúòKöúòKòöüòKò5öüú
+üòKöú
+üúòKöüúüúòKöúüúò#Köüúüúòóöüúüúüúò%öüúüúüúò=Köüú†ò3óKòóóKöüúòKòóKò Köú
+üúüú&ò:Kò Kö°úüúüú)üú:òçö†Eú†%òröüúòKöúüòKöüúòKòóKöú"üúò*Köú ò KöúòKò öüúüúòKöú/ò/KöüúòKòóKò KöúüúòKòKò KòGKò Köüú	üúüúò1Köüúüúüúüúò3óKò Kö†~ò~ò Kò@Kò4Köüúüúò&Kò öüòKöúüúüúò(óKòóKò ö
+°úüúüúüúüúòDöüúüúüúò8KöúüúòKöüúüú%òCKòóKòóóKöù(ô(ò ö
+°úüúüúdüúüúòóKô®KöúüúòKöúüú6ò?KòKöú†3ò4Kò=ò?KöúFòFóKò KöüúüúüúüúòOKò=Kò!KöüúüúòKòóKò Kò óKöüúòóó Öó    8  LQ  

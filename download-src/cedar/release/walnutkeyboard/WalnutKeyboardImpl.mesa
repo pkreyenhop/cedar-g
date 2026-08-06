@@ -1,0 +1,816 @@
+
+
+
+
+DIRECTORY
+Basics,
+BasicTime USING [ earliestGMT, GMT, nullGMT, Pack, Period, Unpacked ],
+Commander USING [CommandProc, Handle, Register],
+CommanderOps USING [NextArgument],
+Convert USING [ IntFromRope, TimeFromRope, UnpackedTimeFromRope ],
+IO,
+List USING [CompareProc, Length, Sort],
+LoganBerry USING [ EndTransaction, StartTransaction ],
+RuntimeError USING [ UNCAUGHT ],
+Rope USING [Cat, Compare, Concat, Equal, Fetch, FetchType, Find, Length, MakeRope, ROPE, Substr],
+SymTab USING [ Create, EachPairAction, Fetch, Ref, Pairs, Store ],
+UserProfile USING [ Token ],
+ViewerClasses USING [ Menu, MenuEntry, Viewer ],
+ViewerOps USING [ EnumerateViewers, EnumProc ],
+ViewerTools USING [ TiogaContents ],
+WalnutDefs USING [dontCareMsgSetVersion ],
+WalnutOps USING [AddMsg, CreateMsg, dontCareDomainVersion, GetHandleForRootfile, GetMsg, MoveMsg, MsgExists, MsgSetExists, MsgSetNames, GetDisplayProps, GetMsgText, MsgSetVersion, RemoveMsg, SetHasBeenRead, SizeOfMsgSet, MsgsInSetEnumeration, WalnutOpsHandle ],
+WalnutNewMail USING [ CheckMailBoxes ],
+WalnutWindow,
+WalnutWindowPrivate USING [ WalnutHandle, WalnutHandleRec ]
+;
+
+
+WalnutKeyboardImpl: CEDAR MONITOR
+IMPORTS BasicTime, Commander, CommanderOps, Convert, IO, List, LoganBerry, Rope, RuntimeError, SymTab, UserProfile, ViewerOps, WalnutOps, WalnutNewMail
+EXPORTS WalnutWindow
+SHARES ViewerClasses ~ {
+OPEN IO;
+
+ROPE: TYPE = Rope.ROPE;
+
+Handle: TYPE = WalnutOps.WalnutOpsHandle;
+
+DB: TYPE = REF DBBody;
+DBBody: TYPE = RECORD [
+dbName: ROPE,
+dbFileName: ROPE,
+handle: Handle ¨ NIL,
+retryCount: INT ¨ 0
+];
+
+Entries: TYPE ~ REF EntrySequence;
+EntrySequence: TYPE ~ RECORD[e: SEQUENCE len: NAT OF EntryRecord];
+EntryRecord: TYPE ~ RECORD [
+msgID: ROPE, toc: ROPE, tocValid: BOOL, hasBeenRead: BOOL, deleted: BOOL¨FALSE, transferred: BOOL¨FALSE];
+
+WalnutHandle: TYPE = WalnutWindowPrivate.WalnutHandle;
+WalnutHandleRec: PUBLIC TYPE = WalnutWindowPrivate.WalnutHandleRec;
+
+MsgSet: TYPE = REF MsgSetBody;
+MsgSetBody: TYPE = RECORD [
+db: DB,  -- belongs to this database.
+msgSetName: ROPE,
+msgSetVersion: WalnutOps.MsgSetVersion,
+entries: Entries
+];
+
+NewFilter: TYPE = {none, read, unread, transferred, all};
+
+DateComparison: TYPE = { none, before, after };
+
+dbs: SymTab.Ref; -- Indexed by db short name (e.g., "default", "voice", "old")
+msgSets: SymTab.Ref; -- Cached indices, indexed by dbname.msgSetName
+
+defaultSource: MsgSet;
+defaultDest: MsgSet;
+thisSource: MsgSet;
+thisDest: MsgSet;
+thisSizes: BOOL¨FALSE;
+
+firstMessageNumber: INT¨1;
+lastMessageNumber: INT¨1;
+thisSourceFilter: ROPE¨NIL;
+thisSourceNewFilter: NewFilter¨$none;
+thisSourceComparison: DateComparison ¨ $none;
+thisSourceDate: BasicTime.GMT ¨ BasicTime.nullGMT;
+
+doWrap: BOOL ¨ FALSE;
+maxLineLength: INT ¨ 65;
+
+WalnutKbdCmd: Commander.CommandProc = {
+dbName: ROPE;
+rootFile: ROPE;
+dbName ¨ CommanderOps.NextArgument[cmd];
+rootFile ¨ CommanderOps.NextArgument[cmd];
+[result, msg, dbName, rootFile] ¨ WalnutKbdInit[dbName, rootFile];
+IF result=$Failed THEN RETURN;
+cmd.out.PutF["Registered %g: %g\n", rope[dbName], rope[rootFile]];
+};
+
+ListDBsCmd: Commander.CommandProc = {
+ENABLE RuntimeError.UNCAUGHT => GOTO Failed;
+ListOneDB: SymTab.EachPairAction = {
+db: DB ¨ NARROW[val];
+cmd.out.PutF[" %g: %g\n",
+rope[db.dbName],
+rope[db.dbFileName]];
+};
+[]¨SymTab.Pairs[dbs, ListOneDB];
+EXITS Failed => RETURN[$Failed, "*** Uncaught signal ***"]
+};
+
+ListMsgSetsCmd: Commander.CommandProc = {
+ENABLE RuntimeError.UNCAUGHT => GOTO Failed;
+msgSetNames: LIST OF ROPE;
+[result, msg] ¨ ParseArguments[cmd: cmd, dbOnly: TRUE];
+IF result = $Failed THEN RETURN;
+msgSetNames ¨ WalnutOps.MsgSetNames[thisSource.db.handle].mL;
+cmd.out.PutF1["Message sets from database %g\n", rope[thisSource.db.dbName]];
+FOR mN: LIST OF ROPE ¨ msgSetNames, mN.rest WHILE mN#NIL DO
+IF thisSizes THEN {
+[] ¨ CacheMsgSet[cmd, GetMsgSet[thisSource.db.dbName, mN.first].msgSet, TRUE];
+thisSource.entries ¨ NIL; -- Keeping all msg sets open might be a big load.
+}
+ELSE cmd.out.PutF1[" %g\n", rope[mN.first]];
+ENDLOOP;
+EXITS Failed => RETURN[$Failed, "*** Uncaught signal ***"]
+};
+
+SelectMsgSetCmd: Commander.CommandProc = {
+ENABLE RuntimeError.UNCAUGHT => GOTO Failed;
+[result, msg] ¨ ParseArguments[cmd];
+IF result = $Failed THEN RETURN;
+defaultSource ¨ thisSource;
+defaultDest ¨ thisDest;
+cmd.out.PutF["Selected message sets: Source = %g, Dest = %g\n", rope[FullName[defaultSource]],  rope[FullName[defaultDest]]];
+EXITS Failed => RETURN[$Failed, "*** Uncaught signal ***"]
+};
+
+ListMsgsInMsgSetCmd: Commander.CommandProc = {
+ENABLE RuntimeError.UNCAUGHT => GOTO Failed;
+handle: Handle;
+refresh: BOOL ¨ cmd.procData.clientData#$Again;
+[result, msg, handle] ¨ ParseRange[cmd: cmd, refresh: refresh, fullRange: TRUE];
+cmd.out.PutF1["Messages in message set %g:\n", rope[FullName[thisSource]]];
+FOR i: INT IN [firstMessageNumber..MIN[lastMessageNumber, thisSource.entries.len]] DO
+hasBeenRead, transferred, deleted: BOOL;
+tocEntry: ROPE;
+[hasBeenRead, deleted, transferred, tocEntry] ¨ GetTocEntry[thisSource, i];
+IF FilterOut[i] THEN LOOP;
+cmd.out.PutFL["%g %3d %g%g\n",
+LIST[char[IF hasBeenRead THEN '\040 ELSE '?], int[i],
+rope[tocEntry],
+rope[IF deleted THEN " (deleted)" ELSE IF transferred THEN " (transferred)" ELSE ""]] ];
+ENDLOOP;
+EXITS Failed => RETURN[$Failed, "*** Uncaught signal ***"]
+};
+
+PrintMsgInMsgSetCmd: Commander.CommandProc = {
+ENABLE RuntimeError.UNCAUGHT => GOTO Failed;
+lineLength: INT¨0;
+Fetch: Rope.FetchType~{
+rt: REF TEXT ¨ NARROW[data];
+c: CHAR ¨ rt[index];
+lineLength ¨ lineLength+1;
+IF c='\015 OR c='\015 OR
+(doWrap AND c='\040 AND lineLength>maxLineLength)
+THEN { lineLength ¨ 0; RETURN['\012]; };
+RETURN[c];
+};
+contents: REF TEXT;
+handle: Handle;
+cr: ROPE;
+[result, msg, handle] ¨ ParseRange[cmd: cmd, refresh: FALSE, fullRange: TRUE];
+IF result = $Failed THEN RETURN;
+FOR i: INT IN [firstMessageNumber..MIN[lastMessageNumber, thisSource.entries.len]] DO
+hasBeenRead, deleted, transferred: BOOL;
+tocEntry, msgID: ROPE;
+[hasBeenRead, deleted, transferred, tocEntry] ¨ GetTocEntry[thisSource, i];
+IF FilterOut[i] THEN LOOP;
+msgID ¨ thisSource.entries[i-1].msgID;
+lineLength ¨ 0;
+contents ¨ WalnutOps.GetMsgText[handle, msgID, contents];
+cr ¨ Rope.MakeRope[base: contents, size: contents.length, fetch: Fetch];
+cmd.out.PutF["-- Message %g:%g\n%g\n\n",
+int[i],
+rope[IF deleted THEN " (deleted)" ELSE IF transferred THEN " (transferred)" ELSE ""],
+rope[cr]];
+IF NOT thisSource.entries[i-1].hasBeenRead THEN {
+WalnutOps.SetHasBeenRead[handle, msgID];
+thisSource.entries[i-1].hasBeenRead ¨ TRUE;
+};
+ENDLOOP;
+EXITS Failed => RETURN[$Failed, "*** Uncaught signal ***"]
+};
+
+MoveMsgCmd: Commander.CommandProc = {
+ENABLE RuntimeError.UNCAUGHT => GOTO Failed;
+handle: Handle;
+op: ROPE ¨ "Moved ";
+destExists: BOOL;
+move: BOOL ¨ cmd.procData.clientData = $Move;
+[result, msg, handle] ¨ ParseRange[cmd: cmd, refresh: FALSE, fullRange: FALSE];
+IF result = $Failed THEN RETURN;
+destExists ¨ WalnutOps.MsgSetExists[opsHandle: handle, name: thisDest.msgSetName, msDomainVersion: WalnutOps.dontCareDomainVersion].exists;
+IF ~destExists THEN RETURN[$Failed, "No destination message set"];
+FOR i: INT IN [firstMessageNumber..MIN[lastMessageNumber, thisSource.entries.len]] DO
+IF FilterOut[i] THEN LOOP;
+IF thisSource.entries[i-1].deleted THEN {
+cmd.out.PutF["** Can't move message %g from set %g (deleted)\n",
+int[i], rope[FullName[thisSource]]];
+LOOP;
+};
+IF move THEN {
+thisSource.entries[i-1].deleted ¨ TRUE;
+[]¨WalnutOps.MoveMsg[handle,
+thisSource.entries[i-1].msgID, [thisSource.msgSetName], [thisDest.msgSetName]];
+}
+ELSE {
+op ¨ "Copied ";
+[]¨WalnutOps.AddMsg[handle, 
+thisSource.entries[i-1].msgID, [thisSource.msgSetName], [thisDest.msgSetName]];
+};
+cmd.out.PutFL["%gmessage %g from set %g to %g\n", LIST[rope[op],
+int [i], rope[FullName[thisSource]], rope[FullName[thisDest]]] ];
+ENDLOOP;
+EXITS Failed => RETURN[$Failed, "*** Uncaught signal ***"]
+};
+
+XferMsgCmd: Commander.CommandProc = {
+ENABLE RuntimeError.UNCAUGHT => GOTO Failed;
+sourceHandle, destHandle: Handle;
+destExists: BOOL;
+[result, msg, sourceHandle] ¨ ParseRange[cmd: cmd, refresh: FALSE, fullRange: FALSE];
+IF result = $Failed THEN RETURN;
+destHandle ¨ thisDest.db.handle;
+destExists ¨ WalnutOps.MsgSetExists[opsHandle: destHandle, name: thisDest.msgSetName, msDomainVersion: WalnutOps.dontCareDomainVersion].exists;
+IF ~destExists THEN RETURN[$Failed, "No destination message set"];
+LoganBerry.StartTransaction[thisDest.db.handle.db]; -- Should speed things up a tad.
+FOR i: INT IN [firstMessageNumber..MIN[lastMessageNumber, thisSource.entries.len]] DO
+pos: INT;
+msgID, msgName: ROPE;
+tc: ViewerTools.TiogaContents;
+IF FilterOut[i] THEN LOOP;
+IF thisSource.entries[i-1].deleted THEN {
+cmd.out.PutF["** Can't transfer message %g from set %g (deleted)\n",
+int[i], rope[FullName[thisSource]]];
+LOOP;
+};
+msgID ¨ msgName ¨ thisSource.entries[i-1].msgID;
+pos ¨ Rope.Find[msgID, "$"];
+IF pos # 0 THEN msgName ¨ msgID.Substr[pos];
+tc ¨ WalnutOps.GetMsg[sourceHandle, msgID].contents;
+IF NOT WalnutOps.MsgExists[destHandle, msgName] THEN {
+WalnutOps.CreateMsg[destHandle, msgID, tc];
+WalnutOps.SetHasBeenRead[destHandle, msgName];
+};
+IF NOT thisDest.msgSetName.Equal["active", FALSE] THEN
+[]¨WalnutOps.MoveMsg[destHandle,
+msgID, ["active"], [thisDest.msgSetName]];
+cmd.out.PutF["Transferred message %g from set %g to %g\n",
+int [i], rope[FullName[thisSource]], rope[FullName[thisDest]]];
+thisSource.entries[i-1].transferred ¨ TRUE;
+ENDLOOP;
+[]¨LoganBerry.EndTransaction[thisDest.db.handle.db]; -- Should speed things up a tad.
+EXITS Failed => {
+IF thisDest#NIL AND thisDest.db#NIL AND thisDest.db.handle#NIL THEN
+[] ¨ LoganBerry.EndTransaction[thisDest.db.handle.db!
+RuntimeError.UNCAUGHT => CONTINUE];
+RETURN[$Failed, "*** Uncaught signal, database may be damaged. ***"]
+};
+};
+
+DeleteMsgCmd: Commander.CommandProc = {
+ENABLE RuntimeError.UNCAUGHT => GOTO Failed;
+handle: Handle;
+[result, msg, handle] ¨ ParseRange[cmd: cmd, refresh: FALSE, fullRange: FALSE];
+IF result = $Failed THEN RETURN;
+FOR i: INT IN [firstMessageNumber..MIN[lastMessageNumber, thisSource.entries.len]] DO
+IF FilterOut[i] THEN LOOP;
+IF thisSource.entries[i-1].deleted THEN {
+cmd.out.PutF["** Can't delete message %g from set %g (already deleted)\n",
+int[i], rope[FullName[thisSource]]];
+LOOP;
+};
+thisSource.entries[i-1].deleted ¨ TRUE;
+[]¨WalnutOps.RemoveMsg[handle,
+thisSource.entries[i-1].msgID, [thisSource.msgSetName], WalnutDefs.dontCareMsgSetVersion];
+cmd.out.PutF["Deleted message %g from set %g\n",
+int [i], rope[FullName[thisSource]]];
+ENDLOOP;
+EXITS Failed => RETURN[$Failed, "*** Uncaught signal ***"]
+};
+
+GetNewMailCmd: Commander.CommandProc = {
+mailDB: DB ¨ GetMailDB[cmd];
+IF mailDB#NIL THEN WalnutNewMail.CheckMailBoxes[mailDB.handle];
+};
+
+FlushCmd: Commander.CommandProc = {
+ENABLE RuntimeError.UNCAUGHT => GOTO Failed;
+msgSets ¨ SymTab.Create[case: FALSE];
+[result, msg, defaultSource] ¨ GetMsgSet["default", "Active"];
+IF result=$Failed THEN RETURN;
+defaultDest  ¨ defaultSource;
+cmd.out.PutRope["Flushed message sets, default source and dest are default.Active\n"];
+EXITS Failed => RETURN[$Failed, "*** Uncaught signal ***"]
+};
+
+WrapCmd: Commander.CommandProc = {
+ENABLE RuntimeError.UNCAUGHT => GOTO Failed;
+param: Rope.ROPE ¨ CommanderOps.NextArgument[cmd];
+doWrap ¨ IF param=NIL THEN TRUE ELSE param.Equal["on", FALSE];
+cmd.out.PutF1["%gnsert line breaks\n", rope[IF doWrap THEN "I" ELSE "Do not i"]];
+EXITS Failed => RETURN[$Failed, "*** Uncaught signal ***"]
+};
+
+ParseArguments: PROC[
+cmd: Commander.Handle, rangeDefaults: {none, all}¨$none, dbOnly: BOOL¨FALSE, sameDB: BOOL ¨ FALSE]
+RETURNS[result: REF ANY ¨ NIL, msg: ROPE ¨ NIL] = {
+parsing: BOOL ¨ FALSE; {
+ENABLE IO.EndOfStream => IF parsing THEN GOTO Failed ELSE CONTINUE;
+s: IO.STREAM ¨ IO.RIS[cmd.commandLine];
+arg: ROPE¨NIL;
+quoted: BOOL;
+GetToken: PROC RETURNS[token: ROPE, quoted: BOOL¨FALSE] = {
+ln: INT;
+token ¨ IO.GetCedarTokenRope[s].token;
+ln ¨ token.Length[];
+IF ln<2 OR token.Fetch[0]#'" THEN RETURN;
+quoted ¨ TRUE; token ¨ token.Substr[start: 1, len: ln-2];
+};
+ParseMsgSet: PROC[msgSetName: ROPE¨NIL] RETURNS[msgSet: MsgSet] ~ {
+dbName: ROPE ¨ "default";
+parsing ¨ TRUE;
+IF msgSetName=NIL THEN msgSetName ¨ GetToken[].token;
+IF s.PeekChar[]='. OR dbOnly THEN {
+dbName ¨ msgSetName;
+msgSetName ¨ NIL;
+IF dbOnly THEN msgSetName ¨ "Active" ELSE DO
+[] ¨ s.GetChar[];
+msgSetName ¨ msgSetName.Concat[GetToken[].token];
+IF s.PeekChar[]#'. THEN EXIT;
+msgSetName ¨ msgSetName.Concat["."];
+ENDLOOP;
+};
+[result, msg, msgSet] ¨ GetMsgSet[dbName, msgSetName];
+parsing ¨ FALSE;
+};
+ParseDate: PROC[dateComparison: DateComparison] RETURNS[date: BasicTime.GMT] ~ {
+quoted: BOOL;
+dateRope: ROPE;
+unpacked: BasicTime.Unpacked;
+[dateRope, quoted] ¨ GetToken[];
+unpacked ¨ Convert.UnpackedTimeFromRope[dateRope];
+parsing ¨ FALSE;
+IF dateComparison = $before THEN {
+unpacked.hour ¨ 0; unpacked.minute¨0; unpacked.second ¨ 0;
+}
+ELSE {
+unpacked.hour ¨ 23; unpacked.minute ¨ 59; unpacked.second ¨ 59;
+};
+date ¨ BasicTime.Pack[unpacked];
+};
+lastSource, lastDest: MsgSet;
+lastSourceFilter: ROPE;
+lastSourceNewFilter: NewFilter;
+lastFirstMessageNumber, lastLastMessageNumber: INT;
+lastSourceComparison: DateComparison;
+lastSourceDate: BasicTime.GMT;
+lastSource ¨ thisSource; thisSource ¨ defaultSource;
+lastDest ¨ thisDest; thisDest ¨ defaultDest;
+lastSourceFilter ¨ thisSourceFilter; thisSourceFilter ¨ NIL;
+lastSourceNewFilter ¨ thisSourceNewFilter; thisSourceNewFilter ¨ $none;
+lastSourceComparison ¨ thisSourceComparison; thisSourceComparison ¨ $none;
+thisSizes ¨ FALSE;
+lastSourceDate ¨ thisSourceDate;
+lastFirstMessageNumber¨firstMessageNumber; lastLastMessageNumber¨lastMessageNumber;
+firstMessageNumber ¨ lastMessageNumber ¨ -1;
+WHILE result=NIL AND ([arg, quoted]¨GetToken[]).token # NIL DO
+c: CHAR ¨ IF arg.Length[]>=1 THEN arg.Fetch[0] ELSE '\000;
+SELECT TRUE FROM
+NOT quoted AND arg.Equal["unread", FALSE] => thisSourceNewFilter ¨ $unread;
+NOT quoted AND arg.Equal["read", FALSE] => thisSourceNewFilter ¨ $read;
+NOT quoted AND arg.Equal["all", FALSE] => thisSourceNewFilter ¨ $all;
+NOT quoted AND arg.Equal["transferred", FALSE] => thisSourceNewFilter ¨ $transferred;
+NOT quoted AND arg.Equal["from", FALSE] => thisSource ¨ ParseMsgSet[];
+NOT quoted AND arg.Equal["to", FALSE] => thisDest ¨ ParseMsgSet[];
+NOT quoted AND arg.Equal["sizes", FALSE] => thisSizes ¨ TRUE;
+NOT quoted AND arg.Equal["before", FALSE] => {
+parsing ¨ TRUE;
+thisSourceDate ¨ ParseDate[$before];
+thisSourceComparison ¨ $before;
+parsing ¨ FALSE;
+};
+NOT quoted AND arg.Equal["after", FALSE] => {
+parsing ¨ TRUE;
+thisSourceDate ¨ ParseDate[$after];
+thisSourceComparison ¨ $after;
+parsing ¨ FALSE;
+};
+NOT quoted AND arg.Equal["with", FALSE] => {
+parsing ¨ TRUE;
+thisSourceFilter ¨ IO.GetRope[s];
+IF thisSourceFilter.Length[]>1 THEN
+thisSourceFilter ¨ thisSourceFilter.Substr[start: 1, len: thisSourceFilter.Length[]-2];
+parsing ¨ FALSE;
+};
+NOT quoted AND (arg.Equal["it", FALSE] OR arg.Equal["them", FALSE]) => {
+thisSource ¨ lastSource;
+thisDest ¨ lastDest;
+thisSourceFilter ¨ lastSourceFilter;
+thisSourceNewFilter ¨ lastSourceNewFilter;
+thisSourceDate ¨ lastSourceDate;
+thisSourceComparison ¨ lastSourceComparison;
+firstMessageNumber ¨ lastFirstMessageNumber; -- [sic]
+lastMessageNumber ¨ lastLastMessageNumber; -- [mea culpa]
+};
+c = '[ => {
+parsing ¨ TRUE;
+arg ¨ GetToken[].token;
+IF ~ (arg.Fetch[0] IN ['0..'9]) THEN RETURN[$Failed, "Non-number in message range"];
+firstMessageNumber ¨ Convert.IntFromRope[arg];
+arg ¨ GetToken[].token;
+IF ~arg.Equal[".."] THEN RETURN[$Failed, "Missing ellipsis in message range"];
+arg ¨ GetToken[].token;
+IF ~ (arg.Fetch[0] IN ['0..'9]) THEN RETURN[$Failed, "Non-number in message range"];
+lastMessageNumber ¨ Convert.IntFromRope[arg];
+arg ¨ GetToken[].token;
+IF ~arg.Equal["]"] THEN RETURN[$Failed, "Message range not properly terminated"];
+parsing ¨ FALSE;
+};
+c IN ['0..'9] => {
+firstMessageNumber ¨ lastMessageNumber ¨ Convert.IntFromRope[arg];
+};
+c IN ['a..'z], c IN ['A..'Z] => thisSource ¨ ParseMsgSet[arg];
+ENDCASE => RETURN[$Failed, "Unrecognized input"];
+ENDLOOP;
+EXITS
+Failed => RETURN[$Failed, "Error while reading command"];
+};
+IF rangeDefaults = $all THEN {
+IF firstMessageNumber = -1 THEN firstMessageNumber ¨ 1;
+IF lastMessageNumber = -1 THEN lastMessageNumber ¨ thisSource.entries.len;
+};
+IF sameDB AND thisSource.db#thisDest.db THEN RETURN[$Failed, "Source and destination message sets must be from same Walnut data base."];
+};
+
+ParseRange: PROC [
+cmd: Commander.Handle, refresh: BOOL¨FALSE, fullRange: BOOL¨FALSE]
+RETURNS [result: REF ANY¨NIL, msg: ROPE¨NIL, handle: Handle¨NIL] ~ {
+[result, msg] ¨ ParseArguments[cmd: cmd];
+IF result = $Failed THEN RETURN;
+handle ¨ CacheMsgSet[cmd, thisSource, refresh];
+IF thisSourceFilter#NIL OR thisSourceNewFilter # $none THEN fullRange ¨ TRUE;
+IF fullRange THEN [result, msg] ¨ ParseArguments[cmd: cmd, rangeDefaults: $all];
+IF result = $Failed THEN RETURN;
+IF firstMessageNumber = lastMessageNumber AND lastMessageNumber = -1 THEN
+RETURN[$Failed, "No message range was specified"];
+IF firstMessageNumber > thisSource.entries.len THEN
+RETURN[$Failed, "There aren't that many"];
+IF firstMessageNumber <= 0 THEN
+RETURN[$Failed, "There aren't that few"];
+};
+
+KeyEntry: TYPE ~ REF KeyEntryRec;
+KeyEntryRec: TYPE ~ RECORD [time: BasicTime.GMT, msgID: ROPE];
+
+GetDBFromName: PROC[dbName: ROPE]
+RETURNS[ db: DB¨NIL] ~ {
+db ¨ NARROW[dbs.Fetch[dbName].val];
+};
+
+SetHandle: PROC[db: DB] RETURNS[Handle] = {
+rootFileName: ROPE ¨ db.dbFileName;
+RETURN[db.handle ¨ WalnutOps.GetHandleForRootfile[rootFileName]];
+};
+
+GetWindowHandleFromDB: PROC[db: DB]
+RETURNS [walnutHandle: WalnutHandle¨NIL] ~ {
+CheckOne: ViewerOps.EnumProc ~ {
+menu: ViewerClasses.Menu ¨ v.menu;
+menuLine: ViewerClasses.MenuEntry;
+db1: DB;
+IF menu = NIL THEN RETURN;
+menuLine ¨ menu.lines[0];
+IF menuLine = NIL THEN RETURN;
+WITH menuLine.clientData SELECT FROM
+wwh: WalnutHandle => walnutHandle ¨ wwh;
+ENDCASE => NULL;
+IF walnutHandle = NIL THEN RETURN;
+IF walnutHandle.opsH = db.handle THEN RETURN[FALSE]; -- terminate enumeration
+walnutHandle ¨ NIL;
+};
+IF SetHandle[db]=NIL THEN RETURN; -- no DB active for this DB name
+ViewerOps.EnumerateViewers[CheckOne];
+};
+
+GetMailDB: PROC [cmd: Commander.Handle] RETURNS [mailDB: DB¨NIL] ~ {
+CheckOne: SymTab.EachPairAction = {
+walnutHandle: WalnutHandle;
+oneDB: DB ¨ NARROW[val];
+IF oneDB.handle.mailFor=NIL THEN RETURN;
+walnutHandle ¨ GetWindowHandleFromDB[oneDB];
+IF walnutHandle=NIL THEN RETURN;
+IF walnutHandle.dontDoMail THEN {
+cmd.out.PutRope["*** Curious (and inconsistent) that Walnut says 'Don't do mail for this database' but knows about a mail recipient for it; no action taken\n"];
+RETURN;
+};
+mailDB ¨ oneDB;
+RETURN[TRUE];
+};
+[]¨SymTab.Pairs[dbs, CheckOne];
+};
+
+GetMsgSet: PROC[dbName, msgSetName: ROPE]
+RETURNS [result: REF ANY, msg: ROPE, msgSet: MsgSet¨NIL] ~ {
+key: ROPE ¨ Rope.Cat[dbName, ".", msgSetName];
+db: DB;
+msgSet ¨ NARROW[msgSets.Fetch[key].val];
+IF msgSet#NIL THEN {
+[]¨SetHandle[msgSet.db];
+RETURN;
+};
+db ¨ GetDBFromName[dbName];
+IF db=NIL THEN {
+result ¨ $Failed;
+msg ¨ "DB Name not registered; use WalnutKeyboard command to register.";
+RETURN;
+};
+[] ¨ SetHandle[db];
+msgSet ¨ NEW[MsgSetBody ¨ [db, msgSetName]];
+[] ¨ msgSets.Store[key, msgSet];
+};
+
+CacheMsgSet: PROC[cmd: Commander.Handle, msgSet: MsgSet, refresh: BOOL¨FALSE]
+RETURNS[handle: Handle] = {
+numMsgs: INT;
+i: INT;
+version1, version2: WalnutOps.MsgSetVersion;
+msgs: LIST OF ROPE;
+sortedMsgs: LIST OF REF ANY;
+msgSetName: ROPE ¨ msgSet.msgSetName;
+entries: Entries ¨ msgSet.entries;
+handle ¨ SetHandle[msgSet.db];
+IF (NOT refresh) AND entries#NIL THEN RETURN; -- have it already
+[numMsgs, version1] ¨ WalnutOps.SizeOfMsgSet[handle, msgSetName];
+IF entries#NIL AND version1 = msgSet.msgSetVersion THEN RETURN;
+DO
+[numMsgs, version1] ¨ WalnutOps.SizeOfMsgSet[handle, msgSetName];
+[msgs, version2] ¨ WalnutOps.MsgsInSetEnumeration[handle, msgSetName];
+IF version2#version1 THEN LOOP;
+sortedMsgs ¨ NIL;
+FOR ml: LIST OF ROPE ¨ msgs, ml.rest WHILE ml#NIL DO
+sortedMsgs ¨
+CONS[NEW[KeyEntryRec ¨ [TimeFromKey[ml.first], ml.first]], sortedMsgs];
+ENDLOOP;
+sortedMsgs ¨ List.Sort[sortedMsgs, CompareByTime];
+EXIT;
+ENDLOOP;
+IF numMsgs # (i ¨ List.Length[sortedMsgs]) THEN {
+cmd.out.PutF["*** Curious that Walnut says %g messages but provided %g TOC entries\n", int[numMsgs], int[i]];
+numMsgs ¨ i;
+};
+msgSet.msgSetVersion ¨ version2;
+entries ¨ msgSet.entries ¨ NEW[EntrySequence[numMsgs]];
+i¨-1;
+FOR ml: LIST OF REF ANY ¨ sortedMsgs, ml.rest WHILE ml#NIL DO
+keyEntry: KeyEntry ¨ NARROW[ml.first];
+entries[i¨i+1].msgID ¨ keyEntry.msgID;
+ENDLOOP;
+cmd.out.PutF["Message set %g contains %g messages\n", rope[FullName[msgSet]], int[i+1]];
+};
+
+
+FilterOut: PROC[msgNo: INT] RETURNS[BOOL] = {-- TRUE IFF entry does NOT match filter
+tocEntry: ROPE; read, transferred: BOOL;
+keyDate: BasicTime.GMT;
+[read,,transferred,tocEntry] ¨ GetTocEntry[thisSource, msgNo];
+IF thisSourceComparison#$none THEN keyDate ¨
+TimeFromKey[thisSource.entries[msgNo-1].msgID];
+SELECT thisSourceComparison FROM
+$before => IF BasicTime.Period[thisSourceDate, keyDate]>0 THEN RETURN[TRUE];
+$after => IF BasicTime.Period[thisSourceDate, keyDate]< 0 THEN RETURN[TRUE];
+ENDCASE;
+RETURN[
+(SELECT thisSourceNewFilter FROM
+$transferred => NOT transferred,
+$read => NOT read,
+$unread => read,
+ENDCASE => FALSE)  OR
+(thisSourceFilter#NIL AND Rope.Find[s1: tocEntry, s2: thisSourceFilter, case: FALSE]<0)];
+};
+
+GetTocEntry: PROC[msgSet: MsgSet, i: INT]
+RETURNS[hasBeenRead: BOOL¨FALSE, deleted: BOOL¨FALSE, transferred: BOOL¨FALSE, toc: ROPE¨NIL]~{
+entries: Entries ¨ msgSet.entries;
+i ¨ i-1;
+IF NOT entries[i].tocValid THEN {
+[hasBeenRead, toc] ¨
+WalnutOps.GetDisplayProps[msgSet.db.handle, entries[i].msgID];
+entries[i].tocValid ¨ TRUE;
+entries[i].toc ¨ toc;
+entries[i].hasBeenRead ¨ hasBeenRead;
+}
+ELSE {
+toc ¨ entries[i].toc;
+hasBeenRead ¨ entries[i].hasBeenRead;
+deleted ¨ entries[i].deleted;
+transferred ¨ entries[i].transferred;
+};
+};
+
+FullName: PROC[msgSet: MsgSet] RETURNS [fullName: ROPE] ~ {
+RETURN[
+IO.PutFR["%g.%g", rope[msgSet.db.dbName], rope[msgSet.msgSetName]]];
+};
+
+CompareByTime: List.CompareProc ~{
+key1: KeyEntry ¨ NARROW[ref1];
+key2: KeyEntry ¨ NARROW[ref2];
+t1: BasicTime.GMT ¨ key1.time;
+t2: BasicTime.GMT ¨ key2.time;
+RETURN[IF t1=t2 THEN Rope.Compare[key1.msgID, key2.msgID, FALSE]
+ELSE IF BasicTime.Period[t1, t2]>0 THEN less ELSE greater];
+};
+
+TimeFromKey: PROC[key: ROPE] RETURNS [BasicTime.GMT] ~ INLINE {
+index: INT;
+index ¨ Rope.Find[key, "@", 0];
+IF index=-1 THEN RETURN[BasicTime.earliestGMT];
+RETURN[Convert.TimeFromRope[Rope.Substr[key, index+1]]];
+};
+
+
+WalnutKbdInit: PROC[dbNameIn, rootFileIn: ROPE¨NIL]
+RETURNS[result: REF ANY¨NIL, msg: ROPE¨NIL, dbName: ROPE¨NIL, rootFile: ROPE¨NIL] = {
+ENABLE RuntimeError.UNCAUGHT => GOTO Failed;
+db: DB;
+dbName ¨ dbNameIn;
+rootFile ¨ rootFileIn;
+IF dbName = NIL THEN {
+dbName ¨ "default";
+rootFile ¨ UserProfile.Token["Walnut.WalnutRootFile"];
+}
+ELSE IF rootFile=NIL THEN RETURN[$Failed, "No root file name provided"];
+db ¨ GetDBFromName[dbName];
+IF db=NIL THEN {
+db ¨ NEW[DBBody¨[dbName, NIL]];
+[]¨dbs.Store[dbName, db];
+};
+db.dbFileName ¨ rootFile;
+db.handle ¨ NIL;
+IF defaultSource=NIL THEN
+defaultSource ¨ defaultDest ¨ GetMsgSet[dbName, "Active"].msgSet;
+EXITS Failed => RETURN[$Failed, "*** Uncaught signal ***"]
+};
+
+Commander.Register["WalnutKeyboard", WalnutKbdCmd, "Usage: Walnutkeyboard <dbName> <rootFile>\nAdds mapping from <dbName> to <rootFile> to list of available Walnut databases\nDefault <dbName>='default'; default <rootFile> from user profile"];
+Commander.Register["WKDBs", ListDBsCmd, "List available Walnut data bases"];
+Commander.Register["WKSets", ListMsgSetsCmd, "List Walnut message sets"];
+Commander.Register["WKSelect", SelectMsgSetCmd, "Select working Walnut message set\n  Usage: WKSelect <source>|<dest>"];
+Commander.Register["WKListTOC", ListMsgsInMsgSetCmd, "List messages in message set, as specified by filters and message range.\n  Usage: WKList <source>", $List];
+Commander.Register["WKSameTOC", ListMsgsInMsgSetCmd, "List messages in message set, without consulting Walnut again.\n  Usage: WKSame <source>", $Again];
+Commander.Register["WKDisplay", PrintMsgInMsgSetCmd, "Display a message designated by number from a selected message set\n  Usage: WKDisplay <msgNumber> <source>"];
+Commander.Register["WKMove", MoveMsgCmd, "Move messages from source message set to destination message set.\n  Usage: WKMove <source> <msgNumber> <destination>", $Move];
+Commander.Register["WKCopy", MoveMsgCmd, "Copy messages from source message set to destination message set.\n  Usage: WKCopy <source> <msgNumber> <destination>", $Copy];
+Commander.Register["WKTransfer", XferMsgCmd, "Transfer messages from source message set in one database to destination message set in another.\n  Usage: WKTransfer <source> <msgNumber> <destination>"];
+Commander.Register["WKDelete", DeleteMsgCmd, "Delete messages from source message set.\n  Usage: WKDelete <source> <msgNumber>"];
+Commander.Register["WKPoll", GetNewMailCmd, "Poll Mail services for new mail"];
+Commander.Register["WKFlush", FlushCmd, "Flush all cached message sets.  Restore default to default.Active."];
+Commander.Register["WKWrap", WrapCmd, "Set line-wrapping as specified (off/on)"];
+dbs ¨ SymTab.Create[case: FALSE];
+msgSets ¨ SymTab.Create[case: FALSE];
+[]¨WalnutKbdInit[NIL, NIL];
+
+}.
+  Ó  WalnutKeyboardImpl.mesa
+Copyright ” 1988, 1989, 1990, 1992 by Xerox Corporation.  All rights reserved.
+Swinehart, September 14, 1993 3:14 pm PDT
+Rick Beach, April 29, 1989 2:16:13 pm PDT
+Willie-s, May 11, 1992 9:28 pm PDT
+Notes:
+1. Next requirement is for the most minimal form of editor.  In some sense, the existing Rope commands with some aka's should do it.
+2. The 10-minute mail check (and its companion, the transaction-aborted crash check) is no longer needed.  Remove it.  After that, there remains little or no dependency on Viewers for the commands, although another way would have to be found to open Walnut databases.  It would be nice to be able to run the system through PCedarTools.  But the new form of Xfer does depend on the viewers' being there.
+3. Current syntax for commands:
+Message set syntax:
+<set> :=
+<message set name> | <database nickname>.<message set name> | it | them
+It and them are pronouns representing the search rule used in the last completed command.
+Arguments:
+source: from <set> (from is default if nothing specified)
+destination: to <set>
+messages:
+message: <number>
+range: [<number> .. <number>]
+list: [<number>, <number>, ...., <number>]
+filter: with <arbitrary text> | unread | read | transferred | all | sizes | before <date> | after <date>
+Filter must be the last item in the command line.  The remainder of the command line, after "with ", is matched in a case-insensitive way against each entire TOC entry in the indicated message set.  Only TOC entries (or messages, depending on the command) matching both the message range and the filter will participate in the command.  The read and unread options permit focus of attention on just new or just old mail.  The transferred option will select only messages that have been transferred, since the last time this message set was enumerated, to some other database.  All selects all messages in the message set, for those commands that demand an interval.  "Sizes" is useful in WKSets to include the number of messages in each message set listed.  The <date> values must be quoted.  The date comparisons are <= or >=, and are made against the dates in the message IDs!!
+Commands:
+WKDBs -- lists the available Walnut databases 
+WKSets <db name> <filter> -- lists message sets for the named dbs, default default; the only meaningful <filter> is "sizes"
+WKNew -- pushes NewMail button for any open DB that has one.
+WKSelect <source>|<destination> -- sets default value
+WKListTOC <source> <messages> (parameters may be in any order)
+WKSameTOC <source> <messages> (Does not refresh cache first!  See below.)
+WKDisplay <source> <message>
+WKMove <source> <messages> <destination> (parameters may be in any order)
+WKCopy <source> <messages> <destination> (parameters may be in any order)
+WKTransfer <source> <messages> <destination> (databases may (should) differ)
+WKDelete <source> <messages> (WalnutOps says "Deleted" is not a legal destination for Move or copy)
+WKLogin (system will prompt for names, passwords; legal only when idle.)
+WKFlush -- Dumps all message set caches.
+WKWrap <on/off> -- Enables/disables insertion of frequent line breaks
+Pragmata:
+To save time, the program caches information about message sets.  Only the WKListTOC command will refresh the caches, although all of the message-specific commands will generate one if it doesn't yet exist.  In particular, commands that move messages from one set to another do not use the Walnut version features (so that many can happen sequentially), and do not change the user-visible numbering of messages within either message set.
+WKListToc will refresh the cache of the named message set if the underlying message set has changed.  WKSameToc will not.  (Useful while performing a series of moves, copies, or deletes).
+Prologue
+
+User Commands
+
+[cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]
+[cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]
+[key: ROPE, val: SymTab.Val] RETURNS [quit: BOOL _ FALSE]
+[cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]
+[cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]
+[cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]
+[cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]
+[cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]
+[cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]
+[cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]
+[cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]
+[cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]
+[cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]
+User Command Parsing, Context Setup Utilities
+
+dbOnly -- Ignore message set name quantities, dummy up index entry bearing corresponding dbDesc.
+sameDB -- source and dest must come from same db.
+Returns same as commandProc to clue in caller as to problems.
+Problems include no such (registered) DB and nonexistent DB.
+IF ~quoted THEN worry a lot.
+Implementation of "it", "them"
+Mail database and database cache utilities
+
+Finds a registered DB that is willing to read new mail.  Any one will do, on the assumption that if there's more than one, the user has bigger problems than our getting the wrong one.
+[key: ROPE, val: SymTab.Val] RETURNS [quit: BOOL _ FALSE]
+New mail operation not thought to work well for open DB's with no assigned viewers.
+Message Content Manipulation Utilities
+
+Initialization
+
+[cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]
+ ù $B  ñ(cedarcode) styleïNewlineDelimiter
+ò codeôKöú
+œeúCôNKô)Köú)ô)Kô"Kò óöœbôKôÑKöúœyrúùôíôôöûôKöûGôGKôYóóô
+Köû9ô9Köûôô	KöûôKöûôKô*óôhKôÔóóô	Köû.ô.Köû{ô{Köû<ô<Köû5ô5Köûúû"ô>Köûúû-ôIKöûôKöûúû/ôIKöûúû/ôIKöûúû.ôLKöûúûGôcKöûHôHKöû(ô(KöûEôEóô	KôµKôªóóóKò Kò öœk	ò	KòKöú
+†ú†ú$òFKöú
+†ú!ò0Köú†úò"Köú†ú5òBKö†úòKöú†úò'Kò6Köú†ú†úò Köú†úI†ú
+òaKöú†ú6òBKöú†úòKöú†úò0Köú
+†ú ò/Köú†úò$Köú†úò*Köú
+†úˆòÖKöú†úò'Köú†òKöú†ú"ò;KòKò óKò ö–lnú†ú†ò!Kö	†ú,œt–kt¢ú$¢ú)¢òóKö†úòKö†úòKö†ú†úòKò óôKô Kö†ú†ú†úòKò Köú†úò)Kò Köú†ú†úòöú†ú†úòKöú†úòKöú†úòKöú†úòKöú†úòKòKò óKöú	†ú†úò"Köú†ú†ú†ú†ú†úòBöú†ú†úòKöú†ú†ú†ú†ú†ú†ú†ú†úòióKò Köú†ú$ò6Köú†ú†ú'òCKò Köú†ú†úòöú†ú†úòKöú	œcò%Köú†úòKöú'ò'KöúòKòKò óKöú†ú*ò9Kò öú†úò/Kò óKöúNòNòDKò óKòKòKöúòKöúòKöú†ú†úòKò Köú†úòKöú†úòKöú†ú†úòKò%Kò-Kò2Kò Köú†ú†úòKöú†úòKò óïStartOfExpansionL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]ôKô ñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]öœnúò'Köú†ú
+†ú†ú†ú†ú†úôHKöú†úòKöú
+†úòKò(Kò*KòBKö†ú†ú†úòKòBKòKò óö•
+úò%Köú†ú
+†ú†ú†ú†ú†úôHKö†ú†ú†úò,ñ= -- [key: ROPE, val: SymTab.Val] RETURNS [quit: BOOL _ FALSE]ö•	úò$Kö–ck9ô9Köú	†úòöúòKöúòKöúòóKòóKò Kö†ú†ú$ò:KòKò óñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]ö•úò)Köú†ú
+†ú†ú†ú†ú†úôHKö†ú†ú†úò,Köú†ú†ú†úòKöú1†úò7Kö†ú†ú†úò Kò=KöúMòMö†ú†ú†ú†ú†ú†ú†ò;ö†ú†úòKöúH†úòNKöú†ú§1òKKòóKö†ú(ò,Kö†úòóKö†ú†ú$ò:KòKò óö•úò*Köú†ú
+†ú†ú†ú†ú†úôHKö†ú†ú†úò,Kò$Kö†ú†ú†úò KòKòKöú}ò}Kö†ú†ú$ò:KòKò óñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]ö•úò.Köú†ú
+†ú†ú†ú†ú†úôHKö†ú†ú†úò,KòKöú	†ú"ò/KöúJ†úòPKöúKòKö	†ú†ú†ú†ú-†òUKöú#†úò(Köú
+†úòKòKKö†ú†ú†úòöúòKö†ú†ú†ú†úò5KöúòKöú†ú	†ú†ú†ú†ú†úòXóKö†úòóKö†ú†ú$ò:KòKò óö•úò.Köú†ú
+†ú†ú†ú†ú†úôHKö†ú†ú†úò,Köú†úòö•úòKöú†ú†ú†úòKöú†úòKòö†ú	†ú	†òöú†ú	†úò1Kö†ú†úò(óóKö†úò
+KòóKöú
+†ú†úòKòKöú†úò	Köú6†ú†úòNKö†ú†ú†úò ö	†ú†ú†ú†ú-†òUKöú#†úò(Köú†úòKòKKö†ú†ú†úòKò&KòKò9KòHöú(ò(KöúòKöú†ú	†ú†ú†ú†ú†úòUKöú
+ò
+óö†ú†ú%†úò1Köú(ò(Köú&†úò+KòóKö†úòóKö†ú†ú$ò:KòKò óñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]ö•
+úò%Köú†ú
+†ú†ú†ú†ú†úôHKö†ú†ú†úò,KòKöú†úòKöú†úòKöú†ú#ò-Köú6†ú†úòOKö†ú†ú†úò KòãKö†ú†ú†ú(òBö	†ú†ú†ú†ú-†òUKö†ú†ú†úòö†ú!†úò)öú@ò@Köú$ò$óKö†úòKòóö†ú†úòKöú"†úò'òKöúOòOóKòóö†úòKòòKöúOòOóKòóöú2†ú
+ò@KöúAòAóKö†úòóKö†ú†ú$ò:KòKò óñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]ö•
+úò%Köú†ú
+†ú†ú†ú†ú†úôHKö†ú†ú†úò,Kò!Köú†úòKöú<†ú†úòUKö†ú†ú†úò Kò KòèKö†ú†ú†ú(òBKöú4§ òTö	†ú†ú†ú†ú-†òUKöú†úò	Köú†úòKòKö†ú†ú†úòö†ú!†úò)öúDòDKöú$ò$óKö†úòKòóKò0KòKö†ú	†úò,Kò4ö†ú†ú*†úò6Köú+ò+Köú.ò.Kòóö†ú†ú%†ú†ò6ò Köú*ò*óóöú:ò:Köú?ò?óKöú&†úò+Kö†úòóKöú5§ òUö†úòö†ú
+†ú†ú†ú†ú†ú†òCò5Köú†ú†úò#óóKö†ú>òDKòóKòKò óñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]ö•úò'Köú†ú
+†ú†ú†ú†ú†úôHKö†ú†ú†úò,KòKöú6†ú†úòOKö†ú†ú†úò ö	†ú†ú†ú†ú-†òUKö†ú†ú†úòö†ú!†úò)öúJòJKöú$ò$óKö†úòKòóKöú"†úò'òKöúZòZóöú0ò0Köú%ò%óKö†úòóKö†ú†ú$ò:KòKò óñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]ö•úò(Köú†ú
+†ú†ú†ú†ú†úôHKöú†úòKö†ú†ú†ú-ò?KòKò óñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]ö•úò#Köú†ú
+†ú†ú†ú†ú†úôHKö†ú†ú†úò,Köú†úò%Kò>Kö†ú†ú†úòKòKòVKö†ú†ú$ò:KòKò óñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]ö•úò"Köú†ú
+†ú†ú†ú†ú†úôHKö†ú†ú†úò,Köú†ú"ò2Köú	†ú†ú†ú†ú†ú†úò>Köú,†ú†ú†úòQKö†ú†ú$ò:KòóKò óô-Kô ñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]ö•ú†úòö	úA†ú†ú
+†ú†úòbKöú§Yô`Köú§*ô1óKö†ú	†ú†ú†ú†ú†úò3Kô=Kô<Köú	†ú†úòKö†ú†ú†ú	†ú†ú†ú†úòCKö	ú†ú†ú†ú†úò'Köú†ú†úòKöú†úòö•ú†ú†ú†ú
+†ú†úò;Köú†úòKöú†úò&KòKö†ú†ú†ú†úò)Köú	†ú,ò9Köúòóö
+•ú†ú†ú†ú†úòCKöú†úòKöú
+†úòKö†ú†ú†úò5ö†ú†ú†úò#KòKöú†úòö†ú†ú†ú†ò,KòKò1Kö†ú†ú†úòKò$Kö†úòóKòóKò6Köú
+†úòKòóö•	ú†ú!†ú†úòPKöú†úòKöú
+†úòKòKò Kö†ú	†úôKò2Köú
+†úòö†ú†úò"Kò:Kòóö†úòKò?KòóKò KòóôKöúòKöú†úòKöúòKöú/†úò3Kò%Köú†úòKò4Kò,Köú8†úò<KòGKòJKöú†úòKò òSKò,óóö	†ú†ú†ú$†ú†ò>Kö	ú†ú†ú†ú†úò:ö†ú†ú†òKö†ú†ú†ú#òKKö†ú†ú†ú!òGKö†ú†ú†ú òEKö†ú†ú†ú(òUKö†ú†ú†ú òFKö†ú†ú†úòBKö†ú†ú†ú†úò=ö†ú†ú†úò.Köú
+†úòKò$KòKöú
+†úòKòóö†ú†ú†úò-Köú
+†úòKò#KòKöú
+†úòKòóö†ú†ú†úò,Köú
+†úòKò!ö†ú†ò#KòWóKöú
+†úòKòóö
+†ú†ú†ú†ú†úòHKòKòKò$Kò*Kò Kò,Kò5Kò9KòóòKöú
+†úòKòKö†ú†ú†ú†ú)òTKò.KòKö†ú†ú†ú/òNKòKö†ú†ú†ú†ú)òTKò-KòKö†ú†ú†ú3òQKöú
+†úòKòóöú†úòKòBKòóKöú†ú†ú+ò>Kö†ú†ú ò1óKö†úòö†òKöú
+†ú)ò9óKòóö†ú†úòKö†ú†úò7Kö†ú†ú,òJKöúòóKö†ú†ú†ú†úUòàKòKò óö•
+ú†úòKö	ú †ú†ú†ú†úòBKö†ú
+†ú†ú†ú†ú†ú†úòDKò)Kö†ú†ú†úò Kò/Kö
+†ú†ú†ú†ú†úòMKö†ú†ú?òPKö†ú†ú†úò ö†ú(†ú†òIKö†ú,ò2óö†ú-†ò3Kö†ú$ò*óö†ú†òKö†ú#ò)óKòóKò óô*Kô Köú
+†ú†úò!ö	ú†ú†ú†ú	†úò>Kò óö•ú†ú	†úò!Kö†ú	†úòKñ= -- [key: ROPE, val: SymTab.Val] RETURNS [quit: BOOL _ FALSE]öú†úò#KòKò óö•	ú†ú†ú†úò+Köú†úò#Kö†ú;òAKöúòKò óö•ú†ú†úò#Kö†ú†úò,ö•úò Kò"Kò"KòKö†ú†ú†ú†úòKòKö†ú†ú†ú†úòö†ú†ú†ò$Kò(Kö†ú†úòóKö†ú†ú†ú†úò"Kö	†ú†ú†ú†ú§òMKöú†úòKòóKö	†ú†ú†ú†ú§ òBKò%KòKò óö
+•	ú†ú†ú
+†ú†úòDKô∑ò#Kö¶9ô9KöúòKöú†úòKö†ú†ú†ú†úò(ò,KôSóKö†ú†ú†ú†úò ö†ú†úò!Köú†ò†Kö†úòKòóKòKö†ú†úòKòóKòKòKò óö•	ú†ú†úò)Kö
+†ú
+†ú†ú†ú†úò<Köú†ú%ò.Köú†úòKöú	†úò(ö†ú†ú†úòKòKö†úòKòóKòö†ú†ú†úòKòKòHKö†úòKöúòóKòKöú	†ú ò,Kò KòKò óö•ú†ú1†ú†úòMKö†úòKöú	†úòKöú†úòKò,Köú†ú†ú†úòKöú†ú†ú†úòKöú†úò%Kò"KòKö†ú†ú
+†ú	†ú†ú†ú§ò@KòAKö
+†ú	†ú†ú!†ú†úò?ö†òKòAKòFKö†ú†ú†úòKöú†úòö†ú†ú†ú†ú†ú†ú†ò4òKö†ú†ú?òGóKö†úòóKò2Kö†úòKö†úòóö†ú)†úò1KöúmòmKòKöúòóKò Köú†úò7Kòö†ú†ú†ú†ú†ú†ú†ò=Köú†úò&Kò&Kö†úòóKöúXòXKòKò óKò óô&Kô ñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]ö•	ú†ú†ú†ú†ú§'òTKöú
+†ú†úò(Köú†úòKò>ö†ú†ú
+ò,Kò/óö†ú†ò Kö	ú†ú-†ú†ú†úòLKö	ú
+†ú-†ú†ú†úòLKö†úòóö†úòöú†ú†ò Köú†úò Köú	†úòKöúòKö†ú†ú†òóKöú†ú†ú5†úòYóKöúòKò óö•ú†ú†úò)Kö†ú†ú†ú†ú†ú†ú†ú†ú†úò_Kò"Kòö†ú†ú†úò!òKöú>ò>óKöú†úòKòKò%Kòóö†úòKòKò%KòKò%KöúòóKòKò óö•ú†ú†ú†úò;ö†úòKö†úBòDóKòKò óö•úò"Köú†úòKöú†úòKöú†úòKöú†úòö†ú†ú†ú&†úò@Kö†ú†ú†ú†ú
+ò;óKòKò óö•ú†ú†ú†ú†ú†úò?Köú†úòKòKö†ú
+†ú†úò/Kö†ú2ò8KòKò óKò óôKô ñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]ö•ú†ú†ú†úò3Kö†ú	†ú†ú†ú†ú†ú
+†ú†ú†ú†úòUKöú†ú
+†ú†ú†ú†ú†úôHKö†ú†ú†úò,Köú†úòKòKòö†ú
+†ú†úòKòKò6KòóKö
+†ú†ú
+†ú†ú†ú(òHKòö†ú†ú†úòKöú†ú†úòKòKòóKòKöú†úòö†ú†ú†òKòAóKö†ú†ú$ò:KòKò óKñx[key: ROPE, proc: Commander.CommandProc, doc: ROPE _ NIL, clientData: REF ANY _ NIL, interpreted: BOOL _ TRUE]òÚKòLKòIKöúxòxKöú¢ò¢KöúôòôKöú§ò§Köú©ò©Kñx[key: ROPE, proc: Commander.CommandProc, doc: ROPE _ NIL, clientData: REF ANY _ NIL, interpreted: BOOL _ TRUE]öú©ò©Köú…ò…Kñx[key: ROPE, proc: Commander.CommandProc, doc: ROPE _ NIL, clientData: REF ANY _ NIL, interpreted: BOOL _ TRUE]öúÅòÅKòOKñx[key: ROPE, proc: Commander.CommandProc, doc: ROPE _ NIL, clientData: REF ANY _ NIL, interpreted: BOOL _ TRUE]ònKñx[key: ROPE, proc: Commander.CommandProc, doc: ROPE _ NIL, clientData: REF ANY _ NIL, interpreted: BOOL _ TRUE]òQKöú†úò!Köú†úò%Köú†ú†úòKò óKöúòó Öó    bö  ú   

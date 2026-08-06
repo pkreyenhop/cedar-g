@@ -1,0 +1,396 @@
+
+
+DIRECTORY BasicTime, Commander, Convert, HostAndTerminalOps, IO, IOErrorFormatting, NetAddressing, NetworkName, NetworkStream, Process, Rope, SimpleFeedback, TerminalMultiServing;
+
+TerminalCoordinationImpl: CEDAR MONITOR
+LOCKS rm USING rm: RefLock
+IMPORTS BasicTime, Commander, Convert, HostAndTerminalOps, IO, IOErrorFormatting, NetAddressing, NetworkName, NetworkStream, Process, Rope, SimpleFeedback
+EXPORTS TerminalMultiServing
+=
+
+BEGIN OPEN HaTO:HostAndTerminalOps, NA:NetAddressing, NN:NetworkName, Nws:NetworkStream, TMS:TerminalMultiServing;
+ROPE: TYPE ~ Rope.ROPE;
+RefLock: TYPE ~ REF MONITORLOCK;
+debugNetworkService: BOOL ¨ TRUE;
+firstTerminalPort: INT ¨ 58813;
+deltaPort: INT ¨ 10;
+portLimit: INT ¨ 10;
+arpaTerminalPort: ROPE ¨ "?uninitialized?";
+arpaListener: Nws.Listener ¨ NIL;
+
+TheVWorker: TMS.ViewersWorker ¨ NIL;
+TheSWorker: TMS.SimpleTerminalWorker ¨ NIL;
+
+RestartArpaListeningForHosts: Commander.CommandProc ~ {
+[] ¨ StopArpaListeningForHosts[NIL];
+FOR i: INT IN [0 .. portLimit] DO
+arpaTerminalPort ¨ IO.PutFR1["%g", [integer[firstTerminalPort + i*deltaPort]] ];
+arpaListener ¨ Nws.CreateListener[
+protocolFamily: $ARPA,
+transportClass: $basicStream,
+local: NN.AddressFromName[$ARPA, NIL, arpaTerminalPort, port].addr,
+listenerWorkerProc: NwsWorkForHost
+! IO.Error => {
+codes: LIST OF ATOM ¨ NIL;
+msg: ROPE ¨ "!Error getting details!";
+[codes, msg] ¨ Nws.GetIOErrorDetails[stream !NetworkStream.Error => CONTINUE];
+SimpleFeedback.PutFL[$TerminalCoordination, oneLiner, $Error, "%g creating Terminal Control TCP listener on port %g", LIST[[rope[NA.FormatError[codes, msg]]], [rope[arpaTerminalPort]]] ];
+CONTINUE};
+Nws.Error => {
+SimpleFeedback.PutFL[$TerminalCoordination, oneLiner, $Error, "%g creating Terminal Control TCP listener on port %g", LIST[[rope[NA.FormatError[codes, msg]]], [rope[arpaTerminalPort]]] ];
+CONTINUE}];
+IF arpaListener#NIL THEN {
+SimpleFeedback.PutFL[$TerminalCoordination, oneLiner, $FYI, "At %g, Terminal Control listener on TCP port %g.", LIST[[time[BasicTime.Now[]]], [rope[arpaTerminalPort]]] ];
+EXIT};
+ENDLOOP;
+RETURN};
+
+StopArpaListeningForHosts: Commander.CommandProc ~ {
+l: Nws.Listener ~ arpaListener;
+IF l#NIL THEN {
+arpaListener ¨ NIL;
+Nws.DestroyListener[l];
+Process.PauseMsec[2000]};
+RETURN};
+
+NwsWorkForHost: PROC [listener: NetworkStream.Listener, in, out: IO.STREAM] ~ {
+pf, tc: ATOM;
+remote, invertErr: ROPE ¨ NIL;
+rna: NA.Address ¨ NA.nullAddress;
+[protocolFamily: pf, remote: remote, transportClass: tc] ¨ NetworkStream.GetStreamInfo[out];
+rna ¨ NA.FromNnAddress[remote, pf !NA.Error => {invertErr ¨ NA.FormatError[codes, msg]; CONTINUE}];
+WorkForHost[in, out, rna, remote, invertErr];
+RETURN};
+
+versionBrick: CHAR ~ CHAR.LAST;
+coordVersions: HaTO.ProtocolVersionRange ¨ [1, 4];
+
+FailWork: ERROR [why: ROPE] ~ CODE;
+
+WorkForHost: PROC [in, out: IO.STREAM, remote: TMS.Host, remoteAddress, invertErr: ROPE] ~ {
+GetPort: PROC ~ {
+IF pv >= 4 THEN {
+addr: ROPE ~ in.GetRopeLiteral[];
+portName: ROPE ~ NN.NameFromAddress[$ARPA, addr, port !NN.Error => FailWork[NA.FormatError[CONS[$NetworkNameError, codes], msg]] ].name;
+sep: CHAR ~ in.GetChar[];
+IF sep#'; THEN FailWork[IO.PutFR1["sep was '%c, not ';", [character[sep]] ]];
+remote ¨ remote.SetSocket[portName];
+RETURN}
+ELSE {
+remote ¨ remote.SetSocket["58812"];
+RETURN};
+};
+cmd: CHAR;
+reply: ROPE ¨ NIL;
+pv: HaTO.ProtocolVersion ¨ 1;
+{ENABLE {
+IO.Error => IF stream=in OR stream=out THEN GOTO closeit;
+IO.EndOfStream => IF stream=in OR stream=out THEN GOTO closeit;
+};
+cmd ¨ in.GetChar[];
+{ENABLE FailWork => {reply ¨ why; CONTINUE};
+IF cmd=versionBrick THEN {
+out.PutChar[versionBrick];
+out.PutChar[VAL[coordVersions.min]];
+out.PutChar[VAL[coordVersions.max]];
+out.Flush[];
+{hisVR: HaTO.ProtocolVersionRange ¨ [min: in.GetChar[].ORD];
+hisVR.max ¨ in.GetChar[].ORD;
+pv ¨ MIN[coordVersions.max, hisVR.max];
+IF MAX[hisVR.min, coordVersions.min] > pv THEN {
+reply ¨ IO.PutFLR["version mismatch: your[%g..%g] <> my[%g .. %g] coordination protocol", LIST[[integer[hisVR.min]], [integer[hisVR.max]], [integer[coordVersions.min]], [integer[coordVersions.max]]] ];
+GOTO Reply};
+cmd ¨ in.GetChar[];
+cmd ¨ cmd}}
+ELSE {reply ¨ "didn't open with version brick";
+GOTO Reply};
+IF remote = NA.nullAddress THEN {
+reply ¨ IO.PutFR["Couldn't invert your address (%g): %g", [rope[remoteAddress]], [rope[invertErr]] ];
+GOTO Reply};
+SELECT cmd FROM
+'D => {
+GetPort[];
+IF IsHost[remote] THEN {
+DontServeHost[remote];
+reply ¨ "OK";
+}
+ELSE reply ¨ "already disconnected from you";
+};
+'V => {
+sessPort: ROPE ¨ NA.ExtractSocket[remote];
+GetPort[];
+SELECT TRUE FROM
+NOT IsHost[remote] => reply ¨ "I'm not a terminal for you";
+TheVWorker = NIL => reply ¨ "Host not fully initialized yet";
+ENDCASE => {
+sessionDescr: ROPE ~ IO.PutFR["%g (session %g)", [rope[NA.FormatAddress[remote, TRUE]]], [rope[sessPort]] ];
+IF debugNetworkService THEN SimpleFeedback.PutFL[$RemoteViewersTerminal, oneLiner, $Debug, "At %g, starting RemoteViewersTerminal service for %g.", LIST[[time[BasicTime.Now[]]], [rope[sessionDescr]]] ];
+TheVWorker[in, out, remote, sessionDescr, NwsPush !UNWIND =>
+IF debugNetworkService THEN SimpleFeedback.PutFL[$RemoteViewersTerminal, oneLiner, $Debug, "At %g, aborting RemoteViewersTerminal service for %g.", LIST[[time[BasicTime.Now[]]], [rope[sessionDescr]]] ] ];
+IF debugNetworkService THEN SimpleFeedback.PutFL[$RemoteViewersTerminal, oneLiner, $Debug, "At %g, ending RemoteViewersTerminal service for %g.", LIST[[time[BasicTime.Now[]]], [rope[sessionDescr]]] ];
+GOTO closeit};
+};
+'S => {
+sessPort: ROPE ¨ NA.ExtractSocket[remote];
+GetPort[];
+SELECT TRUE FROM
+NOT IsHost[remote] => reply ¨ "I'm not a terminal for you";
+TheSWorker = NIL => reply ¨ "Host not fully initialized yet";
+ENDCASE => {
+sessionDescr: ROPE ~ IO.PutFR["%g (session %g)", [rope[NA.FormatAddress[remote, TRUE]]], [rope[sessPort]] ];
+close: BOOL;
+IF debugNetworkService THEN SimpleFeedback.PutFL[$RemoteSimpleTerminal, oneLiner, $Debug, "At %g, starting RemoteSimpleTerminal service for %g.", LIST[[time[BasicTime.Now[]]], [rope[sessionDescr]]] ];
+close ¨ TheSWorker[in, out, remote, sessPort !UNWIND =>
+IF debugNetworkService THEN SimpleFeedback.PutFL[$RemoteSimpleTerminal, oneLiner, $Debug, "At %g, aborting RemoteSimpleTerminal service for %g.", LIST[[time[BasicTime.Now[]]], [rope[sessionDescr]]] ] ];
+IF debugNetworkService THEN SimpleFeedback.PutFL[$RemoteSimpleTerminal, oneLiner, $Debug, "At %g, ending RemoteSimpleTerminal service for %g.", LIST[[time[BasicTime.Now[]]], [rope[sessionDescr]]] ];
+IF close THEN GOTO closeit ELSE RETURN};
+};
+'s => {outStream: IO.STREAM ~ IO.ROS[];
+SendPVR: PROC [protocol: ROPE, pvr: HaTO.ProtocolVersionRange] ~ {
+outStream.PutF["\"%q\" %g %g; ", [rope[protocol]], [integer[pvr.min]], [integer[pvr.max]]];
+RETURN};
+HaTO.EnumerateProtocolVersionsOfSide[Host, SendPVR];
+reply ¨ outStream.RopeFromROS[];
+};
+ENDCASE => {
+reply ¨ IO.PutFR1["Bad command character: %g", [rope[Rope.FromChar[cmd]]]];
+};
+EXITS Reply => NULL};
+out.PutRope[reply.Concat["\r"]];
+IF debugNetworkService THEN SimpleFeedback.PutFL[$TerminalCoordination, oneLiner, $Debug, "Reply to cmd %g from host %g (invertErr=%g) is %g", LIST[[character[cmd]], [rope[remoteAddress]], [rope[invertErr]], [rope[reply]]] ];
+IO.Flush[out]; [] ¨ in.GetChar[];
+in.Close[!IO.Error => CONTINUE]; out.Close[!IO.Error => CONTINUE];
+out ¨ out;
+EXITS closeit => {
+in.Close[!IO.Error => CONTINUE];
+out.Close[!IO.Error => CONTINUE]};
+};
+RETURN};
+
+NwsPush: PROC [pushStream: IO.STREAM] = {
+Nws.SendSoon[pushStream, 0];
+RETURN};
+InterestList: TYPE ~ LIST OF TMS.Interest;
+HostList: TYPE ~ LIST OF TMS.Host;
+
+clientLock: RefLock ~ NEW [MONITORLOCK ¨ []];
+addrs: HostList ¨ NIL;
+interests: InterestList ¨ NIL;
+
+debugSendCommand: BOOL ¨ TRUE;
+
+EqualHosts: PUBLIC PROC [c1, c2: TMS.Host] RETURNS [BOOL]
+~ {RETURN NA.EqualAddrs[c1, c2]};
+
+EnumerateHosts: PUBLIC PROC [Consume: PROC [TMS.Host]] ~ {
+FOR al: HostList ¨ addrs, al.rest WHILE al#NIL DO
+Consume[al.first];
+ENDLOOP;
+RETURN};
+
+IsHost: PUBLIC PROC [addr: TMS.Host] RETURNS [BOOL] ~ {
+Enter: ENTRY PROC [rm: RefLock] RETURNS [BOOL] ~ {
+ENABLE UNWIND => NULL;
+RETURN InnerIsHost[addr]};
+RETURN Enter[clientLock]};
+
+InnerIsHost: INTERNAL PROC [addr: TMS.Host] RETURNS [BOOL] ~ {
+FOR al: HostList ¨ addrs, al.rest WHILE al#NIL DO
+IF EqualHosts[al.first, addr] THEN RETURN [TRUE];
+ENDLOOP;
+RETURN [FALSE]};
+
+ServeHost: PUBLIC PROC [addr: TMS.Host, role: TMS.Role] RETURNS [whyNot: ROPE] ~ {
+WithLock: ENTRY PROC [rm: RefLock] RETURNS [BOOL] ~ {
+ENABLE UNWIND => NULL;
+IF InnerIsHost[addr] THEN RETURN [TRUE];
+addrs ¨ CONS[addr, addrs];
+FOR is: InterestList ¨ interests, is.rest WHILE is # NIL DO
+is.first.NoteHost[is.first, addr, TRUE];
+ENDLOOP;
+RETURN [FALSE]};
+whyNot ¨ NIL;
+IF addr=NA.nullAddress THEN RETURN ["I can't serve the null client"];
+[] ¨ WithLock[clientLock];
+whyNot ¨ SendCommand[addr, roleCmds[role], TRUE, TRUE].ans;
+whyNot ¨ IF whyNot.Length[]=0 THEN "no response" ELSE IF whyNot.Equal["OK"] THEN NIL ELSE whyNot;
+IF whyNot # NIL THEN DontServeHost[addr];
+RETURN};
+roleCmds: ARRAY TMS.Role OF CHAR ~ [primary: 'c, secondary: 'o];
+
+DontServeHost: PUBLIC PROC [addr: TMS.Host] ~ {
+WithLock: ENTRY PROC [rm: RefLock] RETURNS [BOOL] ~ {
+ENABLE UNWIND => NULL;
+prev: HostList ¨ NIL;
+addrs ¨ addrs;
+FOR al: HostList ¨ addrs, al.rest WHILE al#NIL DO
+IF EqualHosts[al.first, addr] THEN {
+IF prev#NIL THEN prev.rest ¨ al.rest ELSE addrs ¨ al.rest;
+EXIT};
+prev ¨ al;
+REPEAT FINISHED => RETURN [FALSE];
+ENDLOOP;
+addrs ¨ addrs;
+FOR is: InterestList ¨ interests, is.rest WHILE is # NIL DO
+is.first.NoteHost[is.first, addr, FALSE];
+ENDLOOP;
+RETURN [TRUE]};
+IF WithLock[clientLock] THEN TRUSTED {Process.Detach[FORK Kissoff[addr, Convert.RopeFromTime[from: BasicTime.Now[], end: seconds]]]};
+RETURN};
+
+Kissoff: PROC [addr: NA.Address, startTime: ROPE] ~ {
+[] ¨ SendCommand[addr, 'd, TRUE, FALSE];
+RETURN};
+
+ServeNoHosts: PUBLIC PROC ~ {
+Dont: PROC [addr: TMS.Host] ~ {DontServeHost[addr]};
+EnumerateHosts[Dont];
+RETURN};
+
+AddMultiInterest: PUBLIC PROC [i: TMS.Interest] ~ {
+WithLock: ENTRY PROC [rm: RefLock] ~ {
+ENABLE UNWIND => NULL;
+interests ¨ CONS[i, interests];
+FOR al: HostList ¨ addrs, al.rest WHILE al#NIL DO
+i.NoteHost[i, al.first, TRUE];
+ENDLOOP;
+RETURN};
+WithLock[clientLock];
+RETURN};
+
+GetHisTerminal: PUBLIC PROC [host: TMS.Host] RETURNS [ok: BOOL, ans: ROPE] ~ {
+RETURN SendCommand[host, 'q, FALSE, FALSE];
+};
+
+GetHisVersions: PUBLIC PROC [client: TMS.Host] RETURNS [ok: BOOL, ans: ROPE] ~ {
+RETURN SendCommand[client, 's, FALSE, FALSE];
+};
+
+GetHisTerminalByName: PROC [name: ROPE] RETURNS [ok: BOOL, ans: ROPE] ~ {
+RETURN GetHisTerminal[NA.ParseAddress[name]];
+};
+
+SendCommand: PROC [dest: TMS.Host, cmd: CHAR, postfixSelf, postfixVersions: BOOL] RETURNS [ok: BOOL ¨ TRUE, ans: ROPE] ~ {
+cmdIn, cmdOut: IO.STREAM ¨ NIL;
+pv: HaTO.ProtocolVersion ¨ 1;
+desta: ROPE ¨ NIL;
+destf: ATOM ¨ NIL;
+ansFromRem: BOOL ¨ FALSE;
+{ENABLE {
+IO.Error => {ok ¨ FALSE; ans ¨ IOErrorFormatting.FormatError[ec]; CONTINUE};
+IO.EndOfStream => {ok ¨ FALSE; ans ¨ "IO.EndOfStream"; CONTINUE};
+Nws.Error => {ok ¨ FALSE; ans ¨ NA.FormatError[codes, msg]; CONTINUE};
+};
+SendPVR: PROC [protocol: ROPE, pvr: HaTO.ProtocolVersionRange] ~ {
+cmdOut.PutF["\"%q\" %g %g\r", [rope[protocol]], [integer[pvr.min]], [integer[pvr.max]]];
+RETURN};
+[desta, destf] ¨ NA.ToNnAddress[dest !NA.Error => {ok ¨ FALSE; ans ¨ IO.PutFR["%g while converting %g %g %g to address", [rope[NA.FormatError[codes, msg]]], [rope[NA.FormatAddress[dest, TRUE]]] ]; GOTO Dun}];
+[cmdIn, cmdOut] ¨ Nws.CreateStreams[protocolFamily: destf, transportClass: $basicStream, remote: desta ];
+cmdOut.PutChar[versionBrick];
+cmdOut.PutChar[VAL[coordVersions.min]];
+cmdOut.PutChar[VAL[coordVersions.max]];
+cmdOut.Flush[];
+IF debugSendCommand THEN SimpleFeedback.PutFL[$TerminalCoordination, oneLiner, $Debug, "Sending cmd %g to host %g", LIST[[character[cmd]], [rope[desta]]] ];
+{hisBrick: CHAR ~ cmdIn.GetChar[];
+IF hisBrick#versionBrick THEN {ans ¨ "Host didn't open with version brick"; GOTO Dun};
+{hisVR: HaTO.ProtocolVersionRange ¨ [min: cmdIn.GetChar[].ORD];
+hisVR.max ¨ cmdIn.GetChar[].ORD;
+pv ¨ MIN[coordVersions.max, hisVR.max];
+IF MAX[coordVersions.min, hisVR.min] > pv THEN {
+ans ¨ IO.PutFLR["version mismatch: his[%g..%g] <> my[%g .. %g] coordination protocol", LIST[[integer[hisVR.min]], [integer[hisVR.max]], [integer[coordVersions.min]], [integer[coordVersions.max]]] ];
+GOTO Dun};
+}};
+cmdOut.PutChar[cmd];
+IF postfixSelf AND pv>=4 THEN cmdOut.PutF1["\"%q\";", [rope[NN.AddressFromName[$ARPA, NIL, arpaTerminalPort, port].addr]] ];
+IF postfixVersions THEN {
+HaTO.EnumerateProtocolVersionsOfSide[Terminal, SendPVR];
+cmdOut.PutRope["\"\" 0 0\r"]};
+IO.Flush[cmdOut];
+IF debugSendCommand THEN SimpleFeedback.PutFL[$TerminalCoordination, oneLiner, $Debug, "Waiting for reply to cmd %g from host %g", LIST[[character[cmd]], [rope[desta]]] ];
+ans ¨ cmdIn.GetLineRope[]; ansFromRem ¨ TRUE;
+EXITS Dun => cmd ¨ cmd;
+};
+IF debugSendCommand THEN SimpleFeedback.PutFL[$TerminalCoordination, oneLiner, $Debug, "Answer for cmd %g from host %g is %g", LIST[[character[cmd]], [rope[desta]], [rope[ans]]] ];
+IF cmdIn#NIL THEN {
+ENABLE IO.Error => CONTINUE;
+cmdOut.PutChar['.]; cmdOut.Flush[];
+cmdOut.Close[]; cmdIn.Close[]};
+RETURN};
+
+DescribeAtom: PROC [a: ATOM] RETURNS [ROPE] ~ {
+IF a=NIL THEN RETURN ["NIL"];
+RETURN IO.PutFR1["$%g", [atom[a]]]};
+
+EqualHostReferents: PUBLIC PROC [key1, key2: REF ANY] RETURNS [BOOL] ~ {
+ra1: REF TMS.Host ~ NARROW[key1];
+ra2: REF TMS.Host ~ NARROW[key2];
+RETURN EqualHosts[ra1≠, ra2≠]};
+
+HashHostReferent: PUBLIC PROC [key: REF ANY] RETURNS [CARDINAL] ~ TRUSTED {
+rh: REF TMS.Host ~ NARROW[key];
+RETURN rh≠.HashAddr[]};
+
+SetViewersWorker: PUBLIC PROC [w: TMS.ViewersWorker]
+~ {TheVWorker ¨ w};
+
+SetSimpleTerminalWorker: PUBLIC PROC [w: TMS.SimpleTerminalWorker]
+~ {TheSWorker ¨ w};
+HaTO.SetProtocolVersionRangeForSide[Terminal, "TerminalCoordination", coordVersions];
+[] ¨ RestartArpaListeningForHosts[NIL];
+Commander.Register["RestartTerminalControlTcp", RestartArpaListeningForHosts, "restart Terminal Control TCP listener"];
+Commander.Register["StopTerminalControlTcp", StopArpaListeningForHosts, "stop Terminal Control TCP listener"];
+END.
+     TerminalCoordinationImpl.Mesa
+Copyright ” 1990, 1992 by Xerox Corporation.  All rights reserved.
+Last tweaked by Mike Spreitzer on February 20, 1992 11:29 am PST
+Willie-s, April 21, 1992 7:57 pm PDT
+Random Stuff
+Network Service
+Exports to TerminalMultiServing
+Final Randomness
+ ù ›  ïNewlineDelimiter
+ñ(cedarcode) styleò codeôKöú
+œeú7ôBKöú@ô@Kô$óKò Köœk	ú4ûútò≥Kò öœnúûúûò'KöûúûúòKöûú4ûú]òöKöûúòKòóKò KöûúûúüúûúûúüúûúòrheadôKöûúûúûúòKöú	ûúûúûúò óôKöúûúûúò!Köúûú	òKöúûúòKöúûúòKöúûúò+Köúûúò!Kò Köü
+úûúûúò$Köü
+úûúûúò+Kò öüúò7Köúûúò$öûúûúûúûò!Köúûú;òPò"KöúòKöúòKöúûúûúòCKöú"ò"öúûúòKö	úûúûúûúûúòKöúûúò&KöúDûúòNKöúvûúûú8òªKöûúò
+óöúòKöúvûúûú8òªKöûúòóóöûúûúûúòKöúpûú6ò™KöûúòóKöûúòóKöûúòóKò öüúò4KöúòöûúûúûúòKöúûúòKöúòKòóKöûúòóKò öüúûú-ûúûúòOKöúûúòKöúûúûúòKöúûúûúò!Kò\Kö	úûúûúûúûúòcKöú-ò-KöûúòóKò KöúûúûúûúòKò2Kò Köüúûúûúûúò#Kò öüúûúûúûú
+ûú!ûúò\öüúûúòöûú	ûúòKöúûúò!Köú
+ûúûú$ûúûúûú)òàKöúûúòKöûúûú
+ûú3òMKò$KöûúòóöûúòKò#KöûúòóKòóKöúûúò
+KöúûúûúòKòöúûúò	Kö
+ûú
+ûúûúûúûú	ò9Kö
+ûúûúûúûúûú	ò?KòóKòKöúûúûúò,öûúûúòKöúòKöúûúò$Köúûúò$KòKöú7ûúò<KöúûúòKöúûúò'öûúûú$ûúò0KöúûúPûúkò…KöûúòóKòKòóöûú+ò/Köûúòóöûú
+ûúûúò!Köúûú[òeKöûúòóöûúûòòKò
+öûúûúòKöúòKòKòóKöûú)ò-KòóòKöú
+ûúûúò*Kò
+öûúûúûòKöûú8ò;Köúûú-ò=öûúòKö	úûúûú ûúûúòlKöûúûúyûú2ò öú3ûúò<Köûúûúyûú4òÃóKöûúûúwûú2ò»Köûú
+òóóKòóòKöú
+ûúûúò*Kò
+öûúûúûòKöûú8ò;Köúûú-ò=öûúòKö	úûúûú ûúûúòlKöúûúòKöûúûúwûú2ò»öú.ûúò7Köûúûúwûú4ò óKöûúûúuûú2ò∆Kö
+ûúûúûú	ûúûúò(óóKòóö	úûúûúûúûúò'öüúûúûú%òBKöú[ò[KöûúòóKöú4ò4Kò KòóöûúòKöúûúAòKKòóóKöûú
+ûúòKöú ò KöûúûútûúNò·Köûúò!Kö	ú
+ûú
+ûúûú
+ûúòBKò
+öûúòKöú
+ûú
+ûúò Köúûú
+ûúò"óKòKöûúòóKò öüúûúûúûúò)KöúòKöûúòóóöúôKö	úûúûúûúûú
+ò*Kö	ú
+ûúûúûúûúò"Kò Köúûúûúò-KöúûúòKöúûúòKò KöúûúûúòKò öü
+úûúûú
+ûúûúûúò9Köúûúûúò!óKò öüúûúûúüúûúûúò:öûúûúûúûò1KòKöûúòóKöûúòóKò öüúûúûúûúûúûúò7ö
+üúûúûúûúûúò2KöûúûúûúòKöûúòóKöûúòóKò öüúûúûúûúûúûúò>öûúûúûúûò1Köûúûúûúûúò1KöûúòóKöûúûúòóKò öü	úûúûúûúûúûú
+ûúòRö
+üúûúûúûúûúò5KöûúûúûúòKöûúûúûúûúò(Köúûúòöûú'ûúûúûò;Köú"ûúò(KöûúòóKöûúûúòóKöú	ûúòKöûúûúûúûú#òEKòKöú+ûúûúò;Köú	ûúûúûúûúûúûúûúòaKöûú
+ûúûúò)KöûúòóKö	ú
+ûúûúûúûú ò@Kò öüúûúûúûú
+ò/ö
+üúûúûúûúûúò5KöûúûúûúòKöúûúòKòöûúûúûúûò1öûúûúò$Köûúûúûúûúò:KöûúòóKò
+Köûúûúûúûúò"KöûúòóKòöûú'ûúûúûò;Köú"ûúò)KöûúòóKöûúûúòóKöûúûúûúûúLòÖKöûúòóKò öüúûúûúûúò5Köúûúûúò(KöûúòóKò öüúûúûúòKöüúûúûúò4KöúòKöûúòóKò öüúûúûúûúò3öüúûúûúò&KöûúûúûúòKöúûúòöûúûúûúûò1KöúûúòKöûúòóKöûúòóKòKöûúòóKò öüúûúûúûúûúûúûúòNKöûúûúûúò+KòóKò öüúûúûú
+ûúûúûúûúòPKöûúûúûúò-KòóKò öüúûúûúûúûúûúòIKöûúûúò-KòóKò öüúûúûúûú ûúûúûúûúûúòzKöúûúûúûúòKòKöúûúûúòKöúûúûúòKöúûúûúòöúûúò	Köûúûúú#ûúòLKöûúûúûúòAKöúûúûúûúòFKöúòóöüúûúûú%òBKöúXòXKöûúòóKöúûúûúûúûú8ûú"ûúûúûúò–KòiKöúòKöúûúò'Köúûúò'KöúòKöûúûú\ûú$òúKöúûúò"Köûúûú/ûúòVKöú:ûúò?Köúûúò Köúûúò'öûúûú$ûúò0KöúûúOûúkò∆Köûúò
+óKòKöúòKö
+ûúûúûúûúûú#ò|öûúûúòKöú8ò8KöúòóKöûúòKöûúûúkûú$ò´Köú(ûúò-KöûúòKòKöûúûúgûú1ò¥öûúûúûúòKöûúûú
+ûúòKöú#ò#KöúòóKöûúòóKò ö
+üúûúûúûúûúò/Köûúûúûúûú	òKöûúûúò$óKò öüúûúûúûúûúûúûúòHKöúûúûúûúò!Köúûúûúûúò!KöûúòóKò öüúûúûúûúûúûúûúûúòKKöúûúûúûúòKöûúòóKò öüúûúûúûúò4KòóKò öüúûúûúûúòBKòóóôKöúUòUKöú"ûúò'KöúwòwKöúnònóLöûúòó Öó    72  I+  

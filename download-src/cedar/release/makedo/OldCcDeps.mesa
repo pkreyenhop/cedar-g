@@ -1,0 +1,808 @@
+DIRECTORY
+Basics USING [Comparison],
+BasicTime USING [GMT, Period],
+CommandTool USING [CurrentWorkingDirectory],
+ExtendADotOut USING [Modifier, DependencyInfo, DependencyInfoRep, Fail, GetDependencyInfo, ObjectClassFromFileName, ObjectID, SetSwitch, VersionStampFromTime],
+FS USING [ComponentPositions, Error, ExpandName, StreamOpen],
+IO USING [Close, EndOf, Error, GetRope, PutF, PutFR, rope, RopeFromROS, ROS, SkipWhitespace, STREAM, Value],
+MakeDo USING [Action, ActionClass, ActionClassRep, AddFinder, fileClass, From, GetNode, GetProp, InnerGetCreated, Node, NodeList, notExistTime, PublicPartsOfAction, PublicPartsOfNode, SetProp, Time, Warning],
+MakeDoParsing,
+MakeDoPrivate USING [MDInstall],
+MakeDoPorting USING [logPath],
+MobDefs USING [NullVersion, VersionStamp],
+Mobery USING [ReadStampTable, StampTable, StampTableRep, StampTableSubset],
+MobListerUtils USING [PrintVersion],
+PBasics USING [IsBound],
+Process USING [PauseMsec],
+RedBlackTree USING [Compare, Create, DestroyTable, EnumerateIncreasing, Insert, Lookup, Table],
+RefTab USING [Fetch],
+Rope USING [Cat, Concat, Equal, EqualSubstrs, Fetch, FindBackward, Length, ROPE, Substr, Translate],
+SimpleStreams USING [Create],
+UserProfile USING [CallWhenProfileChanges, ProfileChangedProc, Boolean];
+
+CcDeps: CEDAR MONITOR
+IMPORTS
+BasicTime, CommandTool, ExtendADotOut, FS, IO, Mobery, MobListerUtils, MakeDo, MakeDoParsing, MakeDoPrivate, MakeDoPorting, PBasics, Process, RedBlackTree, RefTab, Rope
+
+, SimpleStreams, UserProfile =
+
+BEGIN OPEN MakeDo;
+
+dolog: BOOL ¨ FALSE;
+log: IO.STREAM ¨ SimpleStreams.Create[].out;
+
+OnProfileChange: UserProfile.ProfileChangedProc ~ {
+IF UserProfile.Boolean[key: "CcDeps.Talk", default: FALSE]
+THEN {
+dolog ¨ TRUE;
+ExtendADotOut.SetSwitch[debug, TRUE];
+}
+ELSE {
+dolog ¨ FALSE;
+ExtendADotOut.SetSwitch[debug, FALSE];
+};
+};
+
+Log: PROC [fmt: ROPE, val: IO.Value] ~ {
+IF NOT dolog THEN RETURN;
+log.PutF[fmt, val !IO.Error => IF ec=StreamClosed THEN {
+Process.PauseMsec[1500];
+log ¨ SimpleStreams.Create[].out;
+RETRY}];
+RETURN};
+
+GotoSyntaxError: ERROR = CODE;
+ShouldNotHappen: ERROR = CODE;
+
+ROPE: TYPE = Rope.ROPE;
+
+StampTableRef: TYPE = REF StampTableRep; StampTableRep: TYPE = RECORD [
+created: BasicTime.GMT,
+depInfo: ExtendADotOut.DependencyInfo,
+stampTable: Mobery.StampTable,
+depInfoValid: BOOL ¨ FALSE,
+stampTableValid: BOOL ¨ FALSE];
+SourceData: TYPE = REF SourceDataRep; SourceDataRep: TYPE = RECORD [
+oName, cName, shortName, localDir: ROPE,
+sourceType: SourceType ¨ Unknown,
+isC2C: BOOL,
+supports: RedBlackTree.Table,
+mesaNode, cedarNode, configNode, switchesNode, oNode, cNode: Node,
+depInfo: ExtendADotOut.DependencyInfo ¨ NIL,
+stampTable: Mobery.StampTable ¨ NIL,
+oCreateTime: BasicTime.GMT,
+oReadable: BOOL ¨ FALSE,
+supportsInvalid: BOOL ¨ FALSE,
+cmd: ROPE ¨ NIL
+];
+
+SourceType: TYPE = {Unknown, MesaGenerated, ConfigGenerated, PlainCFile};
+
+Support: TYPE = REF SupportRep; SupportRep: TYPE = RECORD [
+node: Node
+];
+
+installDir: ROPE ~ CommandTool.CurrentWorkingDirectory[];
+installed, badInstall: BOOL ¨ FALSE;
+
+c2cTail: ROPE = ".c2c";
+c2coTail: ROPE = Rope.Cat[c2cTail, ".o"];
+c2coTailLength: CARDINAL = c2coTail.Length[];
+c2ccTail: ROPE = Rope.Cat[c2cTail, ".c"];
+mobExt: ROPE = "mob";
+mobTail: ROPE = Rope.Cat[".", mobExt];
+mesaTail: ROPE = ".mesa";
+cedarTail: ROPE = ".cedar";
+configTail: ROPE = ".config";
+switchesTail: ROPE = ".switches";
+sTail: ROPE = ".s";
+oExt: ROPE = "o";
+oTail: ROPE = Rope.Cat[".", oExt];
+cTail: ROPE = ".c";
+
+DirAndClass: TYPE = RECORD [
+dir: ROPE, -- the directory name --
+class: ROPE, -- the corresponding machine class --
+switches: ROPE -- the default switches --
+];
+
+knownLocalDirs: LIST OF DirAndClass = LIST[
+DirAndClass[dir: "sun3", class: "sun3", switches: "-c -g"],
+DirAndClass[dir: "sun4", class: "sun4", switches: "-c -g"],
+DirAndClass[dir: "sun4-o3", class: "sun4", switches: "-c -O3"],
+DirAndClass[dir: "29k", class: "amd29000", switches: "-c -g"],
+DirAndClass[dir: "sun4-profiled", class: "sun4", switches: "-c -p"],
+DirAndClass[dir: "sun4-gprof", class: "sparc", switches: "-c -pg"]
+]; -- if in these directories, we issue this -mach  --
+
+CcClass: ActionClass ¨ NEW [ActionClassRep ¨ [
+CheckConsistency: CheckConsistency,
+Rederive: RederiveSource,
+ClearCaches: ClearCaches
+]];
+
+GetSupportKey: PROC [data: REF ANY] RETURNS [Node] --RedBlackTree.GetKey-- = {
+s: Support = NARROW[data];
+RETURN[s.node]};
+
+CompareSupport: PROC [k, data: REF ANY] RETURNS [Basics.Comparison] --RedBlackTree.Compare-- = {
+k1: INT = LOOPHOLE[k];
+k2: INT = LOOPHOLE[GetSupportKey[data]];
+RETURN [SELECT k1 FROM
+<k2 => less,
+=k2 => equal,
+>k2 => greater,
+ENDCASE => ERROR ShouldNotHappen];
+};
+
+ClearCaches: PROC [ac: ActionClass] ~ {
+MakeDoParsing.ClearCache[];
+installed ¨ badInstall ¨ FALSE;
+};
+
+SourceFind: PROC [resultName: ROPE, finderData: REF ANY] RETURNS [found: BOOLEAN, sought: Node, makes, cmdFrom: NodeList, from: From, cmd: ROPE, class: ActionClass, foundData: REF ANY] -- FinderProc -- ~ {
+
+baseDir, localDir, shortName, middleName: ROPE;
+oName, cName: ROPE;
+oExpanded: ROPE;
+oCP: FS.ComponentPositions;
+oNode, cNode: Node;
+isC2C: BOOL ¨ FALSE;
+md: SourceData;
+GetLocalDir: PROC [name, sep: ROPE] RETURNS [dir: ROPE ¨ NIL] ~ {
+pos, pos2: INT;
+pos ¨ Rope.FindBackward[s1: name, s2: sep];
+IF pos # -1 THEN {
+pos2 ¨ Rope.FindBackward[s1: name, s2: sep, pos1: pos-1];
+dir ¨ Rope.Substr[base: name, start: pos2+1, len: pos-pos2];
+IF RemoteMachClassAndSwitches[dir, knownLocalDirs].mach = NIL THEN dir ¨ NIL;
+};
+};
+found ¨ NOT badInstall;
+IF NOT found THEN RETURN;
+localDir ¨ GetLocalDir[resultName, "/"];
+IF localDir = NIL THEN localDir ¨ GetLocalDir[resultName, ">"];
+[oExpanded, oCP, ] ¨ FS.ExpandName[resultName !FS.Error => {found ¨ FALSE; CONTINUE}];
+IF NOT found THEN RETURN;
+found ¨ oExpanded.EqualSubstrs[start1: oCP.ext.start, len1: oCP.ext.length, s2: oExt, case: FALSE];
+IF NOT found THEN RETURN;
+IF NOT installed THEN InstallMe[];
+found ¨ NOT badInstall;
+IF NOT found THEN RETURN;
+IF (oCP.ver.start - oCP.base.start) >= c2coTailLength
+THEN {
+isC2C ¨ oExpanded.EqualSubstrs[start1: oCP.ext.start + oCP.ext.length - c2coTailLength, len1: c2coTailLength, s2: c2coTail, case: FALSE];
+middleName ¨ c2cTail;
+} ELSE {
+isC2C ¨ FALSE;
+middleName ¨ NIL;
+};
+middleName ¨ IF isC2C THEN c2cTail ELSE NIL;
+shortName ¨ oExpanded.Substr[start: oCP.base.start, len: oCP.base.length - middleName.Length[]];
+baseDir ¨ oExpanded.Substr[start: 0, len: oCP.base.start];
+IF localDir # NIL THEN {
+pos: INT;
+pos ¨ Rope.FindBackward[baseDir, localDir];
+baseDir ¨ baseDir.Substr[start: 0, len: pos];
+};
+
+oName ¨ Rope.Cat[baseDir, localDir, shortName, middleName, oTail];
+cName ¨ Rope.Cat[baseDir, shortName, middleName, cTail];
+oNode ¨ GetNode[oName, fileClass];
+cNode ¨ GetNode[cName, fileClass];
+foundData ¨ md ¨ NEW [SourceDataRep ¨ [
+oName: oName,
+cName: cName,
+shortName: shortName,
+localDir: localDir,
+isC2C: isC2C,
+supports: RedBlackTree.Create[GetSupportKey, CompareSupport],
+mesaNode: GetNode[Rope.Cat[baseDir, shortName, mesaTail], fileClass],
+cedarNode: GetNode[Rope.Cat[baseDir, shortName, cedarTail], fileClass],
+configNode: GetNode[Rope.Cat[baseDir, shortName, configTail], fileClass],
+switchesNode: GetNode[oName.Concat[switchesTail], fileClass],
+oNode: oNode,
+cNode: cNode,
+oCreateTime: MakeDo.notExistTime
+]];
+IF isC2C 
+THEN {
+cmdFrom ¨ LIST[
+md.cedarNode, md.mesaNode, md.configNode,
+md.switchesNode];
+}
+ELSE {
+cmdFrom ¨ LIST[md.cNode, -- md.cNodeUp, -- md.switchesNode];
+};
+sought ¨ md.oNode;
+class ¨ CcClass;
+[from, cmd] ¨ RederiveWork[md];
+makes ¨ LIST[md.oNode];
+RETURN};
+
+GetSwitches: PROC [oName: ROPE] RETURNS [switches: ROPE] =
+BEGIN
+ss: IO.STREAM ¨ NIL;
+ss ¨ FS.StreamOpen[oName.Cat[switchesTail] !FS.Error => CONTINUE];
+IF ss = NIL THEN RETURN [NIL];
+[] ¨ ss.SkipWhitespace[];
+IF ss.EndOf[] THEN { ss.Close[]; RETURN [NIL] };
+switches ¨ IO.GetRope[ss]; 
+ss.Close[];
+END;
+
+SupportIsLoaded: PROC [] RETURNS [BOOL] ~ INLINE {
+moberies: BOOL;
+moblisteries: BOOL;
+moberies ¨ PBasics.IsBound[LOOPHOLE[Mobery.ReadStampTable]] AND PBasics.IsBound[LOOPHOLE[Mobery.StampTableSubset]];
+moblisteries ¨ PBasics.IsBound[LOOPHOLE[MobListerUtils.PrintVersion]];
+RETURN [moberies AND moblisteries];
+};
+
+InstallMe: PROC ~ {
+foundFile, failed: BOOL;
+IF SupportIsLoaded[] THEN {
+installed ¨ TRUE;
+RETURN;
+};
+[foundFile, failed] ¨ MakeDoPrivate.MDInstall[installDir, "CcDepsSupport"];
+badInstall ¨ failed OR NOT foundFile;
+installed ¨ TRUE;
+IF NOT foundFile THEN Warning[Rope.Cat["Couldn't install CcDeps support because couldn't find ", installDir, "CcDepsSupport.Install (see ", MakeDoPorting.logPath, "CcDepsSupport.InstallLog); proceeding without knowledge of Cc"]]
+ELSE IF failed THEN Warning[Rope.Cat["Couldn't install CcDeps support because of error in install file (", installDir, "CcDepsSupport.Install) (see ", MakeDoPorting.logPath, "CcDepsSupport.InstallLog); proceeding without knowledge of Cc"]];
+RETURN};
+
+CheckConsistency: PROC [a: Action, result: Node] RETURNS [consistent: BOOL, reason: ROPE] --ConsistencyChecker-- =
+BEGIN
+md: SourceData = NARROW[a.PublicPartsOfAction[].foundData];
+switchesCreate: BasicTime.GMT = InnerGetCreated[md.switchesNode];
+curCTime: Time = InnerGetCreated[md.cNode] ; -- Creation time of the C node --
+resultExists: BOOL;
+supportFound: BOOL ¨ FALSE;
+CheckSupport: PROC [data: REF ANY] RETURNS [stop: BOOL ¨ FALSE]  --RedBlackTree.EachNode-- ~ {
+s: Support = NARROW[data];
+thisTime: Time = InnerGetCreated[s.node];
+thisName: Rope.ROPE ~ s.node.PublicPartsOfNode[].name;
+thisDepInfo: ExtendADotOut.DependencyInfo;
+thisStampTable: Mobery.StampTable;
+
+IF thisTime = MakeDo.notExistTime THEN RETURN [FALSE];
+supportFound ¨ TRUE;
+IF NOT resultExists THEN RETURN [supportFound];
+IF BasicTime.Period[thisTime, md.oCreateTime] < 0 THEN {
+consistent ¨ FALSE;
+reason ¨ IO.PutFR[".o file created at %g but %g was created at %g", [time[md.oCreateTime]], [rope[thisName]], [time[thisTime]] ];
+RETURN [TRUE];
+};
+
+thisDepInfo ¨ CurDepInfo[node: s.node];
+IF thisDepInfo # NIL AND ContainsDepInfo[md.depInfo]
+THEN {
+StampInDepInfo: PROC [name: ROPE, depInfo: ExtendADotOut.DependencyInfo] RETURNS [stamp: MobDefs.VersionStamp ¨ MobDefs.NullVersion] ~ {
+FOR list: LIST OF ExtendADotOut.ObjectID ¨ depInfo.dependList, list.rest WHILE list # NIL DO
+id: ExtendADotOut.ObjectID ~ list.first;
+IF Rope.Equal[s1: id.name, s2: name] THEN RETURN [id.stamp];
+ENDLOOP;
+};
+stampUsed: MobDefs.VersionStamp ~ StampInDepInfo[thisName, md.depInfo];
+IF thisDepInfo.self.stamp # stampUsed THEN {
+out: IO.STREAM ¨ IO.ROS[];
+out.PutF["Version stamp of %g (", IO.rope[thisName]];
+TRUSTED {MobListerUtils.PrintVersion[thisDepInfo.self.stamp, out, TRUE]};
+out.PutF[") is different from the version stamp used to create %g (", IO.rope[md.oName]];
+TRUSTED {MobListerUtils.PrintVersion[stampUsed, out, TRUE]};
+out.PutF[")"];
+consistent ¨ FALSE;
+reason ¨ out.RopeFromROS[];
+RETURN [TRUE];
+};
+}
+ELSE {
+IF md.stampTable = NIL
+THEN md.stampTable ¨ CurStampTab[node: md.oNode];
+thisStampTable ¨ CurStampTab[node: s.node];
+IF NOT Mobery.StampTableSubset[thisStampTable, md.stampTable] THEN {
+consistent ¨ FALSE;
+reason ¨ Rope.Cat["Stamps in ", thisName, " are not a subset of the stamps in ", md.oName];
+RETURN [TRUE];
+};
+}
+};
+Log["check consistency for %g\n", IO.rope[md.oName]];
+UpdateSupport[md];
+resultExists ¨ md.oCreateTime # MakeDo.notExistTime;
+SELECT md.sourceType FROM
+MesaGenerated, ConfigGenerated, PlainCFile => NULL;
+Unknown => RETURN [TRUE, "No source is known for this result"];
+ENDCASE => ERROR ShouldNotHappen;
+
+IF resultExists AND NOT md.oReadable THEN RETURN [FALSE, ".o file not readable"];
+IF switchesCreate # MakeDo.notExistTime THEN {
+supportFound ¨ TRUE;
+IF resultExists AND BasicTime.Period[md.oCreateTime, switchesCreate] > 0
+ THEN RETURN [FALSE, "switches file created later than result"]};
+consistent ¨ TRUE;
+reason ¨ "all version stamps match";
+md.supports.EnumerateIncreasing[CheckSupport];
+IF NOT supportFound THEN RETURN [TRUE, "no inputs exist to indicate inconsistency"];
+IF NOT resultExists THEN RETURN [FALSE, "some inputs but no result exists"];
+END;
+
+UpdateSupport: PROC [md: SourceData] = {
+
+oldO: Time = md.oCreateTime;
+md.oCreateTime ¨ InnerGetCreated[md.oNode];
+IF md.oCreateTime = MakeDo.notExistTime THEN RETURN;
+IF oldO = md.oCreateTime AND NOT md.supportsInvalid THEN RETURN;
+-- nothing has changed --
+
+md.depInfo ¨ CurDepInfo[node: md.oNode];
+IF NOT ContainsDepInfo[md.depInfo] THEN 
+md.stampTable ¨ CurStampTab[node: md.oNode];
+md.oReadable ¨ md.depInfo # NIL OR md.stampTable # NIL;
+md.supportsInvalid ¨ FALSE;
+
+};
+
+CurStampTab: ENTRY PROC [node: Node] RETURNS [stampTable: Mobery.StampTable] ~ {
+ENABLE UNWIND => {};
+sr: StampTableRef ¨ NARROW[node.GetProp[$StampTable]];
+created: BasicTime.GMT ¨ InnerGetCreated[node];
+fileName: ROPE ~ node.PublicPartsOfNode[].name;
+GetIt: PROC [] RETURNS [stampTable: Mobery.StampTable] ~ INLINE {
+Log["ReadStampTable for %g\n", IO.rope[fileName]];
+stampTable ¨ Mobery.ReadStampTable[fileName !FS.Error => {stampTable ¨ NIL; CONTINUE}];
+Log[".. %g\n", IO.rope[IF stampTable = NIL THEN "F" ELSE "S"]];
+RETURN [stampTable];
+};
+IF sr = NIL THEN node.SetProp[
+prop: $StampTable,
+val: sr ¨ NEW [StampTableRep ¨ [
+created: notExistTime,
+depInfo: NIL,
+stampTable: NIL]]
+];
+IF created = MakeDo.notExistTime
+THEN {
+sr.stampTable ¨ NIL;
+sr.depInfo ¨ NIL;
+sr.stampTableValid ¨ sr.depInfoValid ¨ TRUE;
+RETURN [stampTable: sr.stampTable]; -- cached value --
+};
+IF created = sr.created THEN {
+IF NOT sr.stampTableValid THEN {
+sr.stampTableValid ¨ TRUE;
+sr.stampTable ¨ GetIt[];
+};
+RETURN [stampTable: sr.stampTable]; -- cached value --
+};
+sr.created ¨ created;
+sr.stampTableValid ¨ TRUE;
+sr.depInfoValid ¨ FALSE;
+sr.stampTable ¨ GetIt[];
+stampTable ¨ sr.stampTable;
+RETURN [stampTable: stampTable]
+};
+
+ContainsDepInfo: PROC [depInfo: ExtendADotOut.DependencyInfo] RETURNS [BOOL] ~ INLINE {
+IF depInfo = NIL THEN RETURN [FALSE];
+RETURN [depInfo.action.class # null];
+};
+
+CurDepInfo: ENTRY PROC [node: Node] RETURNS [depInfo: ExtendADotOut.DependencyInfo] ~ {
+ENABLE UNWIND => {};
+sr: StampTableRef ¨ NARROW[node.GetProp[$StampTable]];
+created: BasicTime.GMT ¨ InnerGetCreated[node];
+fileName: ROPE ~ node.PublicPartsOfNode[].name;
+len: INT ~ Rope.Length[fileName];
+ExpandNamesInDepInfo: PROC [depInfo: ExtendADotOut.DependencyInfo, fileName: ROPE] RETURNS [newInfo: ExtendADotOut.DependencyInfo] ~ {
+FromSlash: PROC [old: CHAR] RETURNS [CHAR] ~ {
+IF old = '/ THEN RETURN ['>];
+RETURN [old];
+};
+base: ROPE;
+selfName: ROPE ~ depInfo.self.name;
+selfConverted: ROPE;
+IF selfName.Fetch[0] = '/
+THEN {
+selfConverted ¨ FS.ExpandName[selfName].fullFName;
+depInfo.self.name ¨ selfConverted;
+base ¨ NIL;
+}
+ELSE {
+tailPos: INT;
+selfConverted ¨ Rope.Translate[base: selfName, translator: FromSlash];
+tailPos ¨ fileName.FindBackward[s2: selfConverted, case: TRUE];
+IF tailPos = -1 THEN RETURN [NIL];
+base ¨ fileName.Substr[len: tailPos]; 
+depInfo.self.name ¨ FS.ExpandName[name: selfConverted, wDir: base].fullFName;
+};
+FOR list: LIST OF ExtendADotOut.ObjectID ¨ depInfo.dependList, list.rest WHILE list # NIL DO
+id: ExtendADotOut.ObjectID ¨ list.first;
+IF id.name.Fetch[0] # '/
+THEN IF base = NIL
+THEN RETURN [NIL]
+ELSE {
+tailConverted: ROPE ~ Rope.Translate[base: id.name, translator: FromSlash];
+newName: ROPE ~ FS.ExpandName[Rope.Cat[base, tailConverted]].fullFName;
+list.first.name ¨ newName;
+};
+ENDLOOP;
+RETURN [depInfo];
+};
+GetFromFileName: PROC [] RETURNS [depInfo: ExtendADotOut.DependencyInfo] ~ INLINE {
+depInfo ¨ NEW [ExtendADotOut.DependencyInfoRep ¨ [
+self: [name: fileName, class: ExtendADotOut.ObjectClassFromFileName[fileName], stamp: ExtendADotOut.VersionStampFromTime[created]],
+action: [name: NIL, class: null, stamp: MobDefs.NullVersion],
+dependList: NIL
+]];
+};
+GetIt: PROC [] RETURNS [depInfo: ExtendADotOut.DependencyInfo] ~ {
+SELECT TRUE FROM
+len >= 2 AND Rope.EqualSubstrs[s1: fileName, start1: len-2, s2: ".c"] => {
+Log["DepInfo from create time for %g\n", IO.rope[fileName]];
+depInfo ¨ GetFromFileName[];
+};
+len >= 2 AND Rope.EqualSubstrs[s1: fileName, start1: len-2, s2: ".h"] => {
+Log["DepInfo from create time for %g\n", IO.rope[fileName]];
+depInfo ¨ GetFromFileName[];
+};
+ENDCASE => {
+Log["GetDependencyInfo for %g", IO.rope[fileName]];
+depInfo ¨ ExtendADotOut.GetDependencyInfo[fileName ! ExtendADotOut.Fail => {depInfo ¨ GetFromFileName[] ; CONTINUE }];
+depInfo ¨ ExpandNamesInDepInfo[depInfo, fileName];
+};
+RETURN [depInfo];
+};
+IF sr = NIL THEN node.SetProp[
+prop: $StampTable,
+val: sr ¨ NEW [StampTableRep ¨ [
+created: notExistTime,
+depInfo: NIL,
+stampTable: NIL]]
+];
+IF created = MakeDo.notExistTime
+THEN {
+sr.stampTable ¨ NIL;
+sr.depInfo ¨ NIL;
+sr.stampTableValid ¨ sr.depInfoValid ¨ TRUE;
+RETURN [depInfo: sr.depInfo]; -- cached value --
+};
+IF created = sr.created THEN {
+IF NOT sr.depInfoValid THEN {
+sr.depInfoValid ¨ TRUE;
+sr.depInfo ¨ GetIt[];
+};
+RETURN [depInfo: sr.depInfo]; -- cached value --
+};
+sr.created ¨ created;
+sr.stampTableValid ¨ FALSE;
+sr.depInfoValid ¨ TRUE;
+sr.depInfo ¨ GetIt[];
+depInfo ¨ sr.depInfo;
+RETURN [depInfo: sr.depInfo]; -- cached value --
+};
+
+RederiveSource: PROC [a: Action] RETURNS [from: From, cmd: ROPE] --RederiveProc-- = {
+md: SourceData ~ NARROW[a.PublicPartsOfAction[].foundData];
+RETURN RederiveWork[md]};
+
+RemoteMachClassAndSwitches: PROC [localDir: ROPE, known: LIST OF DirAndClass] RETURNS [mach: ROPE, switches: ROPE] ~ {
+dir: ROPE;
+IF localDir = NIL THEN RETURN [NIL, NIL];
+dir ¨ Rope.Substr[localDir, 0, localDir.Length[]-1];
+FOR list: LIST OF DirAndClass ¨ known, list.rest WHILE list # NIL DO
+pair: DirAndClass = list.first;
+IF Rope.Equal[pair.dir, dir, FALSE] THEN RETURN [mach: pair.class, switches: pair.switches];
+ENDLOOP;
+RETURN [NIL, NIL]
+};
+
+NoteC: PROC [pe: MakeDoParsing.ParseEntry, consume: PROC[ROPE]] ~ {
+WITH pe.parseData.Fetch[$Includes].val SELECT FROM
+list: LIST OF ROPE => {
+FOR list ¨ list, list.rest WHILE list # NIL DO
+name: ROPE ~ list.first;
+consume[name];
+ENDLOOP;
+};
+ENDCASE => NULL;
+};
+NoteConfig: PROC [pe: MakeDoParsing.ParseEntry, consume: PROC[ROPE]] ~ {
+WITH pe.parseData.Fetch[$Requests].val SELECT FROM
+list: LIST OF ROPE => {
+FOR list ¨ list, list.rest WHILE list # NIL DO
+name: ROPE ~ list.first;
+consume[name.Cat[c2coTail]];
+ENDLOOP;
+};
+ENDCASE => NULL;
+WITH pe.parseData.Fetch[$StaticRequests].val SELECT FROM
+list: LIST OF ROPE => {
+FOR list ¨ list, list.rest WHILE list # NIL DO
+name: ROPE ~ list.first;
+consume[name];
+ENDLOOP;
+};
+ENDCASE => NULL;
+};
+NoteMesa: PROC [pe: MakeDoParsing.ParseEntry, consume: PROC[ROPE]] ~ { NULL };
+
+RederiveWork: PROC [md: SourceData] RETURNS [from: From, cmd: ROPE] ~ {
+NoteDep: PROC [fileName: ROPE] ~ {
+n: Node;
+s: Support;
+len: INT = fileName.Length[];
+IF len >= 2 AND Rope.EqualSubstrs[s1: fileName, start1: len-2, len1: 2, s2: oTail, case: FALSE]
+THEN fileName ¨ Rope.Cat[md.localDir, fileName];
+n ¨ GetNode[fileName, fileClass];
+s ¨ NARROW[md.supports.Lookup[n]];
+IF s = NIL THEN {
+s ¨ NEW [SupportRep ¨ [n]];
+md.supports.Insert[s, n];
+};
+from.mustHave ¨ CONS[n, from.mustHave];
+RETURN};
+Q: PROC [rope: ROPE] RETURNS [qRope: ROPE] ~ {
+qRope ¨ IO.PutFR["\"%q\"", IO.rope[rope]];
+RETURN [qRope];
+};
+userSwitches: Rope.ROPE;
+mimosaSwitches: Rope.ROPE;
+ss: Support;
+IterateList: TYPE ~ LIST OF RECORD [node: Node, class: ATOM, proc: PROC[MakeDoParsing.ParseEntry, PROC[ROPE]]];
+iterateList: IterateList;
+QNIL: ROPE = Q[NIL];
+dirSw: ROPE = IF md.localDir # NIL THEN Rope.Cat[" -dir ", md.localDir] ELSE NIL;
+machClass: ROPE;
+uSwitches: ROPE;
+defaultSwitches: ROPE;
+machClassSw: ROPE;
+[mach: machClass, switches: uSwitches] ¨ RemoteMachClassAndSwitches[md.localDir, knownLocalDirs];
+defaultSwitches ¨ Q[uSwitches];
+machClassSw ¨ IF machClass # NIL THEN Rope.Cat[" -class ", machClass] ELSE NIL;
+from ¨ [mustHave: LIST[md.cNode], optional: LIST[md.switchesNode]];
+md.supports.DestroyTable[];
+ss ¨ NEW [SupportRep ¨ [md.cNode]];
+md.supports.Insert[ss, md.cNode];
+IF md.isC2C
+THEN {
+iterateList ¨ LIST[[md.mesaNode, $Mesa, NoteMesa], [md.cedarNode, $Mesa, NoteMesa], [md.configNode, $Config, NoteConfig]];
+}
+ELSE {
+iterateList ¨ LIST[[md.cNode, $C, NoteC]];
+};
+FOR list: IterateList ¨ iterateList, list.rest WHILE list # NIL DO
+node: Node ~ list.first.node;
+class: ATOM ~ list.first.class;
+proc: PROC[MakeDoParsing.ParseEntry, PROC[ROPE]] ~ list.first.proc;
+pe: MakeDoParsing.ParseEntry ¨ MakeDoParsing.GetParseEntry[node: node, class: class];
+IF pe # NIL THEN {
+type: ATOM ~ NARROW[pe.parseData.Fetch[$SourceType].val];
+md.sourceType ¨ SELECT type FROM
+$CedarProg, $CedarMonitor, $CedarDefs => MesaGenerated,
+$Config => ConfigGenerated,
+$C => PlainCFile,
+ENDCASE => PlainCFile;
+proc[pe, NoteDep];
+EXIT;
+};
+ENDLOOP;
+md.supportsInvalid ¨ TRUE;
+UpdateSupport[md];
+mimosaSwitches ¨ userSwitches ¨ Q[GetSwitches[md.oName]];
+SELECT md.sourceType FROM
+MesaGenerated => {
+IF mimosaSwitches.Equal[QNIL] THEN mimosaSwitches ¨ defaultSwitches;
+cmd ¨ Rope.Cat[cmd, "MMCCMesa "];
+cmd ¨ Rope.Cat[cmd, machClassSw]; 
+cmd ¨ Rope.Cat[cmd, " -name ", md.shortName]; 
+cmd ¨ Rope.Cat[cmd, dirSw]; 
+cmd ¨ Rope.Cat[cmd, " -mSw ", mimosaSwitches];
+cmd ¨ Rope.Cat[cmd, " -uSw ", userSwitches];
+};
+ConfigGenerated => {
+IF mimosaSwitches.Equal[QNIL] THEN mimosaSwitches ¨ defaultSwitches;
+cmd ¨ Rope.Cat[cmd, "MMCCConfig "];
+cmd ¨ Rope.Cat[cmd, machClassSw]; 
+cmd ¨ Rope.Cat[cmd, " -name ", md.shortName]; 
+cmd ¨ Rope.Cat[cmd, dirSw]; 
+cmd ¨ Rope.Cat[cmd, " -mSw ", mimosaSwitches];
+cmd ¨ Rope.Cat[cmd, " -uSw ", userSwitches];
+cmd ¨ Rope.Cat[cmd, " -aux ", NodeToOnlyOs[from.mustHave]];
+};
+PlainCFile => {
+IF mimosaSwitches.Equal[QNIL] THEN mimosaSwitches ¨ defaultSwitches;
+cmd ¨ Rope.Cat[cmd, "MMCCC "];
+cmd ¨ Rope.Cat[cmd, machClassSw]; 
+cmd ¨ Rope.Cat[cmd, " -name ", md.shortName]; 
+cmd ¨ Rope.Cat[cmd, dirSw]; 
+cmd ¨ Rope.Cat[cmd, " -mSw ", mimosaSwitches];
+cmd ¨ Rope.Cat[cmd, " -uSw ", userSwitches];
+cmd ¨ Rope.Cat[cmd, " -aux ", NodeToAllButOne[target: md.cNode, nodeList: from.mustHave]];
+};
+Unknown => cmd ¨ NIL;
+ENDCASE => ERROR ShouldNotHappen;
+md.cmd ¨ cmd;
+RETURN};
+
+NodeToOnlyOs: PROC [nodeList: NodeList] RETURNS [aRope: ROPE] ~ {
+ONameOrNIL: PROC [aNode: Node] RETURNS [shortName: ROPE ¨ NIL] ~ {
+nodeName, fullName: ROPE;
+nameCP: FS.ComponentPositions;
+extension: Rope.ROPE;
+[name: nodeName] ¨ MakeDo.PublicPartsOfNode[aNode];
+[fullFName: fullName, cp: nameCP] ¨ FS.ExpandName[nodeName];
+shortName ¨ fullName.Substr[start: nameCP.base.start, len: nameCP.base.length];
+extension ¨ fullName.Substr[start: nameCP.ext.start, len: nameCP.ext.length];
+shortName ¨ IF Rope.Equal[s1: extension, s2: oExt, case: FALSE]
+THEN shortName.Cat[oTail]
+ELSE NIL;
+RETURN [shortName];
+};
+nameToAdd: Rope.ROPE;
+aRope ¨ NIL;
+FOR list: NodeList ¨ nodeList, list.rest WHILE list # NIL DO
+nameToAdd ¨ ONameOrNIL[list.first];
+IF nameToAdd # NIL THEN aRope ¨ Rope.Cat[aRope, " ", ONameOrNIL[list.first]];
+ENDLOOP;
+RETURN [aRope: aRope];
+};
+
+NodeToAllButOne: PROC [target: Node, nodeList: NodeList] RETURNS [aRope: ROPE] ~ {
+ExplodeTarget: PROC [target: Node] RETURNS [targetShortName: ROPE, targetDirLen: INT] ~ {
+targetDir: ROPE;
+targetName: ROPE ~ MakeDo.PublicPartsOfNode[target].name;
+targetFullFName: ROPE;
+targetCP: FS.ComponentPositions;
+[fullFName: targetFullFName, cp: targetCP] ¨ FS.ExpandName[targetName];
+targetDir ¨ targetFullFName.Substr[start: 0, len: targetCP.base.start];
+targetShortName ¨ targetFullFName.Substr[start: targetCP.base.start];
+RETURN [targetShortName: targetShortName, targetDirLen: targetCP.base.start];
+};
+targetShortName: ROPE;
+targetDirLen: INT;
+ShortName: PROC [aNode: Node] RETURNS [shortName: ROPE] ~ {
+nodeName, fullName: ROPE;
+[name: nodeName] ¨ MakeDo.PublicPartsOfNode[aNode];
+fullName ¨ FS.ExpandName[nodeName].fullFName;
+shortName ¨ fullName.Substr[start: targetDirLen];
+};
+[targetShortName: targetShortName, targetDirLen: targetDirLen] ¨ ExplodeTarget[target];
+aRope ¨ NIL;
+FOR list: NodeList ¨ nodeList, list.rest WHILE list # NIL DO
+newName: Rope.ROPE = ShortName[list.first];
+IF NOT Rope.Equal[s1: newName, s2: targetShortName, case: FALSE] THEN
+aRope ¨ Rope.Cat[aRope, " ", newName];
+ENDLOOP;
+RETURN [aRope: aRope];
+};
+
+AddFinder[["Cc", SourceFind], front];
+UserProfile.CallWhenProfileChanges[OnProfileChange];
+
+END.
+
+   ä  
+CcDeps.Mesa
+Copyright ” 1988, 1991 by Xerox Corporation.  All rights reserved.
+Eduardo Pelegri-Llopart, January 18, 1990 2:23:40 pm PST
+After ConfigAndMesaDeps.mesa
+Deals with (user-created and Mimosa & Cinder-created) C files.  Output files are .o
+JKF March 14, 1989 10:28:07 am PST
+Last tweaked by Mike Spreitzer on March 19, 1990 8:31 am PST
+Bill Jackson (bj) January 16, 1989 1:31:39 pm PST
+
+INVARIANT
+StampRef in node props
+The stamp table and when the file was created.  Used for caching information.
+
+Maintains information that MakeDo "knows" about and does not have to re-compute.
+if the ".o" file has been extended, this information is acurate and easy to extract
+stampTable is the desired collection of stamp encoded in the O file.
+To collect the files that will support our action.
+Constants
+A FinderProc looks for an action that will make an object with name resultName.  It returns an indication of whether it found it, a pointer to the node describing the object, and a list of the nodes produced by the action.  cmdFrom is a list of the determiners, while from is a list of all the nodes needed by the action to be runnable, discriminating between mandatory and optional nodes. FoundData is a record holding all the useful information that may be needed later.
+The action found by this finder is "Cc", details depend on the source of the C file
+baseDir: full expanded name, up to, but not including, the sun3 directory part
+localDir: local directory (can be null)
+shortName: local name up to, but not including, .c2c.o
+middleName: either the .c2c extension or null.
+Only accept the local directories that make sense
+We only know what to do with .O files.
+
+md.cedarNodeUp, md.mesaNodeUp, md.configNodeUp, -- files one up --
+LOOPHOLE only needed for PrincOps
+Is an action a consistent with a current result?  The action is derived from the current determiners and result is in Makes of the action. 
+We know that the only valid result is the ONode.
+What to check depends on what we have available.
+It can be either the source creation time, or the encoded-in-O-file stamp, or the collection of mob-version stamps.
+Update the information that may have changed since last time.
+Extract information (Stamps and Create times) from the O that currently exist.  It does not change the contents of md.support, which is done in RederiveWork[].
+Get the current Stamp Table of a node.  Information is cached.
+Get the current dependency or Stamp Table of a node.  Information is cached.
+fileName is in FS format; all the file names in the DependencyInfo are in / format.
+This actually shouldn't happen.
+This shouldn't happen
+Returns a "something" or NIL, depending on whether we know about the localDir or not.
+RederiveWork determines which of a collection of actions implied by md is currently favored by the state of the system.  It returns the action and the list of all the nodes needed for this action to be startable.
+Collect one more dependency into the from set;  also reconstructs md.support.
+This is temporary until I get the semantics cleared up
+IF Rope.SkipTo[s: fileName, skip: "/>"] < len THEN ERROR ShouldNotHappen;
+This is adding the files to the set on which the output nodes depend on.
+This is a mesa, cedar, or config generated file.
+This should be a plain C file.
+cmd _ Rope.Cat[cmd, " -aux ", NodeToAllButOne[target: Rope.Cat[md.shortName, cTail], nodeList: from.mustHave]];
+NodeToAllButOne: PROC [target: Rope.ROPE, nodeList: NodeList] RETURNS [aRope: ROPE] ~ {
+ShortName: PROC [aNode: Node] RETURNS [shortName: ROPE] ~ {
+nodeName, fullName: ROPE;
+nameCP: FS.ComponentPositions;
+[name: nodeName] _ MakeDo.PublicPartsOfNode[aNode];
+[fullFName: fullName, cp: nameCP] _ FS.ExpandName[nodeName];
+shortName _ fullName.Substr[start: nameCP.base.start, len: nameCP.ext.start + nameCP.ext.length - nameCP.base.start];
+};
+aRope _ NIL;
+FOR list: NodeList _ nodeList, list.rest WHILE list # NIL DO
+newName: Rope.ROPE = ShortName[list.first];
+IF NOT Rope.Equal[s1: newName, s2: target, case: FALSE] THEN
+aRope _ Rope.Cat[aRope, " ", newName];
+ENDLOOP;
+RETURN [aRope: aRope];
+};
+
+JKF October 7, 1988 10:51:46 am PDT
+Just changed -lcedarc to -lxrc
+
+JKF March 14, 1989 10:27:47 am PST
+Added a class for profiled code.
+
+ù ä  ïNewlineDelimiter
+ñ(cedarcode) styleô codeôKöú
+œeú7ôBKöú8ô8KôKôSKô"Kô<Kô1Kô óöœk	ò	KöúûúòKöú
+ûúûú
+òKöúûúò,KöúûúåòüKöûúûú5ò=Köûúûú@ûúûú	òlKöúûúƒò–KòKöúûúò KöúûúòKöúûúò*Köúûú?òKKöúûúò$KöúûúòKöúûúòKöúûúMò_Köúûú	òKöúûúAûúòdKöúûú
+òKöúûú7òHóKò ö—bnxúûúûòöûòKöú'ûúûú{ò®Kò Köúòóöû	ô	KöúôóóKò KöûúûúòKò KöúûúûúòKöúûúûúò,Kò öœnú$ò3öûú2ûúò:öûúòKöúûúòKöúûúò%KòóöûúòKöúûúòKöúûúò&KòóóKòóKò ö†úûúûúûúò(Köûúûúûúûúòöúûú
+ûúûúò8KòKöú!ò!KöûúòóKöûúòóKò Kö†úûúûúòKö†úûúûúòKò KöûúûúûúòKò ö	úûúûúûúûúòGKöúûúòKò&KöúòKöúûúûúòöúûúûúòKôMKô óóö	úûúûúûúûúòDKôPKöú#ûúò(Kò!KöúûúòKöúòKòBöú(ûúò,KôSóöú$ò$KöúDôDóKöúûúòKöúûúûúòKöúûúûúòKöúûúûòKòóKò Köúûú9òIKò ö	ú	ûúûúûúûúò;Köú
+ò
+öúòKöú2ô2óóKò Köúûú)ò9Köúûúûúò$Kò headô	Köú	ûú
+òKöú
+ûúò)Köúûúò-Köú
+ûúò)Köúûú	òKöú	ûúò&Köú
+ûúòKöúûúòKöúûúòKöúûúò!KöúûúòKöúûúòKöúûúò"KöúûúòKò óöúûúûúòKöúûúœcò#Köúûú°%ò2Köú
+ûú°ò)KòKò óöúûúûúûúò+Köú;ò;Köú;ò;Köú?ò?Köú>ò>KöúDòDKöúBòBKöú°3ò6óKò öúûúò.Kö†úò#Kö†úòKö†úòKòóKò ö†úûúûúûúûú°úòNKöúûúòKöûú
+òKò óö†úûúûúûúûú°úò`KöúûúûúòKöúûúûúò(öûúûúûòKöúòKöúòKöúòKöûúûúò"óKöúòóKò ö†úûúò'KòKöúûúòKòóKò ö†
+úûúûúûúûúûú	ûú;ûú!ûúûú°úòÕKö	ú+ùúùúèùú%ùú»ôÿKôSKò öú*ûúò/KôNKô'Kô6Kô.óKöúûúòKöúûúòKöúûúòKöúòKöúûúûúòKòö†úûúûúûúûúûúòAKöúûúòKöú+ò+öûú	ûúòKöú9ò9Köú<ò<öûú8ûúûúûúòMKöú1ô1óKòóKòóKöúûúòKöûúûúûúûúòKöú(ò(Köûúûúûú)ò?Kö	úûúûúûúûúòVKöûúûúûúûúòKöú\ûúòcöûúûúûúûúòKö—jls&ô&óKô Köûúûúûúò"KöúûúòKöûúûúûúûúòöûú3ò5öûúòKöúÇûúòâKòóöúûúòKöúûúòKöúûúòóKöúòóKö	úûúûú	ûúûúò,Köú`ò`Köú:ò:öûúûúûúòKöúûúò	Köú+ò+Kò-KöúòóKò KöúBòBKöú8ò8Köú"ò"Köú"ò"öúûúò'KòKòKöúòKòKòKöú=ò=KöúEòEKöúGòGKöúIòIKöú=ò=KöúòKöúòKò Köúòóöûúò	öûúòöú
+ûúòKöú)ò)Köú0°ôBKöúòóKòóöûúòKöú
+ûú°úò<KöúòóóKöúòKöúòKòKöúûúòKöûúòóKò ö
+†úûú	ûúûúûúò:KöûòKöúûúûúûúòKöúûú%ûú
+ûúòBKö
+ûúûúûúûúûúòKòKöûúûúûúûúò0KöúòKòKöûúòóKò ö
+†úûúûúûúûúò2Köú
+ûúòKöúûúòKöúûúûúûúòsöúûúòFKô!óKöûúûúò#òKò óóö†	úûúòKöúûúòöûúûúòKöúûúòKöûúòKòóKöúKòKKöúûúûúò%KöúûúòKöûúûúûúœò‰Köûúûúûú›òKöûúòóKò ö†úûúûúûú
+ûú°úòrIresuöú–aeùúùú\ôãMöúùúô0KöûòKöúûú$ò;Köúûú$òAKöú-°!òNKöúûòKöúûúûúòö†úûúûúûúûúûúûú°úò^Kô0KôsKöúûúòKöú)ò)Köúûú#ò6Kò*Kò"Kò Köûú ûúûúûúò6KöúûúòKöûúûúûúûúò/öûú0ûúò8KöúûúòKöú	ûúvòÅKöûúûúòKòóKò Köú'ò'öûúûúûúò4öûúòö†úûúûú)ûú8òàöûúûúûú8ûúûúûò\Köú(ò(Köûú#ûúûúò<KöûúòóKòóKöúGòGöûú$ûúò,Kö	úûúûúûúûúòKöú5ò5Köûú;ûúòIKöúYòYKöûú.ûúò<KòKöúûúòKöúòKöûúûúòKöúòóKöúòóöûúòöûúûòKöûú-ò1óKöú+ò+öûúûú8ûúòDKöúûúòKò[KöûúûúòKöúòóóKöúòóKòóKöú"ûúò5KòKöú4ò4öûúûòKöú.ûúò3Köúûúûú(ò?Köûúûúò!óKò KöûúûúûúûúûúûúòQöûú&ûúò.KöúûúòKöûúûú5òHKöúûúûúûú.òAóKöúûúòKöú$ò$Köú.ò.Kö
+ûúûúûúûúûú/òTKö
+ûúûúûúûúûú&òLKöûúòóKò ö†úûúò(Köú=ô=Köúsù
+úùôüKò KòKò+Köûú&ûúûúò4ö
+ûúûúûúûúûúò@Kö°òóKò Köú(ò(öûúûúûúò(Kò,óKöúûúûúûúò7KöúûúòKò KòóKò ö†úûúûúûú$òPKô>KöûúûúòKöúûúò6Köúûúò/Köú
+ûú!ò/ö†úûúûú#ûúòAKöúûúò2Köú-ûúûúûúòWKöúûúûúûúûúûúò?KöûúòKòóöûúûúûúòKöúòöú
+ûúò KöúòKöú	ûúòKöúûúòóKòóöûúò öûúòKöúûòKöúûúòKöú'ûúò,Köûú°ò6Kòóóöûúûòöûúûúûúò KöúûúòKòKòóKöûú°ò6KòóKòKöúûúòKöúûúòKòKöúòKöûúòKòKò óö
+†úûú)ûúûúûúòWKö
+ûúûúûúûúûúò%Köûúò%KòKò óö†
+úûúûúûú,òWKôLKöûúûúòKöúûúò6Köúûúò/Köú
+ûú!ò/Köúûúò!ö†úûú3ûúûú,òÜKôSö
+†	úûúûúûúûúò.Köûú
+ûúûúòKöûúòKòóKöúûúòKöú
+ûúò#KöúûúòöûúòöûúòKöúûú ò2Köú"ò"KöúûòKòóöûòKöú	ûúòKöúûú7òFKöú9ûúò?öûúûúûúûúò"KôóKöú&ò&Köúûú7òMKòóóöûúûúûú8ûúûúûò\Köú(ò(öûúòöûúûúûòöûúûúûúòKôóöûúòKöúûú8òKKöú	ûúûú5òGKòKòóóóKöûúòóKöûúòKòóö†úûúûú+ûúòSöú
+ûú%ò2KöúÉòÉKöúûú+ò=KöúûòKöúòóKòóö†úûúûú,òBöûúûúûòöú	ûú>òJKöú)ûúò<KòKöúòóöú	ûú>òJKöú)ûúò<KòKöúòóöûúòKöú ûúò3KöújûúòvKò2KöúòóóKöûúòKòóöûúûúûúòKöúòöú
+ûúò KöúòKöú	ûúòKöúûúòóKòóöûúò öûúòKöúûòKöúûúòKöú'ûúò,Köûú°ò0KöúòóóöûúûòöûúûúûúòKöúûúòKöúòKòóKöûú°ò0KòóKòKöúûúòKöúûúòKöúòKöúòKöûú°ò0KòóKò ö
+†úûúûúûú°úòUKöúûú$ò;KöûúòóKò ö†úûúûú	ûúûúûúûúûúòvKôUKöúûúò
+Köûúûúûúûúûúûúò)Kò4öûúûúûú ûúûúûòDKòKöûúûúûúûú-ò\KöûúòóKöûúûúûúòKòKò óö†úûú)ûúûúòCöûú#ûúûò2öúûúûúûúòöûúûúûúûò.KöúûúòKöúòKöûúòóKöúòóKöûúûúòóKòóö†
+úûú)ûúûúòHöûú#ûúûò2öúûúûúûúòöûúûúûúûò.KöúûúòKöúòKöûúòóKöúòóKöûúûúòóöûú)ûúûò8öúûúûúûúòöûúûúûúûò.KöúûúòKöúòKöûúòóKöúòóKöûúûúòóKòóKö
+†úûú)ûúûúûúòNKò ö†úûúûúûúòGKöúDùúÉù	úô‘ö†úûúûúò"Köú%ùúùôMKöúòKöúòKöúûúòJöœy6ô6Kö–ky§,•§•§ôIöûú
+ûúJûúò_Köûú,ò0óKöú!ò!Köúûúò"öûúûúûúòKöúûúòòKôHóKòóKöúûúò'Köûúòóö
+†úûúûúûú	ûúò.Köúûúûúò*Köûú	òKòóKöúûúòKöúûúòKòKöúûúûúûúûúûúûúûúûúòoKöúòKöûúûúûúòKöúûúûúûúûú!ûúûúòQKöúûúòKöúûúòKöúûúòKöúûúòKöúaòaKöúòKöúûúûúûú!ûúûúòOKöúûúûúòCKòKöúûúò#Kò!öûú	òöûúòKô0KöúûúhòzKöúòóöûòKôKöúûúò*Köúòóóöûú,ûúûúûòBKöúòKöúûúòKöúûúûúûúòCKöúUòUöûúûúûúûòKöúûúûú&ò9öúûúûò Köú7ò7KöúòKòKöûúòóKöúòKöûúòKòóKöûúòóKöúûúòKöúòKöú9ò9öûúûòöúòKöûúûúûú"òDKöú!ò!Kò"Köú.ò.KöúòKöú.ò.Köú,ò,KöúûòóöúòKöûúûúûú"òDKò#Kò"Köú.ò.KöúòKöú.ò.Köú,ò,Köú;ò;KöúòóòKöûúûúûú"òDKòKò"Köú.ò.KöúòKöú.ò.Köú,ò,KöúZòZKö§oôoKòóKöúûúòKöûúûúò!óKòKöûúòóKò ö†úûúûú	ûúòAö
+†
+úûúûúûúûúòBKöúûúòKöúòKöúûúòKò3Köú$ûúò<KöúOòOKöúMòMöúûú+ûúò?KöûúòKöûúûúò	óKöûúòKòóKöúûúòKöúûúòöûú&ûúûò<Kò#Köûúûú6òMKöûúòóKöûúòKöúòóKò ö†úûú$ûú	ûúòRö
+†úûúûúûúûúòYKöúûúòKöúûú)ò9KöúûúòKöú
+ûúò Köú-ûúòGKöúGòGKöúEòEKöûúGòMKòóKöúûòKöúûòö†	úûúûúûúò;KöúûúòKò3Köúûú ò-Köú1ò1KòóKöúWòWKöúûúòöûú&ûúûò<Köúûúò+öûúûú4ûúûòEKöú&ò&óKöûúòóKöûúòKöúòKò óö
+†úûúûúûú	ûúôWö†	úûúûúûúô;KöúûúôKöúôKô3Köú$ûúô<KöúuôuKôóKöúûúôöûú&ûúûô<Köúûúô+öûúûú+ûúûô<Köú&ô&óKöûúôóKöûúôKöúôKô óKò%Kò4Kò KöûúòKò ô#KôKô óô"Kô óKô ó Öó    ^  ç"  

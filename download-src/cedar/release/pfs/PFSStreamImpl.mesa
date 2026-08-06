@@ -1,0 +1,354 @@
+DIRECTORY
+Basics USING [CopyBytes, UnsafeBlock],
+IO USING [STREAM, STREAMRecord, StreamProcs, CreateStreamProcs, EndOfStream, Error],
+IOUtils USING [closedStreamProcs],
+PFS USING [AccessOptions, CreateOptions, Error, ErrorDesc, FileType, StreamBufferParms, StreamOptions, UniqueID, OpenFile, Open, PATH, Read, Write, GetInfo, SetByteCountAndUniqueID],
+PFSExtras USING [NewClose],
+PFSBackdoor USING [ProduceError],
+RefText USING [BaseFromText, New],
+Rope USING [ROPE],
+TiogaFileIO USING [Parts, GetParts];
+
+PFSStreamImpl: CEDAR PROGRAM
+IMPORTS Basics, IO, IOUtils, PFS, PFSExtras, PFSBackdoor, RefText, TiogaFileIO
+EXPORTS PFS ~ BEGIN
+
+ROPE: TYPE ~ Rope.ROPE;
+STREAM: TYPE ~ IO.STREAM;
+
+StreamProcs: TYPE ~ REF IO.StreamProcs;
+StreamData: TYPE ~ REF StreamDataRep; 
+StreamDataRep: TYPE ~ RECORD [
+file: PFS.OpenFile,
+bufferStart: CARD ¨ 0, -- current stream index is bufferStart+bufferIndex
+stop: CARD ¨ CARD.LAST, -- max visible file length (for hiding Tioga formatting)
+closeFileOnClose: BOOL ¨ FALSE,
+error: PFS.ErrorDesc ¨ [ok, NIL, NIL, NIL]
+];
+fileStreamClass: ATOM ~ $UFileIO;
+
+fileInputProcs: StreamProcs ~ IO.CreateStreamProcs[
+variety: $input, class: fileStreamClass,
+getChar: PFSGetChar,
+unsafeGetBlock: PFSUnsafeGetBlock,
+endOf: PFSEndOf,
+backup: PFSBackup,
+flush: PFSFlush,
+close: PFSClose,
+getIndex: PFSGetIndex,
+setIndex: PFSSetIndex,
+getLength: PFSGetLength
+];
+
+fileOutputProcs: StreamProcs ~ IO.CreateStreamProcs[
+variety: $output, class: fileStreamClass,
+putChar: PFSPutChar,
+unsafePutBlock: PFSUnsafePutBlock, 
+flush: PFSFlush,
+close: PFSClose,
+getIndex: PFSGetIndex,
+setIndex: PFSSetIndex,
+getLength: PFSGetLength,
+setLength: PFSSetLength
+];
+
+bufferSize: NAT ~ 8192;
+
+FileLength: PROC [file: PFS.OpenFile] RETURNS [CARD] ~ {
+RETURN[MAX[PFS.GetInfo[file].bytes, 0]];
+};
+
+StreamOpen: PUBLIC PROC [fileName: PFS.PATH, accessOptions: PFS.AccessOptions, 
+wantedUniqueID: PFS.UniqueID, checkFileType: BOOL, fileType: PFS.FileType, 
+createOptions: PFS.CreateOptions, streamOptions: PFS.StreamOptions, 
+streamBufferParms: PFS.StreamBufferParms] RETURNS [STREAM] ~ {
+openFile: PFS.OpenFile ~ PFS.Open[name: fileName, access: accessOptions, 
+wantedUniqueID: wantedUniqueID, checkFileType: checkFileType, fileType: fileType, 
+createOptions: createOptions];
+RETURN StreamFromOpenFile[openFile, accessOptions, streamOptions, streamBufferParms];
+};
+StreamFromOpenFile: PUBLIC PROC [openFile: PFS.OpenFile, 
+accessOptions: PFS.AccessOptions, streamOptions: PFS.StreamOptions, 
+streamBufferParms: PFS.StreamBufferParms] RETURNS [STREAM] ~ {
+output: BOOL ~ (accessOptions#read);
+data: StreamData ~ NEW[StreamDataRep ¨ [file: openFile]];
+self: STREAM ~ NEW[IO.STREAMRecord ¨ [streamProcs: fileInputProcs, 
+streamData: data, buffer: RefText.New[bufferSize]]];
+length: CARD ~ FileLength[openFile];
+IF length>0 AND NOT streamOptions[includeFormatting] THEN {
+parts: TiogaFileIO.Parts ~ TiogaFileIO.GetParts[s: self, start: 0, len: length];
+PFSSetIndex[self, 0];
+IF parts.isTioga THEN {
+IF output THEN PFSBackdoor.ProduceError[cantUpdateTiogaFile, "Can't update Tioga file"];
+data.stop ¨ parts.start1+parts.len1;
+self.bufferInputLength ¨ MIN[self.bufferInputLength, data.stop];
+};
+};
+data.closeFileOnClose ¨ streamOptions[closeFSOpenFileOnClose];
+IF output THEN {
+self.streamProcs ¨ fileOutputProcs;
+self.bufferInputLength ¨ 0;
+self.bufferOutputLength ¨ bufferSize;
+self.bufferIndex ¨ 0;
+data.bufferStart ¨ IF accessOptions=append THEN length ELSE 0;
+};
+RETURN[self];
+};
+
+ReadBuffer: PROC [self: STREAM] ~ {
+data: StreamData ~ NARROW[self.streamData];
+index: CARD ~ data.bufferStart+self.bufferIndex; -- current stream index
+start: CARD ~ (index/bufferSize)*bufferSize; -- start index for buffer containing index
+IF data.bufferStart#start THEN {
+data.bufferStart ¨ start;
+self.bufferIndex ¨ index-start;
+self.bufferInputLength ¨ 0;
+};
+IF start < data.stop THEN {
+len: NAT ~ self.bufferInputLength; -- current buffer length
+max: NAT ~ MIN[bufferSize, data.stop-start]; -- max buffer length
+IF len < max THEN TRUSTED {
+self.bufferInputLength ¨ len + PFS.Read[file: data.file, filePosition: start+len, 
+nBytes: max-len, to: RefText.BaseFromText[self.buffer], toStart: len
+! PFS.Error => { data.error ¨ error; ERROR IO.Error[Failure, self] }];
+};
+};
+};
+
+WriteBuffer: PROC [self: STREAM] ~ {
+IF self.bufferIndex>0 THEN {
+data: StreamData ~ NARROW[self.streamData];
+start: CARD ~ data.bufferStart;
+len: NAT ~ self.bufferIndex;
+bytesWritten: NAT ~ PFS.Write[file: data.file, filePosition: start, 
+nBytes: len, from: RefText.BaseFromText[self.buffer], fromStart: 0
+! PFS.Error => { data.error ¨ error; ERROR IO.Error[Failure, self] }];
+IF bytesWritten#len THEN ERROR IO.Error[Failure, self, NIL, "PFS.Write failed."];
+data.bufferStart ¨ start+len;
+self.bufferIndex ¨ 0;
+};
+};
+
+PFSGetChar: PROC [self: STREAM] RETURNS [char: CHAR] ~ {
+IF NOT self.bufferIndex < self.bufferInputLength THEN ReadBuffer[self];
+IF self.bufferIndex < self.bufferInputLength
+THEN { i: NAT ~ self.bufferIndex; self.bufferIndex ¨ i+1; RETURN[self.buffer[i]] }
+ELSE ERROR IO.EndOfStream[self];
+};
+
+PFSEndOf: PROC [self: STREAM] RETURNS [BOOL] ~ {
+IF NOT self.bufferIndex < self.bufferInputLength THEN ReadBuffer[self];
+RETURN[NOT (self.bufferIndex < self.bufferInputLength)];
+};
+
+PFSBackup: PROC [self: STREAM, char: CHAR] ~ {
+index: INT ~ PFSGetIndex[self];
+IF index>0
+THEN PFSSetIndex[self, index-1]
+ELSE ERROR IO.Error[IllegalBackup, self];
+IF PFSGetChar[self]=char
+THEN PFSSetIndex[self, index-1]
+ELSE ERROR IO.Error[IllegalBackup, self];
+};
+
+PFSUnsafeGetBlock: UNSAFE PROC [self: STREAM, block: Basics.UnsafeBlock]
+RETURNS [nBytesRead: INT ¨ 0] ~ {
+data: StreamData ~ NARROW[self.streamData];
+startIndex: CARD ~ block.startIndex; -- BoundsFault if block.startIndex<0
+count: CARD ~ block.count; -- BoundsFault if block.count<0
+done: CARD ¨ 0;
+WHILE done < count DO
+IF self.bufferIndex < self.bufferInputLength THEN {
+n: CARDINAL ~ MIN[count-done, CARD[self.bufferInputLength-self.bufferIndex]];
+TRUSTED --UNSAFE-- { Basics.CopyBytes[
+dstBase: block.base, dstStart: startIndex+done, 
+srcBase: RefText.BaseFromText[self.buffer], srcStart: self.bufferIndex, 
+count: n] };
+self.bufferIndex ¨ self.bufferIndex+n;
+done ¨ done+n;
+IF done = count THEN EXIT;
+};
+IF (count-done) < bufferSize
+THEN {
+ReadBuffer[self];
+IF NOT self.bufferIndex < self.bufferInputLength THEN EXIT;
+}
+ELSE { -- big transfer, copy directly from file
+index: CARD ~ data.bufferStart+self.bufferIndex;
+n: CARD ¨ 0;
+IF index < data.stop THEN TRUSTED --UNSAFE-- { n ¨ PFS.Read[file: data.file, 
+filePosition: index, nBytes: MIN[count-done, data.stop-index], 
+to: block.base, toStart: startIndex+done
+! PFS.Error => { data.error ¨ error; ERROR IO.Error[Failure, self] }] };
+self.bufferInputLength ¨ 0;
+self.bufferIndex ¨ 0;
+data.bufferStart ¨ index+n;
+done ¨ done+n;
+EXIT;
+};
+ENDLOOP;
+RETURN[done];
+};
+
+PFSPutChar: PROC [self: STREAM, char: CHAR] ~ {
+IF NOT self.bufferIndex < self.bufferOutputLength THEN WriteBuffer[self];
+IF self.bufferIndex < self.bufferOutputLength
+THEN { i: NAT ~ self.bufferIndex; self.bufferIndex ¨ i+1; self.buffer[i] ¨ char }
+ELSE ERROR; -- Flush should have ensured bufferIndex < bufferOutputLength
+};
+
+PFSUnsafePutBlock: PROC [self: STREAM, block: Basics.UnsafeBlock] ~ {
+data: StreamData ~ NARROW[self.streamData];
+startIndex: CARD ~ block.startIndex; -- BoundsFault if block.startIndex<0
+count: CARD ~ block.count; -- BoundsFault if block.count<0
+IF self.bufferIndex > 0 THEN WriteBuffer[self];
+IF self.bufferIndex#0 THEN ERROR; -- WriteBuffer failed??
+IF count < self.bufferOutputLength
+THEN {
+TRUSTED { Basics.CopyBytes[
+dstBase: RefText.BaseFromText[self.buffer], dstStart: 0, 
+srcBase: block.base, srcStart: startIndex, count: count] };
+self.bufferIndex ¨ count;
+}
+ELSE { -- big transfer, copy directly to file
+bytesWritten: CARD ~ PFS.Write[file: data.file, filePosition: data.bufferStart, 
+nBytes: count, from: block.base, fromStart: startIndex
+! PFS.Error => { data.error ¨ error; ERROR IO.Error[Failure, self] }];
+IF bytesWritten#count THEN ERROR IO.Error[Failure, self, NIL, "PFS.Write failed."];
+data.bufferStart ¨ data.bufferStart+count;
+};
+};
+
+PFSFlush: PROC [self: STREAM] ~ {
+IF self.bufferOutputLength=0
+THEN self.bufferInputLength ¨ 0 -- input stream
+ELSE WriteBuffer[self]; -- output stream
+};
+
+PFSGetIndex: PROC [self: STREAM] RETURNS [INT] ~ {
+data: StreamData ~ NARROW[self.streamData];
+RETURN[data.bufferStart+self.bufferIndex];
+};
+
+PFSGetLength: PROC [self: STREAM] RETURNS [INT] ~ {
+data: StreamData ~ NARROW[self.streamData];
+IF data.stop<CARD.LAST THEN RETURN[data.stop]
+ELSE {
+len: NAT ~ IF self.bufferOutputLength=0 THEN self.bufferInputLength ELSE self.bufferIndex;
+bufferEnd: CARD ~ IF len>0 THEN data.bufferStart+len ELSE 0;
+RETURN[MAX[FileLength[data.file], bufferEnd]];
+};
+};
+
+PFSSetIndex: PROC [self: STREAM, index: INT] ~ {
+data: StreamData ~ NARROW[self.streamData];
+old: CARD ~ data.bufferStart+self.bufferIndex;
+new: CARD ~ index; -- bounds fault if index<0
+IF new=old THEN RETURN;
+IF self.bufferOutputLength=0
+THEN { -- input stream
+start: CARD ~ data.bufferStart;
+len: NAT ~ self.bufferInputLength;
+IF new IN[start..(start+len)] THEN self.bufferIndex ¨ new-start
+ELSE { self.bufferInputLength ¨ 0; self.bufferIndex ¨ 0; data.bufferStart ¨ new; };
+}
+ELSE { -- output stream
+WriteBuffer[self];
+data.bufferStart ¨ new;
+};
+};
+
+PFSSetLength: PROC [self: STREAM, length: INT] ~ {
+data: StreamData ~ NARROW[self.streamData];
+index: CARD ~ data.bufferStart+self.bufferIndex;
+len: CARD ~ length; -- bounds fault if length<0
+IF self.bufferIndex>0 THEN WriteBuffer[self];
+PFS.SetByteCountAndUniqueID[file: data.file, bytes: len
+! PFS.Error => {data.error ¨ error; ERROR IO.Error[Failure, self] }];
+IF len<index THEN data.bufferStart ¨ len;
+};
+
+PFSEraseChar: PROC [self: STREAM, char: CHAR] ~ {
+data: StreamData ~ NARROW[self.streamData];
+ERROR IO.Error[NotImplementedForThisStream, self];
+};
+
+PFSClose: PROC [self: STREAM, abort: BOOL] ~ {
+data: StreamData ~ NARROW[self.streamData];
+IF NOT abort THEN PFSFlush[self];
+IF data.closeFileOnClose THEN PFSExtras.NewClose[data.file, abort !
+PFS.Error => { data.error ¨ error; ERROR IO.Error[Failure, self] }];
+self.streamProcs ¨ IOUtils.closedStreamProcs;
+self.bufferInputLength ¨ 0;
+self.bufferOutputLength ¨ 0;
+self.bufferIndex ¨ 0;
+self.buffer ¨ NIL;
+};
+
+ErrorFromStream: PUBLIC PROC [self: STREAM] RETURNS [PFS.ErrorDesc] ~ {
+WITH self.streamData SELECT FROM
+data: StreamData => RETURN[data.error];
+ENDCASE => ERROR IO.Error[NotImplementedForThisStream, self];
+};
+
+OpenFileFromStream: PUBLIC PROC [self: STREAM] RETURNS [PFS.OpenFile] ~ {
+WITH self.streamData SELECT FROM
+data: StreamData => RETURN[data.file];
+ENDCASE => ERROR IO.Error[NotImplementedForThisStream, self];
+};
+
+END.
+      
+PFSStreamImpl.mesa
+Copyright ” 1992 by Xerox Corporation.  All rights reserved.
+Doug Wyatt, April 9, 1992 12:26 pm PDT
+Willie-s, May 27, 1992 4:58 pm PDT
+Michael Plass, February 22, 1993 4:59 pm PST
+
+Stream-based Operations for the Portable Cedar File System.
+
+
+For an input stream:
+bufferOutputLength=0
+buffer[0..bufferInputLength) contains bytes read from file starting at bufferStart
+flush ensures bufferInputLength=0
+For an output stream:
+bufferInputLength=0
+bufferOutputLength=bufferSize
+buffer[0..bufferIndex) contains bytes to be written to file starting at bufferStart
+flush ensures bufferIndex=0
+
+
+*** Note: streamBufferParms are ignored! ***
+This is initially an input stream, regardless of accessOptions, so it can be used below to check for Tioga formatting.  We convert it to an output stream later if necessary.
+For short Tioga files, preserve data already in the buffer.
+Yes, this is rather clunky, but it will seldom be called.  See IOCommonImpl.Backup.  Backup is typically called (I claim) from PeekChar, or some other client that just did a GetChar.  Therefore Backup will normally find the char in the buffer, and not need to invoke PFSBackup.  Note that Backup may raise EndOfStream (from PFSGetChar) if the file shrinks.
+Buffer is exhausted but we're not done; try to get more bytes.
+flush first, since IO.UnsafePutBlock would have written block to buffer if it could fit
+formerly PFSBackdoor.ProduceError[notImplemented, "Stream is not a PFS stream"];
+ù Z  ñ"cedarcode" styleïNewlineDelimiter
+ô codeôKöú
+œeú1ô<Kô&Kô"Kô,Kô óöœk	ò	Köúûúò&KöûúûúûúDòTKöúûúò"Köûúûúxûú1ò∂Köú
+ûúòKöúûúò!Köúûúò"KöúûúûúòKöúûúò$óKò Köú;ô;Kô KöœnúûúûòKöûú	ûúûú.òNKöûúûúûòKò KöûúûúûúòKöûúûúûúûúòKò öúûúûúûúò'Kô óKöúûúûúò&öúûúûúòKöúûú
+òKöúûúœc2òIKöúûúûúûú†8òPKöúûúûúòKö	úûúûúûúûúò*KòôKôKôRKô!óôKôKôKôSKôóKô óöúûúò!Kò óöúûúò3Kò(KòKò"KòKòKòKòKòKòKòKòKò óöúûúò4Kò)KòKò#KòKòKòKòKòKòKöúòKò óöúûúòKò óö
+ü
+úûúûúûúûúò8Köûúûúûúò(KòKò óöü
+úûúûúûúûúûú!ûúûúûúûúûú$ûúûúûúòüKöú
+ûúûúüòªKöûúOòUKòKô óöüúûúûúûúûúûú$ûúûúûúòΩKô,Köúûúò$Köúûú#ò9öúûúûúûúcòxKô≠óKöúûúò$öûú
+ûúûú"ûúò;KòPKòöûúûúòKöûúûúJòXKò$öúûú$ò@Kô;óKòóKòóKò>öûúûúòKò#KòKò%KòKöúûúûúûúò>KòóKöûúòKöúòKò óöü
+úûúûúò#Köúûúò+Köúûú&†òHKöúûú"†*òWöûúûúò KòKòKòKòóöûúûúòKöúûú†ò;Köúûúûú†òAöûúûúûúòKö	úûúxûú ûúûúòﬁKòóKòóKòKò óöüúûúûúò$öûúûúòKöúûúò+KöúûúòKöúûúòKöúûúûúsûú ûúûúòŒKö
+ûúûúûúûúûúòQKòKòKòóKòKò óö
+ü
+úûúûúûúûúò8Köûúûú+ûúòGöûú*ò,Köûúûú-ûúòRKöûúûúûúò óKöúòKò óö
+üúûúûúûúûúò0Köûúûú+ûúòGKöûúûú.ò8KòKò óöü	úûúûúûúò.Kô‰Köúûúòöûúò
+KöûúòKöûúûúûúò)óöûúòKöûúòKöûúûúûúò)óKöúòKò óöüúûúûúûúûúûú	òjKöúûúò+Köúûú†$òIKöúûú†ò:Köúûúòöûúûòöûú+ûúò3Köúûúûúûú+òMKöûú†
+úõò≠Kò&KòKöûúûúûúòKòóKô>öûúòöûúòKòKöûúûú+ûúûúò;Kòóöûú†(ò/Köúûú%ò0KöúûúòKöûúûúûú†
+úûú5ûúKûú ûúûúòˇKòKòKòKòKöûúòKòóóKöûúòóKöûúòKöúòKò óöü
+úûúûúûúò/Köûúûú,ûúòIöûú+ò-KöûúûúDòQKöûúûú†=òIóKöúòKò óöüúûúûú òEKöúûúò+Köúûú†$òIKöúûú†ò:öûúûúò/KôWóKöûúûúûú†ò9öûú ò"öûúòKöûúäòëKöúòKòóöûú†&ò-Köúûúûúrûú ûúûúòŒKö
+ûúûúûúûúûúòSKò*KòóóKòKò óöüúûúûúò!öûúòKöûú†ò/Köûú†ò(óKòKò óö
+üúûúûúûúûúò2Köúûúò+Köûú$ò*KöúòKò óö
+üúûúûúûúûúò3Köúûúò+Kö
+ûúûúûúûúûúò-öûúòKö	úûúûúûúûúòZKö	úûúûúûúûúò<Köûúûú$ò.KòóKöúòKò óöüúûúûú	ûúò0Köúûúò+Köúûú%ò.Köúûú
+†ò-Köûú	ûúûúòöûúòöûú†òKöúûúòKöúûúò"Köûúûúûúò?KöûúOòSKòóöûú†òKöúòKöúòKòóóKöúòKò óöüúûúûú
+ûúò2Köúûúò+Köúûú%ò0Köúûú†ò/Köûúûúò-Köûú7ûúûúûúò}Köûúûúò)KöúòKò óöüúûúûúûúò1Köúûúò+Köûúûú*ò2KöúòKò óöüúûúûú	ûúò.Köúûúò+Köûúûúûúò!Kö
+ûúûú'ûú ûúûúòàKò-KöúòKöúòKöúòKöúûúòKöúòKò óöüúûúûúûúûúûúòGöûúûúûò Köúûúò'Köûúûúûú*ò=óKòKò óöüúûúûúûúûúûúòIöûúûúûò Köúûúò&öûúûúûú*ò=KôPóóKöúòKò óKöûúòó Öó    )ﬁ  <  

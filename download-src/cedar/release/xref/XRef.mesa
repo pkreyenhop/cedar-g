@@ -1,0 +1,646 @@
+
+DIRECTORY
+Atom USING [MakeAtom],
+Basics USING [],
+BasicTime USING [GMT, Now, nullGMT],
+Commander USING [CommandProc, Register],
+CommanderOps USING [ArgumentVector, Failed, Parse],
+Convert USING [AppendInt],
+DFUtilities USING [DirectoryItem, FileItem, IncludeItem, ParseFromStream, ProcessItemProc, SyntaxError],
+IO USING [Close, EndOfStream, GetCedarToken, GetChar, GetIndex, PeekChar, PutChar, PutF1, PutFR, PutFR1, PutRope, SkipWhitespace, STREAM, TokenKind],
+List USING [Compare, CompareProc, Sort],
+PFS USING [EnumerateForNames, Error, FileInfo, GetName, NameProc, OpenFileFromStream, PATH, PathFromRope, RopeFromPath, StreamOpen],
+PFSNames USING [ReplaceShortName, ShortName, ShortNameRope, StripVersionNumber],
+Process USING [CheckForAbort],
+RefText USING [InlineAppendChar, TrustTextAsRope],
+Rope USING [ActionType, Compare, Concat, Equal, Fetch, FindBackward, Flatten, FromRefText, Length, Map, Match, ROPE, SkipOver, SkipTo],
+SymTab USING [Create, FetchText, Ref, Store],
+TiogaAccess USING [Create, Put, TiogaChar, WriteFile, Writer];
+
+XRef: CEDAR PROGRAM
+IMPORTS Atom, BasicTime, Commander, CommanderOps, Convert, DFUtilities, IO, List, PFS, PFSNames, Process, RefText, Rope, SymTab, TiogaAccess
+= BEGIN
+
+ROPE: TYPE = Rope.ROPE;
+STREAM: TYPE = IO.STREAM;
+
+IdEntry: TYPE = RECORD [
+name: ROPE,
+refs: LIST OF IdRef ¬ NIL,
+reserved: ATOM ¬ NIL];
+
+IdRef: TYPE = RECORD [
+fileName: ROPE,	-- file name where reference occurs
+index: INT,		-- index where reference occurs
+defn: BOOL];	-- indicates a defining reference
+
+DoCommandProc: Commander.CommandProc = {
+out: STREAM = cmd.out;
+switches: PACKED ARRAY CHAR['a..'z] OF BOOL ¬ ALL[FALSE];
+ProcessSwitches: PROC [arg: ROPE] = {
+sense: BOOL ¬ TRUE;
+FOR index: INT IN [0..Rope.Length[arg]) DO
+char: CHAR ¬ Rope.Fetch[arg, index];
+SELECT char FROM
+'- => LOOP;
+'~ => {sense ¬ NOT sense; LOOP};
+'x, 'X => IF filesRead # 0 THEN DumpXref[xrefName];
+IN ['a..'z] => switches[char] ¬ sense;
+IN ['A..'Z] => switches[char + ('a-'A)] ¬ sense;
+ENDCASE;
+brief ¬ NOT switches['v];
+sense ¬ TRUE;
+ENDLOOP;
+};
+brief: BOOL ¬ TRUE;
+EachStream: PROC [stream: STREAM, mesa: BOOL] = {
+blockLevel: INTEGER ¬ 0;
+parenLevel: INTEGER ¬ 0;
+lastId: REF IdEntry ¬ NIL;
+lastPos: INT ¬ 0;
+inDirectory: BOOL ¬ FALSE;
+inType: BOOL ¬ FALSE;
+AddRef: PROC [newRef: LIST OF IdRef] = {
+tail: LIST OF IdRef ¬ lastId.refs;
+IF tail = NIL
+THEN {
+idList ¬ CONS[lastId, idList];
+newRef.rest ¬ newRef;
+uniqueTokensRead ¬ uniqueTokensRead + 1;
+}
+ELSE {
+newRef.rest ¬ tail.rest;
+tail.rest ¬ newRef;
+};
+tokensRead ¬ tokensRead + 1;
+lastId.refs ¬ newRef;
+};
+curFileName: ROPE ¬ PFS.RopeFromPath[PFS.GetName[PFS.OpenFileFromStream[stream]].fullFName];
+IF NOT switches['f] THEN curFileName ¬ GetShortName[curFileName];
+ReportName[curFileName];
+filesRead ¬ filesRead + 1;
+IF fileListTail = NIL
+THEN fileListTail ¬ fileListHead ¬ LIST[curFileName]
+ELSE fileListTail ¬ (fileListTail.rest ¬ LIST[curFileName]);
+IF symTab = NIL THEN InitTable[];
+IF switches['t]
+THEN {
+start: INT;
+DO
+c: CHAR ¬ IO.GetChar[stream ! IO.EndOfStream => EXIT];
+SELECT c FROM
+IN ['a..'z], IN ['A..'Z] => {};
+ENDCASE => LOOP;
+cToken[0] ¬ c;
+cToken.length ¬ 1;
+start ¬ IO.GetIndex[stream] - 1;
+DO
+c: CHAR ¬ IO.GetChar[stream ! IO.EndOfStream => EXIT];
+SELECT c FROM
+IN ['a..'z], IN ['A..'Z], IN ['0..'9], '' =>
+cToken ¬ RefText.InlineAppendChar[cToken, c];
+ENDCASE => EXIT;
+ENDLOOP;
+WITH SymTab.FetchText[symTab, cToken].val SELECT FROM
+id: REF IdEntry => lastId ¬ id;
+ENDCASE => {
+new: REF IdEntry ¬ NEW[IdEntry ¬ [name: Rope.FromRefText[cToken]]];
+[] ¬ SymTab.Store[symTab, new.name, new];
+lastId ¬ new;
+};
+AddRef[LIST[[curFileName, start, FALSE]]];
+ENDLOOP;
+}
+ELSE {
+DO
+tokenKind: IO.TokenKind;
+Process.CheckForAbort[];
+[token: cToken, tokenKind: tokenKind] ¬ IO.GetCedarToken[stream, cToken];
+SELECT tokenKind FROM
+tokenSINGLE => {
+SELECT cToken[0] FROM
+'[, '( => parenLevel ¬ parenLevel + 1;
+'], ') => parenLevel ¬ parenLevel - 1;
+'{ => IF NOT inType THEN blockLevel ¬ blockLevel + 1;
+'} => IF NOT inType THEN {
+c: CHAR ¬ '.;
+c ¬ IO.PeekChar[stream ! IO.EndOfStream => CONTINUE];
+blockLevel ¬ blockLevel - 1;
+IF blockLevel <= 0 OR c = '. THEN EXIT;
+};
+', => LOOP;
+'; => GO TO clearFlags;
+ENDCASE;
+EXITS
+clearFlags =>
+inDirectory ¬ inType ¬ FALSE;
+};
+tokenID => {
+WITH SymTab.FetchText[symTab, cToken].val SELECT FROM
+id: REF IdEntry => {
+SELECT id.reserved FROM
+NIL => {
+lastId ¬ id;
+GO TO addReference;
+};
+$BEGIN => blockLevel ¬ blockLevel + 1;
+$END => {
+c: CHAR ¬ '.;
+c ¬ IO.PeekChar[stream ! IO.EndOfStream => CONTINUE];
+blockLevel ¬ blockLevel - 1;
+IF blockLevel <= 0 OR c = '. THEN EXIT;
+};
+$DIRECTORY => {inDirectory ¬ TRUE; GO TO retainDirectoryFlag};
+$USING => GO TO retainDirectoryFlag;
+$TYPE => {inType ¬ TRUE; GO TO retainDirectoryFlag};
+ENDCASE;
+inDirectory ¬ FALSE;
+EXITS retainDirectoryFlag => {};
+};
+ENDCASE => {
+new: REF IdEntry ¬ NEW[IdEntry ¬ [name: Rope.FromRefText[cToken]]];
+[] ¬ SymTab.Store[symTab, new.name, new];
+lastId ¬ new;
+GO TO addReference;
+};
+EXITS addReference => {
+ENABLE IO.EndOfStream => LOOP;
+index: INT ¬ IO.GetIndex[stream]-cToken.length;
+defn: BOOL ¬ FALSE;
+c: CHAR ¬ 0C;
+[] ¬ IO.SkipWhitespace[stream ! IO.EndOfStream => CONTINUE];
+c ¬ IO.PeekChar[stream ! IO.EndOfStream => CONTINUE];
+IF c = ': THEN
+IF parenLevel = 0 AND blockLevel > 0 THEN defn ¬ TRUE;
+AddRef[LIST[[curFileName, index, defn]]];
+LOOP;
+};
+};
+tokenERROR => EXIT;
+tokenEOF => EXIT;
+ENDCASE;
+lastId ¬ NIL;
+ENDLOOP;
+};
+IO.Close[stream];
+};
+InitTable: PROC = {
+reserved: ROPE ¬ "RECORD POINTER REF VAR LIST ARRAY SEQUENCE DESCRIPTOR PROCEDURE PROC PORT SIGNAL ERROR PROCESS PROGRAM MONITOR DEFINITIONS ZONE RELATIVE LONG TYPE FRAME TO ORDERED UNCOUNTED PAINTED BASE OF PACKED RETURNS SAFE UNSAFE MONITORED OVERLAID COMPUTED MACHINE DEPENDENT DIRECTORY IMPORTS EXPORTS SHARES LOCKS USING PUBLIC PRIVATE CEDAR CHECKED TRUSTED UNCHECKED ENTRY INTERNAL INLINE READONLY CODE ABS ALL AND APPLY CONS MAX MIN MOD NOT OR ORD PRED LENGTH NEW START SUCC VAL FORK JOIN LOOPHOLE NARROW ISTYPE SIZE FIRST LAST NIL TRASH NULL IF THEN ELSE WITH FROM FOR DECREASING IN THROUGH UNTIL WHILE REPEAT FINISHED RETURN EXIT LOOP GOTO GO FREE WAIT RESTART NOTIFY BROADCAST STOP RESUME REJECT CONTINUE RETRY TRANSFER STATE OPEN ENABLE ANY EXITS END ENDLOOP ENDCASE BEGIN DO SELECT ";
+builtIn: ROPE ¬ "TRUE FALSE INT CARD INTEGER CARDINAL BOOL BOOLEAN UNSPECIFIED CHARACTER CHAR WORD REAL NAT TEXT STRING MONITORLOCK CONDITION MDSZone StringBody ATOM UNWIND ABORTED ";
+symTab ¬ SymTab.Create[1253];
+AddReserved[symTab, reserved];
+AddReserved[symTab, builtIn];
+};
+ReportName: PROC [name: ROPE] = {
+THROUGH [0..indent) DO IO.PutChar[out, ' ]; ENDLOOP;
+IO.PutF1[out, "  reading %g\n", [rope[name]]];
+};
+DumpXref: PROC [arg: ROPE] = {
+tc: TiogaAccess.TiogaChar ¬ [
+charSet: 0,
+char: '\n,
+looks: ALL[FALSE],
+format: NIL,
+comment: FALSE,
+endOfNode: TRUE,
+deltaLevel: 1,
+propList: NIL
+];
+PutRope: PROC [rope: ROPE] = {
+[] ¬ Rope.Map[base: rope, action: PutCharB];
+};
+PutRopeBold: PROC [rope: ROPE] = {
+tc.looks['n] ¬ TRUE;
+[] ¬ Rope.Map[base: rope, action: PutCharB];
+tc.looks['n] ¬ FALSE;
+};
+PutRopeItalic: PROC [rope: ROPE] = {
+tc.looks['c] ¬ TRUE;
+[] ¬ Rope.Map[base: rope, action: PutCharB];
+tc.looks['c] ¬ FALSE;
+};
+PutCharB: Rope.ActionType = {
+IF brief THEN {IO.PutChar[st, c]; RETURN};
+tc.char ¬ c;
+TiogaAccess.Put[writer, tc];
+};
+PutChar: PROC [c: CHAR] = {
+IF brief THEN {IO.PutChar[st, c]; RETURN};
+tc.char ¬ c;
+TiogaAccess.Put[writer, tc];
+};
+EndNode: PROC [delta: INTEGER ¬ 0, format: ATOM ¬ NIL] = {
+IF brief THEN {IO.PutChar[st, '\n]; RETURN};
+tc.endOfNode ¬ TRUE;
+tc.char ¬ '\n;
+tc.format ¬ format;
+tc.deltaLevel ¬ delta;
+TiogaAccess.Put[writer, tc];
+tc.endOfNode ¬ FALSE;
+};
+writer: TiogaAccess.Writer ¬ IF brief THEN NIL ELSE TiogaAccess.Create[];
+st: IO.STREAM ¬ IF brief THEN PFS.StreamOpen[PFS.PathFromRope[arg], $create] ELSE NIL;
+buffer: REF TEXT ¬ NEW[TEXT[12]];
+
+IF filesRead = 1
+THEN IO.PutRope[out, "  1 file read\n"]
+ELSE IO.PutF1[out, "  %g files read\n", [integer[filesRead]] ];
+
+IF NOT brief THEN TiogaAccess.Put[writer, tc];
+tc.comment ¬ TRUE;
+tc.endOfNode ¬ FALSE;
+tc.propList ¬ NIL;
+
+IO.PutF1[out, "  xref output to %g\n", [rope[arg]]];
+PutRope[arg];
+EndNode[1];
+
+PutRope[IO.PutFR1["taken on %g", [time[BasicTime.Now[]]]]];
+IF NOT brief THEN EndNode[0];
+
+PutRope[IO.PutFR["# files: %g, # tokens: %g, # unique tokens: %g",
+[integer[filesRead]], [integer[tokensRead]], [integer[uniqueTokensRead]] ]];
+EndNode[1];
+
+FOR each: LIST OF ROPE ¬ fileListHead, each.rest WHILE each # NIL DO
+PutRope[each.first];
+EndNode[0];
+ENDLOOP;
+
+EndNode[-2];
+
+tc.comment ¬ FALSE;
+
+idList ¬ List.Sort[idList, MySort];
+IF switches['d] THEN {
+anyOut: BOOL ¬ FALSE;
+FOR each: LIST OF REF ANY ¬ idList, each.rest WHILE each # NIL DO
+WITH each.first SELECT FROM
+idEntry: REF IdEntry => {
+init: LIST OF IdRef = idEntry.refs;
+refs: LIST OF IdRef ¬ init;
+IF refs # NIL THEN {
+WHILE refs # NIL DO
+IF NOT refs.first.defn THEN GO TO noteUsage;
+refs ¬ refs.rest;
+IF refs = init THEN EXIT;
+ENDLOOP;
+IF NOT anyOut THEN {
+PutRope["Warning!  The following names were defined by not otherwise used: "];
+anyOut ¬ TRUE;
+};
+PutRope[idEntry.name];
+PutChar[' ];
+EXITS noteUsage => {};
+};
+};
+ENDCASE;
+ENDLOOP;
+IF anyOut THEN {EndNode[0]; EndNode[0]};
+};
+SELECT TRUE FROM
+brief => {
+WHILE idList # NIL DO
+each: REF IdEntry = NARROW[idList.first];
+init: LIST OF IdRef = each.refs;
+refs: LIST OF IdRef ¬ init;
+IF refs # NIL THEN {
+refs ¬ refs.rest;
+init.rest ¬ NIL;
+each.refs ¬ NIL;
+IO.PutF1[st, "\n%g:", [rope[each.name]]];
+WHILE refs # NIL DO
+fileName: ROPE = refs.first.fileName;
+rest: LIST OF IdRef ¬ refs.rest;
+defn: BOOL ¬ refs.first.defn;
+refs.rest ¬ NIL;
+IO.PutF1[st, " %g", [rope[fileName]]];
+WHILE rest # NIL AND rest.first.fileName = fileName DO
+nrest: LIST OF IdRef ¬ rest.rest;
+IF rest.first.defn THEN defn ¬ TRUE;
+rest.rest ¬ NIL;
+rest ¬ nrest;
+ENDLOOP;
+IF defn THEN IO.PutChar[st, '!];
+refs ¬ rest;
+ENDLOOP;
+IO.PutRope[st, "\n"];
+};
+idList ¬ idList.rest;
+ENDLOOP;
+IO.Close[st];
+};
+ENDCASE => {
+WHILE idList # NIL DO
+each: REF IdEntry ¬ NARROW[idList.first];
+tail: LIST OF IdRef ¬ each.refs;
+IF tail # NIL THEN {
+refs: LIST OF IdRef ¬ tail.rest;
+fileName: ROPE ¬ NIL;
+tail.rest ¬ NIL;
+each.refs ¬ NIL;
+PutRopeBold[each.name];
+PutRopeBold[":"];
+IF filesRead > 1 THEN EndNode[1, $code];
+WHILE refs # NIL DO
+index: INT = refs.first.index;
+tail ¬ refs.rest;
+IF filesRead > 1 AND refs.first.fileName # fileName THEN {
+IF fileName # NIL THEN EndNode[0, $code];
+fileName ¬ refs.first.fileName;
+PutRopeItalic[fileName];
+PutChar[' ];
+};
+buffer.length ¬ 0;
+[] ¬ Convert.AppendInt[buffer, ABS[index], 10, FALSE];
+PutChar[' ];
+IF refs.first.defn
+THEN PutRopeBold[RefText.TrustTextAsRope[buffer]]
+ELSE PutRope[RefText.TrustTextAsRope[buffer]];
+refs.rest ¬ NIL;
+refs ¬ tail;
+ENDLOOP;
+EndNode[IF filesRead > 1 THEN -1 ELSE 0, $code];
+};
+idList ¬ idList.rest;
+ENDLOOP;
+IO.PutF1[out, "  writing to %g\n", [rope[arg]]];
+TiogaAccess.WriteFile[writer, arg];
+};
+symTab ¬ NIL;
+xrefName ¬ NIL;
+filesRead ¬ 0;
+};
+indent: INTEGER ¬ 0;
+symTab: SymTab.Ref ¬ NIL;
+idList: LIST OF REF ANY ¬ NIL;
+cToken: REF TEXT ¬ NEW[TEXT[128]];
+xrefName: ROPE ¬ NIL;
+filesRead: INT ¬ 0;
+tokensRead: INT ¬ 0;
+uniqueTokensRead: INT ¬ 0;
+fileListHead: LIST OF ROPE ¬ NIL;
+fileListTail: LIST OF ROPE ¬ NIL;
+argv: CommanderOps.ArgumentVector ¬ CommanderOps.Parse[cmd
+! CommanderOps.Failed => {msg ¬ errorMsg; GO TO failed}];
+
+FOR i: NAT IN [1..argv.argc) DO
+arg: ROPE ¬ argv[i];
+Process.CheckForAbort[];
+SELECT TRUE FROM
+Rope.Length[arg] = 0 => {};
+Rope.Fetch[arg, 0] = '- => ProcessSwitches[arg];
+Rope.Equal[arg, "_"] => {};
+(i+1) < argv.argc AND Rope.Equal[argv[i+1], "_"] =>
+xrefName ¬ arg;
+ENDCASE => {
+{
+ENABLE {
+PFS.Error => {msg ¬ error.explanation; GO TO cleanUp};
+DFUtilities.SyntaxError => {msg ¬ reason; GO TO cleanUp};
+};
+EachFile: DFUtilities.ProcessItemProc = {
+WITH item SELECT FROM
+fileItem: REF DFUtilities.FileItem => {
+fName: ROPE = fileItem.name;
+SELECT TRUE FROM
+Rope.Match["*.mesa!*", fName, FALSE],
+Rope.Match["*.mesa", fName, FALSE] => {
+sName: ROPE = GetShortName[fName];
+name: ROPE ¬ sName;
+date: BasicTime.GMT ¬ BasicTime.nullGMT;
+st: STREAM ¬ NIL;
+IF NOT switches['h] THEN {
+name ¬ Rope.Concat[path, sName];
+date ¬ fileItem.date.gmt;
+};
+st ¬ OpenRead[name, date
+! PFS.Error =>
+IF error.code = $unknownFile AND switches['h] THEN CONTINUE];
+IF st = NIL THEN {
+name ¬ Rope.Concat[path, sName];
+st ¬ OpenRead[name];
+};
+EachStream[st, TRUE];
+};
+ENDCASE;
+};
+dirItem: REF DFUtilities.DirectoryItem =>
+path ¬ dirItem.path1;
+inclItem: REF DFUtilities.IncludeItem => 
+EachDF[inclItem.path1, inclItem.date.gmt];
+ENDCASE;
+};
+EachDF: PROC [dfName: ROPE, date: BasicTime.GMT ¬ BasicTime.nullGMT] = {
+inclStream: STREAM ¬ NIL;
+sName: ROPE = GetShortName[dfName];
+ReportName[sName];
+inclStream ¬ OpenRead[dfName, date];
+indent ¬ indent + 2;
+DFUtilities.ParseFromStream[
+inclStream, EachFile, [filterA: source, filterC: defining]
+! UNWIND => IO.Close[inclStream]];
+IO.Close[inclStream];
+indent ¬ indent - 2;
+};
+EachName: PFS.NameProc = {
+fullFName: ROPE ¬ PFS.RopeFromPath[name];
+locName: ROPE ¬ NIL;
+continue ¬ TRUE;
+IF xrefName = NIL THEN {
+sName: ROPE ¬ GetShortName[fullFName];
+pos: INT ¬ Rope.Length[sName];
+xrefName ¬ Rope.Flatten[sName];
+WHILE pos > 0 DO
+SELECT Rope.Fetch[xrefName, pos-1] FROM
+'! => xrefName ¬ Rope.Flatten[xrefName, 0, pos-1];
+'. => {xrefName ¬ Rope.Flatten[xrefName, 0, pos-1]; EXIT};
+ENDCASE;
+pos ¬ pos - 1;
+ENDLOOP;
+xrefName ¬ Rope.Concat[xrefName, ".xref"];
+};
+SELECT TRUE FROM
+(locName ¬ FileWithSearchRules[fullFName, ".mesa"]) # NIL =>
+EachStream[OpenRead[locName], TRUE];
+(locName ¬ FileWithSearchRules[fullFName, ".tioga"]) # NIL =>
+EachStream[OpenRead[locName], FALSE];
+(locName ¬ FileWithSearchRules[fullFName, ".df"]) # NIL =>
+IF switches['s]
+THEN EachStream[OpenRead[locName], FALSE]
+ELSE EachDF[locName];
+switches['t] =>
+EachStream[OpenRead[fullFName], FALSE];
+ENDCASE =>
+IO.PutF1[out,
+"-- Warning: %g was not found.\n", [rope[fullFName]] ];
+};
+path: ROPE ¬ NIL;
+IF Rope.SkipTo[arg, 0, "*"] # Rope.Length[arg]
+THEN {
+IF Rope.SkipTo[arg, 0, "!"] = Rope.Length[arg] THEN
+arg ¬ Rope.Concat[arg, "!h"];
+PFS.EnumerateForNames[PFS.PathFromRope[arg], EachName];
+}
+ELSE
+[] ¬ EachName[PFS.PathFromRope[arg]];
+EXITS cleanUp => {
+FOR each: LIST OF REF ANY ¬ idList, each.rest WHILE each # NIL DO
+WITH each.first SELECT FROM
+entry: REF IdEntry => {
+ring: LIST OF IdRef ¬ entry.refs;
+entry.refs ¬ NIL;
+IF ring # NIL THEN ring.rest ¬ NIL;
+};
+ENDCASE;
+ENDLOOP;
+symTab ¬ NIL;
+GO TO failed;
+};
+};
+};
+ENDLOOP;
+IF filesRead # 0 THEN DumpXref[xrefName];
+EXITS
+failed => {result ¬ $Failure};
+};
+
+AddReserved: PROC [symTab: SymTab.Ref, rope: ROPE] = {
+pos: INT ¬ 0;
+len: INT ¬ Rope.Length[rope];
+DO
+next: INT ¬ Rope.SkipTo[rope, pos, " "];
+flat: ROPE ¬ Rope.Flatten[rope, pos, next-pos];
+new: REF IdEntry ¬ NEW[IdEntry ¬ [name: flat, reserved: Atom.MakeAtom[flat]]];
+[] ¬ SymTab.Store[symTab, flat, new];
+pos ¬ Rope.SkipOver[rope, next, " "];
+IF pos = len THEN EXIT;
+ENDLOOP;
+};
+
+MySort: List.CompareProc = {
+name1: ROPE = NARROW[ref1, REF IdEntry].name;
+name2: ROPE = NARROW[ref2, REF IdEntry].name;
+IF name1 = name2 THEN RETURN [equal];
+SELECT Rope.Compare[name1, name2, FALSE] FROM
+less => RETURN [less];
+greater => RETURN [greater];
+ENDCASE => RETURN [Rope.Compare[name1, name2, TRUE]];
+};
+
+OpenRead: PROC
+[name: ROPE, time: BasicTime.GMT ¬ BasicTime.nullGMT] RETURNS [STREAM] = {
+path: PFS.PATH = PFS.PathFromRope[name];
+st: STREAM = PFS.StreamOpen[fileName: path, wantedUniqueID: [[time, 0], [0, 0]]];
+RETURN [st];
+};
+
+GetShortName: PROC [name: ROPE] RETURNS [ROPE] = {
+RETURN [PFSNames.ShortNameRope[PFSNames.StripVersionNumber[PFS.PathFromRope[name]]]];
+};
+
+FileWithSearchRules: PROC [name: ROPE, ext: ROPE] RETURNS [ROPE] = {
+ret: ROPE ¬ name;
+path: PFS.PATH = PFSNames.StripVersionNumber[PFS.PathFromRope[name]];
+sn: ROPE = PFSNames.ShortNameRope[path];
+posExt: INT = Rope.FindBackward[sn, ext];
+posDot: INT = Rope.FindBackward[sn, "."];
+IF posExt < 0 THEN ret ¬ NIL;
+IF posDot < 0 THEN {
+snPath: PFS.PATH = PFS.PathFromRope[Rope.Concat[sn, ext]];
+newPath: PFS.PATH = PFSNames.StripVersionNumber[
+PFSNames.ReplaceShortName[path, PFSNames.ShortName[snPath]]];
+realPath: PFS.PATH = PFS.FileInfo[newPath ! PFS.Error => GO TO beep].fullFName;
+ret ¬ PFS.RopeFromPath[realPath];
+EXITS beep => ret ¬ NIL;
+};
+RETURN [ret];
+};
+
+doc: ROPE = "takes cross-references of Cedar source files listed in the given DF files
+    -d: print warnings on definitions only
+    -f: print full file names
+    -h: use local highest versions of files
+    -s: shallow, don't follow df files
+    -t: text file, not Cedar tokens
+    -v: verbose (print positions, Tioga formatting)";
+
+Commander.Register[
+key: "XRef",
+proc: DoCommandProc,
+doc: doc,
+clientData: NIL,
+interpreted: TRUE
+];
+
+END.
+
+
+
+
+  Â  
+XRef.mesa
+Copyright Ó 1986, 1987, 1989, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Russ Atkinson (RRA) December 27, 1991 6:31 pm PST
+[cmd: Handle] RETURNS [result: REF _ NIL, msg: ROPE _ NIL]
+CommandObject = [in, out, err: STREAM, commandLine, command: ROPE, ...]
+Takes an open stream and adds the info to the xref.
+text, not Cedar/Mesa
+Could be a reference
+Cedar/Mesa reserved words
+derived from Pass1T.mesa
+Cedar/Mesa built-in types
+derived from Pass1.mesa
+Now we can put out the cross-reference
+[c: CHAR] RETURNS [quit: BOOL _ FALSE]
+When parsing the command line, be prepared for failure.  The error is reported to the user
+Each argument can either be a switch specification or a genuine argument to be processed.  The first argument (argv[0]) is not examined, because by convention it is the name of the command as given by the user.
+It is a good idea to periodically check for a process abort request.
+[item: REF ANY] RETURNS [stop: BOOL _ FALSE]
+The local open failed because there was no local version, so try the remote version (with the highest version number).
+[name: PATH] RETURNS [continue: BOOL]
+A pattern to enumerate
+Appears to be a single file
+The idea is to charge down the list, breaking the circularities as we go.
+[ref1: REF ANY, ref2: REF ANY] RETURNS [Basics.Comparison]
+The name does not have the desired extension
+This name does not have the desired extension, and does not have a dot, so let's try to add the desired extension.
+
+ÊK  –(cedarcode) style•NewlineDelimiter
+™ headšœ	™	Icodešœ
+ÏeœI™TL™1—˜ šÏk	˜	Lšœžœ˜Lšœžœ˜Lšœ
+žœžœ˜$Lšœ
+žœ˜(Lšœžœ!˜3Lšœžœ˜LšœžœW˜hLšžœžœzžœ˜•Lšœžœ˜(LšžœžœMžœ*˜„Lšœ	žœB˜PLšœžœ˜Lšœžœ%˜2Lšœžœežœ˜‡Lšœžœ!˜-Lšœžœ-˜>L˜ ——šÏnœžœž˜LšžœAžœžœ7˜ŒLšœž˜—˜ Lšžœžœžœ˜Lšžœžœžœžœ˜L˜ šœ	žœžœ˜Lšœžœ˜Lšœžœžœ	žœ˜Lšœ
+žœžœ˜L˜ —šœžœžœ˜Lšœ
+žœÏc#˜3Lšœžœ ˜,Lšœžœ !˜.——L˜ šŸœ˜(šœžœ
+žœžœžœžœ™:Lšœžœžœ™G—Lšœžœ˜Lšœ
+žœžœžœ	žœžœžœžœ˜9šŸœžœžœ˜%Lšœžœžœ˜šžœžœžœž˜*Lšœžœ˜$šžœž˜Lšœžœ˜Lšœžœžœ˜ Lšœ
+žœžœ˜3Lšžœ$˜&Lšžœ.˜0Lšžœ˜—Lšœžœ˜Lšœžœ˜Lšžœ˜—L˜—Lšœžœžœ˜šŸ
+œžœ
+žœžœ˜1Lšœ3™3Lšœžœ˜Lšœžœ˜Lšœžœžœ˜Lšœ	žœ˜Lšœžœžœ˜Lšœžœžœ˜šŸœžœ
+žœžœ˜(Lšœžœžœ˜"šžœž˜šžœ˜Lšœ	žœ˜L˜L˜(L˜—šžœ˜L˜L˜L˜——L˜L˜L˜—Lš	œžœžœžœ	žœ(˜\Lšžœžœžœ)˜ALšœ˜L˜šžœž˜Lšžœžœ˜4Lšžœ%žœ˜<—Lšžœ
+žœžœ˜!šžœ˜šžœ˜L™Lšœžœ˜šž˜Lš	œžœžœžœžœ˜6šžœž˜Lšžœžœ˜Lšžœžœ˜—L˜L˜Lšœžœ˜ šž˜Lš	œžœžœžœžœ˜6šžœž˜šžœžœžœ˜,L˜-—Lšžœžœ˜—Lšžœ˜—šžœ&žœž˜5Lšœžœ˜šžœ˜Lšœžœžœ-˜CL˜)L˜L˜——Lšœžœžœ˜*Lšžœ˜—L˜—šžœ˜šž˜Lšœžœ˜L˜Lšœ(žœ˜Išžœž˜šœ˜šžœž˜L˜&L˜&Lšœžœžœžœ˜5šœžœžœžœ˜Lšœžœ˜Lšœžœžœžœ˜5L˜Lšžœžœžœžœ˜'L˜—Lšœžœ˜Lšœžœžœ˜Lšžœ˜—šž˜˜Lšœžœ˜——L˜—šœ˜šžœ&žœž˜5šœžœ˜šžœž˜šžœ˜L˜Lšžœžœ˜L˜—L˜&šœ	˜	Lšœžœ˜Lšœžœžœžœ˜5L˜Lšžœžœžœžœ˜'L˜—Lšœžœžœžœ˜>Lšœ
+žœžœ˜$Lšœžœžœžœ˜4Lšžœ˜—Lšœžœ˜Lšžœ˜ L˜—šžœ˜Lšœžœžœ-˜CL˜)L˜Lšžœžœ˜L˜——šžœ˜Lšžœžœžœ˜Lšœžœžœ ˜/Lšœžœžœ˜Lšœžœ˜Lšœžœžœžœ˜<Lšœžœžœžœ˜5šžœž˜Lšœ™Lšžœžœžœžœ˜6—Lšœžœ˜)Lšžœ˜L˜—Lšœ˜—Lšœžœ˜Lšœžœ˜Lšžœ˜—Lšœ	žœ˜Lšžœ˜—L˜——Lšžœ˜L˜—šŸ	œžœ˜šœ
+žœŽ˜œ™L™——šœ	žœª˜·™L™——L˜Lšœ˜Lšœ˜L˜—šŸ
+œžœžœ˜!Lšžœžœžœžœ˜4Lšžœ,˜.L˜—šŸœžœžœ˜Lšœ&™&˜Lšœ˜Lšœ
+˜
+Lšœžœžœ˜Lšœžœ˜Lšœ	žœ˜Lšœžœ˜Lšœ˜Lšœ
+ž˜L˜—šŸœžœžœ˜L•StartOfExpansionT[base: ROPE, start: INT _ 0, len: INT _ 2147483647, action: Rope.ActionType]˜,L˜—šŸœžœžœ˜"Lšœžœ˜L–T[base: ROPE, start: INT _ 0, len: INT _ 2147483647, action: Rope.ActionType]˜,Lšœžœ˜L˜—šŸœžœžœ˜$Lšœžœ˜L–T[base: ROPE, start: INT _ 0, len: INT _ 2147483647, action: Rope.ActionType]˜,Lšœžœ˜L˜—–* -- [c: CHAR] RETURNS [quit: BOOL _ FALSE]šŸœ˜LšÐck&™&Lšžœžœžœžœ˜*L˜Lšœ˜L˜—–* -- [c: CHAR] RETURNS [quit: BOOL _ FALSE]šŸœžœžœ˜Lšžœžœžœžœ˜*L˜Lšœ˜L˜—š
+Ÿœžœ	žœžœžœ˜:Lšžœžœžœžœ˜,Lšœžœ˜L˜L˜L˜Lšœ˜Lšœžœ˜L˜—Lš	œžœžœžœžœ˜ILšœžœžœžœžœžœžœžœžœ˜VLš	œžœžœžœžœ˜!L˜ šžœ˜Lšžœžœ ˜'Lšžœžœ8˜?L˜ —Lšžœžœžœ˜.Lšœžœ˜Lšœžœ˜Lšœžœ˜L˜ Lšžœ2˜4Lšœ˜Lšœ˜L˜ Lšœžœ1˜;Lšžœžœžœ˜L˜ Lšœžœ…˜Lšœ˜L˜ šžœžœžœžœžœžœž˜DLšœ˜Lšœ˜Lšžœ˜L˜ —Lšœ˜L˜ Lšœžœ˜L˜ L˜#šžœžœ˜Lšœžœžœ˜šžœžœžœžœžœžœžœž˜Ašžœžœž˜šœ	žœ˜Lšœžœžœ˜#Lšœžœžœ˜šžœžœžœ˜šžœžœž˜Lš
+žœžœžœžœžœ˜,L˜Lšžœžœžœ˜Lšžœ˜—šžœžœžœ˜LšœN˜NLšœ	žœ˜L˜—Lšœ˜L˜Lšžœ˜L˜—L˜—Lšžœ˜—Lšžœ˜—Lšžœžœ˜(L˜—šžœžœž˜˜
+šžœ
+žœž˜Lšœžœžœ˜)Lšœžœžœ˜ Lšœžœžœ˜šžœžœžœ˜L˜Lšœžœ˜Lšœžœ˜Lšžœ'˜)šžœžœž˜Lšœ
+žœ˜%Lšœžœžœ˜ Lšœžœ˜Lšœžœ˜Lšžœ$˜&šžœžœžœ ž˜6Lšœžœžœ˜!Lšžœžœžœ˜$Lšœžœ˜L˜Lšžœ˜—Lšžœžœžœ˜ L˜Lšžœ˜—Lšžœ˜L˜—L˜Lšžœ˜—Lšžœ˜L˜—šžœ˜šžœ
+žœž˜Lšœžœžœ˜)Lšœžœžœ˜ šžœžœžœ˜Lšœžœžœ˜ Lšœ
+žœžœ˜Lšœžœ˜Lšœžœ˜Lšœ˜Lšœ˜Lšžœžœ˜(šžœžœž˜Lšœžœ˜L˜šžœžœ žœ˜:Lšžœžœžœ˜)L˜Lšœ˜Lšœ˜L˜—L˜Lšœžœžœ˜6Lšœ˜šžœ˜Lšžœ-˜1Lšžœ*˜.—Lšœžœ˜L˜Lšžœ˜—Lšœžœžœžœ˜0L˜—L˜Lšžœ˜—Lšžœ.˜0Lšœ#˜#L˜——Lšœ	žœ˜Lšœžœ˜L˜L˜—Lšœžœ˜Lšœžœ˜Lšœžœžœžœžœžœ˜Lš	œžœžœžœžœ˜"Lšœ
+žœžœ˜Lšœžœ˜Lšœžœ˜Lšœžœ˜Lš	œžœžœžœžœ˜!Lš	œžœžœžœžœ˜!–I[cmd: Commander.Handle, starExpand: BOOL _ FALSE, switchChar: CHAR]˜:Lšœ*žœžœ
+˜9LšœZ™ZL˜ —šžœžœžœž˜LšœÒ™ÒLšœžœ˜˜LšœD™D—šžœžœž˜Lšœ˜Lšœ0˜0Lšœ˜šœžœ˜3L˜—šžœ˜šœ˜šžœ˜Lšžœ$žœžœ
+˜6Lšœ*žœžœ
+˜9L˜—–0 -- [item: REF ANY] RETURNS [stop: BOOL _ FALSE]šŸœ!˜)Lš¡,™,šžœžœž˜šœ
+žœ˜'Lšœžœ˜šžœžœž˜šœžœžœ˜MLšœžœ˜"Lšœžœ	˜Lšœžœ˜(Lšœžœžœ˜šžœžœžœ˜L˜ L˜L˜—˜šœžœ	˜Lšžœžœžœžœ˜=——šžœžœžœ˜Lšœv™vL˜ L˜L˜—Lšœžœ˜L˜—Lšžœ˜—L˜—šœ	žœ˜)L˜—šœ
+žœ˜)Lšœ*˜*—Lšžœ˜—L˜—šŸœžœ
+žœžœ˜HLšœžœžœ˜Lšœžœ˜#Lšœ˜L˜$L˜šœ˜Lšœ:˜:Lšœžœžœ˜"—Lšžœ˜L˜L˜—–. -- [fullFName: ROPE] RETURNS [continue: BOOL]šŸœžœ˜Lš¡œž¡™%Lšœžœžœ˜)Lšœ	žœžœ˜Lšœžœ˜šžœžœžœ˜Lšœžœ˜&Lšœžœ˜L˜šžœ	ž˜šžœž˜'L˜2Lšœ4žœ˜:Lšžœ˜—L˜Lšžœ˜—L˜*L˜—šžœžœž˜šœ6žœ˜<Lšœžœ˜$—šœ7žœ˜=Lšœžœ˜%—šœ4žœ˜:šžœ˜Lšžœžœ˜)Lšžœ˜——šœ˜Lšœ žœ˜'—šžœ˜
+LšžœC˜E——L˜—Lšœžœžœ˜šžœ,˜.šžœ˜Lšœ™šžœ-ž˜3L˜—Lšžœžœ˜7L˜—šž˜L™Lšœžœ˜%——šžœ˜LšœI™Išžœžœžœžœžœžœžœž˜Ašžœžœž˜šœžœ˜Lšœžœžœ˜!Lšœžœ˜Lšžœžœžœžœ˜#L˜—Lšžœ˜—Lšžœ˜—Lšœ	žœ˜Lšžœžœ˜L˜—L˜—L˜——Lšžœ˜—Lšžœžœ˜)šž˜L˜—L˜L˜ —šŸœžœžœ˜6Lšœžœ˜Lšœžœ˜šž˜Lšœžœ˜(Lšœžœ%˜/Lšœžœžœ8˜NL˜%L˜%Lšžœžœžœ˜Lšžœ˜—L˜L˜ —–> -- [ref1: REF ANY, ref2: REF ANY] RETURNS [Basics.Comparison]šŸœ˜Lš¡:™:Lšœžœžœžœ˜-Lšœžœžœžœ˜-Lšžœžœžœ	˜%šžœžœž˜-Lšœžœ˜Lšœžœ˜Lšžœžœžœ˜5—L˜L˜ —šŸœžœžœžœžœžœ˜YLšœžœžœžœ˜(LšœžœžœA˜QLšžœ˜L˜L˜ —š
+Ÿœžœžœžœžœ˜2Lšžœ5žœ˜UL˜L˜ —šŸœžœžœžœžœžœ˜DLšœžœ˜Lšœžœžœžœ˜ELšœžœ ˜(Lšœžœ˜)Lšœžœ˜)šžœžœžœ˜L™,—šžœžœ˜L™rLšœžœžœžœ$˜:Lšœ	žœžœ]˜nLšœ
+žœžœžœžœ
+žœžœ˜OLšœžœ˜!Lšžœžœ˜L˜—Lšžœ˜L˜L˜ —LšœžœÃ˜ÌL˜ –x[key: ROPE, proc: Commander.CommandProc, doc: ROPE _ NIL, clientData: REF ANY _ NIL, interpreted: BOOL _ TRUE]šœ˜Lšœ˜Lšœ˜Lšœ	˜	Lšœžœ˜Lšœž˜Lšœ˜—L˜ Lšžœ˜L˜ šœ˜L™ —— …—    A>  bK  

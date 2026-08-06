@@ -1,0 +1,797 @@
+
+DIRECTORY
+Basics USING[CompareCard, Comparison],
+Breakpoint USING[Break, BreakpointProc, ClearBreakpoint, EnumerateBreakpoints, SetBreakpoint, Cant, CantClear, CantSet],
+BreakWorldArchitecture USING[Address, AddressRep, WorldAccess, WorldAccessFromBreakWorld, BreakWorld, BreakWorldFromBreakWorldAddress, CreateBreakWorld, NewAddress, nullAddress, PatchAreaRep, Cant, WouldBlock],
+CCTypes USING[CCError, CCErrorCase],
+CirioBreakAccess USING[],
+CirioNubAccess USING[FileEntry, GetFileEntry, GetInstructionSetAndOperatingSystem, Handle, LookupFileEntryByStemName, LookupMatchingSymEntryByName, LookupMatchingSymEntryByValue, LookupSymEntryByName, LookupSymEntryByValue, ModuleType, MonitoredCall, RaFromCi, Read32BitsAsCard, Read4Bytes, RemoteAddress, SymEntry, TextType, Write4Bytes],
+CirioTargets,
+IO,
+MIPSArchitecture USING [MIPSAddress, MIPSContents, MIPSAddressFromTargetAddress, MIPSContentsFromTargetContents, TargetContentsFromMIPSContents, NullMIPSAddress],
+RedBlackTree,
+Rope USING[Concat, Equal, Length, ROPE, Substr],
+SourceFileOps USING [FormatPosition, Position],
+SPARCArchitecture USING[SPARCAddress, SPARCAddressFromTargetAddress, SPARCContents, SPARCContentsFromTargetContents, TargetContentsFromSPARCContents, NullSPARCAddress],
+SystemInterface USING[ShowReport],
+TargetArchitecture USING[Contents];
+
+CirioBreakAccessImpl: CEDAR MONITOR
+LOCKS breaks USING breaks: CirioBreakSet
+IMPORTS Basics, Breakpoint, BreakWorldArchitecture, CCTypes, CirioNubAccess, IO,  MIPSArchitecture, RedBlackTree, Rope, SourceFileOps, SPARCArchitecture, SystemInterface
+EXPORTS CirioBreakAccess
+= BEGIN
+
+
+
+
+maxJump: CARD ~ 2**23;
+
+CirioBreakSet: TYPE = REF CirioBreakSetBody;
+CirioBreakSetBody: PUBLIC TYPE = MONITORED RECORD[
+nub: CirioNubAccess.Handle,
+recentBreakIndex: CARD,
+breakProc: BreakWorldArchitecture.Address,
+breakProcDataSegment: BreakWorldArchitecture.Address,
+debuggeeBreakWorld: BreakWorldArchitecture.BreakWorld,
+afterLastSpacer: CARD,
+spacers: RedBlackTree.Table--of Spacer--
+];
+
+Spacer: TYPE ~ REF SpacerPrivate;
+SpacerPrivate: TYPE ~ RECORD [start, size: CARD];
+
+CirioBreakClientData: TYPE = REF CirioBreakClientDataBody;
+CirioBreakClientDataBody: TYPE = RECORD[
+index: CARD,
+cardAddress: CARD32,
+stopAll: BOOLEAN, -- added for two kinds of breaks.
+break: Breakpoint.Break,
+breakSet: CirioBreakSet,
+mesaPosition: SourceFileOps.Position];
+
+QuaBreakSet: PUBLIC PROC [ra: REF ANY] RETURNS [is: BOOL, it: CirioBreakSet] ~ {
+WITH ra SELECT FROM
+x: CirioBreakSet => RETURN [TRUE, x];
+ENDCASE => RETURN [FALSE, NIL];
+};
+
+CreateCirioBreakSet: PUBLIC PROC[nub: CirioNubAccess.Handle, fileNameStem: Rope.ROPE, breakProcName: Rope.ROPE] RETURNS[CirioBreakSet] =
+BEGIN
+breakProcAddr, breakProcDataSegment: CARD;
+breaks: CirioBreakSet;
+breakWorld: BreakWorldArchitecture.BreakWorld;
+target: CirioTargets.Target ¬ NARROW[nub.target];
+
+SPARC: Rope.ROPE ¬ "SPARC";
+RS6000: Rope.ROPE ¬ "RS6000";
+MIPSEL: Rope.ROPE ¬ "MIPSEL";     -- MIPS little endian
+MIPSEB: Rope.ROPE ¬ "MIPSEB";     -- MIPS big endian
+
+instrSet, opSys: Rope.ROPE;
+[instrSet, opSys] ¬ CirioNubAccess.GetInstructionSetAndOperatingSystem[nub];
+
+[breakProcAddr, breakProcDataSegment] ¬ FindNamedProcInNamedFile[nub, fileNameStem, breakProcName];
+breaks ¬ NEW[CirioBreakSetBody¬
+[nub:  nub,
+recentBreakIndex:  0, 
+breakProc: NIL, 
+breakProcDataSegment: NIL, 
+debuggeeBreakWorld: NIL, 
+afterLastSpacer: 0, 
+spacers: RedBlackTree.Create[SpacerGetKey, SpacerCompare] ]];
+
+SELECT TRUE FROM
+Rope.Equal[instrSet, SPARC],
+Rope.Equal[instrSet, RS6000] => 
+{
+breakWorld ¬ 
+BreakWorldArchitecture.CreateBreakWorld[
+name: target.instrSet,
+peekContents: CirioDebuggeePeekContentsProc,
+pokeContents: CirioDebuggeePokeContentsProc,
+getProcAddress: CirioDebuggeeGetProcAddressProc,
+getProcDataSegment: CirioDebuggeeGetDataSegmentProc,
+getPatchArea: CirioDebuggeeGetPatchAreaProc,
+monitoredCall: CirioDebuggeeMonitoredCallProc,
+worldAccessData: breaks];
+};
+Rope.Equal[instrSet, MIPSEL],
+Rope.Equal[instrSet, MIPSEB] => 
+{
+breakWorld ¬ 
+BreakWorldArchitecture.CreateBreakWorld[
+name: target.instrSet,
+peekContents: MIPSCirioDebuggeePeekContentsProc,
+pokeContents: MIPSCirioDebuggeePokeContentsProc,
+getProcAddress: MIPSCirioDebuggeeGetProcAddressProc,
+getProcDataSegment: MIPSCirioDebuggeeGetDataSegmentProc,
+getPatchArea: MIPSCirioDebuggeeGetPatchAreaProc,
+monitoredCall: MIPSCirioDebuggeeMonitoredCallProc,
+worldAccessData: breaks];
+};
+ENDCASE => CCTypes.CCError[cirioError, "Unsupported instrSet for CirioBreakSet"];
+
+breaks.breakProc ¬ IF breakProcAddr # 0 THEN BreakWorldArchitecture.NewAddress[breakWorld, LOOPHOLE[breakProcAddr]] ELSE BreakWorldArchitecture.nullAddress;
+
+breaks.debuggeeBreakWorld ¬ breakWorld;
+
+RETURN[breaks];
+END;
+
+BreakWorldFromBreakSet: PUBLIC PROC[breaks: CirioBreakSet] 
+RETURNS [BreakWorldArchitecture.BreakWorld] ~ {
+breakWorld: BreakWorldArchitecture.BreakWorld ~ breaks.debuggeeBreakWorld;
+
+RETURN [breakWorld];
+};
+
+ReportBreakInfo: PROC[breaks: CirioBreakSet, clientBreak: CirioBreakClientData, clientMessage: Rope.ROPE] =
+{
+symEntry: CirioNubAccess.SymEntry ¬ CirioNubAccess.LookupSymEntryByValue[breaks.nub, clientBreak.cardAddress, 0];
+procName: Rope.ROPE ¬ IF symEntry = NIL THEN CCTypes.CCError[cirioError, "Bad args to LookupAddr"] ELSE symEntry.name;
+SystemInterface.ShowReport[IO.PutFLR[
+"%g%g at %g = 0x%08x (abs), stopAll=%g.\n",
+LIST[[rope[clientMessage]],
+[cardinal[clientBreak.index]],
+[rope[SourceFileOps.FormatPosition[clientBreak.mesaPosition]]],
+[cardinal[clientBreak.cardAddress]],
+[boolean[clientBreak.stopAll]]] ], $urgent];
+};
+
+ClearBreakAtAbsAddr: PUBLIC ENTRY PROC[breaks: CirioBreakSet, cardAddress: CARD32] =
+BEGIN
+ENABLE {
+UNWIND => NULL;
+Breakpoint.Cant => CCTypes.CCError[cirioError, IO.PutFR["Breakpoint.Cant[%g, %g] when trying to clear break at address %g", [atom[code]], [rope[message]], [cardinal[cardAddress]] ]];
+Breakpoint.CantClear => CCTypes.CCError[cirioError, IO.PutFR["Breakpoint.CantClear[%g, %g] when trying to clear break at address %g", [atom[code]], [rope[message]], [cardinal[cardAddress]] ]];
+};
+breakWorld: BreakWorldArchitecture.BreakWorld ¬ breaks.debuggeeBreakWorld;
+clientBreak: CirioBreakClientData ¬ NIL;
+examineBreaks: Breakpoint.BreakpointProc =
+BEGIN
+tentative: CirioBreakClientData ¬ NARROW[clientData];
+IF tentative.cardAddress = cardAddress THEN
+{clientBreak ¬ tentative;
+Breakpoint.ClearBreakpoint[clientBreak.break];
+ReportBreakInfo[breaks, clientBreak, "Cleared break #"];
+RETURN[TRUE]};
+RETURN[FALSE];
+END;
+[] ¬ Breakpoint.EnumerateBreakpoints[breakWorld, examineBreaks];
+IF clientBreak = NIL THEN
+SystemInterface.ShowReport[IO.PutFR1["sorry, there is no break to clear at %g", IO.card[cardAddress]], $urgent];
+
+END;
+
+ClearBreakAtIndex: PUBLIC ENTRY PROC[breaks: CirioBreakSet, index: CARD] =
+BEGIN
+ENABLE {
+UNWIND => NULL;
+Breakpoint.Cant => CCTypes.CCError[cirioError, IO.PutFR["Breakpoint.Cant[%g, %g] when trying to clear break at index %g", [atom[code]], [rope[message]], [cardinal[index]] ]];
+Breakpoint.CantClear => CCTypes.CCError[cirioError, IO.PutFR["Breakpoint.CantClear[%g, %g] when trying to clear break at index %g", [atom[code]], [rope[message]], [cardinal[index]] ]];
+};
+breakWorld: BreakWorldArchitecture.BreakWorld ¬ breaks.debuggeeBreakWorld;
+clientBreak: CirioBreakClientData ¬ NIL;
+examineBreaks: Breakpoint.BreakpointProc =
+BEGIN
+tentative: CirioBreakClientData ¬ NARROW[clientData];
+IF tentative.index = index THEN
+{clientBreak ¬ tentative;
+Breakpoint.ClearBreakpoint[clientBreak.break];
+ReportBreakInfo[breaks, clientBreak, "Cleared break #"];
+RETURN[TRUE]};
+RETURN[FALSE];
+END;
+[] ¬ Breakpoint.EnumerateBreakpoints[breakWorld, examineBreaks];
+IF clientBreak = NIL THEN
+SystemInterface.ShowReport[IO.PutFR1["sorry, there is no break with index %g", IO.card[index]], $urgent];
+
+END;
+
+ClearAllBreaks: PUBLIC ENTRY PROC[breaks: CirioBreakSet] =
+BEGIN
+ENABLE UNWIND => NULL;
+breakWorld: BreakWorldArchitecture.BreakWorld ¬ breaks.debuggeeBreakWorld;
+examineBreaks: Breakpoint.BreakpointProc =
+BEGIN
+clientBreak: CirioBreakClientData ¬ NARROW[clientData];
+Breakpoint.ClearBreakpoint[clientBreak.break !
+Breakpoint.CantClear => {
+SystemInterface.ShowReport[IO.PutFLR["Breakpoint.CantClear[%g, %g] when trying to clear break with index %g at %g", LIST[[atom[code]], [rope[message]], [cardinal[clientBreak.index]], [cardinal[clientBreak.cardAddress]]] ], $normal];
+GOTO Givup};
+Breakpoint.Cant => {
+SystemInterface.ShowReport[IO.PutFLR["Breakpoint.Cant[%g, %g] when trying to clear break with index %g at %g", LIST[[atom[code]], [rope[message]], [cardinal[clientBreak.index]], [cardinal[clientBreak.cardAddress]]] ], $normal];
+GOTO Givup}
+];
+ReportBreakInfo[breaks, clientBreak, "Cleared break #"];
+RETURN[FALSE];
+EXITS Givup => quit ¬ FALSE
+END;
+[] ¬ Breakpoint.EnumerateBreakpoints[breakWorld, examineBreaks
+!Breakpoint.Cant => CCTypes.CCError[cirioError, "Can't enumerate breakpoints"]];
+END;
+
+BreakSetBroken: PUBLIC PROC [breaks: CirioBreakSet] RETURNS [BOOL] ~ {
+RETURN [breaks.breakProc = BreakWorldArchitecture.nullAddress]};
+
+ListBreaks: PUBLIC ENTRY PROC[breaks: CirioBreakSet] =
+BEGIN
+ENABLE UNWIND => NULL;
+breakWorld: BreakWorldArchitecture.BreakWorld ¬ breaks.debuggeeBreakWorld;
+examineBreaks: Breakpoint.BreakpointProc =
+BEGIN
+clientBreak: CirioBreakClientData ¬ NARROW[clientData];
+ReportBreakInfo[breaks, clientBreak, "Break #"];
+RETURN[FALSE];
+END;
+[] ¬ Breakpoint.EnumerateBreakpoints[breakWorld, examineBreaks
+!Breakpoint.Cant => CCTypes.CCError[cirioError, "Can't enumerate breakpoints"]];
+END;
+
+SetBreakAtAbsAddr: PUBLIC ENTRY PROC[breaks: CirioBreakSet, cardAddress: CARD32, mesaPos: SourceFileOps.Position, stopAll: BOOLEAN] =
+BEGIN
+ENABLE UNWIND => NULL;
+stopAllDummy: CARD32 ¬ IF stopAll THEN 1 ELSE 0;
+breakWorld: BreakWorldArchitecture.BreakWorld ¬ breaks.debuggeeBreakWorld;
+worldAccess: BreakWorldArchitecture.WorldAccess ¬ BreakWorldArchitecture.WorldAccessFromBreakWorld[breakWorld];
+clientData: CirioBreakClientData ¬ NEW[CirioBreakClientDataBody¬[
+breaks.recentBreakIndex ¬ breaks.recentBreakIndex+1,
+cardAddress,
+stopAll,
+NIL,
+breaks,
+mesaPos]];
+address: BreakWorldArchitecture.Address ¬ BreakWorldArchitecture.NewAddress[breakWorld, LOOPHOLE[cardAddress]];
+clientData.break ¬ Breakpoint.SetBreakpoint[address, clientData, breaks.breakProc, stopAllDummy !
+Breakpoint.CantSet => CCTypes.CCError[cirioError, IO.PutFR["Breakpoint.CantSet[%g, %g] at %g", [atom[code]], [rope[message]], [cardinal[cardAddress]] ]];
+Breakpoint.Cant => CCTypes.CCError[cirioError, IO.PutFR["Breakpoint.Cant[%g, %g] when trying to set break at %g", [atom[code]], [rope[message]], [cardinal[cardAddress]] ]]
+];
+ReportBreakInfo[breaks, clientData, "Set break #"];
+END;
+
+CirioDebuggeePeekContentsProc: PROC[address: BreakWorldArchitecture.Address] RETURNS [TargetArchitecture.Contents] =
+BEGIN ENABLE {
+SPARCArchitecture.NullSPARCAddress => CCTypes.CCError[cirioError, "SPARCArchitecture.NullSPARCAddress"];
+BreakWorldArchitecture.Cant => CCTypes.CCError[cirioError, IO.PutFR["BreakWorldArchitecture.Cant[%g, %g]", [atom[code]], [rope[message]] ]];
+};
+worldAccess: BreakWorldArchitecture.WorldAccess ¬ BreakWorldArchitecture.WorldAccessFromBreakWorld[BreakWorldArchitecture.BreakWorldFromBreakWorldAddress[address]]; 
+breaks: CirioBreakSet ¬ NARROW[worldAccess.data];
+sparcAddress: SPARCArchitecture.SPARCAddress ¬ SPARCArchitecture.SPARCAddressFromTargetAddress[address.address];
+byteAddress: CARD32 ¬ LOOPHOLE[sparcAddress];
+remoteAddress: CirioNubAccess.RemoteAddress ¬ [
+breaks.nub,
+byteAddress,
+0,
+FALSE,
+TRUE];
+remoteContents: PACKED ARRAY [0..3] OF BYTE ¬ CirioNubAccess.Read4Bytes[remoteAddress];
+sparcContents: SPARCArchitecture.SPARCContents ¬ LOOPHOLE[remoteContents];
+RETURN[SPARCArchitecture.TargetContentsFromSPARCContents[sparcContents]];
+END;
+
+MIPSCirioDebuggeePeekContentsProc: PROC[address: BreakWorldArchitecture.Address] RETURNS [TargetArchitecture.Contents] =
+BEGIN ENABLE {
+MIPSArchitecture.NullMIPSAddress => CCTypes.CCError[cirioError, "MIPSArchitecture.NullMIPSAddress"];
+BreakWorldArchitecture.Cant => CCTypes.CCError[cirioError, IO.PutFR["BreakWorldArchitecture.Cant[%g, %g]", [atom[code]], [rope[message]] ]];
+};
+worldAccess: BreakWorldArchitecture.WorldAccess ¬ BreakWorldArchitecture.WorldAccessFromBreakWorld[BreakWorldArchitecture.BreakWorldFromBreakWorldAddress[address]]; 
+breaks: CirioBreakSet ¬ NARROW[worldAccess.data];
+mipsAddress: MIPSArchitecture.MIPSAddress ¬ MIPSArchitecture.MIPSAddressFromTargetAddress[address.address];
+byteAddress: CARD32 ¬ LOOPHOLE[mipsAddress];
+remoteAddress: CirioNubAccess.RemoteAddress ¬ [
+breaks.nub,
+byteAddress,
+0,
+FALSE,
+TRUE];
+remoteContents: PACKED ARRAY [0..3] OF BYTE ¬ LOOPHOLE[CirioNubAccess.Read4Bytes[remoteAddress]];
+mipsContents: MIPSArchitecture.MIPSContents ¬ LOOPHOLE[remoteContents];
+RETURN[MIPSArchitecture.TargetContentsFromMIPSContents[mipsContents]];
+END;
+
+CirioDebuggeePokeContentsProc: PROC[address: BreakWorldArchitecture.Address, contents: TargetArchitecture.Contents] =
+BEGIN ENABLE {
+SPARCArchitecture.NullSPARCAddress => CCTypes.CCError[cirioError, "SPARCArchitecture.NullSPARCAddress"];
+BreakWorldArchitecture.Cant => CCTypes.CCError[cirioError, IO.PutFR["BreakWorldArchitecture.Cant[%g, %g]", [atom[code]], [rope[message]] ]];
+};
+breakWorld: BreakWorldArchitecture.BreakWorld ¬ BreakWorldArchitecture.BreakWorldFromBreakWorldAddress[address];
+worldAccess: BreakWorldArchitecture.WorldAccess ¬ BreakWorldArchitecture.WorldAccessFromBreakWorld[breakWorld]; 
+breaks: CirioBreakSet ¬ NARROW[worldAccess.data];
+sparcAddress: SPARCArchitecture.SPARCAddress ¬ SPARCArchitecture.SPARCAddressFromTargetAddress[address.address];
+byteAddress: CARD32 ¬ LOOPHOLE[sparcAddress];
+remoteAddress: CirioNubAccess.RemoteAddress ¬ [
+breaks.nub,
+byteAddress,
+0,
+FALSE,
+TRUE];
+sparcContents: SPARCArchitecture.SPARCContents ¬ SPARCArchitecture.SPARCContentsFromTargetContents[contents];
+remoteContents: PACKED ARRAY [0..3] OF BYTE ¬ LOOPHOLE[sparcContents];
+CirioNubAccess.Write4Bytes[remoteAddress, remoteContents];
+END;
+
+MIPSCirioDebuggeePokeContentsProc: PROC[address: BreakWorldArchitecture.Address, contents: TargetArchitecture.Contents] =
+BEGIN ENABLE {
+MIPSArchitecture.NullMIPSAddress => CCTypes.CCError[cirioError, "MIPSArchitecture.NullMIPSAddress"];
+BreakWorldArchitecture.Cant => CCTypes.CCError[cirioError, IO.PutFR["BreakWorldArchitecture.Cant[%g, %g]", [atom[code]], [rope[message]] ]];
+};
+breakWorld: BreakWorldArchitecture.BreakWorld ¬ BreakWorldArchitecture.BreakWorldFromBreakWorldAddress[address];
+worldAccess: BreakWorldArchitecture.WorldAccess ¬ BreakWorldArchitecture.WorldAccessFromBreakWorld[breakWorld]; 
+breaks: CirioBreakSet ¬ NARROW[worldAccess.data];
+mipsAddress: MIPSArchitecture.MIPSAddress ¬ MIPSArchitecture.MIPSAddressFromTargetAddress[address.address];
+byteAddress: CARD32 ¬ LOOPHOLE[mipsAddress];
+remoteAddress: CirioNubAccess.RemoteAddress ¬ [
+breaks.nub,
+byteAddress,
+0,
+FALSE,
+TRUE];
+mipsContents: MIPSArchitecture.MIPSContents ¬ MIPSArchitecture.MIPSContentsFromTargetContents[contents];
+remoteContents: PACKED ARRAY [0..3] OF BYTE ¬ LOOPHOLE[mipsContents];
+CirioNubAccess.Write4Bytes[remoteAddress, remoteContents];
+END;
+
+CirioDebuggeeGetProcAddressProc: PROC[breakWorld: BreakWorldArchitecture.BreakWorld, procName: Rope.ROPE] RETURNS [BreakWorldArchitecture.Address] =
+BEGIN ENABLE BreakWorldArchitecture.Cant => CCTypes.CCError[cirioError, IO.PutFR["BreakWorldArchitecture.Cant[%g, %g]", [atom[code]], [rope[message]] ]];
+worldAccess: BreakWorldArchitecture.WorldAccess ¬ BreakWorldArchitecture.WorldAccessFromBreakWorld[breakWorld]; 
+breaks: CirioBreakSet ¬ NARROW[worldAccess.data];
+symEntry: CirioNubAccess.SymEntry ¬ CirioNubAccess.LookupSymEntryByName[breaks.nub, procName, FALSE, FALSE, 0];
+
+IF symEntry = NIL THEN CCTypes.CCError[cirioError, ""] ELSE RETURN[BreakWorldArchitecture.NewAddress[breakWorld, LOOPHOLE[symEntry.value]]];
+END;
+
+MIPSCirioDebuggeeGetProcAddressProc: PROC[breakWorld: BreakWorldArchitecture.BreakWorld, procName: Rope.ROPE] RETURNS [BreakWorldArchitecture.Address] =
+BEGIN ENABLE BreakWorldArchitecture.Cant => CCTypes.CCError[cirioError, IO.PutFR["BreakWorldArchitecture.Cant[%g, %g]", [atom[code]], [rope[message]] ]];
+worldAccess: BreakWorldArchitecture.WorldAccess ¬ BreakWorldArchitecture.WorldAccessFromBreakWorld[breakWorld]; 
+breaks: CirioBreakSet ¬ NARROW[worldAccess.data];
+symEntry: CirioNubAccess.SymEntry ¬ CirioNubAccess.LookupSymEntryByName[breaks.nub, procName, FALSE, FALSE, 0];
+
+IF symEntry = NIL THEN CCTypes.CCError[cirioError, ""] ELSE RETURN[BreakWorldArchitecture.NewAddress[breakWorld, LOOPHOLE[symEntry.value]]];
+END;
+
+CirioDebuggeeGetDataSegmentProc: PROC[breakWorld: BreakWorldArchitecture.BreakWorld, address: BreakWorldArchitecture.Address] RETURNS [BreakWorldArchitecture.Address] =
+BEGIN ENABLE BreakWorldArchitecture.Cant => CCTypes.CCError[cirioError, IO.PutFR["BreakWorldArchitecture.Cant[%g, %g]", [atom[code]], [rope[message]] ]];
+worldAccess: BreakWorldArchitecture.WorldAccess ¬ BreakWorldArchitecture.WorldAccessFromBreakWorld[breakWorld]; 
+breaks: CirioBreakSet ¬ NARROW[worldAccess.data];
+sparcAddress: SPARCArchitecture.SPARCAddress ¬ SPARCArchitecture.SPARCAddressFromTargetAddress[address.address];
+symEntry: CirioNubAccess.SymEntry ¬ CirioNubAccess.LookupSymEntryByValue[breaks.nub, LOOPHOLE[sparcAddress], 0];
+fileEntry: CirioNubAccess.FileEntry;
+tocName: Rope.ROPE;
+tocEntry: CirioNubAccess.SymEntry;
+tocAddress: CARD;
+
+IF symEntry = NIL THEN CCTypes.CCError[cirioError, ""];
+fileEntry ¬ CirioNubAccess.GetFileEntry[breaks.nub, symEntry.fileSeqNum];
+IF fileEntry = NIL THEN CCTypes.CCError[cirioError, ""];
+tocName ¬ Rope.Substr[symEntry.name, 1, Rope.Length[symEntry.name] - 1];
+tocEntry ¬ CirioNubAccess.LookupSymEntryByName[breaks.nub, tocName, FALSE, FALSE, 0];
+IF tocEntry = NIL THEN RETURN[BreakWorldArchitecture.NewAddress[breakWorld, LOOPHOLE[fileEntry.dataReloc]]];
+tocAddress ¬ CirioNubAccess.RaFromCi[breaks.nub, tocEntry.value, 32].Read32BitsAsCard;
+RETURN[BreakWorldArchitecture.NewAddress[breakWorld, LOOPHOLE[tocAddress]]];
+END;
+
+MIPSCirioDebuggeeGetDataSegmentProc: PROC[breakWorld: BreakWorldArchitecture.BreakWorld, address: BreakWorldArchitecture.Address] RETURNS [BreakWorldArchitecture.Address] =
+BEGIN ENABLE BreakWorldArchitecture.Cant => CCTypes.CCError[cirioError, IO.PutFR["BreakWorldArchitecture.Cant[%g, %g]", [atom[code]], [rope[message]] ]];
+worldAccess: BreakWorldArchitecture.WorldAccess ¬ BreakWorldArchitecture.WorldAccessFromBreakWorld[breakWorld]; 
+breaks: CirioBreakSet ¬ NARROW[worldAccess.data];
+mipsAddress: MIPSArchitecture.MIPSAddress ¬ MIPSArchitecture.MIPSAddressFromTargetAddress[address.address];
+symEntry: CirioNubAccess.SymEntry ¬ CirioNubAccess.LookupSymEntryByValue[breaks.nub, LOOPHOLE[mipsAddress], 0];
+fileEntry: CirioNubAccess.FileEntry;
+tocName: Rope.ROPE;
+tocEntry: CirioNubAccess.SymEntry;
+tocAddress: CARD;
+
+IF symEntry = NIL THEN CCTypes.CCError[cirioError, ""];
+fileEntry ¬ CirioNubAccess.GetFileEntry[breaks.nub, symEntry.fileSeqNum];
+IF fileEntry = NIL THEN CCTypes.CCError[cirioError, ""];
+tocName ¬ Rope.Substr[symEntry.name, 1, Rope.Length[symEntry.name] - 1];
+tocEntry ¬ CirioNubAccess.LookupSymEntryByName[breaks.nub, tocName, FALSE, FALSE, 0];
+IF tocEntry = NIL THEN RETURN[BreakWorldArchitecture.NewAddress[breakWorld, LOOPHOLE[fileEntry.dataReloc]]];
+tocAddress ¬ CirioNubAccess.RaFromCi[breaks.nub, tocEntry.value, 32].Read32BitsAsCard;
+RETURN[BreakWorldArchitecture.NewAddress[breakWorld, LOOPHOLE[tocAddress]]];
+END;
+
+CirioDebuggeeGetPatchAreaProc: PROC[address: BreakWorldArchitecture.Address] RETURNS [BreakWorldArchitecture.PatchAreaRep] = {
+ENABLE {
+SPARCArchitecture.NullSPARCAddress => CCTypes.CCError[cirioError, "SPARCArchitecture.NullSPARCAddress"];
+BreakWorldArchitecture.Cant => CCTypes.CCError[cirioError, IO.PutFR["BreakWorldArchitecture.Cant[%g, %g]", [atom[code]], [rope[message]] ]];
+BreakWorldArchitecture.WouldBlock => CCTypes.CCError[cirioError, IO.PutFR1["BreakWorldArchitecture.WouldBlock[%g]", [rope[message]] ]];
+};
+breakWorld: BreakWorldArchitecture.BreakWorld ¬ BreakWorldArchitecture.BreakWorldFromBreakWorldAddress[address];
+worldAccess: BreakWorldArchitecture.WorldAccess ¬ BreakWorldArchitecture.WorldAccessFromBreakWorld[breakWorld]; 
+breaks: CirioBreakSet ¬ NARROW[worldAccess.data];
+sparcAddress: SPARCArchitecture.SPARCAddress ¬ SPARCArchitecture.SPARCAddressFromTargetAddress[address.address];
+byteAddress: CARD32 ¬ LOOPHOLE[sparcAddress];
+symEntry: CirioNubAccess.SymEntry ¬ CirioNubAccess.LookupSymEntryByValue[breaks.nub, byteAddress, 0];
+patchAddress: BreakWorldArchitecture.Address ¬ NIL;
+patchAreaRep: BreakWorldArchitecture.PatchAreaRep ¬ [NIL, 0];
+key: Spacer;
+TrySpacers: PROC RETURNS [{no, maybe, yes}] ~ {
+raLeft, raAt, raRight: REF ANY;
+spLeft, spAt, spRight: Spacer;
+leftDist, rightDist: CARD ¬ CARD.LAST;
+[raLeft, raAt, raRight] ¬ breaks.spacers.Lookup3[key];
+spLeft ¬ NARROW[raLeft];
+spAt ¬ NARROW[raAt];
+spRight ¬ NARROW[raRight];
+SELECT TRUE FROM
+spAt#NIL, spLeft#NIL AND CARD[byteAddress-spLeft.start] < spLeft.size => CCTypes.CCError[cirioError, IO.PutFR1["trying to set breakpoint in a meadow! (at address 0x%x)", [cardinal[byteAddress]] ]];
+spLeft=NIL AND spRight=NIL => RETURN[maybe];
+ENDCASE => {
+IF spLeft#NIL THEN leftDist ¬ byteAddress-spLeft.start;
+IF spRight#NIL THEN rightDist ¬ spRight.start+spRight.size - byteAddress;
+SELECT TRUE FROM
+leftDist<=rightDist AND NearEnough[byteAddress, spLeft.start]=>{
+patchAddress ¬ NEW[BreakWorldArchitecture.AddressRep¬[breakWorld, LOOPHOLE[spLeft.start]]];
+patchAreaRep ¬ [patchAddress, spLeft.size];
+RETURN[yes]};
+rightDist<=leftDist AND NearEnough[byteAddress, spRight.start+spRight.size] => {
+patchAddress ¬ NEW[BreakWorldArchitecture.AddressRep¬[breakWorld, LOOPHOLE[spRight.start]]];
+patchAreaRep ¬ [patchAddress, spRight.size];
+RETURN[yes]};
+leftDist=CARD.LAST OR rightDist=CARD.LAST => RETURN [maybe];
+ENDCASE => RETURN [no]};
+};
+
+IF symEntry # NIL THEN {
+fileEntry: CirioNubAccess.FileEntry ¬ CirioNubAccess.GetFileEntry[breaks.nub, symEntry.fileSeqNum];
+IF fileEntry.patchSize>0 THEN {
+patchAddress ¬ NEW[BreakWorldArchitecture.AddressRep¬[breakWorld, LOOPHOLE[fileEntry.patchReloc]]];
+patchAreaRep ¬ [patchAddress, fileEntry.patchSize];
+RETURN[patchAreaRep]}};
+
+key ¬ NEW[SpacerPrivate ¬ [byteAddress, 0]];
+SELECT TrySpacers[] FROM
+yes => RETURN[patchAreaRep];
+maybe => {
+UpdateSpacers[breaks];
+IF TrySpacers[]=yes THEN RETURN[patchAreaRep];
+};
+no => NULL;
+ENDCASE => ERROR;
+
+IF symEntry # NIL THEN {
+lo, hi: CARD ¬ symEntry.fileSeqNum;
+gohi: BOOL ¬ TRUE;
+fileEntry: CirioNubAccess.FileEntry;
+WHILE gohi OR lo>1 DO
+IF lo>1 THEN {
+lo ¬ lo - 1;
+fileEntry ¬ CirioNubAccess.GetFileEntry[breaks.nub, lo];
+SELECT TRUE FROM
+fileEntry.patchSize=0 => NULL;
+NearEnough[fileEntry.patchReloc, byteAddress] => {
+patchAddress ¬ NEW[BreakWorldArchitecture.AddressRep¬[breakWorld, LOOPHOLE[fileEntry.patchReloc]]];
+patchAreaRep ¬ [patchAddress, fileEntry.patchSize];
+RETURN[patchAreaRep]};
+ENDCASE => lo ¬ 0;
+};
+IF gohi THEN {
+hi ¬ hi + 1;
+fileEntry ¬ CirioNubAccess.GetFileEntry[breaks.nub, hi];
+SELECT TRUE FROM
+fileEntry.seqNum < hi => gohi ¬ FALSE;
+fileEntry.patchSize=0 => NULL;
+NearEnough[fileEntry.patchReloc+fileEntry.patchSize, byteAddress] => {
+patchAddress ¬ NEW[BreakWorldArchitecture.AddressRep¬[breakWorld, LOOPHOLE[fileEntry.patchReloc]]];
+patchAreaRep ¬ [patchAddress, fileEntry.patchSize];
+RETURN[patchAreaRep]};
+ENDCASE => gohi ¬ FALSE;
+};
+ENDLOOP;
+};
+
+CCTypes.CCError[cirioError, IO.PutFR1["no SymEntry or nearby patch space for address 0x%x", [cardinal[byteAddress]] ]]
+};
+
+MIPSCirioDebuggeeGetPatchAreaProc: PROC[address: BreakWorldArchitecture.Address] RETURNS [BreakWorldArchitecture.PatchAreaRep] = {
+ENABLE {
+MIPSArchitecture.NullMIPSAddress => CCTypes.CCError[cirioError, "MIPSArchitecture.NullMIPSAddress"];
+BreakWorldArchitecture.Cant => CCTypes.CCError[cirioError, IO.PutFR["BreakWorldArchitecture.Cant[%g, %g]", [atom[code]], [rope[message]] ]];
+BreakWorldArchitecture.WouldBlock => CCTypes.CCError[cirioError, IO.PutFR1["BreakWorldArchitecture.WouldBlock[%g]", [rope[message]] ]];
+};
+breakWorld: BreakWorldArchitecture.BreakWorld ¬ BreakWorldArchitecture.BreakWorldFromBreakWorldAddress[address];
+worldAccess: BreakWorldArchitecture.WorldAccess ¬ BreakWorldArchitecture.WorldAccessFromBreakWorld[breakWorld]; 
+breaks: CirioBreakSet ¬ NARROW[worldAccess.data];
+mipsAddress: MIPSArchitecture.MIPSAddress ¬ MIPSArchitecture.MIPSAddressFromTargetAddress[address.address];
+byteAddress: CARD32 ¬ LOOPHOLE[mipsAddress];
+symEntry: CirioNubAccess.SymEntry ¬ CirioNubAccess.LookupSymEntryByValue[breaks.nub, byteAddress, 0];
+patchAddress: BreakWorldArchitecture.Address ¬ NIL;
+patchAreaRep: BreakWorldArchitecture.PatchAreaRep ¬ [NIL, 0];
+key: Spacer;
+TrySpacers: PROC RETURNS [{no, maybe, yes}] ~ {
+raLeft, raAt, raRight: REF ANY;
+spLeft, spAt, spRight: Spacer;
+leftDist, rightDist: CARD ¬ CARD.LAST;
+[raLeft, raAt, raRight] ¬ breaks.spacers.Lookup3[key];
+spLeft ¬ NARROW[raLeft];
+spAt ¬ NARROW[raAt];
+spRight ¬ NARROW[raRight];
+SELECT TRUE FROM
+spAt#NIL, spLeft#NIL AND CARD[byteAddress-spLeft.start] < spLeft.size => CCTypes.CCError[cirioError, IO.PutFR1["trying to set breakpoint in a meadow! (at address 0x%x)", [cardinal[byteAddress]] ]];
+spLeft=NIL AND spRight=NIL => RETURN[maybe];
+ENDCASE => {
+IF spLeft#NIL THEN leftDist ¬ byteAddress-spLeft.start;
+IF spRight#NIL THEN rightDist ¬ spRight.start+spRight.size - byteAddress;
+SELECT TRUE FROM
+leftDist<=rightDist AND NearEnough[byteAddress, spLeft.start]=>{
+patchAddress ¬ NEW[BreakWorldArchitecture.AddressRep¬[breakWorld, LOOPHOLE[spLeft.start]]];
+patchAreaRep ¬ [patchAddress, spLeft.size];
+RETURN[yes]};
+rightDist<=leftDist AND NearEnough[byteAddress, spRight.start+spRight.size] => {
+patchAddress ¬ NEW[BreakWorldArchitecture.AddressRep¬[breakWorld, LOOPHOLE[spRight.start]]];
+patchAreaRep ¬ [patchAddress, spRight.size];
+RETURN[yes]};
+leftDist=CARD.LAST OR rightDist=CARD.LAST => RETURN [maybe];
+ENDCASE => RETURN [no]};
+};
+
+IF symEntry # NIL THEN {
+fileEntry: CirioNubAccess.FileEntry ¬ CirioNubAccess.GetFileEntry[breaks.nub, symEntry.fileSeqNum];
+IF fileEntry.patchSize>0 THEN {
+patchAddress ¬ NEW[BreakWorldArchitecture.AddressRep¬[breakWorld, LOOPHOLE[fileEntry.patchReloc]]];
+patchAreaRep ¬ [patchAddress, fileEntry.patchSize];
+RETURN[patchAreaRep]}};
+
+key ¬ NEW[SpacerPrivate ¬ [byteAddress, 0]];
+SELECT TrySpacers[] FROM
+yes => RETURN[patchAreaRep];
+maybe => {
+UpdateSpacers[breaks];
+IF TrySpacers[]=yes THEN RETURN[patchAreaRep];
+};
+no => NULL;
+ENDCASE => ERROR;
+
+IF symEntry # NIL THEN {
+lo, hi: CARD ¬ symEntry.fileSeqNum;
+gohi: BOOL ¬ TRUE;
+fileEntry: CirioNubAccess.FileEntry;
+WHILE gohi OR lo>1 DO
+IF lo>1 THEN {
+lo ¬ lo - 1;
+fileEntry ¬ CirioNubAccess.GetFileEntry[breaks.nub, lo];
+SELECT TRUE FROM
+fileEntry.patchSize=0 => NULL;
+NearEnough[fileEntry.patchReloc, byteAddress] => {
+patchAddress ¬ NEW[BreakWorldArchitecture.AddressRep¬[breakWorld, LOOPHOLE[fileEntry.patchReloc]]];
+patchAreaRep ¬ [patchAddress, fileEntry.patchSize];
+RETURN[patchAreaRep]};
+ENDCASE => lo ¬ 0;
+};
+IF gohi THEN {
+hi ¬ hi + 1;
+fileEntry ¬ CirioNubAccess.GetFileEntry[breaks.nub, hi];
+SELECT TRUE FROM
+fileEntry.seqNum < hi => gohi ¬ FALSE;
+fileEntry.patchSize=0 => NULL;
+NearEnough[fileEntry.patchReloc+fileEntry.patchSize, byteAddress] => {
+patchAddress ¬ NEW[BreakWorldArchitecture.AddressRep¬[breakWorld, LOOPHOLE[fileEntry.patchReloc]]];
+patchAreaRep ¬ [patchAddress, fileEntry.patchSize];
+RETURN[patchAreaRep]};
+ENDCASE => gohi ¬ FALSE;
+};
+ENDLOOP;
+};
+
+CCTypes.CCError[cirioError, IO.PutFR1["no SymEntry or nearby patch space for address 0x%x", [cardinal[byteAddress]] ]]
+};
+
+NearEnough: PROC [a, b: CARD] RETURNS [BOOL] ~ {
+SELECT TRUE FROM
+a=b => RETURN [TRUE];
+a<b => RETURN [b-a < 2**21];
+a>b => RETURN [a-b < 2**21];
+ENDCASE => ERROR};
+
+UpdateSpacers: PROC [breaks: CirioBreakSet] ~ {
+se: CirioNubAccess.SymEntry;
+target: CirioTargets.Target ¬ NARROW[breaks.nub.target];
+highest: CARD ¬ 0;
+some: BOOL ¬ FALSE;
+FOR
+se ¬
+CirioNubAccess.LookupSymEntryByName[h: breaks.nub, sym: target.CNameToLoaderName[target, "SomePatchSpace"], caseSensitive: FALSE, externOnly: FALSE, numToSkip: 0],
+CirioNubAccess.LookupMatchingSymEntryByName[h: breaks.nub, symID: se.symID, pattern: target.CNameToLoaderName[target, "SomePatchSpace"], caseSensitive: FALSE, wantedTypes: CirioNubAccess.TextType, ignoreClasses: 2--externals--, numToSkip: -1]
+WHILE se#NIL AND se.value >= breaks.afterLastSpacer
+DO
+s: Spacer ~ NEW [SpacerPrivate ¬ [se.value, spacerSize]];
+breaks.spacers.Insert[s, s];
+highest ¬ MAX[highest, se.value];
+some ¬ TRUE;
+ENDLOOP;
+IF some THEN breaks.afterLastSpacer ¬ MAX[breaks.afterLastSpacer, highest+spacerSize];
+RETURN};
+spacerSize: CARD ~ 8192--that's how much the source reserves--;
+
+SpacerGetKey: PROC [data: REF ANY] RETURNS [REF ANY] --RedBlackTree.GetKey--
+~ {RETURN[data]};
+
+SpacerCompare: PROC [k, data: REF ANY] RETURNS [Basics.Comparison] --RedBlackTree.Compare-- ~ {
+s1: Spacer ~ NARROW[k];
+s2: Spacer ~ NARROW[data];
+RETURN Basics.CompareCard[s1.start, s2.start]};
+
+CirioDebuggeeMonitoredCallProc: PROC[address: BreakWorldArchitecture.Address, proc: PROCEDURE [] RETURNS []] =
+BEGIN ENABLE {
+SPARCArchitecture.NullSPARCAddress => CCTypes.CCError[cirioError, "SPARCArchitecture.NullSPARCAddress"];
+BreakWorldArchitecture.Cant => CCTypes.CCError[cirioError, IO.PutFR["BreakWorldArchitecture.Cant[%g, %g]", [atom[code]], [rope[message]] ]];
+BreakWorldArchitecture.WouldBlock => CCTypes.CCError[cirioError, IO.PutFR1["BreakWorldArchitecture.WouldBlock[%g]", [rope[message]] ]];
+};
+breakWorld: BreakWorldArchitecture.BreakWorld ¬ BreakWorldArchitecture.BreakWorldFromBreakWorldAddress[address];
+worldAccess: BreakWorldArchitecture.WorldAccess ¬ BreakWorldArchitecture.WorldAccessFromBreakWorld[breakWorld]; 
+breaks: CirioBreakSet ¬ NARROW[worldAccess.data];
+sparcAddress: SPARCArchitecture.SPARCAddress ¬ SPARCArchitecture.SPARCAddressFromTargetAddress[address.address];
+byteAddress: CARD32 ¬ LOOPHOLE[sparcAddress];
+remoteAddress: CirioNubAccess.RemoteAddress ¬ [
+breaks.nub,
+byteAddress,
+0,
+FALSE,
+TRUE];
+CirioNubAccess.MonitoredCall[remoteAddress, proc];
+END;
+
+
+MIPSCirioDebuggeeMonitoredCallProc: PROC[address: BreakWorldArchitecture.Address, proc: PROCEDURE [] RETURNS []] =
+BEGIN ENABLE {
+MIPSArchitecture.NullMIPSAddress => CCTypes.CCError[cirioError, "MIPSArchitecture.NullMIPSAddress"];
+BreakWorldArchitecture.Cant => CCTypes.CCError[cirioError, IO.PutFR["BreakWorldArchitecture.Cant[%g, %g]", [atom[code]], [rope[message]] ]];
+BreakWorldArchitecture.WouldBlock => CCTypes.CCError[cirioError, IO.PutFR1["BreakWorldArchitecture.WouldBlock[%g]", [rope[message]] ]];
+};
+breakWorld: BreakWorldArchitecture.BreakWorld ¬ BreakWorldArchitecture.BreakWorldFromBreakWorldAddress[address];
+worldAccess: BreakWorldArchitecture.WorldAccess ¬ BreakWorldArchitecture.WorldAccessFromBreakWorld[breakWorld]; 
+breaks: CirioBreakSet ¬ NARROW[worldAccess.data];
+mipsAddress: MIPSArchitecture.MIPSAddress ¬ MIPSArchitecture.MIPSAddressFromTargetAddress[address.address];
+byteAddress: CARD32 ¬ LOOPHOLE[mipsAddress];
+remoteAddress: CirioNubAccess.RemoteAddress ¬ [
+breaks.nub,
+byteAddress,
+0,
+FALSE,
+TRUE];
+CirioNubAccess.MonitoredCall[remoteAddress, proc];
+
+END;
+
+
+ModuleType: CARD = CirioNubAccess.ModuleType;
+TextType: CARD = CirioNubAccess.TextType;
+FindNamedProcInNamedFile: PROC[nub: CirioNubAccess.Handle, fileStemName: Rope.ROPE, procName: Rope.ROPE] RETURNS[CARD, CARD] =
+BEGIN
+target: CirioTargets.Target ¬ NARROW[nub.target];
+loaderName: Rope.ROPE ¬ target.CNameToLoaderName[target, procName];
+lookUpName: Rope.ROPE ¬ Rope.Concat[loaderName, "_P"];
+lookUpNameSize: CARD ¬ Rope.Length[lookUpName];
+moduleEntry: CirioNubAccess.SymEntry ¬ CirioNubAccess.LookupFileEntryByStemName[nub, fileStemName, 0];
+fileEntry: CirioNubAccess.FileEntry;
+tocName: Rope.ROPE;
+tocEntry: CirioNubAccess.SymEntry;
+tocAddress: CARD;
+
+IF moduleEntry # NIL THEN
+BEGIN
+previousEntry: CirioNubAccess.SymEntry ¬ moduleEntry;
+
+fullName: Rope.ROPE ¬ Rope.Concat[loaderName, "_P60"];
+entry: CirioNubAccess.SymEntry ¬ CirioNubAccess.LookupMatchingSymEntryByName[nub, 0, fullName, FALSE, TextType, 0, 0];
+IF entry # NIL THEN 
+RETURN[entry.value, moduleEntry.value];
+
+DO
+nextEntry: CirioNubAccess.SymEntry ¬ CirioNubAccess.LookupMatchingSymEntryByValue[nub, previousEntry.symID, moduleEntry.value, TextType, 0, 1];
+IF nextEntry = NIL THEN RETURN[0, 0]; -- no such proc in the file
+IF nextEntry.value >= moduleEntry.value + moduleEntry.size THEN RETURN[0, 0]; -- no such proc in the file
+IF Rope.Equal[Rope.Substr[nextEntry.name, 0, lookUpNameSize], lookUpName] THEN {
+fileEntry ¬ CirioNubAccess.GetFileEntry[nub, moduleEntry.fileSeqNum];
+IF fileEntry = NIL THEN RETURN [0, 0];
+tocName ¬ Rope.Substr[nextEntry.name, 1, Rope.Length[nextEntry.name] - 1];
+tocEntry ¬ CirioNubAccess.LookupSymEntryByName[nub, tocName, FALSE, FALSE, 0];
+IF tocEntry = NIL THEN RETURN[nextEntry.value, fileEntry.dataReloc];
+tocAddress ¬ CirioNubAccess.RaFromCi[nub, tocEntry.value, 32].Read32BitsAsCard;
+RETURN[nextEntry.value, tocAddress];
+};
+previousEntry ¬ nextEntry;
+ENDLOOP;
+END
+ ELSE -- we couldnt find the file, so look up the symbol blindly (for compatibility)
+BEGIN
+fullName: Rope.ROPE ¬ Rope.Concat[loaderName, "_P60"];
+IF NOT Rope.Equal[procName, "CallDebugger"] THEN RETURN[0, 0]
+ ELSE
+BEGIN
+entry: CirioNubAccess.SymEntry ¬ CirioNubAccess.LookupMatchingSymEntryByName[nub, 0, fullName, FALSE, TextType, 0, 0];
+IF entry = NIL THEN RETURN[0, 0]; -- no such proc
+fileEntry ¬ CirioNubAccess.GetFileEntry[nub, entry.fileSeqNum];
+IF fileEntry = NIL THEN RETURN [0, 0];
+tocName ¬ Rope.Substr[entry.name, 1, Rope.Length[entry.name] - 1];
+tocEntry ¬ CirioNubAccess.LookupSymEntryByName[nub, tocName, FALSE, FALSE, 0];
+IF tocEntry = NIL THEN RETURN[entry.value, fileEntry.dataReloc];
+tocAddress ¬ CirioNubAccess.RaFromCi[nub, tocEntry.value, 32].Read32BitsAsCard;
+RETURN[entry.value, tocAddress];
+END;
+END;
+
+END;
+
+
+END.
+   
+ä  
+CirioBreakAccessImpl.mesa
+Copyright Ó 1991, 1992, 1993 by Xerox Corporation.  All rights reserved.
+Sturgis, March 23, 1990 11:59 am PST
+Last changed by Theimer on October 31, 1989 5:35:37 pm PST
+Peter B. Kessler, July 30, 1990 12:13 pm PDT
+Spreitze, July 24, 1992 7:36 pm PDT
+Philip James, December 26, 1991 3:49 pm PST
+Udagawa, February 15, 1991 4:09 pm PST
+Laurie Horton, August 15, 1992 10:16 am PDT
+Katsuyuki Komatsu January 6, 1993 11:41 am PST
+Jas, November 19, 1992 9:32 am PST
+Willie-s, January 22, 1993 3:13 pm PST
+
+Breakpoints
+
+A CirioBreakSet (or the debuggeeBreakWorld??) also plays the role of a debuggee for Peter
+see [Palain-NFS]<rouge>peter>CirioBreaks>FakeCirioImpl.mesa for a sample implementation
+breakProcName was _CallDebugger_P60
+instruction set names
+note: debuggeeData.breakProc is invalid, however, it won't be needed until after we fill it in below.  (Because breaks is not yet publically available.)
+PROCEDURE [clientData: ClientData] RETURNS [quit: BOOLEAN]
+IF clientBreak # NIL THEN
+BEGIN
+Breakpoint.ClearBreakpoint[clientBreak.break];
+SystemInterface.ShowReport[IO.PutFR["break with index %g cleared at %g", IO.card[clientBreak.index], IO.card[clientBreak.cardAddress]]];
+END
+ ELSE
+SystemInterface.ShowReport[IO.PutFR["sorry, there is no break to clear at %g", IO.card[cardAddress]]];
+PROCEDURE [clientData: ClientData] RETURNS [quit: BOOLEAN]
+IF clientBreak # NIL THEN
+BEGIN
+Breakpoint.ClearBreakpoint[clientBreak.break];
+SystemInterface.ShowReport[IO.PutFR["break with index %g cleared at %g", IO.card[clientBreak.index], IO.card[clientBreak.cardAddress]]];
+END
+ ELSE
+SystemInterface.ShowReport[IO.PutFR1["sorry, there is no break with index %g", IO.card[index]]];
+PROCEDURE [clientData: ClientData] RETURNS [quit: BOOLEAN]
+SystemInterface.ShowReport[IO.PutFR["break with index %g cleared at %g", IO.card[clientBreak.index], IO.card[clientBreak.cardAddress]]];
+PROCEDURE [clientData: ClientData] RETURNS [quit: BOOLEAN]
+
+These two constants come from /jaune/xrhome/DEVELOPMENT/INCLUDE/xr/IncrementalLoad.h
+don't forget that the bottom bit should be ignored, as it is the "external" bit.
+ 
+This procedure should be in LoadStateAccess!!!
+The procedure name is as it would appear in mesa
+
+NOTE: as soon as target worlds get the version 6 nub, then we should always find an appropriate fileEntry.  So, we should change the logic of this code.
+Blindly look for it first, this is for the interm MIPS version, jas.
+End of the interm stuff, jas.
+Important remark: my understanding of LookupMatchingSymEntryByValue is that it ignores moduleEntry.value if previousEntry.symID # 0, hence we progress through successively higher valued entries, all greater or equal to the start of the file.
+we are looking for an entry with a name of the form "_ProcName_Pxx"
+ ÊÜ  •NewlineDelimiter
+–"cedarcode" style™ codešœ™Kšœ
+Ïeœ=™HKšœ$™$K™:K™,K™#K™+K™&K™+K™.K™"K™&—K˜ šÏk	˜	Kšœžœ˜&Kšœžœh˜xKšœžœ¶˜ÒKšœžœ˜$Kšœžœ˜Kšœžœ¿˜ÓKšœ˜Kšžœ˜KšœžœŒ˜¢K˜Kšœžœžœ
+˜0Kšœžœ˜/Kšœžœ‘˜¨Kšœžœ˜"Kšœžœ˜#—K˜ šÏnœžœž˜#Kšžœžœ˜(KšžœFžœZ˜©Kšžœ˜—Kšœž˜K˜ K˜ K˜ K™ ™K˜ Kšœ	žœ	˜K˜ Kšœžœžœ˜,š	œžœžœž	œžœ˜2Kšœ˜Kšœžœ˜Kšœ*˜*Kšœ5˜5Kšœ6˜6Kšœžœ˜KšœÏc˜(šœ˜K™ šœY™YKšœW™W———K˜ Kšœžœžœ˜!Kšœžœžœžœ˜1K˜ Kšœžœžœ˜:šœžœžœ˜(Kšœžœ˜Kšœžœ˜Kšœ	žœ !˜3Kšœ˜Kšœ˜K˜&—K˜ šŸœžœžœžœžœžœžœ˜Pšžœžœž˜Kšœžœžœ˜%Kšžœžœžœžœ˜—K˜—˜ Kšœ#™#—šŸœžœžœ0žœžœžœ˜ˆKšž˜Kšœ%žœ˜*Kšœ˜Kšœ.˜.Kšœžœ˜1K˜ ™Kšžœžœ˜Kšžœžœ˜Kšžœžœ ˜7Kšžœžœ ˜4—K˜ Kšœžœ˜K˜LK˜ K˜cšœ	žœ˜Kšœ˜Kšœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœ˜Kšœ=˜=—K˜ šžœžœž˜Kšœžœ˜šœžœ˜ K˜˜šœ(˜(Kšœ˜Kšœ,˜,Kšœ,˜,Kšœ0˜0Kšœ4˜4Kšœ,˜,Kšœ.˜.šœ˜Kšœ˜™˜———Kšœ˜—Kšœžœ˜šœžœ˜ K˜˜šœ(˜(Kšœ˜Kšœ0˜0Kšœ0˜0Kšœ4˜4Kšœ8˜8Kšœ0˜0Kšœ2˜2Kšœ˜——Kšœ˜—KšžœJ˜QK˜ —Kš	œžœžœ/žœžœ$˜œK˜ K˜'K˜ Kšžœ	˜Kšžœ˜—K˜ šŸœžœžœžœ(˜kKšœJ˜JK˜ Kšžœ˜K˜—K˜ šŸœžœOžœ˜mK˜qKšœžœžœžœžœ7žœ˜všœžœ˜%Kšœ+˜+Kšžœ˜Kšœ˜K˜?Kšœ$˜$K˜,—Kšœ˜K˜ —š
+Ÿœžœžœžœ%žœ˜TKšž˜šžœ˜Kšžœžœ˜Kšœ/žœ…˜¶Kšœ4žœŠ˜ÀKšœ˜—K˜JKšœ$žœ˜(šœ*˜*Kšž	œžœžœ™:Kšž˜Kšœ"žœ˜5šžœ%ž˜+Kšœ‚žœžœ˜—Kšžœžœ˜Kšžœ˜—K˜@Kš
+žœžœžœžœ3žœ˜ŠK˜ šžœžœž™Kšž™Kšœ.™.Kšœžœ,žœžœ!™ˆKšž™—šœž™Kšœžœ2žœ™f—Kšžœ˜—K˜ š
+Ÿœžœžœžœžœ˜JKšž˜šžœ˜Kšžœžœ˜Kšœ/žœ}˜®Kšœ4žœ‚˜¸Kšœ˜—K˜JKšœ$žœ˜(šœ*˜*Kšž	œžœžœ™:Kšž˜Kšœ"žœ˜5šžœž˜Kšœ‚žœžœ˜—Kšžœžœ˜Kšžœ˜—K˜@Kš
+žœžœžœžœ2žœ˜ƒK˜ šžœžœž™Kšž™Kšœ.™.Kšœžœ,žœžœ!™ˆKšž™—šœž™Kšœžœ2žœ™`—Kšžœ˜—K˜ šŸœžœžœžœ˜:Kšž˜Kšžœžœžœ˜K˜Jšœ*˜*Kšž	œžœžœ™:Kšž˜Kšœ$žœ˜7šœ.˜.šœ˜KšœžœWžœp˜èKšžœ˜—šœ˜KšœžœRžœp˜ãKšžœ˜—K˜—Kšœžœ,žœžœ!™ˆKšœ8˜8Kšžœžœ˜Kšžœž˜Kšžœ˜—K˜Kšžœ˜K˜ —š
+Ÿœžœžœžœžœ˜FKšžœ:˜@K˜ —šŸ
+œžœžœžœ˜6Kšž˜Kšžœžœžœ˜K˜Jšœ*˜*Kšž	œžœžœ™:Kšž˜Kšœ$žœ˜7Kšœ0˜0Kšžœžœ˜Kšžœ˜—˜>KšœP˜P—Kšžœ˜—K˜ šŸœžœžœžœ%žœ,žœ˜…Kšž˜Kšžœžœžœ˜Kš	œžœžœ	žœžœ˜0K˜JK˜ošœ#žœ˜AK˜4Kšœ˜Kšœ˜Kšžœ˜K˜K˜
+—KšœXžœ˜o˜aKšœ2žœe˜™Kšœ/žœz˜«Kšœ˜—Kšœ3˜3Kšžœ˜—K™ K˜ šŸœžœ*žœ ˜tšžœžœ˜Kšœh˜hKšœ;žœO˜ŒKšœ˜—K˜¥Kšœžœ˜1K˜pKšœžœžœ˜-˜/Kšœ˜Kšœ˜K˜Kšžœ˜Kšžœ˜—Kš	œžœžœžœžœ,˜WKšœ1žœ˜JKšžœC˜IKšžœ˜K˜ —šŸ!œžœ*žœ ˜xšžœžœ˜Kšœd˜dKšœ;žœO˜ŒKšœ˜—K˜¥Kšœžœ˜1K˜kKšœžœžœ˜,˜/Kšœ˜Kšœ˜K˜Kšžœ˜Kšžœ˜—Kšœžœžœžœžœžœ+˜aKšœ.žœ˜GKšžœ@˜FKšžœ˜K˜ —šŸœžœR˜ušžœžœ˜Kšœh˜hKšœ;žœO˜ŒKšœ˜—K˜pK˜pKšœžœ˜1K˜pKšœžœžœ˜-˜/Kšœ˜Kšœ˜K˜Kšžœ˜Kšžœ˜—K˜mKšœžœžœžœžœžœ˜FKšœ:˜:Kšžœ˜K˜ —KšŸ!œžœR˜yšžœžœ˜Kšœd˜dKšœ;žœO˜ŒKšœ˜—K˜pK˜pKšœžœ˜1K˜kKšœžœžœ˜,˜/Kšœ˜Kšœ˜K˜Kšžœ˜Kšžœ˜—K˜hKšœžœžœžœžœžœ˜EKšœ:˜:Kšžœ˜K˜ šŸœžœ?žœžœ#˜”Kšžœžœ<žœO˜™K˜pKšœžœ˜1Kšœ^žœžœ˜oK˜ Kšžœžœžœ!žœžœ/žœ˜ŒKšžœ˜K˜ —šŸ#œžœ?žœžœ#˜˜Kšžœžœ<žœO˜™K˜pKšœžœ˜1Kšœ^žœžœ˜oK˜ Kšžœžœžœ!žœžœ/žœ˜ŒKšžœ˜—K˜ šŸœžœYžœ#˜¨Kšžœžœ<žœO˜™K˜pKšœžœ˜1K˜pKšœUžœ˜pK˜$Kšœžœ˜Kšœ"˜"Kšœžœ˜K˜ Kšžœžœžœ!˜7K˜IKšžœžœžœ!˜8K˜HKšœDžœžœ˜UKš
+žœžœžœžœ/žœ˜lK˜VKšžœ/žœ˜LKšžœ˜K˜ —šŸ#œžœYžœ#˜¬Kšžœžœ<žœO˜™K˜pKšœžœ˜1K˜kKšœUžœ˜oK˜$Kšœžœ˜Kšœ"˜"Kšœžœ˜K˜ Kšžœžœžœ!˜7K˜IKšžœžœžœ!˜8K˜HKšœDžœžœ˜UKš
+žœžœžœžœ/žœ˜lK˜VKšžœ/žœ˜LKšžœ˜K˜ —šŸœžœ*žœ*˜~šžœ˜Kšœh˜hKšœ;žœO˜ŒKšœAžœD˜‡Kšœ˜—K˜pK˜pKšœžœ˜1K˜pKšœžœžœ˜-K˜eKšœ/žœ˜3Kšœ5žœ˜=Kšœ˜šŸ
+œžœžœ˜/Kšœžœžœ˜K˜Kšœžœžœžœ˜&K˜6Kšœ	žœ	˜Kšœžœ˜Kšœ
+žœ
+˜šžœžœž˜Kšœžœ	žœžœžœHžœ^˜ÅKš	œžœžœ	žœžœ˜,šžœ˜Kšžœžœžœ%˜7Kšžœ	žœžœ6˜Išžœžœž˜šœžœ)˜@Kšœžœ0žœ˜[K˜+Kšžœ˜—šœžœ9˜PKšœžœ0žœ˜\K˜,Kšžœ˜—Kšœ	žœžœžœžœžœžœ	˜<Kšžœžœ˜———K˜—K˜ šžœžœžœ˜K˜cšžœžœ˜Kšœžœ0žœ˜cK˜3Kšžœ˜——K˜ Kšœžœ#˜,šžœž˜Kšœžœ˜˜
+K˜Kšžœžœžœ˜.K˜—Kšœžœ˜Kšžœžœ˜—K˜ šžœžœžœ˜Kšœžœ˜#Kšœžœžœ˜Kšœ$˜$šžœžœž˜šžœžœ˜K˜K˜8šžœžœž˜Kšœžœ˜šœ2˜2Kšœžœ0žœ˜cK˜3Kšžœ˜—Kšžœ˜—K˜—šžœžœ˜K˜K˜8šžœžœž˜Kšœ žœ˜&Kšœžœ˜šœF˜FKšœžœ0žœ˜cK˜3Kšžœ˜—Kšžœžœ˜—K˜—Kšžœ˜—˜K˜ ——KšœžœX˜vKšœ˜—K˜ šŸ!œžœ*žœ*˜‚šžœ˜Kšœd˜dKšœ;žœO˜ŒKšœAžœD˜‡Kšœ˜—K˜pK˜pKšœžœ˜1K˜kKšœžœžœ˜,K˜eKšœ/žœ˜3Kšœ5žœ˜=Kšœ˜šŸ
+œžœžœ˜/Kšœžœžœ˜K˜Kšœžœžœžœ˜&K˜6Kšœ	žœ	˜Kšœžœ˜Kšœ
+žœ
+˜šžœžœž˜Kšœžœ	žœžœžœHžœ^˜ÅKš	œžœžœ	žœžœ˜,šžœ˜Kšžœžœžœ%˜7Kšžœ	žœžœ6˜Išžœžœž˜šœžœ)˜@Kšœžœ0žœ˜[K˜+Kšžœ˜—šœžœ9˜PKšœžœ0žœ˜\K˜,Kšžœ˜—Kšœ	žœžœžœžœžœžœ	˜<Kšžœžœ˜———K˜—K˜ šžœžœžœ˜K˜cšžœžœ˜Kšœžœ0žœ˜cK˜3Kšžœ˜——K˜ Kšœžœ#˜,šžœž˜Kšœžœ˜˜
+K˜Kšžœžœžœ˜.K˜—Kšœžœ˜Kšžœžœ˜—K˜ šžœžœžœ˜Kšœžœ˜#Kšœžœžœ˜Kšœ$˜$šžœžœž˜šžœžœ˜K˜K˜8šžœžœž˜Kšœžœ˜šœ2˜2Kšœžœ0žœ˜cK˜3Kšžœ˜—Kšžœ˜—K˜—šžœžœ˜K˜K˜8šžœžœž˜Kšœ žœ˜&Kšœžœ˜šœF˜FKšœžœ0žœ˜cK˜3Kšžœ˜—Kšžœžœ˜—K˜—Kšžœ˜—˜K˜ ——KšœžœX˜vKšœ˜—K˜ š
+Ÿ
+œžœžœžœžœ˜0šžœžœž˜Kšœžœžœ˜Kšœžœ˜Kšœžœ˜Kšžœžœ˜——K˜ šŸœžœ˜/Kšœ˜Kšœžœ˜8Kšœ	žœ˜Kšœžœžœ˜šž˜˜Kšœ{žœžœ˜£Kšœ˜žœ8 œ˜ò—Kšžœžœžœ#˜3Kšž˜Kšœžœ*˜9Kšœ˜Kšœ
+žœ˜!Kšœžœ˜Kšžœ˜—Kšžœžœžœ-˜VKšžœ˜Kšœžœ 'œ˜?K˜ —šŸœžœžœžœžœžœžœ ˜LKšœžœ˜—K˜ šŸœžœžœžœžœ œ˜_Kšœžœ˜Kšœžœ˜Kšžœ)˜/—K˜ šŸœžœ0ž	œžœ˜nšžœžœ˜Kšœh˜hKšœ;žœO˜ŒKšœAžœD˜‡Kšœ˜—K˜pK˜pKšœžœ˜1K˜pKšœžœžœ˜-˜/Kšœ˜Kšœ˜K˜Kšžœ˜Kšžœ˜—Kšœ2˜2Kšžœ˜K˜ —K˜ šŸ"œžœ0ž	œžœ˜ršžœžœ˜Kšœd˜dKšœ;žœO˜ŒKšœAžœD˜‡Kšœ˜—K˜pK˜pKšœžœ˜1K˜kKšœžœžœ˜,˜/Kšœ˜Kšœ˜K˜Kšžœ˜Kšžœ˜—Kšœ2˜2K˜ Kšžœ˜K˜ —K˜ KšŸ
+œžœ˜-šŸœžœ˜)K™TK™PK™K™.K™0K™ K™˜—šŸœžœ0žœžœžœžœžœ˜~Kšž˜Kšœžœ˜1Kšœžœ.˜CKšœžœ!˜6Kšœžœ˜/K˜fKšœ$˜$Kšœžœ˜Kšœ"˜"Kšœžœ˜K˜ šžœžœž˜Kšž˜K˜5K˜ K™DKšœžœ#˜6Kšœ_žœ˜všžœ	žœžœ˜Kšžœ!˜'—K™K˜ šž˜˜Kšœñ™ñ—Kš	žœžœžœžœ ˜AKšžœ9žœžœ ˜išžœHžœ˜PK˜EKšžœžœžœžœ˜&K˜JKšœ=žœžœ˜NKšžœžœžœžœ'˜DK˜OKšžœ˜$K˜K™C—K˜Kšžœ˜—Kšž˜—šœžœ N˜TKšž˜Kšœžœ#˜6Kšžœžœ&žœžœ˜=šœž˜Kšž˜Kšœ_žœ˜vKš	žœ	žœžœžœ ˜1K˜?Kšžœžœžœžœ˜&K˜BKšœ=žœžœ˜NKšžœžœžœžœ#˜@K˜OKšžœ˜ Kšžœ˜—Kšžœ˜—K˜ Kšžœ˜—K˜ K˜ —Kšžœ˜— …—    „j  ¬*  

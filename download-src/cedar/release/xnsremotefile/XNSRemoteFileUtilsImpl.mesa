@@ -1,0 +1,1208 @@
+
+DIRECTORY
+AuthenticationP14V2 USING [CallProblem, Problem, Verifier],
+Basics USING [LongNumber, Word16],
+BasicTime USING [FromNSTime, GetClockPulses, OutOfRange, PulsesToMicroseconds, ToNSTime],
+CrRPC USING [CreateClientHandle, DestroyClientHandle, Error, ErrorReason, GetCard16, GetCard32, Handle],
+FilingAttributesP10V5,
+FilingP10V5,
+IO,
+PFS USING [Error, ErrorGroup, FileType, RopeFromPath, tDirectory, tUnspecified, UniqueID],
+PFSBackdoor USING [ErrorCode, ProduceError],
+PFSClass USING [FSHandle],
+PFSNames USING [Component, ComponentCount, ComponentRope, Directory, Fetch, PATH, ShortName, Version, VersionToRope],
+QuickFilingP10V5 USING [QuickGetAttributes],
+RefText,
+Rope,
+XNSAuth USING [AuthenticationError, CallError, Conversation, GetNextVerifier, Refresh],
+XNSRemoteFilePrivate,
+XNSRemoteFileTypes,
+XNSStream USING [ConnectionClosed, Timeout];
+
+
+XNSRemoteFileUtilsImpl: CEDAR MONITOR
+IMPORTS BasicTime, CrRPC, FilingP10V5, IO, PFS, PFSBackdoor, PFSNames, RefText, Rope, QuickFilingP10V5, XNSAuth, XNSStream
+EXPORTS XNSRemoteFilePrivate 
+~ BEGIN OPEN XNSRemoteFileTypes;
+
+PATH: TYPE = PFSNames.PATH;
+FSHandle: TYPE = PFSClass.FSHandle;
+
+FileType: TYPE ~ PFS.FileType;
+Version: TYPE = PFSNames.Version;
+OpaqueByteObject: TYPE ~ MACHINE DEPENDENT RECORD [
+length: CARDINAL,
+body: PACKED ARRAY [0..1000) OF CHAR
+];
+
+
+startE, endE: CARD;
+
+InfoFromOpenFile: PUBLIC PROC [data: ServerData, crH: CrRPC.Handle, fileH: FilingP10V5.Handle, op: Op] RETURNS [version: Version, bytes: INT, created: GMT, fileType: FileType,
+pathName: REF TEXT, fID: FileID, isDir: BOOL, withKids: BOOL] = {
+types: AttributeTypeSequence ~ GetCedarAttributes[op];
+numKids: CARD ¬ 0;
+plainFileType: CARD;
+data.session.verifier ¬ XNSAuth.GetNextVerifier[data.conversation];
+startE ¬ BasicTime.GetClockPulses[];
+version.versionKind ¬ numeric;
+[version.version, bytes, created, plainFileType, pathName, fID, isDir, numKids] ¬ QuickFilingP10V5.QuickGetAttributes[h: crH, file: fileH, types: types, session: data.session­]; -- initializes the variables before the process
+fileType ¬ [plainFileType];
+endE ¬ BasicTime.GetClockPulses[];
+withKids ¬ isDir AND (numKids # 0);
+infoTime ¬ BasicTime.PulsesToMicroseconds[endE] - BasicTime.PulsesToMicroseconds[startE];
+};
+
+infoTime: CARD;
+
+GetConnection: PUBLIC PROC [data: ServerData, h: FSHandle] RETURNS [crH: CrRPC.Handle] = {
+crH ¬ CrRPC.CreateClientHandle[$CMUX, data.address ! CrRPC.Error => CONTINUE];
+IF crH = NIL THEN ReportXNSError[resourceLimitExceeded, h, NIL, nullGMT]; -- ???
+IF NOT Revive[data, crH] THEN {
+IF crH # NIL THEN CrRPC.DestroyClientHandle[crH];
+ReportXNSError[resourceLimitExceeded, h, NIL, nullGMT]; -- ???
+};
+data.active ¬ TRUE;
+};
+
+
+ReturnConnection: PUBLIC PROC [crH: CrRPC.Handle] = {
+IF crH # NIL THEN CrRPC.DestroyClientHandle[crH ! CrRPC.Error => CONTINUE];
+};
+
+minStart: CARD ¬ 10; -- seconds to allow credentials to get down to
+
+Revive: PUBLIC ENTRY PROC [data: ServerData, crH: CrRPC.Handle ¬ NIL]
+RETURNS [ok: BOOL ¬ FALSE] ~ {
+ENABLE UNWIND => NULL;
+IF data.connectionTTL < minStart THEN RETURN[ReviveInternal[data, crH]];
+data.session.verifier ¬ XNSAuth.GetNextVerifier[data.conversation];
+data.connectionTTL ¬ data.continuance;
+RETURN[TRUE];
+};
+
+ReviveInternal: INTERNAL PROC [data: ServerData, crH: CrRPC.Handle ¬ NIL]
+RETURNS [ok: BOOL ¬ FALSE] ~ {
+supplied: BOOL ~ crH # NIL;
+{ -- for supplied
+ENABLE {
+UNWIND => {IF NOT supplied AND crH # NIL THEN CrRPC.DestroyClientHandle[crH]};
+CrRPC.Error => GOTO Out;
+FilingP10V5.AuthenticationError, FilingP10V5.SessionError, FilingP10V5.ServiceError => GOTO Out;
+XNSAuth.AuthenticationError, XNSAuth.CallError => GOTO Out;
+};
+IF NOT supplied THEN crH ¬ CrRPC.CreateClientHandle[$CMUX, data.address];
+data.session.verifier ¬ XNSAuth.GetNextVerifier[data.conversation];
+data.connectionTTL ¬ data.continuance ¬ FilingP10V5.Continue[crH, data.session­];
+XNSAuth.Refresh[conversation: data.conversation, seconds: data.connectionTTL];
+IF NOT supplied THEN CrRPC.DestroyClientHandle[crH];
+RETURN[TRUE];
+EXITS Out => {
+IF NOT supplied AND crH # NIL THEN CrRPC.DestroyClientHandle[crH];
+data.connectionTTL ¬ 0;
+RETURN[FALSE];
+};
+};
+};
+
+CallProtected: PUBLIC PROC[proc: PROC, h: FSHandle, filePath: PATH, uid: PFS.UniqueID] ~ {
+time: GMT ~ uid.egmt.gmt;
+file: ROPE ~ PFS.RopeFromPath[filePath];
+gName: ROPE ~ Rope.Cat["[", h.name, "]", file];
+quotedGName: ROPE ~ Rope.Cat["\"", gName, "\""];
+{ -- for ENABLE
+ENABLE {
+XNSStream.ConnectionClosed => PFSBackdoor.ProduceError[resourceLimitExceeded, IO.PutFR1["Server for %g closed the connection.", [rope[quotedGName]]]]; --???
+
+CrRPC.Error => MakeCrRPCError[errorReason, text];
+IO.EndOfStream => ERROR PFS.Error[[environment, $unexpectedClose,
+IO.PutFR1["Server for %g closed the connection.", [rope[quotedGName]]]]];
+IO.Error => ERROR PFS.Error[[bug, $unexpectedError,
+IO.PutFR1["File: %g unexpected IO.Error.", [rope[quotedGName]]]]];
+
+FilingP10V5.AccessError => {
+SELECT problem FROM
+accessRightsInsufficient, accessRightsIndeterminate => 
+PFSBackdoor.ProduceError[accessDenied, IO.PutFR1["Can't access %g", [rope[file]]]];
+fileChanged, fileDamaged => 
+PFSBackdoor.ProduceError[inconsistent, IO.PutFR1["%g is damaged", [rope[file]]]];
+fileInUse, fileOpen => 
+PFSBackdoor.ProduceError[accessDenied, IO.PutFR1["%g is in use", [rope[file]]]];
+fileNotFound => UnknownFile[gName, time];
+ENDCASE => ERROR;
+};
+FilingP10V5.AttributeTypeError => ERROR PFS.Error[[bug, $illegalAttributeType,
+IO.PutFR["%g attribute (%g)", [rope[argumentErrorRopes[problem]]], [cardinal[type]]]]];
+FilingP10V5.AttributeValueError => ERROR PFS.Error[[bug, $illegalAttributeValue,
+IO.PutFR["%g attribute value (%g)", [rope[argumentErrorRopes[problem]]], [cardinal[type]]]]];
+FilingP10V5.ControlTypeError => ERROR PFS.Error[[bug, $illegalControlType,
+IO.PutFR["%g control type (%g)", [rope[argumentErrorRopes[problem]]], [rope[controlErrorRopes[type]]]]]];
+FilingP10V5.ControlValueError => ERROR PFS.Error[[bug, $illegalControlValue,
+IO.PutFR["%g control value (%g)", [rope[argumentErrorRopes[problem]]], [rope[controlErrorRopes[type]]]]]];
+FilingP10V5.ScopeTypeError =>  ERROR PFS.Error[[bug, $illegalScope,
+IO.PutFR["%g scope (%g)", [rope[argumentErrorRopes[problem]]], [rope[scopeErrorRopes[type]]]]]];
+FilingP10V5.ScopeValueError =>  ERROR PFS.Error[[bug, $illegalScopeValue,
+IO.PutFR["%g scope value (%g)", [rope[argumentErrorRopes[problem]]], [rope[scopeErrorRopes[type]]]]]];
+FilingP10V5.AuthenticationError => MakeAuthError[problem, gName];
+FilingP10V5.ConnectionError => {
+r: ROPE ~ SELECT problem FROM
+noRoute => "noRoute",
+noResponse => "noResponse",
+transmissionHardware => "transmissionHardware",
+transportTimeout => "transportTimeout",
+tooManyLocalConnections => "tooManyLocalConnections",
+tooManyRemoteConnections => "tooManyRemoteConnections",
+missingCourier => "missingCourier",
+missingProgram => "missingProgram",
+missingProcedure => "missingProcedure",
+protocolMismatch => "protocolMismatch",
+parameterInconsistency => "parameterInconsistency",
+invalidMessage => "invalidMessage",
+returnTimedOut => "returnTimedOut",
+otherCallProblem => "otherCallProblem",
+ENDCASE => ERROR;
+ERROR PFS.Error[[client, $connectionTrouble,
+IO.PutFR["Server for %g reported a connection problem: %g", [rope[quotedGName]], [rope[r]]]]];
+};
+FilingP10V5.HandleError => {
+r: ROPE ~ SELECT problem FROM
+invalid => "invalid", nullDisallowed => "nullDisallowed",
+directoryRequired => "directoryRequired", ENDCASE => ERROR;
+ERROR PFS.Error[[client, $fileHandleError,
+IO.PutFR["File handle error for %g: %g", [rope[file]], [rope[r]]]]];
+};
+FilingP10V5.InsertionError => {
+r: ROPE ~ SELECT problem FROM
+positionUnavailable => "positionUnavailable", fileNotUnique => "fileNotUnique",
+loopInHierarchy => "loopInHierarchy", ENDCASE => ERROR;
+ERROR PFS.Error[[client, $insertionError,
+IO.PutFR["Server for %g reported insertion error (%g)", [rope[quotedGName]], [rope[r]]]]];
+};
+FilingP10V5.RangeError =>  ERROR PFS.Error[[client, $rangeError,
+IO.PutFR["%g Range error: (%g)", [rope[quotedGName]], [rope[argumentErrorRopes[problem]]]]]];
+FilingP10V5.ServiceError => ERROR PFS.Error[[client, $serviceProblem,
+IO.PutFR["Server for %g reports a service error: %g", [rope[quotedGName]], [rope[serviceErrorRopes[problem]]]]]];
+FilingP10V5.SessionError => MakeSessionError[problem];
+FilingP10V5.SpaceError => MakeSpaceError[problem];
+FilingP10V5.TransferError =>  ERROR PFS.Error[[client, $transferError,
+IO.PutFR["Server for %g has a transfer problem %g", [rope[quotedGName]], [rope[transferErrorRopes[problem]]]]]];
+FilingP10V5.UndefinedError => ERROR PFS.Error[[bug, $undefinedError,
+IO.PutFR["Server for %g has an undefined error (%g)", [rope[quotedGName]], [cardinal[problem]]]]];
+};
+proc[ ! XNSStream.Timeout => RESUME]; -- since the timeout is retryable
+};
+};
+
+UnknownFile: PUBLIC PROC[name: ROPE, createdTime: GMT] = {
+IF createdTime = nullGMT
+THEN PFSBackdoor.ProduceError[unknownFile, IO.PutFR1["Could not find %g", [rope[name]]] ]
+ELSE 
+PFSBackdoor.ProduceError[unknownUniqueID, IO.PutFR["Could not find \"%g\" created on %t", [rope[name]], [time[createdTime]]]];
+};
+
+ReportXNSError: PUBLIC PROC [code: PFSBackdoor.ErrorCode, h: FSHandle, filePath: PATH,
+time: GMT] ~ {
+file: ROPE ~ PFS.RopeFromPath[filePath];
+gName: ROPE ¬ Rope.Cat["[", h.name, "]", file];
+quotedGName: ROPE ¬ Rope.Cat["\"", gName, "\""];
+OldError: PROC [code: PFSBackdoor.ErrorCode, e1, e2: ROPE, downTime: CARD ¬ 0] ~ {
+PFSBackdoor.ProduceError[code, Rope.Cat[(IF e1 # NIL THEN e1 ELSE "Server for "), quotedGName, e2]];
+};
+NewError: PROC [group: PFS.ErrorGroup, code: ATOM, e1, e2: ROPE, downTime: CARD ¬ 0] ~ {
+ERROR PFS.Error[[group, code, Rope.Cat[(IF e1 # NIL THEN e1 ELSE "Server for "), quotedGName, e2]]];
+};
+SELECT code FROM
+unknownFile => UnknownFile[gName, time]; -- raises PFS.Error
+invalidNameSyntax => OldError[invalidNameSyntax, NIL, " says that the file name is illegal", 0];
+accessDenied => PFSBackdoor.ProduceError[code, "Server timed out the connection or File is busy"];
+ENDCASE => ERROR;
+};
+
+REQUIREDROPE: TYPE ~ ROPE ¬;
+
+accessErrorRopes: REF ARRAY FilingP10V5.AccessProblem OF REQUIREDROPE ~
+NEW[ARRAY FilingP10V5.AccessProblem OF REQUIREDROPE ¬ [ 
+accessRightsInsufficient: "Access Rights Insufficient",
+accessRightsIndeterminate: "Access Rights Indeterminate",
+fileChanged: "File Changed",
+fileDamaged: "File Damaged",
+fileInUse: "File In Use",
+fileNotFound: "File Not Found",
+fileOpen: "File Open"
+]];
+MakeAccessError: PROC [problem: FilingP10V5.AccessProblem, h: FSHandle, file: ROPE,
+time: GMT] = {
+gName: ROPE ¬ Rope.Cat["[", h.name, "]", file];
+SELECT problem FROM
+accessRightsInsufficient, accessRightsIndeterminate => 
+PFSBackdoor.ProduceError[accessDenied, IO.PutFR1["Can't access %g", [rope[file]]]];
+fileChanged, fileDamaged => 
+PFSBackdoor.ProduceError[inconsistent, IO.PutFR1["%g is damaged", [rope[file]]]];
+fileInUse, fileOpen => 
+PFSBackdoor.ProduceError[accessDenied, IO.PutFR1["%g is in use", [rope[file]]]];
+fileNotFound => UnknownFile[gName, time];
+ENDCASE => ERROR;
+};
+
+GetAccessErrorMsg: PUBLIC PROC[problem: FilingP10V5.AccessProblem]
+RETURNS[msg: ROPE] =
+{ RETURN[accessErrorRopes[problem]] };
+
+argumentErrorRopes: REF ARRAY FilingP10V5.ArgumentProblem OF REQUIREDROPE ~
+NEW[ARRAY FilingP10V5.ArgumentProblem OF REQUIREDROPE ¬ [
+illegal: "Illegal",
+disallowed: "Disallowed",
+unreasonable: "Unreasonable",
+unimplemented: "Unimplemented",
+duplicated: "Duplicated",
+missing: "Missing"
+]];
+
+authErrorRopes: REF ARRAY AuthenticationP14V2.Problem OF REQUIREDROPE ~
+NEW[ARRAY AuthenticationP14V2.Problem OF REQUIREDROPE ¬ [
+credentialsInvalid: "Credentials Invalid",
+verifierInvalid: "Verifier Invalid",
+verifierExpired: "Verifier Expired",
+verifierReused: "Verifier Reused",
+credentialsExpired: "Credentials Expired",
+inappropriateCredentials: "Inappropriate Credentials"
+]];
+MakeAuthError: PROC [problem: AuthenticationP14V2.Problem, file: ROPE] = {
+r: ROPE ~ authErrorRopes[problem];
+PFSBackdoor.ProduceError[accessDenied, IO.PutFR["%g for %g", [rope[r]], [rope[file]]]];
+};
+
+GetAuthErrorMsg: PUBLIC PROC[problem: AuthenticationP14V2.Problem]
+RETURNS[msg: ROPE] =
+{ RETURN[authErrorRopes[problem]] };
+
+controlErrorRopes: REF ARRAY FilingP10V5.ControlType OF REQUIREDROPE ~
+NEW[ARRAY FilingP10V5.ControlType OF REQUIREDROPE ¬ [
+lock: "lock", timeout: "timeout", access: "access"
+]];
+
+scopeErrorRopes: REF ARRAY FilingP10V5.ScopeType OF REQUIREDROPE ~
+NEW[ARRAY FilingP10V5.ScopeType OF REQUIREDROPE ¬ [
+count: "count", direction: "direction", filter: "filter", depth: "depth"
+]];
+
+serviceErrorRopes: REF ARRAY FilingP10V5.ServiceProblem OF REQUIREDROPE ~
+NEW[ARRAY FilingP10V5.ServiceProblem OF REQUIREDROPE ¬ [
+cannotAuthenticate: "Cannot Authenticate",
+serviceFull: "Service Full",
+serviceUnavailable: "Service Unavailable",
+sessionInUse: "Session In Use",
+serviceUnknown: "Service Unknown"
+]];
+
+GetServiceErrorMsg: PUBLIC PROC[problem: FilingP10V5.ServiceProblem]
+RETURNS[msg: ROPE] =
+{ RETURN[serviceErrorRopes[problem]] };
+
+
+transferErrorRopes: REF ARRAY FilingP10V5.TransferProblem OF REQUIREDROPE ~
+NEW[ARRAY FilingP10V5.TransferProblem OF REQUIREDROPE ¬ [
+aborted: "aborted", checksumIncorrect: "checksumIncorrect",
+formatIncorrect: "formatIncorrect", noRendevous: "noRendevous",
+wrongDirection: "wrongDirection" 
+]];
+
+crRPCErrorRopes: REF ARRAY CrRPC.ErrorReason OF REQUIREDROPE ~
+NEW[ARRAY CrRPC.ErrorReason OF REQUIREDROPE ¬ [
+unknown: "Unknown",
+unknownClass: "unknownClass",
+courierVersionMismatch: "courierVersionMismatch",
+rejectedNoSuchProgram: "rejectedNoSuchProgram",
+rejectedNoSuchVersion: "rejectedNoSuchVersion",
+rejectedNoSuchProcedure: "rejectedNoSuchProcedure",
+rejectedInvalidArgument: "rejectedInvalidArgument",
+rejectedUnspecified: "rejectedUnspecified",
+remoteError: "remoteError",
+cantConnectToRemote: "Can't Connect To Remote",
+argsError: "Args Error",
+resultsError: "Results Error",
+bulkDataError: "Bulk DataError",
+protocolError: "Protocol Error",
+remoteClose: "Remote Close",
+communicationFailure: "Communication Failure",
+notImplemented: "notImplemented",
+unknownOperation: "unknownOperation",
+notServerHandle: "notServerHandle",
+notClientHandle: "notClientHandle",
+addressInappropriateForClass: "addressInappropriateForClass",
+other: "Other"
+]];
+MakeCrRPCError: PROC [errorReason: CrRPC.ErrorReason, text: ROPE] = {
+ERROR PFS.Error[[$environment, $CrRPCError, GetCrRPCErrorMsg[errorReason, text]]];
+};
+
+GetCrRPCErrorMsg: PUBLIC PROC[errorReason: CrRPC.ErrorReason, text: ROPE]
+RETURNS[msg: ROPE] = {
+RETURN[IO.PutFR["CrRPC Error: %g, %g", [rope[crRPCErrorRopes[errorReason]]], [rope[text]] ]];
+};
+
+sessionErrorRopes: REF ARRAY FilingP10V5.SessionProblem OF REQUIREDROPE ~
+NEW[ARRAY FilingP10V5.SessionProblem OF REQUIREDROPE ¬ [
+tokenInvalid: "tokenInvalid",
+serviceAlreadySet: "serviceAlreadySet"
+]];
+MakeSessionError: PROC [problem: FilingP10V5.SessionProblem] = {
+ERROR PFS.Error[[client, $IllegalSession, sessionErrorRopes[problem]]];
+};
+
+GetSessionErrorMsg: PUBLIC PROC[problem: FilingP10V5.SessionProblem]
+RETURNS[msg: ROPE] =
+{ RETURN[sessionErrorRopes[problem]] };
+
+authCallErrorRopes: REF ARRAY AuthenticationP14V2.CallProblem OF REQUIREDROPE ~
+NEW[ARRAY AuthenticationP14V2.CallProblem OF REQUIREDROPE ¬ [
+tooBusy: "Too Busy",
+accessRightsInsufficient: "Access Rights Insufficient",
+keysUnavailable: "Keys Unavailable",
+strongKeyDoesNotExist: "Strong Key Does Not Exist",
+simpleKeyDoesNotExist: "Simple Key Does Not Exist",
+strongKeyAlreadyRegistered: "Strong Key Already Registered",
+simpleKeyAlreadyRegistered: "Simple Key Already Registered",
+domainForNewKeyUnavailable: "Domain For New Key Unavailable",
+domainForNewKeyUnknown: "Domain For New Key Unknown",
+badKey: "Bad Key",
+badName: "Bad Name",
+databaseFull: "Database Full",
+other: "Other"
+]];
+
+GetAuthCallErrorMsg: PUBLIC PROC[problem: AuthenticationP14V2.CallProblem]
+RETURNS[msg: ROPE] =
+{ RETURN[authCallErrorRopes[problem]] };
+
+MakeSpaceError: PROC [problem: FilingP10V5.SpaceProblem] = {
+SELECT problem FROM
+allocationExceeded =>PFSBackdoor.ProduceError[quotaExceeded, "No more room for store"];
+attributeAreaFull => PFSBackdoor.ProduceError[outOfPropertySpace, "Out of attribute space"];
+mediumFull => PFSBackdoor.ProduceError[volumeFull, "Remote volume is full"];
+ENDCASE => ERROR;
+};
+BuildScopeFilter: PUBLIC PROC [filterType: FilingP10V5.FilterType, rope: ROPE, type: CARD32]
+RETURNS [scope: ScopeSequence] = {
+value: AttributeValue ¬ EncapsulateRope[rope];
+filter: Filter;
+scope ¬ NEW[ScopeSequenceObject[4]];
+scope[0] ¬ NEW[ScopeObject.count ¬ [count[FilingP10V5.unlimitedCount]]];
+scope[1] ¬ NEW[ScopeObject.depth ¬ [depth[FilingP10V5.allDescendants]]];
+scope[2] ¬ NEW[ScopeObject.direction ¬ [direction[forward]]];
+SELECT filterType FROM
+matches => filter ¬ NEW [FilterObject.matches ¬ [matches[matches: [
+attribute: [type: type, value: value] ]] ]];
+equal => filter ¬ NEW [FilterObject.equal ¬ [equal[equal: [
+attribute: [type: type, value: value],
+interpretation: string ]] ]];
+ENDCASE => filter ¬ NEW [FilterObject.none ¬ [none[none: [null: 0]]]];
+scope[3] ¬ NEW [ScopeObject.filter ¬ [filter[filter: filter]]];
+};
+
+BuildScopeDepthAndFilter: PUBLIC PROC [depth: CARD32, filterType: FilingP10V5.FilterType, rope: ROPE, type: CARD32]
+RETURNS [scope: ScopeSequence] = {
+value: AttributeValue ¬ EncapsulateRope[rope];
+filter: Filter;
+scope ¬ NEW[ScopeSequenceObject[4]];
+scope[0] ¬ NEW[ScopeObject.count ¬ [count[FilingP10V5.unlimitedCount]]];
+scope[1] ¬ NEW[ScopeObject.depth ¬ [depth[depth]]];
+scope[2] ¬ NEW[ScopeObject.direction ¬ [direction[forward]]];
+SELECT filterType FROM
+matches => filter ¬ NEW [FilterObject.matches ¬ [matches[matches: [
+attribute: [type: type, value: value] ]] ]];
+equal => filter ¬ NEW [FilterObject.equal ¬ [equal[equal: [
+attribute: [type: type, value: value],
+interpretation: string ]] ]];
+ENDCASE => filter ¬ NEW [FilterObject.none ¬ [none[none: [null: 0]]]];
+scope[3] ¬ NEW [ScopeObject.filter ¬ [filter[filter: filter]]];
+};
+
+BuildScopeDepth: PUBLIC PROC [depth: CARD32] RETURNS [scope: ScopeSequence] = {
+scope ¬ NEW[ScopeSequenceObject[3]];
+scope[0] ¬ NEW[ScopeObject.count ¬ [count[FilingP10V5.unlimitedCount]]];
+scope[1] ¬ NEW[ScopeObject.depth ¬ [depth[depth]]];
+scope[2] ¬ NEW[ScopeObject.direction ¬ [direction[forward]]];
+};
+
+BuildAttribute: PUBLIC PROC [name: ROPE, type: CARD32,
+time: GMT ¬ nullGMT, timeType: CARD32 ¬ 0]
+RETURNS [attributes: AttributeSequence] = {
+IF time = nullGMT THEN {
+attributes ¬ NEW [AttributeSequenceObject[1]];
+attributes[0] ¬ [type: type, value: EncapsulateRope[name]];
+RETURN[attributes];
+};
+attributes ¬ NEW [AttributeSequenceObject[2]];
+attributes[0] ¬ [type: timeType, value: EncapsulateCard32[BasicTime.ToNSTime[time]]];
+attributes[1] ¬ [type: type, value: EncapsulateRope[name]];
+RETURN[attributes];
+};
+
+BuildDirectoryAttribute: PUBLIC PROC [nameR: ROPE]
+RETURNS [attributes: AttributeSequence] = {
+attributes ¬ NEW [AttributeSequenceObject[3]];
+attributes[0] ¬ [type: isDirectory, value: EncapsulateBoolean[TRUE]];
+attributes[1] ¬ [type: name, value: EncapsulateRope[nameR]];
+attributes[2] ¬ [type: type, value: EncapsulateCard32[1 -- tDirectory --]];
+RETURN[attributes];
+};
+
+BuildStoreAttributes: PUBLIC PROC [file: ROPE, vers: CARDINAL, created: GMT]RETURNS [attributes: AttributeSequence] ~ {
+num: CARDINAL ¬ IF created = nullGMT THEN 2 ELSE 3;
+attributes ¬ NEW [AttributeSequenceObject[num]];
+attributes[0] ¬ [type: name, value: EncapsulateRope[file]];
+attributes[1] ¬ [type: version, value: EncapsulateCard16[vers]];
+IF created # nullGMT THEN {
+time: CARD32 ¬ BasicTime.ToNSTime[created];
+attributes[2] ¬ [type: createdOn, value: EncapsulateCard32[time]];
+};
+};
+
+GetCedarAttributes: PUBLIC PROC [op: Op] RETURNS [attributes: AttributeTypeSequence] = {
+RETURN[SELECT op FROM
+delete => deleteAttributes,
+enumerate => enumerateAttributes,
+enumerateNames => enumerateNamesAttributes,
+rename => enumerateAttributes,
+retrieve => retrieveAttributes,
+store => storeAttributes,
+ENDCASE => ERROR];
+};
+
+deleteAttributes: AttributeTypeSequence;
+enumerateAttributes: AttributeTypeSequence;
+enumerateNamesAttributes: AttributeTypeSequence;
+retrieveAttributes: AttributeTypeSequence;
+storeAttributes: AttributeTypeSequence;
+MakeCedarAttributes: PROC [] = {
+deleteAttributes ¬ NEW[AttributeTypeSequenceObject[6]];
+deleteAttributes[0] ¬ createdOn; 
+deleteAttributes[1] ¬ fileID;
+deleteAttributes[2] ¬ isDirectory;
+deleteAttributes[3] ¬ numberOfChildren;
+deleteAttributes[4] ¬ version;
+deleteAttributes[5] ¬ pathname;
+
+enumerateAttributes ¬ NEW[AttributeTypeSequenceObject[8]];
+enumerateAttributes[0] ¬ createdOn; 
+enumerateAttributes[1] ¬ dataSize;
+enumerateAttributes[2] ¬ name;
+enumerateAttributes[3] ¬ pathname;
+enumerateAttributes[4] ¬ type;
+enumerateAttributes[5] ¬ isDirectory;
+enumerateAttributes[6] ¬ version;
+enumerateAttributes[7] ¬ fileID;
+
+enumerateNamesAttributes ¬ NEW[AttributeTypeSequenceObject[2]];
+enumerateNamesAttributes[0] ¬ pathname;
+enumerateNamesAttributes[1] ¬ isDirectory;
+
+retrieveAttributes ¬ NEW[AttributeTypeSequenceObject[5]];
+retrieveAttributes[0] ¬ createdOn;
+retrieveAttributes[1] ¬ dataSize;
+retrieveAttributes[2] ¬ version;
+retrieveAttributes[3] ¬ pathname;
+retrieveAttributes[4] ¬ fileID;
+
+storeAttributes ¬ NEW[AttributeTypeSequenceObject[1]];
+storeAttributes[0] ¬ version;
+};
+
+GetAttributeSequence: PROC [in: STREAM] RETURNS [attributeSequence: AttributeSequence] ~ {
+GetAttribute: PROC [in: STREAM] RETURNS [attribute: Attribute] ~ {
+GetAttributeValue: PROC [in: STREAM]  RETURNS [attributeValue: AttributeValue] ~ {
+len: CARDINAL ~ CrRPC.GetCard16[in];
+attributeValue ¬ NEW [AttributeValueObject[len]];
+FOR j: CARDINAL IN [0..len) DO
+attributeValue.body[j] ¬ CrRPC.GetCard16[in];
+ENDLOOP;
+};
+attribute.type ¬ CrRPC.GetCard32[in];
+attribute.value ¬  GetAttributeValue[in];
+}; -- GetAttribute
+length: CARDINAL ~ CrRPC.GetCard16[in];
+attributeSequence ¬ NEW [AttributeSequenceObject[length]];
+FOR i: CARDINAL IN [0..length) DO
+attributeSequence.body[i] ¬ GetAttribute[in];
+ENDLOOP;
+};
+
+ConvertFSNameToXNS: PUBLIC PROC [file: ROPE, op: Op] RETURNS [ROPE] = {
+AddChar: PROC [c: CHAR] = {text[text.length] ¬ c; text.length ¬ text.length + 1};
+name, versionR: ROPE ¬ NIL;
+text: REF TEXT ¬ RefText.ObtainScratch[nChars: 200];
+lastSlash: INT ¬ LAST[INT];
+inDirVersion: BOOL ¬ FALSE;
+text.length ¬ 0;
+
+FOR i: INT IN [0 .. Rope.Length[file]) DO
+c: CHAR ~ Rope.Fetch[base: file, index: i];
+SELECT c FROM
+'< => LOOP; -- throw the < away.
+'> => IF NOT inDirVersion THEN {
+AddChar['/];  -- the XNS server uses / as a file separator
+lastSlash ¬ i;
+};
+'/ => { lastSlash ¬ i; IF inDirVersion THEN inDirVersion ¬ FALSE ELSE AddChar[c] };
+'* => IF NOT inDirVersion THEN { AddChar[c]; AddChar[c] };  -- kludge to handle *
+'! => { -- the version part is next
+IF lastSlash = i-1 THEN {	-- directory version, not file version; get rid of it
+inDirVersion ¬ TRUE;
+LOOP;
+};
+versionR ¬ Rope.Substr[base: file, start: i]; -- the whole version including the !
+EXIT;
+};
+ENDCASE => IF NOT inDirVersion THEN AddChar[c];
+ENDLOOP;
+IF versionR # NIL THEN {
+SELECT Rope.Length[versionR] FROM
+0 => versionR ¬ NIL; -- no version specified
+1 => -- the version rope is just a ! so do the 'default' -- {
+SELECT op FROM
+delete => versionR ¬ "!-"; -- lowest
+enumerate, enumerateNames => versionR ¬ NIL;
+rename, retrieve => versionR ¬ "!+"; -- highest
+store => versionR ¬ "!+"; -- is this right?
+ENDCASE => ERROR; -- can't happen 
+};
+2 => { -- is it H, L or *?
+SELECT Rope.Fetch[versionR, 1] FROM
+'h, 'H => versionR ¬ "!+";
+'l, 'L => versionR ¬ "!-";
+'* => versionR ¬ NIL;
+ENDCASE => NULL;
+};
+ENDCASE => NULL;
+};
+name ¬ Rope.Concat[base: Rope.FromRefText[s: text], rest: versionR];
+RefText.ReleaseScratch[t: text];
+RETURN[name];
+};
+
+ConvertPathToFile: PUBLIC PROC [path: REF TEXT, isDir: BOOL ¬ FALSE] RETURNS [file: ROPE] = {
+state: {name, version} ¬ name;
+AddChar: PROC [t: REF TEXT, c: CHAR] = {t[t.length] ¬ c; t.length ¬ t.length + 1};
+name: REF TEXT ¬ RefText.ObtainScratch[nChars: 200];
+ver: REF TEXT ¬ RefText.ObtainScratch[nChars: 200];
+slashSeen: BOOL ¬ FALSE;
+name.length ¬ 0;
+ver.length ¬ 0;
+AddChar[name, '/]; -- since the path doesn't have this (pfs syntax)
+FOR i: INT IN [0 .. RefText.Length[path]) DO
+c: CHAR ~ RefText.Fetch[path, i];
+SELECT c FROM
+'! => {
+ver.length ¬ 0;  -- discard the version information since it is still a subdir
+state ¬ version;
+};
+'/ => {
+slashSeen ¬ TRUE;
+ver.length ¬ 0;  -- discard the version information since it is still a subdir
+state ¬ name; -- go back to collection characters
+AddChar[name, '/]; -- insert PFS's notion of what a delineator is
+};
+'> => -- an illegal character -- {
+RefText.ReleaseScratch[t: name];
+RefText.ReleaseScratch[t: ver];
+RETURN [NIL];
+};
+ENDCASE => {
+SELECT state FROM
+name => AddChar[name, c];
+version => AddChar[ver, c];
+ENDCASE => ERROR;
+};
+ENDLOOP;
+IF state = version THEN { -- this is the version from the item last on the path
+IF (NOT slashSeen) OR isDir THEN AddChar[name, '/];
+AddChar[name, '!]; -- indicate the version
+name ¬ RefText.Append[to: name, from: ver]; -- and glue it on
+};
+file ¬ Rope.FromRefText[s: name];
+RefText.ReleaseScratch[t: name];
+RefText.ReleaseScratch[t: ver];
+};
+
+
+
+InfoFromAttributeStream: PUBLIC PROC[in: STREAM]
+RETURNS [vers: Version, bytes: INT, created: GMT, fileType: FileType,
+pathName: REF TEXT, fID: FileID, isDir: BOOL, numKids: CARD] ~ {
+GetAttribute: PROC [in: STREAM] RETURNS [attribute: Attribute] ~ {
+GetAttributeValue: PROC [in: STREAM]  RETURNS [attributeValue: AttributeValue] ~ {
+len: CARDINAL ~ CrRPC.GetCard16[in];
+attributeValue ¬ NEW [AttributeValueObject[len]];
+FOR j: CARDINAL IN [0..len) DO
+attributeValue.body[j] ¬ CrRPC.GetCard16[in];
+ENDLOOP;
+};
+attribute.type ¬ CrRPC.GetCard32[in];
+attribute.value ¬  GetAttributeValue[in];
+}; -- GetAttribute
+
+length: CARDINAL ~ CrRPC.GetCard16[in];
+FOR i: CARDINAL IN [0..length) DO
+Get32: PROC RETURNS [num: CARD32] = INLINE {
+temp: Basics.LongNumber;
+len: CARDINAL ~ CrRPC.GetCard16[in];
+IF len # 2 THEN ERROR;
+temp.hi ¬ CrRPC.GetCard16[in];
+temp.lo ¬ CrRPC.GetCard16[in];
+num ¬ temp.lc;
+};
+attribute: Attribute;
+attribute.type ¬ CrRPC.GetCard32[in];
+SELECT attribute.type FROM
+createdOn => {
+temp: CARD32 ~ Get32[];
+created ¬ BasicTime.FromNSTime[temp ! BasicTime.OutOfRange => CONTINUE];
+};
+dataSize => bytes ¬ Get32[];
+fileID => {
+len: CARDINAL ~ CrRPC.GetCard16[in];
+IF len # 5 THEN ERROR;
+FOR i: CARDINAL IN [0 .. 5) DO
+fID[i] ¬ CrRPC.GetCard16[in];
+ENDLOOP;
+};
+isDirectory => {
+len: CARDINAL ~ CrRPC.GetCard16[in];
+IF len # 1 THEN ERROR;
+isDir ¬ IF CrRPC.GetCard16[in] = 1 THEN TRUE ELSE FALSE;
+};
+numberOfChildren => {
+len: CARDINAL ~ CrRPC.GetCard16[in];
+IF len = 1 THEN numKids ¬ CrRPC.GetCard16[in];
+};
+pathname => {
+length: CARDINAL ~ CrRPC.GetCard16[in];
+word, len: NAT ¬ 0;
+temp: Basics.Word16;
+P: PROC [l: NAT] RETURNS[c: CHAR] = INLINE {
+IF l MOD 2 = 0
+THEN {temp.card ¬ CrRPC.GetCard16[in]; word ¬ word + 1; c ¬ VAL[temp.hi]}
+ELSE {c ¬ VAL[temp.lo]};
+};
+len ¬ CrRPC.GetCard16[in];
+pathName ¬ RefText.ObtainScratch[len];
+word ¬ word + 1;
+FOR i: NAT IN [0 .. len) DO
+char: CHAR ~ P[i];
+pathName ¬ RefText.InlineAppendChar[pathName, char];
+ENDLOOP;
+IF word # length THEN ERROR;
+};
+type => {
+fileType ¬ [Get32[]];
+IF fileType = 4098 THEN fileType ¬ PFS.tDirectory;
+};
+version => {
+len: CARDINAL ~ CrRPC.GetCard16[in];
+IF len # 1 THEN ERROR;
+vers.versionKind ¬ numeric;
+vers.version ¬ CrRPC.GetCard16[in];
+};
+ENDCASE => { -- the value was not one we are looking for so eat the data
+len: CARDINAL ~ CrRPC.GetCard16[in];
+FOR j: CARDINAL IN [0..len) DO
+[] ¬ CrRPC.GetCard16[in];
+ENDLOOP;
+};
+ENDLOOP;
+
+};
+
+InfoFromAttributeSequence: PROC[attributes: AttributeSequence]RETURNS [vers: Version, bytes: INT, created: GMT, fileType: FileType,pathName: REF TEXT, fID: FileID, isDir: BOOL, numKids: CARD] ~ {
+vers ¬ [none, 0]; bytes ¬ -1; created ¬ nullGMT;
+fileType ¬ PFS.tUnspecified; pathName ¬ NIL; fID ¬ FilingAttributesP10V5.nullFileID;
+isDir ¬ FALSE; numKids ¬ 0;
+FOR i: INT IN [0 .. attributes.length) DO
+attribute: Attribute ~ attributes[i];
+SELECT attribute.type FROM
+createdOn => {
+temp: CARD32 ~ DecapsulateCard32[attribute.value];
+created ¬ BasicTime.FromNSTime[temp ! BasicTime.OutOfRange => CONTINUE];
+};
+dataSize => bytes ¬ DecapsulateCard32[attribute.value];
+fileID => fID ¬ DecapsulateFileID[attribute.value];
+isDirectory => isDir ¬ DecapsulateBoolean[attribute.value];
+numberOfChildren => 
+numKids ¬ IF (attribute.value # NIL) AND (attribute.value.length # 0)
+THEN DecapsulateCard16[attribute.value] ELSE 0;
+pathname => pathName ¬ DecapsulateRefText[attribute.value];
+type => fileType ¬ [DecapsulateCard32[attribute.value]];
+version => {
+vers.version ¬ DecapsulateCard16[attribute.value];
+vers.versionKind ¬ numeric;
+};
+ENDCASE => NULL;
+ENDLOOP;
+};
+
+ParsePFSPath: PUBLIC PROC [pathName: PATH]
+RETURNS [dir: LIST OF ROPE, name: ROPE, vers: Version] ~ {
+dirPath: PATH ¬ PFSNames.Directory[pathName];
+short: PFSNames.Component ~ PFSNames.ShortName[pathName];
+name ¬ PFSNames.ComponentRope[short];
+vers ¬ short.version;
+FOR i: NAT DECREASING IN [1..PFSNames.ComponentCount[dirPath])  DO
+this: ROPE ~ PFSNames.ComponentRope[PFSNames.Fetch[dirPath, i]];
+IF Rope.Length[this] = 0 THEN {	-- version of directory, ignore if 1
+check: PFSNames.Component ~ PFSNames.Fetch[dirPath, i];
+IF check.version.versionKind # numeric THEN LOOP;	-- ??
+IF check.version.version = 1 THEN LOOP;
+dir ¬ CONS[PFSNames.VersionToRope[check.version], dir];
+}
+ELSE dir _ CONS[this, dir];
+ENDLOOP;
+};
+
+EncapsulateAccessList: PROC [accessList: FilingAttributesP10V5.AccessList]
+RETURNS [value: AttributeValue] ~ {
+value ¬ NIL;
+};
+DecapsulateAccessList: PROC [value: AttributeValue]
+RETURNS [accessList: FilingAttributesP10V5.AccessList] ~ {
+};
+
+EncapsulateFileID: PUBLIC PROC [fileID: FileID] RETURNS [value: AttributeValue] ~ {
+len: CARDINAL ~ 5;
+value ¬ NEW[AttributeValueObject[len]];
+FOR i: CARDINAL IN [0..len) DO
+value[i] ¬ fileID[i];
+ENDLOOP;
+};
+DecapsulateFileID: PROC [value: AttributeValue] RETURNS [fileID: FileID] ~ {
+IF value = NIL THEN ERROR;
+IF value.length # 5 THEN ERROR;
+FOR i: CARDINAL IN [0..5) DO
+fileID[i] ¬ value[i];
+ENDLOOP;
+};
+
+EncapsulateOrdering: PROC [ordering: FilingAttributesP10V5.Ordering]
+RETURNS [value: AttributeValue] ~ {
+value ¬ NIL;
+};
+DecapsulateOrdering: PROC [value: AttributeValue]
+RETURNS [ordering: FilingAttributesP10V5.Ordering] ~ {
+temp: Basics.LongNumber;
+IF value = NIL THEN ERROR;
+IF value.length # 4 THEN ERROR;
+temp.hi ¬ value[0];
+temp.lo ¬ value[1];
+ordering.key ¬ temp.lc;
+ordering.ascending ¬ IF value[2] = 1 THEN TRUE ELSE FALSE;
+ordering.interpretation ¬ VAL[value[3]];
+};
+
+EncapsulatePosition: PROC [position: FilingAttributesP10V5.Position]
+RETURNS [value: AttributeValue] ~ {
+value ¬ NIL;
+};
+DecapsulatePosition: PROC [value: AttributeValue]
+RETURNS [position: FilingAttributesP10V5.Position] ~ {
+length: CARDINAL;
+IF value = NIL THEN ERROR;
+IF value.length <= 0 THEN ERROR;
+length ¬ value[0];
+position ¬  NEW[FilingAttributesP10V5.PositionObject[length]];
+FOR i: CARDINAL IN [0..length) DO
+position.body[i] ¬ value[i+1];
+ENDLOOP;
+};
+
+EncapsulateUser: PROC [name: ROPE] RETURNS [value: AttributeValue] ~ {
+value ¬ NIL;
+};
+DecapsulateUser: PROC [value: AttributeValue] RETURNS [user: FilingAttributesP10V5.User] ~ {
+place: NAT ¬ 0;
+GetRope: PROC [] RETURNS [r: ROPE] = {
+temp: Basics.Word16;
+len, i: NAT ¬ 0;
+P: PROC RETURNS[c: CHAR] = {
+IF i MOD 2 = 0
+THEN {temp.card ¬ value[place]; place ¬ place + 1; c ¬ VAL[temp.hi]}
+ELSE {c ¬ VAL[temp.lo]};
+i ¬ i + 1;
+};
+len ¬ value[place];
+place ¬ place + 1;
+r ¬ Rope.FromProc[len: len, p: P];
+};
+IF value = NIL THEN ERROR;
+user.organization ¬ GetRope[];
+user.domain ¬ GetRope[];
+user.object ¬ GetRope[];
+};
+
+EncapsulateBoolean: PROC [b: BOOL] RETURNS [value: AttributeValue] ~ {
+len: NAT ~ 1; -- wrapped len
+value ¬ NEW [AttributeValueObject[len]];
+value[0] ¬ IF b THEN 1 ELSE 0; 
+};
+DecapsulateBoolean: PROC [value: AttributeValue] RETURNS [b: BOOL] ~ {
+IF value = NIL THEN ERROR;
+IF value.length # 1 THEN ERROR;
+b ¬ IF value[0] = 1 THEN TRUE ELSE FALSE;
+};
+
+EncapsulateCard16: PROC [i: CARD16] RETURNS [value: AttributeValue] ~ {
+len: NAT ~ 1; -- wrapped len
+value ¬ NEW [AttributeValueObject[len]];
+value[0] ¬ i; 
+};
+DecapsulateCard16: PROC [value: AttributeValue] RETURNS [i: CARD16] ~ {
+IF value = NIL THEN ERROR;
+IF value.length # 1 THEN ERROR;
+i ¬ value[0];
+};
+
+EncapsulateCard32: PUBLIC PROC [i: CARD32] RETURNS [value: AttributeValue] ~ {
+temp: Basics.LongNumber;
+len: NAT ~ 2; -- wrapped len
+value ¬ NEW [AttributeValueObject[len]];
+temp.lc ¬ i;
+value[0] ¬ temp.hi; 
+value[1] ¬ temp.lo;
+};
+DecapsulateCard32: PROC [value: AttributeValue] RETURNS [i: CARD32] ~ {
+temp: Basics.LongNumber;
+IF value = NIL THEN ERROR;
+IF value.length # 2 THEN ERROR;
+temp.hi ¬ value[0];
+temp.lo ¬ value[1];
+i ¬ temp.lc;
+};
+
+EncapsulateRope: PROC [name: ROPE] RETURNS [value: AttributeValue] ~ {
+len: NAT ~ (Rope.Length[name]+3) / 2; -- wrapped len
+value ¬ NEW[AttributeValueObject[len]];
+TRUSTED { EncapsulateBytes[@(value.body), name] };
+};
+DecapsulateRope: PROC [value: AttributeValue] RETURNS [rope: ROPE] ~ {
+place: NAT ¬ 0;
+GetRope: PROC [] RETURNS [r: ROPE] = {
+temp: Basics.Word16;
+len, i: NAT ¬ 0;
+P: PROC RETURNS[c: CHAR] = {
+IF i MOD 2 = 0
+THEN {temp.card ¬ value[place]; place ¬ place + 1; c ¬ VAL[temp.hi]}
+ELSE {c ¬ VAL[temp.lo]};
+i ¬ i + 1;
+};
+len ¬ value[place];
+place ¬ place + 1;
+r ¬ Rope.FromProc[len: len, p: P];
+};
+IF value = NIL THEN ERROR;
+rope ¬ GetRope[];
+};
+DecapsulateRefText: PROC [value: AttributeValue] RETURNS [rope: REF TEXT] ~ {
+place: NAT ¬ 0;
+GetRope: PROC [] RETURNS [r: REF TEXT] = {
+temp: Basics.Word16;
+len: NAT ¬ 0;
+P: PROC [i: NAT] RETURNS[c: CHAR] = {
+IF i MOD 2 = 0
+THEN {temp.card ¬ value[place]; place ¬ place + 1; c ¬ VAL[temp.hi]}
+ELSE {c ¬ VAL[temp.lo]};
+};
+len ¬ value[place];
+place ¬ place + 1;
+r ¬ RefText.ObtainScratch[len];
+FOR i: NAT IN [0 .. len) DO
+c: CHAR ~ P[i];
+r ¬ RefText.InlineAppendChar[r, c];
+ENDLOOP;
+};
+IF value = NIL THEN ERROR;
+rope ¬ GetRope[];
+};
+
+EncapsulateBytes: PROC [bytes: LONG POINTER, rope: ROPE] ~ TRUSTED {
+len: NAT ~ rope.Length[];
+b: LONG POINTER TO OpaqueByteObject ~ bytes;
+avo: LONG POINTER TO AttributeValueObject ~ bytes;
+avo.body[0] ¬ len;
+FOR i: NAT IN [0..len) DO
+b.body[i+2] ¬ rope.Fetch[i];
+ENDLOOP;
+IF ( (len MOD 2) = 1 ) THEN b.body[len+2] ¬ 0C;
+};
+
+
+EncapsulateNull: PROC RETURNS [value: AttributeValue] ~ {
+len: NAT ~ 0; -- wrapped len
+value ¬ NEW [AttributeValueObject[len]];
+};
+
+RPath: PROC [path: PATH] RETURNS [rope: ROPE] ~
+{ RETURN[PFS.RopeFromPath[path]] };
+
+Init: PROC = {
+MakeCedarAttributes[];
+};
+
+Init[];
+
+END.
+  Î  XNSRemoteFileUtilsImpl.mesa
+Copyright Ó 1988, 1989, 1990, 1991, 1992, 1993 by Xerox Corporation.  All rights reserved.
+Tim Diebert: September 14, 1988 11:11:57 am PDT
+Willie-sue, February 5, 1993 5:52 pm PST
+
+Copied Types
+Local types
+textLength: CARD16, -- first two bytes of body!
+OpaqueByteObject: TYPE ~ MACHINE DEPENDENT RECORD [
+objectLength: CARDINAL,
+sequenceLength: CARDINAL,
+body: PACKED ARRAY [0..1000) OF CHAR
+];
+Useful things
+attributes: AttributeSequence;
+attributes _ FilingP10V5.GetAttributes[h: crH, file: fileH, types: types, session: data.session^];
+[version, bytes, created, fileType, pathName, fID, isDir, numKids] _ InfoFromAttributeSequence[attributes]; -- initializes the variables before the process
+Connection management
+crH _ CrRPC.CreateClientHandle[$CMUX, data.address ! CrRPC.Error => ReportXNSError[resourceLimitExceeded, h, NIL, nullGMT] ]; -- ???
+DestroyClientHandle: PROC[crH: CrRPC.Handle, from: ROPE] = {
+DebugMsg[IO.PutFR["DestroyClientHandle from %g, crH=%g\n", [rope[from]], [integer[LOOPHOLE[crH]]] ]];
+CrRPC.DestroyClientHandle[crH];
+};
+
+DebugMsg: PROC [r: Rope.ROPE] ~ TRUSTED {
+SimpleFeedback.Append[$XNSRF, oneLiner, $debugging, r];
+};
+Error Reporting and Catching
+fileInUse, fileOpen => 
+PFSBackdoor.ProduceError[fileBusy, IO.PutFR1["%g is in use", [rope[file]]]];
+IF downTime > 0 THEN SetServerDown[h, downTime];
+IF downTime > 0 THEN SetServerDown[h, downTime];
+fileInUse, fileOpen => 
+PFSBackdoor.ProduceError[fileBusy, IO.PutFR1["%g is in use", [rope[file]]]];
+PFSBackdoor.ProduceError[badCredentials, IO.PutFR["%g for %g", [rope[r]], [rope[file]]]];
+connectionErrorRope: REF ARRAY FilingP10V5.ConnectionProblem OF REQUIREDROPE ~
+NEW[ARRAY FilingP10V5.ConnectionProblem OF REQUIREDROPE _ [
+noRoute: "noRoute",
+noResponse: "noResponse",
+transmissionHardware: "transmissionHardware",
+transportTimeout: "transportTimeout",
+tooManyLocalConnections: "tooManyLocalConnections",
+tooManyRemoteConnections: "tooManyRemoteConnections",
+missingCourier: "missingCourier",
+missingProgram: "missingProgram",
+missingProcedure: "missingProcedure",
+protocolMismatch: "protocolMismatch",
+parameterInconsistency: "parameterInconsistency",
+invalidMessage: "invalidMessage",
+returnTimedOut: "returnTimedOut",
+otherCallProblem: "otherCallProblem"
+]];
+Support things
+GetInterpretation: PROC [attribute: Attribute, old: AllInterpretedValues]RETURNS [new: AllInterpretedValues] ~ {
+IF old # NIL
+THEN new _ old
+ELSE {new _ NEW[AllInterpretedValuesRep]; new.set _ ALL[FALSE]};
+SELECT attribute.type FROM
+FilingAttributesP10V5.InterpretedAttributeType.checksum.ORD => {
+new.set[checksum] _ TRUE;
+new.checksum _ DecapsulateCard16[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.childrenUniquelyNamed.ORD => {
+new.set[childrenUniquelyNamed] _ TRUE;
+new.childrenUniquelyNamed _ DecapsulateBoolean[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.createdBy.ORD => {
+new.set[createdBy] _ TRUE;
+new.createdBy _ DecapsulateUser[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.createdOn.ORD => {
+new.set[createdOn] _ TRUE;
+new.createdOn _ DecapsulateCard32[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.fileID.ORD => {
+new.set[fileID] _ TRUE;
+new.fileID _ DecapsulateFileID[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.isDirectory.ORD => {
+new.set[isDirectory] _ TRUE;
+new.isDirectory _ DecapsulateBoolean[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.isTemporary.ORD => {
+new.set[isTemporary] _ TRUE;
+new.isTemporary _ DecapsulateBoolean[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.modifiedBy.ORD => {
+new.set[modifiedBy] _ TRUE;
+new.modifiedBy _ DecapsulateUser[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.modifiedOn.ORD => {
+new.set[modifiedOn] _ TRUE;
+new.modifiedOn _ DecapsulateCard32[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.name.ORD => {
+new.set[name] _ TRUE;
+new.name _ DecapsulateRope[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.numberOfChildren.ORD => {
+new.set[numberOfChildren] _ TRUE;
+new.numberOfChildren _ DecapsulateCard16[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.ordering.ORD => {
+new.set[ordering] _ TRUE;
+new.ordering _ DecapsulateOrdering[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.parentID.ORD => {
+new.set[parentID] _ TRUE;
+new.parentID _ DecapsulateFileID[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.position.ORD => {
+new.set[position] _ TRUE;
+new.position _ DecapsulatePosition[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.readBy.ORD => {
+new.set[readBy] _ TRUE;
+new.readBy _ DecapsulateUser[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.readOn.ORD => {
+new.set[readOn] _ TRUE;
+new.readOn _ DecapsulateCard32[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.dataSize.ORD => {
+new.set[dataSize] _ TRUE;
+new.dataSize _ DecapsulateCard32[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.type.ORD => {
+new.set[type] _ TRUE;
+new.type _ DecapsulateCard32[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.version.ORD => {
+new.set[version] _ TRUE;
+new.version _ DecapsulateCard16[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.accessList.ORD => {
+new.set[accessList] _ TRUE;
+new.accessList _ DecapsulateAccessList[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.defaultAccessList.ORD => {
+new.set[defaultAccessList] _ TRUE;
+new.defaultAccessList _ DecapsulateAccessList[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.pathname.ORD => {
+new.set[pathname] _ TRUE;
+new.pathname _ DecapsulateRope[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.storedSize.ORD => {
+new.set[storedSize] _ TRUE;
+new.storedSize _ DecapsulateCard32[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.subtreeSize.ORD => {
+new.set[subtreeSize] _ TRUE;
+new.subtreeSize _ DecapsulateCard32[attribute.value];
+};
+FilingAttributesP10V5.InterpretedAttributeType.subtreeSizeLimit.ORD => {
+new.set[subtreeSizeLimit] _ TRUE;
+new.subtreeSizeLimit _ DecapsulateCard32[attribute.value];
+};
+ENDCASE => NULL;
+};
+got the type now get the data
+4098 is FileDrawer (top level directory)
+setup the return stuff
+we end with 1 instead of 0 to ignore the leading / in the directory path
+Encapsulation things 
+GetAccessEntrySequence: PROC [h: CrRPC.Handle, s: CrRPC.STREAM]
+RETURNS [res: FilingAttributesP10V5.AccessEntrySequence] ~ {
+GetAccess: PROC [h: CrRPC.Handle, s: CrRPC.STREAM]
+RETURNS [res: FilingAttributesP10V5.AccessSequence] ~ {
+length14: CARDINAL ~ DecapsulateCard16[attribute.value];
+interpreted _ NEW[FilingAttributesP10V5.AccessSequenceObject[length14]];
+FOR i13: CARDINAL IN [0..length14) DO
+res.body[i13] _ VAL[DecapsulateCard16[attribute.value]];
+ENDLOOP;
+};
+length11: CARDINAL ~ DecapsulateCard16[attribute.value];
+interpreted _ NEW[FilingAttributesP10V5.AccessEntrySequenceObject[length11]];
+FOR i10: CARDINAL IN [0..length11) DO
+res.body[i10].key.organization _ DecapsulateRope[attribute.value];
+res.body[i10].key.domain _ DecapsulateRope[attribute.value];
+res.body[i10].key.object _ DecapsulateRope[attribute.value];
+res.body[i10].access _ GetAccess[h, s];
+ENDLOOP;
+};
+accessList.entries _ GetAccessEntrySequence[h, s];
+accessList.defaulted _ DecapsulateBoolean[attribute.value];
+Generic
+b.sequenceLength _ len; -- skip sequence length
+EncapsulateBytes: PROC [bytes: LONG POINTER, rope: ROPE] ~ TRUSTED {
+len: NAT ~ Rope.Length[rope];
+b: LONG POINTER TO OpaqueByteObject ~ bytes;
+b.sequenceLength _ len; -- skip sequence length
+FOR i: NAT IN [0..len) DO
+b.body[i] _ Rope.InlineFetch[rope, i];
+ENDLOOP;
+IF ( (len MOD 2) = 1 ) THEN b.body[len] _ 0C;
+};
+Debugging
+Initialization
+Ê-ü  –(cedarcode) style•NewlineDelimiter
+˜ šœ™Icodešœ
+ÏeœO™ZK™/K™(K™ —šÏk	˜	Kšœžœ"˜;Kšœžœ˜"Kšœ
+žœJ˜YKšœžœ]˜hKšœ˜Kšœ˜Kšžœ˜KšžœžœQ˜ZKšœžœ˜,Kšœ	žœ˜Kšœ	žœ>žœ%˜uKšœžœ˜,Kšœ˜Kšœ˜KšœžœJ˜WKšœ˜Kšœ˜Kšœ
+žœ˜,—K˜ K˜ šÐlnœž˜%Kšžœ žœžœL˜zšžœ˜Kšœžœž˜ —Icode1˜ head™Lšžœžœžœ˜Lšœ
+žœ˜#L˜ Lšœ
+žœžœ
+˜Lšœ	žœ˜!—head2™š	œžœžœž	œžœ˜3Kšœžœ˜Kšœžœ™/Kšœžœžœžœž˜$K˜K˜ —š	œžœžœž	œžœ™3Kšœžœ™Kšœžœ™Kšœžœžœžœž™$K™——L˜ ™šœžœ˜K˜ —šÏnœžœžœJžœžœžœ žœžœžœžœ˜ñKšœ6˜6K•StartOfExpansion{[h: CrRPC.Handle, file: FilingP10V5.Handle, types: FilingP10V5.AttributeTypeSequence, session: FilingP10V5.Session]šœ™Kšœ	žœ˜Kšœžœ˜K˜CK˜$Kšœb™bKšœlÏc/™›K˜Kšœ²¡/˜áK˜K˜"Kšœžœ˜#K˜YKšœ˜—K˜ Kšœ
+žœ˜K˜ —™š œžœžœ!žœ˜ZKšœmžœ¡™„KšœDžœ˜NKš	žœžœžœ*žœ¡˜Pšžœžœžœ˜Kšžœžœžœ ˜1Kšœ)žœ¡˜>K˜—Kšœžœ˜Kšœ˜K˜ —š œžœžœ™<Kšœ	žœGžœ™eK™K™K™ —š œžœ
+žœžœ™)K™7K™—K˜ š œžœžœ˜5Kšžœžœžœ0žœ˜KKšœ˜—K˜ Kšœ
+žœ¡.˜CK˜ š œžœžœžœ(žœžœžœžœ˜dKšžœžœžœ˜Kšžœžœžœ˜HK˜CK˜&Kšžœžœ˜Kšœ˜—K˜ š œžœžœ(žœžœžœžœ˜hKšœ
+žœ	žœ˜šœ¡œ˜šžœ˜Kšžœžœžœ
+žœžœžœ!˜NKšœžœ˜KšœWžœ˜`Kšœ2žœ˜;Kšœ˜—Kšžœžœ
+žœ5˜IK˜CK˜QK–G[conversation: XNSAuth.Conversation, seconds: CARD _ 16040B (7200)]šœN˜NKšžœžœ
+žœ ˜4Kšžœžœ˜šžœ	˜Kš
+žœžœ
+žœžœžœ ˜BK˜Kšžœžœ˜K˜—K˜—Kšœ˜—K˜ —™š œžœžœžœžœžœ˜ZKšœžœ˜Kšœžœžœ˜(Kšœžœ$˜/Icode2šœžœ˜0šœ¡Ðck˜šžœ˜KšœNžœG¡˜œK˜ Kšœ1˜1Kšžœžœžœ'žœG˜‹Kšžœ
+žœžœžœ@˜vK˜ šœ˜šžœ	ž˜šœ7˜7Kšœ'žœ*˜S—šœ˜Kšœ'žœ(˜Q—šœ™Kšœ#žœ'™L—šœ˜Kšœ'žœ'˜P—Kšœ)˜)Kšžœžœ˜—Kšœ˜—Kšœ"žœžœ$žœU˜¦Kšœ#žœžœ%žœ[˜®Kšœ žœžœ"žœg˜´Kšœ!žœžœ#žœh˜·Kšœžœžœžœ^˜¤Kšœ žœžœ!žœd˜°KšœA˜Ašœ ˜ šœžœžœ	ž˜Kšœ˜Kšœ˜Kšœ/˜/Kšœ'˜'Kšœ5˜5Kšœ7˜7Kšœ#˜#Kšœ#˜#Kšœ'˜'Kšœ'˜'Kšœ3˜3Kšœ#˜#Kšœ#˜#Kšœ'˜'Kšžœžœ˜—Kšžœžœ$žœ\˜‹Kšœ˜—šœ˜šœžœžœ	ž˜Kšœ9˜9Kšœ*žœžœ˜;—Kšžœžœ"žœB˜oK˜—šœ˜šœžœžœ	ž˜KšœO˜OKšœ&žœžœ˜7—Kšžœžœ!žœX˜„Kšœ˜—Kšœžœžœžœ[˜žKšœžœžœ!žœo˜·Kšœ6˜6K˜2Kšœžœžœ žœn˜·Kšœžœžœžœ`˜§Kšœ˜—Kšœžœ¡!˜GK˜—K˜K˜ —š
+ œžœžœžœžœ˜:šžœ˜Ošžœ'žœ,˜Yšžœ˜Ošœ*žœR˜~——K˜—O˜ š
+ œžœžœ6žœžœ˜eOšœžœžœ˜(Ošœžœ$˜/Ošœžœ˜0š œžœ'žœžœ	˜ROšžœžœ™0Oš	œ)žœžœžœžœ#˜dO˜—š œžœ	žœžœ
+žœžœ	˜XOšžœžœ™0Ošžœžœžœžœžœžœ$˜dO˜—šžœž˜Ošœ)¡˜<Ošœ1žœ,˜`Ošœb˜bOšžœžœ˜—Ošœ˜—K˜ Ošžœžœžœ˜O˜ š	œžœžœžœžœ˜Gšžœžœžœžœ˜8Kšœ7˜7Kšœ9˜9Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜K˜——š œžœ9žœžœ˜bOšœžœ$˜/šžœ	ž˜šœ7˜7Kšœ'žœ*˜S—šœ˜Kšœ'žœ(˜Q—šœ™Kšœ#žœ'™L—šœ˜Kšœ'žœ'˜P—Kšœ)˜)Kšžœžœ˜—Kšœ˜K˜ —š
+ œžœžœ%žœžœ˜WKšœžœ˜&—K˜ š	œžœžœžœžœ˜Kšžœžœžœžœ˜9Kšœ
+Ïtœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜K˜——K˜ š	œžœžœžœžœ˜Gšžœžœžœžœ˜9Kšœ*˜*Kšœ$˜$Kšœ$˜$Kšœ"˜"Kšœ*˜*Kšœ5˜5K˜——š œžœ.žœ˜JKšœžœ˜"Kšœ)žœ.™YKšœ'žœ.˜WKšœ˜K˜ —š
+ œžœžœ'žœžœ˜WKšœžœ˜$—K˜ š	œžœžœžœžœ˜Fšžœžœžœžœ˜5Kšœ2˜2K˜——K˜ š	œžœžœžœžœ˜Bšžœžœžœžœ˜3KšœH˜HK˜——K˜ š	œžœžœžœžœ˜Išžœžœžœžœ˜8Kšœ*˜*Kšœ˜Kšœ*˜*Kšœ˜Kšœ!˜!K˜K˜ ——š
+ œžœžœ&žœžœ˜YKšœžœ˜'—K˜ š	œžœžœžœžœ™Nšžœžœžœžœ™;Kšœ™Kšœ™Kšœ-™-Kšœ%™%Kšœ3™3Kšœ5™5Kšœ!™!Kšœ!™!Kšœ%™%Kšœ%™%Kšœ1™1Kšœ!™!Kšœ!™!Kšœ$™$K™——K˜ š	œžœžœžœžœ˜Kšžœžœžœžœ˜9Kšœ;˜;Kšœ?˜?Kšœ!˜!K˜——K˜ š	œžœžœžœžœ˜>šžœžœžœžœ˜/Kšœ˜Kšœ˜Kšœ1˜1Kšœ/˜/Kšœ/˜/Kšœ3˜3Kšœ3˜3Kšœ+˜+Kšœ˜Kšœ/˜/Kšœ˜Kšœ˜Kšœ ˜ Kšœ ˜ Kšœ˜Kšœ.˜.Kšœ!˜!Kšœ%˜%Kšœ#˜#Kšœ#˜#Kšœ=˜=Kšœ˜K˜——š œžœ(žœ˜EKšžœžœI˜RKšœ˜K˜ —š œžœžœ'žœžœžœ˜`KšžœžœT˜]K˜—K˜ š	œžœžœžœžœ˜Išžœžœžœžœ˜8Kšœ˜Kšœ&˜&K˜——š œžœ*˜@Kšžœžœ>˜GKšœ˜K˜ —š
+ œžœžœ&žœžœ˜YKšœžœ˜'—K˜ š	œžœžœ!žœžœ˜Ošžœžœ!žœžœ˜=Kšœ˜Kšœ7˜7Kšœ$˜$Kšœ3˜3Kšœ3˜3Kšœ<˜<Kšœ<˜<Kšœ=˜=Kšœ5˜5Kšœ˜Kšœ˜Kšœ˜Kšœ˜K˜K˜ ——š
+ œžœžœ+žœžœ˜_Kšœžœ ˜(—K˜ š œžœ(˜<šžœ	ž˜KšœX˜XKšœ]˜]KšœL˜LKšžœžœ˜—Kšœ˜——™š œžœžœ,žœžœžœ˜K˜.Kšœ˜Kšœžœ˜$Kšœžœ:˜HKšœžœ:˜HKšœžœ/˜=šžœž˜KšœžœY˜pKšœžœk˜€Kšžœžœ/˜F—Kšœžœ1˜?Kšœ˜K˜ —š œžœžœ	žœ,žœžœ˜sKšžœ˜"K˜.Kšœ˜Kšœžœ˜$Kšœžœ:˜HKšœžœ%˜3Kšœžœ/˜=šžœž˜KšœžœY˜pKšœžœk˜€Kšžœžœ/˜F—Kšœžœ1˜?Kšœ˜K˜ —š
+ œžœžœ	žœžœ˜OKšœžœ˜$Kšœžœ:˜HKšœžœ%˜3Kšœžœ/˜=Kšœ˜—K˜ š œžœžœžœžœžœžœžœ$˜šžœžœ˜Kšœžœ˜.K˜;Kšžœ˜Kšœ˜—Kšœžœ˜.K˜UK˜;Kšžœ˜Kšœ˜—K˜ š
+ œžœžœ	žœžœ$˜^Kšœžœ˜.Kšœ>žœ˜EK˜<Kšœ8¡œ˜KKšžœ˜Kšœ˜K˜ —š œžœžœžœžœžœžœ$˜xKš	œžœžœžœžœ˜3Kšœžœ ˜0K˜;K˜@šžœžœ˜K–[GMT]šœžœ˜+K˜BKšœ˜—K˜—K˜ š œžœžœ
+žœ(˜Xšžœžœž˜Kšœ˜Kšœ!˜!Kšœ+˜+Kšœ˜Kšœ˜Kšœ˜Kšžœžœ˜—Kšœ˜—K˜ Kšœ(˜(Kšœ+˜+Kšœ0˜0Kšœ*˜*Kšœ'˜'š œžœ˜ Kšœžœ!˜7K˜!K˜K˜"K˜'K˜K˜K˜ Kšœžœ!˜:K˜$K˜"K˜K˜"K˜K˜%K˜!K˜ K˜ Kšœžœ!˜?K˜'K˜*K˜ Kšœžœ!˜9K˜"K˜!K˜ K˜!K˜K˜ Kšœžœ!˜6K˜Kšœ˜—K˜ š œžœžœžœ+˜Zš œžœžœžœ˜Bš œžœžœž	œ%˜RKšœžœ˜$Kšœžœ˜1šžœžœžœ
+ž˜K˜-Kšžœ˜—K˜—K˜%K˜)Kšœ¡˜—Kšœžœ˜'Kšœžœ#˜:šžœžœžœž˜!K˜-Kšžœ˜—K˜—K˜ š œžœžœžœ
+žœžœ˜GK–[nChars: NAT]š œžœžœ;˜QKšœžœžœ˜Kšœžœžœ&˜4K– [base: ROPE, index: INT _ 0]šœžœžœžœ˜Kšœžœžœ˜K˜K˜ šžœžœžœž˜)Kšœžœ$˜+šžœž˜Kšœžœ¡˜ šœžœžœžœ˜ Kšœ¡,˜:K˜K˜—Kš	œžœžœžœžœ˜SKšœžœžœžœ¡˜Qšœ¡˜#–9[base: ROPE, start: INT _ 0, len: INT _ 2147483647]šžœžœ¡5˜OKšœžœ˜Kšžœ˜K˜—Kšœ.¡$˜RKšžœ˜Kšœ˜—Kšžœžœžœžœ˜/—Kšžœ˜—šžœžœžœ˜šžœž˜!Kšœžœ¡˜,šœ¡6œ˜=šžœž˜Kšœ¡	˜$Kšœ(žœ˜,Kšœ%¡
+˜/Kšœ¡˜+Kšžœžœ¡˜"—Kšœ˜—šœ¡˜šžœž˜#K˜K˜Kšœžœ˜Kšžœžœ˜—K˜—Kšžœžœ˜—Kšœ˜—K–([base: ROPE _ NIL, rest: ROPE _ NIL]˜DK–[t: REF TEXT]˜ Kšžœ˜Kšœ˜—K˜ š œžœžœžœžœ	žœžœžœžœ˜]K˜K–[nChars: NAT]š
+ œžœžœžœžœ/˜RKšœžœžœ&˜4Kšœžœžœ&˜3Kšœžœžœ˜K˜K˜Kšœ¡0˜Cšžœžœžœž˜,Kšœžœ˜!šžœž˜˜Kšœ¡=˜NK˜K˜—šœ˜Kšœžœ˜Kšœ¡=˜NKšœ¡#˜1Kšœ¡.˜AKšœ˜—šœ¡œ˜"K–[t: REF TEXT]˜ K–[t: REF TEXT]˜Kšžœžœ˜K˜—šžœ˜šžœž˜Kšœ˜Kšœ˜Kšžœžœ˜—Kšœ˜——Kšžœ˜—šžœžœ¡5˜OK–P[to: REF TEXT, from: RefText.PureText, start: NAT _ 0, len: NAT _ 32767]šžœžœžœžœ˜3Kšœ¡˜*Kšœ,¡˜=Kšœ˜—K–>[s: REF READONLY TEXT, start: NAT _ 0, len: NAT _ 32767]˜!K–[t: REF TEXT]˜ K–[t: REF TEXT]˜Kšœ˜—K˜ K˜ š œžœ2žœ ™qšžœž™Kšžœ
+™Kšžœžœ%žœžœ™@—šžœž™šœ8žœ™@Kšœžœ™K™2K™—šœEžœ™MKšœ!žœ™&K™@K™—šœ9žœ™AKšœžœ™K™1K™—šœ9žœ™AKšœžœ™K™3K™—šœ6žœ™>Kšœžœ™K™0K™—šœ;žœ™CKšœžœ™K™6K™—šœ;žœ™CKšœžœ™K™6K™—šœ:žœ™BKšœžœ™K™2K™—šœ:žœ™BKšœžœ™K™4K™—šœ4žœ™<Kšœžœ™K™,K™—šœ@žœ™HKšœžœ™!K™:K™—šœ8žœ™@Kšœžœ™K™4K™—šœ8žœ™@Kšœžœ™K™2K™—šœ8žœ™@Kšœžœ™K™4K™—šœ6žœ™>Kšœžœ™K™.K™—šœ6žœ™>Kšœžœ™K™0K™—šœ8žœ™@Kšœžœ™K™2K™—šœ4žœ™<Kšœžœ™K™.K™—šœ7žœ™?Kšœžœ™K™1K™—šœ:žœ™BKšœžœ™K™8K™—šœAžœ™IKšœžœ™"K™?K™—šœ8žœ™@Kšœžœ™K™0K™—šœ:žœ™BKšœžœ™K™4K™—šœ;žœ™CKšœžœ™K™5K™—šœ@žœ™HKšœžœ™!K™:K™—Kšžœžœ™—K™—K˜ š œžœžœžœžœžœžœ žœžœžœžœ˜·š œžœžœžœ˜Bš œžœžœž	œ%˜RKšœžœ˜$Kšœžœ˜1šžœžœžœ
+ž˜K˜-Kšžœ˜—K˜—K˜%K˜)Kšœ¡˜—K˜ Kšœžœ˜'šžœžœžœž˜!š
+ œžœžœžœžœ˜,K˜Kšœžœ˜$Kšžœ	žœžœ˜K˜K˜K˜Kšœ˜—Kšœ˜K˜%Kšœ™šžœž˜šœ˜Kšœžœ˜Kšœ>žœ˜HKšœ˜—K˜šœ˜Kšœžœ˜$Kšžœ	žœžœ˜šžœžœžœ
+ž˜K˜Kšžœ˜—Kšœ˜—šœ˜Kšœžœ˜$Kšžœ	žœžœ˜Kšœžœžœžœžœžœ˜8Kšœ˜—šœ˜Kšœžœ˜$Kšžœ	žœ˜.Kšœ˜—šœ˜K–[len: INT, p: PROCšœžœ˜'Kšœžœ˜K˜š œžœžœžœžœžœ˜,šžœžœ˜Kšžœ8žœ
+˜IKšžœžœ˜—Kšœ˜—K–[len: INT, p: PROC˜K˜&K˜šžœžœžœž˜Kšœžœ˜K˜4Kšžœ˜—Kšžœžœžœ˜Kšœ˜—šœ	˜	K˜K™(Kšžœžœžœ˜2K˜—šœ˜Kšœžœ˜$Kšžœ	žœžœ˜K˜K˜#Kšœ˜—šžœ¡;˜HKšœžœ˜$šžœžœžœ
+ž˜K˜Kšžœ˜—Kšœ˜——Kšžœ˜—K˜ Kšœ˜—K˜ š œžœ žœžœžœ žœžœžœžœ˜ÅKšœ™K˜0Kšœžœžœ)˜TKšœžœ˜šžœžœžœž˜)Kšœ%˜%šžœž˜šœ˜Kšœžœ&˜2Kšœ>žœ˜HKšœ˜—K˜7K˜3K˜;šœ˜šœ
+žœžœžœ˜EKšžœ$žœ˜/——K˜;K˜8šœ˜K˜2K˜K˜—Kšžœžœ˜—Kšžœ˜—Kšœ˜—K˜ š œžœžœžœžœžœžœžœžœ˜eKšœ	žœ ˜-Kšœ9˜9K˜%K˜K™Hš	žœžœž
+œžœ(ž˜BKšœžœ6˜@šžœžœœœœœœœœ˜DK˜7Kšžœ%žœžœ¡˜7Kšžœžœžœ˜'Kšœžœ-˜7K˜Kšžœžœ˜—Kšžœ˜—K˜K˜ ——™š œžœ/žœ˜nKšœžœ˜K˜—š œžœžœ3˜nš œžœžœ™?Kšžœ5™<š 	œžœžœ™2Kšžœ0™7Kšœ
+žœ&™8Kšœžœ7™HKšžœžœžœž™%Kšœžœ%™8Kšžœ™Kšœ™—Kšœ
+žœ&™8Kšœžœ<™MKšžœžœžœž™%KšœB™BKšœ<™<Kšœ<™<Kšœ'™'Kšžœ™Kšœ™—Kšœ2™2Kšœ;™;K˜—K˜ š œžœžœžœ˜SKšœžœ˜Kšœžœ˜'šžœžœžœ
+ž˜K˜Kšžœ˜—K˜—š œžœžœ˜LKšžœ	žœžœžœ˜Kšžœžœžœ˜šžœžœžœž˜K˜Kšžœ˜—K˜—K˜ š œžœ+žœ˜hKšœžœ˜K˜—š œžœžœ/˜hK˜Kšžœ	žœžœžœ˜Kšžœžœžœ˜K˜K˜K˜Kšœžœžœžœžœžœ˜:Kšœžœ˜(K˜—K˜ š œžœ+žœ˜hKšœžœ˜K˜—š œžœžœ/˜hKšœžœ˜Kšžœ	žœžœžœ˜Kšžœžœžœ˜ K˜Kšœžœ/˜>šžœžœžœž˜!K˜Kšžœ˜—K˜—K˜ š œžœžœžœ˜FKšœžœ˜K˜—š œžœžœ'˜\Kšœžœ˜š œžœžœžœ˜&K˜Kšœžœ˜š œžœžœžœ˜šžœžœ˜Kšžœ3žœ
+˜DKšžœžœ˜—K˜
+Kšœ˜—K–[len: INT, p: PROC˜K˜K˜"Kšœ˜—Kšžœ	žœžœžœ˜K˜K˜K˜K˜—K˜ Kšœ™š œžœžœžœ˜FKšœžœ¡˜Kšœžœ˜(Kšœžœžœžœ˜K˜—š œžœžœžœ˜FKšžœ	žœžœžœ˜Kšžœžœžœ˜Kšœžœžœžœžœžœ˜)K˜—K˜ š œžœžœžœ˜GKšœžœ¡˜Kšœžœ˜(K˜K˜—š œžœžœžœ˜GKšžœ	žœžœžœ˜Kšžœžœžœ˜K˜K˜—K˜ š
+ œžœžœžœžœ˜NK˜Kšœžœ¡˜Kšœžœ˜(K˜K˜K˜K˜—š œžœžœžœ˜GK˜Kšžœ	žœžœ˜Kšžœžœžœ˜K˜K˜K˜K˜—K˜ š œžœžœžœ˜FKšœžœ¡˜4Kšœžœ˜'Kšžœ+˜2K˜—š œžœžœžœ˜FKšœžœ˜š œžœžœžœ˜&K˜Kšœžœ˜š œžœžœžœ˜šžœžœ˜Kšžœ3žœ
+˜DKšžœžœ˜—K˜
+Kšœ˜—K–[len: INT, p: PROC˜K˜K˜"Kšœ˜—Kšžœ	žœžœžœ˜K˜K˜—š
+ œžœžœžœžœ˜MKšœžœ˜š
+ œžœžœžœžœ˜*K˜Kšœžœ˜š
+ œžœžœžœžœ˜%šžœžœ˜Kšžœ3žœ
+˜DKšžœžœ˜—Kšœ˜—K–[len: INT, p: PROC˜K˜K˜šžœžœžœž˜Kšœžœ˜K˜#Kšžœ˜—Kšœ˜—Kšžœ	žœžœžœ˜K˜K˜—K˜ š œžœ	žœžœžœžœ˜DKšœžœ˜Kšœžœžœžœ˜,Kšœžœžœžœ˜2Kšœ¡™/K˜šžœžœžœ
+ž˜K˜Kšžœ˜—Kšžœžœ
+žœ˜/K˜K˜ —š œžœ	žœžœžœžœ™DKšœžœ™Kšœžœžœžœ™,Kšœ¡™/šžœžœžœ
+ž™K™&Kšžœ™—Kšžœžœ
+žœ™-K™—K˜ š œžœ˜9Kšœžœ¡˜Kšœžœ˜(K˜——K˜ ™	š œžœžœžœžœžœžœ˜SK˜ ——™š œžœ˜Kšœ˜Kšœ˜K˜ —K˜——K˜ Kšžœ˜— …—    †¤  Ón  

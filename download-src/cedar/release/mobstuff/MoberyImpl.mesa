@@ -1,0 +1,354 @@
+DIRECTORY
+BasicTime USING [GMT],
+FS USING [ExpandName, FileInfo, GetInfo, OpenFileFromStream, StreamOpen],
+IO,
+MobDefs USING [NullVersion, VersionStamp],
+Mobery USING [EnumerateStampProc, StampTable, StampTableRep, VersionStamp],
+MoberyPrivate, 
+RefText USING [ObtainScratch, ReleaseScratch, TrustTextAsRope],
+Rope,
+SymTab;
+
+MoberyImpl: CEDAR MONITOR
+IMPORTS FS, IO, RefText, Rope, SymTab
+EXPORTS Mobery, MoberyPrivate =
+
+BEGIN
+
+ROPE: TYPE = Rope.ROPE;
+VersionStamp: TYPE = Mobery.VersionStamp;
+
+NoStamp: PUBLIC ERROR = CODE;
+
+StampPatterns: LIST OF ROPE = LIST["mob_version", "c2c_time", "c_stamp"];
+hashMark: ROPE = "@(#)";
+
+CacheEntry: TYPE ~ REF CacheEntryRep; CacheEntryRep: TYPE ~ RECORD [
+list: LIST OF ROPE,
+created: BasicTime.GMT
+];
+sourceStampByteLimit: INT ¨ 8000;
+
+StopOnQuoteOrNull: IO.BreakProc = {
+RETURN [IF char = '\000 OR char = '" THEN break ELSE other]
+};
+
+cache: SymTab.Ref ~ SymTab.Create[];
+
+FlushCache: PUBLIC PROC ~ {
+cache.Erase[]; 
+};
+
+objRegs: LIST OF MoberyPrivate.ObjectFileTypeMatcherProc ¨ NIL;
+
+RegisterObjectFileType: PUBLIC PROC[p: MoberyPrivate.ObjectFileTypeMatcherProc] ~ {
+objRegs ¨ CONS[p, objRegs];
+};
+
+GetStamps: ENTRY PROC [fileName: ROPE] RETURNS [LIST OF ROPE] ~ {
+ENABLE UNWIND => {};
+fullName: ROPE ~ FS.ExpandName[fileName].fullFName;
+list: LIST OF ROPE;
+created: BasicTime.GMT;
+WITH cache.Fetch[fullName].val SELECT FROM
+x: CacheEntry => {
+created ¨ FS.FileInfo[fileName].created;
+IF created = x.created THEN RETURN [x.list];
+};
+ENDCASE => NULL;
+[list: list, created: created] ¨ GetCOStamps[fullName];
+{
+ce: CacheEntry ~ NEW [CacheEntryRep ¨ [list: list, created: created]];
+[] ¨ cache.Insert[fullName, ce];
+RETURN [ce.list];
+};
+};
+
+GetCOStamps: PUBLIC PROC [fileName: ROPE] RETURNS [list: LIST OF ROPE, created: BasicTime.GMT] = {
+head: LIST OF ROPE = LIST[NIL];
+last: LIST OF ROPE ¨ head;
+stream: IO.STREAM = FS.StreamOpen[fileName: fileName, accessOptions: $read];
+buf: REF TEXT = RefText.ObtainScratch[nChars: 512];
+hashMarkSize: INT = Rope.Length[hashMark];
+hashStartChar: CHAR = Rope.Fetch[hashMark, 0];
+smallBuf: REF TEXT = NEW[TEXT[hashMarkSize]];
+start: INT ¨ 0;
+end: INT ¨ sourceStampByteLimit;
+match: BOOL;
+index: INT ¨ 0;
+created ¨ FS.GetInfo[FS.OpenFileFromStream[stream]].created;
+FOR r: LIST OF MoberyPrivate.ObjectFileTypeMatcherProc ¨ objRegs, r.rest WHILE r # NIL DO
+[match, start, end] ¨ r.first[stream];
+IF match THEN EXIT;
+IO.SetIndex[self: stream, index: 0];
+ENDLOOP;
+IF NOT match THEN {
+start ¨ 0;
+end ¨ sourceStampByteLimit;
+};
+IO.SetIndex[self: stream, index: start];
+index ¨ start;
+WHILE index < end DO
+bytes: INT ¨ IO.GetBlock[self: stream, block: buf];
+i: NAT ¨ 0;
+needSetIndex: BOOL ¨ FALSE;
+IsHashMark: PROC [pos: INT] RETURNS [BOOL] ~ {
+IF buf[pos] # hashStartChar THEN RETURN [FALSE];
+IF pos+hashMarkSize <= bytes
+THEN {
+FOR j: INT ¨ 1, j+1 WHILE j < hashMarkSize DO
+IF hashMark.Fetch[j] # buf[pos+j] THEN RETURN [FALSE];
+ENDLOOP;
+IO.SetIndex[stream, index+pos+hashMarkSize];
+needSetIndex ¨ TRUE;
+RETURN [TRUE];
+}
+ELSE {
+IO.SetIndex[stream, index+pos];
+needSetIndex ¨ TRUE;
+[] ¨ IO.GetBlock[self: stream, block: smallBuf];
+RETURN [Rope.Equal[hashMark, RefText.TrustTextAsRope[smallBuf]]];
+}
+};
+IF bytes = 0 THEN EXIT;
+WHILE i < bytes DO
+IF IsHashMark[pos: i] THEN {
+{
+token: ROPE = IO.GetTokenRope[stream: stream, breakProc: StopOnQuoteOrNull ! IO.EndOfStream => EXIT].token;
+newIndex: INT = index + i + hashMarkSize + Rope.Length[token];
+last ¨ last.rest ¨ LIST[token];
+IF newIndex > index + bytes THEN{
+index ¨ newIndex;
+IO.SetIndex[stream, index];
+GOTO GetNextBlock;
+};
+i ¨ newIndex - index;
+};
+};
+i ¨ i + 1;
+REPEAT
+GetNextBlock => LOOP; -- the enclosing WHILE --
+ENDLOOP;
+index ¨ index + bytes;
+IF needSetIndex THEN IO.SetIndex[stream, index];
+ENDLOOP;
+RefText.ReleaseScratch[buf];
+IO.Close[stream];
+RETURN [head.rest, created]
+};
+
+StampTable: TYPE = Mobery.StampTable;
+StampTableRep: PUBLIC TYPE = RECORD [
+name: ROPE, -- name of the current file --
+stamps: SymTab.Ref
+];
+
+StampPair: TYPE = RECORD [
+stampClass: ROPE, -- the stamp class --
+stamp: VersionStamp -- its version stamp --
+];
+
+UserData: TYPE = REF UserDataRep;
+UserDataRep: TYPE = RECORD [
+name: ROPE, -- name of the file --
+stampList: LIST OF StampPair -- all the stamps --
+];
+
+EnumerateStampTable: PUBLIC PROC [stampTable: StampTable, to: Mobery.EnumerateStampProc] =
+BEGIN
+DoInner: PROC [key: ROPE, val: REF ANY] RETURNS [stop: BOOL ¨ FALSE] --SymTab.EachPairAction-- ~ {
+myData: UserData = NARROW[val];
+FOR stampList: LIST OF StampPair ¨ myData.stampList, stampList.rest WHILE stampList # NIL AND NOT stop DO
+stamp: StampPair ~ stampList.first;
+stop ¨ to[myData.name, stamp.stampClass, stamp.stamp];
+ENDLOOP;
+RETURN [stop: stop];
+};
+[] ¨ stampTable.stamps.Pairs[DoInner];
+END;
+
+InsertInStampTable: PROC [table: StampTable, name, class: ROPE, stamp: VersionStamp] RETURNS [previously: BOOL ¨ FALSE] ~ {
+userData: UserData ¨ NARROW[table.stamps.Fetch[name].val];
+IF userData = NIL THEN {
+userData ¨ NEW [UserDataRep];
+userData.name ¨ name;
+userData.stampList ¨ LIST[[stampClass: class, stamp: stamp]];
+IF NOT table.stamps.Insert[name, userData] THEN ERROR;
+RETURN [previously: FALSE]
+};
+{
+FOR stampList: LIST OF StampPair ¨ userData.stampList, stampList.rest WHILE stampList # NIL AND NOT previously DO
+stampPair: StampPair ~ stampList.first;
+IF stamp = stampPair.stamp AND Rope.Equal[class, stampPair.stampClass]
+THEN RETURN [previously: TRUE];
+ENDLOOP;
+userData.stampList ¨ CONS[StampPair[stampClass: class, stamp: stamp], userData.stampList];
+};
+RETURN [previously: FALSE];
+};
+
+StampFromStampTable: PUBLIC PROC [stampTable: StampTable, fileName: ROPE] RETURNS [stampClass: ROPE, stamp: VersionStamp] =
+BEGIN
+data: UserData = NARROW [stampTable.stamps.Fetch[fileName].val];
+IF data = NIL THEN ERROR NoStamp;
+FOR stampList: LIST OF StampPair ¨ data.stampList, stampList.rest WHILE stampList # NIL DO 
+stamp: StampPair ~ stampList.first;
+RETURN [stamp: stamp.stamp, stampClass: stamp.stampClass];
+ENDLOOP;
+RETURN [stampClass: NIL, stamp: MobDefs.NullVersion]
+END;
+
+Has: PUBLIC PROC [stampTable: StampTable, name: ROPE, class: ROPE ¨ NIL, stamp: VersionStamp ¨ MobDefs.NullVersion] RETURNS [found: BOOL ¨ FALSE] =
+BEGIN
+data: UserData = NARROW [stampTable.stamps.Fetch[name].val];
+IF data = NIL THEN RETURN [found: FALSE];
+FOR stampList: LIST OF StampPair ¨ data.stampList, stampList.rest WHILE stampList # NIL DO 
+stampPair: StampPair ~ stampList.first;
+IF (class = NIL OR Rope.Equal[class, stampPair.stampClass]) AND
+(stamp = MobDefs.NullVersion OR stamp = stampPair.stamp) THEN RETURN [found: TRUE];
+ENDLOOP;
+RETURN [found: FALSE]
+END;
+
+ReadStampTable: PUBLIC PROC [fileName: ROPE] RETURNS [stampTable: StampTable] ~ {
+listOfStamps: LIST OF ROPE ~ GetStamps[fileName: fileName];
+stampTable ¨ NEW [StampTableRep ¨ [
+name: fileName,
+stamps: SymTab.Create[case: TRUE]
+]];
+FOR stampList: LIST OF ROPE ¨ listOfStamps, stampList.rest WHILE stampList # NIL DO
+aStamp: ROPE ~ stampList.first;
+FOR patternList: LIST OF ROPE ¨ StampPatterns, patternList.rest WHILE patternList # NIL DO
+pattern: ROPE ~ patternList.first;
+patternLen: INT ~ pattern.Length[];
+IF pattern.Equal[aStamp.Substr[len: patternLen]] THEN {
+restOfString: ROPE ~ aStamp.Substr[start: patternLen+1];
+name: ROPE;
+stamp: MobDefs.VersionStamp;
+[stamp: stamp, name: name] ¨ VersionAndNameFromString[restOfString];
+IF name = NIL THEN RETURN [stampTable: NIL];
+[] ¨ InsertInStampTable[table: stampTable, name: name, class: pattern, stamp: stamp];
+};
+ENDLOOP;
+ENDLOOP;
+RETURN [stampTable: stampTable];
+};
+
+StampTableSubset: PUBLIC PROC [tab1, tab2: StampTable] RETURNS [BOOL] = {
+subset: BOOL ¨ TRUE;
+SeeDiff: PROC [name, stampClass: ROPE, stamp: Mobery.VersionStamp] RETURNS [BOOL]
+~ {subset ¨ FALSE; RETURN [TRUE]};
+EnumerateStampTableDifference[tab1, tab2, SeeDiff];
+RETURN [subset]};
+
+EnumerateStampTableDifference: PUBLIC PROC [tab1, tab2: StampTable, to: Mobery.EnumerateStampProc] = {
+CheckOne: PROC [name, stampClass: ROPE, stamp: Mobery.VersionStamp] RETURNS [BOOL] --Mobery.EnumerateStampProc-- ~ {
+IF NOT Has[tab2, name, stampClass, stamp] THEN RETURN to[name, stampClass, stamp];
+RETURN [FALSE];
+};
+EnumerateStampTable[tab1, CheckOne];
+RETURN};
+
+StampAndNameFromFile: PUBLIC PROC [fileName: ROPE] RETURNS [stamp: MobDefs.VersionStamp ¨ MobDefs.NullVersion, name: ROPE ¨ NIL] ~ {
+listOfStamps: LIST OF ROPE ~ GetStamps[fileName: fileName];
+FOR stampList: LIST OF ROPE ¨ listOfStamps, stampList.rest WHILE stampList # NIL DO
+aStamp: ROPE ~ stampList.first;
+FOR patternList: LIST OF ROPE ¨ StampPatterns, patternList.rest WHILE patternList # NIL DO
+pattern: ROPE ~ patternList.first;
+patternLen: INT ~ pattern.Length[];
+IF pattern.Equal[aStamp.Substr[len: patternLen]] THEN {
+restOfString: ROPE ~ aStamp.Substr[start: patternLen+1];
+[stamp: stamp, name: name] ¨ VersionAndNameFromString[restOfString !IO.EndOfStream, IO.Error => GOTO NotThisOne];
+RETURN;
+EXITS NotThisOne => name ¨ name};
+ENDLOOP;
+ENDLOOP;
+};
+
+VersionAndNameFromString: PUBLIC PROC [aRope: ROPE] RETURNS [stamp: MobDefs.VersionStamp, name: ROPE] ~ {
+MyBreakProc: IO.BreakProc ~ {
+RETURN[SELECT char FROM
+IN [IO.NUL .. IO.SP] => sepr,
+'[, '], '(, '), '{, '}, '", '+, '-, '*, '/, '@, '_, ',, ':,  '; => break,
+ENDCASE => other]
+};
+aStream: IO.STREAM ~ IO.RIS[aRope];
+token: ROPE;
+[] ¨ aStream.SkipWhitespace[];
+[token: token] ¨ aStream.GetTokenRope[MyBreakProc];
+IF NOT token.Equal["["] THEN ERROR; -- this should not happen --
+stamp[0] ¨ aStream.GetCard[];
+[token: token] ¨ aStream.GetTokenRope[MyBreakProc];
+IF NOT token.Equal[","] THEN ERROR; -- this should not happen --
+stamp[1] ¨ aStream.GetCard[];
+[token: token] ¨ aStream.GetTokenRope[MyBreakProc];
+IF NOT token.Equal["]"] THEN ERROR; -- this should not happen --
+name ¨ aStream.GetID[!
+IO.EndOfStream, IO.Error => { name ¨ NIL; CONTINUE };
+];
+RETURN [stamp: stamp, name: name];
+};
+
+
+END.
+
+
+
+
+
+
+
+  .  
+MoberyImpl.Mesa
+Copyright ” 1986, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Mike Spreitzer September 3, 1986 10:32:43 am PDT
+Andy Litman March 3, 1988 6:08:18 pm PST
+Eduardo Pelegri-Llopart, December 21, 1989 8:27:57 pm PST
+Michael Plass, June 29, 1989
+JKF January 11, 1989 10:23:16 am PST
+Last tweaked by Mike Spreitzer on August 14, 1990 8:26 am PDT
+Willie-s, May 13, 1992 3:06 pm PDT
+
+Types
+a.out know-how
+(thanks to Michael Plass)
+[char: CHAR] RETURNS [IO.CharClass]
+fileName refers to either a .c file or a .o file.  Action is called with those strings delimited by hashMark at the front and either a double quote or a null at the end.  For source files, only the first sourceStampByteLimit bytes are examined; for object files, the search is confined to the initialized data region.
+if not found then search in a "reasonable" area 
+Stamp Tables
+Enumerate all the files in stampTable
+Get the stamp of a given name; gives an error if none is present.
+Test if a particular stamp is in the table
+Get all the version stamps from an C or O File.  Save them so they can be enumerated afterwards.
+Extract the version stamp from fileName.  If there is none, return MobDefs.NullVersion.
+It uses the prefixes "@(#)pattern", where pattern is in StampPatterns.
+
+Skip over blanks, then construct a version stamp;
+ ù   ñ(cedarcode) styleïNewlineDelimiter
+ô codeôKöú	œeú<ôHKô0Kô(Kô9KôKô$Kô=Kô"Kô óöœk	ò	Köú
+ûúûúòKöûúûúAòIKöûúòKöúûúò*Köúûú?òKKöúòKöúûú2ò?KöúòKòóKò ö—bnx
+úûúûòKöû
+úûúò%KöûúòóKò KöûòKò headôKöûúûúûúòKöúûúò)Kò KöœnúûúûúûúòKò Kö
+†úûúûúûúûú'òIKö†úûú
+òKò ö	úûúûúûúûúòDKöúûúûúûúòKöúûòKòóóôLôKöúûúò!Kò ïStartOfExpansion' -- [char: CHAR] RETURNS [IO.CharClass]ö†úûúò#Köúûúûúûúô#Kö
+ûúûúûúûúûúò;KòKò óKò$Kò ö†
+úûúûúòKòKòKò óKöú	ûúûú/ò?Kò ö†úûú0òSKòKòóKò ö†	úûúûúûúûúûúûúûúòAKöûúûúòKöú
+ûúûú ò3KöúûúûúûúòKöúûúòöûúûúûò*öúûòKöú
+ûúò(Köûúûúûú
+ò,KòóKöûú	òóKöú7ò7òKöúûú2òFKöú ò KöûúòKòóKòKò óö†úûúûúûúûúûúûúûúûúòbKöúd†ú—ôΩKöúûúûúûúûúûúòKöúûúûúûúòKñ [fileName: ROPE, accessOptions: FS.AccessOptions _ read, streamOptions: FS.StreamOptions _ (3)[TRUE, TRUE, TRUE], keep: CARDINAL _ 1B (1), createByteCount: FS.ByteCount _ 2560, streamBufferParms: FS.StreamBufferParms _ [vmPagesPerBuffer: 8, nBuffers: 2], extendFileProc: FS.ExtendFileProc, wantedCreatedTime: GMT _ nullGMT, remoteCheck: BOOL _ TRUE, wDir: ROPE _ NIL, checkFileType: BOOL _ FALSE, fileType: FS.FileType _ [0B (0)]]öúûúûúûú6òLKñ[nChars: NAT]öúûúûú&ò3Köúûúò*Köúûúò.Kö	ú
+ûúûúûúûúò-KöúûúòKöúûúò KöúûúòKñ[self: STREAM]öúûúòKöú
+ûú	ûú%ò<öûúûúûú;ûúûúûòYKò&KöûúûúûúòKöûú"ò$KöûúòóöûúûúûúòKöú0ô0Kò
+KòKòóKöûú&ò(KöúòöûúûòKñP[self: STREAM, block: REF TEXT, startIndex: NAT _ 0, count: NAT _ 32767]öúûúûú$ò3KöúûúòKöúûúûúòö
+†
+úûúûúûúûúò.Köûúûúûúûúò0öûúòöûúòöûúûú
+ûúûò-Köûú ûúûúûúò6KöûúòóKöûú*ò,KöúûúòKöûúûúòKöúòóöûúòKöûúòKñP[self: STREAM, block: REF TEXT, startIndex: NAT _ 0, count: NAT _ 32767]öúûúòKöúûú)ò0Köûú;òAKòóóKòóKöûúûúûúòöûúûòöûúûòKöúòKö	úûúûú=ûúûúòkKöú
+ûú1ò>Köúûúòöûúûúò!KöúòKöûúòKöûúòKöúòóKöúòKöúòKòóKöú
+ò
+öûòKöúûúœcò/óKöûúòóKöúòKöûúûúûúò0KöûúòóKöúòKöûúòKöûúòKöúòKò óóôKöúûúò%öúûúûúò%Köúûú°ò*KöúòKöúòKò óöúûúûúòKöúûú°ò'Köú°ò+KòKò óKöú
+ûúûúò!öúûúûúòKöúûú°ò"Köúûúûú°ò1KòóKò ö†úûúûú:òZKöûòKöú%ô%ö†úûúûúûúûúûúûúûú°úòbKöúûúòöûúûúûú.ûúûúûúûúûòiKò#Köú6ò6KöûúòóKöûúòKòóKöú&ò&KöûúòóKò ö†úûú"ûúûúûúûúò{Köúûúò:öûúûúûúòKöúûúòKòKöúûú$ò=Köûúûú%ûúûúò6KöûúûúòKòóöúòKöûúûúûú0ûúûúûúûúûòqKò'öûúûú(òFKöûúûúûúòóKöûúòKöúûúAòZóKòKöûúûúòKöúòKò óö†úûúûú$ûúûúûúò{KöûòKöúAôAKöúûú)ò@Köûúûúûúûú	ò!öûúûúûú,ûúûúûúò[Kò#Köûú4ò:KöûúòóKöûúûúò4KöûúòóKò ö†úûúûú ûú	ûúûú-ûú	ûúûúòìKöûòKô*Köúûú%ò<Kö
+ûúûúûúûú	ûúò)öûúûúûú,ûúûúûúò[Kò'öûú
+ûúûú*ûò?Kö	úûúûúûú	ûúòSóKöûúòóKöûú	ûúòKöûúòKò óö†úûúûúûúòQKô`Köúûú!ò;öúûúò#KòKöúûúò!Kòóöûúûúûúûú ûúûúûòSKöúûúòöûúûúûúûú#ûúûúûòZKöú	ûúò"Köúûúò#öûú/ûúò7Köúûú&ò8KöúûúòKöúòKöúDòDKö
+ûúûúûúûúûúò,KöúUòUKòóKöûúòóKöûúòóKöûúò KòKò óö†úûúûúûúòIKöúûúûúòö
+†úûúûúûúûúòQKöúûúûúûúò"óKöú3ò3KöûúòóKò ö†úûúûú<òfö†úûúûúûúûú°úòtKöûúûú$ûúûúòRKöûúûúòKòóKöú$ò$KöûúòKò óö†úûúûúûúûú;ûúûúòÑKöúWôWKöú8œbúôFKöúûú!ò;ö	ûúûú ûúûúûòSKöúûúòöûúûúûúûú#ûúûúûòZKöú	ûúò"Köúûúò#öûú/ûúò7Köúûú&ò8KöúDûúûú
+ûúòqKöûúòKöûúò!óKöûúòóKöûúòóKòKò Kô óö†úûúûú	ûúûú%ûúòiKô1ö†úòöûúûúûòKöûúûúûú
+òKöúIòIKöúòóKòóKöú	ûúûúûúò#KöúûúòKòKöú3ò3Kö	ûúûúûúûú°ò@KöúòKöú3ò3Kö	ûúûúûúûú°ò@KöúòKöú3ò3Kö	ûúûúûúûú°ò@öúòKöûúûúûúûúò5KöúòóKöûúò"KòóKò óKò KöûúòKò Kò Kò Kò Kò Kò Kò ó Öó    &h  <∞  

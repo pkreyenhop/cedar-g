@@ -1,0 +1,835 @@
+
+DIRECTORY
+ForkOps,
+ImagerSample,
+IO,
+Process,
+Rope,
+RuntimeError,
+SF,
+SFInline,
+XlAssoc,
+Xl,
+XlBitmap,
+XlBitmapWindow,
+XlBitmapWindowPrivate,
+XlDetails,
+XlDispatch,
+XlShmPixmaps,
+XlSpeedHacks;
+
+XlBitmapWindowImpl: CEDAR MONITOR 
+LOCKS impl USING impl: Impl
+IMPORTS ForkOps, ImagerSample, IO, Process, RuntimeError, SF, SFInline, Xl, XlAssoc, XlBitmap, XlDetails, XlDispatch, XlShmPixmaps, XlSpeedHacks
+EXPORTS XlBitmapWindow =
+BEGIN OPEN XlBitmapWindow, XlBitmapWindowPrivate;
+
+
+debugging: BOOL ¨ FALSE;
+SetDebuggingTrue: PROC [] = {debugging ¨ TRUE};
+SetDebuggingFalse: PROC [] = {debugging ¨ FALSE};
+
+debugInvertFirst: BOOL ¨ FALSE;
+debugFlushAfterInvert: BOOL ¨ FALSE;
+debugPauseAfterInvert: BOOL ¨ FALSE;
+debugPauseAfterInvertCount: INT ¨ 0;
+DebugNormalPaint: PROC [] = {debugInvertFirst ¨ debugFlushAfterInvert ¨ debugPauseAfterInvert ¨ FALSE};
+DebugInvert: PROC [] = {debugInvertFirst ¨ TRUE; debugFlushAfterInvert ¨ debugPauseAfterInvert ¨ FALSE};
+DebugInvertAndFlush: PROC [] = {debugInvertFirst ¨ debugFlushAfterInvert ¨ TRUE; debugPauseAfterInvert ¨ FALSE};
+DebugInvertAndPause: PROC [] = {debugInvertFirst ¨ debugFlushAfterInvert ¨ debugPauseAfterInvert ¨ TRUE; debugPauseAfterInvertCount ¨ 10000};
+
+debugSynchronous: BOOL ¨ FALSE;
+debugSynchronousCOND: CONDITION;
+DebugSetSyncTrue: PROC [] = {debugSynchronous ¨ TRUE};
+DebugSetSyncFalse: PROC [] = {debugSynchronous ¨ FALSE};
+
+
+nastyErrorCount: CARD ¨ 0;
+normalErrorCount: CARD ¨ 0;
+requestedPaintCount: INT ¨ 0;
+actualPaintCount: INT ¨ 0;
+processStartedCount: INT ¨ 0;
+DebugPrintNormalErrors: PROC [] RETURNS [INT] = {RETURN [normalErrorCount]};
+DebugPrintNastyErrors: PROC [] RETURNS [INT] = {RETURN [nastyErrorCount]};
+DebugPrintRequestCount: PROC [] RETURNS [INT] = {RETURN [requestedPaintCount]};
+DebugPrintActualPaintCount: PROC [] RETURNS [INT] = {RETURN [actualPaintCount]};
+DebugPrintProcessStartCount: PROC [] RETURNS [INT] = {RETURN [processStartedCount]};
+DebugResetCounters: PROC [] = {requestedPaintCount ¨ actualPaintCount ¨ processStartedCount ¨ 0};
+
+yieldForEachRect: BOOL = FALSE; --extra yield would help speed at cost of latency
+
+waitBeforeFlush: BOOL ¨ TRUE; --extra wait to reduce number of flushes
+DebugWaitBeforeFlushTrue: PROC [] = {waitBeforeFlush ¨ TRUE};
+DebugWaitBeforeFlushFalse: PROC [] = {waitBeforeFlush ¨ FALSE};
+
+yieldBeforeFlush: BOOL ¨ FALSE; --extra yield to reduce number of flushes 
+DebugYieldBeforeFlushTrue: PROC [] = {yieldBeforeFlush ¨ TRUE};
+DebugYieldBeforeFlushFalse: PROC [] = {yieldBeforeFlush ¨ FALSE};
+
+
+Handle: TYPE = XlBitmapWindow.Handle;
+Impl: TYPE ~ REF ImplRep;
+ImplRep: PUBLIC TYPE = XlBitmapWindowPrivate.ImplRec;
+
+pseudoInfinitBox: SF.Box ~ [min: [-8000, -8000], max: [8000, 8000]]; --artificial clip region used to prevent arithmetic overflow
+
+sharedTQ: Xl.TQ ¨ Xl.CreateTQ[$XlBitmapWindow]; --shared thread; it won't crash 
+events: Xl.EventFilter ¨ Xl.CreateEventFilter[expose, unmapNotify, mapNotify, destroyNotify];
+associationTableKey: REF ATOM ¨ NEW[ATOM¨$Assoc]; --property key, 
+
+shmFLeniance: INTEGER ¨ 255;
+DebugSmallerShmFLeniance: PROC [] RETURNS [INTEGER] = {RETURN [shmFLeniance ¨ shmFLeniance / 2]};
+DebugLargerShmFLeniance: PROC [] RETURNS [INTEGER] = {RETURN [shmFLeniance ¨ shmFLeniance * 2 + 1]};
+
+
+Interesting: PROC [box1, box2: SF.Box, fLeniance: INTEGER] RETURNS [BOOL] ~ INLINE {
+sLeniance: INTEGER = 2;
+RETURN [box1.max.s >= box2.min.s+sLeniance AND box2.max.s+sLeniance >= box1.min.s AND box1.max.f+fLeniance >= box2.min.f AND box2.max.f+fLeniance >= box1.min.f];
+};
+
+Union: PROC [b1, b2: SF.Box] RETURNS [b: SF.Box] = {
+b.min ¨ SFInline.Min[b2.min, b1.min];
+b.max ¨ SFInline.Max[b2.max, b1.max];
+};
+
+Similar: PROC [i, j: INTEGER] RETURNS [BOOL] = {
+sLeniance: INTEGER = 2;
+sLenianceX: INTEGER = 5;
+Diff: PROC [i, j: INTEGER] RETURNS [diff: CARDINAL] = INLINE {
+diff ¨ LOOPHOLE[(i-j+sLeniance--modular arithmetic--), CARDINAL];
+};
+RETURN [Diff[i, j] < sLenianceX]
+};
+
+InternalRefresh: PUBLIC ENTRY PROC [impl: Impl, box: SF.Box] = {
+idx: BuffIndex ¨ 0; 
+thisIn: BuffIndex ~ impl.in;
+nextIn: BuffIndex ~ (thisIn + 1) MOD buffSize;
+IF ~impl.visible THEN RETURN;
+box ¨ SFInline.Intersect[box, impl.softClipBox];
+IF SFInline.Empty[box] THEN RETURN; 
+requestedPaintCount ¨ requestedPaintCount+1;
+DO --outer loop until no simplification is found (by inner loop)
+BEGIN
+FOR idx ¨ impl.out, ((idx+1) MOD buffSize) WHILE idx#thisIn DO
+IF Interesting[box, impl.buffer[idx], impl.fLeniance] THEN {
+b: SF.Box ~ impl.buffer[idx];
+IF SF.Inside[inner: box, outer: b] THEN RETURN;
+IF 
+(Similar[box.max.s, b.max.s] AND Similar[box.min.s, b.min.s]) OR
+SF.Inside[inner: b, outer: box] THEN {
+box ¨ Union[b, box]; 
+GOTO innerLoopSuccessful;
+};
+IF Similar[box.min.s, b.max.s] OR Similar[box.max.s, b.min.s] THEN {
+IF INTEGER[ABS[box.min.f-b.min.f]]<=impl.fLeniance AND INTEGER[ABS[box.max.f-b.max.f]]<=impl.fLeniance THEN {
+box ¨ Union[b, box]; 
+GOTO innerLoopSuccessful;
+};
+};
+};
+ENDLOOP; --the inner loop
+EXITS innerLoopSuccessful => {
+IF idx#impl.out THEN {
+impl.buffer[idx] ¨ impl.buffer[impl.out]; 
+};
+impl.out ¨ (impl.out+1) MOD buffSize; 
+LOOP; --try the outer loop again
+};
+END;
+EXIT --only repeat outer loop if inner loop was sucessfull
+ENDLOOP;
+IF nextIn=impl.out THEN {--looks pseudo empty but actually overly full
+box ¨ Union[box, impl.buffer[impl.out]];
+impl.out ¨ (impl.out+1) MOD buffSize; 
+};
+impl.buffer[thisIn] ¨ box; impl.in ¨ nextIn;
+TicklePainter[impl];
+WHILE debugSynchronous AND impl.out#impl.in DO WAIT debugSynchronousCOND; ENDLOOP;
+IF thisIn=impl.out --was empty or nearly empty-- AND impl.doingShortPause THEN 
+NOTIFY impl.shortPause;
+};
+
+ProbablyEmpty: PROC [impl: Impl] RETURNS [BOOL] = INLINE {
+RETURN [impl.in=impl.out];
+};
+
+RemoveRect: ENTRY PROC [impl: Impl] RETURNS [b: SF.Box] = {
+IF impl.in=impl.out 
+THEN b ¨ emptyBox 
+ELSE {
+b ¨ impl.buffer[impl.out];
+impl.out ¨ (impl.out+1) MOD buffSize; 
+};
+IF debugSynchronous THEN BROADCAST debugSynchronousCOND;
+};
+
+ShortWait: ENTRY PROC [impl: Impl] = {
+IF ProbablyEmpty[impl] THEN {
+impl.doingShortPause ¨ TRUE;
+WAIT impl.shortPause;
+impl.doingShortPause ¨ FALSE;
+};
+};
+
+TicklePainter: INTERNAL PROC [impl: Impl] = INLINE {
+IF ~impl.painterProcessRunning THEN {
+impl.painterProcessRunning ¨ TRUE;
+ForkOps.Fork[PainterProcess, impl, Process.priorityForeground];
+};
+};
+
+HandleError: PROC [data: REF] = {
+ShouldRetryPainter: ENTRY PROC [impl: Impl] RETURNS [BOOL] = {
+ENABLE UNWIND => NULL;
+InternalSetVisible[impl];
+IF ~impl.visible THEN impl.painterProcessRunning ¨ FALSE;
+BROADCAST impl.bufferEmpty;
+RETURN [impl.visible]
+};
+impl: Impl ¨ NARROW[data];
+Process.PauseMsec[100];  --slow down in case silly clients continuing paint requests after connection died
+IF ShouldRetryPainter[impl] THEN {
+ForkOps.Fork[PainterProcess, impl, Process.priorityForeground];
+};
+};
+
+AlIDone: ENTRY PROC [impl: Impl] RETURNS [--must exit process-- BOOL¨FALSE] = {
+IF ProbablyEmpty[impl] THEN {
+IF impl.mustNotifyBufferEmpty#0 THEN BROADCAST impl.bufferEmpty;
+impl.doingShortPause ¨ TRUE;
+WAIT impl.shortPause;
+impl.doingShortPause ¨ FALSE;
+IF ProbablyEmpty[impl] THEN {
+impl.painterProcessRunning ¨ FALSE;
+RETURN [TRUE];
+};
+};
+};
+
+PainterProcess: PROC [data: REF] = {
+ENABLE {
+Xl.XError, IO.Error, IO.EndOfStream => {
+normalErrorCount ¨ normalErrorCount+1;
+HandleError[data]; GOTO oops;
+};
+RuntimeError.UNCAUGHT => {
+nastyErrorCount ¨ nastyErrorCount+1;
+IF ~debugging THEN {HandleError[data]; GOTO oops};
+};
+};
+a: Atomic; box: SF.Box;
+impl: Impl ~ NARROW[data];
+processStartedCount ¨ processStartedCount +1; 
+DO
+Report: PROC [] = INLINE {
+FOR rl: LIST OF REF ReportRec ¨ impl.report, rl.rest WHILE rl#NIL DO
+rl.first.proc[box, rl.first.data]
+ENDLOOP;
+};
+IF yieldForEachRect THEN Process.Yield[];
+IF ProbablyEmpty[impl] THEN {
+IF impl.mustNotifyBufferEmpty#0 THEN {
+NotifyBufferEmpty[impl];
+};
+IF yieldBeforeFlush THEN Process.Yield[];
+IF waitBeforeFlush THEN ShortWait[impl];
+};
+IF ProbablyEmpty[impl] THEN {
+IF impl.visible THEN {
+IF (a ¨ impl.atomic)#NIL THEN Xl.Flush[a.conn];
+};
+IF AlIDone[impl] THEN RETURN[];
+};
+box ¨ RemoveRect[impl];
+IF (a ¨ impl.atomic)#NIL AND impl.visible THEN { 
+actualPaintCount ¨ actualPaintCount+1; 
+box ¨ SFInline.Intersect[box, a.bmClipBox];
+IF ~SFInline.Empty[box] THEN { 
+IF debugInvertFirst THEN {
+Xl.FillRectangle[c: a.conn, drawable: a.window.drawable, 
+pos: [a.origin.x+box.min.f, a.origin.y+box.min.s], 
+size: [box.max.f-box.min.f, box.max.s-box.min.s], 
+gc: a.gc];
+IF debugFlushAfterInvert THEN {
+Xl.Flush[a.conn];
+IF debugPauseAfterInvert AND debugPauseAfterInvertCount>0 THEN {
+debugPauseAfterInvertCount ¨ debugPauseAfterInvertCount-1;
+Process.PauseMsec[100];
+};
+};
+};
+IF a.useShm 
+THEN {
+IF a.shmPixmap = Xl.nullPixmap THEN {
+p: Xl.Pixmap ¨ Xl.nullPixmap;
+p ¨ XlShmPixmaps.UnsafeCreatePixmap[c: a.conn, drawable: a.window.drawable, sm: a.sm ! ANY => {
+a.useShm ¨ FALSE;
+a.hasShmB ¨ FALSE;
+impl.fLeniance ¨ 15;
+impl.onServerLimit ¨ 32;
+InternalRefresh[impl, box]; --back into queue
+LOOP;
+}];
+a.shmPixmap ¨ p;
+RememberPixmap[impl, p, a.conn];
+};
+IF a.useCopyPlane
+THEN Xl.CopyPlane[c: a.conn, src: a.shmPixmap.drawable, dst: a.window.drawable, 
+srcP: [box.min.f, box.min.s], 
+dstP: [a.origin.x+box.min.f, a.origin.y+box.min.s], 
+size: [box.max.f-box.min.f, box.max.s-box.min.s], 
+gc: a.gc, bitPlane: 1]
+ELSE Xl.CopyArea[c: a.conn, src: a.shmPixmap.drawable, dst: a.window.drawable, 
+srcP: [box.min.f, box.min.s], 
+dstP: [a.origin.x+box.min.f, a.origin.y+box.min.s], 
+size: [box.max.f-box.min.f, box.max.s-box.min.s], 
+gc: a.gc];
+}
+ELSE {
+dirtyFix: INT ¨ 0;
+SELECT a.bitsPerPixel FROM
+1 => {};
+8 => {
+dirtyFix ¨ box.min.f MOD 4; --Oops, this line knows unit size is 32...
+IF a.origin.x+box.min.f<dirtyFix THEN {
+dirtyFix ¨ dirtyFix - 4; 
+};
+};
+4 => {
+dirtyFix ¨ box.min.f MOD 8; --Oops, this line knows unit size is 32...
+IF a.origin.x+box.min.f<dirtyFix THEN {
+dirtyFix ¨ dirtyFix - 8; 
+};
+};
+24 => {
+dirtyFix ¨ box.min.f MOD 3; --Oops, this line knows unit size is 32...
+IF a.origin.x+box.min.f<dirtyFix THEN {
+dirtyFix ¨ dirtyFix - 3; 
+};
+};
+ENDCASE => RETURN; --not implemented
+Xl.PutImage[c: a.conn, drawable: a.window.drawable, gc: a.gc, 
+base: a.base, 
+dest: [a.origin.x+box.min.f-dirtyFix, a.origin.y+box.min.s], 
+size: [box.max.f-box.min.f+dirtyFix, box.max.s-box.min.s], 
+offx: box.min.f-dirtyFix, offy: box.min.s, 
+scanLineBytes: a.bytesPerLine, bitsPerPixel: a.bitsPerPixel];
+};
+Report[];
+impl.onServer ¨ impl.onServer+1;
+IF impl.onServer>=impl.onServerLimit THEN {
+newSeq: Xl.SequenceNo ¨ XlSpeedHacks.InitiateRoundTrip[a.conn];
+IF a.lastSeq#0 THEN XlSpeedHacks.WaitInitiatedRange[a.conn, a.lastSeq];
+a.lastSeq ¨ newSeq;
+impl.onServer ¨ 0;
+};
+};
+};
+ENDLOOP
+EXITS oops => {};
+};
+
+SetInterception: INTERNAL PROC [impl: Impl, newBm: XlBitmap.Bitmap] = {
+oldBm: XlBitmap.Bitmap ~ impl.interceptedBitmap;
+IF oldBm#newBm THEN {
+IF oldBm#NIL THEN {
+impl.interceptedBitmap ¨ NIL;
+XlBitmap.RemoveInterceptionProcs[oldBm, impl];
+};
+IF newBm#NIL THEN {
+impl.interceptedBitmap ¨ newBm;
+XlBitmap.RegisterInterceptionProcs[newBm, InterceptedRefresh, InterceptedPreRefresh, impl];
+};
+};
+};
+
+EventProc: Xl.EventProcType = {
+EntryDestroyEvent: ENTRY PROC [impl: Impl, w: Xl.Window] = {
+a: Atomic ~ impl.atomic;
+IF a#NIL AND a.window=w THEN {
+a.windowAlive ¨ FALSE; impl.hasWindow ¨ FALSE;
+impl.visible ¨ FALSE; impl.atomic ¨ NIL;
+};
+};
+EntryUnmapEvent: ENTRY PROC [impl: Impl, w: Xl.Window] = {
+a: Atomic ~ impl.atomic;
+IF a#NIL AND a.window=w THEN {
+impl.mapped ¨ FALSE;
+impl.visible ¨ FALSE;
+};
+};
+EntryMapEvent: ENTRY PROC [impl: Impl, w: Xl.Window] = {
+a: Atomic ~ impl.atomic;
+IF a#NIL AND a.window=w THEN {
+impl.mapped ¨ TRUE;
+InternalSetVisible[impl];
+};
+};
+WITH clientData SELECT FROM
+handle: Handle => {
+impl: Impl ~ handle.impl;
+SELECT event.type FROM
+expose => {
+e: Xl.ExposeEvent ~ NARROW[event];
+a: Atomic ~ impl.atomic;
+IF a#NIL THEN {
+InternalRefresh[impl, [
+min: [s: e.pos.y-a.origin.y, f: e.pos.x-a.origin.x], 
+max: [s: e.pos.y+e.size.height-a.origin.y, f: e.pos.x+e.size.width-a.origin.x]
+]]
+};
+};
+mapNotify => {
+mn: Xl.MapNotifyEvent ~ NARROW[event];
+EntryMapEvent[impl, mn.window];
+};
+unmapNotify => {
+un: Xl.UnmapNotifyEvent ~ NARROW[event];
+EntryUnmapEvent[impl, un.window];
+};
+destroyNotify => {
+dn: Xl.DestroyNotifyEvent ~ NARROW[event];
+EntryDestroyEvent[impl, dn.window];
+IF dn.window#Xl.nullWindow THEN { 
+table: XlAssoc.Table ¨ GetAssocTable[dn.connection];
+[] ¨ XlAssoc.RemoveWindow[table, dn.window];
+}
+};
+ENDCASE => {};
+};
+ENDCASE => {};
+};
+
+InternalSetVisible: INTERNAL PROC [impl: Impl] = {
+a: Atomic ~ impl.atomic;
+IF a=NIL 
+THEN impl.visible ¨ FALSE
+ELSE {
+impl.visible ¨ impl.mapped AND impl.hasWindow AND impl.hasBitmap AND a.windowAlive AND Xl.Alive[a.conn];
+IF a.useShm 
+THEN {
+impl.fLeniance ¨ shmFLeniance;
+impl.onServerLimit ¨ 128;
+}
+ELSE {
+impl.fLeniance ¨ 15;
+impl.onServerLimit ¨ 32;
+};
+};
+};
+
+CreateHandle: PUBLIC PROC [] RETURNS [handle: Handle] = {
+handle ¨ NEW[XlBitmapWindow.HandleRep ¨ [impl: NEW[ImplRep]]];
+TRUSTED {Process.SetTimeout[@handle.impl.bufferEmpty, Process.MsecToTicks[1000]]};
+TRUSTED {Process.SetTimeout[@handle.impl.shortPause, Process.MsecToTicks[20]]};
+};
+
+DestroyHandle: PUBLIC PROC [handle: Handle, destroyWindow: BOOL ¨ FALSE] = {
+impl: Impl ~ handle.impl;
+con: Xl.Connection;
+destroyW: Xl.Window ¨ Xl.nullWindow;
+ProtectedDestroyHandle: ENTRY PROC [impl: Impl] = {
+ENABLE UNWIND => NULL;
+bm: XlBitmap.Bitmap;
+a: Atomic ~ impl.atomic;
+SetInterception[impl, NIL];
+IF a=NIL THEN RETURN;
+con ¨ a.conn; 
+bm ¨ a.bm; 
+IF destroyWindow AND a.windowAlive THEN {
+destroyW ¨ a.window;  
+a.windowAlive ¨ FALSE;
+a.window ¨ Xl.nullWindow;
+};
+};
+impl.visible ¨ impl.hasBitmap ¨ FALSE;
+CancelRefreshs[handle];
+ProtectedDestroyHandle[impl];
+RememberPixmap[impl, Xl.nullPixmap, NIL];
+IF Xl.Alive[con] AND destroyW#Xl.nullWindow THEN {
+ENABLE Xl.XError => GOTO oops;
+Xl.RoundTrip[con]; --just make sure no request are on the way
+Xl.DestroyWindow[con, destroyW];
+Xl.Flush[con, TRUE];
+EXITS oops => {}
+};
+};
+
+InitAssocProp: Xl.InitializeProcType = {
+val ¨ XlAssoc.Create[];
+};
+
+GetAssocTable: PROC [c: Xl.Connection] RETURNS [table: XlAssoc.Table] = {
+WITH Xl.GetConnectionPropAndInit[c, associationTableKey, InitAssocProp] SELECT FROM
+table: XlAssoc.Table => RETURN [table];
+ENDCASE => ERROR;
+};
+
+SetWindow: PUBLIC PROC [handle: Handle, c: Xl.Connection ¨ NIL, w: Xl.Window ¨ Xl.nullWindow, immediateRefresh: BOOL ¨ TRUE, retainRefreshs: BOOL ¨ FALSE] = {
+impl: Impl ~ handle.impl;
+mustRoundTrip: BOOL ¨ FALSE; 
+ProtectedSetWindow: ENTRY PROC [impl: Impl] = {
+ENABLE UNWIND => NULL;
+table: XlAssoc.Table;
+old: Atomic ~ impl.atomic;
+a: Atomic ~ NEW[AtomicRec];
+IF ~retainRefreshs THEN InternalCancelRefreshs[impl];
+IF old#NIL THEN a≠ ¨ old≠;
+a.window ¨ w; a.conn ¨ c;
+table ¨ GetAssocTable[c];
+IF XlAssoc.InsertWindow[table, w] 
+THEN {
+screen: Xl.Screen ~ Xl.QueryScreen[c, w];
+a.gc ¨ Xl.MakeGContext[c, w.drawable];
+Xl.SetGCGraphicsExposures[a.gc, FALSE];
+Xl.SetGCGrounds[gc: a.gc, foreground: screen.blackPixel, background: screen.whitePixel];
+[] ¨ XlAssoc.StoreValue[table, w, a.gc];
+XlDispatch.AddMatch[c, w, NEW[Xl.MatchRep ¨ [proc: EventProc, handles: events, tq: sharedTQ, data: handle]], [exposure: TRUE, structureNotify: TRUE]];
+}
+ELSE { 
+a.gc ¨ Xl.NarrowGContext[XlAssoc.FetchValue[table, w].val];
+};
+a.hasShmC ¨ XlShmPixmaps.ConnectionSupportsPixmaps[c];
+a.useShm ¨ a.hasShmC AND a.hasShmB;
+impl.atomic ¨ a;
+impl.mapped ¨ TRUE; --too simple, but is optimization only
+impl.hasWindow ¨ TRUE;
+IF old#NIL AND ~retainRefreshs THEN mustRoundTrip ¨ TRUE;
+InternalSetVisible[impl];
+};
+IF ~Xl.Alive[c] OR w=Xl.nullWindow THEN RETURN;
+ProtectedSetWindow[impl];
+IF immediateRefresh THEN InternalRefresh[impl, pseudoInfinitBox];
+IF mustRoundTrip THEN Xl.RoundTrip[c];
+};
+
+ClearOutsideAreas: PROC [impl: Impl] = {
+ENABLE ANY => GOTO Oops;
+a: Atomic ¨ impl.atomic;
+IF a#NIL AND Xl.Alive[a.conn] AND a.window#Xl.nullWindow THEN {
+infinite: INT = 9999;
+r: SF.Box ¨ a.bmClipBox;
+IF a.origin.x>0 THEN {
+Xl.ClearArea[a.conn, a.window, [0, 0], [a.origin.x, infinite]];
+};
+IF a.origin.y>0 THEN {
+Xl.ClearArea[a.conn, a.window, [a.origin.x, 0], [infinite, a.origin.y]];
+};
+Xl.ClearArea[a.conn, a.window, [r.max.f+a.origin.x, a.origin.y], [infinite, infinite]];
+Xl.ClearArea[a.conn, a.window, [a.origin.x, r.max.s+a.origin.y], [infinite, infinite]];
+Xl.Flush[a.conn, TRUE];
+};
+EXITS Oops => {};
+};
+
+SetNoWindow: PUBLIC PROC [handle: Handle] = {
+impl: Impl ~ handle.impl;
+ProtectedSetNoWindow: ENTRY PROC [impl: Impl] = {
+a: Atomic ¨ impl.atomic;
+IF a#NIL THEN a.useShm ¨ a.hasShmC ¨ FALSE;
+impl.hasWindow ¨ impl.visible ¨ FALSE;
+SetInterception[impl, NIL];
+InternalCancelRefreshs[impl];
+};
+impl.visible ¨ FALSE;
+ProtectedSetNoWindow[impl];
+};
+
+SetBitmap: PUBLIC PROC [handle: Handle, bitmap: XlBitmap.Bitmap, restrict: SF.Box ¨ SF.maxBox, origin: Xl.Point ¨ [0, 0], immediateRefresh: BOOL ¨ TRUE, retainRefreshs: BOOL ¨ FALSE] = {
+IF bitmap=NIL THEN SetNoBitmap[handle] 
+ELSE {
+ProtectedSetBitmap: ENTRY PROC [impl: Impl] = {
+ENABLE UNWIND => NULL;
+old: Atomic ¨ impl.atomic;
+a: Atomic ¨ NEW[AtomicRec];
+IF ~retainRefreshs OR immediateRefresh THEN InternalCancelRefreshs[impl];
+IF old#NIL THEN {a≠ ¨ old≠};
+a.sm ¨ rsm;
+a.bm ¨ bitmap;
+a.origin ¨ origin; 
+a.bytesPerLine ¨ ImagerSample.GetBitsPerLine[rsm]/8;
+a.base ¨ LOOPHOLE[base.word]; 
+a.bitsPerPixel ¨ ImagerSample.GetBitsPerSample[rsm];
+a.hasShmB ¨ rsm#NIL AND XlShmPixmaps.SampleMapSupportsThis[rsm];
+a.shmPixmap ¨ Xl.nullPixmap;
+a.useCopyPlane ¨ a.bitsPerPixel=1;
+a.useShm ¨ a.hasShmB AND a.hasShmC;
+impl.softClipBox ¨ a.bmClipBox ¨ restrict;
+impl.atomic ¨ a;
+impl.hasBitmap ¨ bitmap#NIL;
+InternalSetVisible[impl];
+SetInterception[impl, bitmap];
+};
+impl: Impl ~ handle.impl;
+rsm: ImagerSample.RasterSampleMap ¨ NARROW[XlBitmap.GetSM[bitmap]];
+base: ImagerSample.BitAddress ¨ ImagerSample.GetBase[rsm];
+restrict ¨ SF.Intersect[restrict, SF.Intersect[pseudoInfinitBox, XlBitmap.GetBox[bitmap]]];
+IF ImagerSample.GetBitsPerLine[rsm] MOD 8 # 0 THEN ERROR;
+IF ~(origin.x IN [-8000..8000]) THEN ERROR;
+IF ~(origin.y IN [-8000..8000]) THEN ERROR;
+ProtectedSetBitmap[impl];
+ClearOutsideAreas[impl];
+IF immediateRefresh THEN InternalRefresh[impl, restrict];
+}
+};
+
+SetNoBitmap: PROC [handle: Handle] = {
+ProtectedSetNoBitmap: ENTRY PROC [impl: Impl] = {
+ENABLE UNWIND => NULL;
+old: Atomic ¨ impl.atomic;
+impl.atomic ¨ NIL;
+impl.softClipBox ¨ emptyBox;
+impl.hasBitmap ¨ FALSE;
+InternalCancelRefreshs[impl];
+SetInterception[impl, NIL];
+};
+ProtectedSetNoBitmap[handle.impl];
+};
+
+EntryCancelRefreshs: ENTRY PROC [impl: Impl] = {
+InternalCancelRefreshs[impl];
+};
+
+InternalCancelRefreshs: INTERNAL PROC [impl: Impl] = INLINE {
+impl.out ¨ impl.in;
+BROADCAST impl.bufferEmpty
+};
+
+CancelRefreshs: PUBLIC PROC [handle: Handle] = {
+EntryCancelRefreshs[handle.impl];
+};
+NotifyBufferEmpty: ENTRY PROC [impl: Impl] = {
+BROADCAST impl.bufferEmpty
+};
+
+WaitForBuffer: ENTRY PROC [impl: Impl] = {
+impl.mustNotifyBufferEmpty ¨ impl.mustNotifyBufferEmpty+1;
+WHILE impl.in#impl.out AND impl.visible DO
+WAIT impl.bufferEmpty
+ENDLOOP;  --possible race condition: empty buffer could get filled right away before leaving loop; this is not too bad since it will be emptied again some time later anyway...
+impl.mustNotifyBufferEmpty ¨ impl.mustNotifyBufferEmpty-1;
+};
+
+Wait: PUBLIC PROC [handle: Handle, server: BOOL] = {
+IF server 
+THEN {
+impl: Impl ~ handle.impl;
+a: Atomic ~ impl.atomic;
+IF ~impl.hasWindow THEN {
+FOR i: INT IN [0..20) DO 
+IF ~impl.painterProcessRunning THEN RETURN;
+IF i<10 THEN Process.Yield[] ELSE Process.PauseMsec[50];
+ENDLOOP;
+RETURN
+};
+IF a#NIL THEN {
+c: Xl.Connection ~ a.conn;
+IF Xl.Alive[c] THEN {
+seq: Xl.SequenceNo ¨ XlSpeedHacks.InitiateRoundTrip[c];
+WaitForBuffer[impl];
+XlSpeedHacks.WaitInitiatedRange[c, seq];
+};
+};
+}
+ELSE {
+WaitForBuffer[handle.impl];
+};
+Process.Yield[];
+};
+
+
+anUnfinishedImpl: Impl ¨ NIL;
+
+InterceptedPreRefresh: PROC [box: SF.Box, data: REF, delayOk: BOOL ¨ FALSE] = {
+impl: Impl ~ NARROW[data];
+impl.unfinishedBox ¨ box;
+anUnfinishedImpl ¨ impl;
+};
+
+InterceptedRefresh: PROC [box: SF.Box, data: REF, delayOk: BOOL ¨ FALSE] = {
+impl: Impl ~ NARROW[data];
+impl.thisUnfinishedKey ¨ impl.thisUnfinishedKey+1; --modular arithmetic
+anUnfinishedImpl ¨ NIL;
+InternalRefresh[impl, box];
+};
+
+lastPeriodicalImpl: Impl;
+PaintUnfinishedActions: PROC [x: REF] = {
+box: SF.Box;
+impl: Impl ¨ anUnfinishedImpl;
+IF impl#NIL THEN{
+IF impl=lastPeriodicalImpl THEN {
+box ¨ impl.unfinishedBox;
+IF impl.lastUnfinishedKey=impl.thisUnfinishedKey AND box=impl.unfinishedBox AND ProbablyEmpty[impl] THEN {
+a: Atomic ¨ impl.atomic;
+IF a#NIL AND a.useShm THEN InternalRefresh[impl, box];
+};
+};
+impl.lastUnfinishedKey ¨ impl.thisUnfinishedKey;
+};
+lastPeriodicalImpl ¨ impl;
+};
+
+RememberPixmap: ENTRY PROC [impl: Impl, p: Xl.Pixmap ¨ Xl.nullPixmap, c: Xl.Connection ¨ NIL] = {
+IF impl.pixmapAndConnection#NIL THEN {
+ForkOps.ForkDelayed[0, DestroyOldPixmap, impl.pixmapAndConnection];
+impl.pixmapAndConnection ¨ NIL;
+};
+IF c#NIL THEN {
+impl.pixmapAndConnection ¨ NEW[PixmapAndConnection ¨ [p, c]];
+};
+};
+
+DestroyOldPixmap: PROC [x: REF ANY] = {
+WITH x SELECT FROM
+pc: REF PixmapAndConnection => {
+IF pc.p#Xl.nullPixmap AND Xl.Alive[pc.c] THEN {
+Xl.FreePixmap[pc.c, pc.p, XlDetails.ignoreErrors];
+};
+};
+ENDCASE => {};
+};
+
+RegisterReportRefreshs: PUBLIC PROC [handle: Handle, proc: PROC[SF.Box, REF], data: REF] = {
+Reg: ENTRY PROC [impl: Impl, rep: REF ReportRec] = {
+impl.report ¨ CONS[rep, impl.report];
+};
+Reg[handle.impl, NEW[ReportRec ¨ [proc, data]]];
+};
+
+FlushSoon: PUBLIC PROC [handle: Handle] = {
+EntryFlushSoon: ENTRY PROC [impl: Impl] = {
+TicklePainter[impl];
+IF impl.doingShortPause THEN NOTIFY impl.shortPause;
+};
+impl: Impl ~ handle.impl;
+IF ProbablyEmpty[impl] THEN EntryFlushSoon[impl];
+};
+
+Init: PROC [] = {
+TRUSTED {Process.SetTimeout[@debugSynchronousCOND, Process.MsecToTicks[100]]};
+ForkOps.ForkPeriodically[40, PaintUnfinishedActions, NIL];
+};
+
+Init[];
+END.
+
+    XlBitmapWindowImpl.mesa
+Copyright ” 1988, 1989, 1990, 1991, 1992, 1993 by Xerox Corporation.  All rights reserved.
+Created by Christian Jacobi, April 13, 1988
+Christian Jacobi, April 19, 1993 10:44 am PDT
+ 
+On some future improvement round
+Make just 1 consumer process per connection instead one per window.
+Right now this is quite secondary, there are not that many bitmap windows that we have to worry about process count yet.
+Debugging and performance measuring
+Use the interpreter to set a values
+If this boolean is TRUE the this package is beeing debugged.  Error handlers then ought to raise errors and not continue, to enable finding bugs as close to the source as possible.  
+If this boolean is FALSE error handlers will try to catch any errors they can to keep the Cedar world alive and running.  
+DebugYieldForEachRectTrue: PROC [] = {yieldForEachRect _ TRUE};
+DebugYieldForEachRectFalse: PROC [] = {yieldForEachRect _ FALSE};
+Real implementation
+--stores assoc-table onto the event-connection
+Distance by which horizontally adjacent rectangles will be combined (if shared memory)
+Use the interpreter to change value
+--Test whether boxes are close to each other... 
+--More leniant in f direction
+--Boxes must neither be empty or extremely large for overflow protection please
+--Includes an area and tickles the painter
+--Doesn't crash; No enable...
+--This is an N**2 / 4 algortithm in worst case; however, notice that each time we re-execute the outer loop we did some simplification well worth paying for.  We don't want to stop at the first possible simplification.
+--inner loop: check for one possible simplification
+--note box neither empty nor extremely large...
+--neither is impl.buffer[idx] since we never include such into buffer
+--test for "words on same line" {Tioga with font changes}
+--test for fully enclosed
+--vertical adjacent test; {Tioga painting from top to bottom}
+--note: buffer NOT empty; otherwise we couldn't remove a thing
+note: impl.buffer[impl.out] has already been checked
+--this is too simple:
+--If buffer overflows we should put extra effort in simplifying
+--but here we punt and behave as if it were hopeless
+--probable only instead of certain when called ouside monitor
+--Not an infinite loop because if connection dies, ShouldRetryPainter will return FALSE 
+--Quietly stop refreshing, probably the connection died 
+--This is normal and not an error condition 
+--Never happens; a bug 
+--Note that we do NOT make window based requests waiting for a reply 
+--Maybe a simple bug. 
+--If the window has been destroyed without stopping the painters first
+--   this would raise an error in an independent thread and not here!  
+This is a possible optimization!   However there is yet no data whether it really helps.  The idea is that we give the painting process a chance to paint faster so we can omit a flush if this process is too fast.  Experiment: Watching the painting at one time did support that thesis; next time it did not.
+oops: window to miss signal because not monitored.  But signal times out and it is notified again when process terminates!
+--we wrongly believed shared memory would work
+--X protocol says left-pad must be 0 for zPixmap format
+--X11R2 version of server had bug requiring left-pad 0 even for 1 bit per pixel; We don't compensate for this old bug anymore.
+--@#$% Horrible case of unfriendly alignments
+--Prevent raising an error on negative dest.x. 
+--However, some pixels will be missing
+--@#$% Horrible case of unfriendly alignments
+--Prevent raising an error on negative dest.x. 
+--However, some pixels will be missing
+--@#$% Horrible case of unfriendly alignments
+--Prevent raising an error on negative dest.x. 
+--However, some pixels will be missing
+--count requests waiting on server to avoid having the server buffering
+--too many requests [which not only might need space, but more severly,
+--prevents those request from beeing optimized away anymore]
+--WARNING: dont ABORT breakpoints; called without UNWIND protection
+--reuse of a window 
+--switch data atomically 
+--eventual round trip to make sure old window does not get used anymore
+--visibility 
+--oops: assumes r.min=[0,0]
+--remember: paints [0, 0] of bitmap at point "origin" in window
+--clear left half space
+--clear direct upper and upper right quarter space
+--clear direct right and right lower quarter space
+--clear direct under and right lower quarter space
+--dont abort; caller does not catch UNWIND
+
+--special case of turning down widget interactions
+--No procedure raises errors! ENABLE Xl.XError => GOTO dead;
+--EXITS dead => {}
+--give the other guys a chance to leave the WaitForBuffer 
+--monitor before the first one to exit it fills it up again  
+--unfinished optimization 
+--	There is a global process (re)painting rectangles denoted by unfinished.
+--	The idea is to make long lasting actions visible before they are finished.
+ ù :  ïNewlineDelimiter
+ñ(cedarcode) styleò öúôIcodeöú
+œeúOôZKô+Kô-Kôóöœk	ò	KòKòKöûúòKòKòKòKöûúòKò	KöúòKöúòKò	KòKòKò
+KòKòKòKò óöœnúûúûúò"KöûúûúòKöûúûúûúûúFòêKöûúòóöûúûú'ò1Kò ô KôCKôxóóheadöú#ô#Köú#ô#Kò öúûúûúòKô∂KôzKöüúûúûúò/Köüúûúûúò1óKò KöúûúûúòKöúûúûúò$Köúûúûúò$öúûúò$KöüúûúJûúògKöüúûúûú2ûúòhKöüúûú2ûúûúòpKöüúûúJûú&òçKò óöúûúûúòKöúû	úò Köüúûúûúò6Köüúûúûúò8óKò Kò KöúûúòKöúûúòKöúûúòKöúûúòöúûúòKö
+üúûúûúûúûúòLKö
+üúûúûúûúûúòJKö
+üúûúûúûúûúòOKö
+üúûúûúûúûúòPKö
+üúûúûúûúûúòTKöüúûúIòaóKò öúûúûúœc1òQKöüúûúûúô?KöüúûúûúôAóKò öúûúûú†(òFKöüúûúûúò=Köüúûúûúò?Kò óöúûúûú†*òJKöüúûúûúò?KöüúûúûúòAóKò óôKò Köúûúò%Köúûúûú	òKöú	ûúûú!ò5Kò Köúûú1†<òÅKò Köúûú!† òPKöú]ò]ö
+úûúûúûúûú
+†òBKö†.ô.óKò öúûúòKôVKöú#ô#Kö
+üúûúûúûúûú$òaKö
+üúûúûúûúûú(òdóKò Kò öüúûúûúûúûúûúûúòTKô0KôKôOKöúûúòKöûú%ûú$ûú$ûú%ò°KòKò óö
+üúûú
+ûúûúûú	ò4Kò%Kò%KòóKò ö
+üúûúûúûúûúò0KöúûúòKöúûúòöüúûúûúûúûúûúò>Köúûú†úûúòAKòóKöûúò KòKò óö
+üúûúûúûúûú	ò@Kö†*ô*KôKòKòKöú!ûú
+ò.KöûúûúûúòKò0Köûúûúûúò$Kò,Kô⁄öûú†=ò@öûòJô3öûúûúûúûò>Köú,ûô/KôEöûú4ûúò<KöúûúòKöûúûúûúûúò/öûúòKô9Köúûúûò@Kôöûúûúò&KòKöûúòKòóóKöúûú!ûô=öûúûúûúòDöûúûúûú%ûúûúûú%ûúòmKòKöûúòKòóKòóKòóKöûú†òóöûúòJô>öûúûúòKò*Jô4KòóKöúûúò&Köûú†ò KòóKöûúòóKöûú†5ò:Köûúòóöûúûú†-òFKò(Köúûúò&KôKô?Kô4KòóKò,KòKö
+ûúûúûúûúûúòRö
+ûú†–cz†úûúûúòOKöûúòóKòKò óö
+üúûúûúûúûúò:Jöú–bfú3ô=KöûúòKòKò óö
+ü
+úûúûúûúûú	ò;öûúòKöûúòöûúòKòKöúûúò&KòóóKöûúûúû	úò8KòKò óöü	úûúûúò&öûúûúòKöúûúòKöûúòKöúûúòKòóKòóKò öüúûúûúûúò4öûúûúò%Köúûúò"Kò?KòóKòóKò öüúûúûúò!ö
+üúûúûúûúûúò>KöûúûúûúòKòKöûúûúûúò9Köû	úòKöûúòKòóKöúûúòKöú†Qòjöûúûúò"KöúE†úôXKò?KòóKòKò óöüúûúûúûú†úûúûúòOöûúûúòKöûúûúû	úò@KöúûúòKöûúòKöúûúòöûúûúòKöúûúò#KöûúûúòKòóKòóKòKò óöüúûúûúò$öûúòöúûúûúò(Kö†8ô8Kö†,ô,Kò&KöúûúòKòóöúûúòKö†ôKö†EôEKö†ôKö†FôFKöúE†ôGKò$Köûúûúûúò2KòóKòóKöúûúòKöúûúòKò.öûòöüúûúûúòöûúûúûúûú"ûúûúûòDKò!KöûúòóKòóöûúûúò)Jöúùœiúô≤óöûúûúòöûúûúò&JôzKòKòóKöûúûúò)Köûúûúò(KòóöûúûúòöûúûúòKöûúûúûúò/KòóKöûúûúûúòKòóKòöûúûúûúûúò1Kò'Kò+öûúûúòöûúûúòKò´öûúûúòKöúòöûúûúûúò@Kò:KòKòóKòóKòóöûú
+òöûúòöûúûúò%KòöúWûúò_Köú.ô.KöúûúòKöúûúòKòKòKöú†ò-KöûúòKòóKòKò KòóöûúòKöûúÍòÓKöûú›ò·óKòóöûúòKöœb7ô7Kô~Köú
+ûúòöûúûòKöúòöúòKöúûú†*òFöûúûúò'Kö§-ô-Köú/ô/Köú&ô&KòKòóKöúòóöúòKöúûú†*òFöûúûúò'Kö§-ô-Köú/ô/Köú&ô&KòKòóKöúòóöúòKöúûú†*òFöûúûúò'Kö§-ô-Köú/ô/Köú&ô&KòKòóKöúòóKöûúûú†ò$óKöú±ò±KòóóKò	Kö†GôGKö†GôGKö†<ô<Kò öûú#ûúò+Kò?Köûúûú4òGKòKòKòóKòóKòóKöûòóKöûúòKòóKò öüúûúûú)òGKò0öûúûúòöûúûúûúòKöúûúòKò.KòóöûúûúûúòKòKò[KòóKòóKòóKò öü	úòöüúûúûúò<KòöûúûúûúûúòKöúûúûúò.Köúûúûúò(KòóKòóöüúûúûúò:KòöûúûúûúûúòKöúûúòKöúûúòKòóKòóöüúûúûúò8KòöûúûúûúûúòKöúûúòKòKòóKòóöûúûúûòòKòöûúûòòKöúûúò"KòöûúûúûúòòKò5KòNKòóKòóKòóòKöúûúò&KòKòóöúòKöúûúò(Kò!KòóòKöúûúò*Kò#öûúûúò"Kò4Kò,KòóKòóKöûúòóKòóKöûúòóKòóKò öüúûúûúò2KôCKòöûúûúò	KöûúûòöûúòKöúûúûúûúûúûúòhöûú
+òöûúòKòKòKòóöûúòKòKòKòóóKòóóKòóKò öüúûúûúûúò9Köú	ûú#ûúò>KöûúKòRKöûúHòOKòóKò ö
+üúûúûú!ûúûúòLKòKöúòKò$öüúûúûúò3KöûúûúûúòKòKòKöúûúòKöûúûúûúûúòKòKòöûúûúûúò)KòKöúûúòKòKòóKòóKöú ûúò&KòKòKöú$ûúò)öûúûúûúò2KöûúûúòKöú†*ò=Kò KöúûúòKöûúòKòóKòóKò öüúò(KòKòKò óöüúûúûúûúòIöûúûúAûúûòSKöúûú	ò'KöûúûúòóKòóKò öü	úûúûúûúûúûú
+ûúûúûúûúûúòûKòKöúûúûúòöüúûúûúò/KöûúûúûúòKöúòKòKöúûúòKöûúûúò5KöûúûúûúòKòKòöûú ò"öûúòKöú)ò)Kò&Köú ûúò'KöúXòXKò(Köúûú[ûúûúòñKòóöûúòKö†ôKò;KòóóKö†úôKò6Köúûúò#KòKöúûú†&ò:KöúûúòKö†GôGKö
+ûúûúûúûúûúò9Kö†úôKòKòóKö
+ûúûú
+ûúûúûúò/KöúòKöûúûú)òAKöûúûúò&Kòóöüúûúò(KöûúûúûúòKòö
+ûúûúûúûúûúò?Köú
+ûúòKöúûúòKôKô?KôöûúûúòKöú?ò?KòóKô2öûúûúòKöúHòHKòóKô2KöúWòWKô2KöúWòWKöúûúòKòóKöûúòKòóKò öüúûúûúò-Kòöüúûúûúò1KòKöûúûúûúûúò+Köú ûúò&KöúûúòKòKòóKöúûúòKöúòKòóKò öü	úûúûú5ûúûúûú#ûúûúûúûúò∫Köûúûúûúò'öûúòöüúûúûúò/KöûúûúûúòKòKöúûúòKöûúûúûúòIKöûúûúûúòKòKòKòKò4Köú	ûúòKò4Köúûúûú)ò@KòKò"Köúûúò#Kò*KòKöúûúòKòKòKòóKòKöú$ûúòCKò:Köúûúûú7ò[Köûú"ûúûúûúò9Köûúûúûúûúò+Köûúûúûúûúò+KòKòKöûúûú!ò9KòóKòKò óöüúûúò&öüúûúûúò1KöûúûúûúòKòKöúûúòKòKöúûúòKòKöúûúòKòóKò"KòKò óöüúûúûúò0KòKòóKò öüúûúûúûúò=Kô*KòKöû	úòKòóKò öüúûúûúò0Kò!KòKô óöüúûúûúò.Köû	úòKòKò óöüúûúûúò*Kò:öûúûúûò*KöûúòKöûú†•òØóKò:KòóKò öüúûúûúûúò4öûúò
+öûúòKòKòöûúûúòKô2öûúûúûú	ûúòKöûúûúûúò+Köûúûúûúò8KöûúòóKöûòKòóöûúûúûúòKòöûúûúòKô<Kò7KòKò(KôKòóKòóKòóöûúòKòKòóóòKö†:ô:Kö†=ô=óKòóKò óKò KöúûúòKò öüúûúûúûúûúûúòOKôKôKKôMKöúûúòKòKòKòKò óöüúûúûúûúûúûúòLKöúûúòKöú3†òGKöúûúòKòKòóKò Kòöüúûúûúò)KöúûúòKòöûúûúûúòöûúûúò!Kòöûú/ûúûúûúòjKòKöûúûúûú
+ûúò6KòóKòóKò0KòóKòKòóKò öüúûúûú?ûúòaöûúûúûúò&KòCKöúûúòKòóöûúûúûúòKöúûúò=KòóKòóKò öüúûúûúûúò'öûúûúûòöúûúò öûúûúûúò/Kò2KòóKòóKöûúòóKòóKò öüúûúûúûúûúûú	ûúò\öüúûúûúûúò4Köúûúò%KòóKöúûúò0KòKò óöü	úûúûúò+öüúûúûúò+KòKöûúûúûúò4KòóKòKöûúûúò1KòóKò öüúûúòKöûúGòNKöú5ûúò:KòóKò KòKöûúòKò ó Öó    U  Éh  

@@ -1,0 +1,566 @@
+
+
+DIRECTORY
+Ascii USING [Lower, Upper, NUL, SP],
+Atom USING [GetPName, MakeAtom],
+BasicTime USING [GMT, Period],
+IO USING [BreakProc, EndOfStream, GetTokenRope, GetLineRope, TokenProc, GetChar, SkipWhitespace, PeekChar, GetRopeLiteral, Error, STREAM, PutRope, PutF1, RIS, rope],
+PatternMatch USING [CheckPattern, DWIM, Lookup, MatchProc],
+Rope USING [Cat, Concat, Equal, Fetch, FromChar, Index, Length, Replace, ROPE, Run, SkipTo, Substr, Translate, TranslatorType],
+Tempus USING [Adjust, Parse, Precision, MakeRope, Unintelligible],
+LoganBerry,
+LoganQueryClass,
+LoganQuery;
+
+LoganQueryImpl: CEDAR PROGRAM
+IMPORTS Ascii, Atom, BasicTime, IO, PatternMatch, Rope, Tempus, LoganBerry, LoganQueryClass
+EXPORTS LoganQuery
+~ BEGIN OPEN LoganQuery;
+
+ROPE: TYPE ~ Rope.ROPE;
+STREAM: TYPE ~ IO.STREAM;
+
+NextEntry: PUBLIC PROC [cursor: Cursor, dir: CursorDirection ¨ increasing] RETURNS [entry: LoganBerry.Entry] = {
+IF cursor.class.retrieve = NIL THEN RETURN[NIL];
+RETURN[cursor.class.retrieve[cursor, dir]];
+};
+
+EndGenerate: PUBLIC PROC [cursor: Cursor] RETURNS [] = {
+IF cursor.class.destroy = NIL THEN RETURN;
+cursor.class.destroy[cursor];
+};
+
+QueryEntries: PUBLIC PROC [db: LoganBerry.OpenDB, patterns: AttributePatterns, baseIndex: LoganBerry.AttributeType ¨ NIL, defaultPattern: PatternType ¨ "DWIM", planOnly: BOOLEAN ¨ FALSE] RETURNS [cursor: Cursor, plan: QueryPlan] ~ {
+dbInfo: LoganBerry.SchemaInfo ¨ LoganBerry.Describe[db: db];
+base: SubPlan ¨ NIL;
+FOR p: AttributePatterns ¨ patterns, p.rest WHILE p # NIL DO
+possibleBase: BOOLEAN = baseIndex=NIL OR baseIndex=p.first.attr.type;
+new: SubPlan ¨ AnalyzeSubPlan[p.first, dbInfo, possibleBase, defaultPattern];
+SELECT TRUE FROM
+NOT possibleBase, new.itype = $notAnIndex => plan ¨ CONS[new, plan];
+baseIndex = p.first.attr.type, base = NIL => base ¨ new;
+new.cost <= base.cost => {  -- new best base
+plan ¨ CONS[base, plan];
+base ¨ new;
+};
+ENDCASE => plan ¨ CONS[new, plan];  -- new plan not best
+ENDLOOP;
+IF base = NIL THEN {  -- no attribute pattern for base
+IF baseIndex = NIL THEN baseIndex ¨ dbInfo.indices.first.key;  -- pick arbitrary base
+base ¨ AnalyzeSubPlan[NEW[AttributePatternRec ¨ [attr: [baseIndex, NIL], ptype: NIL]], dbInfo, TRUE, defaultPattern];
+};
+IF base.itype = $notAnIndex THEN 
+ERROR LoganBerry.Error[$NoIndex, "No suitable base index"];
+plan ¨ CONS[base, plan];
+IF planOnly THEN RETURN;
+cursor ¨ LoganQueryClass.GenerateEntries[db: db, key: base.attr.type, start: base.start, end: base.end];
+FOR p: QueryPlan ¨ plan, p.rest WHILE p # NIL DO
+IF NOT Rope.Equal[p.first.attr.value, ""] AND p.first.filter#NIL THEN
+cursor ¨ LoganQueryClass.FilterEntries[input: cursor, pattern: p.first.attr.value, filter: p.first.filter, atype: p.first.attr.type, stopIfNothingGreater: FALSE];
+ENDLOOP;
+cursor ¨ LoganQueryClass.EnableAborts[input: cursor];
+};
+
+AnalyzeSubPlan: PROC [p: AttributePattern, dbInfo: LoganBerry.SchemaInfo, computeCost: BOOLEAN ¨ TRUE, defaultPattern: PatternType] RETURNS [plan: SubPlan] ~ {
+okPattern: BOOLEAN;
+plan ¨ NEW[SubPlanRec ¨ [attr: p.attr, ptype: p.ptype]];
+IF plan.ptype=NIL THEN plan.ptype ¨ defaultPattern; 
+IF Rope.Equal[plan.ptype, "DWIM", FALSE] THEN {
+plan.wasDWIM ¨ TRUE;
+plan.ptype ¨ PatternMatch.DWIM[plan.attr.value];
+};
+plan.filter ¨ PatternMatch.Lookup[plan.ptype];
+IF plan.filter=NIL THEN
+plan.errMsg ¨ "INVALID PATTERN MATCHING";
+[okPattern, plan.infoMsg] ¨ PatternMatch.CheckPattern[plan.attr.value, plan.filter];
+IF NOT okPattern THEN 
+plan.errMsg ¨ "BAD PATTERN";
+IF plan.wasDWIM THEN 
+plan.infoMsg ¨ Rope.Cat["using ", plan.ptype, "...", plan.infoMsg];
+IF NOT computeCost THEN RETURN;
+FOR i: LIST OF LoganBerry.IndexInfo ¨ dbInfo.indices, i.rest WHILE i#NIL DO
+IF i.first.key = plan.attr.type THEN {
+plan.itype ¨ i.first.order;
+EXIT;
+};
+ENDLOOP;
+IF plan.itype = $notAnIndex THEN RETURN;
+[plan.start, plan.end] ¨ BaseStartEnd[plan.attr.value, plan.ptype, plan.itype];
+plan.cost ¨ QueryCost[plan.start, plan.end, plan.itype];
+};
+
+QueryCost: PROC [start, end: ROPE, itype: ATOM ¨ $lex] RETURNS [est: REAL ¨ 1.0] ~ {
+N: NAT = 5;
+run: INT;
+sChar, eChar: CHAR;
+IF end=NIL THEN RETURN[1.0];
+IF start=NIL THEN start ¨ " ";
+SELECT itype FROM
+$lex, $ascii => {
+run ¨ Rope.Run[s1: start, s2: end, case: itype=$ascii];
+IF run > N THEN RETURN[0.0];  -- the query has negligible cost
+est ¨ 1.0;
+THROUGH [1..run] DO est ¨ est*0.01; ENDLOOP;  -- est ¨ 1/100run
+sChar ¨ IF Rope.Length[start] <= run THEN '  ELSE Rope.Fetch[start, run];
+eChar ¨ IF Rope.Length[end] <= run THEN '  ELSE Rope.Fetch[end, run];
+IF itype=$lex THEN {
+sChar ¨ Ascii.Upper[sChar];
+eChar ¨ Ascii.Upper[eChar];
+};
+est ¨ est*MIN[eChar-sChar,100]*0.01;
+};
+$gmt => {
+startDate, endDate: BasicTime.GMT;
+year: REAL ¨ 31536000.0;
+startDate ¨ Tempus.Parse[rope: start, search: TRUE ! Tempus.Unintelligible => GOTO BadPattern].time;
+endDate ¨ Tempus.Parse[rope: end, search: TRUE ! Tempus.Unintelligible => GOTO BadPattern].time;
+est ¨ BasicTime.Period[from: startDate, to: endDate]/year;  -- assume one year is complete database
+IF est < 0 OR est > 1.0 THEN est ¨ 1.0;
+EXITS
+BadPattern => RETURN[1.0];
+};
+ENDCASE => RETURN[0.5];  -- don't know the index layout so assume half the index will be needed on average
+};
+
+BaseStartEnd: PROC [pattern: ROPE, ptype: ROPE, itype: ATOM ¨ $lex] RETURNS [start, end: ROPE] ~ {
+ENABLE SyntaxError => {start ¨ end ¨ NIL; CONTINUE;};  -- raised by ParseSubrange
+Bump: PROC [old: ROPE] RETURNS [new: ROPE] ~ INLINE {
+last: INT = Rope.Length[old] - 1;
+new ¨ IF last >= 0 THEN Rope.Replace[base: old, start: last, len: 1, with: Rope.FromChar[SUCC[Ascii.Lower[Rope.Fetch[old, last]]]]] ELSE NIL;
+};
+Upper: Rope.TranslatorType = {
+new: CHAR ¨ Ascii.Upper[old];
+RETURN[new];
+};
+Lower: Rope.TranslatorType = {
+new: CHAR ¨ Ascii.Lower[old]; 
+RETURN[new];
+};
+SELECT itype FROM
+$lex => {
+SELECT TRUE FROM
+Rope.Equal[ptype, "exact", FALSE] => {
+start ¨ pattern;
+end ¨ pattern;
+};
+Rope.Equal[ptype, "prefix", FALSE] => {
+start ¨ pattern;
+end ¨ Bump[start];
+};
+Rope.Equal[ptype, "wildcard", FALSE] => {
+start ¨ Rope.Substr[base: pattern, len: Rope.Index[s1: pattern, s2: "*"]];
+end ¨ Bump[start];
+};
+Rope.Equal[ptype, "re", FALSE] => {
+i: INT ¨ Rope.SkipTo[s: pattern, skip: "\'#[^$*+(\\<{!"];  -- look for special chars
+IF NOT i = Rope.Length[pattern] AND Rope.Fetch[pattern, i] = '* THEN  -- could be zero of previous char
+i ¨ i-1;
+start ¨ Rope.Substr[base: pattern, len: i];
+end ¨ Bump[start];
+};
+Rope.Equal[ptype, "soundex", FALSE] => {
+start ¨ Rope.FromChar[Rope.Fetch[base: pattern, index: 0]];
+end ¨ Bump[start];
+};
+Rope.Equal[ptype, "subrange", FALSE] => {
+[start, end] ¨ ParseSubrange[pattern];
+};
+Rope.Equal[ptype, "numrange", FALSE] => {
+s, e: ROPE;
+[s, e] ¨ ParseSubrange[pattern ! SyntaxError => {start ¨ NIL; CONTINUE}];
+IF Rope.Length[s] = Rope.Length[e]
+THEN {
+start ¨ Rope.Substr[base: s, len: Rope.Run[s1: s, s2: e]];
+end ¨ Bump[start];
+}
+ELSE start ¨ end ¨ NIL;  -- can do nothing intelligent, e.g. 300-3000
+};
+Rope.Equal[ptype, "daterange", FALSE] => {
+start ¨ end ¨ NIL;  -- can do nothing intelligent
+};
+Rope.Equal[ptype, "date", FALSE] => {
+start ¨ end ¨ NIL;  -- can do nothing intelligent
+};
+ENDCASE => start ¨ end ¨ NIL;
+};
+$ascii => {
+start ¨ BaseStartEnd[Rope.Translate[base: pattern, translator: Upper], ptype, $lex].start;
+end ¨ BaseStartEnd[Rope.Translate[base: pattern, translator: Lower], ptype, $lex].end;
+};
+$gmt => {
+SELECT TRUE FROM
+Rope.Equal[ptype, "date", FALSE] => {
+patternDate: BasicTime.GMT;
+patternPrecision: Tempus.Precision;
+[patternDate, patternPrecision] ¨ Tempus.Parse[rope: pattern, search: TRUE ! Tempus.Unintelligible => GOTO BadPattern];
+start ¨ Tempus.MakeRope[time: patternDate, precision: patternPrecision];
+[patternDate, patternPrecision] ¨ SELECT patternPrecision FROM
+years => Tempus.Adjust[years: 1, baseTime: patternDate],
+months => Tempus.Adjust[months: 1, baseTime: patternDate],
+days => Tempus.Adjust[days: 1, baseTime: patternDate],
+hours => Tempus.Adjust[hours: 1, baseTime: patternDate],
+minutes => Tempus.Adjust[minutes: 1, baseTime: patternDate],
+seconds => Tempus.Adjust[seconds: 1, baseTime: patternDate],
+ENDCASE => Tempus.Adjust[seconds: 1, baseTime: patternDate];
+end ¨ Tempus.MakeRope[time: patternDate, precision: patternPrecision];
+EXITS
+BadPattern => start ¨ end ¨ NIL;
+};
+Rope.Equal[ptype, "daterange", FALSE] => {
+patternDate: BasicTime.GMT;
+patternPrecision: Tempus.Precision;
+[start, end] ¨ ParseSubrange[pattern];
+[patternDate, patternPrecision] ¨ Tempus.Parse[rope: start, search: TRUE ! Tempus.Unintelligible => GOTO BadPattern];
+start ¨ Tempus.MakeRope[time: patternDate, precision: patternPrecision];
+[patternDate, patternPrecision] ¨ Tempus.Parse[rope: end, search: TRUE ! Tempus.Unintelligible => GOTO BadPattern];
+patternDate ¨ SELECT patternPrecision FROM
+years => Tempus.Adjust[baseTime: patternDate, years: 1, seconds: -1].time,
+months => Tempus.Adjust[baseTime: patternDate, months: 1, seconds: -1].time,
+days => Tempus.Adjust[baseTime: patternDate, days: 1, seconds: -1].time,
+hours => Tempus.Adjust[baseTime: patternDate, hours: 1, seconds: -1].time,
+minutes => Tempus.Adjust[baseTime: patternDate, minutes: 1, seconds: -1].time,
+ENDCASE => Tempus.Adjust[baseTime: patternDate, seconds: 1].time;
+end ¨ Tempus.MakeRope[time: patternDate, precision: seconds];
+EXITS
+BadPattern => start ¨ end ¨ NIL;
+};
+ENDCASE => start ¨ end ¨ NIL;
+};
+$int => {
+SELECT TRUE FROM
+Rope.Equal[ptype, "exact", FALSE] => 
+start ¨ end ¨ pattern;
+Rope.Equal[ptype, "intrange", FALSE] => [start, end] ¨ ParseSubrange[pattern];
+ENDCASE => start ¨ end ¨ NIL;
+};
+ENDCASE => start ¨ end ¨ NIL;  -- search complete database
+};
+SyntaxError: PUBLIC ERROR [explanation: ROPE ¨ NIL] = CODE;
+
+ReadAttributePattern: PROC [s: STREAM, prefetch: ROPE ¨ NIL] RETURNS [a: AttributePattern] ~ {
+ENABLE IO.EndOfStream => ERROR SyntaxError["unexpected end of input"];
+ch: CHAR;
+token: ROPE ¨ prefetch;
+IF token = NIL THEN
+token ¨ IO.GetTokenRope[s, IO.TokenProc ! IO.EndOfStream => GOTO none].token;
+a ¨ NEW[AttributePatternRec];
+a.attr.type ¨ Atom.MakeAtom[token];
+ch ¨ IO.GetChar[s];  -- attribute separation char or "("
+IF ch = '( THEN {  -- read pattern type
+a.ptype ¨ IO.GetTokenRope[s, IO.TokenProc].token;
+ch ¨ IO.GetChar[s];
+IF ch # ') THEN ERROR SyntaxError[Rope.Concat["unmatched ()'s: last read ", a.ptype]];
+ch ¨ IO.GetChar[s];
+};
+IF ch # ': THEN ERROR SyntaxError[Rope.Concat["missing colon: last read ", a.ptype]];
+[] ¨ IO.SkipWhitespace[stream: s, flushComments: FALSE];
+IF IO.PeekChar[s] = '" THEN {
+a.attr.value ¨ IO.GetRopeLiteral[s ! IO.Error => ERROR SyntaxError["Malformed rope literal"]];
+} 
+ELSE 
+a.attr.value ¨ IO.GetTokenRope[s, TokenProc].token;
+EXITS
+none => RETURN[NIL];
+};
+
+ReadAttributePatterns: PUBLIC PROC [s: IO.STREAM] RETURNS [ap: AttributePatterns] ~ {
+a: AttributePattern;
+endOfAp: AttributePatterns ¨ NIL;
+a ¨ ReadAttributePattern[s];
+WHILE a # NIL DO
+IF endOfAp = NIL THEN
+ap ¨ endOfAp ¨ LIST[a]
+ELSE {
+endOfAp.rest ¨ LIST[a];
+endOfAp ¨ endOfAp.rest;
+};
+a ¨ ReadAttributePattern[s];
+ENDLOOP;
+};
+
+WriteAttributePattern: PROC [s: IO.STREAM, a: AttributePattern] RETURNS [] ~ {
+IO.PutRope[s, Atom.GetPName[a.attr.type]];
+IF a.ptype # NIL THEN IO.PutF1[s, "(%g)", IO.rope[a.ptype]];
+IO.PutF1[s, ": ""%g"" ", IO.rope[a.attr.value]];
+};
+
+WriteAttributePatterns: PUBLIC PROC [s: IO.STREAM, ap: AttributePatterns] RETURNS [] ~ {
+FOR p: AttributePatterns ¨ ap, p.rest WHILE p # NIL DO
+WriteAttributePattern[s, p.first];
+ENDLOOP;
+};
+
+PatternsToEntry: PUBLIC PROC [ap: AttributePatterns] RETURNS [entry: LoganBerry.Entry] ~ {
+endOfEntry: LoganBerry.Entry ¨ NIL;
+FOR p: AttributePatterns ¨ ap, p.rest WHILE p # NIL DO
+IF endOfEntry = NIL THEN
+entry ¨ endOfEntry ¨ LIST[p.first.attr]
+ELSE {
+endOfEntry.rest ¨ LIST[p.first.attr];
+endOfEntry ¨ endOfEntry.rest;
+};
+ENDLOOP;
+};
+
+EntryToPatterns: PUBLIC PROC [entry: LoganBerry.Entry] RETURNS [ap: AttributePatterns] ~ {
+pattern: AttributePattern;
+endOfPattern: AttributePatterns ¨ NIL;
+FOR e: LoganBerry.Entry ¨ entry, e.rest WHILE e # NIL DO
+pattern ¨ NEW[AttributePatternRec ¨ [attr: e.first]];
+IF endOfPattern = NIL THEN
+ap ¨ endOfPattern ¨ LIST[pattern]
+ELSE {
+endOfPattern.rest ¨ LIST[pattern];
+endOfPattern ¨ endOfPattern.rest;
+};
+ENDLOOP;
+};
+
+BooleanFilterEntries: PUBLIC PROC [input: Cursor, query: ParseTree, inputOrder: LoganBerry.AttributeType, primaryKey: LoganBerry.AttributeType, defaultPattern: PatternType ¨ "DWIM"] RETURNS [output: Cursor] ~ {
+output ¨ CursorForSubtree[input, query, inputOrder, primaryKey, defaultPattern];
+output ¨ LoganQueryClass.EnableAborts[input: output];
+};
+
+CursorForSubtree: PROC [input: Cursor, node: ParseNode, order, key: LoganBerry.AttributeType, dp: PatternType] RETURNS [output: Cursor] ~ {
+LookupFilter: PROC [ap: AttributePattern, default: PatternType] RETURNS [proc: PatternMatch.MatchProc] ~ {
+IF ap.ptype=NIL THEN ap.ptype ¨ default; 
+IF Rope.Equal[ap.ptype, "DWIM", FALSE] THEN 
+ap.ptype ¨ PatternMatch.DWIM[ap.attr.value];
+proc ¨ PatternMatch.Lookup[ap.ptype];
+};
+SELECT node.tag FROM
+$and => {
+output1: Cursor ¨ CursorForSubtree[input, node.child1, order, key, dp];
+output ¨ CursorForSubtree[output1, node.child2, order, key, dp];
+};
+$or => {
+input1, input2, output1, output2: Cursor;
+[input1, input2] ¨ LoganQueryClass.DuplicateEntries[input];
+output1 ¨ CursorForSubtree[input1, node.child1, order, key, dp];
+output2 ¨ CursorForSubtree[input2, node.child2, order, key, dp];
+output ¨ LoganQueryClass.MergeEntries[output1, output2, order];
+IF order = key THEN
+output ¨ LoganQueryClass.UnDuplicateEntries[output, order];
+};
+$not => {
+input1, fullinput, output1: Cursor;
+IF node.child1.tag = $ap THEN {  -- simple case
+output ¨ LoganQueryClass.AntiFilterEntries[input: input, pattern: node.child1.ap.attr.value, filter: LookupFilter[node.child1.ap, dp], atype: node.child1.ap.attr.type];
+RETURN [output];
+};
+[input1, fullinput] ¨ LoganQueryClass.DuplicateEntries[input];
+output1 ¨ CursorForSubtree[input1, node.child1, order, key, dp];
+output ¨ LoganQueryClass.SubtractEntries[fullinput, output1, key, order];
+};
+$ap => {
+output ¨ LoganQueryClass.FilterEntries[input: input, pattern: node.ap.attr.value, filter: LookupFilter[node.ap, dp], atype: node.ap.attr.type];
+};
+ENDCASE;
+};
+TokenStream: TYPE = REF TokenStreamRec;
+TokenStreamRec: TYPE = RECORD [
+stream: STREAM,
+prefetch: ROPE _ NIL
+];
+
+ParseBooleanQuery: PUBLIC PROC [s: IO.STREAM] RETURNS [tree: ParseTree] ~ {
+ts: TokenStream ¨ NEW[TokenStreamRec ¨ [s]];
+tree ¨ GetQuery[ts];
+};
+GetQuery: PROC [ts: TokenStream] RETURNS [tree: ParseTree] ~ {
+subTree: ParseTree ¨ GetBoolexpr[ts];
+IF PeekToken[ts] # NIL THEN {
+tree ¨ NEW[ParseNodeRec ¨ [tag: $and]];
+tree.child1 ¨ subTree;
+tree.child2 ¨ GetQuery[ts];
+} ELSE {
+tree ¨ subTree;
+};
+};
+
+GetBoolexpr: PROC [ts: TokenStream] RETURNS [tree: ParseTree] ~ {
+subTree: ParseTree ¨ GetTerm[ts];
+IF Rope.Equal[PeekToken[ts], "OR", FALSE] THEN {
+[] ¨ NextToken[ts];
+tree ¨ NEW[ParseNodeRec ¨ [tag: $or]];
+tree.child1 ¨ subTree;
+tree.child2 ¨ GetBoolexpr[ts];
+} ELSE {
+tree ¨ subTree;
+};
+};
+
+GetTerm: PROC [ts: TokenStream] RETURNS [tree: ParseTree] ~ {
+subTree: ParseTree ¨ GetFactor[ts];
+IF Rope.Equal[PeekToken[ts], "AND", FALSE] THEN {
+[] ¨ NextToken[ts];
+tree ¨ NEW[ParseNodeRec ¨ [tag: $and]];
+tree.child1 ¨ subTree;
+tree.child2 ¨ GetTerm[ts];
+} ELSE {
+tree ¨ subTree;
+};
+};
+
+GetFactor: PROC [ts: TokenStream] RETURNS [tree: ParseTree] ~ {
+token: ROPE ¨ PeekToken[ts];
+SELECT TRUE FROM
+Rope.Equal[token, "NOT", FALSE] => {
+token ¨ NextToken[ts];
+tree ¨ NEW[ParseNodeRec ¨ [tag: $not]];
+tree.child1 ¨ GetFactor[ts];
+};
+Rope.Equal[token, "("] => {
+token ¨ NextToken[ts];
+tree ¨ GetBoolexpr[ts];
+token ¨ NextToken[ts];
+IF NOT Rope.Equal[token, ")"] THEN
+ERROR SyntaxError["Unmatched parenthesis"];
+};
+ENDCASE => {  -- attribute-pattern
+tree ¨ GetAttrributePattern[ts];
+};
+};
+
+GetAttrributePattern: PROC [ts: TokenStream] RETURNS [tree: ParseTree] ~ {
+tree ¨ NEW[ParseNodeRec ¨ [tag: $ap]];
+tree.ap ¨ ReadAttributePattern[ts.stream, ts.prefetch];
+IF tree.ap = NIL THEN
+ERROR SyntaxError["Unexpected end of input"];
+ts.prefetch ¨ NIL;
+};
+
+TokenProc: IO.BreakProc ~ {
+RETURN[SELECT char FROM
+IN [Ascii.NUL .. Ascii.SP] => sepr,
+'(, '), ': => break,
+ENDCASE => other];
+};
+
+NextToken: PROC [ts: TokenStream] RETURNS [token: ROPE] ~ {
+IF ts.prefetch # NIL 
+THEN token ¨ ts.prefetch
+ELSE token ¨ IO.GetTokenRope[ts.stream, TokenProc ! IO.EndOfStream => {token ¨ NIL; CONTINUE}].token;
+ts.prefetch ¨ NIL;
+};
+
+PeekToken: PROC [ts: TokenStream] RETURNS [token: ROPE] ~ {
+IF ts.prefetch = NIL THEN 
+ts.prefetch ¨ IO.GetTokenRope[ts.stream, TokenProc ! IO.EndOfStream => CONTINUE].token;
+token ¨ ts.prefetch;
+};
+
+AbortQuery: PUBLIC PROC [cursor: Cursor] ~ {
+LoganQueryClass.AbortQuery[cursor];
+};
+ParseSubrange: PROC [r: ROPE] RETURNS [start, end: ROPE ¨ NIL] ~ {
+ENABLE IO.EndOfStream, IO.Error => GOTO Bad;
+ToDash: IO.BreakProc = {
+RETURN[SELECT char FROM
+'- => sepr,
+ENDCASE => other];
+};
+s: IO.STREAM ¨ IO.RIS[r];
+start ¨ IF IO.PeekChar[s] = '" THEN IO.GetRopeLiteral[s] ELSE IO.GetTokenRope[s, ToDash].token;
+IF IO.GetChar[s] # '- THEN GOTO Bad;
+end ¨ IF IO.PeekChar[s] = '" THEN IO.GetRopeLiteral[s] ELSE IO.GetLineRope[s];
+EXITS
+Bad => ERROR SyntaxError["Not a subrange"];
+};
+
+
+END.
+   ﬁ  LoganQueryImpl.mesa
+Copyright ” 1985, 1992 by Xerox Corporation.  All rights reserved.
+Doug Terry, July 21, 1992 10:07 am PDT
+Willie-s, April 27, 1992 11:40 am PDT
+LoganQuery allows more complicated queries to be performed on a LoganBerry database than the simple retrievals provided by the LoganBerry interface.  This module implements the complex queries, i.e. those that involve composing the basic LoganQuery classes.  These include multi-attribute queries and boolean queries.  See LoganQueryClassImpl.mesa for the implementation of the basic building blocks (LoganQuery classes) used by this module.
+
+Basic operations
+The following operations are syntactically and semantically similar to those provided by LoganBerry.  Any errors raised by these operations are generated by LoganBerry.
+Retrieves the next entry relative to the given cursor.  The cursor is automatically updated so that NextEntry may be repeatedly called to enumerate entries.  NIL is returned if the cursor is at the end of the sequence and dir=increasing or at the start of the sequence and dir=decreasing.
+Errors: IndexNotOpen, BadIndex, LogNotOpen, BadLogEntry
+Releases the cursor; no further operations may be performed using the given cursor.  This must be called once for every cursor created.
+Query planning and execution
+In actuality, there is no $Query class.  The cursor returned by QueryEntries is of class $Filter; it is obtained by one or more calls to FilterEntries.
+Returns a cursor; retrievals using this new cursor match the attribute patterns against entries in the database.  The baseIndex parameter governs which attribute type is used as the base index for the query; for baseIndex=NIL, an index is chosen that attempts to optimize the execution of the query (use this unless you really care about the order in which database entries are retrieved).  The returned query plan provides information about the query.  If planOnly is TRUE, then a query plan is formulated and returned, but a cursor for this query is not created.
+figure out where to start and end in database to save work, and pick a "good" base index if necessary (the index that minimizes expected cost)
+simple base query
+build up filters
+Estimates the cost of enumerating an index of the given type from start to end.  The cost model is quite simple: it assumes that the probability of any given character being the nth character of a string is 0.01 for n in [1..N].  The estimate returned is the estimated fraction of the index that must be traversed.  For instance, start="a" and end="b" for itype=$lex yields est=0.01, while start="aaa" and end="aac" for itype=$lex yields est=0.000002.
+This routine exists solely for performance reasons.  The intent is to identify a range [start..end] of entries in an index that includes all possible values that match the given pattern; clearly this range depends on the ordering of entries in the index ($lex, $ascii, $gmt, etc.).  It is always acceptable to return [NIL, NIL], which indicates that the whole index must be enumerated; returning a range that is too small or incorrect, on the other hand, leads to incomplete answers to a filtered query.
+[old: CHAR] RETURNS [new: CHAR] -- old Cedar7.0 impl
+[old: CHAR] RETURNS [CHAR]
+[old: CHAR] RETURNS [new: CHAR] --old Cedar7.0 impl
+[old: CHAR] RETURNS [CHAR]
+find greatest common prefix for start and end
+Attribute patterns
+An attribute pattern is of the form: atype(ptype): avalue.  The ptype is optional, and there may be whitespace preceeding the avalue.  The avalue can be either a token or rope literal.
+Read attribute patterns until there are no more and build up a list of them.
+Boolean attribute-based queries
+Several LoganQuery classes are composed in various ways to implement a boolean query filter. 
+
+Returns a cursor of class $BooleanFilter.  Retrievals using this new cursor match the boolean query against entries returned by the input cursor.  The query tree should be the result of ParseBooleanQuery.  The inputOrder specifies the attribute by which entries on the input cursor are ordered, while primaryKey indicates the attribute for which these entries have unique values.  The defaultPattern parameter indicates which type of pattern matching to use if this is not explictly specified in an attribute pattern.  The input cursor could be obtained from QueryEntries (or a variety of operations in LoganQueryClass such as GenerateEntries).  
+Actually there is no $BooleanFilter class.  The output cursor returned is of class $Aborter so that queries using this cursor can be aborted.
+This builds up the cursor structure that implements the boolean query rooted at the given node.  It calls itself recursively.
+For computing ANDs, we simply pipeline the two subquery cursors.  That is, the output of one query feeds into the input of the other.
+For computing ORs, we duplicate the input cursor, run one instance through one subquery's cursor pipeline and the other through the other subquery's.  Then the two cursors are merged back together and duplicates are eliminated.
+Note: UnDuplicateEntries wants its input cursor to be ordered by the primary key.  If this is not the case, as it may not be, then we do not call UnDuplicateEntries and hence the client may see duplicate entries in the output cursor.  This should be fixed someday, perhaps by modifying UnDuplicateEntries to take both an order and key parameter ala SubtractEntries.
+There are two cases of NOTs:  In the simple case, the child is simply an attribute pattern; the entries are run through an antifilter.  The complex case handles more general subqueries but is more expensive; we duplicate the input cursor, run one instance through the subquery's cursor pipeline and the other directly into a subtractor, which finds those entries that do not match the subquery.
+In this case, the entries are simply filtered according to the given attribute pattern.
+
+Parsing boolean queries
+The grammar for boolean queries is as follows:
+
+query ::= boolexpr | boolexpr query
+boolexpr ::= term | term "OR" boolexpr
+term ::= factor | factor "AND" term
+factor ::= attribute-pattern |  "NOT" factor | "(" boolexpr ")"
+attribute-pattern ::= attribute-type ":" attribute-value | 
+   attribute-type "(" pattern ")" ":" attribute-value
+
+A recursive decent parser is used to parse queries that comply with this grammar.  For each non-terminal in the grammar there is a parse routine defined below that accepts the right-hand-side of the production from the input stream and returns a parse tree for that portion of the query.
+
+Returns the parse tree for the query read from the given stream.  Raises SyntaxError if the query is not a proper boolean query.
+
+query ::= boolexpr | boolexpr query
+boolexpr ::= term | term "OR" boolexpr
+term ::= factor | factor "AND" term
+factor ::= attribute-pattern |  "NOT" factor | "(" boolexpr ")"
+attribute-pattern ::= attribute-type ":" attribute-value | 
+   attribute-type "(" pattern ")" ":" attribute-value
+Aborting queries
+If a process is currently executing a NextEntry operation on the given cursor, the process is aborted and the operation returns NIL; any subsequent calls to NextEntry will also return NIL (i.e. the cursor is no longer useable).  This can be used on cursors returned by either QueryEntries or BooleanFilterEntries.
+
+Miscellaneous
+r should be of the form "start-end".
+[char: CHAR] RETURNS [IO.CharClass]
+ ù ’  ñ(cedarcode) styleïNewlineDelimiter
+ò codeôKöú	œeú6ôBKô&Kô%Kò KôπKô óöœk	ò	Köúûúò$Köúûúò Köú
+ûúûú
+òKöûúûúzûúûúò•Köúûú)ò;Köúûúûúûúûúûú2òKöúûú6òBKöúòKòKöúòóKò Kö–blúûúûòKöûúûú9ò[Köûúòöúûú
+ûòKò KöûúûúûúòKöûúûúûúòóheadöúôKöú®ô®Kò öœn	úûúûú5ûúòpKöú†ô†Köú7ô7Kö
+ûúûúûúûúûúò0Köûú%ò+KòóKò ö†úûúûúûúò8KöúáôáKöûúûúûúûúò*KöúòKòóóôKöúóôóKò ö†úûúûú\ûú2ûúûúûú&òËKô¥Kò<KöúûúòKöúéôéöûú)ûúûúûò<KöúûúûúûúòEKòMöûúûúûòKöûú1ûúòDKöú&ûúò8öúœcò,KöúûúòKòKòóKöûúûú°ò8óKöûúòóïStartOfExpansionù[format: ROPE _ NIL, v1: IO.Value _ [null[]], v2: IO.Value _ [null[]], v3: IO.Value _ [null[]], v4: IO.Value _ [null[]], v5: IO.Value _ [null[]]]öûúûúûú° ò6Köûúûúûú(°òUKö	úûú*ûú
+ûúûúòuKòóöûúûúò!Köûú6ò;óKöúûúòKöûú
+ûúûúòKöúôKòhKñõ[input: ILQuery.ComplexCursor, pattern: ROPE, filter: ILQuery.FilterProc, atype: IndexedLog.AttributeType, stopIfNothingGreater: BOOLEAN _ FALSE]öúôöûúûúûúûò0ö	ûúûú$ûúûúûòEKöúõûúò¢óKöûúòóKò5KòKò óö
+†úûúCûúûúûúòüKöúûúòKöúûú.ò8Köûúûúûúò4öûú ûúûúò/KöúûúòKò0KòóKò.öûúûúûòKò)óKòTöûúûúûúòKòóöûúûúòKòCóKöûúûúûúûúòöûúûúûú/ûúûúûòKöûúûúò&KòKöûúòKòóKöûúòóKöûúûúûúò(KòOKò8KòKò óö†	úûúûú	ûú	ûúûúòTKöú√ô√KöúûúòKöúûúò	KöúûúòKöûúûúûúûúòKöûúûúûúòöûúûòöúòKò7Köûú	ûúûú° ò>Kñ [base: ROPE, index: INT _ 0]ò
+Kö
+ûú
+ûúûú°ú°–cuò?KöúûúûúûúòIKöúûúûúûúòEöûúûúòKòKòKòóKöú
+ûúò$Kòóò	Köúûúò"KöúûúòKöú.ûúûúòdKñ@[rope: ROPE, baseTime: Tempus.Packed, search: BOOL _ TRUE]öú*ûúûúò`Köú<°'òcKöûú	ûúûúò'öûòKöúûúòóKòóKöûúûú°QòjóKòKò óö†úûúûú	ûú	ûú	ûúûúòbKô˜Köûúûúûú°òQñ# -- [old: CHAR] RETURNS [new: CHAR]ö†úûúûúûúûúûúò5KñM[base: ROPE, start: INT _ 0, len: INT _ 2147483647, with: ROPE _ NIL]öúûúò!KöúûúûúBûú'ûúûúòçKòóñ# -- [old: CHAR] RETURNS [new: CHAR]ö†úòKöúûúûúûúô4KöúûúûúûúôKöúûúòKöûúòKòóñ# -- [old: CHAR] RETURNS [new: CHAR]ö†úòKöúûúûúûúô3KöúûúûúûúôKöúûúòKöûúòKòóöûúûòò	öûúûúûòöúûúò&KòKòKòóöúûúò'KòKñ\[base: ROPE, start: INT _ 0, len: INT _ 2147483647, translator: Rope.TranslatorType]òKòóöúûúò)KòJKñ\[base: ROPE, start: INT _ 0, len: INT _ 2147483647, translator: Rope.TranslatorType]òKòóöúûúò#Köúûú"œoú°òTö	ûúûúûúûú°!ògKòóKò+Kñ\[base: ROPE, start: INT _ 0, len: INT _ 2147483647, translator: Rope.TranslatorType]òKòóöúûúò(Kò;Kñ\[base: ROPE, start: INT _ 0, len: INT _ 2147483647, translator: Rope.TranslatorType]òKòóöúûúò)Kò&Kòóöúûúò)Kô-KöúûúòKöú9ûúûúòIöûú ò"ñO[s1: ROPE, pos1: INT _ 0, s2: ROPE, pos2: INT _ 0, case: BOOL _ TRUE]öûúòKò:Kñ\[base: ROPE, start: INT _ 0, len: INT _ 2147483647, translator: Rope.TranslatorType]òKòóKöûúûú°,òEóKòóöúûúò*Köúûú°ò1Kòóöúûúò%Köúûú°ò1KòóKöûúûúòóKöúòóòKñ\[base: ROPE, start: INT _ 0, len: INT _ 2147483647, translator: Rope.TranslatorType]òZKñ\[base: ROPE, start: INT _ 0, len: INT _ 2147483647, translator: Rope.TranslatorType]òVKöúòóò	öûúûúûòöúûúò%KöúûúòKöú#ò#Kñ@[rope: ROPE, baseTime: Tempus.Packed, search: BOOL _ TRUE]öúFûúûúòwKñz[time: Tempus.Packed, precision: Tempus.Precision _ minutes, includeDayOfWeek: BOOL _ FALSE, useAMPM: BOOL _ TRUE]òHöú"ûúûò>Köú8ò8Köú:ò:Köú6ò6Köú8ò8Köú<ò<Köú<ò<Köûú5ò<óKñz[time: Tempus.Packed, precision: Tempus.Precision _ minutes, includeDayOfWeek: BOOL _ FALSE, useAMPM: BOOL _ TRUE]òFöûòKöúûúò óKöúòóöúûúò*KöúûúòKöú#ò#Kò&Kñ@[rope: ROPE, baseTime: Tempus.Packed, search: BOOL _ TRUE]öúDûúûúòuKñz[time: Tempus.Packed, precision: Tempus.Precision _ minutes, includeDayOfWeek: BOOL _ FALSE, useAMPM: BOOL _ TRUE]òHKñ@[rope: ROPE, baseTime: Tempus.Packed, search: BOOL _ TRUE]öúBûúûúòsöúûúûúûò*Kñˆ[years: INT _ 2147483647, months: INT _ 2147483647, days: INT _ 2147483647, hours: INT _ 2147483647, minutes: INT _ 2147483647, seconds: INT _ 2147483647, baseTime: Tempus.Packed, precisionOfResult: Tempus.Precision _ unspecified]öúJòJKöúLòLKöúHòHKöúJòJKöúNòNKöûú:òAóKñz[time: Tempus.Packed, precision: Tempus.Precision _ minutes, includeDayOfWeek: BOOL _ FALSE, useAMPM: BOOL _ TRUE]ò=öûòKöúûúò óKöúòóKöûúûúòóKöúòóò	öûúûúûòöúûúò%KòóKöúûú+òNKöûúûúòóKöúòóKöûúûú°ò:óKòóóôIcode0ö†úûúûúûúûúûúò;Mò ö†úûúûúûúûúûúò^Kô∏Köûúûúûú(òFKöúûúò	Köúûúòöûú	ûúûòKö	úûúûúûúûúòMóKöúûúòKò#Köúûú°#ò8öûú	ûú°ò'Köú
+ûú%ò1KöúûúòKöûú	ûúûúAòVKöúûúòKòóKöûú	ûúûú@òUKñ0[stream: STREAM, flushComments: BOOL _ TRUE]öúûú*ûúò8öûúûúûúòKöúûú ûú(ò^KöúòóöûúòKöúûú"ò3óöûòKöúûúûúòóKòKò óö
+†úûúûúûúûúòUKôLKöúòKöúûúò!KòöûúûúûòöûúûúûòKöúûúòóöûúòKöúûúòKòKòóKòKöûúòóKòKò óö
+†úûúûúûúûúòNKò*Kö
+ûúûúûúûúûúò<Köúûúò0KòKò óö
+†úûúûúûúûúòXöûú#ûúûúûò6Köú"ò"KöûúòóKòóKò ö†úûúûúòZKöúûúò#öûú#ûúûúûò6öûúûúûòKöúûúò'óöûúòKöúûúò%KòKòóKöûúòóKòóKò ö†úûúûúòZKöúòKöú"ûúò&öûú%ûúûúûò8Köú
+ûú(ò5öûúûúûòKöúûú	ò!óöûúòKöúûú
+ò"Kò!KòóKöûúòóKòKò óóôKô]Kô ö†úûúûúïûúò“KôÜKôçKòPKò5KòKò óö†úûúYûúòãKô}ö†úûú.ûú#òjKöûú
+ûúûúò)öûúûúûúò,Kò,óKò%Kòóöûú
+ûòò	KôÖKòGKò@KòóòKô„Kò)Kò;Kò@Kò@Kò?öûúûòKò;óKôÌKòóò	KôäKò#öûúûú°ò/Kò®Köûú
+òKòóKò>Kò@KòIKòóòKôWKòèKòóKöûúòóKòóKô óôô.ô Kô#Kô&Kô#Kô?KôqóóKô KôüKô Köúûúûúò'öúûúûúòKöúûúòKöú
+ûúûòKòóKò ö†úûúûúûúûúûúòKKôÄKöúûúò,KòKòKô óö†úûúûúò>Kô#Kò%öûúûúûúòKöúûúò'KòKòóöúûúòKòKòóKòKò óö†úûúûúòAKô&Kò!öûú!ûúûúò0KòKöúûúò&KòKòóöúûúòKòKòóKòKò óö†úûúûúò=Kô#Kò#öûú"ûúûúò1KòKöúûúò'KòKòóöúûúòKòKòóKòKò óö†	úûúûúò?Kô?Jöúûúòöûúûúûòöúûúò$JòKöúûúò'KòKòóòJòKòKòöûúûúûò"Köûú&ò+óKòóöûú°ò"Kò KòóóKòKò óö†úûúûúòJKôqKöúûúò&Kò7öûúûúûòKöûú(ò-óKöúûúòKòKò óö†	úûúòöûúûúûòKöûúûú
+ûú
+ò#KòKöûúòóKòKò óö†	úûúûú	ûúò;öûúûúòKöûúòKö
+ûú	ûú%ûúûúûú	òeóKöúûúòKòKò óö†	úûúûú	ûúò;öûúûúûúòKöúûú%ûúûúòWóKòKòKò óóôö†
+úûúûúò,KôπKò#KòKô óóôö†úûúûúûúûúûúòBKô$Köûúûúûú
+ûúò,ö†úûúòKöúûúûúûúô#öûúûúûòKöúòKöûúòóKöúòóKö	úûúûúûúûúòKöúûúûúûúûúûúò_Köûúûúûúûúò$KöúûúûúûúûúûúòNöûòKöúûúò+óKòKò óóKò Köûúòó Öó    BÚ  |•  

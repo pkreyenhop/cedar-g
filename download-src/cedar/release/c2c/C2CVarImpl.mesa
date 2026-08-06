@@ -1,0 +1,1557 @@
+DIRECTORY
+C2CAddressing,
+C2CAddressingOps,
+C2CBasics,
+C2CCodeUtils,
+C2CDefs,
+C2CEmit,
+C2CIntCodeUtils,
+C2CMain,
+C2CMode,
+C2COps,
+C2CRunTime,
+C2CNames,
+C2CStateUtils,
+C2CTarget,
+C2CTypes,
+IntCodeDefs, 
+IntCodeUtils, 
+IO,
+Rope;
+
+C2CVarImpl: CEDAR PROGRAM
+IMPORTS C2CAddressing, C2CAddressingOps, C2CBasics, C2CIntCodeUtils, C2CCodeUtils, C2CEmit, C2CMain, C2CMode, C2CNames, C2CRunTime, C2CStateUtils, C2COps, C2CTarget, C2CTypes, IntCodeUtils, IO, Rope
+EXPORTS C2CMain = 
+BEGIN
+OPEN IntCodeDefs, C2CBasics, C2CDefs, C2CIntCodeUtils, C2CMain, C2CMode, C2CAddressing;
+
+ROPE: TYPE = Rope.ROPE;
+
+Cat2: PROC [c1, c2: Code] RETURNS [c: Code] = {
+IF c2=NIL THEN RETURN [c1];
+IF c1=NIL THEN RETURN [c2];
+RETURN [C2CEmit.Cat[c1, c2]]
+};
+
+WordOffsetToAddressOffset: PROC [wo: Code] RETURNS [Code] = {
+RETURN [C2CEmit.BinOp[C2CCodeUtils.ConstI[C2CTarget.addressUnitsPerWord], " * ", wo, multiplicationPrecedence]]
+};
+UnitPtrCast: PROC [sz: INT] RETURNS [cast: ROPE] = {
+SELECT TRUE FROM
+sz=C2CTarget.bitsPerWord => RETURN [C2CTarget.wordPtrCast];
+sz=8 AND C2CTarget.hasBytes => RETURN [C2CTarget.bytePtrCast];
+sz=C2CTarget.bitsPerHalfWord AND C2CTarget.hasHalfWords => RETURN [C2CTarget.halfWordPtrCast];
+ENDCASE => CantHappen;
+};
+
+CatVoided: PROC [cc, ccVoided: CodeCont] RETURNS [CodeCont] = {
+cc.sc ¬ Cat2[cc.sc, ccVoided.sc];
+IF ccVoided.ec#NIL THEN cc.sc ¬ C2CEmit.Cat[cc.sc, "(void) ", ccVoided.ec, ";\n"];
+RETURN [cc];
+};
+PlainIndexedField: PROC [sz, start: INT, bAddrC: Code, addrNotYetTaken: BOOL ¬ FALSE, base: Node] RETURNS [c: Code] = {
+IF sz#0 AND sz#C2CTarget.PointeeBits[sz] THEN CantHappen;
+IF addrNotYetTaken AND sz = C2CTarget.bitsPerWord AND (start MOD C2CTarget.bitsPerWord)=0 AND base.bits>0 AND (base.bits MOD C2CTarget.bitsPerWord)=0 AND base.bits<=C2CTarget.maxBitsForSimpleStructs AND start<C2CTarget.maxBitsForSimpleStructs AND SizeIsProvableOk[base] THEN {
+IF C2CEmit.IsDelayedDeref[bAddrC] THEN {
+bAddrC ¬ C2CEmit.Deref[C2CEmit.TakeAddr[bAddrC, TRUE], base.bits];
+};
+c ¬ C2CEmit.MinPrecedence[bAddrC, primaryPrecedence];
+IF start=0 AND base.bits=C2CTarget.bitsPerWord --sz=bitsPerWord!-- THEN RETURN;
+c ¬ C2CEmit.Cat[c, IO.PutFR1[".f%g", IO.int[start/C2CTarget.bitsPerWord]]];
+c ¬ C2CEmit.SetPrecedence[c, primaryPrecedence];
+RETURN
+};
+IF addrNotYetTaken THEN 
+bAddrC ¬ C2CEmit.TakeAddr[bAddrC, TRUE];
+c ¬ C2CEmit.PreventCastingToWord[bAddrC];
+c ¬ C2CEmit.MinPrecedence[c, unaryPrecedence];
+IF start#0 THEN {
+unit: INT = 8;
+xsz: INT ¬ IF sz=0
+THEN C2CTarget.PointeeBits[1]--size does not matter; take minimum  
+ELSE MAX[unit, MIN[C2CTarget.bitsPerWord, sz]]; --size for indexing
+IF (start MOD xsz)#0 THEN CantHappen;
+c ¬ C2CEmit.CastRef[c, xsz];
+c ¬ C2CEmit.Parentize[ C2CEmit.Cat[c, "+", C2CCodeUtils.ConstI[start/xsz]] ];
+c ¬ C2CEmit.SetRef[c, xsz];
+};
+c ¬ C2CEmit.Deref[c, sz];
+};
+
+BoolDontCareBit: PROC [] RETURNS [BOOL ¬ FALSE] = {
+SELECT C2CBasics.ctxTop.seq[C2CBasics.ctxTop.idx].key FROM
+$BoolBitHackOk => RETURN [TRUE];
+ENDCASE => RETURN [FALSE];
+};
+
+HandleFieldLoc: PROC [varNode: Var, reqMode: Mode, fieldLoc: FieldLocation] RETURNS [cc: CodeCont] = {
+isLhs: BOOL ¬ LHSMode[reqMode];
+baseSz: INT ¬ C2CMode.BaseSize[reqMode]; --not size of base but basicly used size!
+requestedAM: AddressMode ¬ GetAMode[reqMode];
+baseMode: Mode ¬ NIL; --initialized only on need
+baseAM: AddressMode ¬ bad; --initialized only on need
+pseudoBaseSz: INT ¬ -1; --initialized only on need [assumed size of base]
+
+InitializeBaseMode: PROC[] = {
+IF baseMode=NIL THEN {
+IF baseSz=0 
+THEN baseMode ¬ C2CAddressing.ProposedMode[fieldLoc.base, isLhs, TRUE, 0]
+ELSE {
+pseudoBaseSz ¬ C2COps.MinContainerSize[fieldLoc.start, baseSz];
+baseMode ¬ C2CAddressing.ProposedMode[fieldLoc.base, isLhs, TRUE, pseudoBaseSz];
+};
+baseMode ¬ DSetBaseSize[baseMode, baseSz];
+baseAM ¬ GetAMode[baseMode];
+};
+};
+
+GenericBaseForField: PROC [] RETURNS [bC: Code¬NIL] = {
+SELECT baseAM FROM
+plain, value, getAddr => {
+bcc: CodeCont ¬ GenNode[fieldLoc.base, baseMode];
+cc.sc ¬ Cat2[cc.sc, bcc.sc];
+IF bcc.ec#NIL THEN bC ¬ C2CEmit.MinPrecedence[bcc.ec, unaryPrecedence];
+};
+ENDCASE => CantHappen;
+};
+
+AccessUnitAddr: PROC [baseC: Code, unitSize: INT, unitOff: INT, isAlreadyAddr: BOOL ¬ FALSE] RETURNS [code: Code] = {
+IF ~isAlreadyAddr THEN baseC ¬ C2CEmit.TakeAddr[baseC, TRUE];
+code ¬ C2CEmit.CastRef[baseC, unitSize];
+IF unitOff#0 THEN {
+code ¬ C2CEmit.Parentize[ C2CEmit.Cat[code, "+", C2CCodeUtils.ConstI[unitOff]] ];
+code ¬ C2CEmit.SetRef[code, unitSize];
+};
+};
+
+HandleComplexMask: PROC [] = {
+bcc: CodeCont;
+pointeeBaseBits: INT ¬ C2CTarget.PointeeBits[fieldLoc.base.bits];
+IF fieldLoc.base.bits=0 OR varNode.bits+fieldLoc.start>fieldLoc.base.bits THEN CantHappen;
+bcc ¬ C2CAddressingOps.LoadArithNode[fieldLoc.base]; 
+cc.sc ¬ Cat2[cc.sc, bcc.sc];
+IF varNode.bits=1 AND BoolDontCareBit[] THEN {
+IF C2CTarget.maxBitsForFastLiterals>pointeeBaseBits-fieldLoc.start AND pointeeBaseBits=C2CTarget.bitsPerWord THEN {
+mask: ROPE ¬ C2CCodeUtils.ComplexMask[1, pointeeBaseBits-fieldLoc.start-1];
+cc.ec ¬ C2CEmit.BinOp[bcc.ec, " & ", C2CEmit.IdentCode[mask], bitAndPrecedence];
+RETURN
+};
+};
+cc.ec ¬ C2CCodeUtils.MaskNShift[bcc.ec, varNode.bits, pointeeBaseBits-fieldLoc.base.bits+fieldLoc.start, pointeeBaseBits];
+RETURN;
+};
+
+PlainFieldAsIndexing: PROC [] = {
+
+PeekCouldSimplyMask: PROC [] RETURNS [BOOL ¬ FALSE] = {
+IF varNode.bits=0 OR varNode.bits>C2CTarget.bitsPerWord THEN RETURN; -- test field
+IF fieldLoc.base.bits=0 OR fieldLoc.base.bits>C2CTarget.bitsPerWord THEN RETURN;-- test base
+IF varNode.bits+fieldLoc.start#fieldLoc.base.bits THEN RETURN; -- not exactly adjusted
+IF ~SizeIsProvableOk[fieldLoc.base] THEN RETURN; 
+SELECT requestedAM FROM
+value, maskNShift, assUnits => {};
+ENDCASE => RETURN [FALSE];
+RETURN [TRUE];
+};
+
+PeekShouldMaskEvenIfComplex: PROC [] RETURNS [BOOL ¬ FALSE] = {
+IF varNode.bits=0 OR varNode.bits>C2CTarget.bitsPerWord THEN 
+RETURN [FALSE]; -- test field
+IF fieldLoc.base.bits=0 OR fieldLoc.base.bits>C2CTarget.bitsPerWord THEN 
+RETURN [FALSE]; -- test base
+IF ~SizeIsProvableOk[fieldLoc.base] THEN RETURN [FALSE];
+SELECT requestedAM FROM
+value, maskNShift, assUnits => {};
+ENDCASE => RETURN;
+WITH fieldLoc.base SELECT FROM
+var: Var => {
+IF var.flags[addressed] OR var.flags[upLevel] THEN RETURN [FALSE];
+SELECT var.location.kind FROM
+localVar => RETURN [TRUE];
+ENDCASE => RETURN [FALSE];
+};
+ENDCASE => RETURN [FALSE];
+};
+
+addrNotYetTaken: BOOL ¬ FALSE;
+c: Code ¬ GenericBaseForField[];
+SELECT baseAM FROM
+plain => {
+IF ~isLhs THEN {-- can't yet mask left hand size
+IF PeekCouldSimplyMask[] AND (SizeIsProvableOk[varNode] OR varNode.bits=baseSz)  THEN {
+cc.ec ¬ C2CCodeUtils.MaskOut[c, varNode.bits]; RETURN
+};
+IF PeekShouldMaskEvenIfComplex[] AND SizeIsProvableOk[varNode] THEN {
+HandleComplexMask; RETURN
+};
+};
+SELECT requestedAM FROM
+plain, value, assUnits, assBits => addrNotYetTaken ¬ TRUE;
+assAddr, getAddr, assBitAddr, getBitAddr => c ¬ C2CEmit.TakeAddr[c, TRUE];
+ENDCASE => c ¬ C2CEmit.TakeAddr[c, TRUE];
+};
+getAddr => {};
+assAddr => NotYetImpl;
+ENDCASE => CantHappen;
+cc.ec ¬ PlainIndexedField[IF baseSz=0 THEN 0 ELSE C2CTarget.PointeeBits[baseSz], fieldLoc.start, c, addrNotYetTaken, fieldLoc.base];
+}; --PlainFieldAsIndexing
+
+GenericRHSForFieldLoc: PROC [] = {
+pointeeBits: INT ¬ C2CTarget.PointeeBits[varNode.bits];
+InitializeBaseMode[];
+IF baseAM=plain AND varNode.bits#0 AND C2COps.PlainAccess[fieldLoc.start, varNode.bits] THEN {
+PlainFieldAsIndexing[];
+RETURN
+};
+IF isLhs THEN CantHappen;
+IF baseAM=dummy THEN {
+cc.ec ¬ LoadDummy[varNode.bits];
+RETURN
+};
+IF baseAM#getAddr AND fieldLoc.base.bits<=C2CTarget.bitsPerWord AND SizeIsProvableOk[fieldLoc.base] THEN {
+HandleComplexMask[];
+RETURN
+}; 
+SELECT baseAM FROM
+plain, value, getAddr => {
+unitBits: INT ¬ pointeeBits;
+WHILE unitBits<=C2CTarget.bitsPerWord DO
+IF varNode.bits<=unitBits AND (fieldLoc.start MOD unitBits)+varNode.bits<=unitBits THEN { 
+compensate: INT ¬ 0;
+unitOff: INT ¬ fieldLoc.start/unitBits;
+bitOffset: INT ¬ fieldLoc.start - unitOff*unitBits;
+isAlreadyAddr: BOOL ¬ FALSE;
+SELECT baseAM FROM
+plain, value => {};
+getAddr => isAlreadyAddr ¬ TRUE;
+ENDCASE => NotYetImpl;
+IF fieldLoc.base.bits<C2CTarget.bitsPerWord AND SizeIsProvableOk[fieldLoc.base] THEN {
+compensate ¬ C2CTarget.PointeeBits[fieldLoc.base.bits]-fieldLoc.base.bits
+};
+cc.ec ¬ AccessUnitAddr[GenericBaseForField[], unitBits, unitOff, isAlreadyAddr];
+cc.ec ¬ C2CEmit.Deref[cc.ec, unitBits];
+IF varNode.bits=1 AND BoolDontCareBit[] THEN {
+IF C2CTarget.maxBitsForFastLiterals>unitBits-bitOffset THEN {
+mask: ROPE ¬ C2CCodeUtils.ComplexMask[1, unitBits-bitOffset-1];
+cc.ec ¬ C2CEmit.BinOp[cc.ec, " & ", C2CEmit.IdentCode[mask], bitAndPrecedence];
+RETURN
+};
+};
+BEGIN --Just try this little optimization; no side effect or complete RETURN
+TakingAddressIsFast: PROC [base: Node] RETURNS [BOOL ¬ FALSE] = {
+WITH base SELECT FROM
+var: Var => {
+IF var.flags[notRegister] OR var.flags[addressed] OR var.flags[upLevel] THEN RETURN [TRUE];
+SELECT var.location.kind FROM
+deref, indexed =>  RETURN [TRUE];
+ENDCASE => {}
+};
+ENDCASE => {};
+};
+bigEndian: BOOL = TRUE;
+IF bigEndian AND bitOffset=0 AND compensate=0 AND baseAM=plain AND TakingAddressIsFast[fieldLoc.base] THEN {
+pTypeName: Rope.ROPE ¬ C2CTypes.DefinePtrType[unitBits];
+rightSpares: INT ¬ unitBits-varNode.bits;
+cc.ec ¬ C2CEmit.TakeAddr[c: cc.ec, preventCastingToWord: TRUE];
+cc.ec ¬ C2CEmit.PreventCastingToWord[cc.ec];
+cc.ec ¬ C2CEmit.MinPrecedence[cc.ec, unaryPrecedence];
+cc.ec ¬ C2CEmit.Cat[" * (", pTypeName, ") ", cc.ec];
+cc.ec ¬ C2CEmit.Cat[cc.ec, " >> ", C2CCodeUtils.RopeFromInt[rightSpares]];
+cc.ec ¬ C2CEmit.Parentize[cc.ec];
+RETURN
+};
+END;
+cc.ec ¬ C2CCodeUtils.MaskNShift[cc.ec, varNode.bits, compensate+bitOffset, unitBits];
+RETURN
+};
+unitBits ¬ C2CTarget.PointeeBits[unitBits+1];
+ENDLOOP;
+};
+getBitAddr => {};
+ENDCASE => {};
+
+IF varNode.bits<=C2CTarget.bitsPerWord THEN {
+SELECT baseAM FROM
+value => CantHappen; --single word
+getAddr, plain => {
+ac: C2CAddressing.AddressContainer;
+cc1: CodeCont ¬ GenNode[fieldLoc.base, baseMode];
+cc.sc ¬ Cat2[cc.sc, cc1.sc];
+cc1.ec ¬ AccessUnitAddr[cc1.ec, C2CTarget.bitsPerWord, 0, baseAM=getAddr];
+cc1.ec ¬ C2CEmit.CastWord[cc1.ec];
+ac ¬ ACFromCodes[cc1.ec, C2CCodeUtils.ConstI[fieldLoc.start]];
+cc.ec ¬ C2CEmit.Cat[C2CRunTime.ExtractField[ac, varNode.bits]];
+};
+getBitAddr => {
+ac: C2CAddressing.AddressContainer;
+cc1: CodeCont ¬ GenNode[fieldLoc.base, baseMode];
+cc.sc ¬ Cat2[cc.sc, cc1.sc];
+ac ¬ ACFromCodes[cc1.ec, AddConst[cc1.xbc, fieldLoc.start]];
+cc.ec ¬ C2CEmit.Cat[C2CRunTime.ExtractField[ac, varNode.bits]];
+};
+ENDCASE => NotYetImpl;
+RETURN
+}; --IF
+
+NotYetImpl;
+cc.ec ¬ C2CEmit.Cat[cc.ec, "FunnyBitAddress"];
+};
+
+SELECT requestedAM FROM
+assAddr, plain, getAddr => {
+InitializeBaseMode[];
+IF requestedAM=plain 
+THEN {
+IF baseSz#0 AND ~C2COps.PlainAccess[fieldLoc.start, baseSz] THEN CantHappen;
+}
+ELSE {
+baseAM ¬ getAddr;
+baseMode ¬ DSetAMode[baseMode, baseAM];
+};
+SELECT baseAM FROM
+getAddr, plain => PlainFieldAsIndexing[];
+ENDCASE => NotYetImpl;
+IF requestedAM#plain THEN
+cc ¬ C2CAddressingOps.ModizeArithCode[cc, reqMode, varNode.bits];
+};
+skip => {
+cc ¬ GenNode[fieldLoc.base, reqMode];
+cc ¬ C2CAddressingOps.ModizeArithCode[cc, reqMode, varNode.bits];
+};
+assBitAddr => {
+off: Code ¬ IF fieldLoc.start=0 
+THEN NIL 
+ELSE C2CCodeUtils.ConstI[fieldLoc.start];
+cc ¬ MakeAssBitAdrAndOffset[fieldLoc.base, off, reqMode];
+};
+getBitAddr => {
+off: Code ¬ IF fieldLoc.start=0 THEN NIL ELSE C2CCodeUtils.ConstI[fieldLoc.start];
+cc ¬ MakeGetBitAdrAndOffset[fieldLoc.base, off, reqMode];
+};
+assUnits => {
+GenericRHSForFieldLoc[];
+cc ¬ C2CAddressingOps.ModizeArithCode[cc, reqMode, varNode.bits];
+};
+assBits => {
+GenericRHSForFieldLoc[];
+cc ¬ C2CAddressingOps.ModizeArithCode[cc, reqMode, varNode.bits];
+};
+value, maskNShift => {
+InitializeBaseMode[];
+SELECT baseAM FROM
+assBitAddr => {
+off: Code ¬ IF fieldLoc.start=0 THEN NIL ELSE C2CCodeUtils.ConstI[fieldLoc.start];
+IF isLhs THEN ERROR NotYetImpl;
+IF varNode.bits>C2CTarget.bitsPerWord THEN NotYetImpl;
+IF requestedAM=value THEN {
+bitAddr: AddressContainer ¬ C2CStateUtils.ANewBitAddress[];
+m: Mode ¬ SetAssBitAddr[NIL, bitAddr];
+cc ¬ MakeAssBitAdrAndOffset[fieldLoc.base, off, m];
+cc.ec ¬ C2CRunTime.ExtractField[bitAddr, varNode.bits];
+}
+ELSE CantHappen; --I believe then requestedAM = assBitAddr
+};
+getBitAddr => {
+off: Code ¬ IF fieldLoc.start=0 THEN NIL ELSE C2CCodeUtils.ConstI[fieldLoc.start];
+IF isLhs THEN ERROR NotYetImpl;
+IF varNode.bits>C2CTarget.bitsPerWord THEN NotYetImpl;
+IF requestedAM=value THEN {
+cc ¬ MakeGetBitAdrAndOffset[fieldLoc.base, off, baseMode];
+cc.ec ¬ C2CRunTime.ExtractField[ACFromCodes[cc.ec, cc.xbc], varNode.bits];
+cc.xbc ¬ NIL;
+}
+ELSE CantHappen; --I believe then requestedAM = getBitAddr
+};
+getAddr, plain, dummy => {
+GenericRHSForFieldLoc[];
+};
+value, maskNShift => {
+IF C2CTarget.PointeeBits[fieldLoc.base.bits]<C2CTarget.bitsPerWord AND ~C2CIntCodeUtils.SizeIsProvableOk[fieldLoc.base] THEN NotYetImpl;
+GenericRHSForFieldLoc[];
+};
+assUnits, assBits => CantHappen;
+ENDCASE => CaseMissing;
+};
+lHSMaskNShift => {
+VerySimpleVariable: PROC [node: IntCodeDefs.Node] RETURNS [BOOL] = {
+WITH node SELECT FROM
+var: IntCodeDefs.Var => {
+IF var.flags[notRegister] OR var.flags[addressed] THEN RETURN [FALSE];
+WITH var.location SELECT FROM
+local: IntCodeDefs.LocalVarLocation => {
+IF var.bits<=C2CTarget.maxBitsForSimpleStructs THEN RETURN [TRUE];
+};
+ENDCASE;
+};
+ENDCASE;
+RETURN [FALSE];
+};
+unitBits: INT ¬ C2CMode.UnitSize[reqMode];
+unitOff: INT ¬ fieldLoc.start / unitBits;
+start: INT ¬ fieldLoc.start MOD unitBits;
+baseAMode: AddressMode;
+bCC: CodeCont;
+maskOut, maskIn, rhsC: Code;
+rhsTemplate: ROPE ¬ GetTemplate[reqMode]; --used just once; right adjusted zero fill
+rhsNode: IntCodeDefs.Node ¬ C2CMode.LHSMaskNShiftNode[reqMode]; --optionally
+rhsIsConst: BOOL; rhsConstVal: CARD;
+IF unitBits<C2COps.MinContainerSize[fieldLoc.start, varNode.bits] THEN CantHappen;
+[rhsIsConst, rhsConstVal] ¬ C2CIntCodeUtils.IsSimpleConst[rhsNode];
+baseMode ¬ C2CAddressing.ProposedMode[node: fieldLoc.base, lhs: TRUE, wrongSize: FALSE, usedSz: unitBits];
+baseAMode ¬ GetAMode[baseMode];
+baseMode ¬ SetBaseSize[baseMode, baseSz];
+SELECT baseAMode FROM
+plain => {
+IF ~SizeIsProvableOk[fieldLoc.base] OR fieldLoc.base.bits>C2CTarget.maxBitsForSimpleStructs OR ~VerySimpleVariable[fieldLoc.base] THEN {
+baseMode ¬ DSetAMode[baseMode, getAddr]; baseAMode ¬ getAddr
+};
+};
+getAddr => {}; 
+assAddr => {}; 
+ENDCASE => CantHappen;
+bCC ¬ GenNode[fieldLoc.base, baseMode];
+cc.sc ¬ Cat2[cc.sc, bCC.sc];
+cc.sc ¬ C2CEmit.CatDebugInfo[cc.sc, "field lhs"];
+IF baseAMode=assAddr THEN {
+ac: C2CAddressing.AddressContainer ¬ GetAddrContainer[baseMode];
+baseMode ¬ DSetAMode[baseMode, getAddr]; baseAMode ¬ getAddr;
+IF bCC.ec#NIL THEN ERROR;
+bCC.ec ¬ C2CEmit.IdentCode[ac.words];
+};
+bCC.ec ¬ C2CEmit.MinPrecedence[bCC.ec, primaryPrecedence];
+SELECT baseAMode FROM 
+plain => {
+IF ~VerySimpleVariable[fieldLoc.base] THEN CantHappen;
+IF fieldLoc.base.bits>C2CTarget.bitsPerWord THEN {
+IF fieldLoc.base.bits > C2CTarget.maxBitsForSimpleStructs THEN CantHappen;
+bCC.ec ¬ C2CEmit.Cat[bCC.ec, IO.PutFR1[".f%g", IO.int[fieldLoc.start/C2CTarget.bitsPerWord]]];
+};
+unitBits ¬ fieldLoc.base.bits;
+IF unitBits>C2CTarget.bitsPerWord THEN unitBits ¬ C2CTarget.bitsPerWord;
+start ¬ fieldLoc.start MOD unitBits;
+};
+getAddr => {
+useTemporary: BOOL ¬ FALSE;
+usedJustOnce: BOOL ¬ FALSE;
+IF rhsIsConst THEN {
+IF rhsConstVal=0 THEN usedJustOnce ¬ TRUE;
+IF rhsConstVal=BitMask[varNode.bits] THEN usedJustOnce ¬ TRUE;
+};
+IF unitOff#0 THEN {
+bCC.ec ¬ C2CEmit.CastRef[bCC.ec, unitBits];
+bCC.ec ¬ C2CEmit.Cat[bCC.ec, " + ", C2CCodeUtils.ConstC[unitOff]];
+bCC.ec ¬ C2CEmit.Parentize[bCC.ec];
+bCC.ec ¬ C2CEmit.SetRef[bCC.ec, unitBits];
+bCC.ec ¬ C2CEmit.CatDebugInfo[bCC.ec, "field 0"];
+useTemporary ¬ TRUE;
+};
+IF ~usedJustOnce THEN {
+IF useTemporary OR C2CIntCodeUtils.UseTemporaryIfReused[fieldLoc.base, FALSE<<immediately followed by dereferencing>>] THEN {
+temp: ROPE ¬ C2CStateUtils.DeclareVariable[temporaryDeclarations, C2CTarget.bitsPerWord, "tadr"];
+preCode: C2CEmit.Code ¬ C2CEmit.Cat[temp, " = ", C2CEmit.CastWord[bCC.ec], ";\n"];
+preCode ¬ C2CEmit.CatDebugInfo[preCode, "field 1"];
+cc.sc ¬ Cat2[cc.sc, preCode];
+bCC.ec ¬ C2CEmit.IdentCode[temp];
+};
+};
+bCC.ec ¬ C2CEmit.Deref[bCC.ec, unitBits];
+};
+ENDCASE => ERROR;
+IF (rhsIsConst AND rhsConstVal=0) OR Rope.Equal[rhsTemplate, "0"] THEN {
+mask: CARD ~ UMaskInverted[start, varNode.bits, unitBits];
+cc.sc ¬ C2CEmit.Cat[cc.sc, bCC.ec, " &= ", C2CCodeUtils.ConstC[mask], ";\n"];
+}
+ELSE IF rhsIsConst AND rhsConstVal=BitMask[varNode.bits] THEN {
+mask: CARD ~ UMask[start, varNode.bits, unitBits];
+cc.sc ¬ C2CEmit.Cat[cc.sc, bCC.ec, " |= ", C2CCodeUtils.ConstC[mask], ";\n"];
+}
+ELSE {
+bCC.ec ¬ C2CEmit.CatDebugInfo[bCC.ec, "field adr"];
+maskOut ¬ C2CEmit.Cat[C2CEmit.CopyC[bCC.ec], " & ", C2CCodeUtils.ConstC[UMaskInverted[start, varNode.bits, unitBits]]];
+maskOut ¬ C2CEmit.Parentize[maskOut];
+IF rhsIsConst 
+THEN {
+maskval: CARD ¬ rhsConstVal;
+IF unitBits#varNode.bits+start THEN {
+maskval ¬ LeftShift[maskval, unitBits-(varNode.bits+start)]
+};
+maskIn ¬ C2CCodeUtils.ConstC[maskval];
+}
+ELSE {
+maskIn _ C2CEmit.Parentize[C2CEmit.CastWord[rhsTemplate]];
+IF unitBits#varNode.bits+start THEN {
+maskIn ¬ C2CEmit.Cat[maskIn, " << ", C2CCodeUtils.ConstI[unitBits-(varNode.bits+start)]];
+maskIn ¬ C2CEmit.Parentize[maskIn];
+};
+};
+rhsC ¬ C2CEmit.Cat[maskOut, " | ", maskIn];
+cc.sc ¬ C2CEmit.Cat[cc.sc, bCC.ec, " = ", rhsC, ";\n"];
+};
+};
+ENDCASE => CaseMissing;
+IF baseMode#NIL THEN FreeMode[baseMode];
+}; --HandleFieldLoc
+
+UnitSizeForIndexMaskNShift: PROC [varBits: INT, base: Node] RETURNS [INT] = {
+pointeeBits: INT ¬ C2CTarget.PointeeBits[varBits];
+IF pointeeBits>=C2CTarget.bitsPerWord THEN RETURN [pointeeBits];
+WITH base SELECT FROM
+var: Var => WITH var.location SELECT FROM
+deref: DerefLocation => {
+IF deref.align>=C2CTarget.bitsPerWord THEN RETURN [C2CTarget.bitsPerWord];
+IF deref.align=C2CTarget.bitsPerHalfWord AND C2CTarget.hasHalfWords AND pointeeBits<=C2CTarget.bitsPerHalfWord THEN RETURN [C2CTarget.bitsPerHalfWord];
+RETURN [pointeeBits];
+};
+globalVar: GlobalVarLocation => RETURN [C2CTarget.bitsPerWord];
+localVar: LocalVarLocation => RETURN [C2CTarget.bitsPerWord];
+dummy: DummyLocation => RETURN [C2CTarget.bitsPerWord];
+composite: CompositeLocation => 
+IF base.bits>=C2CTarget.bitsPerWord THEN RETURN [C2CTarget.bitsPerWord];
+field: FieldLocation => {
+IF field.start MOD C2CTarget.bitsPerWord = 0 THEN {
+x: INT ¬ UnitSizeForIndexMaskNShift[varBits, field.base];
+IF base.bits>=x THEN RETURN [x];
+};
+RETURN [pointeeBits];
+};
+indexed: IndexedLocation => --should be optimized away-- RETURN [pointeeBits];
+ENDCASE => RETURN [pointeeBits];
+const: ConstNode => 
+IF base.bits>=C2CTarget.bitsPerWord THEN RETURN [C2CTarget.bitsPerWord];
+apply: ApplyNode => 
+IF base.bits>=C2CTarget.bitsPerWord THEN RETURN [C2CTarget.bitsPerWord];
+ENDCASE => {};
+RETURN [pointeeBits];
+};
+
+HandleIndexedLoc: PROC [varNode: Var, mode: Mode, indexedLoc: IndexedLocation] RETURNS [cc: CodeCont] = {
+rqMode: Mode ¬ mode;
+rqAMode: C2CAddressing.AddressMode ¬ GetAMode[rqMode];
+isLhs: BOOL ¬ LHSMode[rqMode];
+baseSz: INT ¬ C2CMode.BaseSize[rqMode]; --not size of base but basicly used size!
+
+PlainIndexing: PROC [baseMode: Mode¬NIL] RETURNS [cc: CodeCont] = {
+pseudoBaseSz: INT ¬ IF baseSz=0 
+THEN 0 
+ELSE C2COps.MinContainerSize[varNode.bits, baseSz];
+bm: Mode ¬ C2CAddressing.ProposedMode[indexedLoc.base, isLhs, TRUE, pseudoBaseSz];
+baseAM: AddressMode ¬ GetAMode[bm];
+IF varNode.bits=0 OR varNode.bits#C2CTarget.PointeeBits[varNode.bits] THEN CantHappen;
+bm ¬ SetBaseSize[bm, baseSz];
+SELECT baseAM FROM
+plain, getAddr => { --therefore aligned
+basecc: CodeCont ¬ GenNode[indexedLoc.base, SetAMode[bm, getAddr]];
+indexcc: CodeCont ¬ C2CAddressingOps.LoadArithNode[indexedLoc.index];
+cc.sc ¬ Cat2[basecc.sc, indexcc.sc];
+indexcc.ec ¬ C2CEmit.MinPrecedence[indexcc.ec, additionPrecedence];
+basecc.ec ¬ C2CEmit.CastRef[basecc.ec, varNode.bits]; --make sure indexing is right
+cc.ec ¬ C2CEmit.Parentize[C2CEmit.Cat[basecc.ec, "+", indexcc.ec]];
+cc.ec ¬ C2CEmit.SetRef[cc.ec, varNode.bits];
+cc.ec ¬ C2CEmit.Deref[cc.ec, varNode.bits];
+SELECT rqAMode FROM
+plain, value, maskNShift => {
+IF ~isLhs AND varNode.bits<C2CTarget.bitsPerWord THEN 
+cc.ec ¬ C2CEmit.CastWord[cc.ec];
+};
+assAddr => {
+m: Mode ¬ C2CMode.SetContainerSize[C2CMode.SetAMode[m: rqMode, am: assUnits], C2CTarget.bitsPerWord]; --template was already defined before
+cc.ec ¬ C2CEmit.TakeAddr[cc.ec, TRUE];
+cc.sc ¬ C2CEmit.Cat[cc.sc, C2CAddressingOps.CodeToAssUnits[cc.ec, m]]; 
+cc.ec ¬ NIL
+}; 
+getAddr => cc.ec ¬ C2CEmit.TakeAddr[cc.ec, TRUE];
+assUnits => {
+cc.sc ¬  C2CEmit.Cat[cc.sc, C2CAddressingOps.CodeToAssUnits[cc.ec, rqMode]]; 
+cc.ec ¬ NIL; 
+};
+assBitAddr => {CantHappen; --delt with previously--};
+ENDCASE => CaseMissing;
+RETURN;
+};
+ENDCASE => {};--failed, go general case
+}; -- PlainIndexing
+
+IF varNode.bits=0 OR varNode.bits>C2CTarget.bitsPerWord AND (varNode.bits MOD C2CTarget.bitsPerWord # 0) THEN CantHappen;
+SELECT rqAMode FROM
+getAddr, plain, assAddr => {
+IF varNode.bits#C2CTarget.PointeeBits[varNode.bits] THEN CantHappen;
+cc ¬ PlainIndexing[];
+IF cc.sc=NIL AND cc.ec=NIL THEN CantHappen;
+};
+value, maskNShift => {
+OptimizeWithShiftNMask: PROC [] = {
+baseCC: CodeCont ¬ GenNode[indexedLoc.base, SetAMode[rqMode, getAddr]]; 
+preCode, shift: Code ¬ NIL;
+unitSize: INT ¬ UnitSizeForIndexMaskNShift[varNode.bits, indexedLoc.base];
+singleUnit: BOOL ¬ C2CIntCodeUtils.SizeIsProvableOk[indexedLoc.base] AND indexedLoc.base.bits<=unitSize;
+cc.sc ¬ Cat2[cc.sc, baseCC.sc];
+baseCC.ec ¬ C2CEmit.MinPrecedence[baseCC.ec, unaryPrecedence];
+indexcc.ec ¬ C2CEmit.MinPrecedence[indexcc.ec, additionPrecedence];
+IF C2CIntCodeUtils.UseTemporaryIfReused[indexedLoc.index] THEN {
+temp: ROPE ¬ C2CStateUtils.DeclareVariable[temporaryDeclarations, C2CTarget.bitsPerWord, "ix"];
+preCode ¬ C2CEmit.Cat[temp, " = ", indexcc.ec, ",\n"];
+indexcc.ec ¬ C2CEmit.IdentCode[temp];
+};
+baseCC.ec ¬ C2CEmit.CastRef[baseCC.ec, unitSize];
+IF ~singleUnit THEN {
+divIndex: Code;
+divIndex ¬ C2CCodeUtils.ConstDiv[C2CEmit.CopyC[indexcc.ec], unitSize / varNode.bits];
+divIndex ¬ C2CEmit.MinPrecedence[divIndex, multiplicationPrecedence];
+baseCC.ec ¬ AddCodes[baseCC.ec, divIndex];
+indexcc.ec ¬ C2CCodeUtils.ConstMod[indexcc.ec, unitSize / varNode.bits]; 
+indexcc.ec ¬ C2CEmit.MinPrecedence[indexcc.ec, multiplicationPrecedence];
+};
+cc.ec ¬ C2CEmit.Deref[baseCC.ec, unitSize];
+cc.ec ¬ C2CEmit.MinPrecedence[cc.ec, additionPrecedence];
+shift ¬ C2CCodeUtils.ConstMul[indexcc.ec, varNode.bits];
+shift ¬ C2CEmit.MinPrecedence[shift, additionPrecedence];
+shift ¬ C2CEmit.Cat[C2CCodeUtils.ConstI[unitSize-varNode.bits], " - (", shift, ")"];
+cc.ec ¬ C2CEmit.Parentize[C2CEmit.Cat[cc.ec, " >> (", shift, ")"]];
+cc.ec ¬ C2CCodeUtils.MaskOut[cc.ec, varNode.bits];
+IF preCode#NIL THEN cc.ec ¬ C2CEmit.ParentizeAndLn[C2CEmit.Cat[preCode, cc.ec]];
+};
+OptimizeShiftNMaskVal: PROC [] = {
+baseSize: INT ¬ bSz;
+preCode, shift: Code ¬ NIL;
+baseCC: CodeCont ¬ C2CAddressingOps.LoadArithNode[indexedLoc.base];
+baseCC.ec ¬ C2CEmit.MinPrecedence[baseCC.ec, additionPrecedence];
+cc.sc ¬ Cat2[cc.sc, baseCC.sc];
+IF ~SizeIsProvableOk[indexedLoc.base] THEN ERROR; --can't compute shift distance
+IF C2CIntCodeUtils.UseTemporaryIfReused[indexedLoc.index] THEN {
+temp: ROPE ¬ C2CStateUtils.DeclareVariable[temporaryDeclarations, C2CTarget.bitsPerWord, "ix"];
+preCode ¬ C2CEmit.Cat[temp, " = ", indexcc.ec, ",\n"];
+indexcc.ec ¬ C2CEmit.IdentCode[temp];
+};
+shift ¬ C2CCodeUtils.ConstMul[indexcc.ec, varNode.bits];--left offset of leftmost bit wanted
+shift ¬ C2CEmit.MinPrecedence[shift, additionPrecedence];
+shift ¬ C2CEmit.Cat[C2CCodeUtils.ConstI[baseSize-varNode.bits], " - ", shift];--shift amount
+baseCC.ec ¬ C2CEmit.CastWord[baseCC.ec];
+cc.ec ¬ C2CEmit.Parentize[C2CEmit.Cat[baseCC.ec, " >> (", shift, ")"]];
+cc.ec ¬ C2CCodeUtils.MaskOut[cc.ec, varNode.bits];
+IF preCode#NIL THEN cc.ec ¬ C2CEmit.ParentizeAndLn[C2CEmit.Cat[preCode, cc.ec]];
+};
+indexcc: CodeCont; 
+unitSize: INT ¬ C2CTarget.PointeeBits[varNode.bits];
+bSz: INT ¬ MAX[baseSz, varNode.bits, indexedLoc.base.bits];
+baseMode: Mode ¬ C2CAddressing.ProposedMode[indexedLoc.base, isLhs, TRUE, bSz];
+baseAM: AddressMode ¬ GetAMode[baseMode];
+baseMode ¬ SetBaseSize[baseMode, baseSz];
+IF varNode.bits=unitSize THEN {
+cc ¬ PlainIndexing[];
+IF cc.sc#NIL OR cc.ec#NIL THEN RETURN
+};
+IF varNode.bits>C2CTarget.bitsPerWord THEN NotYetImpl;
+indexcc ¬ C2CAddressingOps.LoadArithNode[indexedLoc.index];
+cc.sc ¬ Cat2[cc.sc, indexcc.sc];
+IF (unitSize MOD varNode.bits = 0) AND ~LHSMode[rqMode] THEN {
+IF indexedLoc.base.bits<=C2CTarget.bitsPerWord AND SizeIsProvableOk[indexedLoc.base] THEN {
+OptimizeShiftNMaskVal[];
+RETURN;
+};
+IF baseAM=plain OR baseAM=assAddr OR baseAM=getAddr AND C2CTarget.maskNShiftLikeSun THEN {
+OptimizeWithShiftNMask[];
+RETURN;
+};
+};
+SELECT baseAM FROM
+getAddr, assAddr, plain, getBitAddr, assBitAddr, maskNShift, value => {
+m: Mode ¬ 
+SELECT baseAM FROM
+getAddr, assAddr, plain => SetAMode[rqMode, getAddr]
+ENDCASE => SetAMode[rqMode, getBitAddr];
+baseCC: CodeCont ¬ GenNode[indexedLoc.base, m]; 
+cc.sc ¬ Cat2[cc.sc, baseCC.sc];
+baseCC.xbc ¬ AddCodes[baseCC.xbc, C2CCodeUtils.ConstMul[indexcc.ec, varNode.bits]];
+cc.ec ¬ C2CRunTime.ExtractField[src: ACFromCodes[w: baseCC.ec, b: baseCC.xbc], bits: varNode.bits];
+};
+assBits, assUnits => CantHappen;
+ENDCASE => CaseMissing;
+};
+assBitAddr => {
+cc1: CodeCont;
+indexcc: CodeCont ¬ C2CAddressingOps.LoadArithNode[indexedLoc.index];
+cc.sc ¬ Cat2[cc.sc, indexcc.sc];
+indexcc.ec ¬ C2CCodeUtils.ConstMul[indexcc.ec, varNode.bits];
+cc1 ¬ MakeAssBitAdrAndOffset[indexedLoc.base, indexcc.ec, rqMode];
+cc.sc ¬ Cat2[cc.sc, cc1.sc]; IF cc1.ec#NIL THEN CantHappen;
+};
+getBitAddr => {
+cc1: CodeCont;
+indexcc: CodeCont ¬ C2CAddressingOps.LoadArithNode[indexedLoc.index];
+cc.sc ¬ Cat2[cc.sc, indexcc.sc];
+indexcc.ec ¬ C2CCodeUtils.ConstMul[indexcc.ec, varNode.bits];
+cc1 ¬ MakeGetBitAdrAndOffset[indexedLoc.base, indexcc.ec, rqMode];
+cc.sc ¬ Cat2[cc.sc, cc1.sc];
+cc.ec ¬ cc1.ec; cc.xbc ¬ cc1.xbc;
+};
+assUnits => {
+varcc: CodeCont ¬ GenVarNode[varNode, UseValue[varNode.bits, rqMode]]; 
+cc.sc ¬ Cat2[cc.sc, varcc.sc];
+cc.sc ¬ Cat2[cc.sc, C2CAddressingOps.CodeToAssUnits[varcc.ec, rqMode]];
+};
+assBits => {
+m1: Mode ¬ SetAMode[rqMode, getBitAddr];
+addrCC: CodeCont ¬ GenVarNode[varNode, m1]; 
+IF LHSMode[rqMode] THEN CantHappen;
+cc.sc ¬ C2CEmit.Cat[cc.sc, addrCC.sc,
+C2CRunTime.MoveField[
+dst: GetAddrContainer[rqMode], 
+src: ACFromCodes[w: addrCC.ec, b: addrCC.xbc], 
+bits: ContainerSize[rqMode]],
+";\n"];
+};
+skip => {--do it for side effects only
+IF ~IntCodeUtils.SideEffectFree[indexedLoc.base, FALSE] THEN {
+basecc: CodeCont ¬ GenNode[indexedLoc.base, rqMode];
+cc ¬ CatVoided[cc, basecc];
+};
+IF ~IntCodeUtils.SideEffectFree[indexedLoc.index, FALSE] THEN {
+indexcc: CodeCont ¬ GenNode[indexedLoc.index, rqMode];
+cc ¬ CatVoided[cc, indexcc];
+};
+};
+lHSMaskNShift => {
+basePtrName, shiftName: ROPE ¬ NIL;
+preCode, maskOut, maskIn, rhsC, lhsC: Code ¬ NIL;
+indexCC, baseAddrCC: CodeCont;
+rhsTemplate: ROPE ¬ GetTemplate[rqMode]; --used just once; right adjusted zero fill
+unitSize: INT ¬ UnitSizeForIndexMaskNShift[varNode.bits, indexedLoc.base];
+singleUnit: BOOL ¬ C2CIntCodeUtils.SizeIsProvableOk[indexedLoc.base] AND indexedLoc.base.bits<=unitSize;
+Shift: PROC [] RETURNS [shift: Code ¬ NIL] = {
+shift ¬ C2CCodeUtils.ConstMul[indexCC.ec, varNode.bits];
+shift ¬ C2CEmit.MinPrecedence[shift, multiplicationPrecedence];
+shift ¬ C2CEmit.Cat[shift, "+", C2CCodeUtils.ConstI[varNode.bits]];
+shift ¬ C2CEmit.Cat[C2CCodeUtils.ConstI[unitSize], " - ", C2CEmit.Parentize[shift]];
+shift ¬ C2CEmit.SetPrecedence[shift, additionPrecedence];
+shift ¬ C2CEmit.CatDebugInfo[shift, "idx shift"];
+};
+IF varNode.bits>=C2CTarget.bitsPerWord THEN CantHappen;
+
+indexCC ¬ C2CAddressingOps.LoadArithNode[indexedLoc.index];
+cc.sc ¬ Cat2[cc.sc, indexCC.sc];
+indexCC.ec ¬ C2CEmit.MinPrecedence[indexCC.ec, additionPrecedence];
+IF C2CIntCodeUtils.UseTemporaryIfReused[indexedLoc.index] THEN {
+shiftName ¬ C2CStateUtils.DeclareVariable[temporaryDeclarations, C2CTarget.bitsPerWord, "xs"];
+cc.sc ¬ C2CEmit.Cat[cc.sc, shiftName, " = ", C2CEmit.CastWord[indexCC.ec], ";\n"];
+indexCC.ec ¬ C2CEmit.IdentCode[shiftName];
+};
+baseAddrCC ¬ GenNode[indexedLoc.base, SetAMode[rqMode, getAddr]]; 
+cc.sc ¬ Cat2[cc.sc, baseAddrCC.sc];
+baseAddrCC.ec ¬ C2CEmit.MinPrecedence[baseAddrCC.ec, unaryPrecedence];
+baseAddrCC.ec ¬ C2CEmit.CastRef[baseAddrCC.ec, unitSize];
+
+IF ~singleUnit THEN {
+divIndex: Code ¬ C2CCodeUtils.ConstDiv[C2CEmit.CopyC[indexCC.ec], unitSize / varNode.bits];
+divIndex ¬ C2CEmit.MinPrecedence[divIndex, multiplicationPrecedence];
+indexCC.ec ¬ C2CCodeUtils.ConstMod[indexCC.ec, unitSize / varNode.bits]; 
+indexCC.ec ¬ C2CEmit.MinPrecedence[indexCC.ec, multiplicationPrecedence];
+baseAddrCC.ec ¬ C2CEmit.Parentize[AddCodes[baseAddrCC.ec, divIndex]];
+baseAddrCC.ec ¬ C2CEmit.CatDebugInfo[baseAddrCC.ec, "idx baseAddrCC.ec"];
+}; 
+
+IF unitSize MOD varNode.bits = 0 THEN {--no unused bits to take care of...
+rhsNode: IntCodeDefs.Node ¬ C2CMode.LHSMaskNShiftNode[rqMode]; --optionally
+rhsIsConst: BOOL; rhsConstVal: CARD;
+[rhsIsConst, rhsConstVal] ¬ C2CIntCodeUtils.IsSimpleConst[rhsNode];
+
+IF (rhsIsConst AND rhsConstVal=0) OR Rope.Equal[rhsTemplate, "0"] THEN {
+lhsC ¬ C2CEmit.Deref[baseAddrCC.ec, unitSize];
+maskOut ¬ C2CEmit.Cat["(unsigned) ", C2CCodeUtils.Mask[varNode.bits], " << ", Shift[]];
+cc.sc ¬ C2CEmit.Cat[cc.sc, lhsC, " &= ~(", maskOut, ");\n"];
+RETURN
+};
+IF rhsIsConst AND rhsConstVal=BitMask[varNode.bits] THEN {
+lhsC ¬ C2CEmit.Deref[baseAddrCC.ec, unitSize];
+maskOut ¬ C2CEmit.Cat["(unsigned) ", C2CCodeUtils.Mask[varNode.bits], " << ", Shift[]];
+cc.sc ¬ C2CEmit.Cat[cc.sc, lhsC, " |= (", maskOut, ");\n"];
+RETURN
+};
+};
+
+basePtrName ¬ C2CStateUtils.DeclareVariable[temporaryDeclarations, C2CTarget.bitsPerWord];
+cc.sc ¬ C2CEmit.Cat[cc.sc, basePtrName, " = ", C2CEmit.CastWord[baseAddrCC.ec], ";\n"];
+baseAddrCC.ec ¬ C2CEmit.IdentCode[basePtrName];
+lhsC ¬ C2CEmit.Deref[C2CEmit.CopyC[baseAddrCC.ec], unitSize];
+rhsC ¬ C2CEmit.Deref[baseAddrCC.ec, unitSize];
+rhsC ¬ C2CEmit.MinPrecedence[rhsC, unaryPrecedence];
+
+IF shiftName=NIL THEN 
+shiftName ¬ C2CStateUtils.DeclareVariable[temporaryDeclarations, C2CTarget.bitsPerWord, "sh"];
+cc.sc ¬ C2CEmit.Cat[cc.sc, shiftName, " = ", Shift[], ";\n"];
+
+maskOut ¬ C2CEmit.Cat["(unsigned) ", C2CCodeUtils.Mask[varNode.bits], " << ", shiftName];
+maskOut ¬ C2CEmit.Parentize[C2CEmit.Cat[" ~ ", C2CEmit.Parentize[maskOut]]];
+maskIn ¬ C2CEmit.Parentize[C2CEmit.Cat["(", rhsTemplate, ") << ", shiftName]];
+rhsC ¬ C2CEmit.Cat["(", rhsC, " & ", maskOut, ")"];
+rhsC ¬ C2CEmit.Cat[rhsC, " | ", maskIn];
+cc.sc ¬ C2CEmit.Cat[cc.sc, lhsC, " = ", rhsC, ";\n"];
+};
+bad => CantHappen;
+ENDCASE => CaseMissing;
+};
+
+BitMask: PROC [n: CARD] RETURNS [CARD] = {
+m: CARD ¬ 1;
+IF BITS[CARD]<C2CTarget.bitsPerWord THEN NotYetImpl;
+IF n>C2CTarget.bitsPerWord THEN CantHappen; --bad context
+IF n=BITS[CARD] THEN RETURN [LAST[CARD]];
+WHILE n>0 DO n ¬ n-1; m ¬ m*2 ENDLOOP;
+RETURN [ m-1 ]
+};
+
+LeftShift: PROC [c: CARD, by: CARD] RETURNS [CARD] = {
+WHILE by>0 DO c ¬ c*2; by ¬ by-1 ENDLOOP;
+RETURN [c];
+};
+
+UMask: PROC [start, bits, unitBits: INT] RETURNS [CARD] = {
+RETURN [LeftShift[BitMask[bits], unitBits-(start+bits)]];
+};
+
+UMaskInverted: PROC [start, bits, unitBits: INT] RETURNS [CARD] = {
+RETURN [UInvert[UMask[start, bits, unitBits], unitBits]];
+};
+
+Invert: PROC [c: CARD] RETURNS [CARD] = {
+IF BITS[CARD]<C2CTarget.bitsPerWord THEN NotYetImpl;
+RETURN [LAST[CARD] - c];
+};
+
+UInvert: PROC [c: CARD, unitBits: CARD] RETURNS [CARD] = {
+IF BITS[CARD]<C2CTarget.bitsPerWord THEN NotYetImpl;
+SELECT unitBits FROM
+8 => RETURN [255-c];
+16 => RETURN [0FFFFH-c];
+32 => RETURN [0FFFFFFFFH-c];
+ENDCASE => ERROR;
+};
+
+MakeAssBitAdrAndOffset: PROC [base: Node, offEC: Code, mode: Mode] RETURNS [cc: CodeCont] = {
+baseSz: INT ¬ C2CMode.BaseSize[mode];
+rqAMode: AddressMode ¬ GetAMode[mode];
+baseMode: Mode ¬ C2CAddressing.ProposedMode[base, LHSMode[mode], TRUE, baseSz];
+baseAM: AddressMode ¬ GetAMode[baseMode];
+mode2: Mode;
+basecc: CodeCont;
+ac: C2CAddressing.AddressContainer ¬ GetAddrContainer[mode];
+IF rqAMode#assBitAddr THEN CantHappen;
+IF offEC#NIL THEN offEC ¬ C2CEmit.MinPrecedence[offEC, unaryPrecedence];
+SELECT baseAM FROM
+plain => {
+baseMode ¬ DSetBaseSize[baseMode, 0];
+basecc ¬ GenNode[base, baseMode];
+cc.sc ¬ Cat2[cc.sc, basecc.sc];
+basecc.ec ¬ C2CEmit.TakeAddr[basecc.ec];
+cc.sc ¬ C2CEmit.Cat[cc.sc, ac.words, " = ", basecc.ec, ";\n"];
+IF offEC=NIL THEN offEC ¬ C2CCodeUtils.ConstI[0];
+cc.sc ¬ C2CEmit.Cat[cc.sc, ac.bits, " = ", offEC, ";\n"];
+};
+getAddr => {
+baseMode ¬ DSetBaseSize[baseMode, 0];
+basecc ¬ GenNode[base, baseMode];
+cc.sc ¬ Cat2[cc.sc, basecc.sc];
+cc.sc ¬ C2CEmit.Cat[cc.sc, ac.words, " = ", C2CEmit.CastWord[basecc.ec], ";\n"];
+IF offEC=NIL THEN offEC ¬ C2CCodeUtils.ConstI[0];
+cc.sc ¬ C2CEmit.Cat[cc.sc, ac.bits, " = ", offEC, ";\n"];
+};
+value => {
+baseMode ¬ DSetBaseSize[baseMode, baseSz];
+basecc ¬ GenNode[base, baseMode];
+IF basecc.ec=NIL THEN CantHappen;
+cc.sc ¬ Cat2[cc.sc, basecc.sc];
+IF C2CEmit.GetAddressable[basecc.ec] 
+THEN basecc.ec ¬ C2CEmit.TakeAddr[basecc.ec, TRUE]
+ELSE {
+sz: INT ¬ C2CTarget.TemporaryBits[base.bits];
+template: ROPE ¬ C2CStateUtils.DeclareVariable[temporaryDeclarations, sz];
+IF LHSMode[mode] THEN CantHappen;
+cc.sc ¬ C2CEmit.Cat[cc.sc, template, " = ", basecc.ec, ";\n"];
+basecc.ec ¬ C2CEmit.Cat["&", template];
+IF base.bits<sz THEN {
+offEC ¬ AddConst[offEC, sz-base.bits];
+};
+};
+cc.sc ¬ C2CEmit.Cat[cc.sc, ac.words, " = ", C2CEmit.CastWord[basecc.ec], ";\n"];
+IF offEC=NIL THEN offEC ¬ C2CCodeUtils.ConstI[0];
+cc.sc ¬ C2CEmit.Cat[cc.sc, ac.bits, " = ", offEC, ";\n"];
+};
+assBitAddr => {
+mode2 ¬ SetAssBitAddr[mode, ac]; 
+mode2 ¬ DSetBaseSize[mode2, baseSz];
+basecc ¬ GenNode[base, mode2];
+IF basecc.ec#NIL THEN CantHappen;
+cc.sc ¬ Cat2[cc.sc, basecc.sc];
+IF offEC#NIL THEN cc.sc ¬ C2CEmit.Cat[cc.sc, ac.bits, " += ", offEC, ";\n"];
+};
+getBitAddr, lHSMaskNShift => {
+baseMode ¬ DSetAMode[baseMode, getBitAddr];
+baseMode ¬ DSetBaseSize[baseMode, baseSz];
+basecc ¬ GenNode[base, baseMode];
+cc.sc ¬ Cat2[cc.sc, basecc.sc];
+IF basecc.ec=NIL THEN CantHappen;
+cc.sc ¬ C2CEmit.Cat[cc.sc, ac.words, " = ", C2CEmit.CastWord[basecc.ec], ";\n"];
+cc.sc ¬ C2CEmit.Cat[cc.sc, ac.bits, " = ", AddCodes[basecc.xbc, offEC], ";\n"];
+};
+ENDCASE => CaseMissing;
+IF cc.ec#NIL THEN CantHappen;
+}; --MakeAssBitAdrAndOffset
+
+MakeGetBitAdrAndOffset: PROC [base: Node, offEC: Code, mode: Mode] RETURNS [cc: CodeCont] = {
+baseSz: INT ¬ BaseSize[mode];
+rqAMode: AddressMode ¬ GetAMode[mode];
+baseMode: Mode ¬ C2CAddressing.ProposedMode[base, LHSMode[mode], TRUE, baseSz];
+baseAM: AddressMode ¬ GetAMode[baseMode];
+IF rqAMode#getBitAddr THEN CantHappen;
+IF offEC#NIL THEN offEC ¬ C2CEmit.MinPrecedence[offEC, unaryPrecedence];
+SELECT baseAM FROM
+plain => {
+baseMode ¬ SetBaseSize[baseMode, 0];
+cc ¬ GenNode[base, baseMode];
+cc.ec ¬ C2CEmit.TakeAddr[cc.ec, TRUE];
+cc.xbc ¬ offEC;
+};
+getAddr => {
+baseMode ¬ SetBaseSize[baseMode, 0];
+cc ¬ GenNode[base, baseMode];
+cc.ec ¬ C2CEmit.CastWord[cc.ec];
+cc.xbc ¬ offEC;
+};
+value, maskNShift => {
+baseMode ¬ SetBaseSize[baseMode, baseSz];
+cc ¬ GenNode[base, baseMode];
+IF C2CEmit.GetAddressable[cc.ec] 
+THEN cc.ec ¬ C2CEmit.TakeAddr[cc.ec, TRUE]
+ELSE {
+sz: INT ¬ C2CTarget.TemporaryBits[base.bits];
+template: ROPE ¬ C2CStateUtils.DeclareVariable[temporaryDeclarations, sz];
+IF LHSMode[mode] THEN CantHappen;
+cc.sc ¬ C2CEmit.Cat[cc.sc, template, " = ", cc.ec, ";\n"];
+cc.ec ¬ C2CEmit.Cat["&", template];
+IF base.bits<sz THEN {
+offEC ¬ AddConst[offEC, sz-base.bits];
+};
+};
+cc.xbc ¬ offEC;
+};
+assBitAddr => {
+NotYetImpl;
+};
+getBitAddr, lHSMaskNShift => {
+baseMode ¬ SetBaseSize[baseMode, 0];
+baseMode ¬ DSetAMode[baseMode, getBitAddr];
+cc ¬ GenNode[base, baseMode];
+cc.xbc ¬ AddCodes[cc.xbc, offEC, TRUE];
+};
+ENDCASE => CaseMissing;
+IF cc.ec=NIL THEN CantHappen;
+}; --MakeGetBitAdrAndOffset
+
+AddCodes: PROC [c1, c2: Code ¬ NIL, returnNil: BOOL ¬ FALSE] RETURNS [Code] = {
+SELECT TRUE FROM
+c1 = NIL AND c2 = NIL => 
+IF returnNil 
+THEN RETURN [NIL] 
+ELSE RETURN [C2CCodeUtils.ConstI[0]];
+c1 = NIL => RETURN [c2];
+c2 = NIL => RETURN [c1];
+ENDCASE => RETURN [C2CEmit.BinOp[c1, " + ", c2, additionPrecedence]];
+};
+
+AddConst: PROC [c: Code, const: INT] RETURNS [c1: Code] = {
+c1 ¬ IF const = 0 
+THEN NIL 
+ELSE C2CCodeUtils.ConstI[const];
+c1 ¬ AddCodes[c, c1, FALSE];
+};
+
+HandleDerefLoc: PROC [varNode: Var, mode: Mode, derefLoc: DerefLocation] RETURNS [cc: CodeCont] = {
+Aligned: PROC [] RETURNS [BOOL ¬ TRUE] = {
+IF derefLoc.align<C2CTarget.bestAlignment THEN 
+IF derefLoc.align<varNode.bits THEN RETURN [FALSE];
+};
+rqMode: Mode ¬ mode;
+rqAMode: C2CAddressing.AddressMode ¬ GetAMode[rqMode];
+addrcc: CodeCont ¬ C2CAddressingOps.LoadArithNode[derefLoc.addr];
+baseSz: INT ¬ BaseSize[rqMode];
+IF ~ExpMode[rqMode] THEN CantHappen;
+cc.sc ¬ addrcc.sc;
+addrcc.ec ¬ C2CEmit.MinPrecedence[addrcc.ec, unaryPrecedence];
+SELECT rqAMode FROM
+getAddr, getBitAddr => {cc.ec ¬ addrcc.ec};
+assBits => {
+dst: C2CAddressing.AddressContainer ¬ GetAddrContainer[rqMode];
+cc.sc ¬ C2CEmit.Cat[cc.sc, 
+C2CRunTime.MoveField[
+dst: dst, 
+src: ACFromCodes[C2CEmit.CastWord[addrcc.ec], NIL], 
+bits: ContainerSize[rqMode]
+],
+";\n"
+];
+cc.ec ¬ NIL;
+};
+assUnits => {
+pBits: INT ¬ IF baseSz=0 THEN 0 ELSE C2CTarget.PointeeBits[baseSz];
+IF baseSz=0 THEN NotYetImpl;
+IF baseSz#varNode.bits THEN NotYetImpl;
+IF Aligned[] THEN {
+cc.ec ¬ C2CEmit.Deref[addrcc.ec, pBits];
+cc.sc ¬ C2CEmit.Cat[cc.sc, C2CAddressingOps.CodeToAssUnits[cc.ec, rqMode]]; 
+cc.ec ¬ NIL;
+}
+ELSE {
+rqSz: INT ¬ varNode.bits;
+tSz: INT ¬ ContainerSize[rqMode];
+boff: ROPE ¬ C2CCodeUtils.RopeFromInt[tSz-rqSz];
+IF tSz<rqSz THEN CantHappen;
+IF tSz>rqSz THEN {
+cc.sc ¬ C2CEmit.Cat[cc.sc, 
+C2CRunTime.DepositField[
+dst:  [GetTemplate[mode], " 0"],
+bits: tSz-rqSz,
+word: C2CCodeUtils.ConstI[0]
+],
+";\n"
+];
+}; 
+cc.sc ¬ C2CEmit.Cat[cc.sc, 
+C2CRunTime.MoveField[
+dst: [GetTemplate[mode], boff], 
+src: ACFromCodes[C2CEmit.CastWord[addrcc.ec], NIL], 
+bits: rqSz
+],
+";\n"
+];
+cc.ec ¬ NIL;
+};
+};
+assAddr => {
+template: ROPE ¬ GetTemplate[mode];
+cc.sc ¬ C2CEmit.Cat[cc.sc, template, " = ", C2CEmit.CastWord[addrcc.ec], ";\n"];
+}; 
+assBitAddr => {
+ac: C2CAddressing.AddressContainer ¬ GetAddrContainer[mode];
+cc.sc ¬ C2CEmit.Cat[cc.sc, ac.words, " = ", C2CEmit.CastWord[addrcc.ec], "; "];
+cc.sc ¬ C2CEmit.Cat[cc.sc, ac.bits, " = 0;\n"];
+IF ac.words=NIL OR ac.bits=NIL THEN CantHappen;
+};
+plain => {
+pBits: INT ¬ IF baseSz=0 THEN 0 ELSE C2CTarget.PointeeBits[baseSz];
+cc.ec ¬ C2CEmit.Deref[addrcc.ec, pBits];
+};
+maskNShift => {
+pBits: INT ¬ C2CTarget.PointeeBits[baseSz];
+IF LHSMode[rqMode] THEN NotYetImpl;
+IF varNode.bits=0 THEN NotYetImpl;
+IF pBits>C2CTarget.bitsPerWord THEN NotYetImpl;
+cc.ec ¬ C2CEmit.Deref[addrcc.ec, pBits];
+};
+value => {
+pBits: INT ¬ IF baseSz=0 THEN 0 ELSE C2CTarget.PointeeBits[baseSz];
+IF LHSMode[rqMode] THEN NotYetImpl;
+IF varNode.bits=0 OR baseSz=0 THEN NotYetImpl;
+IF Aligned[] 
+THEN {
+cc.ec ¬ C2CEmit.Deref[addrcc.ec, pBits];
+}
+ELSE {
+ac: C2CAddressing.AddressContainer ¬ ACFromCodes[C2CEmit.CastWord[addrcc.ec], NIL];
+IF varNode.bits#baseSz THEN NotYetImpl;
+IF varNode.bits<=C2CTarget.bitsPerWord 
+THEN cc.ec ¬ C2CRunTime.ExtractField[src: ac, bits: varNode.bits]
+ELSE {
+template: ROPE ¬ C2CStateUtils.DeclareVariable[temporaryDeclarations, C2CTarget.TemporaryBits[varNode.bits]];
+cc.sc ¬ C2CEmit.Cat[cc.sc,
+C2CRunTime.MoveField[src: ac, 
+dst: [Rope.Concat["&", template], "0"], 
+bits: varNode.bits
+],
+";\n"
+];
+cc.ec ¬ C2CEmit.IdentCode[template];
+};
+};
+};
+skip => {--done for side effects only
+cc ¬ CatVoided[cc, addrcc];
+};
+ENDCASE => CaseMissing;
+};
+
+HandleCompositeLoc: PUBLIC PROC [varNode: Var, mode: Mode, compositeLoc: CompositeLocation, hackAddr: ROPE ¬ NIL] RETURNS [cc: CodeCont] = {
+temporary: ROPE ¬ NIL;
+temporaryAddr: ROPE ¬ hackAddr;
+isFirst: BOOL ¬ TRUE;
+specialCaseAlreadyModized: BOOL ¬ FALSE;
+bitsSofar: INT ¬ 0;
+reqAMode: AddressMode ¬ GetAMode[mode];
+IF hackAddr#NIL THEN { 
+IF varNode.bits<=C2CTarget.bitsPerWord THEN CantHappen;
+IF reqAMode#skip THEN CantHappen;
+};
+IF ~ExpMode[mode] THEN CantHappen;
+IF LHSMode[mode] THEN NotYetImpl;
+IF reqAMode=assUnits AND varNode.bits>C2CTarget.bitsPerWord THEN {
+specialCaseAlreadyModized ¬ TRUE;
+temporary ¬ GetTemplate[mode];
+};
+IF varNode.bits>C2CTarget.bitsPerWord 
+THEN {
+AllocSourceBA: PROC [] RETURNS [AddressContainer] = {
+IF srcBA.words=NIL THEN srcBA ¬ C2CStateUtils.ANewBitAddress[];
+RETURN [srcBA]
+};
+destBA, srcBA: AddressContainer ¬ [NIL, NIL];
+IF hackAddr=NIL THEN {
+temporary ¬ C2CStateUtils.DeclareVariable[temporaryDeclarations, C2CTarget.TemporaryBits[varNode.bits], "temp"];
+temporaryAddr ¬ Rope.Concat["&", temporary];
+};
+destBA.words ¬ temporaryAddr;
+FOR list: NodeList ¬ compositeLoc.parts, list.rest WHILE list#NIL DO
+piece: Node ¬ list.first;
+OddPiece: PROC [] = {
+destBA.bits ¬ C2CCodeUtils.RopeFromInt[bitsSofar];
+IF piece.bits<=C2CTarget.bitsPerWord 
+THEN {
+piececc: CodeCont ¬ C2CAddressingOps.LoadArithNode[piece];
+cc.sc ¬ Cat2[cc.sc, piececc.sc];
+piececc.ec ¬ C2CEmit.MinPrecedence[piececc.ec, assignPrecedence];
+cc.sc ¬ C2CEmit.Cat[cc.sc, 
+C2CRunTime.DepositField[dst: destBA, bits: piece.bits, word: piececc.ec],
+";\n"
+];
+}
+ELSE {
+mode: Mode ¬ SetAssBitAddr[UseValue[piece.bits], AllocSourceBA[]];
+piececc: CodeCont ¬ GenNode[piece, mode];
+cc.sc ¬ Cat2[cc.sc, piececc.sc];
+IF piececc.ec#NIL THEN CantHappen;
+cc.sc ¬ C2CEmit.Cat[cc.sc, "(void) ",
+C2CRunTime.MoveField[dst: destBA, src: srcBA, bits: piece.bits],
+";\n"
+];
+};
+};
+WellAlligned: PROC [] RETURNS [BOOL] = {
+IF piece.bits#C2CTarget.PointeeBits[piece.bits] THEN RETURN [FALSE];
+IF (bitsSofar MOD C2CTarget.bestAlignment)=0 THEN 
+RETURN [TRUE];
+IF (bitsSofar MOD C2CTarget.bitsPerWord)=0 THEN 
+RETURN [piece.bits<=C2CTarget.bitsPerWord];
+IF (bitsSofar MOD C2CTarget.bitsPerHalfWord)=0 AND C2CTarget.hasHalfWords THEN 
+RETURN [piece.bits<=C2CTarget.bitsPerHalfWord];
+IF (bitsSofar MOD 8) = 0 AND C2CTarget.hasBytes THEN 
+RETURN [piece.bits<=8];
+RETURN [FALSE];
+};
+piececc: CodeCont;
+pieceMode: Mode ¬ C2CAddressing.ProposedMode[piece, FALSE, FALSE, piece.bits];
+pieceAMode: AddressMode ¬ GetAMode[pieceMode];
+pieceMode ¬ UseValue[piece.bits, pieceMode];
+IF piece.bits=0 THEN NotYetImpl;
+IF ~WellAlligned[] THEN OddPiece[]
+ELSE {
+SELECT pieceAMode FROM
+plain, value, maskNShift, dummy => {
+unit: INT ¬ MIN[C2CTarget.bitsPerWord, piece.bits];
+unitPtr: Code ¬ C2CEmit.CastRef[C2CEmit.IdentCode[temporaryAddr], unit];
+IF bitsSofar#0 THEN { 
+unitPtr ¬ AddConst[unitPtr, bitsSofar/unit];
+unitPtr ¬ C2CEmit.SetRef[unitPtr, unit];
+};
+piececc ¬ GenNode[piece, pieceMode];
+cc.sc ¬ Cat2[cc.sc, piececc.sc]; 
+piececc.ec ¬ C2CEmit.MinPrecedence[piececc.ec, unaryPrecedence];
+IF unit<piece.bits THEN { 
+unitPtr ¬ C2CEmit.CastRef[unitPtr, piece.bits];
+};
+cc.sc ¬ C2CEmit.Cat[cc.sc, C2CEmit.Deref[unitPtr, piece.bits], " = ", piececc.ec, ";\n"];
+};
+ENDCASE => OddPiece[]; 
+};
+bitsSofar ¬ bitsSofar+piece.bits;
+ENDLOOP;
+SELECT reqAMode FROM 
+skip => {};
+ENDCASE => {cc.ec ¬ C2CEmit.IdentCode[temporary]}; --modized outside of IF
+}
+ELSE {
+FOR list: NodeList ¬ compositeLoc.parts, list.rest WHILE list#NIL DO
+piece: Node ¬ list.first;
+piececc: CodeCont;
+bitsSofar ¬ bitsSofar+piece.bits;
+IF isFirst THEN {
+is: BOOL; value: CARD;
+[is, value] ¬ C2CIntCodeUtils.IsSimpleConst[piece];
+IF is AND value=0 THEN LOOP;
+};
+piececc ¬ C2CAddressingOps.LoadArithNode[piece];
+cc.sc ¬ Cat2[cc.sc, piececc.sc];
+piececc.ec ¬ C2CEmit.CastWord[piececc.ec];
+IF isFirst THEN {isFirst ¬ FALSE; cc.ec ¬ piececc.ec}
+ELSE {
+cc.ec ¬ C2CEmit.Cat["(", C2CEmit.CastWord[cc.ec], " << ", C2CCodeUtils.ConstI[piece.bits], ")"];
+cc.ec ¬ C2CEmit.Cat[cc.ec, " + ", piececc.ec];
+cc.ec ¬ C2CEmit.Parentize[cc.ec];
+};
+ENDLOOP;
+IF isFirst THEN cc.ec ¬ C2CCodeUtils.ConstI[0]; --all the parts were constant and 0
+};
+IF bitsSofar#varNode.bits THEN CantHappen;
+IF specialCaseAlreadyModized 
+THEN cc.ec ¬ NIL
+ELSE cc ¬ C2CAddressingOps.ModizeArithCode[cc, mode, varNode.bits]
+};
+
+DummyDataRec: TYPE = RECORD[name: ROPE, bits: INT];
+
+MakeOrFindRHSDummy: PUBLIC PROC [bits: INT] RETURNS [name: ROPE] = {
+WITH C2CBasics.GetProp[$dummyDataRec] SELECT FROM
+ddrp: REF DummyDataRec => {
+IF ddrp.bits>=bits THEN RETURN [ddrp.name];
+};
+ENDCASE => {};
+WITH C2CBasics.GetProp[$LargestDummy] SELECT FROM
+ri: REF INT => bits ¬ MAX[bits, ri­];
+ENDCASE => {};
+bits ¬ C2CTarget.RoundUpToWordBoundary[bits];
+name ¬ C2CStateUtils.DeclareVariable[moduleDeclarations, bits, "dummy"];
+C2CEmit.AppendCode[moduleInitializations,
+C2CEmit.Cat[
+C2CRunTime.FillWords[dst: C2CEmit.Cat["&", name], times: C2CTarget.BitsToWords[bits], value: C2CCodeUtils.ConstI[0]],
+";\n"
+]
+];
+C2CBasics.PutProp[$dummyDataRec, NEW[DummyDataRec ¬ [name, bits]]];
+}; 
+
+LoadDummy: PROC [bits: INT] RETURNS [c: Code] = {
+IF bits<=C2CTarget.bitsPerWord 
+THEN c ¬ C2CEmit.IdentCode["0"]
+ELSE {
+c ¬ C2CEmit.IdentCode[MakeOrFindRHSDummy[bits]];
+c ¬ C2CEmit.TakeAddr[c, TRUE];
+c ¬ C2CEmit.CastRef[c, bits];
+c ¬ C2CEmit.Deref[c, bits];
+};
+};
+
+HandleDummyLoc: PROC [varNode: Var, mode: Mode] RETURNS [cc: CodeCont] = {
+IF LHSMode[mode] THEN {
+IF GetAMode[mode]#dummy THEN NotYetImpl;
+RETURN; --don't generate anything
+};
+cc.ec ¬ LoadDummy[varNode.bits];
+IF GetAMode[mode]#dummy THEN
+cc ¬ C2CAddressingOps.ModizeArithCode[cc, mode, varNode.bits];
+};
+
+GenVarNode: PUBLIC PROC [varNode: Var, mode: Mode] RETURNS [cc: CodeCont] = {
+
+HandleVanillaLoc: PROC [base: ROPE, mode: Mode, isRegister: BOOL ¬ FALSE] RETURNS [cc: CodeCont] = {
+SELECT GetAMode[mode] FROM
+assBitAddr => {
+ac: C2CAddressing.AddressContainer ¬ GetAddrContainer[mode];
+cc.sc ¬ C2CEmit.Cat[ac.words, " = (word) &", base, "; "];
+cc.sc ¬ C2CEmit.Cat[cc.sc, ac.bits, " = 0;\n"];
+IF ac.words=NIL OR ac.bits=NIL THEN CantHappen;
+IF isRegister THEN NotYetImpl;
+};
+assAddr => {
+template: ROPE ¬ GetTemplate[mode];
+cc.sc ¬ C2CEmit.Cat[template, " = (word) &", base, ";\n"];
+IF isRegister THEN NotYetImpl;
+};
+assUnits => {
+IF varNode.bits#C2CTarget.PointeeBits[varNode.bits] THEN NotYetImpl;
+cc.sc ¬ C2CAddressingOps.CodeToAssUnits[C2CEmit.IdentCode[base], mode];
+};
+assBits => {
+ac: C2CAddressing.AddressContainer ¬ GetAddrContainer[mode];
+bits: INT ¬ ContainerSize[mode];
+IF bits=0 THEN CantHappen;
+IF varNode.bits#C2CTarget.TemporaryBits[varNode.bits] THEN NotYetImpl;
+IF bits#varNode.bits THEN NotYetImpl;
+IF bits <= C2CTarget.bitsPerWord 
+THEN {
+cc.sc ¬ C2CEmit.Cat[cc.sc,
+C2CRunTime.DepositField[dst: ac, bits: bits, word: C2CEmit.IdentCode[base]],
+";\n"
+];
+}
+ELSE {
+cc.sc ¬ C2CEmit.Cat[cc.sc,
+C2CRunTime.MoveField[dst: ac, bits: bits, 
+src: ACFromCodes[C2CEmit.TakeAddr[C2CEmit.IdentCode[base], TRUE], NIL]
+],
+";\n"
+];
+};
+};
+getAddr, getBitAddr => {
+cc.ec ¬ C2CEmit.TakeAddr[C2CEmit.IdentCode[base], TRUE];
+IF isRegister THEN NotYetImpl;
+};
+plain => {
+cc.ec ¬ C2CEmit.IdentCode[base];
+IF varNode.bits#C2CTarget.TemporaryBits[varNode.bits] THEN NotYetImpl;
+IF isRegister THEN cc.ec ¬ C2CEmit.SetAddressable[cc.ec, FALSE];
+};
+value, maskNShift => {
+cc.ec ¬ C2CEmit.IdentCode[base];
+IF isRegister THEN cc.ec ¬ C2CEmit.SetAddressable[cc.ec, FALSE];
+IF varNode.bits#C2CTarget.TemporaryBits[varNode.bits] THEN {
+IF varNode.bits>C2CTarget.bitsPerWord THEN NotYetImpl;
+cc.ec ¬ C2CCodeUtils.MaskNShift[cc.ec, varNode.bits, 0, C2CTarget.TemporaryBits[varNode.bits]];
+};
+};
+skip => {--no side effects--};
+ENDCASE => CaseMissing;
+};
+
+GetName: PROC [] RETURNS [name: ROPE] = {
+IF varNode.id=nullVariableId THEN CantHappen;
+name ¬ C2CNames.VarName[id: varNode.id, class: "var"];
+};
+
+EmitNameAsComment: PROC [] = {
+IF varNode.id#nullVariableId THEN {
+name: ROPE ¬ C2CNames.VarName[id: varNode.id, class: "var"];
+IF cc.ec#NIL 
+THEN cc.ec ¬ C2CEmit.CatRemark[cc.ec, name]
+ELSE IF cc.sc#NIL 
+THEN cc.sc ¬ C2CEmit.CatRemark[cc.sc, name]
+ELSE cc.sc ¬ C2CEmit.Cat[C2CEmit.CatRemark[cc.sc, Rope.Concat["node removed: ", name]], C2CEmit.line];
+};
+};
+
+CheckGlobalAccess: PROC [id: LogicalId] = {
+WITH C2CBasics.GetProp[$IdsInGlobalFrame] SELECT FROM
+tab: IntCodeUtils.IdTab => 
+IF IntCodeUtils.Fetch[tab, id]=$UseGlobalFrame THEN CantHappen; 
+ENDCASE => {};
+};
+
+mode ¬ SetExpr[mode]; 
+IF varNode.location=nullLocation THEN CantHappen; 
+WITH varNode.location SELECT FROM
+globLoc: GlobalVarLocation => {
+CheckGlobalAccess[globLoc.id];
+cc ¬ HandleVanillaLoc[GetName[], mode];
+};
+locLoc: LocalVarLocation =>  {
+cc ¬ HandleVanillaLoc[GetName[], mode, varNode.bits=32 AND varNode.flags[frequent]];
+};
+derefLoc: DerefLocation => {
+cc ¬ HandleDerefLoc[varNode: varNode, mode: mode, derefLoc: derefLoc];
+EmitNameAsComment[];
+};
+indexedLoc: IndexedLocation => {
+cc ¬ HandleIndexedLoc[varNode: varNode, mode: mode, indexedLoc: indexedLoc];
+EmitNameAsComment[];
+};
+fieldLoc: FieldLocation => {
+cc ¬ HandleFieldLoc[varNode: varNode, reqMode: mode, fieldLoc: fieldLoc];
+EmitNameAsComment[];
+};
+compositeLoc: CompositeLocation => {
+cc ¬ HandleCompositeLoc[varNode: varNode, mode: mode, compositeLoc: compositeLoc];
+};
+dummyLoc: DummyLocation => {
+cc ¬ HandleDummyLoc[varNode: varNode, mode: mode];
+};
+stackLoc: StackLocation => CantHappen;
+upLevelLoc: UpLevelLocation => CantHappen;
+escLoc: EscapeLocation => CantHappen;
+sysLoc: SystemLocation => CantHappen;
+ENDCASE => CaseMissing;
+FreeMode[mode];
+}; 
+
+END.
+
+
+  Î  
+C2CVarImpl.mesa
+Copyright Ó 1987, 1988, 1989, 1990, 1991, 1992, 1993 by Xerox Corporation.  All rights reserved.
+Christian Jacobi, 1987
+Christian Jacobi, May 4, 1993 8:45 pm PDT
+Willie-s, September 24, 1991 6:08 pm PDT
+
+
+
+
+CURRENTLY DEFINED FOR FIELD, NOT INDEXED
+
+--if bAddrC is address [except if addrNotYetTaken], accesses field with size sz at position start
+--assumes all alignment requirements ok
+we try not to use address; this allows the C compiler to put the base into a register
+--make sure size is ok !
+--makes sure baseMode, baseAM, and, pseudoBaseSz are defined
+--caller needs outside knowlede whether addr or base is loaded
+--The case where we want the shift and mask instructions to handle field access (rhs)
+--Requirement 1: fieldLoc.base.bits<=C2CTarget.bitsPerWord
+--Requirement 2: SizeIsProvableOk[fieldLoc.base]
+--the nice and easy case of field access
+--recognizes case where field is exactly right adjusted in word
+--Case introduced to avoid taking address of local variables which would force local variable into memory 
+--PlainFieldAsIndexing
+--Caveat: Valid only in cases where varNode.bits is well defined 
+--will not yet call C2CAddressingOps.ModizeArithCode 
+--taking this case first prevents us from taking the addr of an expression which is not lvalue or, which we might prefer to remain stored in a register
+--baseAM: so the alignment will be ok
+--access field completely in one unit
+endian !!!
+--Masking out part of word if left boundary of part starts at unit boundary
+--Use deref and shift instead of two shifts... 
+--access field crossing wordboundary
+--HandleFieldLoc
+--alignment ok!
+--This might be somewhat inefficient
+--This might be somewhat inefficient
+--but requestedAM#assBitAddr
+--but requestedAM#assBitAddr
+--??note: varNode.bits are defined, since rqAm in [maskNShift, value] 
+--note: varNode.bits are defined, since rqAm in [maskNShift, value] 
+--Recognizes simple local variables which might be put into registers 
+It might be appropriate to add a test for the alignment
+template is always in range !
+Not necessary maskIn _ C2CEmit.Cat[C2CCodeUtils.Mask[varNode.bits], " & ", rhsTemplate];
+--pointeebits is always safe, but sometimes not efficient
+--pointeebits works, otherwise it would not require maskNShift mode
+--don't consider varBits=bitsPerByte, bitsPerHalfWord; we are maskNShift'ing anyway
+--Either handles the case completely or returns cc empty and makes no costly side effects
+--offset
+--HandleIndexedLoc
+--base is right adjusted!
+--simply retry with different mode
+--simply retry with different mode
+--compute code for shift, using indexCC.ec--
+Creates a mask with n (rightmost) bits set to one
+Creates a mask with specified "bits" bits set to one
+Positioned at start bits from the LEFT on unitBits large unit 
+Creates a mask with non specified "bits" bits set to one
+Positioned at start bits from the LEFT on unitBits large unit 
+--Reqired: mode=assBitAddr
+--offEC: bit offset; NIL for 0
+YYY should test whether base.bits is valid
+--value was right adjusted
+--Reqired: mode=getBitAddr
+--offEC: bit offset; NIL for 0
+YYY we should test whether base.bits is valid
+--value was right adjusted
+-- allows NIL code input for 0
+-- IF returnNil allows NIL code output for 0
+-- allows NIL code as 0
+--left justified
+--should look similar to assBits, except right justified 
+fill left spare of destination template with 0
+--move value to right of template
+--don't AlignmentTest: requestor responsible
+--don't AlignmentTest: requestor responsible
+--hackAddr: efficiency hack; 
+--	if present composite location is generated into *hackAddr
+--	required mode must be skip
+--	hackAddr may be evaluated multiple times
+--needs multi words
+--piece fits in word
+--piece does not fit in word
+--Don't cast to word; all we do is an assignment
+--fits into single word
+--Generates code code to return 0 expression
+--only useage of var; no declaration !
+--Returns base or a bit-address for base
+--Assumes base at least identPrecedence
+--XXX Is this vanilla loc right or left adjusted? I don't care since bits must match
+--take the leftmost bits
+-- globals: varNode
+-- globals: varNode, cc
+--C2C assumed the front end would compute all accesses of this variable 
+--using pointers to the global frame. 
+--we are NOT! in declaration mode
+--ignore locLoc.parent
+ Ê5b  –(cedarcode) style•NewlineDelimiter
+™ codešœ™Kšœ
+ÏeœU™`Kšœ™K™)K™(K™ —šÏk	˜	Kšœ˜Kšœ˜Kšœ
+˜
+Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜K˜Kšœ˜Kšœ	˜	Kšœ˜Kšœ
+˜
+Kšœ	˜	Kšœ˜Kšœ˜Kšžœ˜Kšœ˜K˜ —šÏn
+œžœž˜Kšžœ¿˜ÆKšžœ˜—šž˜KšžœS˜WK˜ —Kšžœžœžœ˜K˜ šŸœžœžœ˜/Kšžœžœžœžœ˜Kšžœžœžœžœ˜Kšžœ˜Kšœ˜—K˜ šŸœžœžœ˜=Kšžœi˜oK˜—K™ š
+Ÿœžœžœžœžœ˜4šžœžœž˜Kšœžœ˜;Kšœžœžœ˜>Kšœžœžœ˜^Kšžœ˜—K˜—K˜ šŸ	œžœžœ˜?Kšœ!˜!Kšžœžœžœ;˜RKšžœ˜K˜—K™ K™ šŸ(™(K™ —šŸœžœžœ!žœžœžœ˜wKšÏca™aKš '™'Kšžœžœžœ˜9šžœžœžœžœžœžœžœžœ.žœ)žœžœ˜”KšœU™Ušžœ žœ˜(Kš ™Kšœ0žœ˜BKšœ˜—Kšœ5˜5Kš
+žœ	žœ! œžœžœ˜OKšœžœžœ$˜KKšœ0˜0Kšž˜Kšœ˜—šžœžœ˜Kšœ"žœ˜(—Kšœ)˜)Kšœ.˜.šžœ	žœ˜Kšœžœ˜šœžœžœ˜Kšžœ &˜CKšžœžœžœ ˜C—Kšžœžœžœ˜%Kšœ˜KšœM˜MKšœ˜K˜—Kšœ˜Kšœ˜—K˜ š
+Ÿœžœžœžœžœ˜3šžœ0ž˜:Kšœžœžœ˜ Kšžœžœžœ˜—K˜—K˜ šŸœžœ6žœ˜fKšœžœ˜Kšœžœ Ðbc $˜RKšœ-˜-Kšœžœ ˜0Kšœ ˜5Kšœžœ 1˜IK˜ šŸœžœ˜Kš <™<šžœ
+žœžœ˜šžœ
+˜Kšžœ=žœ˜Išžœ˜K˜?Kšœ<žœ˜PKšœ˜——Kšœ*˜*Kšœ˜K˜—K˜—K˜ šŸœžœžœžœ˜7Kšœ>™>šžœž˜šœ˜Kšœ1˜1Kšœ˜Kšžœžœžœ5˜GK˜—Kšžœ˜—K˜—K˜ šŸœžœžœžœžœžœžœ˜uKšžœžœ!žœ˜=Kšœ(˜(šžœžœ˜KšœQ˜QKšœ&˜&K˜—K˜—K˜ šŸœžœ˜K™UKšœ:™:Kšœ0™0Kšœ˜Kšœžœ-˜AKšžœžœ0žœ˜ZKšœ5˜5Kšœ˜šžœžœžœ˜.šžœAžœ'žœ˜sKšœžœA˜KKšœP˜PKšž˜K˜—K˜—Kšœz˜zKšžœ˜K˜K˜ —šŸœžœ˜!Kš (™(K˜ š
+Ÿœžœžœžœžœ˜7Kš ?™?Kš	žœžœ$žœžœ ˜RKš	žœžœ*žœžœ ˜\Kšžœ0žœžœ ˜VKšžœ"žœžœ˜1šžœž˜K˜"Kšžœžœžœ˜—Kšžœžœ˜Kšœ˜K˜ —š
+Ÿœžœžœžœžœ˜?Kšœj™jšžœžœ$žœ˜=Kšžœžœ ˜—šžœžœ*žœ˜IKšžœžœ ˜—Kšžœ"žœžœžœ˜8šžœž˜K˜"Kšžœžœ˜—šžœžœž˜šœ˜Kš
+žœžœžœžœžœ˜Bšžœž˜KšÐbfÑbfk¢£¢œ˜Kšžœžœžœ˜—K˜—Kšžœžœžœ˜—Kšœ˜K˜ —K™Kšœžœžœ˜Kšœ ˜ šžœž˜šœ
+˜
+šžœžœ  ˜0šžœžœžœžœ˜WKšœ.ÏbÐbk˜5K˜—šžœžœžœ˜EKšœ¤¥˜K˜—K˜—šžœž˜Kšœ5žœ˜:KšœDžœ˜JKšžœžœ˜)—K˜—Kšœ˜Kšœ˜Kšžœ˜—Kšœžœ
+žœžœS˜„Kšœ ˜—K˜ šŸœžœ˜"Kšœ¤œ9™AKšœ5™5Kšœžœ'˜7Kšœ˜šžœžœžœ2žœ˜^Kšœ˜Kšž˜K˜—Kšžœžœ˜šžœžœ˜Kšœ ˜ Kšž˜K˜—šžœžœ+žœ!žœ˜jKš —™—Kšœ˜Kšž˜Kšœ ˜—šžœž˜šœ˜Kš %™%Kšœ
+žœ˜šžœ!ž˜(šžœžœžœ"žœ˜ZKš %™%Kšœžœ˜Kšœ	žœ˜'Kšœžœ%˜3Kšœžœžœ˜šžœž˜Kšœ˜Kšœžœ˜ Kšžœ˜—šžœ*žœ!žœ˜VJ™
+KšœI˜IK˜—KšœP˜PKšœ'˜'šžœžœžœ˜.šžœ5žœ˜=Kšœžœ5˜?KšœO˜OKšž˜K˜—K˜—šžœ F˜LK™KK™/š
+Ÿœžœžœžœžœ˜Ašžœžœž˜šœ˜Kšžœžœžœžœžœžœ˜[šžœž˜Kšœžœžœ˜!Kšžœ˜—K˜—Kšžœ˜—K˜—Kšœžœžœ˜šžœžœžœžœžœ$žœ˜lKšœžœ$˜8Kšœžœ˜)Kšœ9žœ˜?Kšœ,˜,Kšœ6˜6Kšœ4˜4KšœJ˜JKšœ!˜!Kšž˜Kšœ˜—Kšžœ˜—KšœU˜UKšž˜K˜—Kšœ-˜-Kšžœ˜—Kšœ˜—Kšœ˜Kšžœ˜—K˜ šžœ%žœ˜-Kš $™$šžœž˜Kšœ ˜"šœ˜Kšœ#˜#Kšœ1˜1Kšœ˜KšœJ˜JKšœ"˜"Kšœ>˜>Kšœ?˜?K˜—šœ˜Kšœ#˜#Kšœ1˜1Kšœ˜Kšœ<˜<Kšœ?˜?K˜—Kšžœ˜—Kšž˜Kšœ ˜——˜ Kšœ˜Kšœ.˜.K˜—K˜ K™šžœž˜šœ˜Kš ™Kšœ˜šžœ˜šžœ˜Kšžœ
+žœ-žœ˜LK˜—šžœ˜Kšœ˜Kšœ'˜'K˜——šžœž˜Kšœ)˜)Kšžœ˜—šžœž˜KšœA˜A—Kšœ˜—šœ	˜	Kšœ%˜%KšœA˜AK˜—šœ˜šœžœ˜ Kšžœžœ˜	Kšžœ%˜)—Kšœ9˜9Kšœ˜—šœ˜Kš	œžœžœžœžœ%˜RKšœ9˜9Kšœ˜—šœ˜Kšœ$™$K˜KšœA˜AKšœ˜—šœ˜Kšœ$™$K˜KšœA˜AKšœ˜—šœ˜Kšœ˜šžœž˜šœ˜Kš	œžœžœžœžœ%˜RKš ™Kšžœžœžœ˜Kšžœ$žœ˜6šžœžœ˜Kšœ;˜;Kšœžœ˜&Kšœ3˜3Kšœ7˜7K˜—Kšžœ )˜:Kšœ˜—šœ˜Kš ™Kš	œžœžœžœžœ%˜RKšžœžœžœ˜Kšžœ$žœ˜6šžœžœ˜Kšœ:˜:KšœJ˜JKšœ	žœ˜K˜—Kšžœ )˜:Kšœ˜—šœ˜KšœF™FK˜K˜—šœ˜Kš D™DKšžœAžœ2žœ˜ˆK˜K˜—Kšœ ˜ Kšžœ˜—Kšœ˜—˜šŸœžœžœžœ˜DK™Fšžœžœž˜˜Kšžœžœžœžœ˜Fšžœžœž˜˜(Kšžœ-žœžœžœ˜BK˜—Kšžœ˜—K˜—Kšžœ˜—Kšžœžœ˜K˜—Jšœ
+žœ˜*Jšœ	žœ˜)Kšœžœžœ
+˜)K˜K˜Kšœ˜Kšœžœ *˜TKšœ@ ˜LKšœžœžœ˜$Kšžœ@žœ˜RK˜CKšœ@žœžœ˜jKšœž˜K˜)šžœž˜˜
+šžœ"žœ6žœ"žœ˜ˆK˜<K˜—K™7K˜—K˜K˜Kšžœ˜—K˜'Kšœ˜Kšœ¤œ˜1šžœžœ˜K˜@K˜=Kšžœžœžœžœ˜K˜%K˜—K˜:šžœžœ˜˜
+Kšžœ$žœ˜6šžœ*žœ˜2Kšžœ8žœ˜JKšœžœžœ-˜^K˜—J˜Jšžœ žœ"˜HKšœžœ
+˜$K˜—˜Jšœžœžœ˜Jšœžœžœ˜šžœžœ˜Jšžœžœžœ˜*Jšžœ#žœžœ˜>J˜—šžœžœ˜J˜+J˜BJ˜#J˜*Kšœ¤œ˜1Jšœžœ˜J˜—šžœžœ˜š	žœžœ5žÏi)œžœ˜}KšœžœW˜aK˜RKšœ¤œ˜3K˜K˜!K˜—K˜—K˜)K˜—Kšžœžœ˜—šžœžœžœžœ˜HKšœžœ0˜:K˜MKšœ˜—šžœžœžœ#žœ˜?Kšœžœ(˜2KšœM˜MKšœ˜—šžœ˜Kšœ¤œ˜3K˜wKšœ%˜%šœ™KšœX™X—šžœ˜šžœ˜Kšœ	žœ˜šžœžœ˜%K˜;K˜—K˜&K˜—šžœ˜K˜:šžœžœ˜%K˜YKšœ#˜#K˜—K˜——Kšœ+˜+K˜7K˜—K˜—Kšžœ˜—Kšžœ
+žœžœ˜(Kšœ ˜—K˜ š
+Ÿœžœžœžœžœ˜MKšœžœ"˜2Jš 9™9Jš C™CKšžœ$žœžœ˜@šžœžœž˜šœžœžœž˜)šœ˜Jš S™SKšžœ$žœžœ˜JKš
+žœ'žœžœ(žœžœ˜—Kšžœ˜Kšœ˜—Kšœ žœ˜?Kšœžœ˜=Kšœžœ˜7šœ ˜ Kšžœ"žœžœ˜H—šœ˜šžœžœžœ˜3Kšœžœ3˜9Kšžœžœžœ˜ K˜—Kšžœ˜Kšœ˜—Kšœ œžœ˜NKšžœžœ˜ —šœ˜Kšžœ"žœžœ˜H—šœ˜Kšžœ"žœžœ˜H—Kšžœ˜—Kšžœ˜Kšœ˜—šŸœžœ7žœ˜iKšœ˜Kšœ6˜6Kšœžœ˜Kšœžœ ¡ $˜QK˜ šŸœžœžœžœ˜CKš Y™Yšœžœžœ
+˜ Kšžœ˜Kšžœ/˜3—Kšœ>žœ˜RKšœ#˜#Kšžœžœ2žœ˜VKšœ˜šžœž˜šœ ˜'KšœC˜CKšœE˜EKšœ$˜$KšœC˜CKšœ6 ˜SKš ™KšœC˜CKšœ,˜,Kšœ+˜+šžœ	ž˜˜šžœžœ$žœ˜6Kšœ ˜ —Kšœ˜—šœ˜Kšœf %˜‹Kšœ žœ˜&KšœG˜GKšœž˜Kšœ˜—Kšœ+žœ˜1šœ˜KšœM˜MKšœžœ˜K˜—Kšœ œ˜5Kšžœ˜Kšžœ˜—K˜—Kšžœ ˜'—Kšœ ˜—K˜ K™Kš
+žœžœ$žœžœžœ˜yšžœ	ž˜šœ˜Kšžœ2žœ˜DKšœ˜Kš
+žœžœžœžœžœ˜+K˜—˜šŸœžœ˜#KšœH˜HKšœžœ˜Kšœ
+žœ=˜JKšœžœ5žœ ˜hšœ˜Kšœ>˜>KšœC˜C—šžœ8žœ˜@KšœžœU˜_Kšœ6˜6Kšœ%˜%K˜—Kšœ1˜1šžœžœ˜Kšœ˜šœU˜UKšœE˜E—Kšœ*˜*šœI˜IKšœI˜I—K˜—šœ+˜+Kšœ9˜9—šœ8˜8Kšœ9˜9—KšœT˜TKšœC˜CKšœ2˜2Kšžœ	žœžœ=˜PK˜—šŸœžœ˜"Kšœ
+žœ˜Kšœžœ˜šœC˜CKšœA˜AKšœ˜—Kšžœ$žœžœ ˜Pšžœ8žœ˜@KšœžœU˜_Kšœ6˜6Kšœ%˜%K˜—šœ8 $˜\Kšœ9˜9—K™KšœN ˜\Kšœ(˜(KšœG˜GKšœ2˜2Kšžœ	žœžœ=˜PK˜—Kšœ˜Kšœ
+žœ'˜4Kšœžœžœ-˜;KšœDžœ˜OKšœ)˜)Kšœ)˜)šžœžœ˜Kšœ˜Kšžœžœžœžœžœž˜%K˜—Kšžœ$žœ˜6Kšœ;˜;Kšœ ˜ šžœžœžœžœ˜>šžœ-žœ#žœ˜[Kšœ˜Kšžœ˜K˜—š
+žœžœžœžœžœ˜ZKšœ˜Kšžœ˜K˜—K˜—šžœž˜˜Gšœ
+˜
+šžœž˜Kšœ4˜4Kšžœ!˜(——Kšœ0˜0Kšœ˜KšœS˜SKšœc˜cK˜—Kšœ ˜ Kšžœ˜—K˜—šœ˜Kšœ˜KšœE˜EKšœ ˜ Kšœ=˜=KšœB˜BKšœžœžœžœ˜;K˜—šœ˜Kšœ˜KšœE˜EKšœ ˜ Kšœ=˜=KšœB˜BKšœ˜Kšœ!˜!K˜—šœ˜Kš "™"KšœG˜GKšœ˜KšœG˜GK˜—šœ˜Kš "™"Kšœ(˜(Kšœ,˜,Kšžœžœ˜#šœ%˜%šœ˜Kšœ˜Kšœ/˜/Kšœ˜—Kšœ˜—K˜—šœ	 ˜&šžœ/žœžœ˜>Kšœ4˜4Kšœ˜K˜—šžœ0žœžœ˜?Kšœ6˜6Kšœ˜K˜—K˜—˜Kšœžœžœ˜#Kšœ-žœ˜1Kšœ˜Kšœžœ +˜SKšœ
+žœ=˜JKšœžœ5žœ ˜hšŸœžœžœžœ˜.Kš ,™,˜8Kšœ?˜?—KšœC˜CKšœT˜TKšœ9˜9Kšœ¤œ˜1K˜—Kšžœ%žœ˜7K˜ Kšœ;˜;Kšœ ˜ KšœC˜Cšžœ8žœ˜@K˜^KšœR˜RKšœ*˜*K˜—KšœB˜BKšœ#˜#KšœF˜FKšœ9˜9K˜ šžœžœ˜Kšœ[˜[KšœE˜EKšœI˜IKšœI˜IKšœE˜EKšœ¤œ)˜IK˜—K˜ šžœ
+žœžœ #˜JKšœ? ˜KKšœžœžœ˜$K˜CK˜ šžœžœžœžœ˜HKšœ.˜.K˜WKšœ<˜<Kšž˜Kšœ˜—šžœžœ#žœ˜:Kšœ.˜.K˜WKšœ;˜;Kšž˜Kšœ˜—K˜—K˜ KšœZ˜ZKšœW˜WKšœ/˜/Kšœ=˜=Kšœ.˜.Kšœ4˜4K˜ šžœžœžœ˜K˜^—Kšœ=˜=K˜ K˜YKšœL˜LKšœN˜NKšœ3˜3Kšœ(˜(Kšœ5˜5Kšœ˜—Kšœ˜Kšžœ˜—K˜—K˜ š
+Ÿœžœžœžœžœ˜*K™1Kšœžœ˜Kšžœžœžœžœ˜4Kšžœžœ ˜9Kšžœžœžœžœžœžœžœ˜)Kšžœžœžœ˜&Kšžœ˜K˜—K˜ šŸ	œžœžœžœžœžœ˜6Kšžœžœžœ˜)Kšžœ˜K˜—K˜ š
+Ÿœžœžœžœžœ˜;K™4K™>Kšžœ3˜9K˜K˜ —š
+Ÿœžœžœžœžœ˜CK™8K™>Kšžœ3˜9K˜—K˜ š
+Ÿœžœžœžœžœ˜)Kšžœžœžœžœ˜4Kšžœžœžœ˜K˜K˜ —šŸœžœžœžœžœžœ˜:Kšžœžœžœžœ˜4šžœ
+ž˜Kšœžœ	˜Kšœžœ˜Kšœžœ˜Kšžœžœ˜—K˜—K˜ šŸœžœ%žœ˜]Kš¡™Kš ™Kšœžœ˜%Kšœ&˜&KšœAžœ
+˜OKšœ)˜)Kšœ˜Kšœ˜Kšœ<˜<Kšžœžœ˜&Kšžœžœžœ7˜Hšžœž˜šœ
+˜
+Kšœ%˜%Kšœ!˜!Kšœ˜Kšœ(˜(Kšœ>˜>Kšžœžœžœ ˜1Kšœ9˜9K˜—šœ˜Kšœ%˜%Kšœ!˜!Kšœ˜KšœP˜PKšžœžœžœ ˜1Kšœ9˜9K˜—šœ
+˜
+Kšœ*˜*Kšœ!˜!Kšžœžœžœ˜!Kšœ˜šžœ#˜%Kšžœ)žœ˜2šžœ˜Kšœžœ&˜-Kšœ
+žœ<˜JKšžœ'™*Kšžœžœ˜!Kšœ>˜>Kšœ'˜'šžœžœ˜Kš ™Kšœ&˜&Kšœ˜—Kšœ˜——KšœP˜PKšžœžœžœ ˜1Kšœ9˜9K˜—šœ˜Kšœ!˜!Kšœ$˜$Kšœ˜Kšžœžœžœ˜!Kšœ˜Kšžœžœžœ;˜LK˜—˜Kšœ+˜+Kšœ*˜*Kšœ!˜!Kšœ˜Kšžœžœžœ˜!KšœP˜PKšœO˜OK˜—Kšžœ˜—Kšžœžœžœ˜Kšœ ˜—K˜ šŸœžœ%žœ˜]Kš¡™Kš ™Kšœ˜Kšœ&˜&KšœAžœ
+˜OKšœ)˜)Kšžœ	¤
+œžœ˜&Kšžœžœžœ7˜Hšžœž˜šœ
+˜
+Kšœ$˜$Kšœ˜Kšœ žœ˜&Kšœ˜K˜—šœ˜Kšœ$˜$Kšœ˜Kšœ ˜ Kšœ˜K˜—šœ˜Kšœ)˜)Kšœ˜šžœ˜!Kšžœ!žœ˜*šžœ˜Kšœžœ&˜-Kšœ
+žœ<˜JKšœ-™-Kšžœžœ˜!Kšœ:˜:Kšœ#˜#šžœžœ˜Kš ™Kšœ&˜&Kšœ˜—Kšœ˜——Kšœ˜K˜—šœ˜K˜K˜—˜Kšœ$˜$Kšœ+˜+Kšœ˜Kšœ!žœ˜'K˜—Kšžœ˜—Kšžœžœžœ˜Kšœ ˜—K˜ šŸœžœžžœžœžœžœ˜OKš ™Kš ,™,šžœžœž˜šœžœžœžœ˜šžœ˜Kšžœžœžœ˜Kšžœžœ˜%——Kšœžœžœ˜Kšœžœžœ˜Kšžœžœ4˜E—K˜—K˜ šŸœžœžœžœ˜;Kš ™šœžœ˜Kšžœžœ˜	Kšžœ˜ —Kšœžœ˜K˜—K˜ šŸœžœ3žœ˜cš
+Ÿœžœžœžœžœ˜*šžœ(žœ˜/Kšžœžœžœžœ˜3—K˜—Kšœ˜Kšœ6˜6KšœA˜AKšœ˜Kšžœžœ˜$Kšœ˜Kšœ>˜>šžœ	ž˜Kšœ+˜+šœ˜Kšœ™Kšœ?˜?šœ˜šœ˜Kšœ
+˜
+Kšœ.žœ˜4Kšœ˜Kšœ˜—Kšœ˜Kšœ˜—Kšœžœ˜K˜—šœ˜Kš	œžœžœ
+žœžœ˜CKšžœ
+žœ˜Kšžœžœ˜'šžœžœ˜Kšœ(˜(KšœL˜LKšœžœ˜K˜—šžœ˜Kš 9™9Kšœžœ˜Kšœžœ˜!Kšœžœ&˜0Kšžœ
+žœ˜šžœ
+žœ˜Kšœ.™.šœ˜šœ˜Kšœ ˜ Kšœ˜Kšœ˜K˜—Kšœ˜Kšœ˜—Kšœ˜—K™!šœ˜šœ˜Kšœ ˜ Kšœ.žœ˜4Kšœ
+˜
+Kšœ˜—Kšœ˜Kšœ˜—Kšœžœ˜K˜—Kšœ˜—šœ˜Kšœ
+žœ˜#KšœP˜PKš ,™,Kšœ˜—šœ˜Kšœ<˜<KšœO˜OKšœ/˜/Kš
+žœ
+žœžœ	žœžœ˜/K˜—šœ
+˜
+Kš	œžœžœ
+žœžœ˜CKšœ(˜(Kšœ˜—šœ˜Kšœžœ!˜+Kšžœžœ˜#Kšžœžœ˜"Kšžœžœ˜/Kšœ(˜(Kš ,™,Kšœ˜—˜
+Kš	œžœžœ
+žœžœ˜CKšžœžœ˜#Kšžœžœžœ˜.šžœ˜šžœ˜Kšœ(˜(K˜—šžœ˜KšœNžœ˜SKšžœžœ˜'šžœ%˜'Kšžœ=˜Ašžœ˜Kšœ
+žœ_˜mšœ˜šœ˜Kšœ(˜(Kšœ˜Kšœ˜—Kšœ˜Kšœ˜—Kšœ$˜$Kšœ˜——K˜——Kšœ˜—šœ	 ˜%Kšœ˜Kšœ˜—Kšžœ˜—K˜—K˜ šŸœžœžœGžœžœžœ˜ŒKš ™Kš <™<Kš ™Kš +™+Kšœžœžœ˜Kšœžœ˜Kšœ	žœžœ˜Kšœžœžœ˜(Kšœžœ˜Kšœ'˜'šžœ
+žœžœ˜Kšžœ%žœ˜7Kšžœžœ˜!K˜—Kšžœžœ˜"Kšžœžœ˜!šžœžœ$žœ˜BKšœžœ˜!Kšœ˜K˜—šžœ$˜&šžœ˜Kš ™šŸœžœžœ˜5Kšžœžœžœ(˜?Kšžœ˜Kšœ˜—Kšœ#žœžœ˜-šžœ
+žœžœ˜Kšœp˜pKšœ,˜,K˜—Kšœ˜šžœ0žœžœž˜DKšœ˜šŸœžœ˜Kšœ2˜2šžœ#˜%šžœ˜Kš ™Kšœ:˜:Kšœ ˜ KšœA˜Ašœ˜KšœI˜IKšœ˜Kšœ˜—K˜—šžœ˜Kš ™KšœB˜BKšœ)˜)Kšœ ˜ Kšžœžœžœ˜"šœ%˜%Kšœ@˜@Kšœ˜Kšœ˜—K˜——Kšœ˜—šŸœžœžœžœ˜(Kšžœ.žœžœžœ˜Dšžœžœžœ˜2Kšžœžœ˜—šžœžœžœ˜0Kšžœ%˜+—šžœžœžœžœ˜OKšžœ)˜/—šžœžœžœžœ˜5Kšžœ˜—Kšžœžœ˜Kšœ˜—Kšœ˜Kšœ4žœžœ˜NKšœ.˜.Kšœ,˜,Kšžœžœ˜ Kšžœžœ˜"šžœ˜šžœž˜˜$Kšœžœžœ$˜3KšœH˜Hšžœžœ˜Kšœ,˜,Kšœ(˜(K˜—Kšœ$˜$Kšœ!˜!Kšœ@˜@K™0šžœžœ˜Kšœ/˜/K˜—KšœY˜YKšœ˜—Kšžœ˜—K˜—Kšœ!˜!Kšžœ˜—šžœ
+žœ˜Kšœ˜Kšžœ, ˜J—K˜—šžœ˜Kš ™šžœ0žœžœž˜DKšœ˜Kšœ˜Kšœ!˜!šžœ	žœ˜Kšœžœ	žœ˜Kšœ3˜3Kšžœžœ	žœžœ˜Kšœ˜—Kšœ0˜0Kšœ ˜ Kšœ*˜*Kšžœ	žœžœ˜5šžœ˜K˜`Kšœ.˜.Kšœ!˜!K˜—Kšžœ˜—Kšžœ	žœ! #˜SK˜——Kšžœžœ˜*šžœ˜Kšžœ	ž˜Kšžœ>˜B—Kšœ˜—K˜ Kš	œžœžœžœžœ˜3K˜ šŸœžœžœžœžœžœ˜Dšžœ"žœž˜1šœžœ˜Kšžœžœžœ˜+K˜—Kšžœ˜—šžœ"žœž˜1Kšœžœžœžœ˜%Kšžœ˜—Kšœ-˜-KšœH˜Hšœ)˜)šœ˜Kšœu˜uKšœ˜Kšœ˜—Kšœ˜—Kšœ!žœ˜CKšœ˜—K˜ šŸ	œžœžœžœ˜1Jš ,™,šžœ˜Kšžœ˜šžœ˜Kšœ0˜0Kšœžœ˜Kšœ˜Kšœ˜K˜——K˜—K˜ šŸœžœžœ˜Jšžœžœ˜Kšžœžœ˜(Kšžœ ˜!K˜—Kšœ ˜ šžœž˜Kšœ>˜>—Kšœ˜—K˜ šŸ
+œžœžœžœ˜MKš &™&K˜ šŸœžœžœžœžœžœ˜dKš (™(Kš '™'šžœž˜šœ˜Kšœ<˜<Kšœ9˜9Kšœ/˜/Kš
+žœ
+žœžœ	žœžœ˜/Kšžœžœ˜Kšœ˜—šœ˜Kšœ
+žœ˜#Kšœ:˜:Kšžœžœ˜Kšœ˜—šœ˜Kšžœ2žœ˜DKšœG˜GKšœ˜—šœ˜Kšœ<˜<Kšœžœ˜ Kšžœžœ˜Kšžœ4žœ˜FKšžœžœ˜%Kš T™Tšžœ˜!šžœ˜šœ˜KšœL˜LKšœ˜Kšœ˜—K˜—šžœ˜šœ˜šœ*˜*Kšœ;žœžœ˜FK˜—Kšœ˜Kšœ˜—K˜——Kšœ˜—šœ˜Kšœ2žœ˜8Kšžœžœ˜K˜—šœ
+˜
+Kšœ ˜ Kšžœ4žœ˜FKšžœžœ'žœ˜@K˜—˜Kšœ ˜ Kšžœžœ'žœ˜@šžœ4žœ˜<Kšžœ$žœ˜6Jš ™Kšœ_˜_Kšœ˜—K˜—Kšœ	 œ˜Kšžœ˜—K˜—K˜ šŸœžœžœžœ˜)Kš ™Kšžœžœ˜-Kšœ6˜6Kšœ˜—K˜ šŸœžœ˜Kš ™šžœžœ˜#Kšœžœ2˜<šžœžœ˜Kšžœ'˜+šžœžœžœ˜Kšžœ'˜+Kšžœb˜f——K˜—Kšœ˜—K˜ šŸœžœ˜+šžœ&žœž˜5šœ˜šžœ-žœ˜@Kš H™HKš &™&——Kšžœ˜—K˜—K˜ Jšœ!™!Kšœ˜Kšžœžœ˜2šžœžœž˜!šœ˜Kšœ˜Kšœ'˜'K˜—šœ˜Kš ™Kšœ7žœ˜TK˜—šœ˜KšœF˜FKšœ˜K˜—šœ ˜ KšœL˜LKšœ˜K˜—šœ˜KšœI˜IKšœ˜K˜—šœ$˜$KšœR˜RKšœ˜—šœ˜Kšœ2˜2Kšœ˜—Kšœ&˜&Kšœ*˜*Kšœ%˜%Kšœ%˜%Kšžœ˜—Kšœ˜Kšœ˜—K˜ Kšžœ˜K˜— …—    ¿l  œ 

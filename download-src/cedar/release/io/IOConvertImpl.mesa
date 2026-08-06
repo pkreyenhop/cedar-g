@@ -1,0 +1,1556 @@
+
+
+DIRECTORY
+Arpa USING [Address, nullAddress],
+Ascii USING [caseOffset, Digit, Lower],
+Atom USING [GetPName],
+AtomPrivate USING [UnsafeMakeAtom],
+Basics USING [LowHalf, UnsafeBlock],
+BasicTime USING [DayOfWeek, GetZoneAndDST, GMT, minutesPerHour, MonthOfYear, Unpack, Unpacked, UnpackZ, unspecifiedZone, Zone, ZoneAndDST],
+Convert USING [ErrorType, NetFormat, RealPrecision, TimePrecision],
+DReal,
+IO USING [card, char, DEL, Error, ErrorCode, GetIndex, GetTime, GetUnpackedTime, NUL, PutChar, PutFLR, PutFR, RIS, SP, STREAM],
+PreDebug USING [RegisterErrorExplainer],
+Real USING [DefaultSinglePrecision, Exception, ExceptionFlags, Extended, MaxSinglePrecision, NumberType, PairToReal, RealException, RealToPair],
+RefText USING [Append, AppendChar, AppendRope, AppendTextRope, ObtainScratch, ReleaseScratch, ReserveChars, TrustTextRopeAsText],
+Rope USING [ActionType, Concat, Equal, Fetch, FetchType, FromProc, FromRefText, Index, Length, Map, MapType, MaxLen, MoveType, ROPE, Substr, Text],
+RuntimeError USING [BoundsFault],
+XNS USING [Address, broadcastHost, broadcastNet, GetThisHost, Host, Net, Socket, unknownAddress, unknownNet, unknownSocket];
+
+IOConvertImpl: CEDAR PROGRAM
+IMPORTS Ascii, Atom, AtomPrivate, Basics, BasicTime, DReal, IO, PreDebug, Real, Rope, RefText, RuntimeError, XNS 
+EXPORTS Convert
+SHARES Rope = BEGIN OPEN Basics;
+
+ROPE: TYPE = Rope.ROPE;
+STREAM: TYPE = IO.STREAM;
+NetFormat: TYPE = Convert.NetFormat;
+Base: TYPE = [2..36];
+RealPrecision: TYPE = Convert.RealPrecision;
+DRealPrecision: TYPE = [0..DReal.MaxDoublePrecision];
+TimePrecision: TYPE = Convert.TimePrecision;
+ErrorType: TYPE = Convert.ErrorType; -- { syntax, overflow, empty }
+Error: PUBLIC ERROR [reason: ErrorType, index: INT] = CODE;
+
+AtomFromErrorType: PUBLIC PROC [type: ErrorType] RETURNS [ATOM] ~ {
+SELECT type FROM
+syntax => RETURN[$syntax];
+overflow => RETURN[$overflow];
+empty => RETURN[$empty];
+invalidBase => RETURN[$invalidBase];
+unprintableAtom => RETURN[$unprintableAtom];
+invalidNetFormat => RETURN[$invalidNetFormat];
+ENDCASE => RETURN[NIL];
+};
+
+ErrorTypeFromAtom: PUBLIC PROC [atom: ATOM] RETURNS [ErrorType] ~ {
+SELECT atom FROM
+$syntax => RETURN[syntax];
+$overflow => RETURN[overflow];
+$empty => RETURN[empty];
+$invalidBase => RETURN[invalidBase];
+$unprintableAtom => RETURN[unprintableAtom];
+$invalidNetFormat => RETURN[invalidNetFormat];
+ENDCASE => RETURN[ErrorType.LAST];
+};
+
+
+CardFromDecimalLiteral: PUBLIC PROC [r: ROPE, start: INT] RETURNS [CARD] = {
+rLength: INT = r.Length[];
+digitSeen: BOOL ¨ FALSE;
+num: CARD ¨ 0;
+decBase: CARD = 10D;
+FOR i: INT IN [start..rLength) DO
+c: CHAR;
+SELECT (c ¨ r.Fetch[i]) FROM
+IN ['0..'9] => {
+IF num > CARD[(LCLAST-(decBase-1))]/decBase AND
+num > (LCLAST-LOOPHOLE[(c.ORD-'0.ORD),CARDINAL])/decBase THEN
+ERROR Error[$overflow, i];
+num ¨ num * decBase + CARD[c.ORD-'0.ORD];
+digitSeen ¨ TRUE;
+};
+'D, 'd => {
+IF NOT digitSeen THEN ERROR Error[$syntax, i];
+IF i < rLength THEN num ¨ ParseScaleFactor[decBase, num, r, i];
+RETURN [num];
+};
+IN [IO.NUL..IO.SP] => IF digitSeen THEN EXIT;
+ENDCASE => ERROR Error[$syntax, i];
+ENDLOOP;
+IF NOT digitSeen THEN ERROR Error[$empty, rLength-1];
+RETURN [num];
+};
+LCLAST: CARD = LAST[CARD];
+ParseScaleFactor: PROC [base: NAT, accum: CARD, r: ROPE, index: INT]
+RETURNS [CARD] = {
+bound: CARD = LCLAST/CARD[base];
+decBase: CARD = 10D;
+scale: CARDINAL ¨ 0;
+c: CHAR;
+FOR i: INT IN [index+1..r.Length[]) DO
+IF (c ¨ r.Fetch[i]) IN ['0..'9] THEN {
+IF scale > CARD[(LCLAST-(decBase-1))]/decBase THEN ERROR Error[$overflow, i];
+scale ¨ scale * 10 + CARD[c.ORD-'0.ORD];
+}
+ELSE IF c IN [IO.NUL..IO.SP] THEN EXIT
+ELSE ERROR Error[$syntax, i];
+ENDLOOP;
+UNTIL scale = 0 DO
+IF accum > bound THEN ERROR Error[$overflow, r.Length[]-1];
+accum ¨ accum * base;  scale ¨ scale - 1;
+ENDLOOP;
+RETURN [accum];
+};
+CardFromOctalLiteral: PUBLIC PROC [r: ROPE, start: INT] RETURNS [CARD] = {
+rLength: INT = r.Length[];
+digitSeen: BOOL ¨ FALSE;
+num: CARD ¨ 0;
+FOR i: INT IN [start..rLength) DO
+c: CHAR;
+octalBase: CARD = 10B;
+SELECT (c ¨ r.Fetch[i]) FROM
+IN ['0..'7] => {
+IF num > CARD[(LCLAST-(octalBase-1))]/octalBase AND
+num > (LCLAST-LOOPHOLE[(c.ORD-'0.ORD),CARDINAL])/octalBase THEN
+ERROR Error[$overflow, i];
+num ¨ num * octalBase + CARD[c.ORD-'0.ORD];
+digitSeen ¨ TRUE;
+};
+'B, 'b => {
+IF NOT digitSeen THEN ERROR Error[$syntax, i];
+IF i < rLength THEN num ¨ ParseScaleFactor[octalBase, num, r, i];
+RETURN [num];
+};
+IN [IO.NUL..IO.SP] => IF digitSeen THEN ERROR Error[$syntax, i];
+ENDCASE => ERROR Error[$syntax, i];
+ENDLOOP;
+ERROR Error[$empty, rLength-1];
+};
+CardFromHexLiteral: PUBLIC PROC [r: ROPE, start: INT] RETURNS [CARD] = {
+rLength: INT = r.Length[];
+digitSeen: BOOL ¨ FALSE;
+num: CARD ¨ 0;
+hexBase: CARD ¨ 10H;
+FOR i: INT IN [start..rLength) DO
+c: CHAR;
+SELECT (c ¨ Ascii.Lower[r.Fetch[i]]) FROM
+IN ['0..'9] => {
+IF num > CARD[(LCLAST-(hexBase-1))]/hexBase AND
+num > (LCLAST-LOOPHOLE[(c.ORD-'0.ORD),CARDINAL])/hexBase THEN
+ERROR Error[$overflow, i];
+num ¨ num * hexBase + CARD[c.ORD-'0.ORD];
+digitSeen ¨ TRUE;
+};
+IN ['a..'f] => {
+IF num > CARD[(LCLAST-(hexBase-1))]/hexBase AND
+num > (LCLAST-LOOPHOLE[c.ORD-(('a).ORD-10),CARDINAL])/hexBase THEN
+ERROR Error[$overflow, i];
+num ¨ num * hexBase + CARD[c.ORD-(('a).ORD-10)];
+digitSeen ¨ TRUE;
+};
+'h => {
+IF NOT digitSeen THEN ERROR Error[$syntax, i];
+IF i < rLength THEN num ¨ ParseScaleFactor[hexBase, num, r, i];
+RETURN [num];
+};
+IN [IO.NUL..IO.SP] => IF digitSeen THEN ERROR Error[$syntax, i];
+ENDCASE => ERROR Error[$syntax, i];
+ENDLOOP;
+ERROR Error[$empty, rLength-1];
+};
+CardFromWholeNumberLiteral: PUBLIC PROC [r: ROPE, start: INT] RETURNS [CARD] = {
+rLength: INT = r.Length[];
+radixChar: CHAR = FindRadix[r, start];
+RETURN [(SELECT radixChar FROM
+'d => CardFromDecimalLiteral,
+'b => CardFromOctalLiteral,
+'h => CardFromHexLiteral
+ENDCASE => ERROR)[r, start]]
+};
+FindRadix: PROC [r: ROPE, start: INT] RETURNS [CHAR] ~ {
+rLength: INT = r.Length[];
+radixChar: CHAR ¨ 'd;
+FOR i: INT IN [start .. rLength) DO
+c: CHAR;
+SELECT (c ¨ Ascii.Lower[r.Fetch[i]]) FROM
+'b, 'd, 'h => radixChar ¨ c;
+ENDCASE;
+ENDLOOP;
+RETURN [radixChar]
+};
+maxDINT: DCARD ~ 7FFFFFFFFFFFFFFFH; -- DINT.LAST
+DIntFromRope: PUBLIC PROC [r: ROPE] RETURNS [DINT] = {
+rLength: INT = r.Length[];
+start: INT ¨ 0;
+neg: BOOL ¨ FALSE;
+mag: DCARD ¨ 0;
+WHILE start < rLength AND r.Fetch[start] IN['\000..' ] DO start ¨ start + 1 ENDLOOP;
+IF start >= rLength THEN ERROR Error[$syntax, start];
+SELECT r.Fetch[start] FROM
+'- => {neg ¨ TRUE; start ¨ start+1};
+'+ => {start ¨ start+1};
+ENDCASE;
+mag ¨ DCardFromWholeNumberLiteral[r, start];
+IF mag > maxDINT + ORD[neg] THEN Error[$overflow, rLength];
+RETURN [IF neg THEN -mag ELSE mag];
+};
+DCardFromWholeNumberLiteral: PUBLIC PROC [r: ROPE, start: INT] RETURNS [DCARD] = {
+rLength: INT = r.Length[];
+radixChar: CHAR = FindRadix[r, start];
+radix: CARD = SELECT radixChar FROM 'b => 8, 'h => 16, ENDCASE => 10;
+value: DCARD ¨ 0;
+WHILE start < rLength AND r.Fetch[start] IN['\000..' ] DO start ¨ start + 1 ENDLOOP;
+IF start >= rLength THEN ERROR Error[$syntax, start];
+FOR i: INT IN [start..rLength) DO
+c: CHAR = Ascii.Lower[r.Fetch[i]];
+prev: DCARD ¨ value;
+digit: CARD ¨ 0;
+IF c = radixChar THEN {
+IF i+1 < rLength THEN {
+scale: CARD = CardFromWholeNumberLiteral[r, i+1];
+value ¨ value * (radix**scale);
+IF value < prev THEN Error[$overflow, i];
+};
+EXIT;
+};
+SELECT c FROM
+IN ['0..'9] => digit ¨ (c-'0);
+IN ['a..'f] => digit ¨ (c-'a+10);
+ENDCASE => Error[$syntax, i];
+IF digit >= radix THEN Error[$syntax, i];
+value ¨ (value * radix) + digit;
+IF value < prev THEN Error[$overflow, i];
+ENDLOOP;
+RETURN [value]
+};
+RealFromLiteral: PUBLIC PROC [r: ROPE, start: INT] RETURNS [REAL] ~ {
+state: {begin, int, dot, frac, estart, esign, exp, error} ¨ begin;
+index: INT ¨ start; -- index in rope of current char
+fr: INT ¨ 0; -- mantissa
+exp, adj: INTEGER ¨ 0; -- exponent and adjustment
+eNeg: BOOL ¨ FALSE;
+mDigits, eDigits: NAT ¨ 0; -- significant digits
+MDigit: PROC[c: CHAR] ~ { d: [0..10) ~ c-'0;
+IF state=frac THEN adj ¨ adj-1;
+IF mDigits=0 AND d=0 THEN NULL -- leading zero
+ELSE IF mDigits<9 THEN { fr ¨ fr*10+d; mDigits ¨ mDigits+1 }
+ELSE { adj ¨ adj+1; IF mDigits=9 AND d>5 THEN fr ¨ fr+1; }; -- round if 10th digit >5
+};
+EDigit: PROC[c: CHAR] ~ { d: [0..10) ~ c-'0;
+IF eDigits=0 AND d=0 THEN NULL -- leading zero
+ELSE IF eDigits<3 THEN { exp ¨ exp*10+d; eDigits ¨ eDigits+1 }
+ELSE ERROR Error[reason: $overflow, index: index];
+};
+action: Rope.ActionType ~ {
+SELECT state FROM
+begin => SELECT c FROM
+IN['\000..' ] => NULL; -- leading white space
+IN['0..'9] => { state ¨ int; MDigit[c] };
+'. => state ¨ dot;
+ENDCASE => GOTO Fail;
+int => SELECT c FROM -- ?( + | - ) 0..9 | int 0..9
+IN['0..'9] => MDigit[c];
+'. => state ¨ frac;
+'e, 'E => state ¨ estart;
+IN['\000..' ] => RETURN[TRUE];
+ENDCASE => GOTO Fail;
+dot => SELECT c FROM -- ?( + | - ) .
+IN['0..'9] => { state ¨ frac; MDigit[c] };
+ENDCASE => GOTO Fail;
+frac => SELECT c FROM -- int . | ?( + | - ) . 0..9 | frac 0..9
+IN['0..'9] => MDigit[c];
+'e, 'E => state ¨ estart;
+IN['\000..' ] => RETURN[TRUE];
+ENDCASE => GOTO Fail;
+estart => SELECT c FROM -- ( int | frac ) ( E | e )
+IN['0..'9] => { state ¨ exp; EDigit[c] };
+'+, '- => { eNeg ¨ (c='-); state ¨ esign };
+ENDCASE => GOTO Fail;
+esign => SELECT c FROM -- ( int | frac ) ( E | e ) ( + | - )
+IN['0..'9] => { state ¨ exp; EDigit[c] };
+ENDCASE => GOTO Fail;
+exp => SELECT c FROM -- ( int | frac ) ( E | e ) ?( + | - ) 0..9 | exp 0..9
+IN['0..'9] => EDigit[c];
+IN['\000..' ] => RETURN[TRUE];
+ENDCASE => GOTO Fail;
+ENDCASE => GOTO Fail;
+index ¨ index+1;
+EXITS Fail => { state ¨ error; RETURN[TRUE] };
+};
+[] ¨ Rope.Map[base: r, start: start, action: action];
+SELECT state FROM
+int, frac, exp => NULL; -- ok
+begin => ERROR Error[reason: $empty, index: index];
+ENDCASE => ERROR Error[reason: $syntax, index: index];
+IF eNeg THEN exp ¨ -exp;
+RETURN[Real.PairToReal[fr: fr, exp10: exp+adj ! Real.RealException => RESUME]];
+};
+RopeFromLiteral: PUBLIC PROC [r: ROPE, start: INT] RETURNS [ROPE] = {
+new: ROPE;
+index: INT ¨ start + 1;
+end: INT ¨ r.Length[]-1;
+resultChars: INT ¨ 0;
+escaped: BOOL ¨ FALSE;
+getProc: PROC RETURNS [c: CHAR] = {
+IF index > end THEN RETURN ['\000];
+c ¨ r.Fetch[index];  index ¨ index + 1;
+SELECT c FROM
+'\\ => {
+[c, index] ¨ ParseEscapeCode[r, index];
+escaped ¨ TRUE };
+'\" => {
+IF r.Fetch[index] # '\" THEN ERROR Error[$syntax, index];  index ¨ index + 1;
+escaped ¨ TRUE };
+ENDCASE;
+resultChars ¨ resultChars + 1;
+};
+IF r.Fetch[start] # '\" THEN ERROR Error[$syntax, start];
+SELECT r.Fetch[end] FROM
+'l, 'L => {
+end ¨ end - 2;
+IF r.Fetch[end+1] # '\" THEN ERROR Error[$syntax, end];
+};
+'\" => end ¨ end - 1;
+ENDCASE => ERROR Error[$syntax, end];
+new ¨ Rope.FromProc[end - index + 1, getProc];
+IF escaped THEN new ¨ new.Substr[0, resultChars];
+RETURN [new];
+};
+CharFromLiteral: PUBLIC PROC [r: ROPE, start: INT] RETURNS [CHAR] = {
+ENABLE RuntimeError.BoundsFault => ERROR Error[$syntax, start];
+c: CHAR;
+SELECT (c ¨ r.Fetch[start]) FROM
+'\' => { -- preferred form: ' extendedChar
+IF (c ¨ r.Fetch[start ¨ start+1]) = '\\
+THEN RETURN[ParseEscapeCode[r, start+1].c]
+ELSE RETURN[c];
+};
+IN ['0..'7] => { -- obsolete form: digit!...C
+num: INTEGER ¨ c.ORD-'0.ORD;
+DO
+SELECT (c ¨ r.Fetch[start ¨ start+1]) FROM
+IN ['0..'7] => {
+num ¨ num*10B + c.ORD-'0.ORD;
+IF num > 377B THEN ERROR Error[$overflow, start];
+};
+'C, 'c => RETURN [VAL[num]];
+ENDCASE => Error[$syntax, start];
+ENDLOOP;
+};
+ENDCASE => ERROR Error[$syntax, start];
+};
+ParseEscapeCode: PROC [r: ROPE, start: INT] RETURNS [c: CHAR, newIndex: INT] = {
+ENABLE RuntimeError.BoundsFault => ERROR Error[$syntax, start];
+c ¨ r.Fetch[start];
+SELECT Ascii.Lower[c] FROM
+'n => c ¨ '\n;
+'r => c ¨ '\r;
+'t => c ¨ '\t;
+'b => c ¨ '\b;
+'f => c ¨ '\f;
+'l => c ¨ '\l;
+'\' => c ¨ '\';
+'\" => c ¨ '\";
+'\\ => c ¨ '\\;
+IN ['0..'3] => {
+num: INTEGER ¨ c.ORD-'0.ORD;
+FOR i: NAT IN [1..2] DO
+SELECT (c ¨ r.Fetch[start+i]) FROM
+IN ['0..'7] => num ¨ num*10B + c.ORD-'0.ORD;
+ENDCASE => ERROR Error[$syntax, start+i];
+ENDLOOP;
+c ¨ VAL[num];
+start ¨ start + 2;
+};
+ENDCASE => ERROR Error[$syntax, start];
+start ¨ start + 1;
+RETURN[c, start];
+};
+IntFromRope: PUBLIC PROC [r: ROPE, defaultBase: Base] RETURNS [INT] = {
+LastInt: CARD = INT.LAST;
+card: CARD; negative: BOOL;
+[card, negative] ¨ NumberFromRope[r, defaultBase, TRUE];
+IF negative THEN { IF card <= LastInt+1 THEN RETURN[-card] }
+ELSE {  IF card <= LastInt THEN RETURN[card] };
+ERROR Error[$overflow, 0];
+};
+CardFromRope: PUBLIC PROC [r: ROPE, defaultBase: Base] RETURNS [CARD] = {
+RETURN[NumberFromRope[r, defaultBase, FALSE].card];
+};
+NumberFromRope: PROC [r: ROPE, defaultBase: Base, negativeOK: BOOL] RETURNS [card: CARD, negative: BOOL] = {
+rLength: INT = r.Length[];
+start: INT ¨ 0;
+base: NAT = defaultBase;
+State: TYPE = { initial, signSeen, digitSeen };
+state: State ¨ $initial;
+num: CARD ¨ 0;
+negative ¨ FALSE;
+FOR i: INT IN [start..rLength) DO {
+c: CHAR;
+SELECT (c ¨ Ascii.Lower[r.Fetch[i]]) FROM
+IN ['0..'9] => {
+cNum: CARDINAL = LOOPHOLE[(c.ORD-'0.ORD),CARDINAL];
+IF cNum >= base THEN GOTO FindBase; 
+IF (num > (LCLAST-9)/10 AND
+num > (LCLAST-cNum)/CARD[base]) THEN GOTO FindBase;
+num ¨ num * base + cNum;
+state ¨ $digitSeen;
+};
+IN ['a..'z] => {
+cNum: CARDINAL = CARDINAL[c.ORD-('a.ORD-10)];
+IF cNum >= base THEN GOTO FindBase;
+IF (num > CARD[(LCLAST-CARD[(Base.LAST-1)])]/CARD[Base.LAST] AND
+num > (LCLAST-cNum)/CARD[base]) THEN GOTO FindBase;
+num ¨ num * base + CARD[c.ORD-('a.ORD-10)];
+state ¨ $digitSeen;
+};
+'+, '- =>
+IF state = $initial THEN {
+IF c = '- AND NOT negativeOK THEN GOTO Error;
+negative ¨ c = '-;  start ¨ i+1; state ¨ $signSeen }
+ELSE GOTO Error;
+IN [IO.NUL..IO.SP] => IF state = $digitSeen THEN EXIT;
+ENDCASE => GOTO Error;
+EXITS
+FindBase => RETURN [CardFromWholeNumberLiteral[r, start], negative];
+Error => ERROR Error[$syntax, i];
+} ENDLOOP;
+SELECT state FROM
+initial, signSeen => ERROR Error[$empty, rLength];
+ENDCASE => RETURN [num, negative];
+};
+RealFromRope: PUBLIC PROC [r: ROPE] RETURNS [REAL] = {
+rLength: INT = r.Length[];
+start: INT ¨ 0;
+result: REAL;
+signSeen: BOOL ¨ FALSE;
+negative: BOOL ¨ FALSE;
+FOR i: INT IN [start..rLength) DO {
+c: CHAR;
+SELECT (c ¨ Ascii.Lower[r.Fetch[i]]) FROM
+IN ['0..'9], '. => { start ¨ i;  EXIT };
+'+, '- =>
+IF NOT signSeen THEN { negative ¨ c = '-;  start ¨ i+1;  EXIT }
+ELSE GOTO Error;
+IN [IO.NUL..IO.SP] => NULL;
+ENDCASE => GOTO Error;
+EXITS
+Error => ERROR Error[$syntax, i];
+} ENDLOOP;
+result ¨ RealFromLiteral[r, start];
+RETURN [IF negative THEN -result ELSE result];
+};
+TimeFromRope: PUBLIC PROC [r: ROPE] RETURNS [BasicTime.GMT] = {
+RETURN [IO.GetTime[IO.RIS[r] ! IO.Error => SELECT ec FROM
+$SyntaxError => ERROR Error[$syntax, stream.GetIndex[]];
+$Overflow => ERROR Error[$overflow, stream.GetIndex[]];
+ENDCASE]];
+};
+UnpackedTimeFromRope: PUBLIC PROC [r: ROPE] RETURNS [BasicTime.Unpacked] = {
+RETURN [IO.GetUnpackedTime[IO.RIS[r] ! IO.Error =>
+IF ec = $SyntaxError THEN ERROR Error[$syntax, stream.GetIndex[]]]];
+};
+BoolFromRope: PUBLIC PROC [r: ROPE] RETURNS [BOOL] = {
+IF MatchPrefix[r, "true"] THEN RETURN [TRUE];
+IF MatchPrefix[r, "false"] THEN RETURN [FALSE];
+IF MatchPrefix[r, "yes"] THEN RETURN [TRUE];
+IF MatchPrefix[r, "no"] THEN RETURN [FALSE];
+ERROR Error[$syntax, 0];
+};
+MatchPrefix: PROC [r: ROPE, pat: Rope.Text] RETURNS [BOOL] = {
+patLen: INT = pat.Length[];
+fail: BOOL ¨ patLen = 0;
+index: INT ¨ 0;
+match: PROC [c: CHAR] RETURNS [quit: BOOL ¨ FALSE] = {
+IF index < patLen THEN {
+IF pat.Fetch[index] = Ascii.Lower[c] THEN index ¨ index+1 ELSE fail ¨ TRUE;
+RETURN [quit: fail]
+}
+ELSE IF c IN [IO.NUL..IO.SP] THEN RETURN [quit: TRUE];
+};
+[] ¨ r.Map[action: match];
+RETURN [NOT fail];
+};
+AtomFromRope: PUBLIC PROC [r: ROPE] RETURNS [ATOM] = {
+rLength: INT = r.Length[];
+result: ATOM;
+start: INT ¨ 0;
+IF start >= rLength THEN ERROR Error[$syntax, start];
+IF r.Fetch[start] = '$ THEN start ¨ start+1;
+{
+scratch: REF TEXT = RefText.ObtainScratch[rLength-start];
+len: NAT ¨ rLength-start;
+FOR i: NAT IN [0 .. len) DO
+scratch[i] ¨ r.Fetch[start+i];
+ENDLOOP;
+scratch.length ¨ len;
+TRUSTED { result ¨ AtomPrivate.UnsafeMakeAtom[LOOPHOLE[scratch]] };
+RefText.ReleaseScratch[scratch];
+};
+RETURN [result];
+};
+AppendInt: PUBLIC PROC [to: REF TEXT, from: INT, base: Base, showRadix: BOOL] RETURNS [REF TEXT] = {
+RETURN[AppendWholeNumber[to, LOOPHOLE[from.ABS], base, from<0, showRadix]];
+};
+AppendCard: PUBLIC PROC [to: REF TEXT, from: CARD, base: Base ¨ 10, showRadix: BOOL ¨ FALSE] RETURNS [REF TEXT] = {
+RETURN[AppendWholeNumber[to, from, base, FALSE, showRadix]];
+};
+AppendWholeNumber: PROC [ to: REF TEXT, from: CARD, base: NAT, negative: BOOL, showRadix: BOOL] RETURNS [REF TEXT] = {
+stack: ARRAY [0..31] OF CHAR;
+nChars: NAT ¨ 0;
+IF showRadix THEN {
+SELECT base FROM
+10 => NULL;
+8, 16 => { stack[0] ¨ IF base = 8 THEN 'B ELSE 'H;  nChars ¨ 1 };
+ENDCASE => ERROR Error[$invalidBase, 0];
+}
+ELSE IF base NOT IN [2..36] THEN ERROR Error[$invalidBase, 0]; 
+DO
+digit: NAT ¨ from MOD CARD[base];
+stack[nChars] ¨ VAL[IF digit < 10 THEN '0.ORD + digit ELSE 'A.ORD + (digit-10)];
+nChars ¨ nChars + 1;
+IF from < CARD[base] THEN EXIT;
+from ¨ from / CARD[base];
+ENDLOOP;
+IF negative THEN {
+stack[nChars] ¨ '-;
+nChars ¨ nChars + 1;
+};
+to ¨ RefText.ReserveChars[to, nChars];
+{
+newLengthMinusOne: NAT = to.length + nChars - 1;
+FOR i: NAT DECREASING IN [0 .. nChars) DO
+to[newLengthMinusOne-i] ¨ stack[i];
+ENDLOOP;
+to.length ¨ newLengthMinusOne + 1;
+};
+RETURN[to];
+};
+AppendDCard: PUBLIC PROC [to: REF TEXT, from: DCARD, 
+base: Base ¨ 10, showRadix: BOOL ¨ TRUE
+] RETURNS [REF TEXT] ~ {
+IF from <= CARD.LAST
+THEN {RETURN [AppendCard[to, from, base, showRadix]]}
+ELSE {
+cbase: CARD ¨ base;
+digit: CARD ¨ from MOD cbase;
+to ¨ AppendDCard[to, from/cbase, base, FALSE];
+RETURN [AppendCard[to, digit, base, showRadix]];
+};
+};
+
+AppendReal: PUBLIC PROC [to: REF TEXT, from: REAL, precision: RealPrecision, useE: BOOL ¨ FALSE] RETURNS [REF TEXT] = TRUSTED {
+IF useE
+THEN RETURN [AppendE[to, from, precision]]
+ELSE RETURN [AppendG[to, from, precision]];
+};
+<<AppendDReal: PUBLIC PROC [to: REF TEXT, from: DREAL, precision: [0..17], useE: BOOL ¨ FALSE] RETURNS [REF TEXT] ~ TRUSTED {
+gconvert: UNSAFE PROC [value: DREAL, ndigit: INT, trailing: INT, buf: POINTER TO CHAR] ~ UNCHECKED MACHINE CODE {
+"+#define gconvert_help(v,n,t,b) (void)gconvert(*((double*) (&(v))),n,t,b)\n";
+".gconvert_help"
+};
+fieldwidth: INT ¨ 7+precision;
+i: NAT ¨ to.length;
+hasDot: BOOL ¨ FALSE;
+to ¨ RefText.ReserveChars[to, fieldwidth+6];
+gconvert[value: from, ndigit: precision, trailing: 0, buf: LOOPHOLE[to, POINTER TO CHAR]+SIZE[TEXT[0]]+to.length];
+UNTIL to[i]=0C DO IF to[i] = '. THEN hasDot ¨ TRUE; i ¨ i + 1 ENDLOOP;
+to.length ¨ i;
+IF NOT hasDot THEN to ¨ RefText.Append[to, ".0"];
+RETURN [to]
+};>>
+
+AppendDecimalDigits: PROC [to: REF TEXT, c: CARD, nDigits: [0..9]] RETURNS [REF TEXT] ~ {
+to ¨ RefText.ReserveChars[to, nDigits];
+FOR j: NAT DECREASING IN [to.length..to.length+nDigits) DO
+to[j] ¨ '0 + (c MOD 10);
+c ¨ c / 10;
+ENDLOOP;
+to.length ¨ to.length+nDigits;
+RETURN [to]
+};
+AppendDReal: PUBLIC PROC [to: REF TEXT, from: DREAL, precision: DRealPrecision, useE: BOOL ¨ FALSE] RETURNS [REF TEXT] ~ TRUSTED {
+type: Real.NumberType;
+d: DINT;
+exp10: INTEGER;
+precision ¨ MAX[precision, 1];
+[type, d, exp10] ¨ DReal.RealToPair[from, precision];
+SELECT type FROM
+zero => { to ¨ RefText.Append[to, "0.0"] };
+infinity => {
+to ¨ RefText.AppendChar[to, IF from < 0.0 THEN '- ELSE '+];
+to ¨ RefText.Append[to, "Inf"];
+};
+nan => {
+to ¨ RefText.Append[to, "NaN"];
+};
+ENDCASE => {
+IF d < 0 THEN { to ¨ RefText.AppendChar[to, '-]; d ¨ - d };
+to ¨ RefText.Append[to, "0."];
+IF precision > 9
+THEN {
+to ¨ AppendDecimalDigits[to, d / 1d9, precision-9];
+to ¨ AppendDecimalDigits[to, d MOD 1d9, 9];
+}
+ELSE {
+to ¨ AppendDecimalDigits[to, d, precision];
+};
+to ¨ RefText.AppendChar[to, 'e];
+to ¨ AppendInt[to, exp10 + precision, 10, FALSE];
+};
+RETURN [to]
+};
+AppendTime: PUBLIC PROC [to: REF TEXT, from: BasicTime.GMT, start, end: TimePrecision, includeDayOfWeek, useAMPM, includeZone: BOOL] RETURNS [REF TEXT] = {
+RETURN[AppendUnpackedTime[
+to, BasicTime.Unpack[from], start, end, includeDayOfWeek, useAMPM, includeZone]];
+};
+AppendUnpackedTime: PUBLIC PROC [to: REF TEXT, from: BasicTime.Unpacked, start, end: TimePrecision, includeDayOfWeek, useAMPM, includeZone: BOOL] RETURNS [REF TEXT] = {
+ok: PACKED ARRAY TimePrecision OF BOOL ¨ ALL[FALSE];
+FOR p: TimePrecision IN TimePrecision[start..end] DO ok[p] ¨ TRUE ENDLOOP;
+IF includeDayOfWeek THEN {
+to ¨ RefText.AppendTextRope[to, Day[from.weekday]];
+IF ok # ALL[FALSE] THEN to ¨ RefText.AppendTextRope[to, ", "]
+};
+IF ok[months] THEN {
+to ¨ RefText.AppendTextRope[to, Month[from.month]];
+IF ok[days] OR ok[years] OR ok[hours] THEN to ¨ RefText.AppendChar[to, ' ]
+};
+IF ok[days] THEN {
+to ¨ AppendCard[to, from.day, 10, FALSE];
+IF ok[years] OR ok[hours] THEN to ¨ RefText.AppendTextRope[to, ", "]
+};
+IF ok[years] THEN {
+to ¨ AppendCard[to, from.year, 10, FALSE];
+IF ok[hours] THEN to ¨ RefText.AppendChar[to, ' ]
+};
+IF ok[hours] THEN {
+to ¨ AppendCard[
+to, IF useAMPM AND from.hour>12 THEN from.hour - 12 ELSE from.hour, 10, FALSE];
+IF ok[minutes] THEN {
+to ¨ RefText.AppendChar[to, ':];
+to ¨ Append2[to, from.minute];
+IF ok[seconds] THEN {
+to ¨ RefText.AppendChar[to, ':];
+to ¨ Append2[to, from.second];
+};
+};
+IF useAMPM THEN {
+to ¨ RefText.AppendTextRope[to, IF from.hour >= 12 THEN " pm" ELSE " am"];
+};
+IF includeZone THEN {
+to ¨ RefText.AppendChar[to, ' ];
+to ¨ AppendZone[to, from.zone, (from.dst=yes)];
+};
+};
+RETURN[to];
+};
+AppendTimeRFC822: PUBLIC PROC [to: REF TEXT, from: BasicTime.GMT, includeSeconds: BOOL ¨ TRUE, includeDayOfWeek: BOOL ¨ FALSE, useUT: BOOL ¨ FALSE] RETURNS [REF TEXT] = {
+utz: BasicTime.ZoneAndDST ~ [zone: 0, beginDST: 366, endDST: 0];
+z: BasicTime.ZoneAndDST ~ IF useUT THEN utz ELSE BasicTime.GetZoneAndDST[];
+RETURN [AppendUnpackedTimeRFC822[to: to, from: BasicTime.UnpackZ[from, z], includeSeconds: includeSeconds, includeDayOfWeek: includeDayOfWeek]];
+};
+AppendUnpackedTimeRFC822: PROC [to: REF TEXT, from: BasicTime.Unpacked, includeSeconds: BOOL ¨ TRUE, includeDayOfWeek: BOOL ¨ FALSE] RETURNS [REF TEXT] = {
+IF includeDayOfWeek THEN {
+to ¨ RefText.AppendTextRope[to: to, from: Day[from.weekday], len: 3];
+to ¨ RefText.AppendTextRope[to, ", "];
+};
+to ¨ Append2[to, from.day];
+to ¨ RefText.AppendChar[to, ' ];
+to ¨ RefText.AppendTextRope[to: to, from: Month[from.month], len: 3];
+to ¨ RefText.AppendChar[to, ' ];
+to ¨ Append2[to, from.year MOD 100];
+to ¨ RefText.AppendChar[to, ' ];
+to ¨ Append2[to, from.hour];
+to ¨ RefText.AppendChar[to, ':];
+to ¨ Append2[to, from.minute];
+IF includeSeconds THEN {
+to ¨ RefText.AppendChar[to, ':];
+to ¨ Append2[to, from.second];
+};
+to ¨ RefText.AppendChar[to, ' ];
+to ¨ AppendZone[to, from.zone, (from.dst=yes), TRUE];
+RETURN[to];
+};
+MonthArray: TYPE ~ ARRAY BasicTime.MonthOfYear[January .. December] OF Rope.Text;
+Month: REF MonthArray ~ NEW [MonthArray ¨ ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]];
+DayArray: TYPE ~ ARRAY BasicTime.DayOfWeek[Monday .. Sunday] OF Rope.Text;
+Day: REF DayArray ~ NEW [DayArray ¨ ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]];
+Append2: PROC [to: REF TEXT, from: [0..100)] RETURNS [REF TEXT] ~ {
+to ¨ RefText.AppendChar[to, '0+(from/10)];
+to ¨ RefText.AppendChar[to, '0+(from MOD 10)];
+RETURN [to];
+};
+AppendZone: PROC [to: REF TEXT, zone: BasicTime.Zone, dst: BOOL, useUT: BOOL ¨ FALSE] RETURNS [REF TEXT] ~ {
+zoneRope: ROPE ¨ NIL;
+metZone: BasicTime.Zone = -1*BasicTime.minutesPerHour;
+jstZone: BasicTime.Zone = -9*BasicTime.minutesPerHour;
+nZ: BasicTime.Zone ¨ zone;
+SELECT zone FROM
+jstZone => zoneRope ¨ "JST";
+metZone => zoneRope ¨ "MET";
+0 => zoneRope ¨ IF useUT THEN "UT" ELSE IF dst THEN "BST" ELSE "GMT";
+NAT[5*BasicTime.minutesPerHour] => zoneRope ¨ IF dst THEN "EDT" ELSE "EST";
+NAT[6*BasicTime.minutesPerHour] => zoneRope ¨ IF dst THEN "CDT" ELSE "CST";
+NAT[7*BasicTime.minutesPerHour] => zoneRope ¨ IF dst THEN "MDT" ELSE "MST";
+NAT[8*BasicTime.minutesPerHour] => zoneRope ¨ IF dst THEN "PDT" ELSE "PST";
+ENDCASE;
+IF ( dst AND ( zone >= -720+BasicTime.minutesPerHour ) ) THEN
+nZ ¨ zone - BasicTime.minutesPerHour;
+IF zoneRope = NIL THEN zoneRope ¨ IO.PutFR["%g%02d%02d",
+IO.char[IF zone < 0 THEN '- ELSE '+],
+IO.card[zone.ABS/BasicTime.minutesPerHour],
+IO.card[zone.ABS MOD BasicTime.minutesPerHour]
+];
+to ¨ RefText.AppendRope[to, zoneRope];
+RETURN [to];
+};
+AppendBool: PUBLIC PROC [to: REF TEXT, from: BOOL] RETURNS [REF TEXT] = {
+RETURN [RefText.AppendTextRope[to, RopeFromBool[from]]];
+};
+AppendAtom: PUBLIC PROC [to: REF TEXT, from: ATOM, quote: BOOL] RETURNS [REF TEXT] = {
+pName: Rope.Text = IF from = NIL THEN "<NIL>" ELSE Atom.GetPName[from];
+IF quote THEN {
+CheckID[pName];
+to ¨ RefText.AppendChar[to, '$];
+};
+RETURN [RefText.AppendTextRope[to, pName]];
+};
+CheckID: PUBLIC PROC [id: Rope.Text] = {
+FOR i: INT IN [0..id.Length[]) DO
+SELECT id.Fetch[i] FROM
+IN ['0..'9] => IF i = 0 THEN ERROR Error[$unprintableAtom, 0];
+IN ['A..'Z], IN ['a..'z] => NULL;
+ENDCASE => ERROR Error[$unprintableAtom, 0];
+ENDLOOP;
+};
+AppendRope: PUBLIC PROC [to: REF TEXT, from: ROPE, quote: BOOL ¨ TRUE] RETURNS [REF TEXT] = {
+IF quote THEN to ¨ RefText.AppendChar[to, '\"];
+FOR i: INT IN [0 .. from.Length[]) DO
+to ¨ AppendChar[to, Rope.Fetch[from, i], FALSE];
+ENDLOOP;
+IF quote THEN to ¨ RefText.AppendChar[to, '\"];
+RETURN [to];
+};
+AppendChar: PUBLIC PROC [to: REF TEXT, from: CHAR, quote: BOOL ¨ TRUE] RETURNS [REF TEXT] = {
+IF quote THEN to ¨ RefText.AppendChar[to, '\'];
+RETURN [
+IF from IN [IO.SP .. IO.DEL) AND from # '\\ AND from # '\" AND from # '\' THEN 
+RefText.AppendChar[to, from]
+ELSE AppendExtendedChar[to, from]
+];
+};
+AppendExtendedChar: PROC [to: REF TEXT, c: CHAR] RETURNS [REF TEXT] = {
+IF c IN [IO.SP .. IO.DEL) THEN {
+IF c = '\\ OR c = '\" OR c = '\' THEN to ¨ RefText.AppendChar[to, '\\];
+to ¨ RefText.AppendChar[to, c];
+}
+ELSE {
+to ¨ RefText.AppendChar[to, '\\];
+SELECT c FROM
+'\n => to ¨ RefText.AppendChar[to, 'n];
+'\t => to ¨ RefText.AppendChar[to, 't];
+'\b => to ¨ RefText.AppendChar[to, 'b];
+'\f => to ¨ RefText.AppendChar[to, 'f];
+'\l => to ¨ RefText.AppendChar[to, 'l];
+ENDCASE => {
+to ¨ RefText.AppendChar[to, VAL['0.ORD + (c.ORD / 64)]]; 
+to ¨ RefText.AppendChar[to, VAL['0.ORD + (c.ORD MOD 64 / 8)]]; 
+to ¨ RefText.AppendChar[to, VAL['0.ORD + (c.ORD MOD 8)]]
+} ;
+};
+RETURN [to];
+};
+RopeFromInt: PUBLIC PROC [from: INT, base: Base, showRadix: BOOL] RETURNS [Rope.Text] = {
+scratch: REF TEXT = RefText.ObtainScratch[100];
+result: Rope.Text = Rope.FromRefText[AppendInt[scratch, from, base, showRadix]];
+RefText.ReleaseScratch[scratch];
+RETURN [result];
+};
+RopeFromCard: PUBLIC PROC [from: CARD, base: Base, showRadix: BOOL] RETURNS [Rope.Text] = {
+scratch: REF TEXT = RefText.ObtainScratch[100];
+result: Rope.Text = Rope.FromRefText[AppendCard[scratch, from, base, showRadix]];
+RefText.ReleaseScratch[scratch];
+RETURN [result];
+};
+RopeFromReal: PUBLIC PROC [from: REAL, precision: RealPrecision, useE: BOOL] RETURNS [Rope.Text] = {
+scratch: REF TEXT = RefText.ObtainScratch[100];
+result: Rope.Text = Rope.FromRefText[AppendReal[scratch, from, precision, useE]];
+RefText.ReleaseScratch[scratch];
+RETURN [result];
+};
+RopeFromDReal: PUBLIC PROC [from: DREAL, precision: DRealPrecision, useE: BOOL] RETURNS [Rope.Text] = {
+scratch: REF TEXT = RefText.ObtainScratch[100];
+result: Rope.Text = Rope.FromRefText[AppendDReal[scratch, from, precision, useE]];
+RefText.ReleaseScratch[scratch];
+RETURN [result];
+};
+RopeFromTime: PUBLIC PROC [from: BasicTime.GMT, start, end: TimePrecision, includeDayOfWeek, useAMPM, includeZone: BOOL] RETURNS [Rope.Text] = {
+scratch: REF TEXT = RefText.ObtainScratch[100];
+result: Rope.Text = Rope.FromRefText[AppendUnpackedTime[scratch,
+BasicTime.Unpack[from], start, end, includeDayOfWeek, useAMPM, includeZone]];
+RefText.ReleaseScratch[scratch];
+RETURN [result];
+};
+RopeFromUnpackedTime: PUBLIC PROC [from: BasicTime.Unpacked, start, end: TimePrecision, includeDayOfWeek, useAMPM, includeZone: BOOL] RETURNS [Rope.Text] = {
+scratch: REF TEXT = RefText.ObtainScratch[100];
+result: Rope.Text = Rope.FromRefText[AppendUnpackedTime[scratch,
+from, start, end, includeDayOfWeek, useAMPM, includeZone]];
+RefText.ReleaseScratch[scratch];
+RETURN [result];
+};
+RopeFromTimeRFC822: PUBLIC PROC [from: BasicTime.GMT, includeSeconds: BOOL ¨ TRUE, 
+includeDayOfWeek: BOOL ¨ FALSE, useUT: BOOL ¨ FALSE] RETURNS [Rope.Text] = {
+scratch: REF TEXT = RefText.ObtainScratch[100];
+result: Rope.Text = Rope.FromRefText[AppendTimeRFC822[to: scratch, from: from, includeSeconds: includeSeconds, includeDayOfWeek: includeDayOfWeek, useUT: useUT]];
+RefText.ReleaseScratch[scratch];
+RETURN [result];
+};
+RopeFromBool: PUBLIC PROC [from: BOOL] RETURNS [Rope.Text] = {
+RETURN [IF from THEN "TRUE" ELSE "FALSE"]; 
+};
+RopeFromAtom: PUBLIC PROC [from: ATOM, quote: BOOL] RETURNS [ROPE] =  {
+pName: Rope.Text = IF from = NIL THEN "<NIL>" ELSE Atom.GetPName[from];
+IF NOT quote THEN RETURN [pName];
+CheckID[pName];
+RETURN [Rope.Concat["$", pName]];
+};
+RopeFromRope: PUBLIC PROC [from: ROPE, quote: BOOL] RETURNS [Rope.Text] =  {
+scratch: REF TEXT = RefText.ObtainScratch[from.Length[]+10];
+result: Rope.Text = Rope.FromRefText[AppendRope[scratch, from, quote]];
+RefText.ReleaseScratch[scratch];
+RETURN [result];
+};
+RopeFromChar: PUBLIC PROC [from: CHAR, quote: BOOL] RETURNS [Rope.Text] =  {
+scratch: REF TEXT = RefText.ObtainScratch[5];
+result: Rope.Text = Rope.FromRefText[AppendChar[scratch, from, quote]];
+RefText.ReleaseScratch[scratch];
+RETURN [result];
+};
+bufferSize: NAT = Real.MaxSinglePrecision*2 + 8;
+
+FtoRope: PUBLIC PROC [r: REAL, afterDot: [0..Real.MaxSinglePrecision]] RETURNS [rope: ROPE] = {
+scratch: REF TEXT ¨ RefText.ObtainScratch[bufferSize];
+rope ¨ Rope.FromRefText[AppendF[scratch, r, afterDot]];
+RefText.ReleaseScratch[scratch];
+};
+
+AppendF: PUBLIC PROC [buffer: REF TEXT, r: REAL, afterDot: [0..Real.MaxSinglePrecision]] RETURNS [REF TEXT] = {
+nType: Real.NumberType;
+fract: INT;
+exp10: INTEGER;
+places: INTEGER ¨ afterDot;
+[nType, fract, exp10] ¨ Real.RealToPair[r, Real.MaxSinglePrecision];
+SELECT nType FROM
+normal => {
+fudge: REAL ¨ Real.PairToReal[5, -places-1];
+abs: REAL ¨ ABS[r];
+IF abs < fudge THEN {
+buffer ¨ RefText.AppendChar[buffer, '0];
+GO TO restZero};
+IF fract < 0 THEN {
+buffer ¨ RefText.AppendChar[buffer, '-];
+fract ¨ -fract;
+};
+{
+temp: REF TEXT ¨ RefText.ObtainScratch[afterDot+Real.MaxSinglePrecision+4];
+tpos: NAT ¨ 0;
+card: CARD ¨ fract;
+error: {up, none, down} ¨ none;
+DO
+SELECT places+exp10 FROM
+< 0 => {
+thisDigit: [0..10) ¨ LowHalf[card MOD 10];
+card ¨ card/10;
+exp10 ¨ exp10 + 1;
+SELECT thisDigit FROM
+= 0 => {};
+> 5 => {card ¨ card + 1; error ¨ up};
+= 5 => IF error = up THEN error ¨ down ELSE {card ¨ card + 1; error ¨ up};
+ENDCASE => error ¨ down;
+};
+> 0 => {
+temp[tpos] ¨ '0;
+tpos ¨ tpos + 1;
+places ¨ places - 1;
+IF places = 0 THEN {temp[tpos] ¨ '.; tpos ¨ tpos + 1};
+};
+ENDCASE => EXIT;
+ENDLOOP;
+DO
+temp[tpos] ¨ '0 + LowHalf[card MOD 10];
+tpos ¨ tpos + 1;
+card ¨ card / 10;
+exp10 ¨ exp10 + 1;
+places ¨ places - 1;
+IF places = 0 THEN {temp[tpos] ¨ '.; tpos ¨ tpos + 1};
+IF card = 0 AND exp10 > 0 THEN EXIT;
+ENDLOOP;
+WHILE tpos > 0 DO
+buffer ¨ RefText.AppendChar[buffer, temp[tpos ¨ tpos - 1]];
+ENDLOOP;
+RefText.ReleaseScratch[temp];
+};
+};
+zero => {
+buffer ¨ RefText.AppendChar[buffer, '0];
+GO TO restZero;
+};
+infinity =>
+buffer ¨ RefText.AppendRope[buffer, IF fract < 0 THEN "-Inf" ELSE "+Inf"];
+nan => {
+buffer ¨ RefText.AppendChar[buffer, '*];
+buffer ¨ RefText.AppendChar[buffer, '.];
+buffer ¨ AppendChars[buffer, afterDot, '*];
+};
+ENDCASE => ERROR;
+RETURN [buffer];
+EXITS
+restZero => {
+IF afterDot > 0 THEN {
+buffer ¨ RefText.AppendChar[buffer, '.];
+buffer ¨ AppendChars[buffer, afterDot, '0]};
+RETURN [buffer];
+};
+};
+
+EtoRope: PUBLIC PROC [r: REAL, afterDot: [0..Real.MaxSinglePrecision]] RETURNS [rope: ROPE] = {
+scratch: REF TEXT ¨ RefText.ObtainScratch[bufferSize];
+rope ¨ Rope.FromRefText[AppendE[scratch, r, afterDot]];
+RefText.ReleaseScratch[scratch];
+};
+
+AppendE: PUBLIC PROC [buffer: REF TEXT, r: REAL, precision: [0..Real.MaxSinglePrecision]] RETURNS [REF TEXT] = {
+nType: Real.NumberType;
+fract: INT;
+exp10: INTEGER;
+IF precision < 1 THEN precision ¨ 1;
+[nType, fract, exp10] ¨ Real.RealToPair[r, precision];
+SELECT nType FROM
+normal => {
+abs: REAL ¨ ABS[r];
+lag: CARD ¨ 1;
+card: CARD ¨ ABS[fract];
+pos: NAT ¨ 0;
+IF r < 0.0 THEN buffer ¨ RefText.AppendChar[buffer, '-];
+pos ¨ buffer.length;
+buffer ¨ RefText.AppendChar[buffer, '.];
+buffer ¨ AppendWholeNumber[buffer, card, 10, FALSE, FALSE];
+buffer[pos] ¨ buffer[pos+1];
+buffer[pos+1] ¨ '.;
+buffer ¨ RefText.AppendChar[buffer, 'e];
+exp10 ¨ exp10 + precision - 1;
+buffer ¨ RefText.AppendChar[buffer, IF exp10 < 0 THEN '- ELSE '+];
+buffer ¨ AppendWholeNumber[buffer, ABS[exp10], 10, FALSE, FALSE];
+};
+ENDCASE => buffer ¨ AppendF[buffer, r, 1];
+RETURN [buffer];
+};
+
+GtoRope: PUBLIC PROC [r: REAL, precision: [0..Real.MaxSinglePrecision]] RETURNS [rope: ROPE] = {
+scratch: REF TEXT ¨ RefText.ObtainScratch[bufferSize];
+rope ¨ Rope.FromRefText[AppendG[scratch, r, precision]];
+RefText.ReleaseScratch[scratch];
+};
+
+AppendG: PUBLIC PROC [buffer: REF TEXT, r: REAL, precision: [0..Real.MaxSinglePrecision]] RETURNS [REF TEXT] = {
+nType: Real.NumberType;
+fract: INT;
+exp10: INTEGER;
+IF precision < 1 THEN precision ¨ 1;
+[nType, fract, exp10] ¨ Real.RealToPair[r, precision];
+SELECT nType FROM
+normal => {
+places: NAT ¨ precision;
+IF fract < 0 THEN {
+buffer ¨ RefText.AppendChar[buffer, '-];
+fract ¨ ABS[fract];
+r ¨ ABS[r];
+};
+IF exp10 > 0 THEN {
+buffer ¨ AppendE[buffer, r, precision];
+GO TO done};
+WHILE LowHalf[fract MOD 10] = 0 DO
+places ¨ places - 1;
+exp10 ¨ exp10 + 1;
+fract ¨ fract / 10;
+ENDLOOP;
+IF exp10 >= 0 THEN {
+buffer ¨ AppendF[buffer, r, 1];
+GO TO done};
+IF -exp10 <= precision THEN {
+buffer ¨ AppendF[buffer, r, -exp10];
+GO TO done};
+buffer ¨ AppendE[buffer, r, MAX[places, 2]];
+EXITS done => {};
+};
+ENDCASE => buffer ¨ AppendF[buffer, r, 1];
+RETURN [buffer];
+};
+
+PutChars: PROC [st: STREAM, chars: NAT, char: CHAR] = {
+THROUGH [0..chars) DO IO.PutChar[st, char]; ENDLOOP;
+};
+
+AppendChars: PROC [text: REF TEXT, chars: NAT, char: CHAR] RETURNS [REF TEXT] = {
+THROUGH [0..chars) DO text ¨ RefText.AppendChar[text, char]; ENDLOOP;
+RETURN [text];
+};
+XNSFieldType: TYPE = { default, broadcast, octal, decimal, hex, notANumber };
+
+XNSAddressFromRope: PUBLIC PROC [r: ROPE] RETURNS [XNS.Address] ~ {
+nameLen: INT ~ Rope.Length[r];
+answer: XNS.Address ¨ XNS.unknownAddress;
+netPart, hostPart, socketPart: ROPE ¨ NIL;
+netType, hostType, socketType: XNSFieldType ¨ default;
+BEGIN
+firstDot, secondDot: INT;
+
+firstDot ¨ Rope.Index[s1~r, s2~"."];
+IF firstDot = nameLen THEN
+firstDot ¨ Rope.Index[s1~r, s2~"#"];
+IF firstDot = nameLen THEN {
+hostPart ¨ r;  hostType ¨ GetXNSFieldType[hostPart];
+GOTO DoneSplit };
+
+secondDot ¨ Rope.Index[s1~r, pos1~firstDot+1, s2~"."];
+IF secondDot = nameLen THEN
+secondDot ¨ Rope.Index[s1~r, pos1~firstDot+1, s2~"#"];
+IF secondDot = nameLen THEN {
+part1: ROPE ~ Rope.Substr[base~r, len~firstDot];
+part2: ROPE ~ Rope.Substr[base~r, start~firstDot+1];
+type1: XNSFieldType ~ GetXNSFieldType[part1];
+type2: XNSFieldType ~ GetXNSFieldType[part2];
+SELECT TRUE FROM
+(type1 = notANumber) AND (type2 # notANumber) => {
+hostPart ¨ part1;  hostType ¨ type1;
+socketPart ¨ part2;  socketType ¨ type2 };
+(type1 # notANumber) AND (type2 = notANumber) => {
+netPart ¨ part1;  netType ¨ type1;
+hostPart ¨ part2;  hostType ¨ type2 };
+ENDCASE => ERROR Error[reason~syntax, index~0];
+GOTO DoneSplit };
+
+{
+netPart ¨ Rope.Substr[base~r, len~firstDot];
+netType ¨ GetXNSFieldType[netPart];
+hostPart ¨ Rope.Substr[base~r, start~firstDot+1, len~secondDot-firstDot-1];
+hostType ¨ GetXNSFieldType[hostPart];
+socketPart ¨ Rope.Substr[base~r, start~secondDot+1];
+socketType ¨ GetXNSFieldType[socketPart];
+GOTO DoneSplit };
+
+EXITS
+DoneSplit => NULL;
+END;
+
+SELECT hostType FROM
+default => ERROR Error[reason~syntax, index~0];
+broadcast => answer.host ¨ XNS.broadcastHost;
+octal, decimal, hex => answer.host ¨ CvtXNSHost[hostPart, hostType];
+notANumber => {
+IF Rope.Equal[hostPart, "ME"]
+THEN answer.host ¨ XNS.GetThisHost[]
+ELSE ERROR Error[reason~syntax, index~0];
+};
+ENDCASE => ERROR;
+
+SELECT netType FROM
+default => answer.net ¨ DefaultXNSNet[];
+broadcast => answer.net ¨ XNS.broadcastNet;
+octal, decimal, hex => answer.net ¨ CvtXNSNet[netPart, netType];
+notANumber => ERROR Error[reason~syntax, index~0];
+ENDCASE => ERROR;
+
+SELECT socketType FROM
+default => answer.socket ¨ XNS.unknownSocket;
+broadcast => ERROR Error[reason~syntax, index~0];
+octal, decimal, hex => answer.socket ¨ CvtXNSSocket[socketPart, socketType];
+notANumber => ERROR Error[reason~syntax, index~0];
+ENDCASE => ERROR;
+
+RETURN [answer];
+};
+
+XNSNetFromRope: PUBLIC PROC [r: ROPE] RETURNS [XNS.Net] ~ {
+type: XNSFieldType ~ GetXNSFieldType[r];
+SELECT type FROM
+default => RETURN [DefaultXNSNet[]];
+broadcast => RETURN [XNS.broadcastNet];
+octal, decimal, hex => RETURN [CvtXNSNet[r, type]];
+notANumber => ERROR Error[syntax, 0];
+ENDCASE => ERROR;
+};
+
+XNSHostFromRope: PUBLIC PROC [r: ROPE] RETURNS [XNS.Host] ~ {
+type: XNSFieldType ~ GetXNSFieldType[r];
+SELECT type FROM
+default => RETURN [XNS.GetThisHost[]];
+broadcast => RETURN [XNS.broadcastHost];
+octal, decimal, hex => RETURN [CvtXNSHost[r, type]];
+notANumber => {
+IF Rope.Equal[r, "ME"] THEN RETURN [XNS.GetThisHost[]];
+ERROR Error[syntax, 0] };
+ENDCASE => ERROR;
+};
+
+XNSSocketFromRope: PUBLIC PROC [r: ROPE] RETURNS [XNS.Socket] ~ {
+type: XNSFieldType ~ GetXNSFieldType[r];
+SELECT type FROM
+default => RETURN [XNS.unknownSocket];
+broadcast => ERROR Error[syntax, 0];
+octal, decimal, hex => RETURN [CvtXNSSocket[r, type]];
+notANumber => ERROR Error[syntax, 0];
+ENDCASE => ERROR;
+};
+DefaultXNSNet: PROC RETURNS [default: XNS.Net ¨ XNS.unknownNet] ~ {
+<<netH: CommDriver.Network;
+oneSecond: Process.Ticks ~ Process.SecondsToTicks[1];
+FOR i: NAT IN [1..5] DO
+IF ((netH ¨ CommDriver.GetNetworkChain[]) # NIL)
+AND ((default ¨ netH.xns.net) # XNS.unknownNet)
+THEN EXIT;
+Process.Pause[oneSecond];
+ENDLOOP;>>
+ERROR Error[empty, 0];  -- Not yet implemented - waiting on CommDriver.GetNetworkChain
+};
+
+bnSize: NAT ~ 6;
+BigNum: TYPE ~ ARRAY[0..bnSize) OF CARDINAL;
+
+CvtXNSHost: PROC [rope: ROPE, type: XNSFieldType] RETURNS [XNS.Host] ~ {
+n: BigNum ~ CvtXNS[rope, type];
+RETURN [ [a~n[0], b~n[1], c~n[2], d~n[3], e~n[4], f~n[5]] ] };
+
+CvtXNSNet: PROC [rope: ROPE, type: XNSFieldType] RETURNS [XNS.Net] ~ {
+n: BigNum ~ CvtXNS[rope, type];
+RETURN [ [hi~[hi~n[2], lo~n[3]], lo~[hi~n[4], lo~n[5]]] ] };
+
+CvtXNSSocket: PROC [rope: ROPE, type: XNSFieldType] RETURNS [XNS.Socket] ~ {
+n: BigNum ~ CvtXNS[rope, type];
+RETURN [ [hi~n[4], lo~n[5]] ] };
+
+CvtXNS: PROC [rope: ROPE, type: XNSFieldType] RETURNS [BigNum] ~ {
+n: BigNum ¨ ALL [0];
+base: CARDINAL;
+len: CARDINAL;
+c: CHAR;
+MulAdd: PROC [increment: CARDINAL] ~ {
+FOR i: CARDINAL DECREASING IN [0..bnSize) DO
+temp: CARDINAL ¨ n[i] * base + increment;
+n[i] ¨ temp MOD 100H;
+increment ¨ temp / 100H;
+ENDLOOP;
+};
+base ¨ SELECT type FROM octal => 8, decimal => 10, ENDCASE => 16;
+IF (len ¨ Rope.Length[rope]) = 0 THEN ERROR;
+c ¨ Rope.Fetch[rope, len-1];
+SELECT TRUE FROM
+(type = octal) AND ((c = 'B) OR (c = 'b)) => len ¨ len - 1;
+(type = hex) AND ((c = 'H) OR (c = 'h)) => len ¨ len - 1;
+ENDCASE => NULL;
+FOR i: CARDINAL IN [0..len) DO
+SELECT (c ¨ Rope.Fetch[rope,i]) FROM
+IN ['0..'9] => MulAdd[c - '0]; 
+IN ['A..'F] => MulAdd[(c - 'A) + 10]; 
+IN ['a..'f] => MulAdd[(c - 'a) + 10]; 
+ENDCASE => NULL;
+ENDLOOP;
+RETURN [n];
+};
+
+GetXNSFieldType: PROC [rope: ROPE] RETURNS [type: XNSFieldType] ~ {
+limit: CARDINAL;
+IF (limit ¨ Rope.Length[rope]) = 0 THEN RETURN [default];
+limit ¨ limit - 1;
+IF Rope.Equal[rope, "*"] THEN RETURN [broadcast];
+type ¨ (SELECT Rope.Fetch[rope, 0] FROM
+IN ['0 .. '7] => octal,
+IN ['8 .. '9] => decimal,
+ENDCASE => notANumber);
+FOR i: CARDINAL IN [1 .. limit) WHILE type < notANumber DO
+SELECT Rope.Fetch[rope, i] FROM
+IN ['0 .. '7] => type ¨ MAX[type, octal];
+IN ['8 .. '9] => type ¨ MAX[type, decimal];
+IN ['A .. 'F], IN ['a .. 'f] => type ¨ MAX[type, hex];
+'- => type ¨ (IF type <= decimal THEN decimal ELSE notANumber);
+ENDCASE => type ¨ notANumber;
+ENDLOOP;
+IF limit > 0 THEN SELECT Rope.Fetch[rope, limit] FROM
+IN ['0 .. '9], 'D, 'd => type ¨ MAX[type, decimal];
+'B, 'b => type ¨ MAX[type, octal];
+IN ['A .. 'F], IN ['a .. 'f], 'H, 'h => type ¨ MAX[type, hex];
+ENDCASE => type ¨ notANumber;
+};
+RopeFromXNSAddress: PUBLIC PROC [address: XNS.Address, 
+format: NetFormat] RETURNS [rope: ROPE] ~ {
+scratch: REF TEXT ¨ RefText.ObtainScratch[40];
+rope ¨ Rope.FromRefText[scratch ¨ AppendXNSAddress[scratch, address, format]];
+RefText.ReleaseScratch[scratch];
+};
+
+RopeFromXNSNet: PUBLIC PROC [net: XNS.Net, 
+format: NetFormat] RETURNS [rope: ROPE] ~ {
+scratch: REF TEXT ¨ RefText.ObtainScratch[20];
+rope ¨ Rope.FromRefText[scratch ¨ AppendXNSNet[scratch, net, format]];
+RefText.ReleaseScratch[scratch];
+};
+
+RopeFromXNSHost: PUBLIC PROC [host: XNS.Host, 
+format: NetFormat] RETURNS [rope: ROPE] ~ {
+scratch: REF TEXT ¨ RefText.ObtainScratch[20];
+rope ¨ Rope.FromRefText[scratch ¨ AppendXNSHost[scratch, host, format]];
+RefText.ReleaseScratch[scratch];
+};
+
+RopeFromXNSSocket: PUBLIC PROC [socket: XNS.Socket, 
+format: NetFormat] RETURNS [rope: ROPE] ~ {
+scratch: REF TEXT ¨ RefText.ObtainScratch[20];
+rope ¨ Rope.FromRefText[scratch ¨ AppendXNSSocket[scratch, socket, format]];
+RefText.ReleaseScratch[scratch];
+};
+
+AppendXNSAddress: PUBLIC PROC [to: REF TEXT, address: XNS.Address,
+format: NetFormat] RETURNS [REF TEXT] ~ {
+IF address.net = XNS.broadcastNet
+THEN to ¨ RefText.AppendChar[to, '* ]
+ELSE to ¨ FmtXNS[to, [0, 0, address.net.hi.hi, address.net.hi.lo, address.net.lo.hi, address.net.lo.lo], format];
+to ¨ RefText.AppendChar[to, '. ];
+IF address.host = XNS.broadcastHost
+THEN to ¨ RefText.AppendChar[to, '* ]
+ELSE to ¨ FmtXNS[to, [address.host.a, address.host.b, address.host.c, address.host.d, address.host.e, address.host.f], format];
+to ¨ RefText.AppendChar[to, '. ];
+IF address.socket # XNS.unknownSocket THEN
+to ¨ FmtXNS[to, [0, 0, 0, 0, address.socket.hi, address.socket.lo], format];
+RETURN [to] };
+
+AppendXNSNet: PUBLIC PROC [to: REF TEXT, net: XNS.Net,
+format: NetFormat] RETURNS [REF TEXT] ~ {
+IF net = XNS.broadcastNet
+THEN to ¨ RefText.AppendChar[to, '* ]
+ELSE to ¨ FmtXNS[to, [0, 0, net.hi.hi, net.hi.lo, net.lo.hi, net.lo.lo], format];
+RETURN [to] };
+
+AppendXNSHost: PUBLIC PROC [to: REF TEXT, host: XNS.Host,
+format: NetFormat] RETURNS [REF TEXT] ~ {
+IF host = XNS.broadcastHost
+THEN to ¨ RefText.AppendChar[to, '* ]
+ELSE to ¨ FmtXNS[to, [host.a, host.b, host.c, host.d, host.e, host.f], format];
+RETURN [to] };
+
+AppendXNSSocket: PUBLIC PROC [to: REF TEXT, socket: XNS.Socket,
+format: NetFormat] RETURNS [REF TEXT] ~ {
+to ¨ FmtXNS[to, [0, 0, 0, 0, socket.hi, socket.lo], format];
+RETURN [to] };
+
+maxDigits: NAT ~ 24;
+repChar: ARRAY [0 .. 16) OF CHAR ~ ['0, '1, '2, '3, '4, '5, '6, '7, '8, '9, 'A, 'B, 'C, 'D, 'E, 'F];
+
+FmtXNS: PROC [to: REF TEXT, n: BigNum, type: NetFormat]
+RETURNS [REF TEXT] ~ {
+text: REF TEXT;
+base, rem: CARDINAL ¨ 0;
+i: NAT;
+isZero: BOOL;
+DivRem: PROC ~ {
+temp, carry: CARDINAL;
+rem ¨ 0;  isZero ¨ TRUE;
+FOR j: CARDINAL IN [0 .. bnSize) DO
+temp ¨ n[j] + rem*0100H;
+IF (n[j] ¨ temp / base) # 0 THEN isZero ¨ FALSE;
+rem ¨ temp MOD base;
+ENDLOOP;
+carry ¨ 0;
+FOR j: NAT DECREASING IN [0 .. bnSize) DO
+temp ¨ n[j] + carry;
+n[j] ¨ temp MOD 0100H;
+carry ¨ temp / 0100H;
+ENDLOOP;
+};
+text ¨ RefText.ObtainScratch[maxDigits];
+text.length ¨ text.maxLength;
+i ¨ text.length;
+SELECT type FROM
+productSoftware => {
+untilDash: NAT ¨ 3;
+nDashes: NAT ¨ 0;
+base ¨ 10;
+isZero ¨ FALSE;
+WHILE (NOT isZero) OR (nDashes = 0) DO
+DivRem[];
+IF untilDash = 0 THEN {
+text[i ¨ i - 1] ¨ '-;
+untilDash ¨ 3;
+nDashes ¨ nDashes + 1 };
+text[i ¨ i - 1] ¨ repChar[rem];
+untilDash ¨ untilDash - 1;
+ENDLOOP;
+};
+octal => {
+base ¨ 8;
+text[i ¨ i - 1] ¨ 'B;
+isZero ¨ FALSE;
+WHILE NOT isZero DO
+DivRem[];
+text[i ¨ i - 1] ¨ repChar[rem];
+ENDLOOP;
+};
+hex => {
+base ¨ 16;
+text[i ¨ i - 1] ¨ 'H;
+isZero ¨ FALSE;
+WHILE (NOT isZero) OR (rem >= 10) DO
+DivRem[];
+text[i ¨ i - 1] ¨ repChar[rem];
+ENDLOOP;
+};
+ENDCASE => ERROR;
+WHILE i < text.length DO
+to ¨ RefText.AppendChar[to, text[i]];
+i ¨ i + 1;
+ENDLOOP;
+RefText.ReleaseScratch[text];
+RETURN [to] };
+ArpaAddressFromRope: PUBLIC PROC [r: ROPE] RETURNS [address: Arpa.Address] ~ {
+i: INT ¨ 0;
+len: INT;
+AToI: PROC [] RETURNS [BYTE] ~ {
+n: CARDINAL ¨ 0;
+c: CHAR;
+IF i < len THEN { c ¨ Rope.Fetch[r, i];  i ¨ i + 1 } ELSE { c ¨ 'X };
+IF NOT Ascii.Digit[c] THEN ERROR Error[syntax, i];
+DO
+n ¨ n * 10 + (c - '0);
+IF n >= 256 THEN ERROR Error[syntax, i];
+IF i >= len THEN RETURN[n];
+c ¨ Rope.Fetch[r, i];
+IF NOT Ascii.Digit[c] THEN RETURN [n];
+i ¨ i + 1;
+ENDLOOP;
+};
+SkipDot: PROC ~ {
+IF (i >= len) OR (Rope.Fetch[r, i] # '.) THEN ERROR Error[syntax, i];
+i ¨ i + 1;
+};
+len ¨ Rope.Length[r];
+IF len <= 0 THEN RETURN [Arpa.nullAddress];
+IF (len >= 2) AND (Rope.Fetch[r,0] = '[) AND (Rope.Fetch[r, len-1] = ']) THEN { 
+len ¨ len - 2; r ¨ Rope.Substr[r, 1, len]
+};
+address.a ¨ AToI[];
+SkipDot[];
+address.b ¨ AToI[];
+SkipDot[];
+address.c ¨ AToI[];
+SkipDot[];
+address.d ¨ AToI[];
+IF i < len THEN ERROR Error[syntax, i];
+};
+
+RopeFromArpaAddress: PUBLIC PROC [a: Arpa.Address] RETURNS [rope: ROPE] ~ {
+RETURN[IO.PutFLR["[%g.%g.%g.%g]", LIST[[cardinal[a.a]], [cardinal[a.b]], [cardinal[a.c]],
+	[cardinal[a.d]]]] ];
+};
+
+AppendArpaAddress: PUBLIC PROC [to: REF TEXT, address: Arpa.Address]
+	RETURNS [REF TEXT] ~ {
+base: Base = 10;
+to ¨ AppendWholeNumber[to, address.a, base, FALSE, FALSE];
+to ¨ AppendChar[to, '.];
+to ¨ AppendWholeNumber[to, address.b, base, FALSE, FALSE];
+to ¨ AppendChar[to, '.];
+to ¨ AppendWholeNumber[to, address.c, base, FALSE, FALSE];
+to ¨ AppendChar[to, '.];
+RETURN[AppendWholeNumber[to, address.d, base, FALSE, FALSE]];
+};
+ 
+PreDebug.RegisterErrorExplainer[Error, NIL, "Convert.Error"]; 
+END.
+     IOConvertImpl.mesa
+Copyright ” 1985, 1986, 1987, 1990, 1991, 1992, 1993 by Xerox Corporation.  All rights reserved.
+MBrown on January 16, 1984 2:22 pm PST
+Russ Atkinson (RRA) April 26, 1985 6:02:16 pm PST
+Demers, November 6, 1990 5:40 pm PST
+Doug Wyatt, August 21, 1991 5:50 pm PDT
+Willie-sue, March 6, 1990 1:12 pm PST
+Wes Irish, June 12, 1987 5:06:02 pm PDT
+Carl Hauser, May 11, 1988 4:01:48 pm PDT
+JKF August 26, 1988 10:05:42 am PDT
+Christian Jacobi,  January 27, 1993 3:26 pm PST
+Michael Plass, October 18, 1991 11:58 am PDT
+Parsing Cedar literals
+Accepts whitespaceChar...num?((d|D)?num)?whitespaceChar
+Note: does not accept a plus or minus sign
+Accepts whitespaceChar...num(b|B)?num?whitespaceChar
+Note: does not accept a plus or minus sign, or a string of digits without radix char 'b
+Accepts whitespaceChar...num(h|H)?num?whitespaceChar
+Note: does not accept a plus or minus sign, or a string of digits without radix char 'h
+bug: should check for overflow.
+Accepts both whitespaceChar...num exponent?whitespaceChar and whitespaceChar...?num.num?exponent?whitespaceChar, where exponent is (E|e)?(+|-)num
+"Relaxed" parsing
+Accepts whitespaceChar...?(+|-)whitespaceChar...number?whitespaceChar where number is digit... or a decimal, octal, or hex literal.
+Printing
+BUG: Ignores useE
+BUG: Ignores useE
+Real formatting
+
+{normal, zero, infinity, nan}
+The answer is small enough to be considered 0.
+This is the more normal case.  The trick here is to get the proper # of digits after the decimal point.
+First, adjust the number to be "aligned" with the buffer
+card has too much precision, so eliminate one digit
+fract has too little precision, so accum a '0
+Next, put chars into the temp buffer in reverse order (the convenient order when peeling them off of a number).
+Finally, append the temporary buffer onto the output buffer
+{normal, zero, infinity, nan}
+{normal, zero, infinity, nan}
+Too large for F format, so use E format
+Remove extra 0s to determine whether we can use F format
+Can use F format, and only show 1 0 (to show that it's real)
+Can use F format, but use places determined by the exponent
+Sigh, default to using E format
+XNS Network Address Formatting
+The order in which these possibilities are specified is important: receiving more information (i.e. looking at more characters of the field) may cause a computed XNSFieldType to increase (e.g. octal->decimal->hex) but cannot cause it to decrease.  See GetXNSFieldType[...].
+Split name into pieces.
+One-part name.
+Two-part name.
+Three-part name.
+
+We define the default net to be the one at the head of the network chain.  It may not be a good idea to block the caller of DefaultNet for so long, but it shouldn't happen (in theory).
+A BigNum a represents sum over i ( a[i] * 256**(5-i) ); that is, it's a base 256 number with the most significant part in a[0] and the least significant in a[5].  WARNING:  Call a BigNum "normalized" if all the elements are in the range [0..256).  The BigNum multiplication routine, MulAdd, always produces normalized results, but the division routine, DivRem, while mathematically correct, would leave its result unnormalized except for the explicit renormalization code.  For legal network numbers, it can be proved that BigNum elements won't exceed LAST[LONG CARDINAL], so to speed thing up you could change the declaration of BigNum and delete the renormalization code.  Yecch.
+
+Returns a ROPE of the form "1.12.123".
+An unknownSocket is expanded as the null string, e.g. "1.12." (no trailing 0).
+[n, rem, isZero] _ [n/base, n MOD base, (n/base = 0)]
+n _ renormalize[n]:
+[n, rem, isZero] _ [n/base, n MOD base, (n/base = 0)]
+[n, rem, isZero] _ [n/base, n MOD base, (n/base = 0)]
+[n, rem, isZero] _ [n/base, n MOD base, (n/base = 0)]
+Arpa Network Address Formatting 
+c is digit to append to n, i is index of next char to fetch ...
+ù A¥  ïNewlineDelimiter
+ñ(cedarcode) styleò codeöúôKöú
+œeúUô`Köú
+œcô&Jô1Kô$Kô'Kô%Kô'Kô(Kô#Kô/Kô,óKò öœk	ò	Köúüúò"Köúüúò'KöúüúòKöúüúò#Köúüúò$Köú
+üúüú]òãKöúüú6òCKòKöüúüúüú8üúüúüúüúòKöú	üúò(KöúüúÜòêKöúüútòÅKöúüúuüúòìKöúüúò!Köüúüúsò|óKò ö–blúüúüòKöüú5üú/üúòqKöüúòKöüúüúüúò Kò KöüúüúüúòKöüúüúüúüúòKöúüúò$KöúüúòKöúüúò,Köúüú!ò5Köúüúò,KöúüúûòCö
+œnúüúüúüúüúò;Kò óö
+°úüúüúüúüúòCöüúüòKöú
+üú
+òKöúüúòKöú	üú	òKöúüúò$Köúüúò,Köúüúò.KöüúüúüúòóKòKò óö
+°úüúüúüúüúòCöüúüòKöúüú	òKöúüúòKöú
+üúòKöúüúò$Köúüúò,Köúüúò.Köüúüúüúò"óKòKò óKò óheadôunitö°úüúüúüú	üúüúüúòLöû7ô7Köû*ô*óKöú	üúòKöúüúüúòKöúüúòKöú	üúòöüúüúüúüò!Köúüúòöüúüòöüúòöüúüúüúüò/öúüúüúüúüúüúüò=KöüúòóóKöúüúüúüúò)KöúüúòKòóöúòKöüúüúüúüúò.Köüúüú,ò?KöüúòKöúòóKöüúüúüúüúüúüúüúüúò-Köüúüúò#óKöüúòóKöüúüúüúüúò5KöüúòKòóMöüúüúüúüúòö°úüúüú	üúüú	üúòDöüúüúòKöúüúüúüúò Köú	üúòKöúüúòKöúüúòöüúüúüúüò&öüúüú
+üúò&Kö
+üú	üúüúüúüúòMKöúüúüúüúò(KòóKöüúüúüúüúüúüúüúüúüò&KöüúüúòKöüúòóöüúüòKöüúüúüú ò;Köú)ò)KöüúòóKöüú	òóKòóö°úüúüúüú	üúüúüúòJKöû4ô4KöûWôWKöú	üúòKöúüúüúòKöúüúòöüúüúüúüò!KöúüúòKöúüúòöüúüòöüúòöüúüúüúüò3öúüúüúüúüúüúüò?KöüúòóóKöúüúüúüúò+KöúüúòKòóöúòKöüúüúüúüúò.Köüúüú.òAKöüúòKöúòóKöüúüúüúüúüúüúüúüúò@Köüúüúò#óKöüúòóKöüúòKòóö°úüúüú	üúüúüúòHKöû4ô4KöûWôWKöú	üúòKöúüúüúòKöúüúòKöú	üúòöüúüúüúüò!Köúüúòöüúüò)öüúòöüúüúüúüò/öúüúüúüúüúüúüò=KöüúòóóKöúüúüúò)KöúüúòKòóöüúòöüúüúüúüò/öúüúüúüúüúüúüòBKöüúòóóKöúüúüúüúò0KöúüúòKòóöúòKöüúüúüúüúò.Köüúüú,ò?KöüúòKöúòóKöüúüúüúüúüúüúüúüúò@Köüúüúò#óKöüúòóKöüúòKòóö°úüúüú	üúüúüúòPKöú	üúòKöúüúò&öüúüúüòKòKòKòKöüúüúòóKòóö°	úüúüú	üúüúüúò8Köú	üúòKöúüúòöüúüúüúüò#Köúüúòöüúüò)KòKöüúòóKöüúòóKöüúòKöúòóMöú	üúûò0ö°úüúüúüúüúüúò6Köú	üúòKöúüúòKöúüúüúòKöúüúòKö
+üúüúüúüúüúòTKöüúüúüúò5öüúüòKöúüúò$KöúòKöüúòóKöú,ò,Köüúüúüúò;Köüúüúüúüúò#Köúòóö°úüúüú	üúüúüúòRKôKöú	üúòKöúüúò&Kö	úüúüúüúüúòEKöúüúòKö
+üúüúüúüúüúòTKöüúüúüúò5öüúüúüúüò!Köúüúò"Köúüú	òKöúüúòöüúüúòöüúüúòKöúüú&ò1KöúòKöüúüúò)KöúòóKöüúòKòóöüúüòKöüúòKöüúò!KöüúòóKöüúüúò)Köú ò Köüúüúò)KöüúòóKöüúòKòóö°úüúüúüú	üúüúüúòEKöû–cnû¢û!¢û¢û¢û"¢û¢û¢û¢û¢ûôëKöúBòBKöúüú
+û ò4KöúüúûòKöú
+üúûò1KöúüúüúòKöúüúûò0ö°úüúüúò,KöüúüúòKö	üúüúüúüúûò.Köüúüúüú&ò<Kö	üúüúüúüúûòUKòóö°úüúüúò,Kö	üúüúüúüúûò.Köüúüúüú(ò>Köüúüú(ò2Kòóòöüúüòöú	üúüòKöüúüúûò-Köüú'ò)KöúòKöüúüúòóöúüúüúûò2KöüúòKöúòKöúòKöüúüúüúòKöüúüúòóöúüúüúûò$Köüú(ò*Köüúüúòóöúüúüúû(ò>KöüúòKöúòKöüúüúüúòKöüúüúòóöú
+üúüúûò3Köüú'ò)Köú+ò+Köüúüúòóöú	üúüúû%ò<Köüú'ò)Köüúüúòóöúüúüúû6òKKöüúòKöüúüúüúòKöüúüúòóKöüúüúòóKöúòKöüúüúüúò.KòóKöú5ò5öüúüòKöúüúûòKöú	üú%ò3Köüúüú&ò6óKöüúüúòKöüú@üúòOKòóö°úüúüúüú	üúüúüúòEKöúüúò
+KöúüúòKöúüúòKöúüúòKöú	üúüúòöú	üúüúüúò#Köüúüúüú	ò#Kò'öüúüòöúòKöú'ò'Köú
+üúòóöúòKöüúüúüú+òMKöú
+üúòóKöüúòóKòKòóKöüúüúüúò9öüúüòöúòKöúòKöüúüúüúò7KòóKòKöüúò%óKöú.ò.Köüú	üú"ò1KöüúòKòóö°úüúüúüú	üúüúüúòEKöüúüúò?Köúüòöüúüò öú	û!ò*öüú%ò'Köüúüúò*KöüúüúòóKòóöüúû¢ûò-Köúüúüúüúòöüòöüú üò*öüúòKöúüúüúòKöüúüúüúò1KòóKöú
+üúüúòKöüúò!óKöüúòóKòóKöüúüúò'óKòö°úüúüú	üúüúüúüúòPKöüúüúò?KöúòöüúüòKöúòKöúòKöúòKöúòKöúòKöúòKöúòKöúòKöúòöüúòKöúüúüúüúòöüúüúüúüòöüúüò"Köüúüúüúò,Köüúüúò)óKöüúòóKöúüúòKöúòKòóKöüúüúò'óKöúòKöüúòKòóóóôö°úüúüúüúüúüúòGKöú	üúüúüúòKöúüúüòKöú2üúò8Kö
+üú
+üúüúüúüú	ò<Köüúüúüúüú	ò/KöüúòKòóö°úüúüúüúüúüúòIKöüú üúò3Kòóö°úüúüú!üúüúüúüúòlKöúÉôÉKöú	üúòKöúüúòKöúüúòKöúüú$ò/KöúòKöúüúòKöúüúòöüúüúüúüúò#Köúüúòöüúüò)öüúòKöúüúüúüúüúüúò3Köüúüúüú
+üò$öüú	üúüòKö	úüúüúüúüú
+ò3óKöúòKöúòKòóöüúòKö	úüúüúüúüúò-Köüúüúüú
+ò#öüúüúüúüúüúüúüúüò@Kö	úüúüúüúüú
+ò3óKöúüúüúüúò+KöúòKòóöú	ò	öüúüúòKö
+üúüúüúüúüúò-Köú4ò4óKöüúüúòóKöüúüúüúüúüúüúüúüúò6KöüúüúòóöüòKöúüú2òDKöú	üúò!óKöúüúò
+óöüúüòKöúüúò2Köüúüúò"óKòóö°úüúüúüúüúüúò6Köú	üúòKöúüúòKöúüúòKöú
+üúüúòKöú
+üúüúòöüúüúüúüúò#Köúüúòöüúüò)Köüúüúò(öú	ò	Köüúüú
+üú%üúò?KöüúüúòóKöüúüúüúüúüúüúòKöüúüúòóöüòKöú	üúò!óKöúüúò
+óKöúüúò#Köüúüú
+üú	üú	ò.Köúòóö°úüúüúüúüúüúò?öüúüú	üúüúüú
+üúüò9Köúüú#ò8Köúüú%ò7Köüúò
+óKòóö
+°úüúüúüúüúòLö
+üúüúüúüúüú	ò2Köüúüúüú%òDóKòóö°úüúüúüúüúüúò6Köüúüúüúüúò-Köüúüúüúüúò/Köüúüúüúüúò,Köüúüúüúüúò,KöüúòKòö
+°úüúüúüúüúò>KöúüúòKöúüúòKöúüúòö	úüúüúüúüúò6öüúüúòKöüú#üúüúüúòKKöüúòKòóKöüúüúüúüúüúüúüúüúüúüúò6KòóKöúòKöüúüúòKòóóö
+°úüúüúüúüúò6Köú	üúòKöúüúòKöúüúòKöüúüúüúò5Köüúüúò,òKöú	üúüú(ò9KöúüúòöüúüúüúüòKöúòKöüúòóKöúòKöüú'üúòCKöú ò KòóKöüú
+òKòóóôö°	úüúüúüúüúüúüúüúüúüúòdKöüúüúüúòKKòóö°
+úüúüúüúüúüúüúüúüúüúüúòsKöüú#üúò<Kòóö°úüúüúüúüúüúüúüúüúüúüúüúòvKöúüú	üúüúòKöúüúòöüúüúòöüúüòKöúüúòKöúüú
+üúüúòAóKöüúüúò(KòóKöüúüúüúüú	üúüúò?öüòKöúüúüúüúò!Köúüúüúüúüú	üúüúòPKöúòKöüúüúüúüúòKöúüúòKöüúòóöüú
+üúòKöúòKöúòKòóKöú&ò&öúòKöúüúò0ö	üúüúü
+úüúüò)Köú#ò#KöüúòóKöú"ò"KòóKöüúòKòóö°úüúüúüúüúüúüúüúüúüúüúòvöüú	üúüòKöüúüú)ò5öüúòKöúüúòKöúüúüúòKöú'üúò.Köüú*ò0KöúòóóKöúòKò óö°
+úüúüúüúüúüú"üúüúüúüúüúüúòöüúòKöüúüúò*Köüúüú ò+óKòóöü°úüúüúüúüúüúüúüúüúüúüúüúò}Köúôöú
+üúüú	üú
+üúüúüúüúüúü	úüúüúòqKöúNòNKöúòKöúòóKöúüúòKöúüúòKöúüúüúòKöú,ò,Köú;üúüúüúüúüúüúòrKöüú
+üúüúüú
+üúüúòFKöúòKöüúüúüúò1KöüúòKöúüòKò óö°úüúüúüúüúüúüúüúòYKöú'ò'ö	üúüúü
+úüú üò:KöúüúòKòKöüúòóKòKöüúòKöúòóö°úüúüúüúüúüú#üúüúüúüúüúüúòÇKöúôKöúòKöúüúòKöúüúòKöúüúòKò5öüúüòKò+öúòKöúüúüúüúò;KòKöúòóöúòKòKöúòóöüúòKöüúüú.ò;KòöüúòöüúòKò3Köúüú	ò+KöúòóöüúòKò+KöúòóóKò Köú*üúò1KöúòóóKöüúòKöúòóö°
+úüúüúüúüúüúEüúüúüúüúòõöüúòKöúQòQóKòóö°úüúüúüúüú5üú(üúüúüúüúò®Köúüúüúüúüúüúüúò4KöüúüúüúüúòJöüúüúòKöú3ò3Köüúüúüúüú&ò=KòóöüúüúòKöú3ò3Köüú
+üúüúüú òJKöúòóöüú
+üúòKöú"üúò)Köüúüúüú&òDKòóöüúüúòKöú#üúò*Köüúüú ò1KòóöüúüúòöúòKöúüú	üúüúüúüúòOóöüúüúòKöú ò KöúòöüúüúòKöú ò KöúòKòóKöúòóöüú	üúòKöú üúüúüúòJKòóöüúüúòKöú ò Köú/ò/KòóKöúòóKöüúòKòóö°úüúüúüúüúüúüúüúüúüú	üúüúüúüúüúò™Köú@ò@KöúüúüúüúòKKöüúäòêKòóö°úüúüúüú,üúüúüúüúüúüúüúòõöüúüúòKöúEòEKöú&ò&KòóKöúòKöú ò KöúEòEKöú ò Köúüúò$Köú ò KöúòKöú ò KöúòöüúüúòKöú ò KöúòKòóKöú ò Köú/üúò5KöüúòKòóMöúüúüú,üúòQMö°úüúüúãò¶Möú
+üúüú'üúòJMö°úüúüú]òtö°úüúüúüúüúüúüúòCKò*Köú%üúò.KöüúòKòóö°
+úüúüúüúüú	üúüúüúüúüúòlKöú
+üúüúòKöú6ò6Köú6ò6KöúòöüúüòKöúòKöúòKöúüúüúüúüúüúüúòEKöüú+üúüúüúòKKöüú+üúüúüúòKKöüú+üúüúüúòKKöüú+üúüúüúòKKöüúòóKöüúüú-üú&òcöüúüúüúüúò8Köüúüú
+üúüúò%Köüúüúò+Köüúüúüúò.KòóKöú&ò&KöüúòKòóö°
+úüúüúüúüúüúüúüúòIKöüú2ò8Kòóö°
+úüúüúüúüú	üúüúüúüúòVKö	úüúüúüú	üúòGöüúüúòKöúòKöú ò KòóKöüú%ò+Kòóö°úüúò(öüúüúüúüò!öüúüòKöüúüúüúüúò>Köüúüúüúò!Köüúüúò,óKöüúòóKòóö°
+úüúüúüúüúüú	üúüúüúüúüúò]Köüúüú"ò/öüúüúüúüò%Köú)üúò0KöüúòóKöüúüú"ò/KöüúòKòóö°
+úüúüúüúüúüú	üúüúüúüúüúò]Köüúüú"ò/öüúòöüúüúüúüúüúüúüúüúüúüúòOKöúòóKöüúò!KöúòóKòóö°úüúüúüúüúüúüúüúòGöüúüúüúüúüúüúüúò Köüú	üú	üú	üú"òGKöúòKòóöüúòKöú!ò!öüúüòKöú'ò'Köú'ò'Köú'ò'Köú'ò'Köú'ò'öüúòKöúüúüúüú
+ò9Kö	úüúüúüúüúò?Kö	úüúüúüúüúò8KöúòóóKòóKöüúòKòóö°úüúüúüúüúüúòYKöú	üúüúò/KöúPòPKöú ò Köüú
+òKòóö
+°úüúüúüúüúò[Köú	üúüúò/KöúQòQKöú ò Köüú
+òKòóö°úüúüú'üúòdKöú	üúüúò/KöúQòQKöú ò Köüú
+òKòóö°úüúüú(üúògKöú	üúüúò/KöúRòRKöú ò Köüú
+òKòóö°úüúüúüúEüúüúòêKöú	üúüúò/öú@ò@KöúMòMóKöú ò Köüú
+òKòóö
+°úüúüú_üúüúòùKöú	üúüúò/öú@ò@Köú;ò;óKöú ò Köüú
+òKòóö°úüúüúüúüúüúüúüú	üúüúüúò†Köú	üúüúò/Köú¢ò¢Köú ò Köüú
+òKòóö
+°úüúüúüúüúò>Köüúüúüúüúò+Kòóö°úüúüúüú	üúüúüúòGKö	úüúüúüú	üúòGKöüúüúüúüú	ò!KöúòKöüúò!Kòóö°úüúüúüú	üúüúòLKöú	üúüú+ò<KöúGòGKöú ò Köüú
+òKòóö°úüúüúüú	üúüúòLKöú	üúüúò-KöúGòGKöú ò Köüú
+òKòóóôJô Köúüú!ò0Kò ö°úüúüúüú*üúüúò_Köú	üúüú%ò6Köú7ò7Köú ò KòKò óö°úüúüú
+üúüúüú*üúüúüúòoöúòKöúôóKöúüúòKöúüúòKöúüúòKöúDòDöüúüòöúòKöúüú!ò,KöúüúüúòöüúüúòKöú.ô.Köú(ò(KöüúüúòóöüúüúòKöú(ò(KòKòóöúòKöúgôgKöúüúüú=òKKöúüúòKöúüú	òKöúòKöú8ô8öüòöüúüòòKöú3ô3Köú"üúò*KöúòKòöüúüòKöú
+ò
+Köú%ò%KöúüúüúüúòJKöüúòóKòóòKöú-ô-KòKòKòKöüúüú$ò6KòóKöüúüúòóKöüúòóKöúoôoöüòKöúüúò'KòKöúòKöúòKòKöüúüú$ò6Köüú
+üúüúüúò$KöüúòóKöú;ô;öüú
+üòKöú;ò;KöüúòóKöúòKòóKöúòóöú	ò	Köú(ò(Köüúüú
+òKòóöúòKöú$üúüúüú	òJóöúòKöú(ò(Köú(ò(Köú+ò+KöúòóKöüúüúòóKöüú
+òöüòöúòöüúüúòKöú(ò(Köú,ò,óKöüú
+òKòóóKòKò óö°úüúüúüú*üúüúò_Köú	üúüú%ò6Köú7ò7Köú ò KòKò óö°úüúüú
+üúüúüú+üúüúüúòpöúòKöúôóKöúüúòKöúüúòKöüúüúò$Köú6ò6öüúüòöúòKöúüúüúòKöúüúòKöúüúüúòKöúüúòKöüú	üú)ò8KöúòKöú(ò(Köú-üúüúò;KòKòKöú(ò(KòKöú$üúüúüúòBKöú#üúüúüúòAKöúòóKöüú#ò*óKöüú
+òKòKò óö
+°úüúüú+üúüúò`Köú	üúüú%ò6Köú8ò8Köú ò KòKò óö°úüú
+üúüúüú+üúüúüúòpöúòKöúôóKöúüúòKöúüúòKöüúüúò$Köú6ò6öüúüòöúòKöúüúòöüúüúòKöú(ò(KöúüúòKöúüúòKöúòóöüúüúòKöú'ô'Köú'ò'KöüúüúòóKöú8ô8öüúüú	üò"KöúòKöúòKöúòKöüúòóöüúüúòKô<KöúòKöüúüúòóöüúüúòKô;Köú$ò$KöüúüúòóKöúôKöúüúò,KöüúòKöúòóKöüú#ò*óKöüú
+òKòKò óö
+°úüúüú	üúüúò7Köüúüúüúüúò4KòKò óö°úüúüúüú	üúüúüúüúüúòQKöüúüú(üúòEKöüúòKòóóôöúüú;òMKôëóKò ö°úüúüúüúüúüúòCKöú	üúòKöúüúüúò)Köúüúüúò*Köú6ò6KôöüòKöúüúòKò Köú$ò$öüúüòKöú$ò$óöüúüúòKôKöú4ò4KöüúòóKò Köú6ò6öüúüòKöú6ò6óöüúüúòKôKöúüú"ò0Köúüú)ò4Köú-ò-Köú-ò-öüúüúüòöúüúò2Kò$Kò*óöúüúò2Kò"Kò&óKöüúüúò/óKöüúòóKò òKôKöú,ò,Kò#KöúKòKKò%Köú4ò4Kò)KöüúòóKò öüòKöúüúòóKöüúòóKò öüú
+üòKöúüúò/Köúüúò-KöúDòDöúòöüúòKöüúüúò$Köüúüúò)óKòóKöüúüúòóKò öüú	üòKöú(ò(Köúüúò+Köú@ò@Köúüúò2KöüúüúòóKò öüúüòKöúüúò-Köúüúò1KöúLòLKöúüúò2KöüúüúòóKò Köüú
+òKòKò óö
+°úüúüúüúüú	ò;Kò(öüúüòKöúüúò$Köúüúüúò'Köúüúò3Köúüúò%KöüúüúòóKòKò óö°úüúüúüúüúüú
+ò=Kò(öüúüòKöúüúüúò&Köúüúüúò(Köúüúò4öúòKöüúüúüúüúò7KöüúòóKöüúüúòóKòKò óö
+°úüúüúüúüúòAKò(öüúüòKöúüúüúò&Köúüúò$Köúüúò6Köúüúò%KöüúüúòóKòóKô ö
+°úüúüúüúüúòCKöú∏ô∏KöúòKò5öüúüúüúüòöüú*üúüúüúò`Köüúüúò
+óKòKöüúò
+óKöüúQòVKöúòKò óKöúüúòö	úüúüúüúüúò,Kö	ú£üú˛üúüúüúoô©Kò óö°
+úüúüúüúòHKòKöüú8ò>óKò ö°	úüúüúüúòFKòKöüú6ò<óKò ö°úüúüúüúòLKòKöüúò Kò óö°úüúüúüúòBKöúüúòKöúüúòKöúüúòKöúüúòö°úüúüúò&ö	üúüúü
+úüúüò,Köúüúò)KöúüúòKöúòKöüúòóKòóKöúüúüúüúòAKöüúüúüúò,KöúüòöüúüúüòKöúüúüúò;Köúüúüúò9Köüúüúòóöüúüúüú
+üòöüúüò$KöüúòKöüú$ò&Köüú$ò&KöüúüúòóKöüúòóKöüúòKòKò óö°úüúüúüúòCKöúüúòKöüú!üúüú
+ò9KöúòKöüúüúüúò1öúüúüò'KöüúòKöüúòKöüúòóö	üúüúüúüúüò:öüúüòKöüúüúò)Köüúüúò+Köüúüúüúò6Köúüúüú	üúò?KöüúòóKöüúòóöüúüúüúüò5Köüúüúò3Köúüúò"Köüúüúüúò>KöüúòóKòóKô ö°úüúüúüúüúüúòcKöú	üúüúò.KöúNòNKöú ò KòKò óö°úüúüúüúüúüúòWKöú	üúüúò.KöúFòFKöú ò KòKò óö°úüúüúüúüúüúòZKöú	üúüúò.KöúHòHKöú ò KòKò óö°úüúüú
+üúüúüúò`Köú	üúüúò.KöúLòLKöú ò KòóKò ö°úüúüúüúüúüúüúüúüúòlKöú
+üúô&KôNöüúüúò!Köüú!ò%KöüúmòqóKöú!ò!öüúüúò#Köüú!ò%Köüú{òóKöú!ò!öüúüúüò*KòLóKöüúòKò óö°úüúüúüúüúüúüúüúò`öüúüúòKöüú!ò%KöüúMòQóKöüúòKò óö°úüúüúüúüúüúüúüúòcöüúüúòKöüú!ò%KöüúKòOóKöüúòKò óö°úüúüúüú
+üúüúüúüúòiKöú<ò<KöüúòKò óKöúüúòKöú	üúüúüúDòdKò ö°úüúüúüúüúüúüúòNKöúüúüúòKöúüúòKöúüúòKöúüúòö°úüúòöû5ô5KöúüúòKöúüúòöüúüúüúüò#KöúüúòKöüúüú
+üúò0KöúüúòKöüúòóóôKò
+ö	üúüúü
+úüúüò)KòKöúüúòKòKöüúòóóKòóKöú(ò(KòKòöüúüòòKöúüúòKöú	üúòKò
+Köú	üúòöüúüú	üúüò&öû5ô5Köú	ò	óöüúüúòKöúòKöúòKöúòóKöúòKòKöüúòóKòóöú
+ò
+Köú	ò	KöúòKöú	üúòöüúüúüòöû5ô5Köú	ò	óKöúòKöüúòóKòóöúòKöú
+ò
+KöúòKöú	üúòöüúüú	üúüò$öû5ô5Köú	ò	óKöúòKöüúòóKòóKöüúüúòóöüúüòKöú%ò%Köú
+ò
+KöüúòóKöúòKöüúòóóöú ô ö
+°úüúüúüúüúòNKöúüúòKöúüúò	ö°úüúüúüúò KöúüúòKöúüúòKöüú	üú&üúòEKöüúüúüúüúò2öüòKô?KòKöüú
+üúüúò(Köüú
+üúüúòKöúòKöüúüúüúüúò&Kò
+KöüúòóKòóö°úüúòKöüúüúüúüúòEKò
+KòóKöúòKöüú
+üúüúò+öüúüúüúüúòPKò)KòóKòKò
+KöúòKò
+KöúòKò
+KöúòKöüú	üúüúò'KòKò óö
+°úüúüúüúüúòKöüúüúüú3òYKöúòóKòKò óö
+°úüúüúüúüúòDKöúüúüúüúòKöúòKöú,üúüúò:KöúòKöú,üúüúò:KöúòKöú,üúüúò:KöúòKöüú(üúüúò=KòóKòóMöú'üúò>Möüúòó Öó    ≤j  " 

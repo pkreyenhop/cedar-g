@@ -1,0 +1,1283 @@
+DIRECTORY
+Atom USING [MakeAtom],
+ConvertUnsafe USING [ToRope],
+IntCodeDefs USING [Align, ArithClass, ArithClassKind, ArithSelector, BoolClass, ByteSequence, CaseList, CaseListRep, CedarSelector, Comparator, Count, FileId, Handler, HandlerRep, Label, LabelRep, LambdaKind, Location, LocationRep, LogicalId, MesaSelector, Node, NodeList, NodeListRep, NodeRep, nullFileId, nullVariableFlags, nullVariableId, Offset, OperRep, SourceRange, Var, VariableFlag, VariableFlags, VariableId, VarList, VarListRep, Word],
+IntCodeUtils USING [Fetch, IdTab, IntToWord, NewIdTab, Store, WordToInt, zone],
+IO USING [EndOfStream, GetChar, GetID, GetInt, GetRopeLiteral, PeekChar, PutChar, PutF1, PutRope, PutText, RopeFromROS, ROS, SkipWhitespace, STREAM, Value],
+ParseIntCode USING [],
+Rope USING [ActionType, Concat, FromChar, Length, Map, ROPE],
+Target: TYPE MachineParms USING [bitsPerRef, bitsPerWord];
+
+ParseIntCodeImpl: CEDAR PROGRAM
+IMPORTS Atom, ConvertUnsafe, IntCodeUtils, IO, Rope
+EXPORTS ParseIntCode
+= BEGIN OPEN IntCodeDefs;
+
+ROPE: TYPE = Rope.ROPE;
+STREAM: TYPE = IO.STREAM;
+
+SyntaxError: PUBLIC ERROR [why: ROPE] = CODE;
+
+signalStrange: BOOL ¨ FALSE;
+
+StrangeCondition: SIGNAL = CODE;
+
+ParseContext: TYPE = REF ParseContextRep;
+ParseContextRep: TYPE = RECORD [
+stream: STREAM ¨ NIL,
+idTab: IntCodeUtils.IdTab ¨ NIL,
+labelTab: IntCodeUtils.IdTab ¨ NIL
+];
+
+bitsPerRef: NAT = Target.bitsPerRef;
+defaultBits: NAT = Target.bitsPerWord;
+
+z: ZONE ¨ IntCodeUtils.zone;
+
+FromStream: PUBLIC PROC [st: STREAM] RETURNS [nodes: NodeList ¨ NIL] = {
+idTab: IntCodeUtils.IdTab ¨ IntCodeUtils.NewIdTab[];
+labelTab: IntCodeUtils.IdTab ¨ IntCodeUtils.NewIdTab[];
+pc: ParseContext ¨ z.NEW[ParseContextRep ¨ [st, idTab, labelTab]];
+tail: NodeList ¨ NIL;
+DO
+ENABLE IO.EndOfStream => EXIT;
+list: NodeList ¨ z.NEW[NodeListRep ¨ [first: ParseNode[pc], rest: NIL]];
+IF tail = NIL THEN nodes ¨ list ELSE tail.rest ¨ list;
+tail ¨ list;
+ENDLOOP;
+};
+
+ToRope: PROC [node: Node] RETURNS [ROPE] = {
+ros: STREAM ¨ IO.ROS[];
+out: OutputContext ¨ CreateOutputContext[ros];
+PutNode[out, node];
+RETURN [IO.RopeFromROS[ros]];
+};
+
+ToStream: PUBLIC PROC [st: STREAM, nodes: NodeList] = {
+out: OutputContext ¨ CreateOutputContext[st];
+FOR each: NodeList ¨ nodes, each.rest WHILE each # NIL DO
+StartLine[out];
+EndLine[out];
+PutNode[out, each.first];
+ENDLOOP;
+};
+
+ParseNode: PROC [pc: ParseContext] RETURNS [node: Node ¨ NIL] = {
+st: STREAM = pc.stream;
+IF Insist[st, '{] THEN {
+bits: INT ¨ ScanInt[st, -1];
+IF PeekChar[st] # '} THEN {
+kind: ATOM ¨ ScanKind[st];
+SELECT kind FROM
+$var => {
+flags: VariableFlags ¨ ScanVariableFlags[st];
+id: VariableId ¨ ParseVarId[pc];
+loc: Location ¨ ParseLocation[pc];
+useCache: BOOL ¨ FALSE;
+IF bits < 0 THEN bits ¨ defaultBits;
+IF id # nullVariableId AND (loc = NIL OR loc.kind = localVar) THEN {
+prev: Var ¨ IF id = nullVariableId THEN NIL
+ELSE NARROW[IntCodeUtils.Fetch[pc.idTab, id]];
+IF prev # NIL AND prev.location # NIL THEN {
+IF loc = NIL THEN {node ¨ prev; GO TO oldVar};
+NoteStrange[];
+};
+IF prev # NIL THEN {
+prev.location ¨ loc;
+node ¨ prev;
+GO TO oldVar;
+};
+useCache ¨ TRUE;
+};
+node ¨ z.NEW[NodeRep.var ¨ [bits, var[flags, id, loc]]];
+IF useCache THEN [] ¨ IntCodeUtils.Store[pc.idTab, id, node];
+EXITS oldVar => {};
+};
+$const => {
+constKind: ATOM ¨ ScanKind[st];
+SELECT constKind FROM
+$word => {
+IF bits < 0 THEN bits ¨ defaultBits;
+node ¨ z.NEW[NodeRep.const.word
+¨ [bits, const[word[ScanWord[st]]]]];
+};
+$bytes => {
+align: Align ¨ ScanInt[st];
+byteSeq: ByteSequence ¨ ParseBytes[pc];
+IF bits < 0 THEN node.bits ¨ 8*Rope.Length[byteSeq];
+node ¨ z.NEW[NodeRep.const.bytes
+¨ [bits, const[bytes[align, byteSeq]]]];
+};
+$refLiteral => {
+const: REF NodeRep.const.refLiteral ¨ z.NEW[NodeRep.const.refLiteral
+¨ [bitsPerRef, const[refLiteral[rope, NIL]]]];
+refLitKind: ATOM ¨ ScanKind[st];
+const.litKind ¨ SELECT refLitKind FROM
+$rope => rope, $atom => atom, $refText => refText, $other => other,
+ENDCASE => ERROR SyntaxError["illegal refLitKind"];
+const.contents ¨ ParseBytes[pc];
+node ¨ const;
+};
+$numLiteral => {
+class: ArithClass ¨ ScanArithClass[st];
+contents: ROPE ¨ ParseBytes[pc];
+IF bits < 0 THEN bits ¨ defaultBits;
+node ¨ z.NEW[NodeRep.const.numLiteral
+¨ [bits, const[numLiteral[class, contents]]]];
+};
+ENDCASE => ERROR SyntaxError["illegal constant kind"];
+};
+$block => {
+nodes: NodeList ¨ ParseNodeList[pc, '}];
+IF bits < 0 THEN bits ¨ 0;
+node ¨ z.NEW[NodeRep.block ¨ [bits, block[nodes]]];
+};
+$enable => {
+handlerContext: Node ¨ ParseNode[pc];
+handlerProc: Node ¨ ParseNode[pc];
+handler: Handler ¨ z.NEW[HandlerRep
+¨ [context: handlerContext, proc: handlerProc]];
+nodes: NodeList ¨ ParseNodeList[pc, '}];
+IF bits < 0 THEN bits ¨ 0;
+node ¨ z.NEW[NodeRep.enable ¨ [bits, enable[handler, nodes]]];
+};
+$decl => {
+var: Var ¨ ParseVar[pc];
+init: Node ¨ ParseNode[pc];
+node ¨ z.NEW[NodeRep.decl ¨ [0, decl[var: var, init: init]]];
+};
+$assign => {
+lhs: Var ¨ ParseVar[pc];
+rhs: Node ¨ ParseNode[pc];
+IF bits < 0 THEN bits ¨ 0;
+node ¨ z.NEW[NodeRep.assign ¨ [bits, assign[lhs: lhs, rhs: rhs]]];
+};
+$cond => {
+caseHead: CaseList ¨ NIL;
+caseTail: CaseList ¨ NIL;
+WHILE PeekChar[st] # '} DO
+IF Insist[st, '(] THEN {
+key: ATOM ¨ ScanKind[st];
+IF key = $test
+THEN {
+tests: NodeList ¨ ParseNodeList[pc, ')];
+body: Node ¨ IF Insist[st, ')] THEN ParseNode[pc] ELSE NIL;
+new: CaseList ¨ z.NEW[CaseListRep ¨ [tests, body, NIL]];
+IF caseTail = NIL THEN caseHead ¨ new ELSE caseTail.rest ¨ new;
+caseTail ¨ new;
+}
+ELSE ERROR SyntaxError["'test' expected"];
+};
+ENDLOOP;
+IF bits < 0 THEN bits ¨ 0;
+node ¨ z.NEW[NodeRep.cond ¨ [bits, cond[caseHead]]];
+};
+$label => {
+label: Label ¨ ParseLabel[pc];
+labNode: Node ¨ IF PeekChar[st] = '} THEN NIL ELSE ParseNode[pc];
+IF bits < 0 THEN bits ¨ 0;
+IF labNode # NIL THEN label.node ¨ labNode;
+node ¨ z.NEW[NodeRep.label ¨ [bits, label[label]]];
+};
+$goto => {
+dest: Label ¨ ParseLabel[pc, FALSE, TRUE];
+backwards: BOOL ¨ ScanFlag[st];
+IF backwards THEN dest.backTarget ¨ TRUE;
+dest.jumpedTo ¨ TRUE;
+node ¨ z.NEW[NodeRep.goto ¨
+[0, goto[dest: dest, backwards: backwards]]];
+};
+$apply => {
+proc: Node ¨ ParseNode[pc];
+args: NodeList ¨ ParseNodeList[pc, '}, '!];
+handler: Handler ¨ NIL;
+IF Accept[st, '!] THEN {
+handler ¨ z.NEW[HandlerRep];
+handler.context ¨ ParseNode[pc];
+handler.proc ¨ ParseNode[pc];
+};
+IF bits < 0 THEN bits ¨ defaultBits;
+node ¨ z.NEW[NodeRep.apply ¨
+[bits, apply[proc: proc, args: args, handler: handler]]];
+};
+$lambda => {
+parent: Label ¨ ParseLabel[pc, TRUE, TRUE];
+descBody: Var ¨ IF PeekChar[st] = '{ THEN ParseVar[pc] ELSE NIL;
+kind: LambdaKind = SELECT ScanKind[st] FROM
+$outer => outer,
+$inner => inner,
+$install => install,
+$init => init,
+$catch => catch,
+$scope => scope,
+$fork => fork,
+ENDCASE => unknown;
+bitsOut: INT ¨ ScanInt[st];
+formalArgs: VarList ¨ ParseVarList[pc];
+body: NodeList ¨ ParseNodeList[pc, '}];
+node ¨ z.NEW[NodeRep.lambda ¨ [defaultBits, lambda[
+parent: parent, kind: kind, descBody: descBody,
+bitsOut: bitsOut, formalArgs: formalArgs, body: body]]];
+};
+$return =>
+node ¨ z.NEW[NodeRep.return ¨
+[0, return[ParseNodeList[pc, '}] ]]];
+$oper => {
+IF bits < 0 THEN bits ¨ 0;
+node ¨ z.NEW[NodeRep.oper ¨
+[bits, oper[z.NEW[OperRep ¨ ParseOperRep[pc]]]]];
+};
+$machineCode => {
+IF bits < 0 THEN bits ¨ 0;
+node ¨ z.NEW[NodeRep.machineCode ¨
+[bits, machineCode[ ParseBytes[pc] ]]];
+};
+$module => {
+vars: VarList ¨ ParseVarList[pc];
+procs: NodeList ¨ ParseNodeList[pc, '}];
+node ¨ z.NEW[NodeRep.module ¨
+[0, module[vars: vars, procs: procs]]];
+};
+$source => {
+source: SourceRange ¨ ScanSourceRange[st];
+nodes: NodeList ¨ ParseNodeList[pc, '}];
+IF bits < 0 THEN bits ¨ 0;
+node ¨ z.NEW[NodeRep.source ¨
+[bits, source[source: source, nodes: nodes]]];
+};
+$comment => {
+msg: ByteSequence ¨ ParseBytes[pc];
+node ¨ z.NEW[NodeRep.comment ¨ [0, comment[msg]]];
+};
+ENDCASE => ERROR SyntaxError ["illegal node kind"];
+};
+};
+[] ¨ Insist[st, '}];
+};
+
+ParseNodeList: PROC [pc: ParseContext, stop1: CHAR ¨ '}, stop2: CHAR ¨ '!] RETURNS [head: NodeList ¨ NIL] = {
+st: STREAM = pc.stream;
+tail: NodeList ¨ NIL;
+DO
+SELECT PeekChar[st] FROM
+stop1, stop2 => RETURN;
+ENDCASE => {
+node: Node ¨ ParseNode[pc];
+new: NodeList ¨ z.NEW[NodeListRep ¨ [node, NIL]];
+IF tail = NIL THEN head ¨ new ELSE tail.rest ¨ new;
+tail ¨ new;
+};
+ENDLOOP;
+};
+
+ParseVar: PROC [pc: ParseContext] RETURNS [Var ¨ NIL] = {
+node: Node ¨ ParseNode[pc];
+IF node # NIL THEN
+WITH node SELECT FROM
+var: Var => RETURN [var];
+ENDCASE => ERROR SyntaxError["var expected, node found"];
+};
+
+ParseVarList: PROC [pc: ParseContext] RETURNS [head: VarList ¨ NIL] = {
+st: STREAM = pc.stream;
+tail: VarList ¨ NIL;
+[] ¨ Insist[st, '(];
+WHILE NOT Accept[st, ')] DO
+new: VarList ¨ z.NEW[VarListRep ¨ [ParseVar[pc], NIL]];
+IF tail = NIL THEN head ¨ new ELSE tail.rest ¨ new;
+tail ¨ new;
+ENDLOOP;
+};
+
+ParseBytes: PROC [pc: ParseContext] RETURNS [ROPE ¨ NIL] = {
+st: STREAM = pc.stream;
+[] ¨ IO.SkipWhitespace[st];
+SELECT IO.PeekChar[st] FROM
+'" => RETURN [IO.GetRopeLiteral[st]];
+ENDCASE;
+};
+
+ParseVarId: PROC [pc: ParseContext] RETURNS [VariableId] = {
+st: STREAM = pc.stream;
+RETURN [ScanInt[st]];
+};
+
+ParseLabel: PROC [pc: ParseContext, optional: BOOL ¨ FALSE, forceUsed: BOOL ¨ FALSE]
+RETURNS [label: Label ¨ NIL] = {
+st: STREAM = pc.stream;
+SELECT TRUE FROM
+Accept[st, '%] => {
+id: LogicalId ¨ ScanId[st];
+WITH IntCodeUtils.Fetch[pc.labelTab, id] SELECT FROM
+lab: Label => {
+IF forceUsed THEN lab.used ¨ TRUE;
+RETURN [lab];
+};
+ENDCASE;
+label ¨ z.NEW[LabelRep ¨ [
+id: id, node: NIL, backTarget: FALSE, jumpedTo: FALSE, used: forceUsed]];
+[] ¨ IntCodeUtils.Store[pc.labelTab, id, label];
+RETURN [label];
+};
+NOT optional => ERROR SyntaxError["label expected"];
+ENDCASE;
+};
+
+MesaSelectorFromSKind: PROC [sKind: ATOM] RETURNS [mesa: MesaSelector] = {
+mesa ¨ SELECT sKind FROM
+$addr => addr, $all => all,
+$equal => equal, $notEqual => notEqual, $nilck => nilck,
+$alloc => alloc, $free => free, $fork => fork, $join => join,
+$monitorEntry => monitorEntry, $monitorExit => monitorExit, 
+$notify => notify, $broadcast => broadcast, $wait => wait,
+$unnamedError => unnamedError, $unwindError => unwindError, 
+$abortedError => abortedError, $uncaughtError => uncaughtError, 
+$boundsError => boundsError, $narrowFault => narrowFault,
+$signal => signal, $error => error,
+$unwind => unwind, $resume => resume, $reject => reject,
+$copyGlobal => copyGlobal, $startGlobal => startGlobal, 
+$restartGlobal => restartGlobal, $stopGlobal => stopGlobal, $checkInit => checkInit,
+$globalFrame => globalFrame,
+ENDCASE => ERROR SyntaxError["illegal mesa selector"];
+RETURN[mesa];
+};
+
+ParseOperRep: PROC [pc: ParseContext] RETURNS [OperRep] = {
+st: STREAM = pc.stream;
+kind: ATOM ¨ ScanKind[st];
+SELECT kind FROM
+$arith => {
+class: ArithClass ¨ ScanArithClass[st];
+sKind: ATOM ¨ ScanKind[st];
+select: ArithSelector ¨ SELECT sKind FROM
+$add => add, $sub => sub, $mul => mul, $div => div, 
+$mod => mod, $pow => pow, $abs => abs, $neg => neg, 
+$min => min, $max => max,
+ENDCASE => ERROR SyntaxError["illegal arith selector"];
+RETURN [[arith[class, select]]];
+};
+$boolean => {
+kind: ATOM ¨ ScanKind[st];
+class: BoolClass ¨ SELECT kind FROM
+$and => and, $not => not, $or => or, $xor => xor,
+ENDCASE => ERROR SyntaxError["illegal boolean class"];
+bits: Count ¨ ScanInt[st, defaultBits];
+RETURN [[boolean[class, bits]]];
+};
+$code => {
+label: Label ¨ ParseLabel[pc, FALSE, TRUE];
+offset: INT ¨ ScanInt[st];
+direct: BOOL ¨ ScanFlag[st, TRUE];
+RETURN [[code[label, offset, direct]]];
+};
+$convert => {
+to: ArithClass ¨ ScanArithClass[st];
+from: ArithClass ¨ ScanArithClass[st];
+RETURN [[convert[to: to, from: from]]];
+};
+$check => {
+class: ArithClass ¨ ScanArithClass[st];
+sKind: ATOM ¨ ScanKind[st];
+sense: Comparator ¨ SELECT sKind FROM
+$eq => eq, $lt => lt, $le => le, $ne => ne, $ge => ge, $gt => gt, 
+ENDCASE => ERROR SyntaxError["illegal comparator"];
+RETURN [[check[class, sense]]];
+};
+$compare => {
+class: ArithClass ¨ ScanArithClass[st];
+sKind: ATOM ¨ ScanKind[st];
+sense: Comparator ¨ SELECT sKind FROM
+$eq => eq, $lt => lt, $le => le, $ne => ne, $ge => ge, $gt => gt, 
+ENDCASE => ERROR SyntaxError["illegal comparator"];
+RETURN [[compare[class, sense]]];
+};
+$mesa => {
+sKind: ATOM ¨ ScanKind[st];
+mesa: MesaSelector ¨ MesaSelectorFromSKind[sKind];
+RETURN [[mesa[mesa, ScanInt[st]]]]; 
+};
+$cedar => {
+sKind: ATOM ¨ ScanKind[st];
+cedar: CedarSelector ¨ SELECT sKind FROM
+$simpleAssign => simpleAssign, $simpleAssignInit => simpleAssignInit,
+$complexAssign => complexAssign, $complexAssignInit => complexAssignInit,
+$new => new, $code => code,
+$narrow => narrow, $referentType => referentType, $procCheck => procCheck,
+ENDCASE => ERROR SyntaxError["illegal Cedar selector"];
+RETURN [[cedar[cedar, ScanInt[st]]]]; 
+};
+$escape => {
+id: LogicalId ¨ ScanId[st];
+RETURN [[escape[id, ScanInt[st]]]]; 
+};
+ENDCASE => ERROR SyntaxError["illegal oper kind"];
+};
+
+ParseLocation: PROC [pc: ParseContext] RETURNS [loc: Location ¨ NIL] = {
+st: STREAM = pc.stream;
+IF Accept[st, '(] THEN {
+kind: ATOM ¨ ScanKind[st];
+SELECT kind FROM
+$system => {
+id: LogicalId ¨ ScanId[st];
+loc ¨ z.NEW[LocationRep.system ¨ [system[id]]];
+};
+$globalVar => {
+id: LogicalId ¨ ScanId[st];
+loc ¨ z.NEW[LocationRep.globalVar ¨ [globalVar[id]]];
+};
+$localVar => {
+id: LogicalId ¨ ScanId[st];
+parent: Label ¨ ParseLabel[pc];
+loc ¨ z.NEW[LocationRep.localVar ¨ [localVar[id, parent]]];
+};
+$register => {
+id: LogicalId ¨ ScanId[st];
+loc ¨ z.NEW[LocationRep.register ¨ [register[id]]];
+};
+$link => {
+id: LogicalId ¨ ScanId[st];
+loc ¨ z.NEW[LocationRep.link ¨ [link[id]]];
+};
+$stack => {
+offset: Offset ¨ ScanOffset[st];
+loc ¨ z.NEW[LocationRep.stack ¨ [stack[offset]]];
+};
+$deref => {
+node: Node ¨ ParseNode[pc];
+align: INT ¨ ScanInt[st, defaultBits];
+loc ¨ z.NEW[LocationRep.deref ¨ [deref[node, align]]];
+};
+$indexed => {
+base: Node ¨ ParseNode[pc];
+index: Node ¨ ParseNode[pc];
+loc ¨ z.NEW[LocationRep.indexed ¨ [indexed[base, index]]];
+};
+$field => {
+offset: Offset ¨ ScanOffset[st];
+node: Node ¨ ParseNode[pc];
+loc ¨ z.NEW[LocationRep.field ¨ [field[node, offset, FALSE]]];
+};
+$xfield => {
+offset: Offset ¨ ScanOffset[st];
+node: Node ¨ ParseNode[pc];
+loc ¨ z.NEW[LocationRep.field ¨ [field[node, offset, TRUE]]];
+};
+$upLevel => {
+link: Var ¨ ParseVar[pc];
+reg: Var ¨ ParseVar[pc];
+format: LogicalId ¨ ScanId[st];
+loc ¨ z.NEW[LocationRep.upLevel ¨ [upLevel[link, reg, format]]];
+};
+$composite => {
+list: NodeList ¨ ParseNodeList[pc, ')];
+loc ¨ z.NEW[LocationRep.composite ¨ [composite[list]]];
+};
+$escape => {
+id: LogicalId ¨ ScanId[st];
+offset: Offset ¨ ScanOffset[st];
+base: Node ¨ ParseNode[pc];
+loc ¨ z.NEW[LocationRep.escape ¨ [escape[id, base, offset ]]];
+};
+$dummy =>
+loc ¨ z.NEW[LocationRep ¨ [dummy[]]];
+ENDCASE => ERROR SyntaxError["illegal location kind"];
+[] ¨ Insist[st, ')];
+};
+};
+
+ScanArithClass: PROC [st: STREAM] RETURNS [ArithClass] = {
+kind: ArithClassKind ¨ signed;
+precision: NAT ¨ 0;
+checked: BOOL ¨ TRUE;
+[] ¨ IO.SkipWhitespace[st];
+SELECT IO.PeekChar[st] FROM
+'s, 'S => {kind ¨ signed; checked ¨ TRUE};
+'u, 'U => {kind ¨ unsigned; checked ¨ FALSE};
+'a, 'A => {kind ¨ address; checked ¨ FALSE};
+'r, 'R => {kind ¨ real; checked ¨ TRUE};
+'x, 'X => {
+k: [0..ORD[LAST[ArithClassKind]]] ¨ 0;
+[] ¨ IO.GetChar[st];
+k ¨ ScanInt[st, ORD[LAST[ArithClassKind]] ];
+kind ¨ VAL[k];
+checked ¨ TRUE;
+};
+ENDCASE => ERROR SyntaxError["illegal arith class"];
+[] ¨ IO.GetChar[st];
+precision ¨ ScanInt[st, defaultBits];
+checked ¨ ScanFlag[st, checked];
+RETURN [[kind, checked, precision]];
+};
+
+ScanSourceRange: PROC [st: STREAM] RETURNS [SourceRange] = {
+start: Offset ¨ ScanInt[st];
+chars: Offset ¨ ScanInt[st];
+fileNum: INT ¨ ScanInt[st];
+file: FileId ¨ nullFileId;
+RETURN [[start: start, chars: chars, file: fileNum]];
+};
+
+ScanInt: PROC [st: STREAM, default: INT ¨ 0] RETURNS [INT] = {
+[] ¨ IO.SkipWhitespace[st];
+SELECT IO.PeekChar[st] FROM
+'-, IN ['0..'9] => {
+RETURN [IO.GetInt[st]];
+};
+ENDCASE => RETURN [default];
+};
+
+ScanId: PROC [st: STREAM] RETURNS [LogicalId] = {
+RETURN [ScanInt[st]];
+};
+
+ScanWord: PROC [st: STREAM] RETURNS [Word] = {
+RETURN [IntCodeUtils.IntToWord[ScanInt[st]]];
+};
+
+ScanOffset: PROC [st: STREAM] RETURNS [Offset] = {
+RETURN [ScanInt[st]];
+};
+
+ScanCount: PROC [st: STREAM] RETURNS [Offset] = {
+card: LONG CARDINAL ¨ ScanInt[st];
+RETURN [card];
+};
+
+ScanKind: PROC [st: STREAM, optional: BOOL ¨ FALSE] RETURNS [ATOM ¨ NIL] = {
+[] ¨ IO.SkipWhitespace[st];
+SELECT IO.PeekChar[st] FROM
+IN ['A..'Z], IN ['a..'z] => {
+id: ROPE ¨ IO.GetID[st];
+RETURN [Atom.MakeAtom[id]];
+};
+ENDCASE => IF NOT optional THEN ERROR SyntaxError["number expected"];
+};
+
+ScanFlag: PROC [st: STREAM, default: BOOL ¨ FALSE] RETURNS [BOOL] = {
+SELECT PeekChar[st] FROM
+'T, 't => {[] ¨ IO.GetChar[st]; RETURN [TRUE]};
+'F, 'f => {[] ¨ IO.GetChar[st]; RETURN [FALSE]};
+ENDCASE => RETURN [default];
+};
+
+ScanVariableFlags: PROC [st: STREAM] RETURNS [VariableFlags] = {
+flags: VariableFlags ¨ nullVariableFlags;
+FOR flag: VariableFlag IN VariableFlag DO
+SELECT PeekChar[st] FROM
+'T, 't => flags[flag] ¨ TRUE;
+'F, 'f => {};
+ENDCASE => EXIT;
+[] ¨ IO.GetChar[st];
+ENDLOOP;
+RETURN [flags];
+};
+
+PeekChar: PROC [st: STREAM] RETURNS [CHAR] = {
+[] ¨ IO.SkipWhitespace[st];
+RETURN [IO.PeekChar[st]];
+};
+
+Accept: PROC [st: STREAM, c: CHAR] RETURNS [BOOL] = {
+[] ¨ IO.SkipWhitespace[st];
+IF IO.PeekChar[st] = c THEN {[] ¨ IO.GetChar[st]; RETURN [TRUE]};
+RETURN [FALSE];
+};
+
+Insist: PROC [st: STREAM, c: CHAR] RETURNS [BOOL] = {
+[] ¨ IO.SkipWhitespace[st];
+IF IO.PeekChar[st] = c THEN {[] ¨ IO.GetChar[st]; RETURN [TRUE]};
+ERROR SyntaxError[Rope.Concat[Rope.FromChar[c], " expected"]];
+};
+
+PutNodeAuto: PROC [out: OutputContext, node: Node, break: BOOL ¨ FALSE] = {
+PutNode[out, node, break OR IsComplex[node]];
+};
+
+PutNode: PROC
+[out: OutputContext, node: Node, newLine: BOOL ¨ FALSE, space: BOOL ¨ TRUE] = {
+IF newLine THEN EndLine[out];
+IF space AND NOT out.empty THEN PutRopeLit[out, " "];
+IF node = NIL THEN {PutRopeLit[out, "{}"]; RETURN};
+PutRopeLit[out, "{"];
+out.nodeLevel ¨ out.nodeLevel + 1;
+SELECT node.kind FROM
+var, apply =>
+IF node.bits # defaultBits THEN PutInt[out, node.bits, "%g "];
+block, enable, oper, machineCode, source, assign, cond =>
+IF node.bits > 0 THEN PutInt[out, node.bits, "%g "];
+ENDCASE => {};
+WITH node SELECT FROM
+var: REF NodeRep.var => PutVar[out, var, FALSE];
+const: REF NodeRep.const => {
+WITH const SELECT FROM
+word: REF NodeRep.const.word => {
+IF node.bits = defaultBits
+THEN PutRopeLit[out, "const word "]
+ELSE PutInt[out, node.bits, "%g const word "];
+PutWord[out, word.word];
+};
+bytes: REF NodeRep.const.bytes => {
+PutInt[out, node.bits, "%g const bytes "];
+PutInt[out, bytes.align, "%g "];
+PutBytes[out, bytes.bytes];
+};
+refLiteral: REF NodeRep.const.refLiteral => {
+PutInt[out, node.bits, "%g const refLiteral "];
+SELECT refLiteral.litKind FROM
+rope => PutRopeLit[out, "rope "];
+atom => PutRopeLit[out, "atom "];
+refText => PutRopeLit[out, "refText "];
+other => PutRopeLit[out, "other "];
+ENDCASE => ERROR;
+PutBytes[out, refLiteral.contents];
+};
+numLiteral: REF NodeRep.const.numLiteral => {
+PutInt[out, node.bits, "%g const numLiteral "];
+PutArithClass[out, numLiteral.class];
+PutBytes[out, numLiteral.contents];
+};
+ENDCASE => ERROR;
+};
+block: REF NodeRep.block => {
+nodeList: NodeList ¨ block.nodes;
+PutRopeLit[out, "block"];
+PutNodeList[out, block.nodes, TRUE];
+};
+enable: REF NodeRep.enable => {
+PutRopeLit[out, "enable"];
+PutNode[out, enable.handle.context, TRUE];
+PutNode[out, enable.handle.proc, TRUE];
+PutNodeList[out, enable.scope, TRUE];
+};
+decl: REF NodeRep.decl => {
+var: Var = decl.var;
+init: Node = decl.init;
+SELECT TRUE FROM
+decl.bits # 0 => NoteStrange[];
+var = NIL => NoteStrange[];
+init # NIL AND var.bits # init.bits => NoteStrange[];
+ENDCASE;
+PutRopeLit[out, "decl "];
+PutVar[out, var, TRUE];
+SELECT TRUE FROM
+init = NIL => PutRopeLit[out, " {}"];
+ENDCASE => PutNodeAuto[out, init];
+};
+assign: REF NodeRep.assign => {
+break: BOOL ¨ IsComplex[assign.lhs, TRUE] OR IsComplex[assign.rhs, TRUE];
+lhs: Node = assign.lhs;
+rhs: Node = assign.rhs;
+SELECT TRUE FROM
+lhs = NIL => NoteStrange[];
+rhs # NIL AND rhs.bits # lhs.bits => NoteStrange[];
+ENDCASE;
+PutRopeLit[out, "assign"];
+PutNode[out, lhs, break];
+PutNode[out, rhs, break];
+};
+cond: REF NodeRep.cond => {
+delta: INTEGER ¨ 1;
+PutRopeLit[out, "cond"];
+FOR each: CaseList ¨ cond.cases, each.rest WHILE each # NIL DO
+tests: NodeList ¨ each.tests;
+EndLine[out];
+IF tests # NIL
+THEN {
+first: Node ¨ tests.first;
+break: BOOL ¨ tests.rest # NIL OR IsComplex[first, FALSE];
+PutRopeLit[out, "(test"];
+out.nodeLevel ¨ out.nodeLevel + 1;
+FOR eachTest: NodeList ¨ tests, eachTest.rest WHILE eachTest # NIL DO
+PutNode[out, eachTest.first, break];
+ENDLOOP;
+PutRopeLit[out, ")"];
+out.nodeLevel ¨ out.nodeLevel - 1;
+}
+ELSE
+PutRopeLit[out, "(test)"];
+PutNode[out, each.body, TRUE];
+EndLine[out];
+ENDLOOP;
+GO TO closeBlock;
+};
+label: REF NodeRep.label => {
+lab: Label ¨ label.label;
+PutRopeLit[out, "label "];
+PutLabel[out, lab];
+IF lab.node # NIL THEN PutNode[out, lab.node, TRUE];
+};
+goto: REF NodeRep.goto => {
+PutRopeLit[out, "goto "];
+PutLabel[out, goto.dest];
+IF goto.dest = NIL THEN NoteStrange[];
+IF goto.backwards THEN PutRopeLit[out, " T"];
+};
+apply: REF NodeRep.apply => {
+handler: Handler ¨ apply.handler;
+hasHandler: BOOL ¨ handler # NIL;
+PutRopeLit[out, "apply"];
+IF apply.proc = NIL THEN NoteStrange[];
+PutNodeAuto[out, apply.proc, hasHandler];
+IF apply.args # NIL THEN PutNodeList[out, apply.args, hasHandler];
+IF hasHandler THEN {
+EndLine[out];
+PutRopeLit[out, "! "];
+PutNodeAuto[out, handler.context, FALSE];
+PutNodeAuto[out, handler.proc, FALSE];
+};
+};
+lambda: REF NodeRep.lambda => {
+PutRopeLit[out, "lambda "];
+IF lambda.parent # NIL THEN {
+PutLabel[out, lambda.parent];
+PutRopeLit[out, " "];
+};
+IF lambda.descBody # NIL THEN {
+PutRopeLit[out, "{"];
+PutVar[out, lambda.descBody, FALSE];
+PutRopeLit[out, "} "];
+};
+SELECT lambda.kind FROM
+outer => PutRopeLit[out, "outer "];
+inner => PutRopeLit[out, "inner "];
+install => PutRopeLit[out, "install "];
+init => PutRopeLit[out, "init "];
+catch => PutRopeLit[out, "catch "];
+scope => PutRopeLit[out, "scope "];
+fork => PutRopeLit[out, "fork "];
+ENDCASE => PutRopeLit[out, "unknown "];
+PutInt[out, lambda.bitsOut, "%g "];
+PutVarList[out, lambda.formalArgs, TRUE];
+PutNodeList[out, lambda.body, TRUE];
+};
+return: REF NodeRep.return => {
+IF return.bits # 0 THEN NoteStrange[];
+PutRopeLit[out, "return"];
+PutNodeList[out, return.rets];
+};
+oper: REF NodeRep.oper => {
+PutRopeLit[out, "oper "];
+WITH oper.oper SELECT FROM
+arith: REF arith OperRep => {
+PutRopeLit[out, "arith "];
+PutArithClass[out, arith.class];
+PutRopeLit[out, SELECT arith.select FROM
+add => " add", sub => " sub", mul => " mul", div => " div",
+mod => " mod", pow => " pow", abs => " abs", neg => " neg",
+min => " min", max => " max",
+ENDCASE => ERROR
+];
+};
+boolean: REF boolean OperRep => {
+PutRopeLit[out, "boolean "];
+PutRopeLit[out, SELECT boolean.class FROM
+and => "and", not => "not", or => "or", xor => "xor",
+ENDCASE => ERROR
+];
+IF boolean.bits # defaultBits THEN PutInt[out, boolean.bits, " %g"];
+};
+code: REF code OperRep => {
+PutRopeLit[out, "code "];
+PutLabel[out, code.label];
+IF code.offset # 0 THEN PutInt[out, code.offset, " %g"];
+IF NOT code.direct THEN PutRopeLit[out, " F"];
+};
+convert: REF convert OperRep => {
+PutRopeLit[out, "convert "];
+PutArithClass[out, convert.to];
+PutRopeLit[out, " "];
+PutArithClass[out, convert.from];
+};
+check: REF check OperRep => {
+PutRopeLit[out, "check "];
+PutArithClass[out, check.class];
+PutRopeLit[out, SELECT check.sense FROM
+eq => " eq", lt => " lt", le => " le", ne => " ne", ge => " ge", gt => " gt",
+ENDCASE => ERROR
+];
+};
+compare: REF compare OperRep => {
+PutRopeLit[out, "compare "];
+PutArithClass[out, compare.class];
+PutRopeLit[out, SELECT compare.sense FROM
+eq => " eq", lt => " lt", le => " le", ne => " ne", ge => " ge", gt => " gt",
+ENDCASE => ERROR
+];
+};
+mesa: REF mesa OperRep => {
+s: LONG STRING;
+SELECT mesa.mesa FROM
+addr => s ¨ "addr"; all => s ¨ "all"; equal => s ¨ "equal"; 
+notEqual => s ¨ "notEqual"; nilck => s ¨ "nilck";
+alloc => s ¨ "alloc"; free => s ¨ "free"; fork => s ¨ "fork"; join => s ¨ "join";
+monitorEntry => s ¨ "monitorEntry"; monitorExit => s ¨ "monitorExit";
+notify => s ¨ "notify"; broadcast => s ¨ "broadcast"; wait => s ¨ "wait";
+unnamedError => s ¨ "unnamedError"; unwindError => s ¨ "unwindError"; 
+abortedError => s ¨ "abortedError"; uncaughtError => s ¨ "uncaughtError"; 
+boundsError => s ¨ "boundsError"; narrowFault => s ¨ "narrowFault";
+signal => s ¨ "signal"; error => s ¨ "error";
+unwind => s ¨ "unwind"; resume => s ¨ "resume"; reject => s ¨ "reject";
+copyGlobal => s ¨ "copyGlobal"; startGlobal => s ¨ "startGlobal"; 
+restartGlobal => s ¨ "restartGlobal"; stopGlobal => s ¨ "stopGlobal"; 
+checkInit => s ¨ "checkInit"; globalFrame => s ¨ "globalFrame";
+ENDCASE => ERROR;
+PutRopeLit[out, "mesa "];
+PutRopeLit[out, s];
+IF mesa.info # 0 THEN PutInt[out, mesa.info, " %g"];
+};
+cedar: REF cedar OperRep => {
+PutRopeLit[out, "cedar "];
+PutRopeLit[out, SELECT cedar.cedar FROM
+simpleAssign => "simpleAssign", simpleAssignInit => "simpleAssignInit",
+complexAssign => "complexAssign", complexAssignInit => "complexAssignInit",
+new => "new", code => "code",
+narrow => "narrow", referentType => "referentType", procCheck => "procCheck",
+ENDCASE => ERROR
+];
+IF cedar.info # 0 THEN PutInt[out, cedar.info, " %g"];
+};
+escape: REF escape OperRep => {
+PutRopeLit[out, "escape "];
+PutId[out, escape.escape];
+IF escape.info # 0 THEN PutInt[out, escape.info, " %g"];
+};
+ENDCASE => ERROR;
+};
+machineCode: REF NodeRep.machineCode => {
+PutRopeLit[out, "machineCode "];
+PutBytes[out, machineCode.bytes];
+};
+module: REF NodeRep.module => {
+PutRopeLit[out, "module "];
+PutVarList[out, module.vars, TRUE];
+PutNodeList[out, module.procs, TRUE];
+EndLine[out];
+GO TO closeBlock;
+};
+source: REF NodeRep.source => {
+PutRopeLit[out, "source "];
+PutInt[out, source.source.start];
+PutRopeLit[out, " "];
+PutInt[out, source.source.chars];
+PutRopeLit[out, " "];
+PutInt[out, source.source.file];
+PutNodeList[out, source.nodes, TRUE];
+GO TO closeBlock;
+};
+comment: REF NodeRep.comment => {
+PutRopeLit[out, "comment "];
+PutBytes[out, comment.bytes];
+};
+ENDCASE => ERROR;
+PutRopeLit[out, "}"];
+out.nodeLevel ¨ out.nodeLevel - 1;
+EXITS closeBlock => {
+PutRopeLit[out, "}"];
+EndLine[out];
+out.nodeLevel ¨ out.nodeLevel - 1;
+};
+};
+
+PutNodeList: PROC [out: OutputContext, nodeList: NodeList, newLine: BOOL ¨ FALSE] = {
+IF NOT newLine THEN newLine ¨ IsComplexList[nodeList];
+WHILE nodeList # NIL DO
+PutNode[out, nodeList.first, newLine];
+nodeList ¨ nodeList.rest;
+ENDLOOP;
+};
+
+PutVar: PROC [out: OutputContext, var: Var, defn: BOOL ¨ FALSE] = {
+flags: VariableFlags ¨ var.flags;
+loc: Location ¨ var.location;
+showDetails: BOOL ¨ defn OR (loc # NIL AND loc.kind # localVar);
+IF defn THEN {
+PutRopeLit[out, "{"];
+IF var.bits # defaultBits THEN PutInt[out, var.bits, "%g "];
+};
+PutRopeLit[out, "var"];
+IF showDetails AND flags # nullVariableFlags THEN {
+PutRopeLit[out, " "];
+FOR flag: VariableFlag IN VariableFlag WHILE flags # nullVariableFlags DO
+PutFlag[out, flags[flag]];
+flags[flag] ¨ FALSE;
+ENDLOOP;
+};
+PutVarId[out, var.id];
+IF loc = NIL THEN NoteStrange[];
+IF showDetails THEN PutLocation[out, var.location];
+IF defn THEN PutRopeLit[out, "}"];
+};
+
+PutVarList: PROC [out: OutputContext, varList: VarList, defn: BOOL ¨ FALSE] = {
+space: BOOL ¨ FALSE;
+PutRopeLit[out, "("];
+WHILE varList # NIL DO
+IF defn
+THEN {
+IF space THEN PutRopeLit[out, " "];
+PutVar[out, varList.first, TRUE]
+}
+ELSE PutNode[out, varList.first, FALSE, space];
+varList ¨ varList.rest;
+space ¨ TRUE;
+ENDLOOP;
+PutRopeLit[out, ")"];
+};
+
+PutArithClass: PROC [out: OutputContext, class: ArithClass] = {
+checked: BOOL ¨ FALSE;
+SELECT class.kind FROM
+signed => PutRopeLit[out, "S"];
+unsigned => PutRopeLit[out, "U"];
+address => PutRopeLit[out, "A"];
+real => {PutRopeLit[out, "R"]; checked ¨ TRUE};
+ENDCASE => PutF1[out, "X%g ", [integer[ORD[class.kind]]]];
+IF class.precision # defaultBits THEN
+PutInt[out, class.precision];
+IF class.checked # checked THEN
+PutRopeLit[out, IF class.checked THEN "T" ELSE "F"];
+};
+
+PutFlag: PROC [out: OutputContext, flag: BOOL] = {
+PutRopeLit[out, IF flag THEN "T" ELSE "F"];
+};
+
+PutVarId: PROC [out: OutputContext, varId: VariableId] = {
+IF varId # nullVariableId THEN PutInt[out, varId, " %g"];
+};
+
+PutId: PROC [out: OutputContext, id: LogicalId] = {
+PutInt[out, id];
+};
+
+PutLabel: PROC [out: OutputContext, label: Label] = {
+IF label = NIL THEN PutRopeLit[out, "%0"] ELSE PutInt[out, label.id, "%%%g"];
+};
+
+PutInt: PROC [out: OutputContext, int: INT, form: ROPE ¨ NIL] = {
+PutF1[out, IF form = NIL THEN "%g" ELSE form, [integer[int]] ];
+};
+
+PutWord: PROC [out: OutputContext, word: Word] = {
+PutInt[out, IntCodeUtils.WordToInt[word]];
+};
+
+PutBytes: PROC [out: OutputContext, bytes: ByteSequence] = {
+each: Rope.ActionType = {
+SELECT c FROM
+'\", '\', '\\ => {IO.PutChar[st, '\\]; IO.PutChar[st, c]};
+IN [040C..176C] => IO.PutChar[st, c];
+ENDCASE => {
+IO.PutChar[st, '\\];
+IO.PutChar[st, '0+(ORD[c] / 100b)];
+IO.PutChar[st, '0+((ORD[c] MOD 100b) / 10b)];
+IO.PutChar[st, '0+(ORD[c] MOD 10b)];
+};
+};
+st: STREAM = out.st;
+IO.PutChar[st, '\"];
+[] ¨ Rope.Map[base: bytes, action: each];
+IO.PutChar[st, '\"];
+};
+
+PutLocation: PROC [out: OutputContext, loc: Location] = {
+IF loc # NIL THEN {
+PutRopeLit[out, " ("];
+WITH loc SELECT FROM
+system: REF LocationRep.system => {
+PutRopeLit[out, "system "];
+PutId[out, system.id];
+};
+globalVar: REF LocationRep.globalVar => {
+PutRopeLit[out, "globalVar "];
+PutId[out, globalVar.id];
+};
+localVar: REF LocationRep.localVar => {
+PutRopeLit[out, "localVar "];
+PutId[out, localVar.id];
+PutRopeLit[out, " "];
+PutLabel[out, localVar.parent];
+};
+register: REF LocationRep.register => {
+PutRopeLit[out, "register "];
+PutId[out, register.id];
+};
+link: REF LocationRep.link => {
+PutRopeLit[out, "link "];
+PutId[out, link.id];
+};
+stack: REF LocationRep.stack => {
+PutRopeLit[out, "stack"];
+IF stack.offset # 0 THEN PutInt[out, stack.offset, " %g"];
+};
+deref: REF LocationRep.deref => {
+PutRopeLit[out, "deref"];
+PutNode[out, deref.addr];
+IF deref.align # defaultBits THEN PutInt[out, deref.align, " %g"];
+};
+indexed: REF LocationRep.indexed => {
+PutRopeLit[out, "indexed"];
+PutNode[out, indexed.base, TRUE];
+PutNode[out, indexed.index, TRUE];
+};
+field: REF LocationRep.field => {
+IF field.cross 
+THEN PutRopeLit[out, "xfield"] --little endian only ChJ, May 4, 1993
+ELSE PutRopeLit[out, "field"];
+PutInt[out, field.start, " %g"];
+PutNode[out, field.base, TRUE];
+};
+upLevel: REF LocationRep.upLevel => {
+PutRopeLit[out, "upLevel {"];
+PutVar[out, upLevel.link, FALSE];
+PutRopeLit[out, "} {"];
+PutVar[out, upLevel.reg, FALSE];
+PutInt[out, upLevel.format, "} %g"];
+};
+composite: REF LocationRep.composite => {
+PutRopeLit[out, "composite"];
+PutNodeList[out, composite.parts, TRUE];
+};
+escape: REF LocationRep.escape => {
+PutRopeLit[out, "escape "];
+PutId[out, escape.id];
+IF escape.offset # 0 THEN PutInt[out, escape.offset, " %g"];
+PutNode[out, escape.base, TRUE];
+};
+dummy: REF LocationRep.dummy => {
+PutRopeLit[out, "dummy"];
+};
+ENDCASE => ERROR;
+PutRopeLit[out, ")"];
+};
+};
+
+IsComplexList: PROC [list: NodeList] RETURNS [BOOL] = {
+count: NAT ¨ 0;
+FOR each: NodeList ¨ list, each.rest WHILE each # NIL DO
+IF IsComplex[each.first, TRUE] THEN RETURN [TRUE];
+IF (count ¨ count + 1) > 3 THEN RETURN [TRUE];
+ENDLOOP;
+RETURN [FALSE];
+};
+
+IsComplex: PROC [node: Node, inList: BOOL ¨ FALSE] RETURNS [BOOL] = {
+IF node = NIL THEN RETURN [FALSE];
+WITH node SELECT FROM
+var: REF NodeRep.var => RETURN [IsComplexLocation[var.location, inList]];
+const: REF NodeRep.const => RETURN [FALSE];
+decl: REF NodeRep.decl => RETURN [IsComplex[decl.init]];
+assign: REF NodeRep.assign => RETURN [inList OR IsComplex[assign.rhs]];
+label: REF NodeRep.label => RETURN [label.label # NIL AND IsComplex[label.label.node]];
+goto: REF NodeRep.goto => RETURN [FALSE];
+return: REF NodeRep.return => RETURN [IsComplexList[return.rets]];
+oper: REF NodeRep.oper => RETURN [FALSE];
+source: REF NodeRep.source => RETURN [IsComplexList[source.nodes]];
+ENDCASE => RETURN [TRUE];
+};
+
+IsComplexLocation: PROC [location: Location, inList: BOOL ¨ FALSE] RETURNS [BOOL] = {
+IF location = NIL THEN RETURN [FALSE];
+WITH location SELECT FROM
+deref: REF LocationRep.deref => RETURN [inList OR IsComplex[deref.addr, TRUE]];
+indexed: REF LocationRep.indexed => RETURN [TRUE];
+field: REF LocationRep.field => RETURN [TRUE];
+upLevel: REF LocationRep.upLevel => RETURN [TRUE];
+composite: REF LocationRep.composite => RETURN [TRUE];
+escape: REF LocationRep.escape => RETURN [TRUE];
+ENDCASE => RETURN [FALSE];
+};
+
+OutputContext: TYPE = REF OutputContextRep;
+OutputContextRep: TYPE = RECORD [
+nodeLevel: INTEGER ¨ 0,
+writtenLevel: INTEGER ¨ 0,
+empty: BOOL ¨ TRUE,
+st: STREAM ¨ NIL,
+text: REF TEXT ¨ NIL,
+tos: STREAM ¨ NIL
+];
+
+CreateOutputContext: PROC [st: STREAM] RETURNS [OutputContext] = {
+out: OutputContext ¨ z.NEW[OutputContextRep];
+IF st # NIL
+THEN {
+out.st ¨ st;
+}
+ELSE {
+ERROR;
+};
+RETURN [out];
+};
+
+EndLine: PROC [out: OutputContext, comment: BOOL ¨ FALSE] = {
+SELECT TRUE FROM
+out.st # NIL => IO.PutChar[out.st, '\n];
+ENDCASE => ERROR;
+out.empty ¨ TRUE;
+};
+
+StartLine: PROC [out: OutputContext] = {
+SELECT TRUE FROM
+out.st # NIL => {
+st: STREAM ¨ out.st;
+THROUGH [out.writtenLevel..out.nodeLevel) DO
+IO.PutChar[st, ' ];
+IO.PutChar[st, ' ];
+ENDLOOP;
+};
+ENDCASE => ERROR;
+out.empty ¨ FALSE;
+};
+
+PutChar: PROC [out: OutputContext, char: CHAR] = {
+IF out.empty THEN StartLine[out];
+SELECT TRUE FROM
+out.st # NIL =>
+IO.PutChar[out.st, char];
+ENDCASE => ERROR;
+};
+
+PutRopeLit: PROC [out: OutputContext, s: LONG STRING] = {
+IF out.empty THEN StartLine[out];
+SELECT TRUE FROM
+out.st # NIL =>
+IO.PutRope[out.st, ConvertUnsafe.ToRope[s]];
+ENDCASE => ERROR;
+};
+
+PutText: PROC [out: OutputContext, text: REF TEXT] = {
+IF out.empty THEN StartLine[out];
+SELECT TRUE FROM
+out.st # NIL =>
+IO.PutText[out.st, text];
+ENDCASE => ERROR;
+};
+
+PutF1: PROC [out: OutputContext, format: ROPE, value: IO.Value] = {
+IF out.empty THEN StartLine[out];
+SELECT TRUE FROM
+out.st # NIL =>
+IO.PutF1[out.st, format, value];
+ENDCASE => ERROR;
+};
+
+NoteStrange: PROC = {
+IF signalStrange THEN SIGNAL StrangeCondition;
+};
+
+
+END.
+
+  ‰  
+ParseIntCodeImpl.mesa
+Copyright ” 1986, 1987, 1988, 1989, 1991, 1993 by Xerox Corporation.  All rights reserved.
+Russ Atkinson (RRA) November 20, 1989 6:19:51 pm PST
+JKF March 7, 1989 12:57:10 pm PST
+Christian Jacobi, May 4, 1993 7:23 pm PDT
+
+Types & errors
+For debugging
+The zone
+Testing routines
+Parsing routines (a parsing context is needed)
+This variable is a candidate for cacheing
+This is a conflicting location for a local variable!
+We just found the location!
+This is only used by the little endian compiler
+Added, ChJ, May 4, 1993
+Scanning routines (only a stream is needed)
+Temporary!
+Temporary!
+Temporary!
+Temporary!
+Node output routines
+Temporary!
+Temporary!
+[c: CHAR] RETURNS [quit: BOOL _ FALSE]
+Basic output routines
+ ù ,Ù  ñ(cedarcode) styleïNewlineDelimiter
+ô codeöúôKöú
+œeúOôZKô4Kô!Kô)Kô öœk	ò	KöúûúòKöúûú
+òKöúûú¨òΩKöúûú=òOKöûúûúpûúûú	òúKöúûúòKöúûú-ûúò=Köúûúûúò:óóKò headöúûúûòKöûú$ûúò3KöûúòKöúûúûúòKò KöûúûúûúòKöûúûúûúûúòKò óhead2ôKö
+œnúûúûúûúûúò-Kò KöúûúûúòKò öüúûúûúò KôóKò Köúûúûúò)öúûúûúò KöúûúûúòKöúûúò Köúûò"KòKò óKöúûúò$öúûúò&Kò óóôöúûúòKò óóôöü
+úûúûúûúûúûúòHKöú4ò4Köú7ò7Köúûú*òBKöúûúòöûòKöûúûúûúòKöúûú,ûúòHKöûúûúûúûúò6KöúòKöûúòóKòKò óöüúûúûúûúò,KöúûúûúûúòKò.KöúòKöûúûúòKòKò óöüúûúûúûúò7Köú-ò-öûú#ûúûúûò9KòKòKöúòKöûúòóKòKò óóô.öü	úûúûúûúòAKöúûúòöûúûúòKöúûúòöûúûúòKöúûúòöûúûòöú	ò	Köú-ò-Köú ò Köú"ò"Köú
+ûúûúòKöûú
+ûúò$ö
+ûúûúûúûúûúòDKô)Kö	úûúûúûúûú#òZö
+ûúûúûúûúûúò,Kö
+ûúûúûúûúûú	ò.öúòKô4óKöúòóöûúûúûúòKôKöúòKöúòKöûúûúòKöúòóKöúûúòKòóKöú	ûú,ò8Köûú
+ûú-ò=KöûúòKòóöúòKöúûúòöûúûòò
+Köûú
+ûúò$Köú	ûú9òEKòóöúòKöúòKöú'ò'Köûú
+ûú$ò4Köú	ûú=òIKòóöúòKöúûúûú@ûúòsKöúûúò öúûúûò&KöúCòCKöûúûú#ò3óKöú ò KöúòKòóöúòKò'Köú
+ûúò Köûú
+ûúò$Köú	ûúHòTKòóKöûúûú&ò6óKòóöúòKöú(ò(Köûú
+ûú
+òKöú	ûú'ò3KòóöúòKöú%ò%Köú"ò"Köúûú<òTKöú(ò(Köûú
+ûú
+òKöú	ûú2ò>Kòóöú
+ò
+KöúòKöúòKöú	ûú1ò=KòóòKöúòKöúòKöûú
+ûú
+òKöú	ûú6òBKòóöú
+ò
+KöúûúòKöúûúòöûúûòöûúûúòKöúûúòöûúòöûúòKöú(ò(Kö	úûúûúûúûúò;Köúûúûúò8Köûúûúûúûúò?KöúòKòóKöûúûú ò*óKòóKöûúòóKöûú
+ûú
+òKöú	ûú(ò4KòóöúòKöúòKö	úûúûúûúûúòAKöûú
+ûú
+òKöûúûúûúò+Köú	ûú'ò3Kòóöú
+ò
+Köúûúûúò*KöúûúòKöûúûúûúò)KöúûúòKöú	ûú=òIKòóöúòKöúòKöú+ò+KöúûúòöûúûúòKöúûúòKöú ò KöúòKòóKöûú
+ûúò$Köú	ûúJòVKòóòKöúûúûúò+Kö	úûúûúûúûúò@öúûúûò+KöúòKöúòKöúòKöúòKöúòKöúòKöúòKöûúòóKöú	ûúòKöú'ò'Köú'ò'Köú	ûúêòúKòóöú
+ò
+Köú	ûú7òCóöú
+ò
+Köûú
+ûú
+òKöú	ûúûú òMKòóöúòKöûú
+ûú
+òKöú	ûú>òJKòóöúòKöú!ò!Köú(ò(Köú	ûú9òEKòóöúòKöú*ò*Köú(ò(Köûú
+ûú
+òKöú	ûú@òLKòóöúòKöú#ò#Köú	ûú&ò2KòóKöûúûú#ò3óKòóKòóKòKòKò óöüúûúûúûúûúûúòmKöúûúòKöúûúòöûòöûúûòKöúûúòöûúòKöúòKöúûúûúò1Köûúûúûúûúò3KòKòóóKöûúòóKòKò óöüúûúûúûúò9KöúòöûúûúûòöûúûúûòKöúûúòKöûúûú)ò9óóKòKò óöüúûúûúûúòGKöúûúòKöúûúòKòöûúûúûòKöúûúûúò7Köûúûúûúûúò3KòKöûúòóKòKò óö
+ü
+úûúûúûúûúò<KöúûúòKöúûúòöûúûúûòKöúûúûúò%KöûúòóKòKò óöü
+úûúûúò<KöúûúòKöûúòKòKò óöü
+úûúûúûúûúûúûúûúòuKöúûúòöûúûúûòöúòKöúòöûú%ûúûò4öúòKöûúûúûúò"KöûúòKòóKöûúòóKö	ú
+ûúûúûúûúòdKöú0ò0Köûú	òKòóKöûúûúò4KöûúòóKòKò óöüúûú	ûúûúòJKöúûúûòKöúòKöú8ò8Köú=ò=Köú<ò<Köú:ò:Köú<ò<Köú@ò@Köú9ò9Köú#ò#Köú8ò8Köú8ò8KöúTòTKöúòKöûúûú&ò6KöûúòKòKò óöüúûúûúò;KöúûúòKöúûúòöûúûòöúòKöú'ò'Köúûúòöúûúûò)Köú4ò4Köú4ò4KöúòKöûúûú'ò7óKöûúò KòóöúòKöúûúòöúûúûò#Köú1ò1Köûúûú&ò6óKò'Köûúò Kòóöú
+ò
+Köúûúûúò+KöúûúòKöúûúûúò"Köûú!ò'KòóöúòKöú$ò$Köú&ò&Köûú!ò'KòóöúòKöú'ò'Köúûúòöúûúûò%KöúBòBKöûúûú#ò3óKöûúòKòóöúòKöú'ò'Köúûúòöúûúûò%KöúBòBKöûúûú#ò3óKöûúò!Kòóöú
+ò
+KöúûúòKöú2ò2Köûúò$KòóöúòKöúûúòöúûúûò(KöúEòEKöúIòIKöúòKöúJòJKöûúûú'ò7óKöûú ò&KòóöúòKöúòKöûúò$KòóKöûúûú"ò2óòKò óóöüúûúûúûúòHKöúûúòöûúûúòKöúûúòöûúûòöúòKöúòKöúûú$ò/KòóöúòKöúòKöúûú*ò5KòóöúòKöúòKöúòKöúûú0ò;KòóöúòKöúòKöúûú(ò3Kòóöú
+ò
+KöúòKöúûú ò+KòóöúòKöú ò Köúûú&ò1KòóöúòKöúòKöúûúò&Köúûú+ò6KöúòóöúòKöúòKöúòKöúûú/ò:KöúòóòKöú ò KöúòKöúûú*ûúò>KöúòóòKô/KôKò KöúòKöúûú*ûúò=KöúòóöúòKöúòKöúòKöúòKöúûú5ò@KöúòóöúòKöú'ò'Köúûú,ò7KöúòóöúòKöúòKöú ò KöúòKöúûú3ò>Köúòóöú	ò	Köúûúò%óKöûúûú&ò6óKòKòóKòKò óóô+öüúûúûúûúò:KöúòKöúûúòKöú	ûúûúòKöúûúòöûúûúûòKöú$ûúò*Köú&ûúò-Köú%ûúò,Köú"ûúò(öúòKöúûúûúò&KöúûúòKöúûúûúò,KöúûúòKöú
+ûúòKöúòóKöûúûú$ò4óKöúûúòKöú%ò%Köú ò Köûúò$KòKò óöüúûúûúûúò<KöúòKöúòKöú	ûúòKöúòKöûú/ò5KòKò óöüúûúûúûúûúûúò>KöúûúòöûúûúûòöúûúòKöûúûúòKòóKöûúûúòóKòKò óöüúûúûúûúò1öûúòKöú
+ô
+óKòKò óöüúûúûúûúò.öûú'ò-Köú
+ô
+óKòKò óöü
+úûúûúûúò2öûúòKöú
+ô
+óKòKò óöü	úûúûúûúò1Köúûúûúò"öûúòKöú
+ô
+óòKò óóöüúûúûúûúûúûúûúûúòLKöúûúòöûúûúûòöûúûúòKöúûúûúòKöûúòKòóKö
+ûúûúûú
+ûúûú òEóKòKò óöüúûúûúûúûúûúûúòEöûúûòKöúûúûúûúò/Köúûúûúûúò0KöûúûúòóòKò óóöüúûúûúûúò@Köú)ò)öûúûúûò)öûúûòKöúûúòKöúòKöûúûúòóKöúûúòKöûúòóKöûú	òòKò óóö
+üúûúûúûúûúò.KöúûúòKöûúûúòKòKò óöüúûúûúûúûúûúò5KöúûúòKöûúûúûúûúûúûúòAKöûúûúòKòKò óöüúûúûúûúûúûúò5KöúûúòKöûúûúûúûúûúûúòAKöûú9ò>KòKò óóôöüúûú)ûúûúòKKöúûúò-KòKò óöüúûú*ûúûú	ûúûúò]Köûú	ûúòKöûúûúûúûúò5Köûúûúûúûúò3KòKò"öûúûòöúòKöûúûúò>óöú9ò9Köûúûúò4óKöûúòóöûúûúûòKöúûú!ûúò0öúûúòöûúûúûòöúûúò!öûúòKöûúò#Köûú*ò.óKöúòKòóöúûúò#Köú*ò*Köú ò KöúòKòóöúûúò-Köú/ò/öûúûòKò!Köú!ò!Köú'ò'Köú#ò#KöûúûúòóKöú#ò#Kòóöúûúò-Köú/ò/Köú%ò%Köú#ò#KòóKöûúûúòóKòóöúûúòKò!KöúòKöúûúò$KòóöúûúòKöúòKöú$ûúò*Köú!ûúò'Köúûúò%KòóöúûúòKöúòKöúòöûúûúûòKöúòKöúûúòKöúûúûú'ò5KöûúòóKöúòKöúûúòöûúûúûòKöúûúò%Köûúò"óKòóöúûúòKö	úûúûúûúûúòIKöúòKöúòöûúûúûòKöúûúòKöúûúûú&ò3KöûúòóKöúòKöúòKöúòKòóöúûúòKöúûúòKöúòöûú(ûúûúûò>KöúòKòöûú	ûòöûúòKöúòKö	úûúûúûúûúò:KòKò"öûú+ûúûúûòEKöú$ò$KöûúòóKòKò"KòóöûòKöúòóóKöúûúòKòKöûúòóKöûúûúòKòóöúûúòKòKöúòKòKöûúûúûúûúò4KòóöúûúòKöúòKöúòKöûúûúûúò&Köûúûúò-KòóöúûúòKöú!ò!Köúûúûúò!KöúòKöûúûúûúò'Köú)ò)Köûúûúûú*òBöûúûúòKöúòKòKöú"ûúò)Köúûúò&KòóKòóöúûúòKöúòöûúûúûúòKöúòKòKòóöûúûúûúòKòKöúûúò$KòKòóöûúûòKöú#ò#Köú#ò#Köú'ò'Köú!ò!Köú#ò#Köú#ò#Köú!ò!Köûú ò'óKöú#ò#Köú#ûúò)Köúûúò$KòóöúûúòKöûúûúò&KöúòKöúòKòóöúûúòKöúòöûúûúûòöúûúòKöúòKöú ò öúûúûò(Köú;ò;Köú;ò;KöúòKöûúûòKöúòóKòóöú	ûúò!Köúòöúûúûò)Köú5ò5KöûúûòKöúòóKöûúûú"òDKòóöúûúòKöúòKöúòKöûúûú!ò8Köûúûúûúò.Kòóöú	ûúò!KöúòKöúòKöúòKöú!ò!KòóöúûúòKöúòKöú ò öúûúûò'KöúMòMKöûúûòKöúòóKòóöú	ûúò!KöúòKöú"ò"öúûúûò)KöúMòMKöûúûòKöúòóKòóöúûúòKöúûúûúòöûúûòKöú<ò<Köú1ò1KöúQòQKöúEòEKöúIòIKöúFòFKöúJòJKöúCòCKöú-ò-KöúGòGKöúBòBKöúFòFKöú?ò?KöûúûúòóKöúòKöúòKöûúûúò4KòóöúûúòKöúòöúûúûò'KöúGòGKöúKòKKöúòKöúMòMKöûúûòKöúòóKöûúûú ò6KòóöúûúòKöúòKöúòKöûúûú!ò8KòóKöûúûúòóKòóöúûúò)Köú ò Köú!ò!KòóöúûúòKöúòKöúûúò#Köúûúò%KöúòKöûúûúòKòóöúûúòKöúòKöú!ò!KöúòKöú!ò!KöúòKöú ò Köúûúò%KöûúûúòKòóöú	ûúò!KöúòKöúòKòóKöûúûúòóKòKò"öûúòKöúòKöúòKöú"ò"KöúòóKòKò óöüúûú3ûúûúòUKöûúûú	ûú#ò6öûúûúûòKöú&ò&KöúòKöûúòóKòKò óöüúûú&ûúûúòCKöú!ò!KöúòKö	úûúûúûúûúò@öûúûúòKòKöûúûúò<KòóKöúòöûúûúûúò3KöúòöûúûúûúûòIKöúòKöúûúòKöûúòóKòóKöúòKöûúûúûúò Köûúûú ò3Köûúûúò"KòKò óöü
+úûú.ûúûúòOKöúûúûúòKòöûúûúûòöûúòöûúòKöûúûúò#Köúûúò KòóKöûúûú	ò/óKöúòKöúûúòKöûúòóKòKòKò óöüúûú,ò?Köú	ûúûúòöûúûòKöúòKöú!ò!Köú ò Köú)ûúò/Köûú ûúò:óöûúûò%KöúòóöûúûòKöúûúûúûúò4óKòKò óöüúûúûúò2Köúûúûúûúò+KòKò óöüúûú,ò:Köûúûúò9KòKò óöüúûú(ò3öúòKöú
+ô
+óKòKò óöüúûú'ò5Köûú	ûúûúûúòMKòKò óö
+üúûúûúûúûúòAKö	úûúûúûúûúò?KòKò óöüúûú%ò2öú*ò*Köú
+ô
+óKòKò óöüúûú.ò<ïStartOfExpansion* -- [c: CHAR] RETURNS [quit: BOOL _ FALSE]öúòKö	úûúûúûúûúô&öûúûòKöúûúûúò:Köûúûúò%öûúòKöûúòKöûúûúò#Köûúûúûúò-Köûúûúûúò$KòóóKòóKöúûú
+òKöûúòKöú)ò)KöûúòKòKò óöüúûú(ò9öûúûúûúòKöúòöûúûúûòöúûúò#KöúòKöúòKòóöúûúò)KöúòKöúòKòóöú
+ûúò'KöúòKöúòKöúòKöúòKòóöú
+ûúò'KöúòKöúòKòóöúûúòKöúòKöúòKòóöúûúò!KöúòKöûúûú"ò:Kòóöúûúò!KöúòKöúòKöûúûú!òBKòóöú	ûúò%KöúòKöúûúò!Köúûúò"Kòóöúûúò!öûúòKöûúœc%òDKöûúòóKöú ò KöúûúòKòóöú	ûúò%KöúòKöúûúò!KöúòKöúûúò Köú$ò$Kòóöúûúò)KöúòKöú"ûúò(Kòóöúûúò#KöúòKöúòKöûúûú#ò<Köúûúò Kòóöúûúò!KöúòKòóKöûúûúòóKòKòóKòKò óöüúûúûúûúò7Köúûúòöûú"ûúûúûò8Kö
+ûúûúûúûúûúò2Köûúûúûúûúò.KöûúòóKöûúûúòKòKò óöü	úûúûúûúûúûúòEKö
+ûúûúûúûúûúò"öûúûúûòKöúûúûú+òIKöúûúûúûúò+Köúûúûúò8Köúûúûú	ûúòGKö	úûúûúûúûúòWKöúûúûúûúò)KöúûúûúòBKöúûúûúûúò)KöúûúûúòCKöûúûúûúòóKòKò óöüúûúûúûúûúûúòUKö
+ûúûúûúûúûúò&öûú
+ûúûòKö	úûúûú	ûúûúòOKöú	ûúûúûúò2Köúûúûúûúò.Köú	ûúûúûúò2Köúûúûúûúò6Köúûúûúûúò0KöûúûúûúòóKòKò óóôKöúûúûúò+öúûúûúò!KöúûúòKöúûúòKöúûúûúòKöúûúûúòKöúûúûúûúòKöúûúûòKòKò óöüúûúûúûúòBKöúûúò-öûúûòöûúòKöúòKöúòóöûúòKöûúòKöúòóóKöûúòKòKò óöüúûúûúûúò=öûúûúûòKöú	ûúûúò(KöûúûúòóKöúûúòKòKò óöü	úûúò(öûúûúûòöú	ûúòKöúûú
+òöûú#ûò,KöûúòKöûúòKöûúòóKöúòóKöûúûúòóKöúûúòKòKò óöüúûúûúò2Köûúûúò!öûúûúûòöú	ûúòKöûúòóKöûúûúòóKòKò óöü
+úûúûúûúò9Köûúûúò!öûúûúûòöú	ûúòKöûú*ò,óKöûúûúòóKòKò óöüúûúûúò6Köûúûúò!öûúûúûòöú	ûúòKöûúòóKöûúûúòóKòKò óöüúûúûú	ûúòCKöûúûúò!öûúûúûòöú	ûúòKöûúò óKöûúûúòóKòKò óöüúûúòKöûúûúûúò.KòKò óKò óKöûúòKò ó Öó    Ñ≤  ¥ä  

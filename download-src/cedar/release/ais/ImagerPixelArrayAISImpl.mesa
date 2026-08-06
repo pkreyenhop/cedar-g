@@ -1,0 +1,259 @@
+
+DIRECTORY
+AISFileFormat USING [AttributeHeader, byteSizeAttributeHeader, byteSizeCommentPart, byteSizePartHeader, byteSizePhotometryPart, byteSizePlacementPart, byteSizeRasterPart, byteSizeUCACoding, bytesPerAISWord, CommentPart, nil, PartHeader, passwordValue, PhotometryPart, PlacementPart, RasterPart, UCACoding, wordsPerAISPage],
+Basics USING [HWORD, BITSHIFT, bitsPerByte, Int16FromH, Card16FromH],
+ImagerError USING [Error],
+ImagerPixelArray USING [Join3, PixelArray],
+ImagerPixelArrayAIS USING [],
+ImagerPixelArrayAISPrivate USING [Data, DataRep],
+ImagerPixelArrayPrivate USING [GetSamplesProc, MaxSampleValueProc, New, NewClass, PixelArrayClass],
+ImagerSample USING [GetBase, GetSamples, GetSize, NewSampleMap, RasterSampleMap],
+ImagerSys USING [OpenInputFile],
+ImagerTransformation USING [ScanMode, SFToXY, Transformation],
+IO USING [EndOfStream, GetIndex, SetIndex, STREAM, UnsafeGetBlock],
+Rope USING [Concat, FromProc, ROPE],
+SF USING [Vec];
+
+ImagerPixelArrayAISImpl: CEDAR MONITOR LOCKS data USING data: Data
+IMPORTS Basics, ImagerError, ImagerPixelArray, ImagerPixelArrayPrivate, ImagerSample, ImagerSys, ImagerTransformation, IO, Rope
+EXPORTS ImagerPixelArrayAIS
+~ BEGIN
+
+ROPE: TYPE ~ Rope.ROPE;
+STREAM: TYPE ~ IO.STREAM;
+Int16: TYPE ~ Basics.HWORD;
+Card16: TYPE ~ Basics.HWORD;
+
+IOrd: PROC [h: Int16] RETURNS [INT16] ~ INLINE { RETURN [Basics.Int16FromH[h]] };
+COrd: PROC [h: Card16] RETURNS [CARD16] ~ INLINE { RETURN [Basics.Card16FromH[h]] };
+
+PixelArray: TYPE ~ ImagerPixelArray.PixelArray;
+
+Data: TYPE ~ ImagerPixelArrayAISPrivate.Data;
+DataRep: TYPE ~ ImagerPixelArrayAISPrivate.DataRep;
+defaultLinesPerBlock: NAT ¬ 16;
+
+ProduceError: PROC [explanation: ROPE] ~ {
+ERROR ImagerError.Error[[code: $syntax, explanation: explanation]];
+};
+
+Assert: PROC [assertion: BOOL] ~ {
+IF NOT assertion THEN ProduceError["AIS file structure is inconsistent."];
+};
+
+BytesForAISWords: PROC [aisWords: INT] RETURNS [INT] ~ INLINE {
+RETURN[LONG[AISFileFormat.bytesPerAISWord]*aisWords];
+};
+
+ReadBytes: UNSAFE PROC [stream: STREAM, base: LONG POINTER, bytes: INT] ~ UNCHECKED {
+actualBytes: INT ~ IO.UnsafeGetBlock[stream, [base: LOOPHOLE[base], count: bytes]];
+IF actualBytes#bytes THEN ERROR IO.EndOfStream[stream]; -- file too short
+};
+
+
+FromAIS: PUBLIC PROC [name: ROPE] RETURNS [PixelArray] ~ { OPEN AISFileFormat;
+stream: STREAM ~ ImagerSys.OpenInputFile[name];
+data: Data ~ NEW[DataRep ¬ [stream: stream]];
+header: MACHINE DEPENDENT RECORD [
+c: AttributeHeader,
+p: PACKED ARRAY [0..(BITS[WORD]-(BITS[AttributeHeader] MOD BITS[WORD])) MOD BITS[WORD]) OF [0..1]
+];
+m: ImagerTransformation.Transformation ¬ NIL; -- from [s, f] to [x, y]
+IF stream = NIL THEN ERROR ImagerError.Error[[code: $fileNotFound, explanation: Rope.Concat["File not found: ", name]]];
+TRUSTED { ReadBytes[stream, @header, byteSizeAttributeHeader] };
+IF header.c.password#passwordValue THEN ProduceError["AIS password value is wrong."];
+Assert[COrd[header.c.length]>0 AND (COrd[header.c.length] MOD wordsPerAISPage)=0];
+data.rasterSectionIndex ¬ BytesForAISWords[COrd[header.c.length]];
+FOR firstPart: BOOL ¬ TRUE, FALSE DO
+partHeader: MACHINE DEPENDENT RECORD [
+c: PartHeader,
+p: PACKED ARRAY [0..(BITS[WORD]-(BITS[PartHeader] MOD BITS[WORD])) MOD BITS[WORD]) OF [0..1]
+];
+startIndex: INT ~ IO.GetIndex[stream];
+stopIndex: INT;
+TRUSTED { ReadBytes[stream, @partHeader, byteSizePartHeader] };
+stopIndex ¬ startIndex+BytesForAISWords[256*partHeader.c.lengthHi+partHeader.c.lengthLo];
+Assert[stopIndex<=data.rasterSectionIndex];
+SELECT partHeader.c.type FROM
+nil => { Assert[partHeader.c.lengthHi=0 AND partHeader.c.lengthLo=0]; EXIT }; -- should be a zero word
+raster => {
+raster: MACHINE DEPENDENT RECORD [
+c: RasterPart,
+p: PACKED ARRAY [0..(BITS[WORD]-(BITS[RasterPart] MOD BITS[WORD])) MOD BITS[WORD]) OF [0..1]
+];
+Assert[firstPart]; -- raster part must be first
+TRUSTED { ReadBytes[stream, @raster, byteSizeRasterPart] };
+Assert[IO.GetIndex[stream]<=stopIndex];
+Assert[COrd[raster.c.scanCount]>0 AND COrd[raster.c.scanLength]>0 AND COrd[raster.c.samplesPerPixel]>0];
+data.raster ¬ NEW[RasterPart ¬ raster.c];
+SELECT raster.c.codingType FROM
+uca => {
+uca: MACHINE DEPENDENT RECORD [
+c: UCACoding,
+p: PACKED ARRAY [0..(BITS[WORD]-(BITS[UCACoding] MOD BITS[WORD])) MOD BITS[WORD]) OF [0..1]
+];
+byteSizeCoding: INT ~ stopIndex-IO.GetIndex[stream];
+Assert[byteSizeCoding<=byteSizeUCACoding];
+TRUSTED { ReadBytes[stream, @uca, byteSizeCoding] };
+IF COrd[uca.c.bitsPerSample]=0 THEN uca.c.bitsPerSample.lo ¬ 1; -- kludge
+Assert[INT[COrd[uca.c.bitsPerSample]]*INT[COrd[raster.c.samplesPerPixel]]*INT[COrd[raster.c.scanLength]]
+<=INT[Basics.bitsPerByte]*BytesForAISWords[COrd[uca.c.wordsPerScanLine]]];
+IF byteSizeCoding<byteSizeUCACoding THEN {
+Assert[uca.c.scanLinesPerBlock=nil];
+uca.c.paddingPerBlock ¬ nil;
+};
+data.uca ¬ NEW[UCACoding ¬ uca.c];
+};
+ENDCASE => ProduceError["Unknown AIS coding type."];
+};
+placement => {
+placement: MACHINE DEPENDENT RECORD [
+c: PlacementPart,
+p: PACKED ARRAY [0..(BITS[WORD]-(BITS[PlacementPart] MOD BITS[WORD])) MOD BITS[WORD]) OF [0..1]
+];
+TRUSTED { ReadBytes[stream, @placement, byteSizePlacementPart] };
+Assert[IO.GetIndex[stream]=stopIndex];
+IF IOrd[placement.c.xLeft]=-1 AND IOrd[placement.c.yBottom]=-1
+AND IOrd[placement.c.xWidth]=-1 AND IOrd[placement.c.yHeight]=-1 THEN NULL
+ELSE Assert[IOrd[placement.c.xWidth]>0 AND IOrd[placement.c.yHeight]>0];
+Assert[data.placement=NIL];
+data.placement ¬ NEW[PlacementPart ¬ placement.c];
+};
+photometry => {
+photometry: MACHINE DEPENDENT RECORD [
+c: PhotometryPart,
+p: PACKED ARRAY [0..(BITS[WORD]-(BITS[PhotometryPart] MOD BITS[WORD])) MOD BITS[WORD]) OF [0..1]
+];
+TRUSTED { ReadBytes[stream, @photometry, byteSizePhotometryPart] };
+Assert[IO.GetIndex[stream]<=stopIndex];
+IO.SetIndex[stream, stopIndex]; -- Ignore histogram, if any
+Assert[data.photometry=NIL];
+data.photometry ¬ NEW[PhotometryPart ¬ photometry.c];
+};
+comment => {
+comment: MACHINE DEPENDENT RECORD [
+c: CommentPart,
+p: PACKED ARRAY [0..(BITS[WORD]-(BITS[CommentPart] MOD BITS[WORD])) MOD BITS[WORD]) OF [0..1]
+];
+byteSizeComment: INT ~ stopIndex-IO.GetIndex[stream];
+length: NAT ¬ 0; -- number of characters in the string
+rope: ROPE ¬ NIL;
+Assert[byteSizeComment IN[1..byteSizeCommentPart]];
+TRUSTED { ReadBytes[stream, @comment, byteSizeComment] };
+length ¬ ORD[comment.c[0]];
+Assert[byteSizeComment>=INT[length+1]];
+{ -- turn the comment into a ROPE
+i: NAT ¬ 0;
+p: PROC RETURNS [CHAR] ~ { RETURN[comment.c[i ¬ i+1]] };
+rope ¬ Rope.FromProc[len: length, p: p];
+};
+data.comments ¬ CONS[rope, data.comments];
+};
+ENDCASE => IO.SetIndex[stream, stopIndex]; -- ignore unknown part type
+IF IO.GetIndex[stream]=stopIndex THEN NULL
+ELSE ERROR ImagerError.Error[[code: $bug, explanation: "Bug in FromAIS."]];
+ENDLOOP;
+IF data.raster#NIL AND data.uca#NIL THEN {
+samplesPerPixel: NAT ~ COrd[data.raster.samplesPerPixel];
+sSize: CARDINAL ~ COrd[data.raster.scanCount];
+fSize: CARDINAL ~ COrd[data.raster.scanLength];
+linesPerBlock: CARDINAL ¬ COrd[data.uca.scanLinesPerBlock];
+bytesPadding: INT ¬ 0;
+scanMode: ImagerTransformation.ScanMode;
+data.bytesPerLine ¬ BytesForAISWords[COrd[data.uca.wordsPerScanLine]];
+IF data.uca.scanLinesPerBlock=nil
+THEN linesPerBlock ¬ MIN[defaultLinesPerBlock, sSize]
+ELSE bytesPadding ¬ BytesForAISWords[COrd[data.uca.paddingPerBlock]];
+data.bytesPerBlock ¬ data.bytesPerLine*linesPerBlock+bytesPadding;
+data.bufferMap ¬ ImagerSample.NewSampleMap[
+box: [min: [0, 0], max: [s: linesPerBlock, f: samplesPerPixel*fSize]], 
+bitsPerSample: COrd[data.uca.bitsPerSample], 
+bitsPerLine: Basics.bitsPerByte*data.bytesPerLine
+];
+SELECT COrd[data.raster.scanDirection] FROM
+0, 8 => scanMode ¬ [slow: right, fast: up];
+3 => scanMode ¬ [slow: down, fast: right];
+ENDCASE => ERROR ImagerError.Error[[$unimplemented, 
+"AIS file has unimplemented scanDirection"]];
+RETURN[ImagerPixelArrayPrivate.New[class: classAIS, data: data, immutable: TRUE,
+samplesPerPixel: samplesPerPixel, sSize: sSize, fSize: fSize, 
+m: ImagerTransformation.SFToXY[scanMode: scanMode, sSize: sSize, fSize: fSize]
+]];
+}
+ELSE { ProduceError["AIS file has no raster part."]; RETURN[NIL] };
+};
+
+classAIS: ImagerPixelArrayPrivate.PixelArrayClass ~ ImagerPixelArrayPrivate.NewClass[
+type: $AIS,
+MaxSampleValue: MaxSampleValueAIS,
+GetSamples: GetSamplesAIS
+];
+
+MaxSampleValueAIS: ImagerPixelArrayPrivate.MaxSampleValueProc ~ {
+data: Data ~ NARROW[pa.data];
+RETURN[Basics.BITSHIFT[1, COrd[data.uca.bitsPerSample]]-1];
+};
+
+GetSamplesAIS: ImagerPixelArrayPrivate.GetSamplesProc ~ {
+data: Data ~ NARROW[pa.data];
+entryGetSamplesAIS: ENTRY PROC [data: Data] ~ {
+ENABLE UNWIND => NULL;
+s0: CARDINAL ~ s; f0: CARDINAL ~ f;
+samplesPerPixel: CARDINAL ~ COrd[data.raster.samplesPerPixel];
+bufferMap: ImagerSample.RasterSampleMap ~ data.bufferMap;
+bufferSize: SF.Vec ~ ImagerSample.GetSize[bufferMap];
+IF s0 NOT IN [data.smin..data.smax) THEN {
+linesPerBlock: NAT ~ bufferSize.s;
+block: NAT ~ s0/linesPerBlock; -- block number containing s0
+byteIndex: INT ~ data.rasterSectionIndex+block*data.bytesPerBlock;
+byteCount: INT ¬ 0;
+data.smin ¬ block*linesPerBlock; -- first scan line in block
+data.smax ¬ MIN[data.smin+linesPerBlock, COrd[data.raster.scanCount]];
+byteCount ¬ (data.smax-data.smin)*data.bytesPerLine;
+IO.SetIndex[data.stream, byteIndex];
+TRUSTED { ReadBytes[stream: data.stream, base: ImagerSample.GetBase[bufferMap].word, bytes: byteCount] };
+};
+ImagerSample.GetSamples[map: bufferMap, 
+initIndex: [s: s0-data.smin, f: f0*samplesPerPixel+i], delta: [s: 0, f: samplesPerPixel],
+buffer: buffer, start: start, count: count
+];
+};
+entryGetSamplesAIS[data];
+};
+
+
+Join3AIS: PUBLIC PROC [name1, name2, name3: ROPE] RETURNS [PixelArray] ~ {
+RETURN[ImagerPixelArray.Join3[FromAIS[name1], FromAIS[name2], FromAIS[name3]]];
+};
+
+
+END.
+  ê  
+ImagerPixelArrayAISImpl.mesa
+Copyright Ó 1984, 1985, 1986, 1987, 1992 by Xerox Corporation.  All rights reserved.
+Michael Plass, February 3, 1992 12:04 pm PST
+Doug Wyatt, March 7, 1986 4:21:51 pm PST
+
+foo: MACHINE DEPENDENT RECORD [
+c: Foo,
+p: PACKED ARRAY [0..(BITS[WORD]-(BITS[Foo] MOD BITS[WORD])) MOD BITS[WORD]) OF [0..1]
+];
+-- PROC [pa: PixelArray, i: NAT] RETURNS [Sample] --
+-- PROC [pa: PixelArray, i: NAT, s, f: INT, buffer: SampleBuffer, start: NAT, count: NAT] --
+ Ê  –(cedarcode) style•NewlineDelimiter
+™ codešœ™Kšœ
+ÏeœI™TK™,K™(—K˜ šÏk	˜	Kšœžœ°˜ÃKšœžœžœžœ(˜EKšœžœ	˜Kšœžœ˜+Kšœžœ˜Kšœžœ˜1KšœžœF˜cKšœžœ?˜QKšœ
+žœ˜ Kšœžœ$˜>Kšžœžœ#žœ˜CKšœžœžœ˜$Kšžœžœ˜—K˜ Kš
+Ðblœžœžœžœžœ˜BKšžœpžœ˜Kšžœ˜Kšœž˜K˜ Kšžœžœžœ˜Kšžœžœžœžœ˜Kšœžœ
+žœ˜šœžœ
+žœ˜K˜ —KšÏnœžœžœžœžœžœ˜QKš œžœžœžœžœžœ˜TK˜ Kšœžœ˜/K˜ Kšœžœ#˜-Kšœ	žœ&˜3K™ Kšœžœ˜K˜ š œžœžœ˜*Kšžœ>˜CK˜K˜ —š œžœžœ˜"Kšžœžœžœ5˜JKšœ˜K˜ —š œžœžœžœžœžœ˜?Kšžœžœ*˜5K˜K˜ —š 	œžœžœ
+žœžœžœ	žœž	œ˜UKšœžœžœžœ˜SKš	žœžœžœžœÏc˜IK˜K˜ —K˜ š œžœžœžœžœžœ˜NKšœžœ!˜/Kšœžœ˜-š
+Ïtœ¢œžœž	œžœ™!Kšœ¢œ¢œ™	Kšœžœžœžœžœžœ¢œ¢œžœžœžœžœžœžœžœ™WKšœ™—šœžœž	œžœ˜"Kšœ˜Kšœžœžœžœžœžœžœžœžœžœžœžœžœ˜aKšœ˜—Kšœ)žœ¡˜FKšžœ
+žœžœžœ^˜xKšžœ9˜@Kšžœ!žœ.˜UKšœžœžœ˜RK˜Bš	žœžœžœžœž˜$šœžœž	œžœ˜&Kšœ˜Kšœžœžœžœžœžœžœžœžœžœžœžœžœ˜\Kšœ˜—Kšœžœžœ˜&Kšœžœ˜Kšžœ8˜?K˜YKšœ+˜+šžœž˜Kšœ(žœžœ¡˜fšœ˜šœžœž	œžœ˜"Kšœ˜Kšœžœžœžœžœžœžœžœžœžœžœžœžœ˜\Kšœ˜—Kšœ¡˜/Kšžœ4˜;Kšœžœ˜'Kšœ"žœžœ#˜hKšœžœ˜)šžœž˜˜šœžœž	œžœ˜Kšœ˜Kšœžœžœžœžœžœžœžœžœžœžœžœžœ˜[Kšœ˜—Kšœžœžœ˜4Kšœ*˜*Kšžœ-˜4Kšžœžœ¡	˜IKš	œžœžœ!žœžœE˜³šžœ"žœ˜*Kšœ$˜$K˜K˜—Kšœžœ˜"K˜—Kšžœ-˜4—K˜—šœ˜šœžœž	œžœ˜%Kšœ˜Kšœžœžœžœžœžœžœžœžœžœžœžœžœ˜_Kšœ˜—Kšžœ:˜AKšœžœ˜&Kšžœžœ˜>Kšžœžœžœž˜JKšžœ#žœ˜HKšœžœ˜Kšœžœ˜2K˜—šœ˜šœžœž	œžœ˜&Kšœ˜Kšœžœžœžœžœžœžœžœžœžœžœžœžœ˜`Kšœ˜—Kšžœ<˜CKšœžœ˜'Kšžœ¡˜;Kšœžœ˜Kšœžœ ˜5K˜—šœ˜šœ	žœž	œžœ˜#Kšœ˜Kšœžœžœžœžœžœžœžœžœžœžœžœžœ˜]Kšœ˜—Kšœžœžœ˜5Kšœžœ¡%˜6Kšœžœžœ˜Kšœžœ˜3Kšžœ2˜9Kšœ	žœ˜Kšœžœ˜'šœ¡˜!Kšœžœ˜Kš	œžœžœžœžœ˜8K˜(Kšœ˜—Kšœžœ˜*K˜—Kšžœžœ¡˜F—Kšžœžœžœž˜*KšžœžœA˜KKšžœ˜—š
+žœžœžœ
+žœžœ˜*Kšœžœ%˜9Kšœžœ˜.Kšœžœ ˜/Kšœžœ$˜;Kšœžœ˜Kšœ(˜(K˜Fšžœ˜!Kšžœžœ˜5KšžœA˜E—K˜B˜+KšœG˜GKšœ-˜-Kšœ1˜1Kšœ˜—šžœ!ž˜+K˜+K˜*KšžœžœR˜b—šžœEžœ˜PKšœ>˜>KšœN˜NKšœ˜—K˜—Kšžœ1žœžœ˜CK˜K˜ —šœU˜UKšœ˜Kšœ"˜"Kšœ˜Kšœ˜K˜ —š œ0˜AKšœžœžœžœ
+¡™4Kšœžœ
+˜Kšžœžœ%˜;K˜K˜ —š œ,˜9Kšœžœžœžœžœ	žœ™\Kšœžœ
+˜šœžœžœ˜/Kšžœžœžœ˜Kšœžœ
+žœ˜#Kšœžœ%˜>K˜9Kšœžœ'˜5šžœžœžœžœ˜*Kšœžœ˜"Kšœžœ¡˜<Kšœžœ4˜BKšœžœ˜Kšœ!¡˜<Kšœžœ7˜FK˜4Kšžœ"˜$Kšžœb˜iK˜—šœ(˜(KšœY˜YK˜*K˜—K˜—Kšœ˜K˜K˜ —K˜ š
+ œžœžœžœžœ˜JKšžœI˜OK˜K˜ —K˜ Kšžœ˜— …—    %þ  3u  

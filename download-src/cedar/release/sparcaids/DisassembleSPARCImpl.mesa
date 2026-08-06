@@ -1,0 +1,787 @@
+DIRECTORY Basics, Commander, CommanderOps, Convert, DisassembleSPARC, InstallationBasicComforts, IO, Process, RefText, Rope, SparcInstruction, UXStrings, VM;
+
+DisassembleSPARCImpl: PROGRAM
+IMPORTS Basics, Commander, CommanderOps, Convert, InstallationBasicComforts, IO, Process, RefText, Rope, UXStrings, VM
+EXPORTS DisassembleSPARC
+~ BEGIN OPEN SparcInstruction, DisassembleSPARC;
+
+ROPE: TYPE = Rope.ROPE;
+PC: TYPE = CARD;
+CString: TYPE ~ UXStrings.CString;
+
+AddressFault: PUBLIC ERROR [address: LONG POINTER] ~ CODE;
+Failed: PUBLIC ERROR [errMsg: ROPE] ~ CODE;
+
+localNub: DebugNub = NEW[DebugNubPrivate ¨ [
+LocalMatchingSymEntryByName,
+LocalMatchingSymEntryByValue,
+LocalSymEntryByID,
+LocalGetInterfaceSlot,
+LocalPCtoInfo,
+LocalFetchWord
+]];
+
+PutPCInfo: PROC [to: REF TEXT, nub: DebugNub, pc: PC] RETURNS [result: REF TEXT, offset: CARD := 0] = {
+PutBase: PROC [p: ROPE] ~ {
+lim: INT = MIN[p.Length[], 200];
+start: INT := 0;
+end: INT := 0;
+FOR i: NAT IN [0..lim) DO
+c: CHAR ~ p.Fetch[i];
+SELECT c FROM
+'/ => start := i+1;
+'. => IF end <= start THEN end := i;
+ENDCASE;
+REPEAT FINISHED => IF end <= start THEN end := lim;
+ENDLOOP;
+to := RefText.AppendRope[to, p, start, end-start];
+};
+info: PCInfo := nub.PCtoInfo[nub, pc];
+IF info#nullPCInfo THEN {
+se: SymEntry ¨ nub.GetSymEntryByID[nub, info.procSymID];
+PutBase[info.guessedEmbeddedFileName];
+to := RefText.AppendChar[to, '.];
+IF se#nullSymEntry THEN {
+to := RefText.AppendRope[to, se.name];
+offset := pc-se.value;
+};
+};
+result := to;
+};
+
+CardFromRope: PUBLIC PROC [num: ROPE] RETURNS [CARD] ~ {
+IF Rope.Match["0x*", num, FALSE]
+THEN RETURN Convert.CardFromRope[Rope.Substr[num, 2], 16
+!Convert.Error => Convert.Error[reason, index+2]]
+ELSE RETURN Convert.CardFromRope[num]
+};
+
+FindSym: PUBLIC PROC [name: ROPE, nub: DebugNub, textOnly: BOOL ¨ TRUE] RETURNS [SymEntry] = {
+ENABLE Convert.Error => Failed[Rope.Concat["invalid pc: ", name]];
+e1: SymEntry;
+types: CARD ~ IF textOnly THEN typeText ELSE allTypes;
+IF (Rope.Size[name] > 0 AND Rope.Fetch[name, 0] IN ['0..'9]) THEN {
+x: CARD ~ CardFromRope[name];
+e1 := nub.GetMatchingSymEntryByValue[nub: nub,
+val: x,
+types: types,
+classes: all,
+nth: 0,
+from: nullID
+];
+}
+ELSE {
+IF Rope.Match["*.*", name] THEN {
+dot: INT ~ Rope.Index[name, 0, "."];
+outer: ROPE ~ Rope.Substr[name, 0, dot];
+inner: ROPE ~ Rope.Substr[name, dot+1];
+slot: CARD ~ nub.GetInterfaceSlot[nub, outer, inner];
+filePat: ROPE;
+eMod: SymEntry ¨ nullSymEntry;
+IF slot # nullAddr THEN {
+procVal: WORD ~ nub.FetchWord[nub, slot];
+e1 := nub.GetMatchingSymEntryByValue[nub: nub,
+val: procVal,
+types: types,
+classes: all,
+nth: 0,
+from: nullID
+];
+GOTO Got};
+filePat ¨ outer.Concat[".*"];
+DO
+eMod ¨ nub.GetMatchingSymEntryByName[nub, filePat, TRUE, typeModule, all, 1, eMod.symID];
+IF eMod=nullSymEntry THEN EXIT;
+IF eMod.size>0 THEN {
+e1 ¨ eMod;
+DO
+e1 ¨ nub.GetMatchingSymEntryByValue[nub, nullVal, types, all, 1, e1.symID];
+SELECT TRUE FROM
+e1=nullSymEntry => EXIT;
+e1.value < eMod.value => NULL--can't happen--;
+e1.value-eMod.value >= eMod.size => EXIT;
+e1.name.Equal[inner] => GOTO Got;
+ENDCASE => NULL;
+ENDLOOP;
+};
+ENDLOOP;
+};
+e1 := nub.GetMatchingSymEntryByName[nub: nub,
+pattern: name,
+caseSensitive: TRUE,
+types: types,
+classes: all,
+nth: 1,
+from: nullID
+];
+EXITS Got => NULL};
+IF e1 = nullSymEntry THEN Failed[Rope.Concat["undefined: ", name]];
+RETURN [e1]};
+
+LocalGetInterfaceSlot: PUBLIC PROC [nub: DebugNub, ifc, item: ROPE] RETURNS [addr: CARD] ~ {
+p: PROCEDURE ANY RETURNS ANY ~ InstallationBasicComforts.BasicProcFromNamedInterface[interfaceName: ifc, procName: item];
+IF p=NIL THEN RETURN [nullAddr] ELSE RETURN[LOOPHOLE[p]]};
+
+EstSize: PUBLIC PROC [nub: DebugNub, e1: SymEntry, textOnly: BOOL] RETURNS [nBytes: CARD] ~ {
+e2: SymEntry = nub.GetMatchingSymEntryByValue[nub: nub,
+val: nullVal,
+types: IF textOnly THEN typeText ELSE allTypes,
+classes: all,
+nth: 1,
+from: e1.symID
+];
+RETURN [nBytes: IF e2 = nullSymEntry
+THEN unknownSize
+ELSE (e2.value-e1.value)]};
+
+LocalMatchingSymEntryByName: PROC [nub: DebugNub, pattern: ROPE ¨ NIL, caseSensitive: BOOLEAN, types: CARD ¨ allTypes, classes: Classes ¨ all, nth: INT, from: SymID ¨ nullID] RETURNS [SymEntry] ~ {
+LookupMatchingSymEntryByNameInner: PROC [ symID: CARD, pattern: CString, caseSensitive: BOOLEAN, wantedTypes: CARD, ignoreClasses: CARD, numToSkip: INT, buf: SWSymEntryPtr] RETURNS [INT]
+= MACHINE CODE {"CirioNubLocalGetMatchingSymEntryByName"};
+buf: SWSymEntry;
+result: INT ¨ LookupMatchingSymEntryByNameInner[from, IF pattern=NIL THEN NIL ELSE UXStrings.Create[pattern], caseSensitive, types, classes.ORD, nth, @buf];
+RETURN[ExportSymEntry[result, buf]]};
+
+LocalMatchingSymEntryByValue: PROC [nub: DebugNub, val: CARD ¨ nullVal, types: CARD ¨ allTypes, classes: Classes ¨ all, nth: INT, from: SymID ¨ nullID] RETURNS [SymEntry] ~ {
+LookupMatchingSymEntryByValueInner: PROC [symID: CARD, val: CARD, wantedTypes: CARD, ignoreClasses: CARD, numToSkip: INT, buf: SWSymEntryPtr] RETURNS [INT]
+= TRUSTED MACHINE CODE {"CirioNubLocalGetMatchingSymEntryByValue"};
+buf: SWSymEntry;
+result: INT ¨ LookupMatchingSymEntryByValueInner[from, val, types, classes.ORD, nth, @buf];
+RETURN[ExportSymEntry[result, buf]]};
+
+LocalSymEntryByID: PROC [nub: DebugNub, id: SymID] RETURNS [SymEntry] ~ {
+LookupSymEntryByIDInner: PROC[symID: CARD, buf: SWSymEntryPtr] RETURNS [INT]
+= TRUSTED MACHINE CODE { "CirioNubLocalLookupSymEntryByID"};
+buf: SWSymEntry;
+result: INT ¨ LookupSymEntryByIDInner[id, @buf];
+RETURN[ExportSymEntry[result, buf]]};
+
+SWSymEntryPtr: TYPE ~ POINTER TO SWSymEntry;
+SWSymEntry: TYPE = MACHINE DEPENDENT RECORD [
+symID: CARD,
+name: CString,
+type: CARD,
+value: CARD,
+size: CARD,
+fileSeqNum: CARD];
+
+ExportSymEntry: PROC [result: INT, buf: SWSymEntry] RETURNS [SymEntry] ~ {
+IF result#0 THEN RETURN [nullSymEntry];
+RETURN [[
+symID: buf.symID,
+name: UXStrings.ToRope[buf.name],
+type: buf.type,
+value: buf.value,
+size: buf.size,
+fileSeqNum: buf.fileSeqNum]]};
+
+LocalPCtoInfo: PROC [nub: DebugNub, pc: CARD] RETURNS [PCInfo] ~ {
+SWPCInfoPtr: TYPE ~ POINTER TO SWPCInfo;
+SWPCInfo: TYPE = MACHINE DEPENDENT RECORD [
+procName: CString,
+procSymID: CARD,
+fileName: CString,
+fileSeqNum: CARD,
+guessedEmbeddedFileName: CString,
+guessedEmbeddedFileSymID: CARD
+];
+PCtoInfoInner: PROC [pc: CARD, buf: SWPCInfoPtr] RETURNS [INT]
+= TRUSTED MACHINE CODE {"CirioNubLocalPCtoInfo"};
+buf: SWPCInfo;
+result: INT ¨ PCtoInfoInner[pc, @buf];
+IF result#0 THEN RETURN [nullPCInfo];
+RETURN [[
+procName: UXStrings.ToRope[buf.procName],
+procSymID: buf.procSymID,
+fileName: UXStrings.ToRope[buf.fileName],
+fileSeqNum: buf.fileSeqNum,
+guessedEmbeddedFileName: UXStrings.ToRope[buf.guessedEmbeddedFileName],
+guessedEmbeddedFileSymID: buf.guessedEmbeddedFileSymID
+]]};
+
+GetMess: PROC RETURNS [BOOL] ~ MACHINE CODE {
+"+extern int XR_msgFromMemerrHandler;\n";
+"#define GetMessHelp() (XR_msgFromMemerrHandler)\n";
+".GetMessHelp";
+};
+
+SetMess: PROC [BOOL] ~ MACHINE CODE {
+"+#define SetMessHelp(new) XR_msgFromMemerrHandler = new\n";
+".SetMessHelp";
+};
+
+LocalFetchWord: PROC [nub: DebugNub, addr: CARD] RETURNS [word: WORD] = {
+p: POINTER TO WORD = LOOPHOLE[addr];
+save: BOOL ~ GetMess[];
+SetMess[FALSE];
+{ ENABLE
+{ VM.AddressFault => AddressFault[address]; UNWIND => SetMess[save] };
+word := LOOPHOLE[addr, POINTER TO WORD]≠;
+};
+SetMess[save];
+};
+
+huh: REF TEXT = "???";
+
+ldstOpNames: ARRAY LdStOp OF REF TEXT := [
+"ld", "ldub", "lduh", "ldd", "st", "stb", "sth", "std",
+huh, "ldsb", "ldsh", huh, huh, "ldstub", huh, "swap",
+"lda", "lduba", "lduha", "ldda", "sta", "stba", "stha", "stda",
+huh, "ldsba", "ldsha", huh, huh, "ldstuba", huh, "swapa",
+"ldf", "ldfsr", huh, "lddf", "stf", "stfsr", "stdfq", "stdf",
+huh, huh, huh, huh, huh, huh, huh, huh,
+"ldc", "ldcsr", huh, "lddc", "stc", "stcsr", "stdcq", "stdc",
+huh, huh, huh, huh, huh, huh, huh, huh
+];
+
+regOpNames: ARRAY RegOp OF REF TEXT := [
+"add", "and", "or", "xor", "sub", "andn", "orn", "xnor",
+"addx", huh, huh, huh, "subx", huh, huh, huh,
+"addcc", "andcc", "orcc", "xorcc", "subcc", "andncc", "orncc", "xnorcc",
+"addxcc", huh, huh, huh, "subxcc", huh, huh, huh,
+"taddcc", "tsubcc", "taddcctv", "tsubcctv", "mulscc", "sll", "srl", "sra",
+"rdy", "rdpsr", "rdwim", "rdtbr", huh, huh, huh, huh,
+"wry", "wrpsr", "wrwim", "wrtbr", "FPop1", "FPop2", "CPop1", "CPop2",
+"jmpl", "rett", "te", "iflush", "save", "restore", huh, huh
+];
+
+biccNames: ARRAY Bicc OF REF TEXT := [
+"bn", "be", "ble", "bl", "bleu", "bcs", "bm", "bvs",
+"ba", "bne", "bg", "bge", "bgu", "bcc", "bp", "bvc"
+];
+
+fbiccNames: ARRAY FBicc OF REF TEXT := [
+"fbn", "fbne", "fblg", "fbul", "fbl", "fbug", "fbg", "fbu",
+"fba", "fbe", "fbue", "fbge", "fbuge", "fble", "fbule", "fbo"
+];
+
+hexlit: ARRAY BIT4 OF REF TEXT := [
+"0", "1", "2", "3", "4", "5", "6", "7",
+"8", "9", "0xA", "0xB", "0xC", "0xD", "0xE", "0xF"
+];
+
+regNames: ARRAY Register OF REF TEXT := [
+"%g0", "%g1", "%g2", "%g3", "%g4", "%g5", "%g6", "%g7",
+"%o0", "%o1", "%o2", "%o3", "%o4", "%o5", "%o6", "%o7",
+"%l0", "%l1", "%l2", "%l3", "%l4", "%l5", "%l6", "%l7",
+"%i0", "%i1", "%i2", "%i3", "%i4", "%i5", "%i6", "%i7"
+];
+
+FPCompareOps: TYPE ~ [50H..57H]; -- These are FPop2, others are FPop1.
+FP2ArgOps: TYPE ~ [40H..8FH]; -- These use rs1, others ignore it.
+fpOp1Names: ARRAY BYTE OF REF TEXT := [
+<<00>>
+NIL,	"fmovs",	NIL,	NIL,	NIL,	"fnegs",	NIL,	NIL,
+NIL,	"fabss",	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,
+<<10>>
+NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,
+NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,
+<<20>>
+NIL,	"fints",	"fintd",	"fintx",	NIL,	"fintrzs",	"fintrzd",	"fintrzx",
+NIL,	"fsqrts",	"fsqrtd",	"fsqrtx",	NIL,	NIL,	NIL,	NIL,
+<<30>>
+NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,
+NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,
+<<40>>
+NIL,	"fadds",	"faddd",	"faddx",	NIL,	"fsubs",	"fsubd",	"fsubx",
+NIL,	"fmuls",	"fmuld",	"fmulx",	NIL,	"fdivs",	"fdivd",	"fdivx",
+<<50>>
+NIL,	"fcmps",	"fcmpd",	"fcmpx",	NIL,	"fcmpes",	"fcmped",	"fcmpex",
+NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,
+<<60>>
+NIL,	"frems",	"fremd",	"fremx",	NIL,	"fquos",	"fquod",	"fquox",
+NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,
+<<70>>
+NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,
+NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,
+<<80>>
+NIL,	NIL,	NIL,	NIL,	"fscales",	NIL,	NIL,	NIL,
+"fscaled",	NIL,	NIL,	NIL,	"fscalex",	NIL,	NIL,	NIL,
+<<90>>
+NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,
+NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,
+<<A0>>
+NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,
+NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,
+<<B0>>
+NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,
+NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,
+<<C0>>
+NIL,	"fstoir",	"fdtoir",	"fxtoir",	"fitos",	NIL,	"fdtos",	"fxtos",
+"fitod",	"fstod",	NIL,	"fxtod",	"fitox",	"fstox",	"fdtox",	NIL,
+<<D0>>
+NIL,	"fstoi",	"fdtoi",	"fxtoi",	NIL,	NIL,	NIL,	NIL,
+NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,
+<<E0>>
+NIL,	"fclasss",	"fclassd",	"fclassx",	NIL,	NIL,	NIL,	NIL,
+NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,
+<<F0>>
+NIL,	"fexpos",	"fexpod",	"fexpox",	NIL,	NIL,	NIL,	NIL,
+NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL,	NIL
+];
+
+fregNamesArray: ARRAY Register OF REF TEXT ¨ ALL[NIL];
+fregNames: PROC [fr: Register] RETURNS [REF TEXT] ~ {
+t: REF TEXT ¨ fregNamesArray[fr];
+IF t = NIL THEN {
+t ¨ RefText.Append[NEW[TEXT[4]], "%f"];
+t ¨ Convert.AppendInt[t, fr];
+fregNamesArray[fr] ¨ t;
+};
+RETURN [t]
+};
+
+Disp22: PROC [d: [0..2**22)] RETURNS [CARD] ~ {
+RETURN [IF d > 2**21-1 THEN CARD[d] + (LAST[CARD]-(2**22-1)) ELSE d];
+};
+
+DisassembleInstr: PUBLIC PROC [to: REF TEXT, pc: CARD, word: WORD, nub: DebugNub, regs: RegisterModel ¨ NIL] RETURNS [REF TEXT] = {
+instr: InstructionOverlay := LOOPHOLE[word];
+line: REF TEXT := to;
+sep: {null, comma, operand, comment, space, plus} := null;
+PutChar: PROC [char: CHAR] ~ { line := RefText.AppendChar[line, char] };
+Op: PROC [op: REF TEXT] = { line := RefText.Append[line, op]; sep ¨ operand };
+Text: PROC [text: REF TEXT] = { line := RefText.Append[line, text] };
+Hex: PROC [val: CARD] = {
+Sep[];
+line := RefText.ReserveChars[line, 12];
+Text["0x"];
+line := PutHexCard[line, [lc[val]]];
+sep := comma;
+};
+Lit: PROC [text: REF TEXT] = {
+Sep[];
+Text[text];
+sep := comma;
+};
+Decimal: PROC [int: INT] = {
+Sep[];
+line := Convert.AppendInt[line, int];
+sep := comma;
+};
+TabTo: PROC [col: INTEGER] ~ {
+len: INTEGER ~ col-1;
+IF line.length < len
+THEN {
+line := RefText.ReserveChars[line, len-line.length];
+FOR i: NAT IN [line.length..len) DO
+line[i] ¨ ' ;
+ENDLOOP;
+line.length ¨ len;
+}
+ELSE {PutChar[' ]};
+};
+Sep: PROC = {
+SELECT sep FROM
+null => {};
+comment => {
+TabTo[46];
+PutChar['!];
+PutChar[' ];
+};
+operand => {
+TabTo[26];
+};
+comma => {PutChar[',]};
+space => {PutChar[' ]};
+plus => {PutChar['+]};
+ENDCASE;
+sep := null;
+};
+Source2: PROC [s2: Src2] = {
+WITH s2: s2 SELECT FROM
+zero => {
+Lit[regNames[s2.rs2]];
+IF s2.asi # 0 THEN { sep := space; Decimal[s2.asi]};
+};
+one => {
+signed13: BIT13 = s2.signed13;
+val: INT = IF signed13 >= 2**12 THEN INT[signed13]-INT[2**13] ELSE signed13;
+Decimal[val];
+};
+ENDCASE;
+};
+EaddrVal: PROC [rs1: Register, s2: Src2] RETURNS [RegisterContents] = {
+asi: NAT := 0;
+val: WORD := regs[rs1].val;
+IF NOT regs[rs1].known THEN RETURN [[0,FALSE]];
+WITH s2: s2 SELECT FROM
+zero => {
+rs2: Register = s2.rs2;
+IF NOT regs[rs2].known THEN RETURN [[0,FALSE]];
+val := val + regs[rs2].val;
+asi := s2.asi;
+};
+one => {
+signed13: BIT13 = s2.signed13;
+delta: INT = IF signed13 >= 2**12 THEN INT[signed13]-INT[2**13] ELSE signed13;
+val := val + LOOPHOLE[delta, CARD];
+};
+ENDCASE;
+IF asi # 0 THEN RETURN [[0,FALSE]];
+RETURN[[val,TRUE]]
+};
+Eaddr: PROC [rs1: Register, s2: Src2] = {
+asi: NAT := 0;
+Sep[];
+Text["["];
+IF rs1 # 0 THEN { Lit[regNames[rs1]]; sep := plus };
+WITH s2: s2 SELECT FROM
+zero => {
+rs2: Register = s2.rs2;
+IF sep=null OR rs2 # 0 THEN {
+Lit[regNames[rs2]];
+};
+asi := s2.asi;
+};
+one => {
+signed13: BIT13 = s2.signed13;
+val: INT = IF signed13 >= 2**12 THEN INT[signed13]-INT[2**13] ELSE signed13;
+IF val < 0 THEN sep := null;
+Decimal[val];
+};
+ENDCASE;
+Text["]"];
+IF asi # 0 THEN { sep := space; Decimal[asi] };
+sep := comma;
+};
+forget: BOOL := FALSE;
+resultReg: Register := 0;
+jumpTarget: CARD := 0;
+IF regs=NIL THEN regs ¨ NEW[RegisterModelRep];
+regs[0] := [0, TRUE]; -- the constant 0 register
+SELECT instr.op FROM
+0 => {
+SELECT instr.brop FROM
+sethi => {
+Op["sethi"]; Sep[];
+Text["&hi("];
+Hex[instr.imm22*(2**10)];
+Text[")"];
+Lit[regNames[instr.rd]];
+regs[instr.rd] := [instr.imm22*(2**10), TRUE]; forget ¨ FALSE;
+resultReg := instr.rd;
+};
+Bicc => {
+Op[biccNames[instr.cond]];
+IF instr.annul THEN Text[",a"];
+Hex[Disp22[instr.disp22]*4+pc];
+};
+FBicc => {
+Op[fbiccNames[instr.fcond]];
+IF instr.annul THEN Text[",a"];
+Hex[Disp22[instr.disp22]*4+pc];
+};
+CBccc => {
+Op["cbicc"];
+IF instr.annul THEN Text[",a"];
+Lit[hexlit[instr.ccond]];
+Hex[Disp22[instr.disp22]*4+pc];
+};
+ENDCASE => {
+Op[".dw"];
+Hex[word]
+};
+};
+1 => {
+target: PC ~ CARD[instr.disp30]*4+pc;
+offset: CARD := 0;
+Op["call"]; Hex[target]; sep := comment; Sep[];
+[line, offset] := PutPCInfo[line, nub, target];
+IF offset # 0 THEN { sep := plus; Hex[offset] };
+};
+2 => {
+SELECT instr.regop FROM
+FPop1, FPop2 => {
+fopName: REF TEXT ¨ fpOp1Names[instr.opf1 MOD 256];
+IF fopName = NIL OR instr.opf1 >= 256 OR ((instr.opf1 IN FPCompareOps) # (instr.regop=FPop2))
+THEN {Op[".dw"]; Hex[word]}
+ELSE {
+Op[fopName];
+IF instr.opf1 IN FP2ArgOps THEN Lit[fregNames[instr.fp1rs1]];
+Lit[fregNames[instr.fp1rs2]];
+IF instr.regop#FPop2 THEN Lit[fregNames[instr.fp1rd]];
+forget := FALSE;
+};
+};
+ENDCASE => {
+Op[regOpNames[instr.regop]];
+Lit[regNames[instr.rs1]];
+Source2[instr.s2];
+Lit[regNames[instr.rd]];
+forget := FALSE;
+SELECT instr.regop FROM
+or, add, sub, jmpl => {
+s2: Src2 ~ instr.s2;
+sr1: Register ~ instr.rs1;
+sr2: Register := 0;
+i2: CARD := 0;
+WITH s2: s2 SELECT FROM
+zero => {
+sr2 := s2.rs2;
+IF s2.asi # 0 THEN {regs[sr2].known := FALSE};
+};
+one => {
+signed13: BIT13 = s2.signed13;
+val: INT = IF signed13 >= 2**12 THEN INT[signed13]-INT[2**13] ELSE signed13;
+i2 := LOOPHOLE[val];
+};
+ENDCASE;
+IF regs[sr1].known AND regs[sr2].known
+THEN {
+v1: CARD ~ regs[sr1].val;
+v2: CARD ~ regs[sr2].val + i2;
+val: CARD ~ SELECT instr.regop FROM
+or => Basics.BITOR[v1, v2],
+add => v1+v2,
+sub => v1-v2,
+jmpl => pc,
+ENDCASE => ERROR;
+regs[instr.rd] := [val, TRUE];
+regs[0] := [0, TRUE];
+resultReg := instr.rd;
+IF instr.regop = jmpl THEN {
+resultReg := 0;
+jumpTarget := v1+v2;
+};
+}
+ELSE regs[instr.rd].known := FALSE;
+};
+ENDCASE => regs[instr.rd].known := FALSE;
+};
+};
+3 => {
+Op[ldstOpNames[instr.ldstop]];
+SELECT instr.ldstop FROM
+ld, ldub, lduh, ldd, ldsb, ldsh, ldstub, swap,
+lda, lduba, lduha, ldda, ldsba, ldsha, ldstuba, swapa => {
+Eaddr[instr.rs1, instr.s2];
+Lit[regNames[instr.rd]];
+forget := FALSE;
+resultReg := instr.rd;
+IF instr.ldstop = ld THEN {
+ea: RegisterContents := EaddrVal[instr.rs1, instr.s2];
+regs[instr.rd].known := FALSE;
+IF ea.known AND (ea.val MOD 4 = 0) THEN {
+ENABLE AddressFault => { Text[" !??"]; CONTINUE};
+w: WORD := nub.FetchWord[nub, ea.val];
+regs[instr.rd] := [w, TRUE];
+};
+} ELSE regs[instr.rd].known := FALSE;
+regs[0] := [0,TRUE];
+};
+st, stb, sth, std, sta, stba, stha, stda => {
+Lit[regNames[instr.rd]];
+Eaddr[instr.rs1, instr.s2];
+forget := FALSE;
+};
+ldf, ldfsr, lddf, ldc, ldcsr, lddc => {
+Eaddr[instr.rs1, instr.s2];
+Lit[fregNames[instr.rd]];
+forget := FALSE;
+};
+stf, stfsr, stdfq, stdf, stc, stcsr, stdcq, stdc => {
+Lit[fregNames[instr.rd]];
+Eaddr[instr.rs1, instr.s2];
+forget := FALSE;
+};
+ENDCASE => Hex[word];
+};
+ENDCASE;
+IF forget THEN regs≠ := ALL[[0, FALSE]];
+IF jumpTarget # 0 THEN {
+target: PC := jumpTarget;
+offset: CARD := 0;
+sep := comment; Sep[];
+[line, offset] := PutPCInfo[line, nub, target];
+IF offset # 0 THEN { sep := plus; Hex[offset] };
+};
+IF resultReg # 0 AND regs[resultReg].known THEN {
+sep := comment;
+Hex[regs[resultReg].val];
+};
+RETURN [line]
+};
+
+PutHexCard: PROC [line: REF TEXT, num: Basics.LongNumber] RETURNS [REF TEXT] ~ {
+PutChar: PROC [char: CHAR] ~ { line := RefText.AppendChar[line, char] };
+PutHexit: PROC [nybble: [0..16)] ~ {
+PutChar[(IF nybble < 10 THEN '0 ELSE 'A-10) + nybble];
+};
+PutHexByte: PROC [byte: BYTE] ~ {
+PutHexit[byte/16];
+PutHexit[byte MOD 16];
+};
+PutHexByte[num.hh];
+PutHexByte[num.hl];
+PutHexByte[num.lh];
+PutHexByte[num.ll];
+RETURN [line]
+};
+
+DisassembleCommand: Commander.CommandProc = TRUSTED {
+ENABLE {
+AddressFault => {
+CommanderOps.Failed[IO.PutFR1["<<< Address Fault at 0x%08x >>>", [cardinal[LOOPHOLE[address]]]]];
+};
+Failed => CommanderOps.Failed[errMsg]};
+argv: CommanderOps.ArgumentVector ~ CommanderOps.Parse[cmd];
+regs: RegisterModel = NEW[RegisterModelRep];
+IF argv.argc<2 OR argv.argc>10 THEN CommanderOps.Failed[cmd.procData.doc] ELSE {
+e1: SymEntry = FindSym[argv[1], localNub, TRUE];
+nBytes: CARD ~ EstSize[localNub, e1, TRUE];
+FOR i: NAT IN [2..argv.argc) DO
+ENABLE Convert.Error => CommanderOps.Failed[IO.PutFR["Syntax error in contents (%g) of register i%g", [rope[argv[i]]], [integer[i-2]] ]];
+regs[22+i] ¨ [CardFromRope[argv[i]], TRUE];
+ENDLOOP;
+DisassembleProc[cmd.out, e1.value, nBytes, localNub, regs];
+};
+};
+
+DisassembleProc: PUBLIC PROC [to: IO.STREAM, startPC, nBytes: CARD, nub: DebugNub, regs: RegisterModel ¨ NIL, stop: REF BOOL ¨ NIL] ~ {
+line: REF TEXT := RefText.ObtainScratch[100];
+PutChar: PROC [char: CHAR] ~ { line := RefText.AppendChar[line, char] };
+size: NAT := IF nBytes IN [8..30000] THEN nBytes ELSE 200;
+stopped: BOOL ¨ FALSE;
+IF regs=NIL THEN regs ¨ NEW[RegisterModelRep];
+IO.PutF1[to, "%L", [rope["f"]]];
+line.length := 0;
+IO.PutBlock[to, PutPCInfo[line, nub, startPC].result];
+IO.PutChar[to, '\n];
+FOR i: CARD := 0, i+4 WHILE i < size DO
+pc: CARD := startPC+i;
+word: WORD := nub.FetchWord[nub, pc];
+line.length := 0;
+line := PutHexCard[line, [lc[pc]]];
+PutChar[':];
+PutChar[' ];
+line := PutHexCard[line, [lc[word]]];
+PutChar[' ];
+line := DisassembleInstr[line, pc, word, nub, regs];
+PutChar['\n];
+IO.PutBlock[to, line];
+Process.CheckForAbort[];
+IF stop#NIL AND stop≠ THEN {stopped ¨ TRUE; EXIT};
+ENDLOOP;
+RefText.ReleaseScratch[line];
+IF stopped THEN IO.PutRope[to, "(stopped)\n"]
+ELSE IF size < nBytes THEN IO.PutRope[to, ". . .\n"];
+IO.PutF1[to, "%L", [rope["F"]]];
+
+};
+
+SymbolFromPCCommand: Commander.CommandProc = TRUSTED {
+ENABLE {
+AddressFault => {
+CommanderOps.Failed[IO.PutFR1["<<< Address Fault at 0x%08x >>>", [cardinal[LOOPHOLE[address]]]]];
+};
+Failed => CommanderOps.Failed[errMsg]};
+name: ROPE = CommanderOps.NextArgument[cmd];
+IF name = NIL THEN CommanderOps.Failed[cmd.procData.doc] ELSE {
+entr: SymEntry = FindSym[name, localNub, TRUE];
+line: REF TEXT := RefText.ObtainScratch[100];
+IO.PutBlock[cmd.out, PutPCInfo[line, localNub, entr.value].result];
+IO.PutChar[cmd.out, '\n];
+RefText.ReleaseScratch[line];
+};
+};
+
+PCFromSymbolCommand: Commander.CommandProc = TRUSTED {
+ENABLE {
+AddressFault => {
+CommanderOps.Failed[IO.PutFR1["<<< Address Fault at 0x%08x >>>", [cardinal[LOOPHOLE[address]]]]];
+};
+Failed => CommanderOps.Failed[errMsg]};
+arg: ROPE = CommanderOps.NextArgument[cmd];
+IF arg = NIL THEN CommanderOps.Failed[cmd.procData.doc] ELSE {
+entr: SymEntry = FindSym[arg, localNub, TRUE];
+IO.PutF1[cmd.out, "0x%08x\n", [cardinal[entr.value]]];
+};
+};
+
+Commander.Register["Disassemble", DisassembleCommand, "<cprocname>|<pc> [i0 [i1 [i2 [i3 [i4 [i5 [i6 [i7]]]]]]]]--- Disassemble from memory"];
+
+Commander.Register["SymbolFromPC", SymbolFromPCCommand, "Shows the c-procedure name for a given pc: SymbolFromPC <cprocname>|<pc>"];
+
+Commander.Register["PCFromSymbol", PCFromSymbolCommand, "Shows the address for a given procedure: PCFromSymbol <cprocname>|<pc>"];
+
+END.
+
+   ¬  
+DisassembleSPARCImpl.mesa
+Copyright ” 1990, 1991, 1992, 1993 by Xerox Corporation.  All rights reserved.
+Michael Plass, February 4, 1992 4:50 pm PST
+Last tweaked by Mike Spreitzer July 23, 1992 2:47 pm PDT
+Willie-s, June 9, 1993 12:56 pm PDT
+
+Interface or module lookup.
+We got it through the interface.
+The SWPCInfo MACHINE DEPENDENT RECORD overlays the CirioNubPCInfo structure defined in CirioNubTypes.h.
+Sign extension for 22-bit fields.
+ ù   ïNewlineDelimiter
+ñ(cedarcode) styleô codeöúôKöú
+œeúCôNKô+Kô8Kô#Kô óKöœk	úXûú7ûúòùKò KöœnúûòKöûúFûú%ûòvKöûúòKöúûúûú$ò0Kò KöûúûúûúòKöûúûúûúòöú	ûúò"Kò óKöüúûúûúûúûúûúò:Kö
+üúûúûú
+ûúûúò+Kò öúûúò,KöúòKöúòKöúòKöúòKöúòKöúòKòóKò öü	úûúûúûúûúûú
+ûúûú
+ûú
+ògöüúûúûúòKöúûúûúò KöúûúòKöúûúòöûúûúûú
+ûòKöúûúòöûúûòKòKöúûúûú
+ò$KöûúòóKöûúûúûúûúò3KöûúòóKò2KòóKöú&ò&öûúûúòKò8Köú&ò&Kò!öûúûúòKò&KòKòóKòóKòKòKò óöüúûúûúûúûúûúò8öûúûúò öûúûú-ò8Köú1ò1óKöûúûúò%óKòóKò öüúûúûúûúûúûúûúò^Köûú<òBKöúòKö	úûúûú
+ûú
+ûú
+ò6öûúûúûúûúòCKöúûúòò.KòKöúòKòKòKòKòóKòóöûúòöûúûúò!JôKöúûúò$Köúûúò(Köúûúò'Köúûú+ò5Köú	ûúòKòöûúûúòKô Köú	ûúò)ò.KöúòKöúòKòKòKòKòóKöûúò
+óKòöûòKöú3ûú"òYKöûúûúûúòöûúûúòKò
+öûòKòKöûúûúûòKöúûúòKöúûœcúò.Köú$ûúò)Köúûúò!KöûúûúòóKöûúòóKòóKöûúòóKòóöú-ò-KòKöúûúòKöúòKòKòKòKòóKöûúûúòóKöûúûú*òCKöûúòKò óöüúûúûúûúûúûúò\Kö	úû	úûúûúûú]òyKöûúûúûúûúûúûúûúò:Kò óöüúûúûú)ûúûú
+ûúò]öú7ò7KöúòKöúûú
+ûú
+ûú
+ò/KòKòKòKòóöûú
+ûúò$KöûúòKöûúòóKò óöüúûúûúûúûú	ûú*ûúûúò≈ö–bnüúûú
+ûú#ûúûúûúûúûúûúò∫Köúûúûú,ò:óKöúòKöúûú+ûú	ûúûúûúûú:ûúòúKöûúò%Kò óöüúûúûúûú*ûúûúòÆöü"úûú	ûúûúûúûúûúûúûúòõKöúûúûúûú-òCóKöúòKöúûú@ûúò[Köûúò%óKò öüúûúûúòIö
+üúûúûúûúûúòLKöúûúûúûú&ò<óKöúòKöúûú%ò0Köûúò%Kò óKöúûúûúûúò,ö	úûúûúû	úûúò-KöúûúòKöúòKöúûúòKöúûúòKöúûúòKöúûúòKò óöüúûú
+ûúûúòJKöûú
+ûúûúò'öûúò	KöúòKöú!ò!KòKòKòKöúòóKò óöüúûúûúûúòBKöúûúû	úûúBôgKöúûúûúûú
+ò(ö	ú
+ûúûúû	úûúò+KöúòKöúûúòKöúòKöúûúòKöú!ò!KöúûòKòóö
+üúûúûúûúûúò>Köúûúûúûúò1óKöúòKöúûúò&Köûú
+ûúûúò%öûúò	Köú)ò)KöúòKöú)ò)KöúòKöúGòGKöú6ò6KòóKò óöüúûúûúûúûúûúò-Kò)Kò4KòKòKò óö
+üúûúûúûúûúò%Kò<KòKòKò óö
+üúûúûúûúûúòIKö	úûúûúûúûúò$KöúûúòKöúûúòöúûòKöúûú(ûúòFKö	úûúûúûúûúò)KòóKòKòKò óöúûúûú	òKò óö	úûúûúûúûúò*Kò7Kò5Kò?Kò9Kò=Kò'Kò=Kò&KòKò óö	úûúûúûúûúò(Kò8Kò-KòHKò1KòJKò5KòEKò;KòKò óö	úûúûúûúûúò&Kò4Kò3KòKò óö	úûúûúûúûúò(Köú;ò;Köú=ò=KòKò óöúûúûúûúûúûúò#Kò'Kò2KòKò óö	ú
+ûú
+ûúûúûúò)Kò7Kò7Kò7Kò6KòKò óKöúûú–bfú†%òFKöúûú¢ú†#òAöúûúûúûúûúûúò'Kö¢òKöûúœzúûúûúûú£úûúûúò/Köûú£úûúûúûúûúûúûúò+Kö¢òKöûúûúûúûúûúûúûúûúò'Köûúûúûúûúûúûúûúûúò'Kö¢òKöûú£ú£ú£úûú£ú£ú£úòEKöûú£ú£ú£úûúûúûúûúò6Kö¢òKöûúûúûúûúûúûúûúûúò'Köûúûúûúûúûúûúûúûúò'Kö¢òKöûúûúò?Köûúûúò?Kö¢òKöûúœbú§ú§úûú§ú§ú§úòBKöûúûúûúûúûúûúûúûúò'Kö¢òKöûúûúò?Köûúûúûúûúûúûúûúûúò'Kö¢òKöûúûúûúûúûúûúûúûúò'Köûúûúûúûúûúûúûúûúò'Kö¢òKöûúûúûúûúûúûúûúò-Köúûúûúûúûúûúûúò3Kö¢òKöûúûúûúûúûúûúûúûúò'Köûúûúûúûúûúûúûúûúò'Kö¢òKöûúûúûúûúûúûúûúûúò'Köûúûúûúûúûúûúûúûúò'Kö¢òKöûúûúûúûúûúûúûúûúò'Köûúûúûúûúûúûúûúûúò'Kö¢òKöûú£ú£ú£ú£úûú£ú£úòBKöú£ú£úûú£ú£ú£ú£úûúò?Kö¢òKöûú£ú£ú£úûúûúûúûúò3Köûúûúûúûúûúûúûúûúò'Kö¢òKöûú£ú£ú£úûúûúûúûúò9Köûúûúûúûúûúûúûúûúò'Kö¢òKöûú£ú£ú£úûúûúûúûúò6Köûúûúûúûúûúûúûúûò&KöúòKò óKöúûú
+ûúûúûúûúûúò6ö	úûúûúûúûúò5Köúûúûúò!öûúûúûúòKöúûúûúò'KöúòKöúòKöúòóKöûúò
+KòKò óöüúûúûúûúò/Kô!KöûúûúûúûúûúûúûúòEKöúòKò óöüúûúûúûúûúûúûú'ûúûúûúûúòÉKöúûúò,KöúûúûúòKöú:ò:Köüúûúûú/òHKöüúûúûúûú8òNKöüúûúûúûú+òEöüúûúûúòKòKò'KòKò$KòKòóöüúûúûúûúòKòKòKòKòóöüúûúûúòKòKò%KòKòóöüúûúûúòKöúûú	òöûúòöûúòKöú4ò4öûúûúûúûò#KöúòKöûúòóKöúòKöúòóKöûúòóKöúòóöüúûúòöûúûòKòöúòKöú
+ò
+KòKòKöúòóöúòKò
+KöúòóKòKòKòKöûúòóKòKòóöüúûúòöûúûúûòò	KòKöûúûú"ò4KòóòKöú
+ûúòKöúûúûúûúûúûúûú
+òLKòKòóKöûúòóKòóöüúûúûúòGKöúûúòKöúûúòKö
+ûúûúûúûúûúò/öûúûúûòò	KòKö
+ûúûúûúûúûúò/KòKòKòóòKöú
+ûúòKöúûúûúûúûúûúûú
+òNKöúûúûúò#KòóKöûúòóKöûú	ûúûúûúò#KöûúûúòKòóöüúûúò)KöúûúòKòKò
+Köûú	ûú%ò4öûúûúûòò	Kòöûú
+ûú	ûúòKòKòóKòKòóòKöú
+ûúòKöúûúûúûúûúûúûú
+òLKöûú	ûúòKòKòóKöûúòóKò
+Köûú	ûú ò/KòKòóKöúûúûúòKòKöúûúòKöûúûúûúûúò.Köúûú†ò0öûú
+ûòòöûúûòò
+KòKòKòKò
+KòKöú(ûúûúò>KòKòóò	KòKöûúûúòKöúòKòóò
+KòKöûúûúòKöúòKòóò
+KòKöûúûúòKòKöúòKòóöûúòKò
+Kò	KòóóKòóòKöúûúûúò%KöúûúòKò/Kò/Köûúûúò0KòóòöûúûòòKöú	ûúûúûúò3ö
+ûúûúûúûúûú%ò]KöûúòöûúòKöúòKöûúûúûúò=KòKöûúûúò6Köú
+ûúòKöúòóóKòóöûúòKòKòKòKòKöú
+ûúòöûúûòòKòKòKòKöúûúòöûúûúûòò	KòKöûúûúûúò.KòóòKöú
+ûúòKöúûúûúûúûúûúûú
+òLKöúûúòKòóKöûúòóöûúûúò&öûúòKöúûúòKöúûúòöúûúûúûò#Köúûú	òKòKòòKöûúûúòóóKöúûúòKöúûúòKòöûúûúòKòKòKòKòóóKöûúûúò#óKòóKöûúûúò)óKòóóKòóòKòöûúûòKò.ò:KòKòKöú
+ûúòKòöûúûúòKò6Köúûúòöûú
+ûú	ûúûúò)Köûú!ûúò1Köúûúò&KöúûúòKòóKöúûúûúò%óKöúûúòKòóò-KòKòKöú
+ûúòKòóò'KòKòKöú
+ûúòKòóò5KòKòKöú
+ûúòKòóKöûúòóKòóKöûúòóKöûúûú
+ûúûúò(öûúûúòKöúûúòKöúûúòKòKò/Köûúûúò0Kòóöûúûúûúò1KòKòKòóKöûúòKòKò óöü
+úûúûúûúûúûúûúòPKöüúûúûú/òHöüúûúò$Köú	ûúûúûúò6Kòóöü
+úûúûúò!KòKöúûúòKòóKòKòKòKòKöûúòKòKò óöüúûúò5öûúòöúòKöúûú5ûúòaKòóKò'óKò<Köúûúò,öûúûúûú'ûúòPKöú*ûúò0Köúûúûúò+öûúûúûúûòKöûú&ûú[òâKöú%ûúò+KöûúòóKöú;ò;KòóKòKò óöüúûúûúûúûúûú'ûúûúûúûúòáKöúûúûúò-Köüúûúûú/òHKöúûúûúûúûúûúò:Köú	ûúûúòKöûúûúûúûúò.Köûúò KòKöûú4ò6Köûúòöûúûúûú
+ûò'KöúûúòKöúûúò%KòKò#KòKòKò%KòKöú4ò4KòKöûúòKòKöûúûúûúûúûúûúò2KöûúòóKòKöûú	ûúûúò-Köûúûúûúûúò5Köûúò Kò KòKò óöüúûúò6öûúòöúòKöúûú5ûúòaKòóKò'óKöúûú"ò,öûúûúûú'ûúò?Köú)ûúò/Köúûúûúò-KöûúAòCKöûúòKòKòóKòKò óöüúûúò6öûúòöúòKöúûú5ûúòaKòóKò'óKöúûú"ò+öûúûúûú'ûúò>Köú(ûúò.Köûú4ò6KòóKòKò óòçKò óöúÑòÑKò óKòÇKò KöûúòKò ó Öó    Rˆ  q—  

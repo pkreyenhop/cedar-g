@@ -1,0 +1,721 @@
+
+DIRECTORY
+AmpersandContext USING[CreateAnAmpersandContext, MakeNodeFromNode, StripAMNode],
+BasicTime USING[Now],
+CCTypes USING[CC, CCError, CCErrorCase, CreateCedarCompilerContext, LocalCedarTargetWorld, LocalCedarTargetWorldBody, RegisterLocalCedarTargetWorld],
+CedarCode USING[GetNodeRepresentation, GetTypeOfNode, LoadThroughIndirectNode, SelectFieldFromNode, StoreThroughIndirectNode],
+CirioBackstop USING[Protect],
+CirioBreakAccess USING[CirioBreakSet, CreateCirioBreakSet, ClearAllBreaks, ClearBreakAtAbsAddr, ClearBreakAtIndex, ListBreaks, QuaBreakSet, SetBreakAtAbsAddr],
+CirioDeltaFace USING[CallerInfo, GetCallersSPandPC],
+CirioNubAccess USING[CreateSameWorldNub, DestroyNub, FileEntry, GetFileEntry, Handle, LookupSymEntryByName, LookupSymEntryByValue, LookupSymEntryByID, PCInfo, PCtoInfo, Read32BitsAsCard, SymEntry],
+CirioTargets USING[Target],
+CirioTypes USING[CC, CompilerContext, Node, Type],
+Commander USING[CommandProc, Register],
+IO USING[PutF1, PutFR1, rope, STREAM],
+LoadStateAccess USING[CreateLoadStateHandle, GetLoadedModuleInfoFromAbsPC, LoadedModuleInfo, LoadStateHandle],
+LocalCirio USING[BreakDest, nilBreakDest],
+LocalCirioWorld USING[],
+NewAmpersandProcs USING[Handle, HandleBody, InstallItems],
+NewRMTW USING[CedarModuleSet, CreateCedarModuleSet, CreateRemoteMimosaTargetWorld, FlushUnknownFileCache, FlushUnknownSymbolCache, FlushUnknownTypeCodes, FrameNodeInfo, GetLoadedModuleInfo, GetNodeForCedarFrame, LoadedModuleInfo, RawFrameInfo, RemoteMimosaTargetWorld, ResetSearchPaths, ShowReportByLevel],
+ObjectFiles USING[CreateParsed, GetLineNumForPC, GetPCForLineNum, Module, ModuleFromParsedAndPC, Parsed],
+OneCasabaParser USING[ParserTable],
+PFS USING [RopeFromPath, PathFromRope],
+PFSNames USING [PATH, Equal],
+RefTab,
+Rope USING[Cat, Equal, Substr, ROPE],
+RopeHash USING[FromRope],
+SourceFileOps USING [OpenSource, Position],
+StackCirio USING[OpenDummyStack, OpenStack, ResetStack, Stack],
+SystemInterface USING [ShowReport, FileSet, CirioFile, CloseFileSet, CreateFileSet, GetCirioFile];
+
+LocalCirioImpl: CEDAR MONITOR
+LOCKS connection USING connection: Connection
+IMPORTS AmpersandContext, BasicTime, CCTypes, CedarCode, CirioBackstop, CirioBreakAccess, CirioDeltaFace, CirioNubAccess, Commander,  IO, LoadStateAccess, NewAmpersandProcs, NewRMTW, ObjectFiles, PFS, PFSNames, RefTab, Rope, RopeHash, SourceFileOps, StackCirio, SystemInterface
+EXPORTS LocalCirio, LocalCirioWorld =
+BEGIN OPEN ObjF: ObjectFiles, LSA: LoadStateAccess;
+
+
+DebugFlag: BOOLEAN ¨ FALSE;
+
+ROPE: TYPE = Rope.ROPE;
+CC: TYPE = CirioTypes.CompilerContext;
+CCE: ERROR[case: CCTypes.CCErrorCase, msg: ROPE ¨ NIL] ¨ CCTypes.CCError;
+
+BreakDest: TYPE = LocalCirio.BreakDest;
+nilBreakDest: BreakDest = LocalCirio.nilBreakDest;
+ConnectionList: TYPE ~ LIST OF Connection;
+Connection: TYPE = REF ConnectionBody;
+ConnectionBody: PUBLIC TYPE = MONITORED RECORD[
+open: BOOLEAN,
+forRemote: BOOLEAN, -- true if created to provide local ampersand vars for a remoteCirio 
+searchDirectories: REF LIST OF PFSNames.PATH,
+searchDirectoryLock: Connection,
+tsOut: IO.STREAM, -- WARNING: this field is very transient.  It is only valid during an interpretation of an expression, and was placed here for the convenience of ampersand routines and (local target wrld) user routines called through the interpreter.
+aph: NewAmpersandProcs.Handle,
+ampersandContext1: CirioTypes.Node,
+ampersandContext2: CirioTypes.Node,
+cc: CC,
+breakDest: BreakDest,
+rmtw: NewRMTW.RemoteMimosaTargetWorld,
+cedarModules: NewRMTW.CedarModuleSet,
+nub: CirioNubAccess.Handle,
+target: CirioTargets.Target,
+breaks: CirioBreakAccess.CirioBreakSet,
+fileSet: SystemInterface.FileSet,
+lsh: LoadStateAccess.LoadStateHandle,
+cParserTable: OneCasabaParser.ParserTable,
+dbxActive: BOOLEAN ¨ FALSE];
+
+
+
+thisWorldLock: Connection ¨ NEW[ConnectionBody];
+
+commonFileSet: SystemInterface.FileSet ¨ NIL;
+commonCedarModules: NewRMTW.CedarModuleSet ¨ NIL;
+commonNub: CirioNubAccess.Handle ¨ NIL;
+commonTarget: CirioTargets.Target ¨ NIL;
+commonBreaks: RefTab.Ref--BreakDest -> CirioBreakAccess.CirioBreakSet-- ¨ RefTab.Create[equal: BDEqual, hash: BDHash];
+commonlsh: LoadStateAccess.LoadStateHandle ¨ NIL;
+commonSearchDirectories: REF LIST OF PFSNames.PATH ¨ NIL;
+commonSearchDirectoryLock: Connection ¨ NIL;
+
+availConnections: RefTab.Ref--BreakDest -> ConnectionList-- ¨ RefTab.Create[equal: BDEqual, hash: BDHash];
+
+
+
+
+RecreateThisWorldCirioConnection: Commander.CommandProc =
+BEGIN
+inner: ENTRY PROC[connection: Connection] = {InstallNewConnectionComponents[cmd.out]};
+inner[thisWorldLock];
+END;
+
+InstallNewConnectionComponents: PROC[reports: IO.STREAM] =
+BEGIN
+ENABLE UNWIND => {
+commonFileSet ¨ NIL;
+commonCedarModules ¨ NIL;
+commonCedarModules ¨ NIL;
+commonBreaks ¨ RefTab.Create[equal: BDEqual, hash: BDHash];
+commonlsh ¨ NIL;
+commonSearchDirectories ¨ NIL;
+commonSearchDirectoryLock ¨ NIL};
+
+
+IF commonNub # NIL THEN CirioNubAccess.DestroyNub[commonNub];
+IF commonFileSet # NIL THEN SystemInterface.CloseFileSet[commonFileSet];
+
+commonFileSet ¨ SystemInterface.CreateFileSet[];
+commonCedarModules ¨ NewRMTW.CreateCedarModuleSet[commonFileSet];
+commonNub ¨ CirioNubAccess.CreateSameWorldNub[];
+commonTarget ¨ NARROW[commonNub.target];
+commonBreaks.Erase[];
+commonlsh ¨ LoadStateAccess.CreateLoadStateHandle["sameWorld", commonNub, commonFileSet];
+commonSearchDirectories ¨ NEW[LIST OF PFSNames.PATH ¨ NIL];
+commonSearchDirectoryLock ¨ NEW[ConnectionBody];
+availConnections.Erase[];
+END;
+
+TryForExistingConnection: ENTRY PROC[connection: Connection, breakDest: BreakDest] RETURNS[Connection] =
+BEGIN
+rbd: REF BreakDest ~ NEW [BreakDest ¨ breakDest];
+acl: ConnectionList ~ NARROW[availConnections.Fetch[rbd].val];
+IF acl#NIL THEN {
+first: Connection ~ acl.first;
+IF first.open THEN RETURN WITH ERROR CCE[cirioError, "Locking failure for a local connection"];
+first.open ¨ TRUE;
+[] ¨ availConnections.Store[rbd, acl.rest];
+RETURN [first]}
+ ELSE RETURN[NIL];
+END;
+
+BuildCommon: PROC[cc: CC, breakDest: BreakDest, reports: IO.STREAM, setCTC: BOOL, wdirs: LIST OF ROPE] RETURNS[Connection] =
+BEGIN
+
+makeProtoConnection: ENTRY PROC[connection: Connection] RETURNS[Connection] =
+BEGIN
+rbd: REF BreakDest ~ NEW [BreakDest ¨ breakDest];
+bs: CirioBreakAccess.CirioBreakSet;
+IF commonFileSet = NIL THEN InstallNewConnectionComponents[reports];
+IF (bs ¨ CirioBreakAccess.QuaBreakSet[commonBreaks.Fetch[rbd].val].it) = NIL THEN {
+bs ¨ CirioBreakAccess.CreateCirioBreakSet[commonNub, breakDest.fileNameStem, breakDest.breakProcName];
+[] ¨ commonBreaks.Store[rbd, bs]};
+
+BEGIN
+aph: NewAmpersandProcs.Handle ¨ NEW[NewAmpersandProcs.HandleBody¨[
+out: NIL,  -- only valid during a text line interpretation in StackCirio
+rmtw: NIL,
+cedarModules: commonCedarModules,
+nub: commonNub,
+target: commonTarget,
+fileSet: commonFileSet,
+lsh: commonlsh]];
+pc: Connection ¨ NEW[ConnectionBody¨[
+open: TRUE,
+forRemote: FALSE,
+searchDirectories: commonSearchDirectories,
+searchDirectoryLock: commonSearchDirectoryLock,
+aph: aph,
+ampersandContext1: NIL,
+ampersandContext2: NIL,
+cc: cc,
+breakDest: breakDest,
+rmtw: NIL,
+cedarModules: commonCedarModules,
+nub: commonNub,
+target: commonTarget,
+breaks: bs,
+fileSet: commonFileSet,
+lsh: commonlsh,
+cParserTable: NIL]];
+RETURN[pc]
+END;
+END;
+
+
+pc: Connection ¨ makeProtoConnection[thisWorldLock];
+lctw: CCTypes.LocalCedarTargetWorld ¨ NEW[CCTypes.LocalCedarTargetWorldBody¨[
+createNodeFromRefAny: NIL,
+createFrameNodeForSelf: LCTWCreateFrameNodeForSelf,
+data: pc]];
+
+AddDir[pc, "[PCedar2.0]<Cirio>", reports];
+AddDir[pc, "[PCedar2.0]<CirioThings>", reports];
+AddDir[pc, "[PCedar2.0]<Atom>", reports];
+AddDir[pc, "[PCedar2.0]<Rope>", reports];
+AddDir[pc, "-compiled:/CirioCompiledData", reports];
+
+EnsureDirs[pc, wdirs, reports];
+
+pc.ampersandContext1 ¨ AmpersandContext.CreateAnAmpersandContext[cc];
+pc.ampersandContext2 ¨ AmpersandContext.CreateAnAmpersandContext[cc];
+pc.rmtw ¨ NewRMTW.CreateRemoteMimosaTargetWorld["sameWorld", pc.nub, cc, pc.cedarModules, pc.lsh, reports, setCTC];
+pc.aph.rmtw ¨ pc.rmtw;
+
+CCTypes.RegisterLocalCedarTargetWorld[lctw, pc.cc];
+
+RETURN[pc];
+END;
+
+GetConnection: PUBLIC PROC[breakDest: BreakDest, reports: IO.STREAM, workingDirectories: LIST OF ROPE] RETURNS[Connection] = {
+ENABLE SystemInterface.ShowReport =>
+{NewRMTW.ShowReportByLevel[reports, msgText, priority];
+RESUME};
+ans: Connection ¨ TryForExistingConnection[thisWorldLock, breakDest];
+IF ans # NIL THEN EnsureDirs[ans, workingDirectories, reports]
+ELSE {
+cc: CC ¨ CCTypes.CreateCedarCompilerContext[];
+ans ¨ BuildCommon[cc, breakDest, reports, TRUE, workingDirectories];
+NewAmpersandProcs.InstallItems[ans.ampersandContext2, ans.aph, ans.cc];
+};
+RETURN [ans]};
+
+EnsureDirs: PROC [c: Connection, wdirs: LIST OF ROPE, reports: IO.STREAM] ~ {
+IF wdirs#NIL THEN {
+EnsureDirs[c, wdirs.rest, reports];
+AddDir[c, wdirs.first, reports, FALSE]};
+RETURN};
+
+ExtractCcFromConnection: PUBLIC PROC [c: Connection] RETURNS [CirioTypes.CC]
+~ {RETURN [c.cc]};
+
+CreateAndRegisterNominalLocalCirioTW: PUBLIC PROC[cc: CCTypes.CC, reports: IO.STREAM] =
+BEGIN
+ENABLE SystemInterface.ShowReport =>
+{NewRMTW.ShowReportByLevel[reports, msgText, priority];
+RESUME};
+connection: Connection ¨ BuildCommon[cc, nilBreakDest, reports, FALSE, NIL];
+connection.forRemote ¨ TRUE;
+END;
+
+LCTWCreateFrameNodeForSelf: PROC[lctw: CCTypes.LocalCedarTargetWorld, cc: CCTypes.CC] RETURNS[CirioTypes.Node] =
+BEGIN
+connection: Connection ¨ NARROW[lctw.data];
+ourInfo: CirioDeltaFace.CallerInfo ¨ CirioDeltaFace.GetCallersSPandPC[connection.nub];
+
+ourSP: CARD ¨ ourInfo.callersStackPointer;
+
+callerPC: CARD ¨ CirioNubAccess.Read32BitsAsCard[[connection.nub, ourSP+(15*4), 0, FALSE, TRUE]];
+
+callerLedo: REF LSA.LoadedModuleInfo ¨ LSA.GetLoadedModuleInfoFromAbsPC[connection.lsh, callerPC];
+
+callerLoadedCedarModule: REF NewRMTW.LoadedModuleInfo ¨ NewRMTW.GetLoadedModuleInfo[connection.cedarModules, callerLedo];
+
+ourFP: CARD ¨ CirioNubAccess.Read32BitsAsCard[[connection.nub, ourSP+(14*4), 0, FALSE, TRUE]];
+
+callerSP: CARD ¨ ourFP;
+callerFP: CARD ¨ CirioNubAccess.Read32BitsAsCard[[connection.nub, callerSP+(14*4), 0, FALSE, TRUE]];
+
+callerRawFrameInfo: REF NewRMTW.RawFrameInfo ¨ NEW[NewRMTW.RawFrameInfo ¨ [
+callerPC,
+callerFP,
+callerSP]];
+
+callerInfo: REF NewRMTW.FrameNodeInfo;
+
+IF callerLoadedCedarModule=NIL THEN CCE[cirioError, "Cirio can't NewRMTW.GetLoadedModuleInfo for itself"];
+
+callerInfo ¨ NewRMTW.GetNodeForCedarFrame[connection.rmtw, callerLoadedCedarModule, callerRawFrameInfo];
+
+RETURN[callerInfo.node];
+END;
+
+FlushUnknownFileCache: PUBLIC ENTRY PROC[connection: Connection, reports: IO.STREAM] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT connection.open THEN RETURN;
+NewRMTW.FlushUnknownFileCache[connection.cedarModules, BasicTime.Now[]];
+NewRMTW.FlushUnknownSymbolCache[connection.rmtw, BasicTime.Now[], reports];
+NewRMTW.FlushUnknownTypeCodes[connection.rmtw];
+END;
+
+ReleaseConnection: PUBLIC ENTRY PROC[connection: Connection, reports: IO.STREAM] =
+BEGIN ENABLE UNWIND => NULL;
+renamed: Connection ¨ connection;
+PutBack: PROC[connection: Connection] = {
+ENABLE UNWIND => NULL;
+rbd: REF BreakDest ~ NEW [BreakDest ¨ renamed.breakDest];
+acl: ConnectionList ¨ NARROW[availConnections.Fetch[rbd].val];
+acl ¨ CONS[renamed, acl];
+[] ¨ availConnections.Store[rbd, acl];
+RETURN};
+IF NOT connection.open THEN RETURN WITH ERROR CCE[cirioError, "some fool released a local connection that wasn't open"];
+connection.open ¨ FALSE;
+IF NOT connection.forRemote THEN PutBack[thisWorldLock];
+RETURN; END;
+
+DoUnderMonitorLock: PUBLIC ENTRY PROC[connection: Connection, toDo: PROC] =
+BEGIN
+ENABLE UNWIND => NULL;
+toDo[];
+END;
+
+
+
+
+GetStackForSelf: PUBLIC ENTRY PROC[connection: Connection, reports: IO.STREAM]RETURNS[StackCirio.Stack] = 
+BEGIN
+callerInfo: CirioDeltaFace.CallerInfo¨ CirioDeltaFace.GetCallersSPandPC[connection.nub];
+
+stack: StackCirio.Stack ¨ StackCirio.OpenStack[
+ampersandContext1: connection.ampersandContext1,
+ampersandContext2: connection.ampersandContext2,
+cc: connection.cc,
+rmtw: connection.rmtw,
+cedarModules: connection.cedarModules,
+nub: connection.nub,
+target: connection.target,
+fileSet: connection.fileSet,
+breaks: connection.breaks,
+lsh: connection.lsh,
+aph: connection.aph,
+cParserTable: connection.cParserTable,
+hotFramePC: callerInfo.callersPC,
+hotFrameSP: callerInfo.callersStackPointer,
+skipKFrames: 1,
+ShowSource: SourceFileOps.OpenSource,
+reports: reports];
+frameIndex: CARD ¨ StackCirio.ResetStack[stack, reports];
+
+RETURN[stack]
+END;
+
+GetDummyStack: PUBLIC ENTRY PROC[connection: Connection, reports: IO.STREAM]RETURNS[StackCirio.Stack] = 
+BEGIN
+stack: StackCirio.Stack ¨ StackCirio.OpenDummyStack[
+ampersandContext1: connection.ampersandContext1,
+ampersandContext2: connection.ampersandContext2,
+cc: connection.cc,
+rmtw: connection.rmtw,
+cedarModules: connection.cedarModules,
+nub: connection.nub,
+target: connection.target,
+fileSet: connection.fileSet,
+breaks: connection.breaks,
+lsh: connection.lsh,
+aph: connection.aph,
+cParserTable: connection.cParserTable,
+ShowSource: SourceFileOps.OpenSource,
+reports: reports];
+
+RETURN[stack]
+END;
+
+
+InstallOneAmpersandItem: PROC[ampersandContext: CirioTypes.Node, name: ROPE, item: CirioTypes.Node, cc: CC] =
+BEGIN
+IF NOT Rope.Equal[Rope.Substr[name, 0, 2], "&&"] THEN ERROR
+ELSE
+BEGIN
+ampersandContextType: CirioTypes.Type ¨ CedarCode.GetTypeOfNode[ampersandContext];
+indirect: CirioTypes.Node ¨ CedarCode.SelectFieldFromNode[name, ampersandContextType, ampersandContext, cc];
+indirectType: CirioTypes.Type ¨ CedarCode.GetTypeOfNode[indirect];
+encapsulatedItem: CirioTypes.Node ¨ AmpersandContext.MakeNodeFromNode[item, cc];
+encapsulatedType: CirioTypes.Type ¨ CedarCode.GetTypeOfNode[encapsulatedItem];
+CedarCode.StoreThroughIndirectNode[encapsulatedType, encapsulatedItem, indirectType, indirect, cc];
+END
+END;
+
+ReadOneAmpersandItem: PROC[name: ROPE, nameScope: CirioTypes.Node, cc: CC] RETURNS[CirioTypes.Node] =
+BEGIN
+IF NOT Rope.Equal[Rope.Substr[name, 0, 2], "&&"] THEN ERROR
+ELSE
+BEGIN
+nameScopeType: CirioTypes.Type ¨ CedarCode.GetTypeOfNode[nameScope];
+indirect: CirioTypes.Node ¨ CedarCode.SelectFieldFromNode[name, nameScopeType, nameScope, cc];
+indirectType: CirioTypes.Type ¨ CedarCode.GetTypeOfNode[indirect];
+encapsulatedItem: CirioTypes.Node ¨ CedarCode.LoadThroughIndirectNode[indirectType, indirect, cc];
+RETURN[AmpersandContext.StripAMNode[encapsulatedItem]]
+END;
+END;
+
+ReadOneAmpersandInt: PROC[name: ROPE, defaultVal: INT, nameScope: CirioTypes.Node, cc: CC] RETURNS[INT] =
+BEGIN
+valNode: CirioTypes.Node ¨ NIL;
+valNode ¨ ReadOneAmpersandItem[name, nameScope, cc
+! CCE => {valNode ¨ NIL; CONTINUE}];
+IF valNode = NIL THEN RETURN[defaultVal]
+ELSE
+BEGIN
+val: REF INT ¨ NARROW[CedarCode.GetNodeRepresentation[valNode, cc]];
+RETURN[val≠];
+END;
+END;
+AddSearchDirectory: PUBLIC PROC [connection: Connection, dirName: ROPE, reports: IO.STREAM]  =
+BEGIN
+
+inner: PROC RETURNS[ROPE] =
+BEGIN
+AddDir[connection, dirName, reports];
+IO.PutF1[reports, " %g added to search directories\n", IO.rope[dirName]];
+RETURN [NIL];
+END;
+
+eMsg: ROPE;
+eMsg ¨ CirioBackstop.Protect[inner, reports];
+IF eMsg # NIL THEN IO.PutF1[reports, "%g\N", [rope[eMsg]]];
+END;
+
+RemoveSearchDirectory: PUBLIC PROC [connection: Connection, dirName: ROPE, reports: IO.STREAM]  =
+BEGIN
+
+inner: PROC RETURNS[ROPE] =
+BEGIN
+RemoveDir[connection, dirName, reports];
+IO.PutF1[reports, " %g removed from search directories\n", IO.rope[dirName]];
+RETURN [NIL];
+END;
+
+eMsg: ROPE;
+eMsg ¨ CirioBackstop.Protect[inner, reports];
+IF eMsg # NIL THEN IO.PutF1[reports, "%g\N", [rope[eMsg]]];
+END;
+
+ListSearchDirectory: PUBLIC PROC [connection: Connection, reports: IO.STREAM] =
+BEGIN
+
+inner: PROC RETURNS [ROPE] =
+BEGIN
+ListDir[connection];
+RETURN [NIL]
+END;
+
+eMsg: ROPE;
+eMsg ¨ CirioBackstop.Protect[inner, reports];
+IF eMsg # NIL THEN IO.PutF1[reports, "%g\N", [rope[eMsg]]];
+END;
+
+ClearSearchDirectory: PUBLIC PROC [connection: Connection, reports: IO.STREAM] =
+BEGIN
+
+inner: PROC RETURNS [ROPE] =
+BEGIN
+ClearDir[connection];
+RETURN [NIL]
+END;
+
+eMsg: ROPE;
+eMsg ¨ CirioBackstop.Protect[inner, reports];
+IF eMsg # NIL THEN IO.PutF1[reports, "%g\N", [rope[eMsg]]];
+END;
+
+
+
+SetBreakAtAbsAddr: PROC[h: Connection, absAddr: CARD32, mesaPos: SourceFileOps.Position, stopAll: BOOLEAN] =
+{CirioBreakAccess.SetBreakAtAbsAddr[h.breaks, absAddr, mesaPos, stopAll]};
+
+ListBreaks: PROC[h: Connection] =
+{CirioBreakAccess.ListBreaks[h.breaks]};
+
+ClearBreakAtAbsAddr: PROC[h: Connection, absAddr: CARD32] =
+{CirioBreakAccess.ClearBreakAtAbsAddr[h.breaks, absAddr]};
+
+ClearBreakAtIndex: PROC[h: Connection, index: CARD] =
+{CirioBreakAccess.ClearBreakAtIndex[h.breaks, index]};
+
+ClearAllBreaks: PROC[h: Connection] =
+{CirioBreakAccess.ClearAllBreaks[h.breaks]};
+
+AddDir: PROC [h: Connection, dirName: ROPE, reports: IO.STREAM, toFront: BOOL ¨ TRUE] = {
+inner: ENTRY PROC[connection: Connection] = {
+ENABLE UNWIND => NULL;
+dirPath: PFSNames.PATH ¨ PFS.PathFromRope[dirName];
+prev: LIST OF PFSNames.PATH ¨ NIL;
+WHILE TRUE DO
+current: LIST OF PFSNames.PATH ¨ IF prev # NIL THEN prev.rest ELSE h.searchDirectories≠;
+IF current = NIL THEN EXIT;
+SELECT TRUE FROM
+NOT dirPath.Equal[current.first] => NULL;
+toFront => {
+IF prev = NIL THEN h.searchDirectories≠ ¨ current.rest ELSE prev.rest ¨ current.rest;
+EXIT;
+};
+ENDCASE => RETURN--already present--;
+prev ¨ current;
+ENDLOOP;
+h.searchDirectories≠ ¨ CONS[dirPath, h.searchDirectories≠];
+NewRMTW.ResetSearchPaths[h.cedarModules, h.searchDirectories≠, BasicTime.Now[]];
+IF h.rmtw#NIL THEN NewRMTW.FlushUnknownSymbolCache[h.rmtw, BasicTime.Now[], reports];
+};
+inner[h.searchDirectoryLock];
+};
+
+RemoveDir: PROC [h: Connection, dirName: ROPE, reports: IO.STREAM] =
+BEGIN
+inner: ENTRY PROC[connection: Connection] =
+BEGIN
+ENABLE UNWIND => NULL;
+dirPath: PFSNames.PATH ¨ PFS.PathFromRope[dirName];
+prev: LIST OF PFSNames.PATH ¨ NIL;
+WHILE TRUE DO
+current: LIST OF PFSNames.PATH ¨ IF prev # NIL THEN prev.rest ELSE h.searchDirectories≠;
+IF current = NIL THEN EXIT;
+IF dirPath.Equal[current.first] THEN
+BEGIN
+IF prev = NIL THEN h.searchDirectories≠ ¨ current.rest ELSE prev.rest ¨ current.rest;
+EXIT;
+END;
+prev ¨ current;
+ENDLOOP;
+NewRMTW.ResetSearchPaths[h.cedarModules, h.searchDirectories≠, BasicTime.Now[]];
+NewRMTW.FlushUnknownSymbolCache[h.rmtw, BasicTime.Now[], reports];
+END;
+inner[h.searchDirectoryLock];
+END;
+
+ListDir: PROC [h: Connection] =
+BEGIN
+inner: ENTRY PROC[connection: Connection] =
+BEGIN
+ENABLE UNWIND => NULL;
+searchDirectories: ROPE ¨ NIL;
+FOR paths: LIST OF PFSNames.PATH ¨ h.searchDirectories≠, paths.rest WHILE paths # NIL DO
+searchDirectories ¨ Rope.Cat[searchDirectories, PFS.RopeFromPath[paths.first], "  "];
+ENDLOOP;
+SystemInterface.ShowReport[IO.PutFR1["%g", IO.rope[searchDirectories]], $urgent];
+END;
+inner[h.searchDirectoryLock];
+END;
+
+ClearDir: PROC [h: Connection] =
+BEGIN
+inner: ENTRY PROC[connection: Connection] =
+BEGIN
+ENABLE UNWIND => NULL;
+SystemInterface.ShowReport["Clearing search directory list", $urgent];
+SystemInterface.ShowReport["Was: ", $urgent];
+ListDir[h];
+h.searchDirectories≠ ¨ NIL;
+NewRMTW.ResetSearchPaths[h.cedarModules, h.searchDirectories≠, BasicTime.Now[]];
+END;
+inner[h.searchDirectoryLock];
+END;
+
+
+LookupSym: PROC[h: Connection, name: ROPE, numToSkip: INT ¨ 0, externOnly: BOOL ¨ TRUE] RETURNS[CirioNubAccess.SymEntry] =
+{RETURN[CirioNubAccess.LookupSymEntryByName[h.nub, name, FALSE, externOnly, numToSkip]]};
+
+LookupAddr: PROC[h: Connection, val: CARD, numToSkip: INT ¨ 0] RETURNS[CirioNubAccess.SymEntry] =
+{RETURN[CirioNubAccess.LookupSymEntryByValue[h.nub, val, numToSkip]]};
+
+LookupID: PROC[h: Connection, symID: CARD] RETURNS[CirioNubAccess.SymEntry] =
+{RETURN[CirioNubAccess.LookupSymEntryByID[h.nub, symID]]};
+
+LookupFile: PROC[h: Connection, seqNum: CARD] RETURNS[entry: CirioNubAccess.FileEntry] =
+{RETURN[CirioNubAccess.GetFileEntry[h.nub, seqNum]]};
+
+GetPCInfo: PROC[h: Connection, absPC: CARD] RETURNS[CirioNubAccess.PCInfo] =
+{RETURN[CirioNubAccess.PCtoInfo[h.nub, absPC]]};
+
+
+DebugOn: PROC =
+BEGIN
+DebugFlag ¨ TRUE;
+END;
+
+DebugOff: PROC =
+BEGIN
+DebugFlag ¨ FALSE;
+END;
+
+
+GetRelPCForCLine: PROC[dotOName: PFSNames.PATH, cLineNum: CARD, h: Connection] RETURNS[CARD] =
+BEGIN
+file: SystemInterface.CirioFile ¨ SystemInterface.GetCirioFile[h.fileSet, dotOName];
+container: ObjF.Parsed ¨ ObjF.CreateParsed[file];
+AcquireModule: PROC RETURNS[ObjF.Module] =
+BEGIN
+RETURN[ObjF.ModuleFromParsedAndPC[container, [[0, ""], 1]]];
+END; 
+dotO: ObjF.Module ¨ AcquireModule[];
+relPC: CARD ¨ ObjF.GetPCForLineNum[dotO, cLineNum].relPC;
+RETURN[relPC];
+END;
+
+GetCLineForRelPC: PROC[dotOName: PFSNames.PATH, relPC: CARD, h: Connection] RETURNS[CARD] =
+BEGIN
+file: SystemInterface.CirioFile ¨ SystemInterface.GetCirioFile[h.fileSet, dotOName];
+container: ObjF.Parsed ¨ ObjF.CreateParsed[file];
+AcquireModule: PROC RETURNS[ObjF.Module] =
+BEGIN
+RETURN[ObjF.ModuleFromParsedAndPC[container, [[0, ""], 1]]];
+END; 
+dotO: ObjF.Module ¨ AcquireModule[];
+cLine: CARD ¨ ObjF.GetLineNumForPC[dotO, [[0, ""], relPC]];
+RETURN[cLine];
+END;
+
+BDEqual: PROC [key1, key2: REF ANY] RETURNS [BOOL] ~ {
+bd1: REF BreakDest ~ NARROW[key1];
+bd2: REF BreakDest ~ NARROW[key2];
+RETURN [bd1.fileNameStem.Equal[bd2.fileNameStem] AND bd1.breakProcName.Equal[bd2.breakProcName]]};
+
+BDHash: PROC [key: REF ANY] RETURNS [CARDINAL] ~ {
+bd: REF BreakDest ~ NARROW[key];
+RETURN [RopeHash.FromRope[bd.fileNameStem] + RopeHash.FromRope[bd.breakProcName]]};
+
+
+Commander.Register["RecreateThisWorldCirioConnection", RecreateThisWorldCirioConnection];
+
+END..
+   î  
+LocalCirioImpl.mesa
+Copyright ” 1990, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Sturgis, April 20, 1990 3:25 pm PDT
+Last changed by Theimer on November 28, 1989 3:36:23 pm PST
+Last tweaked by Mike Spreitzer on July 24, 1992 6:14 pm PDT
+Linda Howe January 3, 1990 4:09:35 pm PST
+Coolidge, July 18, 1990 10:21 am PDT
+Laurie Horton, March 31, 1992 12:48 pm PST
+Philip James, February 24, 1992 11:42 am PST
+Udagawa, February 12, 1991 9:03 pm PST
+Willie-s, July 27, 1992 5:48 pm PDT
+Debugging aids
+This variable can be set/reset by the ampersand routines &&DebugOn and &&DebugOff.
+Types
+
+
+Connections
+serves as a monitor lock for the following
+Note: we delay creating any worlds until all modules have been started, because the nominal creation code will be calling procedures in those modules.
+There are more than one world so that we can have multiple independent cirios active at one time, e.g. if an error is raised during an interpreted procedure call, while at the same time avoiding monitor deadlocks.
+However, they will all share common CedarModuleSet, CirioNubAccess.Handle, CirioBreakAccess.CirioBreakSet (per break dest), SystemInterface.FileSet, and LoadStateAccess.LoadStateHandle.  I assume these modules will suitably protect themselves, and that none of them will be holding a monitor lock during an interpreted procedure call.
+
+"thisWorldLock" must be held during a call to this procedure
+commonTarget _ CirioTargets.CreateTarget[commonNub];
+
+connection param must be "thisWorldLock"
+connection param must be "thisWorldLock"
+designed not to do anything dangerous while the lock is held
+simply collects common stuff into some records
+Add the directories in REVERSE ORDER because AddDir adds to the front of the list!!
+We include these directories so that examination of "navel" will procede correctly for a released Cirio.  This is done before CreateRemoteMimosaTargetWorld so that the studying of CirioRopeHelper done therein will succeed on first try.  The following files are needed (on August 17, 1991):
+CirioThings/CirioRopeHelper.mob
+Cirio/CCTypesImpl.mob
+Cirio/CirioTypes.mob
+Cirio/NewAmpersandProcs.mob
+Cirio/NewAmpersandProcsImpl.mob
+Rope/Rope.mob
+Atom/AtomPrivate.mob
+all local connections register themselves with their cc
+BUT, outside the monitor lock
+
+IO.PutF[reports, "%g\N", IO.rope[msgText]]; 
+note: connection argument will be thisWorldLock
+this procedure is exported to LocalCirioWorld, and is called by RemoteCirioImpl to permit construction of ampersand routines.
+parallels GetConnection, except that registration is with supplied cc, we always create a connection, we let the caller install the ampersand procs, and breakpoints cannot be set through this connection.
+IO.PutF[reports, "%g\N", IO.rope[msgText]]; 
+in this case, "self" is the caller of this procedure
+This procedure duplicates assorted activity in StackCirioImpl
+note: In CirioDeltaFace.GetCallersSPandPC, "caller" refers to the caller of CirioDeltaFace.GetCallersSPandPC, i.e., ourselves.  In LCTWCreateFrameNodeForSelf, "self" refers to the caller of LCTWCreateFrameNodeForSelf, i.e., our caller.
+note: in the following var names, "caller" refers to the same frame as "Self" in our procedure name, that is, our caller.
+
+the nomenclature is such that ourInfo.callersStackPointer is really our stack pointer.
+This constant (14*4) exists in several places.  They should be combined.
+This constant (14*4) exists in several places.  They should be combined.
+to be visible inside putBack
+putBack has to reuse the identifier: connection so as to be able to lock
+Stack examination
+
+need to install a catch phrase for NARROW fault
+
+
+source and break positions
+
+Set the search directory.
+Remove the search directory.
+List the set of search directories
+Clear the set of search directories
+breakpoints  (tentative, using ampersand procedures)
+properDirName: ROPE _ CirioDeltaFace.ConvertToLocalDirectoryFormat[dirName];
+first, we remove any existing entry for the path
+now we install the path at the front of the list
+now we inform those who need to know
+first, we remove any existing entry for the path
+now we inform those who need to know
+now we inform those who need to know
+note: we need not do a NewRMTW.FlushUnknownSymbolCache[h.rmtw, BasicTime.Now[]], because that need only be called when new definition mobs become accessible, not when some become inaccessible.
+symbols
+these procedures are expected to become ampersand procedures.  During the interpreted call on them the connection will be locked, so there is no need to lock it here.  In fact, that would cause a monitor deadlock.
+
+misc
+stabRange _ ObjF.AlternativeFindModuleStabRange[container, 1];
+another Kludge
+stabRange _ ObjF.AlternativeFindModuleStabRange[container, 1];
+main code
+ù ;  ïNewlineDelimiter
+ñ"cedarcode" styleô codeöúôKöú
+œeú=ôHKöú#ô#Kô;Kô;Kô)Kô$Kô*Kô,Kô&Kô#óKò öœk	ò	Köúûú:òPKöú
+ûúòKöúûúûúÖòïKöú
+ûúoò~Köúûú
+òKöúûúâòüKöúûú ò4Köúûú±ò≈Köúûú	òKöúûúûúò2Köú
+ûúò'Köûúûúûúò&KöúûúYònKöúûúò*KöúûúòKöúûú#ò:Köúûú•ò≤KöúûúXòiKöúûúò#Köûúûúò'Köú	ûúûú	òKòKöúûúûúò%Köú	ûúòKöúûúò+Köúûú/ò?KöúûúMòbKò óöœnúûúûòKöûúûúò-Köûúûú<ûúNòïKöûúò%óKöûúûúüúûúò3Kò ôKò öü	úûúûúòKôRóóKò Kôô KöûúûúûúòKöûúûúò&Köûúûú!ûúûúòIóò Köúûúò'Köú2ò2Kô Köúûúûúûúò*Köúûúûúò&ö	úûúûúû	úûúò/KöúûúòKöúûúœcEòYKö	úûúûúûú
+ûúò-Köú ò Köúûúûú†Íò¸KòKò#Kò#KöúûúòKòKöú&ò&Köú%ò%KöúòKòKöú'ò'Kò!Kò%Köú*ò*Köúûúûúòóò Kò óóôKò öúûúò0Kô*óKò Köú)ûúò-Köú-ûúò1Köú#ûúò'Köú$ûúò(Köú†/ú/òvKöú-ûúò1Köúûúûúûú
+ûúûúò9Köú(ûúò,Kò Köú†ú/òjò KôñKô’KöúŒôŒKô Kò óKò Kò öü úò9KöûòKöúûúûúEòVKöúòöûúòKò Kô<óóöüúûú
+ûúûúò:KöûòöûúûúòKöúûúòKöúûúòKöúûúòKò;KöúûúòKöúûúòKöúûúò!Kò óKò Köûúûúûú&ò=Köûúûúûú-òHKò Kò0KòAKò0Köú4ô4Köúûúò(Kô KöúòKòYKöúûúûúûú
+ûúûúò;Köúûúò0KöúòKöûúòóò Kô(óöüúûúûú/ûúòhKöûòKöúûúûúò1Köúûú"ò>öûúûúûúòKòKöûúûúûúûúûúûú7ò_KöúûúòKò+Köûú	òóKöúûúûúûúòKöûúòóKò öüúûúûú!ûúûú
+ûú	ûúûúûúûúò|Köûòò Kô(ô<Kô.óóöúûúûúûúòMKöûòKöúûúûúò1Köú#ò#Köûúûúûú)òDöûúGûúûúòSKòfKò"óò Köûòöú ûúòBKöúûú†=òHKöúûúò
+Köú!ò!KöúòKöúòKöúòKöúòóöúûúò%KöúûúòKöúûúòKò+Köú/ò/Kò	KöúûúòKöúûúòKöúòKòKöúûúò
+Köú!ò!KöúòKöúòKöúòKòKöúòKöúûúòóKöûúò
+KöûúòóKöûúòóKò Kò Kò4öú&ûú$òMKöúûúòKöú3ò3KöúòóKò KöúSôSKöú*ò*Köú0ò0Köú)ò)Köú)ò)öú4ò4öú°ô°KôKôKôKôKôKôKôóóKò KòKò KòEKòEKòsKòKò öú3ò3Kô7KôóKò KöûúòKöûúòKô óKò öüúûúûú ûúûúûúûúûúûúò~öûúò$Köú7ò7Köûúûúô,KöûúòKöú/ô/óKòEKöûúûúûú-ò>öûúòKöúûú(ò.Köú*ûúòDKöúGòGKöúòóKöûúòóKò öü
+úûúûúûúûúûúûúòMöûúûúûúòKöú#ò#Köú ûúò(óKöûúòóKò ö
+üúûúûúûúûúòLKöúûú	òóò Kô}KöúÀôÀóöü$úûúûúûúûúûúòWKöûòöûúò$Köú7ò7Köûúûúô,KöûúòóKöú@ûúûúòLKöúûúòKöûúòóò Kô4Kô=óöüúûú2ûúûúòpKöûòKöúûúò+òVKöúÎôÎóKò KôyKô öúûúò*KöúVôVóKò Köú
+ûúEûúûúòaKò Köúûúûúûú8òbKò Köúûú]òyKò öúûúEûúûúò^KöúHôHóKò Köú
+ûú	òöú
+ûúHûúûúòdKöúHôHóKò öúûúûúòKKöú	ò	Köú	ò	KöúòóKò Köúûúò&Kò KöûúûúûúûúCòjKò KòhKò KöûúòKöûúòóKò öüúûúûúûú"ûúûúòVKöûòKöûúûúûúòKöûúûúûúûúò#KöúHòHKöúKòKKöú/ò/KöûúòóKò öüúûúûúûú"ûúûúòRKöûúûúûúûúòò!KôKôHóöüúûúò)KöûúûúûúòKöúûúûú!ò9Köúûú"ò>KöúûúòKò&KöûúòóKöûúûúûúûúûúûúûúGòxKöúûúòKöûúûúûúò8KöûúûúòóKò ö
+üúûúûúûúûúòKKöûòKöûúûúûúòKòKöûúòóKò Kò óôKò Kò öüúûúûúûú"ûúûúûúòjKöûòKòXKò ò/Köú0ò0Köú0ò0KöúòKöúòKöú&ò&KöúòKöúòKöúòKòKöúòKöúòKöú&ò&Köú!ò!Köú+ò+KöúòKöü
+úò%KöúòóKöúûú)ò9Kò KöûúòKöûúòóKò öüúûúûúûú"ûúûúûúòhKöûòò4Köú0ò0Köú0ò0KöúòKöúòKöú&ò&KöúòKöúòKöúòKòKöúòKòKöú&ò&Köü
+úò%KöúòóKò KöûúòKöûúòóKò óKò ô öüúûú*ûúûúòmKöûòöûúûú+ûúûò;öûòKöûòKòRKòlKòBKòPKòNKòcKöûòóóKöûúòóKò ö
+üúûúûú"ûúûúòeKöûòöûúûú+ûúûò;öûòKöûòKòDKò^KòBKòbKöûú0ò6KöûúòóóKöûúòóKò öüúûúûúûú"ûúûúûúòiKöûòKöúûúòò2Köúûúûúûúò$óöûúûúûúûúò(öûòKöûòöúûúûúûú/òDKöú/ô/óKöûúòKöûúòóóKöûúòóKô óKô Kôô öüúûúûú#ûúûúûúò^KöûòKò öúûúûúûúòKöûòôKöú%ò%Köûú5ûúòIóKöûúûúòKöûúòóKò KöúûúòKò-Köûúûúûúûú&ò;KöûúòKò óöüúûúûú#ûúûúûúòaKöûòKò öúûúûúûúòKöûòôKöú(ò(Köûú9ûúòMóKöûúûúòKöûúòóKò KöúûúòKò-Köûúûúûúûú&ò;KöûúòKò óö
+üúûúûú#ûúûúòOKöûòKò öúûúûúûúòKöûòKô"KòKöûúûúòKöûúòKò óKöúûúòKò-Köûúûúûúûú&ò;KöûúòKò óö
+üúûúûú#ûúûúòPKöûòKò öúûúûúûúòKöûòKô#KòKöûúûúòKöûúòKò óKöúûúòKò-Köûúûúûúûú&ò;KöûúòKò óóKò ô4Kò öüúûúûú,ûúòlKöúJòJKò óöü
+úûúò!Köú(ò(Kò óöüúûúûúò;Köú:ò:Kò óöüúûúûúò5Köú6ò6óKò öüúûúò%Köú,ò,óKò öüúûúûúûúûúûúûúòYöúûúûúò-KöûúûúûúòKöúLôLKöúûúûúò3ö	úûúûú
+ûúûúò"Kô0óöûúûúûòKöú	ûúûú
+ûúûúûúûúûúòXKöûúûúûúûúòöûúûúûòKöûú!ûúò)öúòKöûúûúûú%ûúòUKöûúòKöúòóKöûúû†úò%óKòKöûúòóKô0Köúûú ò;Kô$KòPKöûúûúûúCòUKöúòóKöúòKöúòóKò ö
+ü	úûúûúûúûúòDKöûòöúûúûúò+KöûòKöûúûúûúòKöúûúûúò3ö	úûúûú
+ûúûúò"Kô0óöûúûúûòKöú	ûúûú
+ûúûúûúûúûúòXKöûúûúûúûúòöûúûò$KöûòKöûúûúûú%ûúòUKöûúòKöûúòóKòKöûúòóKô$KòPKöúBòBKöûúòóKöúòKöûúòKò óö–bnúûúòKöûòöúûúûúò+KöûòKöûúûúûúòKöúûúûúòöûúûúûú
+ûú$ûú	ûúûòXKöú0ûú"òUKöûúòóKöúûúûú$òQKöûúòóKöúòKöûúòóKò ö°úûúò Köûòöúûúûúò+KöûòKöûúûúûúòKòFKò-KòKöúûúòKô$KòPKöú¿ô¿KöûúòóKöúòKöûúòKò óóKò ôKô’Kô öü	úûúûúûúûúûúûúòzKöúûú2ûúòYóKò ö
+ü
+úûúûúûúûúòaKöúûú?òFóKò öüúûúûúûúòMKöúûú3ò:óKò öü
+úûúûúûú#òXKöúûú.ò5óKò öü	úûúûúûúòLKöúûú)ò0óKò KôKò öüúûúòKöûòKöúûúòKöûúòóKò öüúûúòKöûòKöúûúòKöûúòóò Kò óöüúûúûúûúûúûúò^KöûòKòTKò1öüúûúûúò*KöûòKöúûú-ô>Köûú6ò<KöûúòóKò$Köúûú.ò9KöûúòKöûúòóò Kôóöüúûúûú	ûúûúûúò[KöûòKòTKò1öüúûúûúò*KöûòKöúûú-ô>Köûú6ò<KöûúòóKò$Köúûú0ò;KöûúòKöûúòóKò öüúûúûúûúûúûúò6Köúûúûúò"Köúûúûúò"Köûú+ûú.òbóKò öüúûúûúûúûúûúò2Köúûúûúò KöûúMòSóKò óKöú	ô	ò KöúYòYóKò Köûúòó Öó    Sh  7  

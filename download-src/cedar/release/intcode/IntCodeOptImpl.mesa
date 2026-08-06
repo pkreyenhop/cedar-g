@@ -1,0 +1,1530 @@
+
+DIRECTORY
+Basics32,
+IO,
+IntCodeDefs,
+IntCodeOpt USING [],
+IntCodeStuff,
+IntCodeTwig,
+IntCodeUtils,
+ProcessProps, ParseIntCode,
+Rope,
+Target: TYPE MachineParms;
+IntCodeOptImpl: CEDAR PROGRAM
+IMPORTS Basics32, IO, IntCodeStuff, IntCodeTwig, IntCodeUtils, ProcessProps, ParseIntCode
+EXPORTS IntCodeOpt
+= BEGIN OPEN IntCodeDefs, IntCodeStuff, IntCodeUtils, Rope;
+
+useReturnSubstitution: BOOL ¨ TRUE;
+useTailGotoSubstitution: BOOL ¨ TRUE;
+testBogusAssignment: BOOL ¨ TRUE;
+retainNamedReturns: BOOL ¨ TRUE;
+useRemTemp: BOOL ¨ TRUE;
+
+BaseModel: TYPE = IntCodeTwig.BaseModel;
+LambdaModel: TYPE = IntCodeTwig.LambdaModel;
+
+DebugNodeList: PROC [why: REF TEXT, list: NodeList] = {
+WITH ProcessProps.GetProp[$StdOut] SELECT FROM
+st: IO.STREAM => {
+IO.PutText[st, why];
+ParseIntCode.ToStream[st, list];
+IO.PutText[st, "\n"];
+};
+ENDCASE;
+};
+
+GenAnonLocal: PUBLIC PROC [base: BaseModel, parent: Label, bits: INT] RETURNS [Var] = {
+next: INT ¨ -IntCodeTwig.DeclsSize[base]-1;
+z: ZONE ¨ IntCodeUtils.zone;
+loc: Location ¨ z.NEW[LocationRep.localVar ¨ [localVar[id: next, parent: parent]]];
+var: Var ¨ IntCodeStuff.GenAnonVar[bits, loc];
+var.id ¨ next;
+var.flags[used] ¨ TRUE;
+IntCodeTwig.DeclsStore[base, next, var];
+RETURN [var];
+};
+
+CleanupLambda: PUBLIC PROC
+[base: BaseModel, model: LambdaModel, lambda: LambdaNode, rtnPtr: Var] = {
+innerList: PROC [list: NodeList] RETURNS [NodeList] = {
+head: NodeList ¨ NIL;
+tail: NodeList ¨ NIL;
+splicingOut: BOOL ¨ FALSE;
+WHILE list # NIL DO
+oldLive: BOOL ¨ live;
+oldCount: INT ¨ labelCount;
+next: NodeList ¨ list.rest;
+this: Node ¨ list.first;
+IF NOT live AND this # NIL AND this.bits = 0 THEN {
+WITH this SELECT FROM
+decl: DeclNode =>
+decl.init ¨ NIL;
+block: BlockNode =>
+list.first ¨ deadBlockComment;
+ENDCASE => GO TO notSimple;
+list ¨ next;
+LOOP;
+EXITS notSimple => {};
+};
+IF useTailGotoSubstitution AND next # NIL THEN {
+label: Label ¨ FindLeadingLabel[next.first];
+IF label # NIL THEN this ¨ RemTailGoTo[this, label, tailGoToComment];
+};
+this ¨ inner[this];
+IF this # NIL THEN {
+SELECT TRUE FROM
+oldLive, live, oldCount # labelCount => {
+splicingOut ¨ FALSE;
+GO TO spliceIn;
+};
+this = deadLabelComment, this = deadCodeComment =>
+GO TO spliceIn;
+ENDCASE;
+WITH this SELECT FROM
+decl: DeclNode => {
+decl.init ¨ NIL;
+GO TO spliceIn;
+};
+ENDCASE;
+IF NOT splicingOut THEN {
+list.first ¨ deadCodeComment;
+splicingOut ¨ TRUE;
+GO TO spliceIn;
+};
+EXITS spliceIn => {
+IF tail # NIL THEN tail.rest ¨ list ELSE head ¨ list;
+tail ¨ list;
+};
+};
+list ¨ next;
+ENDLOOP;
+IF tail # NIL THEN tail.rest ¨ NIL;
+RETURN [head];
+};
+innerArgs: PROC [list: NodeList] = {
+oldLive: BOOL ¨ live;
+newLive: BOOL ¨ live;
+FOR each: NodeList ¨ list, each.rest WHILE each # NIL DO
+live ¨ oldLive;
+each.first ¨ inner[each.first];
+newLive ¨ newLive AND live;
+ENDLOOP;
+live ¨ newLive;
+};
+inner: IntCodeUtils.Visitor = {
+list: NodeList ¨ NIL;
+WITH node SELECT FROM
+var: Var => {
+WITH var.location SELECT FROM
+field: FieldLocation => field.base ¨ inner[field.base];
+deref: DerefLocation => deref.addr ¨ inner[deref.addr];
+escape: EscapeLocation => escape.base ¨ inner[escape.base];
+indexed: IndexedLocation => {
+oldLive: BOOL ¨ live;
+newLive: BOOL ¨ oldLive;
+indexed.base ¨ inner[indexed.base];
+newLive ¨ live;
+live ¨ oldLive;
+indexed.index ¨ inner[indexed.index];
+live ¨ newLive AND live;
+};
+comp: CompositeLocation => {
+needsFlattening: BOOL ¨ FALSE;
+innerArgs[comp.parts];
+FOR each: NodeList ¨ comp.parts, each.rest WHILE each # NIL DO
+elem: Node = each.first;
+WITH elem SELECT FROM
+v: Var => WITH v.location SELECT FROM
+comp: REF LocationRep.composite => needsFlattening ¨ TRUE;
+ENDCASE;
+ENDCASE;
+ENDLOOP;
+IF needsFlattening THEN {
+head: NodeList ¨ NIL;
+tail: NodeList ¨ NIL;
+copyParts: PROC [parts: NodeList] = {
+FOR each: NodeList ¨ parts, each.rest WHILE each # NIL DO
+elem: Node = each.first;
+WITH elem SELECT FROM
+v: Var => WITH v.location SELECT FROM
+comp: REF LocationRep.composite => {copyParts[comp.parts]; LOOP};
+ENDCASE;
+ENDCASE;
+IF elem # NIL THEN {
+new: NodeList ¨ NodeListCons[elem];
+IF tail = NIL THEN head ¨ new ELSE tail.rest ¨ new;
+tail ¨ new;
+};
+ENDLOOP;
+};
+copyParts[comp.parts];
+comp.parts ¨ head;
+};
+};
+ENDCASE;
+GO TO done;
+};
+assign: AssignNode => {
+lhs: Var ¨ NARROW[inner[assign.lhs]];
+lhsLive: BOOL ¨ live;
+rhs: Node ¨ inner[assign.rhs];
+live ¨ live AND lhsLive;
+WITH rhs SELECT FROM
+rv: Var => WITH rv.location SELECT FROM
+cLoc: CompositeLocation => {
+lv: Var ¨ lhs;
+start: INT ¨ 0;
+DO
+IF lv = NIL THEN GO TO done;
+WITH lv.location SELECT FROM
+local: LocalVarLocation => IF NOT lv.flags[addressed] THEN EXIT;
+field: FieldLocation => {
+IF field.cross THEN { --Little endian code lifted without understanding.  ChJ, May 4, 1993
+GOTO done;
+};
+WITH field.base SELECT FROM
+fv: Var => {start ¨ start + field.start; lv ¨ fv; LOOP};
+ENDCASE;
+};
+ENDCASE;
+GO TO done;
+ENDLOOP;
+IF cLoc.parts # NIL THEN {
+head: NodeList ¨ NIL;
+tail: NodeList ¨ NIL;
+FOR each: NodeList ¨ cLoc.parts, each.rest WHILE each # NIL DO
+val: Node ¨ each.first;
+IF val # NIL THEN {
+vBits: INT = val.bits;
+IF ModBits[vBits] # 0 THEN GO TO done;
+IF vBits > 0 THEN {
+field: Var ¨ GenField[lv, start, val.bits];
+new: NodeList ¨ NodeListCons[GenAssign[field, val]];
+start ¨ start + val.bits;
+IF tail # NIL THEN tail.rest ¨ new ELSE head ¨ new;
+tail ¨ new;
+};
+};
+ENDLOOP;
+IF head # NIL THEN {
+IF head.rest = NIL THEN {
+node ¨ head.first;
+node.bits ¨ assign.bits;
+GO TO done;
+};
+IF assign.bits # 0 THEN tail ¨ tail.rest ¨ NodeListCons[lhs];
+node ¨ GenBlock[head, assign.bits];
+GO TO done;
+};
+};
+};
+ENDCASE;
+ENDCASE;
+GO TO done;
+};
+labelNode: LabelNode => {
+label: Label = labelNode.label;
+IF label.used
+THEN {
+live ¨ TRUE;
+labelCount ¨ labelCount + 1;
+}
+ELSE {
+node ¨ label.node;
+IF node = NIL THEN RETURN [deadLabelComment];
+};
+label.node ¨ inner[label.node];
+GO TO done;
+};
+lambda: LambdaNode => {
+lambda.body ¨ innerList[lambda.body];
+GO TO done;
+};
+block: BlockNode => {
+nodes: NodeList ¨ innerList[block.nodes];
+IF useRemTemp THEN nodes ¨ RemTemp[nodes];
+block.nodes ¨ nodes;
+SELECT TRUE FROM
+nodes = NIL => node ¨ NIL;
+block.bits # 0 => IF live THEN {
+tail: NodeList ¨ NodeListTail[block.nodes];
+IF tail.first = NIL OR tail.first.bits # block.bits THEN SIGNAL CantHappen;
+};
+ENDCASE;
+GO TO done;
+};
+source: SourceNode => {
+source.nodes ¨ innerList[source.nodes];
+GO TO done;
+};
+enable: EnableNode => {
+enable.scope ¨ innerList[enable.scope];
+GO TO done;
+};
+rtn: ReturnNode => {
+innerArgs[rtn.rets];
+live ¨ FALSE;
+GO TO done;
+};
+goto: GotoNode => {
+live ¨ FALSE;
+GO TO done;
+};
+cond: CondNode => {
+oldLive: BOOL ¨ live;
+newLive: BOOL ¨ FALSE;
+nCases: INT ¨ 0;
+lastTestList: NodeList ¨ NIL;
+lastBody: Node ¨ NIL;
+nextTestLive: BOOL ¨ oldLive;
+FOR each: CaseList ¨ cond.cases, each.rest WHILE each # NIL DO
+live ¨ oldLive;
+lastTestList ¨ each.tests;
+FOR tests: NodeList ¨ lastTestList, tests.rest WHILE tests # NIL DO
+tests.first ¨ inner[tests.first];
+nextTestLive ¨ nextTestLive OR live;
+ENDLOOP;
+lastBody ¨ each.body ¨ inner[each.body];
+newLive ¨ live OR newLive;
+nCases ¨ nCases + 1;
+ENDLOOP;
+SELECT TRUE FROM
+lastTestList # NIL => newLive ¨ newLive OR nextTestLive;
+nCases < 2 => node ¨ lastBody;
+ENDCASE;
+live ¨ newLive;
+GO TO done;
+};
+decl: DeclNode => {
+var: Var ¨ decl.var;
+IF NOT var.flags[used] AND NOT var.flags[named] THEN
+IF decl.init = NIL OR IntCodeUtils.SideEffectFree[decl.init, TRUE] THEN
+RETURN [GenComment[
+IO.PutFR1["removed dead decl of %g", [integer[var.id]]]]];
+};
+apply: ApplyNode => {
+oldLive: BOOL ¨ live;
+newLive: BOOL ¨ oldLive;
+apply.proc ¨ inner[apply.proc];
+newLive ¨ live;
+live ¨ oldLive;
+innerArgs[apply.args];
+live ¨ live AND newLive;
+IF IsError[apply] THEN live ¨ FALSE;
+GO TO done;
+};
+ENDCASE;
+IntCodeUtils.MapNode[node, inner];
+RETURN [node];
+EXITS done => RETURN [node];
+};
+live: BOOL ¨ TRUE;
+labelCount: INT ¨ 0;
+deadBlockComment: Node ¨ GenComment["removed dead block"];
+deadCodeComment: Node ¨ GenComment["removed dead code"];
+deadLabelComment: Node ¨ GenComment["removed dead label"];
+tailGoToComment: Node ¨ GenComment["removed tail goto"];
+[] ¨ inner[lambda];
+IF rtnPtr # NIL AND useReturnSubstitution THEN
+ReturnSubstitution[base, model, lambda.body, rtnPtr];
+};
+
+RectifyBlock: PUBLIC PROC [node: Node] RETURNS [Node] = {
+DO
+WITH node SELECT FROM
+block: BlockNode => {
+nodes: NodeList ¨ block.nodes;
+IF nodes # NIL THEN WITH nodes.first SELECT FROM
+decl: DeclNode => {
+rest: NodeList ¨ nodes.rest;
+var: Var ¨ decl.var;
+second: Node ¨ IF rest = NIL THEN NIL ELSE rest.first;
+IF second = NIL THEN RETURN [node];
+WITH second SELECT FROM
+bn: BlockNode => {
+IF rest.rest = NIL THEN rest.first ¨ RectifyBlock[second];
+RETURN [node];
+};
+assign: AssignNode =>
+IF decl.init = NIL AND decl.var = assign.lhs AND assign.bits = 0 THEN {
+decl.init ¨ assign.rhs;
+nodes.rest ¨ rest.rest;
+LOOP;
+};
+ENDCASE;
+IF NOT var.flags[named] AND rest # NIL THEN {
+rest ¨ rest.rest;
+IF rest # NIL AND rest.rest = NIL THEN
+WITH rest.first SELECT FROM
+assign: AssignNode => IF assign.rhs = var THEN {
+ultimateVar: Var ¨ assign.lhs;
+WITH second SELECT FROM
+dn: DeclNode =>
+IF var = dn.var THEN
+node ¨ GenAssign[ultimateVar, dn.init];
+apply: ApplyNode => IF ultimateVar # NIL THEN {
+args: NodeList ¨ apply.args;
+IF args # NIL THEN WITH args.first SELECT FROM
+ap2: ApplyNode => IF ap2.proc = addrOperNode THEN
+IF ap2.args # NIL AND ap2.args.first = var THEN {
+ap2.args.first ¨ ultimateVar;
+MarkAddressed[ultimateVar];
+IF block.bits = 0
+THEN
+node ¨ apply
+ELSE
+node ¨ GenBlock[
+NodeListCons2[apply, ultimateVar], ultimateVar.bits];
+};
+ENDCASE;
+};
+ENDCASE;
+};
+ENDCASE;
+};
+};
+ENDCASE;
+};
+ENDCASE;
+RETURN [node];
+ENDLOOP;
+};
+
+depthLimit: INT ¨ 100;
+SimplifyValueBlocks: PUBLIC PROC
+[base: BaseModel, model: LambdaModel, lambda: LambdaNode] = {
+declHead: NodeList ¨ NIL;
+declTail: NodeList ¨ NIL;
+depth: INT ¨ 0;
+generalVisit: PROC [example: Node, n: Node] RETURNS [Node] = {
+visit: IntCodeUtils.Visitor = {
+new: Node ¨ node;
+WITH example SELECT FROM
+var: Var => WITH var.location SELECT FROM
+field: FieldLocation => IF field.cross --ChJ, May 4, 1993
+THEN new ¨ GenXField[node, field.start, example.bits]
+ELSE new ¨ GenField[node, field.start, example.bits];
+deref: DerefLocation => new ¨ GenDeref[node, example.bits, deref.align];
+ENDCASE;
+apply: ApplyNode =>
+new ¨ innerExpr[GenApply[apply.proc, NodeListCons[node], example.bits]];
+assign: AssignNode =>
+new ¨ innerExpr[GenAssign[assign.lhs, node, example.bits]];
+return: ReturnNode =>
+new ¨ innerExpr[GenReturn[NodeListCons[node]]];
+ENDCASE;
+RETURN [new];
+};
+IF WillMapValuePoints[n] THEN {
+n ¨ MapValuePoints[n, visit];
+n.bits ¨ example.bits;
+n ¨ RectifyBlock[n];
+RETURN [n];
+};
+RETURN [example];
+};
+innerExpr: IntCodeUtils.Visitor = {
+oldDeclHead: NodeList ¨ declHead;
+oldDeclTail: NodeList ¨ declTail;
+IF node # NIL THEN {
+IF (depth ¨ depth + 1) > depthLimit THEN SIGNAL CantHappen;
+declHead ¨ declTail ¨ NIL;
+WITH node SELECT FROM
+const: ConstNode => GO TO return;
+var: Var => {
+bits: INT = var.bits;
+WITH var.location SELECT FROM
+field: FieldLocation => {
+base: Node ¨ field.base;
+IF base # NIL THEN {
+base ¨ field.base ¨ innerExpr[base];
+IF IsReallySimple[node] THEN node ¨ generalVisit[node, base];
+GO TO return;
+};
+};
+deref: DerefLocation => {
+base: Node ¨ deref.addr;
+IF base # NIL THEN {
+base ¨ deref.addr ¨ innerExpr[deref.addr];
+IF IsReallySimple[node] THEN node ¨ generalVisit[node, base];
+GO TO return;
+};
+};
+ENDCASE;
+};
+assign: AssignNode => {
+rhs: Node ¨ assign.rhs ¨ innerExpr[assign.rhs];
+lhs: Var ¨ assign.lhs;
+IF IsReallySimple[lhs] THEN node ¨ generalVisit[node, rhs];
+GO TO return;
+};
+apply: ApplyNode => {
+args: NodeList ¨ apply.args;
+proc: Node ¨ apply.proc;
+listHead: NodeList ¨ NIL;
+listTail: NodeList ¨ NIL;
+makeTemp: PROC [n: Node, relaxed: BOOL] RETURNS [Node] = {
+WITH n SELECT FROM
+bn: BlockNode => {
+bnHead: NodeList ¨ bn.nodes;
+tail: NodeList ¨ bnHead;
+temp: Var ¨ NIL;
+WITH bnHead.first SELECT FROM
+decl: DeclNode => {
+var: Var = decl.var;
+IF NOT var.flags[named] THEN temp ¨ var;
+};
+ENDCASE;
+DO
+rest: NodeList ¨ tail.rest;
+IF rest = NIL THEN EXIT;
+tail.rest ¨ NIL;
+IF listTail = NIL THEN listHead ¨ tail ELSE listTail.rest ¨ tail;
+listTail ¨ tail;
+tail ¨ rest;
+ENDLOOP;
+bnHead ¨ tail;
+n ¨ bnHead.first;
+IF relaxed OR IsConst[n, TRUE] OR temp = n THEN RETURN [n];
+};
+ENDCASE;
+{
+eBits: INT = n.bits;
+mod: [0..Target.bitsPerWord) = ModBits[eBits];
+newVar: Var ¨ GenRoundedLocal[base, model.label, eBits];
+newDecl: Node = GenDecl[newVar, IF mod = 0 THEN n ELSE NIL];
+newList: NodeList ¨ NodeListCons[newDecl];
+IF listTail # NIL THEN listTail.rest ¨ newList ELSE listHead ¨ newList;
+listTail ¨ newList;
+newVar.flags[constant] ¨ TRUE;
+IF mod # 0 THEN {
+newVar ¨ AdjustedField[newVar, eBits, TRUE];
+listTail ¨ listTail.rest ¨ NodeListCons[GenAssign[newVar, n]];
+};
+RETURN [newVar];
+};
+};
+WITH proc SELECT FROM
+oper: OperNode => WITH oper.oper SELECT FROM
+mesa: REF OperRep.mesa =>
+SELECT mesa.mesa FROM
+addr => GO TO dontHassle;
+equal, notEqual =>
+IF args.first.bits > Target.bitsPerWord THEN GO TO dontHassle;
+ENDCASE;
+ENDCASE;
+ENDCASE;
+SELECT TRUE FROM
+NOT IsReallySimple[proc], NOT IntCodeUtils.SideEffectFree[proc, FALSE] =>
+proc ¨ apply.proc ¨ makeTemp[innerExpr[proc], IsConstList[args, TRUE]];
+args # NIL AND args.rest = NIL AND apply.handler = NIL => {
+singleArg: Node = args.first;
+IF WillMapValuePoints[singleArg] THEN {
+node ¨ generalVisit[node, singleArg];
+GO TO return;
+};
+};
+ENDCASE;
+FOR each: NodeList ¨ args, each.rest WHILE each # NIL DO
+first: Node = each.first;
+IF NOT IsReallySimple[first] THEN {
+each.first ¨ NIL;  -- don't count current argument
+each.first ¨ makeTemp[innerExpr[first], IsConstList[args, TRUE]];
+};
+ENDLOOP;
+IF listTail # NIL THEN {
+listTail.rest ¨ NodeListCons[apply];
+node ¨ GenBlock[listHead, apply.bits];
+};
+GO TO return;
+EXITS dontHassle => {};
+};
+decl: DeclNode => {
+decl.init ¨ innerExpr[decl.init];
+GO TO return;
+};
+return: ReturnNode => {
+rets: NodeList = return.rets;
+IF rets # NIL THEN
+IF rets.rest = NIL AND WillMapValuePoints[rets.first]
+THEN node ¨ generalVisit[return, rets.first]
+ELSE exprList[return.rets];
+GO TO return;
+};
+lambda: LambdaNode => GO TO return;
+comment: CommentNode => GO TO return;
+block: BlockNode => {
+nodes: NodeList ¨ block.nodes ¨ innerList[block.nodes];
+GO TO return;
+};
+source: SourceNode => {
+source.nodes ¨ innerList[source.nodes];
+GO TO return;
+};
+enable: EnableNode => {
+enable.scope ¨ innerList[enable.scope];
+GO TO return;
+};
+ENDCASE;
+IntCodeUtils.MapNode[node, innerExpr];
+GO TO return;
+EXITS return => {
+depth ¨ depth - 1;
+IF depth < 0 THEN ERROR;
+IF declTail # NIL THEN {
+declTail.rest ¨ NodeListCons[node];
+node ¨ GenBlock[declHead, node.bits];
+};
+declHead ¨ oldDeclHead;
+declTail ¨ oldDeclTail;
+};
+};
+RETURN [node];
+};
+exprList: PROC [args: NodeList] = {
+FOR each: NodeList ¨ args, each.rest WHILE each # NIL DO
+expr: Node ¨ each.first ¨ innerExpr[each.first];
+IF expr # NIL THEN {
+eBits: INT ¨ expr.bits;
+IF eBits # 0 AND NOT IsReallySimple[expr] THEN {
+mod: [0..Target.bitsPerWord) = ModBits[eBits];
+newVar: Var ¨ GenRoundedLocal[base, model.label, eBits];
+newDecl: Node = GenDecl[newVar, NIL];
+field: Var = AdjustedField[newVar, eBits, TRUE];
+new: NodeList ¨ NodeListCons2[newDecl, innerExpr[GenAssign[field, expr]]];
+IF declTail = NIL THEN declHead ¨ new ELSE declTail.rest ¨ new;
+declTail ¨ new.rest;
+each.first ¨ field;
+};
+};
+ENDLOOP;
+};
+innerList: PROC [list: NodeList] RETURNS [NodeList] = {
+this: NodeList ¨ list;
+lag: NodeList ¨ NIL;
+WHILE this # NIL DO
+next: NodeList ¨ this.rest;
+comment: ROPE ¨ NIL;
+first: Node ¨ this.first;
+bits: INT ¨ 0;
+IF first = NIL THEN {
+IF lag = NIL THEN list ¨ next ELSE lag.rest ¨ next;
+this ¨ next;
+LOOP;
+};
+WITH first SELECT FROM
+decl: DeclNode => {
+init: Node ¨ decl.init;
+IF NOT IsReallySimple[init] THEN {
+decl.init ¨ NIL;
+next ¨ this.rest ¨ NodeListCons[GenAssign[decl.var, init], next];
+};
+};
+ENDCASE => first ¨ innerExpr[first];
+this.first ¨ first;
+lag ¨ this;
+this ¨ next;
+ENDLOOP;
+IF declHead # NIL THEN {
+declTail.rest ¨ list;
+list ¨ declHead;
+declHead ¨ declTail ¨ NIL;
+};
+RETURN [list];
+};
+count: INT ¨ 0;
+lambda.body ¨ innerList[lambda.body];
+};
+
+IsReallySimple: PUBLIC PROC [n: Node] RETURNS [BOOL] = {
+DO
+WITH n SELECT FROM
+const: ConstNode => RETURN [TRUE];
+var: Var => WITH var.location SELECT FROM
+local: LocalVarLocation => RETURN [TRUE];
+global: GlobalVarLocation => RETURN [TRUE];
+deref: DerefLocation => {n ¨ deref.addr; LOOP};
+field: FieldLocation => {n ¨ field.base; LOOP};
+indexed: IndexedLocation =>
+RETURN [IsReallySimple[indexed.base] AND IsReallySimple[indexed.index]];
+dummy: DummyLocation => RETURN [TRUE];
+ENDCASE;
+assign: AssignNode => {
+RETURN [IsReallySimple[assign.lhs] AND IsReallySimple[assign.rhs]];
+};
+apply: ApplyNode => {
+args: NodeList ¨ apply.args;
+IF apply.handler # NIL THEN RETURN [FALSE];
+IF NOT IsReallySimple[apply.proc] THEN RETURN [FALSE];
+FOR each: NodeList ¨ apply.args, each.rest WHILE each # NIL DO
+IF NOT IsReallySimple[each.first] THEN RETURN [FALSE];
+ENDLOOP;
+RETURN [TRUE];
+};
+oper: OperNode => RETURN [TRUE];
+mc: MachineCodeNode => RETURN [TRUE];
+cond: CondNode => {
+FOR each: CaseList ¨ cond.cases, each.rest WHILE each # NIL DO
+FOR tests: NodeList ¨ each.tests, tests.rest WHILE tests # NIL DO
+IF NOT IsReallySimple[tests.first] THEN RETURN [FALSE];
+ENDLOOP;
+IF NOT IsReallySimple[each.body] THEN RETURN [FALSE];
+ENDLOOP;
+RETURN [TRUE];
+};
+ENDCASE => IF n = NIL THEN RETURN [TRUE];
+RETURN [FALSE];
+ENDLOOP;
+};
+
+WillMapValuePoints: PROC [node: Node] RETURNS [BOOL] = {
+tail: NodeList ¨ NIL;
+WITH node SELECT FROM
+block: BlockNode => tail ¨ NodeListTail[block.nodes];
+source: SourceNode => tail ¨ NodeListTail[source.nodes];
+label: LabelNode => RETURN [TRUE];
+cond: CondNode => RETURN [TRUE];
+ENDCASE => RETURN [FALSE];
+IF tail # NIL THEN {
+tailNode: Node ¨ tail.first;
+IF tailNode # NIL AND tailNode.bits = node.bits THEN RETURN [TRUE];
+};
+RETURN [FALSE];
+};
+
+MapValuePoints: PROC [node: Node, visitor: IntCodeUtils.Visitor] RETURNS [Node] = {
+tail: NodeList ¨ NIL;
+WITH node SELECT FROM
+source: SourceNode => tail ¨ NodeListTail[source.nodes];
+block: BlockNode => tail ¨ NodeListTail[block.nodes];
+labelNode: LabelNode => {
+label: Label ¨ labelNode.label;
+new: Node ¨ label.node;
+IF new # NIL THEN {
+new ¨ MapValuePoints[label.node, visitor];
+IF new # NIL THEN {label.node ¨ new; labelNode.bits ¨ new.bits};
+};
+GO TO done;
+};
+cond: CondNode => {
+bits: INT ¨ cond.bits;
+FOR each: CaseList ¨ cond.cases, each.rest WHILE each # NIL DO
+body: Node ¨ each.body;
+IF body # NIL THEN {
+new: Node ¨ MapValuePoints[body, visitor];
+IF new # NIL THEN {bits ¨ new.bits; each.body ¨ new};
+};
+ENDLOOP;
+cond.bits ¨ bits;
+GO TO done;
+};
+goto: GotoNode => GO TO done;
+rtn: ReturnNode => GO TO done;
+ENDCASE => RETURN [visitor[node]];
+IF tail # NIL THEN {
+tailNode: Node ¨ tail.first;
+IF tailNode # NIL AND node.bits = tailNode.bits THEN {
+new: Node ¨ MapValuePoints[tailNode, visitor];
+IF new # NIL THEN {node.bits ¨ new.bits; tail.first ¨ new};
+};
+};
+GO TO done;
+EXITS done => RETURN [node];
+};
+
+MergeDecl: PROC [decl: DeclNode, list: NodeList] RETURNS [NodeList] = {
+IF decl.init = NIL AND list # NIL THEN {
+WITH list.first SELECT FROM
+assn: AssignNode => IF assn.lhs = decl.var AND assn.bits = 0 THEN {
+decl.init ¨ assn.rhs;
+list ¨ list.rest;
+};
+ENDCASE;
+};
+RETURN [list];
+};
+
+RemTemp: PROC [list: NodeList] RETURNS [NodeList] = {
+declLag: NodeList ¨ NIL;
+IF list # NIL THEN {
+WITH list.first SELECT FROM
+decl: DeclNode => {
+scanChange: IntCodeUtils.Visitor = {
+IF NOT changed THEN {
+WITH node SELECT FROM
+bn: BlockNode => {};
+cn: CondNode => {};
+sn: SourceNode => {};
+dn: DeclNode =>
+IF NodeContains[object, dn.var] THEN GO TO change;
+assn: AssignNode => {
+lhs: Var = assn.lhs;
+IF CouldIntersect[node, object] THEN GO TO change;
+IF CouldIntersect[assn.rhs, temp] THEN GO TO change;
+WITH lhs.location SELECT FROM
+loc: REF LocationRep.localVar =>
+IF lhs = temp THEN GO TO noChange;
+field: REF LocationRep.field =>
+IF field.base = temp THEN GO TO noChange;
+ENDCASE;
+IF CouldIntersect[lhs, temp] THEN GO TO change;
+GO TO noChange;
+};
+ENDCASE => {
+IF CouldIntersect[node, object] THEN GO TO change;
+IF CouldIntersect[node, temp] THEN GO TO change;
+GO TO noChange;
+};
+IntCodeUtils.MapNode[node, scanChange];
+};
+GO TO noChange;
+EXITS
+change => {changed ¨ TRUE; RETURN [node]};
+noChange => RETURN [node];
+};
+changed: BOOL ¨ FALSE;
+object: Var ¨ NIL;
+temp: Var ¨ decl.var;
+rest: NodeList ¨ list.rest;
+lag: NodeList ¨ list;
+tail: NodeList ¨ lag.rest;
+IF tail = NIL THEN GO TO tryNext;
+IF temp.flags[named] OR temp.flags[addressed] THEN GO TO tryNext;
+WITH temp.location SELECT FROM
+loc: REF LocationRep.localVar => {};
+ENDCASE => GO TO tryNext;
+DO
+WITH tail.first SELECT FROM
+assn: AssignNode => {
+lhs: Var = assn.lhs;
+IF CouldIntersect[decl.init, lhs] THEN GO TO tryNext;
+IF assn.rhs = temp THEN {
+IF NodeContains[lhs, temp] THEN GO TO tryNext;
+IF NOT IsSimple[lhs, [derefs: 1, noSignals: TRUE]] THEN GO TO tryNext;
+FOR each: NodeList ¨ tail.rest, each.rest WHILE each # NIL DO
+IF NodeContains[each.first, temp] THEN GO TO tryNext;
+ENDLOOP;
+object ¨ lhs;
+FOR each: NodeList ¨ list.rest, each.rest WHILE each # tail DO
+[] ¨ scanChange[each.first];
+IF changed THEN GO TO tryNext;
+ENDLOOP;
+IF decl.init # NIL
+THEN list.first ¨ GenAssign[lhs: lhs, rhs: decl.init]
+ELSE list ¨ list.rest;
+SubstituteInList[list: list, old: temp, new: lhs];
+IF assn.bits # 0 
+THEN tail.first ¨ lhs
+ELSE lag.rest ¨ tail.rest;
+GO TO tryNext;
+};
+WITH assn.lhs.location SELECT FROM
+loc: REF LocationRep.localVar => IF assn.lhs = temp THEN GO TO okThisTime;
+field: REF LocationRep.field => IF field.base = temp THEN GO TO okThisTime;
+ENDCASE => GO TO tryNext;
+IF CouldIntersect[assn.lhs, temp] THEN GO TO tryNext;
+IF CouldIntersect[assn.rhs, temp] THEN GO TO tryNext;
+EXITS okThisTime => {};
+};
+cn: CommentNode => {};
+dn: DeclNode =>
+IF declLag = NIL AND NOT dn.var.flags[named] THEN declLag ¨ lag;
+labNode: LabelNode => GO TO tryNext;
+gotoNode: GotoNode => GO TO tryNext;
+ENDCASE;
+lag ¨ tail;
+tail ¨ lag.rest;
+IF tail = NIL THEN GO TO done;
+ENDLOOP;
+};
+ENDCASE;
+EXITS
+done => { };
+tryNext =>
+IF declLag # NIL THEN declLag.rest ¨ RemTemp[declLag.rest];
+};
+RETURN [list];
+};
+
+ReturnSubstitution: PROC
+[base: BaseModel, model: LambdaModel, nodes: NodeList, rtnPtr: Var] = {
+rtnAssn: AssignNode ¨ NIL;
+rtnVar: Var ¨ NIL;
+rtnVarDecl: DeclNode ¨ NIL;
+assnHead: NodeList ¨ NIL;
+abort: BOOL ¨ FALSE;
+remField: IntCodeUtils.Visitor = {
+WITH node SELECT FROM
+var: Var => WITH var.location SELECT FROM
+fv: FieldLocation => {
+base: Node = fv.base;
+IF fv.start = 0 AND var.bits = base.bits THEN
+WITH base SELECT FROM
+bv: Var => RETURN [base];
+ENDCASE;
+};
+ENDCASE;
+ENDCASE;
+RETURN [node];
+};
+firstPass: IntCodeUtils.Visitor = {
+WITH node SELECT FROM
+var: Var => {
+IF var = rtnPtr THEN abort ¨ TRUE;
+RETURN [remField[var]];
+};
+assn: AssignNode => {
+lhs: Var ¨ assn.lhs ¨ NARROW[remField[assn.lhs]];
+rhs: Node ¨ assn.rhs ¨ remField[assn.rhs];
+base: Var ¨ lhs;
+start: INT ¨ 0;
+bits: INT ¨ lhs.bits;
+IF testBogusAssignment
+AND IntCodeUtils.SimplyEqual[lhs, rhs]
+AND IntCodeUtils.SideEffectFree[lhs, TRUE]
+AND IntCodeUtils.SideEffectFree[rhs, TRUE] THEN {
+IF node.bits # 0 THEN RETURN [lhs];
+RETURN [IntCodeStuff.GenComment["removed bogus assignment"]];
+};
+WITH lhs.location SELECT FROM
+deref: REF LocationRep.deref =>
+IF deref.addr = rtnPtr THEN {
+IF rtnAssn = NIL THEN
+WITH rhs SELECT FROM
+rv: Var => WITH rv.location SELECT FROM
+rLoc: REF LocationRep.localVar =>
+IF NOT rv.flags[addressed] AND NOT rv.flags[upLevel] THEN {
+assn.rhs ¨ firstPass[rhs];
+rtnVar ¨ rv;
+rtnAssn ¨ assn;
+RETURN [assn];
+};
+ENDCASE;
+ENDCASE;
+abort ¨ TRUE;
+};
+ENDCASE;
+};
+ENDCASE;
+IntCodeUtils.MapNode[node, firstPass];
+RETURN [node];
+};
+secondPass: IntCodeUtils.Visitor = {
+IF abort THEN RETURN [node];
+WITH node SELECT FROM
+var: Var => IF var = rtnVar THEN abort ¨ TRUE;
+decl: DeclNode => IF decl.var = rtnVar THEN {
+decl.init ¨ secondPass[decl.init];
+IF decl.init # NIL THEN abort ¨ TRUE;
+IF retainNamedReturns AND rtnVar.flags[named] THEN abort ¨ TRUE;
+rtnVarDecl ¨ decl;
+RETURN [node];
+};
+assn: AssignNode => {
+lhs: Var = assn.lhs;
+rhs: Node = assn.rhs;
+base: Var ¨ lhs;
+start: CARD ¨ 0;
+bits: INT ¨ lhs.bits;
+IF retainNamedReturns AND lhs.flags[named] THEN {abort ¨ TRUE; RETURN [node]};
+IF assn = rtnAssn THEN RETURN [node];
+WITH lhs.location SELECT FROM
+field: REF LocationRep.field => {
+IF field.cross THEN ERROR; -- cant expect cross records in a return can we? LAI.  Lifted: ChJ, May 4, 1993
+WITH field.base SELECT FROM
+fv: Var => {base ¨ fv; start ¨ field.start};
+ENDCASE;
+};
+ENDCASE;
+IF base = rtnVar AND bits < rtnVar.bits THEN {
+new: NodeList ¨ NodeListCons[assn];
+lag: NodeList ¨ NIL;
+lagLim: CARD ¨ 0;
+assn.rhs ¨ secondPass[assn.rhs];
+FOR each: NodeList ¨ assnHead, each.rest WHILE each # NIL DO
+WITH each.first SELECT FROM
+listAssn: AssignNode => {
+listStart: CARD ¨ 0;
+WITH listAssn.lhs.location SELECT FROM
+listField: REF LocationRep.field => {
+IF listField.cross THEN ERROR; -- cant expect cross records in a return can we? LAI.  Lifted, ChJ, May 4, 1993
+listStart ¨ listField.start;
+};
+ENDCASE;
+IF start <= listStart THEN EXIT;
+lagLim ¨ listStart + listAssn.lhs.bits;
+};
+ENDCASE => ERROR;
+lag ¨ each;
+ENDLOOP;
+IF lag = NIL
+THEN {new.rest ¨ assnHead; assnHead ¨ new}
+ELSE {new.rest ¨ lag.rest; lag.rest ¨ new};
+RETURN [node];
+};
+};
+ENDCASE;
+IntCodeUtils.MapNode[node, secondPass];
+RETURN [node];
+};
+thirdPass: IntCodeUtils.Visitor = {
+list: NodeList ¨ NIL;
+WITH node SELECT FROM
+sn: SourceNode => thirdPassList[sn.nodes];
+bn: BlockNode => thirdPassList[bn.nodes];
+assn: AssignNode => {
+base: Var ¨ assn.lhs;
+start: CARD ¨ 0;
+lim: CARD ¨ 0;
+IF assn = rtnAssn THEN {
+newList: NodeList ¨ NIL;
+FOR each: NodeList ¨ assnHead, each.rest WHILE each # NIL DO
+new: Node ¨ NIL;
+start: CARD ¨ 0;
+val: Node ¨ NIL;
+var: Var ¨ NIL;
+WITH each.first SELECT FROM
+eAssn: AssignNode => {var ¨ eAssn.lhs; val ¨ eAssn.rhs};
+ENDCASE => ERROR;
+WITH var.location SELECT FROM
+field: REF LocationRep.field => {
+IF field.cross THEN ERROR; -- cant expect cross records in a return can we? LAI.  Lifted, ChJ, May 4, 1993
+start ¨ field.start;
+};
+ENDCASE;
+newList ¨ NodeListCons[
+GenAssign[GenFieldOfDeref[rtnPtr, start, var.bits], val],
+newList];
+ENDLOOP;
+RETURN [GenBlock[newList]];
+};
+WITH assn.lhs.location SELECT FROM
+field: REF LocationRep.field => {
+IF field.cross THEN ERROR; -- cant expect cross records in a return can we? LAI.  Lifted, ChJ, May 4, 1993
+WITH field.base SELECT FROM
+fv: Var => {base ¨ fv; start ¨ field.start};
+ENDCASE;
+};
+ENDCASE;
+IF base = rtnVar THEN {
+lim ¨ start + assn.lhs.bits;
+FOR each: NodeList ¨ assnHead, each.rest WHILE each # NIL DO
+eStart: CARD ¨ 0;
+val: Node ¨ NIL;
+var: Var ¨ NIL;
+const: BOOL ¨ FALSE;
+WITH each.first SELECT FROM
+eAssn: AssignNode => {var ¨ eAssn.lhs; val ¨ eAssn.rhs};
+ENDCASE => ERROR;
+WITH var.location SELECT FROM
+field: REF LocationRep.field => {
+IF field.cross THEN ERROR; -- cant expect cross records in a return can we? LAI.  Lifted, ChJ, May 4, 1993
+eStart ¨ field.start;
+};
+ENDCASE;
+IF start = eStart THEN {
+IF IsConst[val, FALSE] THEN {
+IF assn.bits # 0 THEN RETURN [val];
+RETURN [GenComment["eliminated constant return field"]];
+};
+RETURN [GenAssign[NARROW[val], assn.rhs, assn.bits]];
+};
+ENDLOOP;
+ERROR;
+};
+};
+ENDCASE => IntCodeUtils.MapNode[node, thirdPass];
+RETURN [node];
+};
+thirdPassList: PROC [list: NodeList] = {
+WHILE list # NIL DO
+first: Node = thirdPass[list.first];
+list.first ¨ first;
+WITH first SELECT FROM
+dn: DeclNode => IF dn = rtnVarDecl THEN {
+list.first ¨ IntCodeStuff.GenComment["Return var split"];
+FOR aList: NodeList ¨ assnHead, aList.rest WHILE aList # NIL DO
+WITH aList.first SELECT FROM
+var: Var => {
+vBits: INT = var.bits;
+newVar: Var = GenRoundedLocal[base, model.label, vBits];
+aList.first ¨ GenAssign[var, AdjustedField[newVar, vBits, FALSE]];
+list.rest ¨ NodeListCons[GenDecl[newVar, NIL], list.rest];
+list ¨ list.rest;
+};
+ENDCASE;
+ENDLOOP;
+};
+ENDCASE;
+list ¨ list.rest;
+ENDLOOP;
+};
+IntCodeUtils.MapNodeList[nodes, firstPass];
+IF rtnVar # NIL AND NOT abort THEN {
+lagStart: CARD ¨ 0;
+lagLim: CARD ¨ 0;
+IntCodeUtils.MapNodeList[nodes, secondPass];
+IF abort THEN GO TO noDice;
+FOR each: NodeList ¨ assnHead, each.rest WHILE each # NIL DO
+start: CARD ¨ 0;
+lim: CARD ¨ 0;
+WITH each.first SELECT FROM
+assn: AssignNode => {
+multiple: BOOL ¨ FALSE;
+constVal: Node ¨ NIL;
+WITH assn.lhs.location SELECT FROM
+field: REF LocationRep.field => {
+IF field.cross THEN ERROR; -- cant expect cross records in a return can we? LAI.  Lifted, ChJ, May 4, 1993
+start ¨ field.start;
+};
+ENDCASE;
+lim ¨ start + assn.lhs.bits;
+IF lagLim > start THEN GO TO noDice;
+IF assn.rhs.bits = Target.bitsPerWord AND IsConst[assn.rhs, FALSE] THEN
+constVal ¨ assn.rhs;
+FOR next: NodeList ¨ each.rest, next.rest WHILE next # NIL DO
+WITH next.first SELECT FROM
+nassn: AssignNode => {
+nstart: CARD ¨ 0;
+nlim: CARD ¨ 0;
+WITH nassn.lhs.location SELECT FROM
+field: REF LocationRep.field => {
+IF field.cross THEN ERROR; -- cant expect cross records in a return can we? LAI.  Lifted, ChJ, May 4, 1993
+nstart ¨ field.start;
+};
+ENDCASE;
+nlim ¨ nstart + nassn.lhs.bits;
+SELECT TRUE FROM
+start = nstart AND lim = nlim =>
+IF constVal = NIL
+OR NOT IntCodeUtils.SimplyEqual[constVal, nassn.rhs] THEN
+multiple ¨ TRUE;
+lim > nstart => GO TO noDice;
+ENDCASE => EXIT;
+each.rest ¨ next.rest;
+};
+ENDCASE => ERROR;
+ENDLOOP;
+SELECT TRUE FROM
+NOT multiple AND constVal # NIL => {};
+ENDCASE => each.first ¨ assn.lhs;
+};
+ENDCASE => ERROR;
+lagStart ¨ start;
+lagLim ¨ lim;
+ENDLOOP;
+IntCodeUtils.MapNodeList[nodes, thirdPass];
+EXITS noDice => {abort ¨ TRUE};
+};
+};
+
+CouldIntersect: PROC [node: Node, lhs: Var] RETURNS [BOOL] = {
+list: NodeList ¨ NIL;
+IF node = NIL THEN RETURN [FALSE];
+IF node = lhs THEN RETURN [TRUE];
+WITH node SELECT FROM
+const: ConstNode => RETURN [FALSE];
+var: Var => {
+IF var.flags[constant] THEN RETURN [FALSE];
+WITH var.location SELECT FROM
+local: REF LocationRep.localVar => {
+IF NodeContains[var, lhs] THEN RETURN [TRUE];
+RETURN [var.flags[addressed]];
+};
+field: REF LocationRep.field => {
+WITH lhs.location SELECT FROM
+lf: REF LocationRep.field =>
+IF EqualVars[field.base, lf.base, FALSE] AND field.cross=lf.cross <<ChJ lifted>> THEN {
+IF NOT SideEffectFree[field.base, FALSE] THEN RETURN [TRUE];
+SELECT field.start FROM
+< lf.start => RETURN [field.start+var.bits > lf.start];
+> lf.start => RETURN [lf.start+lhs.bits > field.start];
+ENDCASE => RETURN [TRUE];
+};
+ENDCASE;
+RETURN [CouldIntersect[field.base, lhs]];
+};
+deref: REF LocationRep.deref => {
+IF var.flags[addressed] THEN RETURN [TRUE];
+RETURN [CouldIntersect[deref.addr, lhs]];
+};
+ENDCASE;
+RETURN [TRUE];
+};
+apply: ApplyNode => {
+IF NOT SideEffectFree[apply, FALSE] THEN RETURN [TRUE];
+IF apply.handler # NIL THEN RETURN [TRUE];
+FOR each: NodeList ¨ apply.args, each.rest WHILE each # NIL DO
+IF CouldIntersect[each.first, lhs] THEN RETURN [TRUE];
+ENDLOOP;
+RETURN [FALSE];
+};
+bn: BlockNode => list ¨ bn.nodes;
+sn: SourceNode => list ¨ sn.nodes;
+cn: CommentNode => RETURN [FALSE];
+cond: CondNode => {
+FOR each: CaseList ¨ cond.cases, each.rest WHILE each # NIL DO
+FOR each: CaseList ¨ cond.cases, each.rest WHILE each # NIL DO
+FOR tests: NodeList ¨ each.tests, tests.rest WHILE tests # NIL DO
+IF NOT CouldIntersect[tests.first, lhs] THEN RETURN [TRUE];
+ENDLOOP;
+IF CouldIntersect[each.body, lhs] THEN RETURN [TRUE];
+ENDLOOP;
+ENDLOOP;
+RETURN [FALSE];
+};
+an: AssignNode =>
+RETURN [CouldIntersect[an.lhs, lhs] OR CouldIntersect[an.rhs, lhs]];
+dn: DeclNode =>
+RETURN [CouldIntersect[dn.var, lhs] OR CouldIntersect[dn.init, lhs]];
+ENDCASE;
+FOR each: NodeList ¨ list, each.rest WHILE each # NIL DO
+IF CouldIntersect[each.first, lhs] THEN RETURN [TRUE];
+ENDLOOP;
+RETURN [TRUE];
+};
+
+EqualVars: PROC [n1, n2: Node, compareBits: BOOL] RETURNS [BOOL] = {
+IF n1 = n2 THEN RETURN [TRUE];
+WITH n1 SELECT FROM
+v1: Var => {
+WITH n2 SELECT FROM
+v2: Var => {
+IF v1.id # 0 AND v2.id # 0 AND v1.id # v2.id THEN RETURN [FALSE];
+WITH v1.location SELECT FROM
+v1f: FieldLocation => WITH v2.location SELECT FROM
+v2f: FieldLocation => {
+IF v1f.start # v2f.start THEN RETURN [FALSE];
+IF v1f.cross # v2f.cross THEN RETURN [FALSE];  --Lifted, ChJ
+IF compareBits AND v1.bits # v2.bits THEN RETURN [FALSE];
+RETURN [EqualVars[v1f.base, v2f.base, FALSE]];
+};
+ENDCASE;
+v1d: DerefLocation => WITH v2.location SELECT FROM
+v2d: DerefLocation => RETURN [EqualVars[v1d.addr, v2d.addr, FALSE]];
+ENDCASE;
+ENDCASE;
+};
+ENDCASE;
+};
+ENDCASE;
+RETURN [FALSE];
+};
+
+SubstituteInList: PROC [list: NodeList, old: Node, new: Node] = {
+inner: IntCodeUtils.Visitor = {
+IF node = old THEN RETURN [new];
+IntCodeUtils.MapNode[node, inner];
+IF newIsField THEN
+WITH node SELECT FROM
+var: Var => WITH var.location SELECT FROM
+field: FieldLocation =>
+WITH field.base SELECT FROM
+baseVar: Var => WITH baseVar.location SELECT FROM
+baseField: FieldLocation => 
+IF field.cross=baseField.cross
+THEN { 
+-- simply add if same sex
+field.start ¨ field.start + baseField.start;
+field.base ¨ baseField.base;
+}
+ELSE { --lifted but not understood ChJ
+-- upper node is a field of a record in an cross record, translate to native access by pretending the cross base is a native base and adjusting the offsets
+-- upper node is a field of an cross record in an native record, translate to cross access by pretending the native base is an cross base, and adjusting the offsets
+IF field.base.bits >= bitsPerWord 
+THEN {
+-- we should test if the basefield.start is a multiple of words LAI
+field.start _ field.start + baseField.start
+}
+ELSE {
+-- we have to switch an offset within a word
+field.start _ field.start + Basics32.BITXOR[ baseField.start + field.base.bits-1, bitsPerWord-1]
+};
+field.base _ baseField.base;
+};
+ENDCASE;
+ENDCASE;
+ENDCASE;
+ENDCASE;
+RETURN [node];
+};
+newIsField: BOOL ¨ FALSE;
+WITH new SELECT FROM
+var: Var => WITH var.location SELECT FROM
+field: FieldLocation => newIsField ¨ TRUE;
+ENDCASE;
+ENDCASE;
+IntCodeUtils.MapNodeList[list, inner];
+};
+
+FindLeadingLabel: PROC [node: Node] RETURNS [Label] = {
+WITH node SELECT FROM
+labNode: REF NodeRep.label => RETURN [labNode.label];
+source: SourceNode =>
+IF source.nodes # NIL THEN RETURN [FindLeadingLabel[source.nodes.first]];
+ENDCASE;
+RETURN [NIL];
+};
+
+RemTailGoTo: PROC [base: Node, label: Label, comment: Node] RETURNS [Node] = {
+inner: IntCodeUtils.Visitor = {
+list: NodeList ¨ NIL;
+WITH node SELECT FROM
+goto: REF NodeRep.goto =>
+IF goto.dest = label THEN RETURN [comment] ELSE RETURN [node];
+cond: REF NodeRep.cond => {
+trivial: BOOL ¨ TRUE;
+FOR each: CaseList ¨ cond.cases, each.rest WHILE each # NIL DO
+new: Node ¨ inner[each.body];
+each.body ¨ new;
+IF NOT IsTrivial[new] THEN trivial ¨ FALSE;
+ENDLOOP;
+IF trivial THEN {
+FOR each: CaseList ¨ cond.cases, each.rest WHILE each # NIL DO
+FOR tests: NodeList ¨ each.tests, tests.rest WHILE tests # NIL DO
+IF NOT IntCodeUtils.SideEffectFree[tests.first, TRUE] THEN GO TO nonTrivial;
+ENDLOOP;
+ENDLOOP;
+RETURN [GenComment["removed trivial cond node"]];
+EXITS nonTrivial => {};
+};
+RETURN [node];
+};
+block: BlockNode => list ¨ block.nodes;
+source: SourceNode => list ¨ source.nodes;
+enable: EnableNode => list ¨ enable.scope;
+ENDCASE => RETURN [node];
+IF list # NIL THEN
+DO
+next: NodeList ¨ list.rest;
+IF next # NIL THEN {list ¨ next; LOOP};
+list.first ¨ inner[list.first];
+EXIT;
+ENDLOOP;
+RETURN [node];
+};
+RETURN [inner[base]];
+};
+
+IsTrivial: PROC [node: Node] RETURNS [BOOL] = {
+list: NodeList ¨ NIL;
+IF node = NIL THEN RETURN [TRUE];
+WITH node SELECT FROM
+block: BlockNode => list ¨ block.nodes;
+source: SourceNode => list ¨ source.nodes;
+enable: EnableNode => list ¨ enable.scope;
+comNode: REF NodeRep.comment => RETURN [TRUE];
+ENDCASE => RETURN [FALSE];
+WHILE list # NIL DO
+IF NOT IsTrivial[list.first] THEN RETURN [FALSE];
+list ¨ list.rest;
+ENDLOOP;
+RETURN [TRUE];
+};
+
+IsConstList: PROC [list: NodeList, varOK: BOOL] RETURNS [BOOL] = {
+FOR each: NodeList ¨ list, each.rest WHILE each # NIL DO
+IF NOT IsConst[each.first, varOK] THEN RETURN [FALSE];
+ENDLOOP;
+RETURN [TRUE];
+};
+
+IsConst: PROC [n: Node, varOK: BOOL] RETURNS [BOOL] = {
+WITH n SELECT FROM
+var: Var => {
+IF varOK AND var.flags[constant] THEN RETURN [TRUE];
+WITH var.location SELECT FROM
+field: FieldLocation => RETURN [IsConst[field.base, varOK]];
+dummy: DummyLocation => RETURN [TRUE];
+ENDCASE;
+};
+const: REF NodeRep.const => RETURN [TRUE];
+cond: CondNode => {
+FOR each: CaseList ¨ cond.cases, each.rest WHILE each # NIL DO
+FOR each: CaseList ¨ cond.cases, each.rest WHILE each # NIL DO
+FOR tests: NodeList ¨ each.tests, tests.rest WHILE tests # NIL DO
+IF NOT IsConst[tests.first, varOK] THEN RETURN [FALSE];
+ENDLOOP;
+IF NOT IsConst[each.body, varOK] THEN RETURN [FALSE];
+ENDLOOP;
+ENDLOOP;
+RETURN [TRUE];
+};
+ENDCASE;
+RETURN [n = NIL];
+};
+
+ModBits: PROC [bits: INT] RETURNS [[0..Target.bitsPerWord)] = INLINE {
+RETURN [
+(IF BITS[WORD] = BITS[INT]
+THEN LOOPHOLE[bits, WORD]
+ELSE Basics32.LowHalf[LOOPHOLE[bits, CARD]]) MOD Target.bitsPerWord];
+};
+
+GenRoundedLocal: PROC [base: BaseModel, parent: Label, bits: INT] RETURNS [Var] = {
+IF bits # Target.bitsPerWord THEN {
+mod: [0..Target.bitsPerWord) = ModBits[bits];
+IF mod # 0 THEN bits ¨ bits + (Target.bitsPerWord-mod);
+};
+RETURN [GenAnonLocal[base, parent, bits]];
+};
+
+AdjustedField: PROC [var: Var, bits: INT, isConst: BOOL] RETURNS [Var] = {
+mod: [0..Target.bitsPerWord) = ModBits[bits];
+IF isConst THEN var.flags[constant] ¨ TRUE;
+IF mod # 0 THEN {
+offset: INT ¨ IF bits < Target.bitsPerWord AND Target.bitOrder = msBit <<???Lifted, ChJ.  This is wierd>> THEN (Target.bitsPerWord-bits) ELSE 0;
+var ¨ GenField[var, offset, bits];
+IF isConst THEN var.flags[constant] ¨ TRUE;
+};
+RETURN [var];
+};
+
+END.
+
+
+  6  
+IntCodeOptImpl.mesa
+Copyright ” 1989, 1990, 1991, 1993 by Xerox Corporation.  All rights reserved.
+Russ Atkinson (RRA) February 4, 1991 7:33 pm PST
+Willie-s, September 23, 1991 6:01 pm PDT
+Christian Jacobi, May 4, 1993 8:20 pm PDT
+This routine cleans up the tree, removing all sorts of unclean cases.
+innerList treats the list as a sequence of nodes where we should splice out the unreachable stuff.
+Special cases where we can eliminate jumping into things without processing the parts, since we can't jump into the middle of processing.
+Just kill the initialization, since it can't be executed
+Get rid of the whole thing
+This node either was live or has become live, or must be preserved because there may be a live piece in it.
+Preserve notices of dead labels and code
+At this point we are going to lose this node unless it is a declaration
+Just kill the initialization, since it can't be executed
+At this point we are going to lose this node forever
+We need to put in a splice out notice
+Since the args can be evaluated in any order, the initial value of live is always oldLive.  However, since all of the arguments must be evaluated, we take liveness to be the AND of all the livenesses.  The handler does not affect the liveness.
+[node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]
+Special handling for variables (both because they are common and because they are a lot like application).
+We are assigning a composite.  If this assignment is to a local var then we should do it as a series of simpler assignments to make C2C more happy.
+--Currently we dont support a composite assignment to a lhs which is xfield.  But we need to, we will have to add a case for collapsing xfield, however we need to separate the cases of xfield or field is the toplevel and collapse accordingly.  Then use the state to determine if we use genfield of genxfield in the multiple assignment stuff below.   LAI
+We try to build up a series of assignments to the variable.  If we fail, we discard the list we are building up, and nothing else has changed.
+We were able to break up the composite, so make a block
+Actually, a single assignment will do
+This node must be assumed to be live.  Further, we bump the label counter to ensure that the container for the label does not disappear.
+This label is not used by anyone.  If there is no node, then we mark it as a dead label.  In any case, sequential liveness is not affected.
+The liveness of a cond is the OR of all the livenesses of the arms.
+represents the test liveness if all of them could evaluate to FALSE
+The liveness of a test is the OR of all the livenesses of the tests, evaluated sequentially, since the first test being true will prevent evaluation of the succeeding tests.
+There is an implicit ENDCASE or ELSE preserving liveness
+The cond is trivially unconditional
+Since the proc and the args can be evaluated in any order, the initial value of live is always oldLive.  However, since all of the arguments must be evaluated, we take liveness to be the AND of all the livenesses.  The handler does not affect the liveness.
+Collapse out an assignment if it can be done by the decl init
+This code declares a nameless variable, and may not need to.
+This looks suspiciously like a gratuitous temporary
+Now there are two cases: if the block returns 0 bits, then the apply node is the resulting node; otherwise, the resulting node is a block with the apply node followed by the ultimateVar.
+The apply node is sufficient
+We need to return the ultimate var as the value
+[node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]
+A field location can be moved into the block!
+A deref location can be moved into the block!
+The variable is not properly aligned, so just use a field of it.
+Put the procedure into a temp
+In the single-argument case we move the application inside of the block
+We need to make a new block
+This routine is used to process nodes at a "statement" level.  All declaration processing actually happens here to avoid inserting an extra level of scope, potentially hiding the declaration fron its users.
+A NIL node at this level can always be spliced out
+This is an estimate of what can be generated as an expression without nasty control flow and funny effects.  It tends to be conservative, but is not necessarily totally correct.
+[node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]
+Sets changed to TRUE if the object could be affected, or if the temp is used in any way except simple assignments.
+If the assignment could affect the initialization, then we cannot remove the use of this temporary without changing the semantics.
+This could be the last use of temp, and we might be able to substitute the destination of the assignment for all uses of temp.
+Ensure that there is no subsequent use of temp
+Can't trust the control flow
+Can't trust the control flow
+The one we looked at was no good, but there is a next candidate
+The first pass removes bogus self-assignments, and finds a single assignment to deref of the rtnPtr.  If there is such a single assignment, it must be from a simple local return variable.
+A completely bogus assignment
+This variable is not addressed or upLevel, so it is simple enough
+The second pass collects all simple assignments to the rtnVar, sorting the assignments by the start position.
+We have a new assignment to collect
+The third pass turns fields of the rtnVar into simple variables or constants.
+An assignment to a constant return field is discarded.  An assignment to a variable return field is turned into an assignment to a simple variable.  And the rtnAssn is turned into a sequence of assignments to field thru the rtnPtr.
+This assignment needs to be replaced by a block of assignments
+The right field is now found.  Discard an assignment of a constant
+At this point we retain the assignment, but substitute the new variable
+We should not be able to find such an assignment!
+This must become a sequence of declarations
+Now rewrite the sorted assignment list to ensure that the fields are distinct.  Assignments of single constants are retained.  Otherwise, the fields of the rtnVar are retained.  The assignments themselves are not modified.
+multiple assignments to the same field
+overlapping fields, so don't even try
+Done with this scan
+Special case looking for disjoint fields
+[node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]
+Lifted comment from the little endian compiler: ChJ
+do we need this in a little-endian machine?  a AdjustedXField? LAI 
+ù ;û  ñ(cedarcode) styleïNewlineDelimiter
+ô headôIcodeöú
+œeúCôNLô0Lô(Lô)óò öœk	ò	Lò	LöûúòLòLöúûúòLòLòLòLöúòLòLöúûúòóóöœnúûúûòLöûúûúEòYLöûúòLöúûúûú/ò;Lò Löúûúûúò#Löúûúûúò%Löúûúûúò!Löúûúûúò LöúûúûúòLò Löúûúò(Löúûúò,Lò öüúûúûúûúò7öûúûúûò.öúûúûúòLöûúòLöú ò LöûúòLòóLöûúòóLòLò óóöüúûú(ûúûú
+òWLöúûú"ò+LöúûúòLöúûú>òSLöú.ò.LöúòLöúûúòLöú(ò(LöûúòLòLò óöüúûúûúKòeLöúEôEïStartOfExpansion7 -- [node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]öúûúûúò7LöúbôbLöúûúòLöúûúòLöúûúûúòöûúûúûòLöú	ûúòLöú
+ûúòLöúòLòöûúûúûúûúûúûúò3LôâöûúûúûòöúòLô8LöúûúòóòLôLöúòóLöûúûúûúòóLöúòLöûúòLöûúòLòóöûúûúûúûúò0Löú,ò,Löûú	ûúûú2òELòóLòöûúûúûúòöûúûúûòöú)ò)LôkLöúûúòLöûúûú
+òLòóöú2ò2Lô(Löûúûú
+òóLöûúòóLôGöûúûúûòöúòLô8LöúûúòLöûúûú
+òLòóLöûúòóLô4öûúûúûúòLô%LöúòLöúûúòLöûúûú
+òLòóöûúòLöûúûúûúûúò5LöúòLòóLòóLöúòLöûúòóLöûúûúûúûúò#LöûúòLòóöúûúò$LöúÆûúBôÛLöú	ûúòLöú	ûúòöûú"ûúûúûò8LöúòLòLöúûúòLöûúòóLöúòLòóòLöúûúô3LöúûúòöûúûúûòòLôjöûúûúûòLöú7ò7Löú7ò7Löú;ò;öúòLöú	ûúòLöú	ûúòLöú#ò#LòLöúòLöú%ò%LöúûúòLòóöúòLöúûúûúòLöúòöûú(ûúûúûò>Lòöûúûúûòöú
+ûúûúûò%Löúûú,ûúò:LöûúòóLöûúòóLöûúòóöûúûúòLöúûúòLöúûúòöúûúò%öûú#ûúûúûò9Löúòöûúûúûòöú
+ûúûúûò%Löúûú2ûúòALöûúòóLöûúòóöûúûúûúòLöú#ò#Löûúûúûúûúò3LòLòóLöûúòóLòóLöúòLöúòLòóLòóLöûúòóLöûúûúòLòóòLöúûúò%Löú	ûúòLöúòLöúûú	òöûúûúûòöúûúûúûò'òLöúÑûúôìLöúòLöúûúòöûòLö
+ûúûúûúûúûúòöûúûúûòLö	úûúûúûúûúò@òöûúûúœc†/òZLöûúò
+Lô·LòóöûúûúûòLöú2ûúò8LöûúòóLòóLöûúòóLöûúûúòLöûúòóöûúûúûúòLôéLöúûúòLöúûúòöûú(ûúûúûò>LöúòöûúûúûúòLöúûúòLöûúûúûúûúò&öûúûúòLöú+ò+Löú4ò4LöúòLöûúûúûúûúò3LòLòóLòóLöûúòóöûúûúûúòLô7öûúûúûúòLô%LöúòLòLöûúûúòLòóLöûúûú&ò=Löú#ò#LöûúûúòLòóLòóLòóLöûúòóLöûúòóLöûúûúòLòóöúòLöúòöûúòöûúòLôàLöúûúòLöúòLöúòóöûúòLôãLöúòLöûúûúûúûúò-LòóóLòLöûúûúòLòóöúòLöú%ò%LöûúûúòLöúòóöúòLöú)ò)Löûúûúò*LòöûúûúûòLöúûúûúòöúûúûúò Löú+ò+Lö
+ûúûúûúûúûúòKLòóLöûúòóLöûúûúòLöúòóòLöú'ò'LöûúûúòLòóöúòLöú'ò'LöûúûúòLòóöúòLòLöúûúòLöûúûúòLòóöúòLöúûúòLöûúûúòLöúòóöúòLöúûú#ôCLöú	ûúòLöú	ûúûúòLöúûúòLöúûúòLöúûúòöúûúòLöú>ûôCóöûú(ûúûúûò>LöúòLöúòöûú,ûú	ûúûòCLöúûúçô≠Löú!ò!Löúûúò$LöûúòóLöú(ò(Löúûú	òLöúòLöûúòóöûúûúûòöúûúûúò8Löúûúûúô8óöúòLô#óLöûúòóLöúòLöûúûúòLöúòóöúòLöúòö	ûúûúûúûúûò4ö	ûúûúûú(ûúûòGLöûúûú8òNóóLòóöúòLöúªûúBôÄLöú	ûúòLöú	ûúòLöúòLöúòLöúòLöúòLöúûú	òLöûúûúûúò$LöûúûúòLòóLöûúòóLöú"ò"LöûúòLöûú	ûúòLòóLöúûúûúòLöúûúòLöú:ò:Löú8ò8Löú:ò:Löú8ò8Löúòöûú
+ûúûúûò.Löú5ò5óLòLò óöüúûúûúûúò9öûòöûúûúûòòLöúòöûú	ûúûúûúûúûò0öúòLöúòLöúòLöúûúûúûúûúûúò6Löûú
+ûúûúûúò#öûúûúûòöúòLöûúûúûú#ò:LöûúòLòóöúòö
+ûúûúûúûúûúòGLô=LöúòLöúòLöûúòLòóóLöûúòóö
+ûúûúûúûúûúò-Lô<Lòö	ûúûúûúûúûò&Lô3öûúûúûòöúûúûúò0LöúòöûúûúûòöúòöûúûòLöú'ò'óóöúûúûúûúò/Lòöûúûúûúûúûúûò.öúûúûò1öûúûúûúûúò1LöúòLöúòLöú∫ô∫öûúòöûòLôLöúòóöûòLô/LöúFòFóóLòóóLöûúòóLòóLöûúòóLòóLöûúòóóLòóLòóLöûúòóLòóLöûúòóLöûúòLöûúòóLòLò óLöúûúòöüúûú=ò^LöúûúòLöúûúòLöúûúòöúûúûúò>òLöúòöûú	ûúûòöúûúûúûò)öúûú†ò9Löûú1ò5Löûú1ò5óLöúHòHLöûúòóöúòLöúHòHóöúòLöú;ò;óöúòLöú/ò/óLöûúòóLöûúòLòóöûúûúòLöúòLöúòLöúòLöûúòLòóLöûúòLòóò#Löúûúô3Löú!ò!Löú!ò!öûúûúûúòLöûú"ûúûúò;LöúûúòöûúûúûòLöúûúûúò!òLöúûúòöûúûúûòòLô-LòöûúûúûúòLöú$ò$Löûúûú!ò=LöûúûúòLòóLòóòLô-LöúòöûúûúûúòLöú*ò*Löûúûú!ò=LöûúûúòLòóLòóLöûúòóLòóöúòLöú/ò/LöúòLöûúûú ò;LöûúûúòLòóöúòLöúòLöúòLöúûúòLöúûúòöú
+ûúûúûúò:öûúûúûòòLòLòLöúûúòöûúûúûòòLòLöûúûúûúò(LòóLöûúòóöûòLòLöûúûúûúûúòLöúûúòLöûúûúûúûúòALöúòLöúòLöûúòóLòLòLöûú	ûúûúûú
+ûúûúò;LòóLöûúòóòLöúûú
+òLöú.ò.Löú8ò8Lö	ú ûú	ûúûúûúò<Löú*ò*LöûúûúûúûúòGLöúòLöúûúòöûú	ûúòLô@Löú&ûúò,Löú>ò>LòóLöûú
+òLòóLòóöûúûúûòöúûúûúûò,öúûúòöûúûòLöúûúûúòöúòLöûú&ûúûúûúò>óLöûúòóóLöûúòóLöûúòóöûúûúûòöûúûú#ûúòILôLöú@ûúòGóöúûúûúûúûúûúò;LôGLöúòöûúûúò'Löú%ò%LöûúûúòLòóLòóLöûúòóöûú"ûúûúûò8Lòöûúûúûúò#Löúûú†ò2Löú:ûúòALòóLöûúòóöûúûúûúòLôLò$Lò&LòóLöûúûúòLöûúòLòóòLöú!ò!LöûúûúòLòóöúòLöúòöûúûúûòöûúûúò5Löûú(ò,LöûúòóóLöûúûúòLòóLöúûúûúò#Löúûúûúò%òLöú7ò7LöûúûúòLòóòLöú'ò'LöûúûúòLòóòLöú'ò'LöûúûúòLòóLöûúòóLöú&ò&LöûúûúòöûúòLòLöûúûúûúòöûúûúûúòLöú#ò#Löú%ò%LòóLöúòLöúòLöúòóLòóLöûúòLöúòóöú
+ûúò#öûú"ûúûúûò8Löú0ò0öûúûúûúòLöúûúòöûúûúûúûúò0Löú.ò.Löú8ò8Löú ûúò%Löú*ûúò0LöúJòJLöûúûúûúûúò?LöúòLöúòLòóLòóLöûúòóLòóöúûúûúò7LôŒLöúòLöúûúòöûúûúûòLöúòLñ7 -- [node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]öú	ûúûúòLöúòLöúûúòöûú	ûúûúòLöúûú-ô2Löûúûúûúûúò3LòLöûúòLöúòóöûúûúûòòLöúòöûúûúûúò"LöúûúòLöúAòALòóLòóLöûúò$óLöúòLòLòLöûúòóöûúûúûúòLöúòLöúòLöúûúòLòóLöûúòLòóLöúûúòLöú%ò%LòLò óö
+üúûúûúûúûúò8Löú-œbútô±öûòöûúûúûòLöúûúûúò"öúûúûúûò)Löúûúûúò)Löúûúûúò+Löú)ûúò/Löú)ûúò/öúòLöûúûú òHóLöúûúûúò&LöûúòóöúòLöûúûúòCLòóöúòLöúòLö
+ûúûúûúûúûúò+Lö
+ûúûúûúûúûúò6öûú(ûúûúûò>Lö
+ûúûúûúûúûúò6LöûúòóLöûúûúòLòóLöúûúûúò Löúûúûúò%öúòöûú(ûúûúûò>öûú*ûú	ûúûòALö
+ûúûúûúûúûúò7LöûúòóLö
+ûúûúûúûúûúò5LöûúòóLöûúûúòLòóLöûúûúûúûúûúûúò)óLöûúûúòLöûúòóLòLò óöüúûúûúûúò8LöúûúòöûúûúûòLöú5ò5Löú8ò8Löúûúûúò"Löúûúûúò LöûúûúûúòóöûúûúûúòLòLöûúûúûúûúûúûúòCLòóLöûúûúòLòLò óöüúûú-ûúòSLöúûúòöûúûúûòLöú8ò8Löú5ò5öúòLöúòLöúòöûúûúûúòLöú*ò*Löûúûúûú/ò@LòóLöûúûúòLòóöúòLöúûúòöûú(ûúûúûò>LöúòöûúûúûúòLöú*ò*Löûúûúûú$ò5LòóLöûúòóLöúòLöûúûúòLòóLöúûúûúòLöúûúûúòLöûúûúò"óöûúûúûúòLòöûúûúûúûúò6Löú.ò.Löûúûúûú*ò;LòóLòóLöûúûúòLöûú	ûúòLòLò óöü	úûú"ûúòGö
+ûúûúûúûúûúò(öûúûúûòöúûúûúûúòCLöúòLòLòóLöûúòóLòóLöûúòLòLò óöüúûúûúò5Löúûúòöûúûúûúòöûúûúûòòñ7 -- [node: IntCodeDefs.Node] RETURNS [IntCodeDefs.Node]ò$Löúûúô3Löúûú^ôröûúûú	ûúòöûúûúûòLòLòLòöúòLöûúûúûúûúò2óöúòLòLöûúûúûúûúò2Löûú ûúûúûúò4öûúûúûòöúûúò Löûúûúûúûú
+ò"óöúûúòLöûúûúûúûú
+ò)óLöûúòóLöûúûúûúûúò/Löûúûú
+òLöúòóöûúòLöûúûúûúûúò2Löûúûúûúûúò0Löûúûú
+òLöúòóóLò'LòóLöûúûú
+òöûòLöúûúûú	ò*LöúûúòóLòóLöú	ûúûúòLöúûúòLòLòLòLòLö
+ûúûúûúûúûú	ò!Lö
+ûúûúûúûúûú	òAöûúûúûòLöúûúò$Löûúûúûú	òóöûòöûúûúûòòLòöûú ûúûúûú	ò5LôÇóöûúûúòLô~Löûúûúûúûú	ò.Löûúûú&ûúûúûúûú	òFöûú'ûúûúûò=Lô.Löûú ûúûúûú	ò5LöûúòóLòöûú'ûúûò>LòLöûú	ûúûúûú	òLöûúòóöûúûòLöûú1ò5LöûúòóLò2öûúòLöûúòLöûúòóLöûúûú	òLòóöûúûúûò"LöúûúûúûúûúûúòJLöúûúûúûúûúûúòKLöûúûúûú	òóLöûú ûúûúûú	ò5Löûú ûúûúûú	ò5LöûúòLòóLòöúòLö
+ûúûúûúûúûúò@óöúûúûú	ò$Lôóöúûúûú	ò$LôóLöûúòóLòLòLö
+ûúûúûúûúûúòLöûúòóLòóLöûúòóöûòLöúòöú
+ò
+Lô?Löûúûúûú&ò;óóLòóLöûúòLòLò óöüúûúHò`LöúûúòLöúûúòLöúûúòLöúûúòLöúûúûúòò"öûúûúûòöúûúûúûò)òLòöûúûúûò-öûúûúûòLöúûúòLöûúòóóLòóLöûúòóLöûúòóLöûúòLòóò#LôªöûúûúûòöúòLöûúûú	ûúò"LöûúòLòóòLöúûúò1Lò*LòLöúûúòLöúûúòöûúûú$ûú"ûúûú"ûúûúòöLôLöûúûúûúò#Löûú7ò=Lòóöûúûúûòöúûúòöûúûúòöûúûúûòöûúûúûòöúûúûúûò'öúûúò!ö
+ûúûúûúûúûúò;LôALöúòLöúòLöúòLöûúòLöúòóóLöûúòóLöûúòóóLöúûúòLöúòóóLöûúòóLòóLöûúòóLöú&ò&LöûúòLòóò$LômLöûúûúûúòöûúûúûòLöúûúûú	ûúò.öúûúûúò-Löú"ò"Löûúûúûú	ûúò%Löûúûúûú	ûúò@LöúòLöûúòLòóòLòLòLòLöúûúòLöúûúòLö
+ûúûúûú
+ûúûú	òNLöûúûúûúò%öûúûúûòöúûúúúò!Löûúûúûú†4†††††òjöûúûúûòLöú,ò,LöûúòóLòóLöûúòóöûúûúûúò.Lô#Lò#LöúûúòLöúûúòLò öûú&ûúûúûò<öûúûúûòòLöúûúòöûúûúûò&öúûúò%Löûúûúûú†OònLòLòóLöûúòóLöûúûúûúò Löú'ò'LòóLöûúûúòóLòLöûúòóöûúûòLöûú&ò*Löûú'ò+óLöûúòLòóLòóLöûúòóLöú'ò'LöûúòLòóò#LôMLöúûúòöûúûúûòLöú*ò*Löú)ò)òLôÁLòLöúûúòLöúûúòöûúûúòLô>Löúûúòöûú&ûúûúûò<LöúûúòLöúûúòLöúûúòLöúûúòöûúûúûòLöú8ò8Löûúûúòóöûúûúûòöúûúò!Löûúûúûú†OòjLòLòóLöûúòóLöú[ò[LöûúòóLöûúòLòóöûúûúûò"öúûúúúò!Löûúûúûú†OòjöûúûúûòLöú,ò,LöûúòóLòóLöûúòóöûúûúòLöúòöûú&ûúûúûò<LöúûúòLöúûúòLöúûúòLöúûúûúòöûúûúûòLöú8ò8Löûúûúòóöûúûúûòöúûúò!Löûúûúûú†OòjLòLòóLöûúòóöûúûúòLôBöûúûúûúòLöûúûúûúò#Löûú2ò8LòóLôGLöûúûúò5LòóLöûúòóöûúòLô1óLòóLòóLöûú*ò1óLöûúòLòóöúûúò(öûúûúûòLöú$ò$Löúòöûúûúûòöúûúûúò)Lô+Löú9ò9öûú(ûú	ûúûò?öûúûúûòòLöúûúòLöú8ò8Löú:ûúòBLöú)ûúò:LòLòóLöûúòóLöûúòóLòóLöûúòóLòLöûúòóLòóLöú+ò+ö
+ûú
+ûúûúûúûúò$Löú
+ûúòLöúûúòLöú,ò,LöûúûúûúûúòLôﬁöûú&ûúûúûò<LöúûúòLöúûúòöûúûúûòòLöú
+ûúûúòLöúûúòöûúûúûò"öúûúò!Löûúûúûú†OòjLòLòóLöûúòóLöúòLöûúûúûúûúò$öûú$ûúûúûòGLöúòóöûú'ûúûúûò=öûúûúûòòLöúûúòLöúûúòöûúûúûò#öúûúò!Löûúûúûú†OòjLòLòóLöûúòóLöúòöûúûúûòöúûúò ö	ûúûúûúûú/ûòKLô&LöúûúòóóöúûúûúòLô%óöûúûúòLôóóLòLòóLöûúûúòóLöûúòóöûúûúûòLöûú
+ûúûúò&Löûúò!óLòóLöûúûúòóLöúòLöúòLöûúòóLöú+ò+LöûúûúòLòóLòLò óöüúûúûúûúò>LöúûúòLö
+ûúûúûúûúûúò"Löûúûúûúûúò!öûúûúûòLöúûúûúò#öúòLöûúûúûúûúò+öûúûúûòöúûúò$Löûúûúûúûúò-LöûúòLòóöúûúò!öûúûúûòöúûúòöûú ûúûú%ûúòWLô(Löûúûúûúûúûúûúò<öûúûòLöúûú#ò7Löúûú#ò7LöûúûúûúòóLòóóLöûúòóLöûú#ò)Lòóöúûúò!Löûúûúûúûúò+Löûú#ò)LòóLöûúòóLöûúûúòLòóöúòLöûúûúûúûúûúûúò7Lö
+ûúûúûúûúûúò*öûú(ûúûúûò>Löûú!ûúûúûúò6LöûúòóLöûúûúòLòóLöú!ò!Löú"ò"Löúûúûúò"öúòöûú(ûúûúûò>öûú(ûúûúûò>öûú*ûú	ûúûòALö
+ûúûú"ûúûúûúò;LöûúòóLöûú ûúûúûúò5LöûúòóLöûúòóLöûúûúòLòóòLöûúûúòDóòLöûúûúòEóLöûúòóöûú"ûúûúûò8Löûú!ûúûúûúò6LöûúòóLöûúûúòLòLò óö
+ü	úûúûúûúûúòDLöûú	ûúûúûúòöûúûúûòòöûúûúûòòLöûúûúûúûúûúûúòAöûúûúûòöúûúûúûò2öúòLöûúûúûúûúò-Lö	ûúûúûúûú†ò<Lö
+ûúûúûúûúûúò9Löûú ûúò.LòóLöûúòóöúûúûúûò2Löúûú ûúòDLöûúòóLöûúòóLòóLöûúòóLòóLöûúòóLöûúûúòLòLò óöüúûú+òAòLöûúûúûúò Löú"ò"öûúûòöûúûúûòöúûúûúûò)öúòöûúûúûòöúûúûúûò1òòòLö†òLöú,ò,LöúòLòóöûú†ò&Lö†õòõLö†§ò§öûú ò"öûúòLö†CòCLò+LòóöûúòLö†,ò,Löú%ûú5ò`LòóóLöúòLöúòóóóLöûúòóLöûúòóóLöûúòóLöûúòóóLöûúòLòóLöúûúûúòöûúûúûòöúûúûúûò)Löú%ûúò*LöûúòóLöûúòóLöú&ò&LòLò óöüúûúûúò7öûúûúûòLöú	ûúûúò5öúòLöûúûúûúûú(òIóLöûúòóLöûúûúòLòLò óöüúûú+ûúòNòLöúûúô3LöúûúòöûúûúûòöúûúòLö
+ûúûúûúûúûúò>óöúûúòLöú	ûúûúòöûú(ûúûúûò>LöúòLöúòLöûúûúûúûúò+Löûúòóöûú	ûúòöûú(ûúûúûò>öûú*ûú	ûúûòALöûúûú*ûúûúûúûúòLLöûúòóLöûúòóLöûú+ò1LöûúòLòóLöûúòLòóLöú'ò'Löú*ò*Löú*ò*LöûúûúòóöûúûúûòöûòLöúòLöûúûúûúûúò'LòLöûúòLöûúòóóLöûúòLòóLöûúòLòLò óöü	úûúûúûúò/LöúûúòLö
+ûúûúûúûúûúò!öûúûúûòLöú'ò'Löú*ò*Löú*ò*Löú	ûúûúûúò.LöûúûúûúòóöûúûúûòLö
+ûúûúûúûúûúò1LòLöûúòóLöûúûúòLòLò óö
+üúûúûúûúûúòBöûú"ûúûúûò8Lö
+ûúûúûúûúûúò6LöûúòóLöûúûúòLòLò óö
+üúûúûúûúûúò7öûúûúûòöúòLö
+ûúûúûúûúûúò4öûúûúûòLöúûúò<Löúûúûúò&LöûúòóLòóLöúûúûúûúò*öúòöûú(ûúûúûò>öûú(ûúûúûò>öûú*ûú	ûúûòALö
+ûúûúûúûúûúò7LöûúòóLö
+ûúûúûúûúûúò5LöûúòóLöûúòóLöûúûúòLòóLöûúòóLöûúûúòLòLò óö
+üúûúûúûúûúòFöûúòöúûúûúûúûúûúòLöûúûúûúòLöûúûúûúûúòEóóLòLò óöüúûú(ûúûú
+òSöûúûúò#Löú-ò-Löûú	ûú(ò7LòóLöûú$ò*LòLò óö
+üúûúûúûúûú
+òJô3Lö†BúôCóLò-Löûú	ûúûúò+öûú	ûúòLöúûúûúûúœiúûúûúòêLöú"ò"Löûú	ûúûúò+LòóLöûúòLòLò óLöûúòLò Lò ó Öó    ë“  Ê¶  

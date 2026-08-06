@@ -1,0 +1,1116 @@
+
+DIRECTORY
+Basics, BasicTime, Commander, CommanderOps, DeltaResource, IO, List, Process, RefText, Rope;
+LeafySampleCommand: CEDAR MONITOR
+IMPORTS BasicTime, Commander, CommanderOps, DeltaResource, IO, List, Process, RefText, Rope
+ = BEGIN
+
+dumpRequest: CONDITION;
+dumpFinish: CONDITION;
+dumpWanted: BOOL ¨ FALSE;
+dumpBusy: BOOL ¨ FALSE;
+registry: Registration ¨ NIL;
+freeSamples: AcceptSamplesInstance ¨ NIL;
+
+specialRegistration: Registration ¨ NIL;
+resourceActivity: ResourceActivity ¨ NIL;
+
+defaultModCutoff: REAL ¨ 1.0;
+defaultProcCutoffRatio: REAL ¨ 0.10;
+
+maxEntries: INT = 20*100;
+dumpRequestMillis: NAT = (maxEntries*10)/4;
+maxAcceptSamples: INT = maxEntries/2;
+
+maxValidSize: CARDINAL ¨ 1000000;
+ROPE: TYPE = Rope.ROPE;
+STREAM: TYPE = IO.STREAM;
+
+CharPtr: TYPE = POINTER TO Basics.RawChars;
+
+TimeVal: TYPE = DeltaResource.TimeVal;
+RUsage: TYPE = DeltaResource.RUsage;
+Stats: TYPE = DeltaResource.Stats;
+
+ILSymEntry: TYPE = POINTER;
+
+Registration: TYPE = LIST OF RegistrationEntry;
+RegistrationEntry: TYPE = RECORD [
+state: RegistrationState,
+proc: EnumSamplesProc,
+data: REF];
+RegistrationState: TYPE = {waitingActive, active, waitingDead, dead};
+
+EnumSamplesProc: TYPE = PROC [pc: WORD, count: CARDINAL, data: REF];
+masterProfile: ProfileBuffer ¨ NIL;
+globalGen: INT ¨ 0;
+
+ProfileEntryList: TYPE = LIST OF RefProfileEntry;
+RefProfileEntry: TYPE = REF ProfileEntry;
+ProfileEntry: TYPE = RECORD [
+count: CARDINAL,
+pc: WORD
+];
+ProfileBuffer: TYPE = POINTER TO ProfileBufferRep;
+ProfileBufferRep: TYPE = RECORD [
+nEntries: INT,
+offset: INT,
+entries: ARRAY [0..maxEntries] OF ProfileEntry];
+
+AcceptSamplesInstance: TYPE = REF AcceptSamplesInstanceRep;
+AcceptSamplesInstanceRep: TYPE = RECORD [
+link: AcceptSamplesInstance ¨ NIL,
+nextIndex: [0..maxAcceptSamples] ¨ 0,
+samples: ARRAY [0..maxAcceptSamples) OF ProfileEntry
+];
+
+LoadStateList: TYPE = LIST OF LoadStateEntry;
+LoadStateEntry: TYPE = REF LoadStateEntryRep;
+LoadStateEntryRep: TYPE = RECORD [
+ilse: ILSymEntry ¨ NIL,
+pc: WORD,
+size: CARDINAL];
+
+VisitModules: TYPE = PROC
+[ilse: ILSymEntry, name: CharPtr, nameOK: BOOL,
+ pc: WORD, size: CARDINAL, type: WORD, list: ProcEntryList ¨ NIL]
+RETURNS [continue: BOOL ¨ TRUE];
+
+ProcEntryList: TYPE = LIST OF ProcEntry;
+ProcEntry: TYPE = REF ProcEntryRep;
+ProcEntryRep: TYPE = RECORD [
+ilse: ILSymEntry,
+count: WORD
+];
+
+ModuleEntryList: TYPE = LIST OF ModuleEntry;
+ModuleEntry: TYPE = REF ModuleEntryRep;
+ModuleEntryRep: TYPE = RECORD [
+ilse: ILSymEntry,
+name: CharPtr, nameOK: BOOL,
+pc: WORD, size: CARDINAL, type: WORD,
+count: CARDINAL,
+procs: ProcEntryList
+];
+
+SwitchArray: TYPE = PACKED ARRAY SwitchIndex OF BOOL;
+SwitchIndex: TYPE = CHAR ['a..'z];
+
+ResourceActivity: TYPE = REF ResourceActivityRep;
+ResourceActivityRep: TYPE = RECORD [
+reg: Registration,
+state: ResourceActivityState,
+line: ROPE,
+changed: CONDITION,
+stats: Stats
+];
+ResourceActivityState: TYPE = {starting, active, stopping, done, error};
+
+DoIncludes: PROC = TRUSTED MACHINE CODE {
+"*";
+"#include <xr/BasicTypes.h>\n";
+"#include <xr/IncrementalLoad.h>\n";
+"#include <xr/UIO.h>\n";
+"."
+};
+
+LocalStartProfile: UNSAFE PROC [p: ProfileBuffer, size: INT] RETURNS [INT]
+~ UNCHECKED MACHINE CODE {
+"+static word LocalStartProfil (p, s) ptr p; word s; {\n";
+"    return (profil(p, s+1, 0, 2));\n";
+"    };\n";
+".LocalStartProfil";
+};
+
+LocalStopProfile: UNSAFE PROC [p: ProfileBuffer] ~ UNCHECKED MACHINE CODE {
+"+static void LocalStopProfil (p) ptr p; {\n";
+"    (void) profil(p, 0, 0, 0);\n";
+"    };\n";
+".LocalStopProfil";
+};
+
+LocalNextModule: PROC [last: ILSymEntry] RETURNS [ILSymEntry]
+= TRUSTED MACHINE CODE {
+"+static word LocalNextModule (last) word last; {\n";
+"    int skip = 1;\n";
+"    XR_ILSymEntry ilse = ((XR_ILSymEntry) last);\n";
+"    word flags = ILSE_MODULE;\n";
+"    word ignore = IGNORE_NONE;\n";
+"    if (last == 0) skip = 0;\n";
+"    ilse = XR_ILGetMatchingSymEntryByValue(ilse, 0, flags, ignore, skip);\n";
+"    return ((word) ilse);\n";
+"    };\n";
+".LocalNextModule";
+};
+
+LocalNextEntry: PROC [last: ILSymEntry] RETURNS [ILSymEntry]
+= TRUSTED MACHINE CODE {
+"+static word LocalNextEntry (last) word last; {\n";
+"    int skip = 1;\n";
+"    XR_ILSymEntry ilse = ((XR_ILSymEntry) last);\n";
+"    word flags = -1;\n";
+"    word ignore = IGNORE_NONE;\n";
+"    if (last == 0) skip = 0;\n";
+"    ilse = XR_ILGetMatchingSymEntryByValue(ilse, 0, flags, ignore, skip);\n";
+"    return ((word) ilse);\n";
+"    };\n";
+".LocalNextEntry";
+};
+
+ValueFromILSymEntry: PROC [ilse: ILSymEntry] RETURNS [WORD]
+= TRUSTED MACHINE CODE {
+"+static word ValueFromILSymEntry (p) word p; {\n";
+"    XR_ILSymEntry ilse = ((XR_ILSymEntry) p);\n";
+"    return (ilse->ilse_value);\n";
+"    };\n";
+".ValueFromILSymEntry";
+};
+
+TypeFromILSymEntry: PROC [ilse: ILSymEntry] RETURNS [WORD]
+= TRUSTED MACHINE CODE {
+"+static word TypeFromILSymEntry (p) word p; {\n";
+"    XR_ILSymEntry ilse = ((XR_ILSymEntry) p);\n";
+"    return (ilse->ilse_type);\n";
+"    };\n";
+".TypeFromILSymEntry";
+};
+
+SizeFromILSymEntry: PROC [ilse: ILSymEntry] RETURNS [WORD]
+= TRUSTED MACHINE CODE {
+"+static word SizeFromILSymEntry (p) word p; {\n";
+"    XR_ILSymEntry ilse = ((XR_ILSymEntry) p);\n";
+"    return (ilse->ilse_size);\n";
+"    };\n";
+".SizeFromILSymEntry";
+};
+
+SymbolNameFromILSymEntry: PROC [ilse: ILSymEntry] RETURNS [CharPtr]
+= TRUSTED MACHINE CODE {
+"+static word SymbolNameFromILSymEntry (p) word p; {\n";
+"    XR_ILSymEntry ilse = ((XR_ILSymEntry) p);\n";
+"    if (ilse == NIL) return (0);\n";
+"    return ((word) ilse->ilse_name);\n";
+"    };\n";
+".SymbolNameFromILSymEntry";
+};
+
+LeafyCommand: Commander.CommandProc = {
+out: STREAM = cmd.out;
+modCutoff: REAL ¨ defaultModCutoff;
+procCutoff: REAL ¨ 0.0;
+line: ROPE ¨ cmd.commandLine;
+switches: SwitchArray ¨ ALL[FALSE];
+debug: BOOL ¨ FALSE;
+
+DO
+SELECT TRUE FROM
+Rope.Match[" *", line] => line ¨ Rope.Substr[line, 1];
+Rope.Match["-*", line] => {
+pos: INT = Rope.SkipTo[line, 1, " "];
+arg: ROPE = Rope.Substr[line, 0, pos];
+switches ¨ GetSwitches[arg, switches];
+debug ¨ switches['d];
+IF switches['v] THEN modCutoff ¨ defaultModCutoff * 0.5;
+IF switches['a] THEN modCutoff ¨ 0.0;
+line ¨ Rope.Substr[line, MAX[Rope.Length[line], pos+1]];
+};
+ENDCASE => EXIT;
+ENDLOOP;
+
+procCutoff ¨ modCutoff * defaultProcCutoffRatio;
+
+SELECT cmd.procData.clientData FROM
+$Start => {
+act: ResourceActivity = StartResourceWatcher[line];
+msg ¨ "Leafy sampling already running.";
+IF act # NIL THEN {
+msg ¨ "Leafy sampling started.";
+IF act.state = error THEN msg ¨ "-- OOPS! Resource watcher not started!";
+};
+};
+$Stop => {
+act: ResourceActivity = StopResourceWatcher[];
+msg ¨ "Leafy sampling not running.";
+IF act # NIL THEN {
+old: Registration = act.reg;
+WITH old.first.data SELECT FROM
+asd: AcceptSamplesInstance =>
+OutputFromSamples[out, asd, act.stats, act.line, modCutoff, procCutoff, debug];
+ENDCASE;
+msg ¨ NIL;
+};
+};
+$Leafy => {
+asd: AcceptSamplesInstance = AllocSamples[];
+reg: Registration = StartProfiling[AcceptSamples, asd];
+aborted: BOOL ¨ FALSE;
+IF reg = NIL
+THEN {
+msg ¨ "Could not start profiling!";
+FreeSamples[asd];
+GO TO oops;
+}
+ELSE {
+inner: PROC = {
+result ¨ CommanderOps.DoCommand[commandLine: line, parent: cmd];
+};
+stats: Stats = DeltaResource.TakeDelta[inner
+! UNWIND => StopProfiling[reg]; ABORTED => GO TO abort
+];
+StopProfiling[reg];
+OutputFromSamples[out, asd, stats, line, modCutoff, procCutoff, debug];
+EXITS abort => {StopProfiling[reg]; aborted ¨ TRUE};
+};
+IF aborted THEN ERROR ABORTED;
+};
+ENDCASE => ERROR;
+EXITS oops => result ¨ $Failure;
+};
+
+ShowSymsInModuleCommand: Commander.CommandProc = {
+out: STREAM = cmd.out;
+argv: CommanderOps.ArgumentVector = CommanderOps.Parse[cmd
+! CommanderOps.Failed => {msg ¨ errorMsg; GO TO oops}];
+scratch: REF TEXT ¨ RefText.ObtainScratch[60];
+FOR i: NAT IN [1..argv.argc) DO
+arg: ROPE = argv[i];
+text: REF TEXT ¨ RefText.ObtainScratch[Rope.Length[arg]+1];
+text ¨ RefText.AppendRope[text, arg];
+TRUSTED {
+ptr: CharPtr ¨ LOOPHOLE[text, CharPtr] + SIZE[TEXT[0]];
+last: ILSymEntry ¨ NIL;
+DO
+ilse: ILSymEntry ¨ LocalNextModule[last];
+IF ilse = NIL
+THEN {
+IF last = NIL THEN IO.PutF1[out, "No matches for %g\n", [rope[arg]]];
+EXIT;
+}
+ELSE {
+name: CharPtr = SymbolNameFromILSymEntry[ilse];
+modType: WORD = TypeFromILSymEntry[ilse];
+scratch.length ¨ 0;
+scratch ¨ AppendCharStar[scratch, name, '., '_];
+IF RefText.Match[text, scratch, FALSE] THEN
+DO
+name: CharPtr ¨ SymbolNameFromILSymEntry[ilse];
+PutCharStar[out, name];
+IO.PutF1[out, " => val: %g", [cardinal[ValueFromILSymEntry[ilse]]] ];
+IF SizeFromILSymEntry[ilse] # 0 THEN
+IO.PutF1[out, ", size: %g", [cardinal[SizeFromILSymEntry[ilse]]] ];
+IO.PutF1[out, ", type: %g\n", [cardinal[TypeFromILSymEntry[ilse]]] ];
+ilse ¨ LocalNextEntry[ilse];
+IF ilse = NIL THEN EXIT;
+IF TypeFromILSymEntry[ilse] = modType THEN EXIT;
+IO.PutRope[out, "  "];
+ENDLOOP;
+};
+last ¨ ilse;
+ENDLOOP;
+};
+RefText.ReleaseScratch[text];
+ENDLOOP;
+RefText.ReleaseScratch[scratch];
+EXITS oops => result ¨ $Failure;
+};
+
+ShowModulesCommand: Commander.CommandProc = {
+argv: CommanderOps.ArgumentVector = CommanderOps.Parse[cmd
+! CommanderOps.Failed => {msg ¨ errorMsg; GO TO oops}];
+out: STREAM = cmd.out;
+switches: SwitchArray ¨ ALL[FALSE];
+scratch: REF TEXT ¨ RefText.ObtainScratch[60];
+FOR i: NAT IN [1..argv.argc) DO
+arg: ROPE = argv[i];
+text: REF TEXT ¨ RefText.ObtainScratch[Rope.Length[arg]+1];
+text ¨ RefText.AppendRope[text, arg];
+IF Rope.Match["-*", arg]
+THEN switches ¨ GetSwitches[arg, switches]
+ELSE {
+noFilter: BOOL = switches['a];
+each: VisitModules = TRUSTED {
+scratch.length ¨ 0;
+scratch ¨ AppendCharStar[scratch, name, '., '_];
+IF RefText.Match[text, scratch, FALSE] THEN {
+PutCharStar[out, name];
+IF NOT nameOK THEN IO.PutChar[out, '?];
+IO.PutF1[out, " => pc: %g", [cardinal[pc]] ];
+IO.PutF1[out, ", size: %g\n", [cardinal[size]] ];
+};
+};
+ScanModules[each, noFilter];
+};
+RefText.ReleaseScratch[text];
+ENDLOOP;
+RefText.ReleaseScratch[scratch];
+EXITS oops => result ¨ $Failure;
+};
+
+SpinCommand: Commander.CommandProc = {
+argv: CommanderOps.ArgumentVector = CommanderOps.Parse[cmd
+! CommanderOps.Failed => {msg ¨ errorMsg; GO TO oops}];
+out: STREAM = cmd.out;
+start: BasicTime.Pulses = BasicTime.GetClockPulses[];
+pulses: BasicTime.Pulses ¨ 0;
+IF argv.argc # 2 THEN {
+msg ¨ "Usage: Spin <seconds>";
+RETURN;
+};
+{
+arg: ROPE = argv[1];
+seconds: INT ¨ 0;
+FOR i: NAT IN [0..Rope.Length[arg]) DO
+c: CHAR = Rope.Fetch[arg, i];
+SELECT c FROM
+IN ['0..'9] => seconds ¨ seconds * 10 + (c - '0);
+ENDCASE => {msg ¨ "Illegal syntax for number"; GO TO oops};
+IF seconds > LAST[INT]/1000000 THEN {
+msg ¨ "Can't spin accurately for that long";
+GO TO oops;
+}; 
+ENDLOOP;
+pulses ¨ BasicTime.MicrosecondsToPulses[seconds*1000000];
+};
+DO
+now: BasicTime.Pulses = BasicTime.GetClockPulses[];
+IF BasicTime.Pulses[now-start] >= pulses THEN EXIT;
+THROUGH [0..1000) DO Nothing[]; ENDLOOP;
+Process.CheckForAbort[];
+ENDLOOP;
+EXITS oops => result ¨ $Failure;
+};
+
+ScanModules: PROC [visit: VisitModules, noFilter: BOOL ¨ FALSE] = TRUSTED {
+ilse: ILSymEntry ¨ LocalNextModule[NIL];
+lagIlse: ILSymEntry ¨ NIL;
+lagName: CharPtr ¨ NIL;
+lagNameOK: BOOL ¨ FALSE;
+lagPC: WORD ¨ 0;
+lagSize: WORD ¨ 0;
+lagType: WORD ¨ 0;
+DO
+IF ilse = NIL
+THEN {
+IF lagIlse # NIL THEN
+[] ¨ visit[lagIlse, lagName, lagNameOK, lagPC, lagSize, lagType];
+EXIT;
+}
+ELSE {
+name: CharPtr ¨ SymbolNameFromILSymEntry[ilse];
+nameOK: BOOL ¨ MaxNumericCount[name] < 6;
+pc: WORD = ValueFromILSymEntry[ilse];
+size: WORD ¨ SizeFromILSymEntry[ilse];
+type: WORD = TypeFromILSymEntry[ilse];
+IF pc < lagPC THEN ERROR;
+IF pc = 0 OR size > maxValidSize THEN size ¨ 0;
+SELECT TRUE FROM
+lagIlse = NIL => {};
+pc # lagPC, noFilter => {
+continue: BOOL ¨ visit[lagIlse, lagName, lagNameOK, lagPC, lagSize, lagType];
+IF NOT continue THEN EXIT;
+};
+ENDCASE => {
+IF NOT nameOK THEN {
+name ¨ lagName;
+nameOK ¨ lagNameOK;
+};
+SELECT TRUE FROM
+size = 0 => size ¨ lagSize;
+lagSize = 0 => {};
+size > lagSize => size ¨ lagSize;
+ENDCASE;
+};
+lagName ¨ name;
+lagNameOK ¨ nameOK;
+lagPC ¨ pc;
+lagSize ¨ size;
+lagType ¨ type;
+};
+lagIlse ¨ ilse;
+ilse ¨ LocalNextModule[ilse];
+ENDLOOP;
+};
+
+ModulesFromSamples: PROC
+[profList: ProfileEntryList, eachModule: VisitModules, st: STREAM]
+RETURNS [bogusList: ProfileEntryList ¨ NIL] ~ {
+visitModule: VisitModules = TRUSTED {
+lastProcFound: ILSymEntry ¨ NIL;
+limit: CARDINAL = pc+size;
+procHead: ProcEntryList ¨ NIL;
+procTail: ProcEntryList ¨ NIL;
+WHILE profList # NIL DO
+first: RefProfileEntry ¨ profList.first;
+rest: ProfileEntryList = profList.rest;
+fpc: WORD = first.pc;
+fc: CARDINAL = first.count;
+IF rest # NIL AND rest.first.pc = fpc THEN {
+rest.first.count ¨ rest.first.count + fc;
+profList ¨ rest;
+LOOP;
+};
+IF fpc >= limit THEN EXIT;
+{
+lagIlse: ILSymEntry ¨ ilse;
+lagPC: WORD ¨ 0;
+IF fpc < pc THEN GO TO bogus;
+DO
+nextIlse: ILSymEntry = LocalNextEntry[lagIlse];
+IF nextIlse = lagIlse THEN ERROR;
+IF nextIlse # NIL THEN {
+nextPC: WORD = ValueFromILSymEntry[nextIlse];
+IF nextPC IN [pc..limit) THEN
+IF nextPC <= fpc THEN {lagIlse ¨ nextIlse; lagPC ¨ nextPC; LOOP};
+};
+EXIT;
+ENDLOOP;
+IF lagIlse = ilse THEN GO TO bogus;
+IF procTail # NIL AND procTail.first.ilse = lagIlse
+THEN {
+entry: ProcEntry = procTail.first;
+entry.count ¨ entry.count + fc;
+}
+ELSE {
+entry: ProcEntry = NEW[ProcEntryRep ¨ [lagIlse, fc]];
+new: ProcEntryList = LIST[entry];
+IF procTail = NIL THEN procHead ¨ new ELSE procTail.rest ¨ new;
+procTail ¨ new;
+};
+EXITS
+bogus => {
+profList.rest ¨ bogusList;
+bogusList ¨ profList;
+};
+};
+profList ¨ rest;
+ENDLOOP;
+procHead ¨ SortProcEntriesByCount[procHead];
+RETURN [eachModule[ilse, name, nameOK, pc, size, type, procHead]];
+};
+ScanModules[visitModule];
+WHILE profList # NIL DO
+first: RefProfileEntry ¨ profList.first;
+rest: ProfileEntryList ¨ profList.rest;
+IF rest # NIL AND first.pc = rest.first.pc THEN {
+rest.first.count ¨ rest.first.count + first.count;
+profList ¨ rest;
+LOOP;
+};
+profList.rest ¨ bogusList;
+bogusList ¨ profList;
+profList ¨ rest;
+ENDLOOP;
+RETURN [bogusList];
+};
+
+SortProfileEntries: PROC [list: ProfileEntryList] RETURNS [ProfileEntryList] = TRUSTED {
+list ¨ LOOPHOLE[List.Sort[LOOPHOLE[list, List.LORA], CompareProfileEntries]];
+RETURN [list];
+};
+
+CompareProfileEntries: List.CompareProc = {
+WITH ref1 SELECT FROM
+ent1: RefProfileEntry =>
+WITH ref2 SELECT FROM
+ent2: RefProfileEntry => {
+SELECT ent1.pc FROM
+< ent2.pc => RETURN [less];
+> ent2.pc => RETURN [greater];
+ENDCASE => RETURN [equal];
+};
+ENDCASE;
+ENDCASE;
+ERROR;
+};
+
+SortProcEntriesByCount: PROC
+[list: ProcEntryList] RETURNS [ProcEntryList] = TRUSTED {
+list ¨ LOOPHOLE[List.Sort[LOOPHOLE[list, List.LORA], CompareProcEntriesByCount]];
+RETURN [list];
+};
+
+CompareProcEntriesByCount: List.CompareProc = {
+WITH ref1 SELECT FROM
+ent1: ProcEntry =>
+WITH ref2 SELECT FROM
+ent2: ProcEntry => {
+SELECT ent1.count FROM
+< ent2.count => RETURN [greater];
+> ent2.count => RETURN [less];
+ENDCASE => RETURN [equal];
+};
+ENDCASE;
+ENDCASE;
+ERROR;
+};
+
+SortModuleEntriesByCount: PROC
+[list: ModuleEntryList] RETURNS [ModuleEntryList] = TRUSTED {
+list ¨ LOOPHOLE[List.Sort[LOOPHOLE[list, List.LORA], CompareModuleEntriesByCount]];
+RETURN [list];
+};
+
+CompareModuleEntriesByCount: List.CompareProc = {
+WITH ref1 SELECT FROM
+ent1: ModuleEntry =>
+WITH ref2 SELECT FROM
+ent2: ModuleEntry => {
+SELECT ent1.count FROM
+< ent2.count => RETURN [greater];
+> ent2.count => RETURN [less];
+ENDCASE => RETURN [equal];
+};
+ENDCASE;
+ENDCASE;
+ERROR;
+};
+
+PutCharStar: UNSAFE PROC
+[out: STREAM, ptr: CharPtr, stop: CHAR ¨ 0c, skipLead: CHAR ¨ 0c] = UNCHECKED {
+i: NAT ¨ LOOPHOLE[ptr, CARDINAL] MOD UNITS[WORD];
+base: CharPtr = LOOPHOLE[LOOPHOLE[ptr, CARDINAL] - i, CharPtr];
+output: NAT ¨ 0;
+IF base # NIL THEN
+DO
+c: CHAR = base[i];
+IF c = 0c THEN EXIT;
+IF c = skipLead AND skipLead # 0c AND output = 0 THEN {i ¨ i + 1; LOOP};
+IF c = stop THEN EXIT;
+IO.PutChar[out, c];
+i ¨ i + 1;
+output ¨ output + 1;
+ENDLOOP;
+IF output = 0 THEN IO.PutRope[out, "??"];
+};
+
+AppendCharStar: UNSAFE PROC
+[text: REF TEXT, ptr: CharPtr, stop: CHAR ¨ 0c, skipLead: CHAR ¨ 0c]
+RETURNS [REF TEXT] = UNCHECKED {
+i: NAT ¨ LOOPHOLE[ptr, CARDINAL] MOD UNITS[WORD];
+base: CharPtr = LOOPHOLE[LOOPHOLE[ptr, CARDINAL] - i, CharPtr];
+output: NAT ¨ 0;
+IF base # NIL THEN
+DO
+c: CHAR = base[i];
+IF c = 0c THEN EXIT;
+IF c = skipLead AND skipLead # 0c AND output = 0 THEN {i ¨ i + 1; LOOP};
+IF c = stop THEN EXIT;
+text ¨ RefText.AppendChar[text, c];
+i ¨ i + 1;
+output ¨ output + 1;
+ENDLOOP;
+RETURN [text];
+};
+
+MaxNumericCount: UNSAFE PROC [ptr: CharPtr] RETURNS [NAT] = UNCHECKED {
+i: NAT ¨ LOOPHOLE[ptr, CARDINAL] MOD UNITS[WORD];
+base: CharPtr = LOOPHOLE[LOOPHOLE[ptr, CARDINAL] - i, CharPtr];
+max: NAT ¨ 0;
+count: NAT ¨ 0;
+IF base # NIL THEN
+DO
+c: CHAR = base[i];
+SELECT c FROM
+IN ['0..'9] => {
+count ¨ count + 1;
+IF count > max THEN max ¨ count;
+};
+0c => EXIT;
+ENDCASE => count ¨ 0;
+i ¨ i + 1;
+ENDLOOP;
+RETURN [max];
+};
+
+AcceptSamples: EnumSamplesProc = {
+WITH data SELECT FROM
+asd: AcceptSamplesInstance => IF pc # 0 THEN {
+nextIndex: [0..maxAcceptSamples] ¨ asd.nextIndex;
+asd.samples[nextIndex] ¨ [pc: pc, count: count];
+nextIndex ¨ nextIndex + 1;
+asd.nextIndex ¨ nextIndex;
+IF nextIndex = maxAcceptSamples-1 THEN {
+next: AcceptSamplesInstance ¨ AllocSamples[];
+next≠ ¨ asd≠;
+asd.link ¨ next;
+asd.samples ¨ ALL [ [0, 0] ];
+asd.nextIndex ¨ 0;
+};
+};
+ENDCASE;
+};
+
+AllocSamples: ENTRY PROC RETURNS [AcceptSamplesInstance] = {
+new: AcceptSamplesInstance ¨ freeSamples;
+IF new = NIL
+THEN new ¨ NEW[AcceptSamplesInstanceRep]
+ELSE freeSamples ¨ new.link;
+RETURN [new];
+};
+
+FreeSamples: ENTRY PROC [asd: AcceptSamplesInstance] = {
+WHILE asd # NIL DO
+link: AcceptSamplesInstance = asd.link;
+asd.link ¨ freeSamples;
+freeSamples ¨ asd.link;
+asd ¨ link;
+ENDLOOP;
+};
+
+StartProfiling: ENTRY PROC [proc: EnumSamplesProc, data: REF] RETURNS [Registration] = {
+RETURN [StartProfilingInternal[proc, data]];
+};
+
+StartProfilingInternal: INTERNAL PROC
+[proc: EnumSamplesProc, data: REF] RETURNS [Registration] = {
+IF proc # NIL THEN {
+new: Registration = CONS [[state: waitingActive, proc: proc, data: data], registry];
+registry ¨ new;
+IF masterProfile = NIL THEN {
+globalGen ¨ globalGen + 1;
+Process.Detach[FORK ProfileWatcher[globalGen]];
+};
+WHILE new.first.state = waitingActive DO
+InternalDumpAndWait[];
+ENDLOOP;
+RETURN [new];
+};
+RETURN [NIL];
+};
+
+StopProfiling: ENTRY PROC [reg: Registration] = {
+StopProfilingInternal[reg];
+};
+
+StopProfilingInternal: INTERNAL PROC [reg: Registration] = {
+IF reg # NIL AND reg.first.state = active THEN {
+lag: Registration ¨ NIL;
+reg.first.state ¨ waitingDead;
+IF reg = specialRegistration THEN specialRegistration ¨ NIL;
+WHILE reg.first.state = waitingDead DO
+InternalDumpAndWait[];
+ENDLOOP;
+reg.first.proc ¨ NIL;
+FOR each: Registration ¨ registry, each.rest WHILE each # NIL DO
+IF reg = each THEN TRUSTED {
+IF lag = NIL THEN registry ¨ each.rest ELSE lag.rest ¨ each.rest;
+EXIT;
+};
+lag ¨ each;
+ENDLOOP;
+{
+prof: ProfileBuffer ¨ masterProfile;
+IF prof # NIL THEN TRUSTED {
+LocalStopProfile[prof];
+masterProfile ¨ NIL;
+};
+};
+};
+};
+
+InternalDumpAndWait: INTERNAL PROC = {
+dumpWanted ¨ TRUE;
+BROADCAST dumpRequest;
+WHILE dumpWanted OR dumpBusy DO WAIT dumpFinish; ENDLOOP;
+};
+
+FinishDumpAndWait: ENTRY PROC = {
+dumpBusy ¨ FALSE;
+BROADCAST dumpFinish;
+IF NOT dumpWanted THEN WAIT dumpRequest;
+dumpWanted ¨ FALSE;
+dumpBusy ¨ TRUE;
+};
+
+ProfileWatcher: PROC [gen: INT] = TRUSTED {
+startIndex: NAT ¨ 0;
+profRep: ProfileBufferRep ¨ [maxEntries, 0, ALL[ [0, 0] ]];
+prof: ProfileBuffer ¨ @profRep;
+IF masterProfile # NIL THEN RETURN;
+IF LocalStartProfile[prof, SIZE[ProfileBufferRep]] < 0 THEN RETURN;
+masterProfile ¨ prof;
+Process.SetTimeout[@dumpRequest, Process.MsecToTicks[dumpRequestMillis]];
+DO
+FinishDumpAndWait[];
+IF prof # masterProfile OR gen # globalGen THEN EXIT;
+THROUGH [0..maxEntries] DO
+pc: WORD = prof.entries[startIndex].pc;
+count: WORD = prof.entries[startIndex].count;
+IF pc # 0 OR count # 0 THEN {
+prof.entries[startIndex].pc ¨ 0;
+prof.entries[startIndex].count ¨ 0;
+FOR each: Registration ¨ registry, each.rest WHILE each # NIL DO
+SELECT each.first.state FROM
+active, waitingDead => {
+proc: EnumSamplesProc = each.first.proc;
+data: REF = each.first.data;
+IF proc # NIL THEN proc[pc: pc, count: count, data: data];
+};
+ENDCASE;
+ENDLOOP;
+};
+startIndex ¨ IF startIndex = maxEntries THEN 0 ELSE startIndex + 1;
+ENDLOOP;
+FOR each: Registration ¨ registry, each.rest WHILE each # NIL DO
+SELECT each.first.state FROM
+waitingActive => each.first.state ¨ active;
+waitingDead => each.first.state ¨ dead;
+ENDCASE;
+ENDLOOP;
+ENDLOOP;
+};
+
+Nothing: PROC = {};
+
+ShowPercent: PROC [st: STREAM, count: CARDINAL, perc: REAL, suffix: ROPE ¨ NIL] = {
+IO.PutF1[st, "%g ", [cardinal[count]] ];
+IO.PutF1[st, "(%4.2f%%)", [real[perc]] ];
+IF suffix # NIL THEN IO.PutRope[st, suffix];
+};
+
+StartResourceWatcher: ENTRY PROC [line: ROPE] RETURNS [act: ResourceActivity] = {
+IF resourceActivity = NIL THEN {
+act: ResourceActivity = NEW[ResourceActivityRep];
+act.state ¨ starting;
+act.line ¨ line;
+Process.Detach[FORK ResourceWatcher[act]];
+resourceActivity ¨ act;
+WHILE act.state = starting DO WAIT act.changed; ENDLOOP;
+RETURN [act];
+};
+RETURN [NIL];
+};
+
+ResourceWatcher: PROC [act: ResourceActivity] = {
+entryResourceWatcher: ENTRY PROC = {
+act.reg ¨ StartProfilingInternal[AcceptSamples, asd];
+IF act.reg = NIL
+THEN act.state ¨ error
+ELSE {
+act.state ¨ active;
+BROADCAST act.changed;
+act.stats ¨ DeltaResource.TakeDelta[internalResourceWatcher];
+act.state ¨ done;
+};
+BROADCAST act.changed;
+};
+internalResourceWatcher: INTERNAL PROC = {
+WHILE act.state = active DO WAIT act.changed; ENDLOOP;
+};
+asd: AcceptSamplesInstance = AllocSamples[];
+entryResourceWatcher[];
+IF act.state = error THEN FreeSamples[asd];
+};
+
+StopResourceWatcher: ENTRY PROC RETURNS [ResourceActivity] = {
+act: ResourceActivity ¨ resourceActivity;
+IF act # NIL THEN {
+StopProfilingInternal[act.reg];
+resourceActivity ¨ NIL;
+act.state ¨ stopping;
+BROADCAST act.changed;
+WHILE act.state # done DO WAIT act.changed; ENDLOOP;
+};
+RETURN [act];
+};
+
+GetSwitches: PROC [arg: ROPE, old: SwitchArray] RETURNS [SwitchArray] = {
+switches: SwitchArray ¨ old;
+IF Rope.Match["-*", arg] THEN {
+sense: BOOL ¨ TRUE;
+FOR i: NAT IN [1..Rope.Length[arg]) DO
+c: CHAR = Rope.Fetch[arg, i];
+SELECT c FROM
+IN ['a..'z] => switches[c] ¨ sense;
+IN ['A..'Z] => switches[c+('a - 'A)] ¨ sense;
+'~ => {sense ¨ NOT sense; LOOP};
+ENDCASE;
+sense ¨ TRUE;
+ENDLOOP;
+};
+RETURN [switches];
+};
+
+ListFromSamples: PROC [asd: AcceptSamplesInstance] RETURNS [ProfileEntryList] = {
+procList: ProfileEntryList ¨ NIL;
+FOR next: AcceptSamplesInstance ¨ asd, next.link WHILE next # NIL DO
+FOR i: [0..maxAcceptSamples) IN [0..next.nextIndex) DO
+sample: ProfileEntry = next.samples[i];
+new: RefProfileEntry ¨ NEW[ProfileEntry ¨ [pc: sample.pc, count: sample.count]];
+procList ¨ CONS[new, procList];
+ENDLOOP;
+ENDLOOP;
+procList ¨ SortProfileEntries[procList];
+FreeSamples[asd];
+RETURN [procList];
+};
+
+OutputFromSamples: PROC
+[out: STREAM, asd: AcceptSamplesInstance, stats: Stats, line: ROPE,
+ modCutoff: REAL, procCutoff: REAL, debug: BOOL ¨ FALSE] = {
+totalProcs: NAT ¨ 0;
+totalCount: CARDINAL ¨ 0;
+modules: NAT ¨ 0;
+eachModule: VisitModules = {
+IF list # NIL THEN {
+first: ProcEntry = list.first;
+mc: CARDINAL ¨ 0;
+entry: ModuleEntry = NEW[ModuleEntryRep ¨ [
+ilse: ilse,
+name: name, nameOK: nameOK,
+pc: pc, size: size, type: type,
+count: 0,
+procs: list]];
+WHILE list # NIL DO
+first: ProcEntry = list.first;
+fc: CARDINAL = first.count;
+list ¨ list.rest;
+mc ¨ mc + fc;
+totalCount ¨ totalCount + fc;
+totalProcs ¨ totalProcs + 1;
+ENDLOOP;
+entry.count ¨ mc;
+modList ¨ CONS[entry, modList];
+modules ¨ modules + 1;
+};
+};
+modList: ModuleEntryList ¨ NIL;
+modSkipped: CARDINAL ¨ 0;
+modCountSkipped: CARDINAL ¨ 0;
+tryCutoff: BOOL ¨ modCutoff > 0.0;
+bogusList: ProfileEntryList ¨ ModulesFromSamples[
+ListFromSamples[asd],
+eachModule,
+IF debug THEN out ELSE NIL];
+toPercent: REAL = 100.0/totalCount;
+modList ¨ SortModuleEntriesByCount[modList];
+IO.PutF1[out, "-- Leafy output on %g for\n", [time[BasicTime.Now[]]] ];
+IO.PutF1[out, "  -- %g", [rope[line]]];
+IO.PutF1[out, "-- Elapsed seconds: %5.3f", [real[stats.elapsed]]];
+IO.PutF1[out, ", bytes allocated: %g", [cardinal[stats.bytesAllocated]] ];
+IO.PutF1[out, ", utime: %5.3f", [real[stats.utime]] ];
+IO.PutF1[out, ", stime: %5.3f\n", [real[stats.stime]] ];
+IO.PutF1[out, "-- Total count: %g", [cardinal[totalCount]] ];
+IO.PutF1[out, ", modules with counts: %g", [cardinal[modules]] ];
+IO.PutF1[out, ", procs with counts: %g\n", [cardinal[totalProcs]] ];
+modules ¨ 0;
+FOR each: ModuleEntryList ¨ modList, each.rest WHILE each # NIL DO
+me: ModuleEntry = each.first;
+mc: CARDINAL = me.count;
+list: ProcEntryList ¨ me.procs;
+modPerc: REAL = mc*toPercent;
+procSkipped: CARDINAL ¨ 0;
+countSkipped: CARDINAL ¨ 0;
+showProcs: BOOL ¨ TRUE;
+IF tryCutoff AND (modPerc < modCutoff OR mc < 2)
+THEN {
+modSkipped ¨ modSkipped + 1;
+modCountSkipped ¨ modCountSkipped + mc;
+showProcs ¨ FALSE;
+}
+ELSE TRUSTED {
+ShowPercent[out, mc, modPerc, ": "];
+PutCharStar[out, me.name, '., '_];
+IO.PutF1[out, ", startPC: %g", [cardinal[me.pc]] ];
+IO.PutF1[out, ", size: %g\n", [cardinal[me.size]] ];
+};
+WHILE list # NIL DO
+pe: ProcEntry = list.first;
+procName: CharPtr = SymbolNameFromILSymEntry[pe.ilse];
+count: CARDINAL = pe.count;
+procPerc: REAL = count*toPercent;
+list ¨ list.rest;
+IF showProcs THEN {
+IF tryCutoff
+AND (procPerc < procCutoff OR count < 2)
+AND (procSkipped # 0 OR list # NIL)
+THEN {
+procSkipped ¨ procSkipped + 1;
+countSkipped ¨ countSkipped + count;
+}
+ELSE TRUSTED {
+IO.PutRope[out, "    "];
+ShowPercent[out, count, procPerc, ": "];
+PutCharStar[out, procName, 0c, '_];
+IO.PutRope[out, "\n"];
+};
+};
+ENDLOOP;
+IF showProcs AND procSkipped # 0 THEN {
+IO.PutF1[out, "    -- procs skipped: %g, counts skipped: ", [cardinal[procSkipped]] ];
+ShowPercent[out, countSkipped, countSkipped*toPercent, "\n"];
+};
+modules ¨ modules + 1;
+ENDLOOP;
+IF modSkipped # 0 THEN {
+IO.PutF1[out, "-- Modules not shown: %g, counts not shown: ", [cardinal[modSkipped]] ];
+ShowPercent[out, modCountSkipped, modCountSkipped*toPercent, "\n"];
+};
+IF bogusList # NIL THEN {
+bogusCount: CARDINAL ¨ 0;
+IF debug THEN {
+bogusList ¨ SortProfileEntries[bogusList];
+IO.PutRope[out, "-- Bogus:"];
+};
+FOR each: ProfileEntryList ¨ bogusList, each.rest WHILE each # NIL DO
+first: RefProfileEntry = each.first;
+bogusCount ¨ bogusCount + first.count;
+IF debug THEN {
+IO.PutF1[out, " %g", [cardinal[first.pc]]];
+IF first.count # 1 THEN
+IO.PutF1[out, "(%g)", [cardinal[first.count]]];
+};
+ENDLOOP;
+IF debug THEN IO.PutChar[out, '\n];
+IO.PutF1[out, "-- Bogus count: %g\n", [cardinal[bogusCount]]];
+};
+};
+
+DoIncludes[];
+
+Commander.Register[
+"Leafy", LeafyCommand,
+"takes a leafy sample of the command (-a: all, -v: verbose)",
+$Leafy,
+FALSE];
+
+Commander.Register[
+"ShowSymsInModule", ShowSymsInModuleCommand,
+"show the symbols in a given module",
+$Leafy,
+TRUE];
+
+Commander.Register[
+"ShowModules", ShowModulesCommand,
+"show the loaded modules",
+$Leafy,
+TRUE];
+
+Commander.Register[
+"StartLeafy", LeafyCommand,
+"start leafy sampling",
+$Start,
+TRUE];
+
+Commander.Register[
+"StopLeafy", LeafyCommand,
+"stop leafy sampling & print results (-a: all, -v: verbose)",
+$Stop,
+TRUE];
+
+Commander.Register[
+"Spin", SpinCommand,
+"spin for a given number of seconds",
+$Leafy,
+TRUE];
+
+
+END.
+
+   ò  
+LeafySampleCommand.mesa
+Copyright ” 1990, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Russ Atkinson (RRA) December 27, 1991 3:29 pm PST
+Global variables & interesting constants
+At current rates, this gives us enough space for at least 20 seconds of samples
+
+This allows us up to four intervals to transfer the samples
+
+Arbitrary validity bound on module text sizes
+Types
+Equivalent to Unix (char *), but be careful about alignment
+Callback proc type.
+
+C access procedures
+NOTE: should be changed when PCR is fixed to:
+"    return (XR_Profil(p, s+1, 0, 2));\n";
+NOTE: should be changed when PCR is fixed to:
+"    (void) XR_Profil(p, 0, 0, 0);\n";
+Command procedures
+[cmd: Handle] RETURNS [result: REF _ NIL, msg: ROPE _ NIL]
+CommandObject = [
+in, out, err: STREAM, commandLine, command: ROPE,
+propertyList: List.AList, procData: CommandProcHandle]
+[cmd: Handle] RETURNS [result: REF _ NIL, msg: ROPE _ NIL]
+CommandObject = [
+in, out, err: STREAM, commandLine, command: ROPE,
+propertyList: List.AList, procData: CommandProcHandle]
+[cmd: Handle] RETURNS [result: REF _ NIL, msg: ROPE _ NIL]
+CommandObject = [
+in, out, err: STREAM, commandLine, command: ROPE,
+propertyList: List.AList, procData: CommandProcHandle]
+[cmd: Handle] RETURNS [result: REF _ NIL, msg: ROPE _ NIL]
+CommandObject = [
+in, out, err: STREAM, commandLine, command: ROPE,
+propertyList: List.AList, procData: CommandProcHandle]
+Iteration procedures
+This procedure iterates through the "modules" in the world, calling visit for each valid module.  If noFilter = TRUE, then the information is presented exactly as it is in the basic load state as reflected in IncrementalLoad.h.  If noFilter = FALSE, then we try to synthesize the information about the modules so that module names and sizes are reasonable.
+Alan promised that this would not happen!
+This size does not look very nice, so cancel it
+Same pc, so try to collapse the lagging info and the current info together to come up with a synthesis that has a valid name and a valid size.
+This name is not OK, so preserve the previous name
+Note: if st # NIL then debug output goes to st
+Collapse the counts for equal PCs
+We are no longer in the right module, so return to get the next one
+Add this one to the bogus list
+This should not happen!
+No containing procedure found!
+This just adds to the current procedure
+At this point we are going to exit the module, so yield the results for this module.  This is true even for modules that have no entries.
+Splice the rest of the profList onto the bogus list
+Collapse the counts
+Sorting procedures
+Unix string procedures
+Sampling procedures
+Make a new bunch of samples
+ProfileWatcher scans the profile buffer every few seconds and reads out the samples deposited since the last time.  As the samples are read, the slots are cleared, and each sample is given to the registered callback routines.  There is no checking for lost samples.
+We put the profile buffer on the process atsck to avoid unfortunate interactions with the virtual dirty but mechanism in the garbage collector.
+Utility procedures
+ListFromSamples destructively reads the structure produced by AcceptSamples and returns a list of <pc, count> pairs, sorted by increasing pc.  The client must not use the old AcceptSamplesInstance instance after this call.
+Some counts found in this module
+Don't bother to show this module, it's not significant
+Don't show this procedure
+We noticed some bogus pc values, so print them out
+Initialization
+ù '?  ñ(cedarcode) styleïNewlineDelimiter
+ô headöœnôIcodeöú
+œeú=ôHLô1óò öœk	ò	Löú;üúò\óóöùúüúüò!Löüú4üúò[LöúüòLò óñ2.2 in tabStopsô(Lñ2.2 in tabStopsöúü	úòLñ2.2 in tabStopsöúü	úòLñ2.2 in tabStopsöúüúüúòLñ2.2 in tabStopsöú
+üúüúòLöúüúòLöú%üúò)Lò Löú$üúò(Löú%üúò)Lò LöúüúòLöúüúò$Lò öúüú
+òLöú1œbúôOLô óñ2.2 in tabStopsöúüúò+Lñ2.2 in tabStopsô;Lñ2.2 in tabStopsô óöúüúò%Lò óöúüúò!Lô-óóôLöüúüúüúòLöüúüúüúüúòLò öú	üúüúüúò+Lô;óLò Löú	üúò&Lñ2.2 in tabStopsöúüúò$Lñ2.2 in tabStopsöúüúò"Lñ2.2 in tabStopsò ñ2.2 in tabStopsöúüúüúòLñ2.2 in tabStopsò óLöúüúüúüúò/öúüúüúò"LöúòLöúòLöúüúòóöúüú.òELò óöúüúüúüú	üúüúòDLôLô óLöúüúò#öúüúòLò óLöúüúüúüúò1Löúüúüúò)öúüúüúòLöúüúòLöúüòLòóLöúüúüúüúò2öúüúüúò!Löú
+üúòLöúüúòLöú	üúüúò0Lò óLöúüúüúò;öúüúüúò)Löúüúò"Lò%Löú	üúüúò4LòLò óLöúüúüúüúò-Löúüúüúò-öúüúüúò"LöúüúòLöúüúò	LöúüúòLò óLöúüúüú+üúüúüúüúüúüúüúüúò¨Lò Löúüúüúüúò(Löúüúüúò#öúüúüúòLöúòLöúüòLòLò óLöúüúüúüúò,Löúüúüúò'öúüúüúòLöúòLöúüúòLöúüúüúüúò%LöúüúòLöúòLòóLò Löúüúüúüúüúüúò5Löúüúüú
+ò"Lò Löúüúüúò1öúüúüúò$LòLöúòLöúüúòLöú	ü	úòLöúòLòóLöúüú-òHLò óôö
+ù
+úüúüúüúüúò)LöúòLöúòLöú$ò$LöúòLòLòLò óöùúüúüúüúüúüúü	úüúüúòeLöú:ò:öú†úò'ô-Löú*ô*óóLöúòLöúòLòLò óöùúüúüúü	úüúüúòKLöú.ò.öú†úò#Lô-Löú&ô&óLöúòLöúòLòLò óöùúüúüúüúüúüúòVLöú5ò5LöúòLöú5ò5Löú"ò"Löú#ò#Löú!ò!LöúNòNLöúòLöúòLöúòLòLò óöùúüúüúüúüúüúòULöú4ò4LöúòLöú5ò5LöúòLöú#ò#Löú!ò!LöúNòNLöúòLöúòLöúòLòLò óöùúüúüúüúüúüúüúòTLöú3ò3Löú2ò2Löú#ò#LöúòLöúòLòLò óöùúüúüúüúüúüúüúòSLöú2ò2Löú2ò2Löú"ò"LöúòLöúòLòLò óöùúüúüúüúüúüúüúòSLöú2ò2Löú2ò2Löú"ò"LöúòLöúòLòLò óöùúüúüúüúüúüúò\Löú8ò8Löú2ò2Löú%ò%Löú)ò)LöúòLöúòLòLò óóôöùúò'Löúüú
+üúüúüúüúô:öúôLöúüúüúô1Löú6ô6óLöúüúòLöúüúò#LöúüúòLöúüúòLöúüúüúò#LöúüúüúòLò öüòöüúüúüòLò6òLöúüúò%Löúüúò&Lò&LòLöüúüú$ò8Löüúüúò%Löúüúò8LòóLöüúüúòóLöüúòóLò Lò0Lò öüúüò#òLöú3ò3Lò(öüúüúüúòLò Löüúüú0òILòóLòóò
+Löú.ò.Lò$öüúüúüúòLöúòöüúüúüòöúòLöúOòOóLöüúòóLöúüúò
+LòóLòóòLöú,ò,Löú7ò7Löú	üúüúòöüúüòöüúòLò#LòLöüúüúòLòóöüúòöúüúòLò@Lòóöú,ò,Lö	úüúüúüúüúò6LöúòóLöúòLöúGòGLöüú)üúò4LòóóLöüú	üúüúüúòLòóLöüúüúòóLöüúò LòLò óöùúò2Löúüú
+üúüúüúüúô:öúôLöúüúüúô1Löú6ô6óLöúüúòöú:ò:Löú*üúüúò7óLöú	üúüúò.öüúüúüúüòLöúüúòLöúüúüú-ò;Lò%öüúò	Löúüúüúüúò7LöúüúòöüòLò)öüúüòöüúòLöüúüúüúüú0òELöüúòLòóöüúòLöú/ò/Löú	üúò)LòLò0öüúüúüò+öüòLò/LöúòLöüúCòEöüúüò$LöüúAòCóLöüúCòELòLöüúüúüúüúòLöüú$üúüúò0LöüúòLöüúòóóLòóóLòLöüúòóLòóLöúòLöüúòóLöú ò Löüúò LòLò óöùúò-Löúüú
+üúüúüúüúô:öúôLöúüúüúô1Löú6ô6óöú:ò:Löú*üúüúò7óLöúüúòLöúüúüúò#Löú	üúüúò.öüúüúüúüòLöúüúòLöúüúüú-ò;Lò%öüúòLöüú&ò*öüúòLöú
+üúòöúüúòLòLò0öüúüúüúò-LöúòLöüúüúüúüúò'Löüú+ò-Löüú/ò1LòóLòóLöúòLòóóLöúòLöüúòóLöú ò Löüúò LòLò óöùúò&Löúüú
+üúüúüúüúô:öúôLöúüúüúô1Löú6ô6óöú:ò:Löú*üúüúò7óLöúüúòLöú5ò5LòöüúüúòLòLöüúòLòóòLöúüúòLöú	üúòöüúüúüúüò&LöúüúòöüúüòLöüú/ò1Löüú(üúüúò;óöüúüúüú
+üúò%Lò,LöüúüúòLöúòóLöüúòóLò9LòóöüòLöú3ò3Löüú'üúüúò3Löüúüúüúò(LòLöüúòóLöüúò LòLò óóôö
+ùúüú!üúüúüúòKLöú‰ô‰Löú#üúò(LöúüúòLöúüúòLöúüúüúòLöúüúòLöú	üúòLöú	üúòöüòöüúüòöüúòöüúüúüòLòAóLöüúòLòóöüúòLò/Löúüúò)Löúüúò%Löúüúò&Löúüúò&öüúüúüúòLô)óöüúüúüú
+ò/Lô/óöüúüúüòLöú
+üúòöúòLöú
+üú?òMLöüúüú
+üúüúòLòóöüúòLôéöüúüúüúòLô2LòLòLöúòóöüúüúüòLòLòLò!LöüúòóLòóóLòLòLòLòLòLòóóLòLòLöüúòóLòLò óö
+ùúüú<üúüú üúòãLô.öúüúò%Löúüúò LöúüúòLöúüúòLöúüúòöüúüúüòLò(Löú'ò'LöúüúòLöúüúòöüúüúüúüúò,Lô!Lò)LòLöüúòLòóöüúüúüúòLôCóòLòLöúüúòöüú
+üúüúüúòLôóöüòLöú/ò/öüúüúüúò!LôóöüúüúüúòLöúüú!ò-öüúüúüòLöüúüú&üúòAóLòóLöüúòLöüúòóöüúüúüúüúò#Lôóöüúüúüúò3öüúòLô'Löú"ò"LòLòóöüúòLöúüúò5Löúüúò!Löüúüúüúüúò?LòLòóóöüòöú
+ò
+LòLòLòóóLòóLòLöüúòóLôâLò,Löüú<òBLòóLöúòöüúüúüòLô3Lò(Lò'öüúüúüúüúò1LôLò2LòLöüúòLòóLòLòLòLöüúòóLöüúòLòLò óóôöùúüúüúüúòXLöúüúüúüúòMLöüúòLòLò óöùúò+öüúüúüòöúòöüúüúüòöúòöüú	üòLöúüúòLöúüúòLöüúüú	òóLòóLöüúòóóLöüúòóLöüúòLòLò óöùúüúüúüúòVLöúüúüúüúòQLöüúòLòLò óöùúò/öüúüúüòöúòöüúüúüòöúòöüúüòLöúüúò!LöúüúòLöüúüú	òóLòóLöüúòóóLöüúòóLöüúòLòLò óöùúüúüúüúò\Löúüúüúüú!òSLöüúòLòLò óöùúò1öüúüúüòöúòöüúüúüòöúòöüúüòLöúüúò!LöúüúòLöüúüú	òóLòóLöüúòóóLöüúòóLöüúòLòLò óóôöùúüúüúüúüúüú	ü	úòhLöúüúüúüúüúüúüúò1Löúüúüúüúò?LöúüúòöüúüúüòöüòLöúüúòLöüúüúüúòLö
+üúüúüúüúüúòHLöüú
+üúüúòLöüúòLò
+LòLöüúòóóLöüúüúüúò)LòLò óöùúüúüúüúüúüúüúüúüúüúü	úòÅLöúüúüúüúüúüúüúò1Löúüúüúüúò?LöúüúòöüúüúüòöüòLöúüúòLöüúüúüúòLö
+üúüúüúüúüúòHLöüú
+üúüúòLò#Lò
+LòLöüúòóóLöüúòLòLò óöùúüúüúüúüúü	úòGLöúüúüúüúüúüúüúò1Löúüúüúüúò?LöúüúòLöúüúòöüúüúüòöüòLöúüúòöüúüòöüúòLòLöüúüúò LöúòóLöúüúòóLöüúòLò
+LöüúòóóLöüúòLòLò óóôöùúò"öüúüúüòöúüúüúò.Lò1Lò0LòLòöüú üúò(LôLò-LòLòLöúüúòLòLòóLòóLöüúòóLòLò óöùúüúüúüúò<Lò)öüúüòLöüúüúò(LöüúòóLöüúòLòLò óöùúüúüú!ò8öüúüúüòLöú'ò'LòLòLòLöüúòóLòLò óö
+ùúüúüúüúüúòXLöüú&ò,LòLò óö
+ùúüúüúüúüúòcöüúüúüúòLöúüú<òTLòöüúüúüúòLòLöúüúò/Lòóöüú!üò(LöúòLöüúòóLöüúòLòóLöüúüúòLòLò óöùúüúüúò1LöúòLòLò óöùúüúüúò<öüúüúüúüúò0LöúüúòLòLöüúüúüúò<öüúüò&LöúòLöüúòóLöúüúòöüú*üúüúüò@öüúüúüúòLöüúüúüúüúòALöüúòLòóLòLöüúòóòLò$öüúüúüúüúòLöúòLöúüúòLòóLòóLòóLòLò óöùúüúüúò&LöúüúòLöü	úòLö
+üúüú
+üúüúüúò9LòLò óöùúüúüúò!LöúüúòLöü	úòLöüúüúüúüúò(LöúüúòLöúüúòLòLò óöùúüúüúüúò+LöúâôâLöúüúòöú,üúò;LôèóLòLöüúüúüúüúò#LöüúüúüúüúòCLòLöúIòIöüòLöúòLöüúüúüúüúò5öüúüòLöúüúò'Löúüú"ò-öüúüúüúòLò Lò#öüú*üúüúüò@öüúüòòLöú(ò(LöúüúòLöüúüúüú(ò:LòóLöüúòóLöüúòóLòóLöúüúüúüúòCLöüúòóöüú*üúüúüò@öüúüòLò+Lò'LöüúòóLöüúòóLöüúòóLòLò óóôöùúüúòLò óöùúüúüú	üúüú
+üúüúòSLöüú&ò(Löüú'ò)Löüú
+üúüúüúò,LöúòLò óö
+ùúüúüúüúüúòQöüúüúüúò Löúüúò1LòLòLöúüúò*LòLöüúüúüúüúò8LöüúòLòóLöüúüúòLòLò óöùúüúò1öúüúüúò$Lò5öüúüòLöüúòöüúòLòLöü	úòLò=LòLòóóLöü	úòLòóöúüúüúò*Löüúüúüúüúò6LòóLöú,ò,LöúòLöüúüúò+LòLò óöùúüúüúüúò>Lò)öüúüúüúòLöúòLöúüúòLòLöü	úòLöüúüúüúüúò4LòóLöüúòLòLò óöùúüúüúüúòILòöüúüúòLöúüúüúòöüúüúüúüò&LöúüúòöüúüòLöüú!ò#Löüú+ò-Löúüúüúò LöüúòóLöúüúòLöüúòóLòóLöüúòLòLò óöùúüúüúòQLöúﬁôﬁLöúüúò!öüú.üúüúüòDöüúüúüò6Löú'ò'Löúüú6òPLöúüúòLöüúòóLöüúòóLò(LöúòLöüúòLòLò óöùúüúüú2üúüúüú	üúüúòòLöúüúòLöúüúòLöú	üúòöúòöüúüúüúòLô LöúòLöúüúòöúüúò+LöúòLöúòLöúòLöú	ò	LöúòóöüúüúüòLöúòLöúüúòLòLòLòLòLöüúòóLòLöú
+üúòLòLòóLòóLöúüúòLöúüúòLöúüúòLöúüúò"Lö	úTüúüúüúüúòpLöúüúò#Lò,LöüúEòGLöüú%ò'Löüú@òBLöüúHòJLöüú4ò6Löüú6ò8Löüú;ò=Löüú?òALöüúBòDLòöüú,üúüúüòBLöúòLöúüúòLòLöú	üúòLöúüúòLöúüúòLöúüúüúòöüúüúüúò0öüúòLô6LòLò'LöúüúòLòóöüúüúòLöú$ò$Löú"ò"Löüú1ò3Löüú2ò4LòóóöüúüúüòLöúòLöú6ò6LöúüúòLöú
+üúò!LòöüúüúòöüúüúüúüúüúüúòYöüúòLôLòLò$LòóöüúüúòLöüúòLöú(ò(Löú#ò#LöüúòLòóóLòóLöüúòóöüúüúüúò'LöüúTòVLöú=ò=LòóLòLöüúòóöüúüúòLöüúUòWLöúCòCLòóöüúüúüúòLô2LöúüúòöüúüúòLò*LöüúòLòóöüú/üúüúüòELöú$ò$Lò&öüúüúòLöüú)ò+öüúüòLöüú-ò/óLòóLöüúòóLöüúüúüúò#Löüú<ò>LòóLòLò óóôòLò óöúòLöúòLöú=ò=LöúòLöüúòLò óöúòLöú,ò,Löú%ò%LöúòLöüúòLò óöúòLöú"ò"LöúòLöúòLöüúòLò óöúòLöúòLöúòLöúòLöüúòLò óöúòLöúòLöú=ò=LöúòLöüúòLò óöúòLöúòLöú%ò%LöúòLöüúòLò óLò óLöüúòLò ó Öó    iÄ  ûW  

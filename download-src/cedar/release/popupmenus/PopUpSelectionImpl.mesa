@@ -1,0 +1,489 @@
+
+
+DIRECTORY
+BasicTime 	USING [GMT, Now, Period, Update],
+CedarProcess USING [Priority, SetPriority],
+Cursors,
+MultiCursors,
+Imager 	USING [black, ClipRectangleI, Context, DoSave, Font, MaskRectangleI, SetColor, SetFont, SetXY, SetXYI, ShowRope, TranslateT, white],
+ImagerBackdoor USING [DiscardBuffer, invert, RestoreBuffer, SaveBufferRectangle, ViewReset],
+ImagerFont 	USING [Extents, RopeBoundingBox, RopeEscapement],
+InputFocus	USING [CaptureButtons, PopInputFocus, PushInputFocus, ReleaseButtons],
+PopUpSelection USING [],
+Process 	USING [Detach, MsecToTicks, PauseMsec],
+Real 	USING [Fix, Round],
+Rope 	USING [Concat, IsEmpty, ROPE],
+RuntimeError USING [UNCAUGHT],
+SystemNames USING [CedarDir],
+TIPUser 	USING [InstantiateNewTIPTable, TIPScreenCoords, TIPTable],
+UserProfile 	USING [Boolean, CallWhenProfileChanges, Number, ProfileChangedProc, Token],
+VFonts 	USING [EstablishFont, FontAscent, FontHeight],
+ViewerClasses USING [NotifyProc, MouseButton],
+ViewerLocks USING [CallUnderColumnLock, CallUnderViewerTreeLock],
+ViewerPrivate USING [CreateContext],
+ViewerSpecs USING [bwScreenHeight, bwScreenWidth, colorScreenHeight, colorScreenWidth];
+
+PopUpSelectionImpl: CEDAR MONITOR
+IMPORTS BasicTime, CedarProcess, Cursors, MultiCursors, Imager, ImagerBackdoor, ImagerFont, InputFocus, --PeriodicalFork,-- Process, Real, Rope, RuntimeError, SystemNames, TIPUser, --UserInput,-- UserProfile, VFonts, ViewerLocks, ViewerPrivate, ViewerSpecs
+EXPORTS PopUpSelection = 
+BEGIN 
+
+sHeight, sWidth: INTEGER ¬ 0; 	-- size of screen, in pixels; [screen containing menu]
+mHeight, mWidth: INTEGER ¬ 0; 	-- size of menu, in pixels
+mx, my: INTEGER ¬ 0;		-- menu position, in context coordinates, lower left point
+context: Imager.Context;         	-- menu context
+mOnColor: BOOL ¬ FALSE;  		-- menu [NOT cursor] on color screen 
+lastRemoved: BasicTime.GMT ¬ BasicTime.Now[]; --for crazy heuristics
+MousePosition: TYPE ~ RECORD [x, y: INTEGER, display: REF ¬ NIL];
+lastMouse: MousePosition ¬ [0, 0, NIL];  -- at start; remember between calls is creature comfort
+allwaysHelp: BOOL ¬ FALSE;
+
+reCheck: CONDITION ¬ [Process.MsecToTicks[2000]];
+
+allDone: BOOL ¬ TRUE; 	--monitored
+moduleFree: BOOL ¬ FALSE; 	--monitored; initializations frees module
+escaped: BOOL ¬ FALSE;
+
+blackBorderW: INTEGER = 2;
+whiteBorderW: INTEGER = 2; 
+borderW: INTEGER = blackBorderW+whiteBorderW;
+border2W: INTEGER = borderW+borderW;
+
+gSelection: NAT ¬ 0;
+gTitleLines: NAT ¬ 0; 	-- 0 or 1 header lines
+gLabel: Rope.ROPE;
+gChoice: LIST OF Rope.ROPE ¬ NIL;
+gDefault: NAT;
+gMouse: REF ¬ NIL;
+gRefMouseButton: REF ViewerClasses.MouseButton ¬ NIL;
+gHelp: LIST OF Rope.ROPE;
+gHelpOn: INTEGER ¬ -1;
+gHelpMode: BOOL ¬ FALSE;
+
+tipTable: TIPUser.TIPTable;
+font: Imager.Font ¬ NIL;
+lineHeight: INTEGER ¬ 0; 
+descent: INTEGER ¬ 0;
+
+
+SetDone: ENTRY PROC [] = {
+allDone ¬ TRUE;
+BROADCAST reCheck
+};
+
+SetTimeOut: ENTRY PROC [key: REF] = {
+IF timeOutKey=key AND ~moduleFree THEN allDone ¬ timedOut ¬ TRUE; 
+BROADCAST reCheck
+};
+
+Wait: ENTRY PROC [] = {
+allDone ¬ FALSE;
+WHILE ~allDone DO WAIT reCheck ENDLOOP;
+};
+
+
+Enter: ENTRY PROC [] = {
+WHILE ~moduleFree DO WAIT reCheck ENDLOOP;
+moduleFree ¬ FALSE
+};
+
+Leave: ENTRY PROC [] = {
+moduleFree ¬ TRUE;
+BROADCAST reCheck
+};
+
+
+SetUpTimeOutWatcher: PROC [i: NAT] = {
+timedOut ¬ FALSE;
+IF i<=0 OR i>10000 THEN timeOutKey ¬ NIL --upper limit to prevent overflow
+ELSE {
+timeOutKey ¬ NEW[BasicTime.GMT ¬ BasicTime.Update[BasicTime.Now[], i]];
+TRUSTED {Process.Detach[FORK TimeOutWatcherProcess[key: timeOutKey]]};
+}
+};
+
+timedOut: BOOL;
+timeOutKey: REF BasicTime.GMT ¬ NIL; 
+--NIL means no time out expected; SetUpTimeOutWatcher is only writer
+
+TimeOutWatcherProcess: PROC [key: REF BasicTime.GMT] = {
+CedarProcess.SetPriority[excited];
+DO
+Process.PauseMsec[500];
+IF timeOutKey#key THEN RETURN; --invalid invocation of TimeOutWatcherProcess
+IF moduleFree THEN RETURN; --not timed out
+IF BasicTime.Period[from: key­, to: BasicTime.Now[]]>0 THEN { --time out
+SetTimeOut[key];
+};
+ENDLOOP;
+};
+
+
+helpSave: ATOM ¬ NIL;
+
+NthRestFirstRope: PROC [list: LIST OF Rope.ROPE, n: INTEGER] RETURNS [r: Rope.ROPE¬NIL] = {
+FOR l: LIST OF Rope.ROPE ¬ list, l.rest WHILE l#NIL DO
+IF n<=0 THEN {r ¬ l.first; EXIT};
+n ¬ n-1;
+ENDLOOP;
+};
+
+Box: PROC [x, y, w, h, border: INTEGER] = {
+Imager.SetColor[context, Imager.white];
+Imager.MaskRectangleI[context, x, y, w, h];
+Imager.SetColor[context, Imager.black];
+Imager.MaskRectangleI[context, x, y, border, h];
+Imager.MaskRectangleI[context, x+w-border, y, border, h];
+Imager.MaskRectangleI[context, x, y, w, border];
+Imager.MaskRectangleI[context, x, y+h-border, w, border];
+};
+
+HelpMessage: PROC [n: INTEGER] = {
+IF n#gHelpOn THEN {
+msg: Rope.ROPE ¬ NIL;
+gHelpOn ¬ n;
+IF helpSave#NIL THEN {
+ImagerBackdoor.RestoreBuffer[context, helpSave]; 
+ImagerBackdoor.DiscardBuffer[context, helpSave]; 
+helpSave ¬ NIL
+};
+msg ¬ NthRestFirstRope[gHelp, n];
+IF ~Rope.IsEmpty[msg] THEN {
+border: NAT ~ 2; below: NAT ~ 2; 
+e: ImagerFont.Extents ¬ ImagerFont.RopeBoundingBox[font, msg];
+h: INTEGER ¬ Real.Fix[MIN[e.descent+e.ascent+2*border]]; --text height
+w: INTEGER ¬ Real.Fix[MIN[e.rightExtent-e.leftExtent+2*border+1, sWidth]]; --text width 
+ty: INTEGER ¬ my-h-below; --text boxes lower y in context coordinates
+tx: INTEGER ¬ MIN[mx, sWidth-w]; --text boxes left x in context coordinates
+IF ty<0 THEN {
+ty ¬ my+mHeight+below;
+IF ty>=sHeight THEN RETURN;
+};
+ImagerBackdoor.SaveBufferRectangle[context, helpSave ¬ $Help, [tx, ty, w, h]];
+Box[tx, ty, w, h, 1];
+Imager.SetColor[context, Imager.black];
+Imager.SetXY[context, [(tx+border)-e.leftExtent, ty+border+e.descent]];
+Imager.ShowRope[context, msg];
+};
+}
+};
+
+MoveCursor: ENTRY PROC [x, y: INTEGER, col: BOOL] = {
+ENABLE UNWIND => NULL;
+InvertPictureLine: PROC [pos: NAT] = {
+Imager.MaskRectangleI[context, mx+borderW, my+mHeight-borderW-lineHeight*pos, mWidth-border2W, lineHeight];
+};
+sel: NAT ¬ 0;
+IF allDone THEN RETURN; 
+IF col=mOnColor THEN
+IF x>mx+blackBorderW AND x<mx+mWidth-blackBorderW THEN {
+IF y>my+mHeight-borderW THEN {
+IF y<my+mHeight+lineHeight THEN {gHelpMode ¬ TRUE; HelpMessage[0]}
+}
+ELSE IF y>my+borderW THEN
+sel ¬ (1-gTitleLines) + (my+mHeight-borderW-y)/lineHeight;
+};
+IF gSelection#sel THEN {
+Imager.SetColor[context, ImagerBackdoor.invert];
+IF gSelection#0 THEN InvertPictureLine[gSelection+gTitleLines];
+gSelection ¬ sel;
+IF gSelection#0 THEN InvertPictureLine[gSelection+gTitleLines];
+IF gHelpMode THEN HelpMessage[gSelection];
+};
+}; 
+
+PopUpNotify: ViewerClasses.NotifyProc = {
+
+ProtectedNotify: PROC [input: LIST OF REF ANY] = {
+IF allDone THEN SetDone[] 
+ELSE 
+FOR list: LIST OF REF ANY ¬ input, list.rest WHILE list#NIL DO
+WITH list.first SELECT FROM
+coords: TIPUser.TIPScreenCoords => 
+MoveCursor[coords­.mouseX, coords­.mouseY, coords­.color];
+atom: ATOM => {
+mb: REF ViewerClasses.MouseButton ¬ gRefMouseButton;
+SELECT atom FROM
+$DoneRed => IF mb#NIL THEN mb­ ¬ red;
+$DoneYellow => IF mb#NIL THEN mb­ ¬ yellow;
+$DoneBlue => IF mb#NIL THEN mb­ ¬ blue; 
+$Escaped => escaped ¬ TRUE;
+ENDCASE => LOOP;
+SetDone[];
+};
+ENDCASE => {};
+ENDLOOP;
+};
+
+ProtectedNotify[input ! RuntimeError.UNCAUGHT => GOTO failed];
+EXITS failed => {gSelection ¬ 0; SetDone[]};
+};
+
+Request: PUBLIC PROC [
+header: Rope.ROPE, choice: LIST OF Rope.ROPE, 
+headerDoc: Rope.ROPE, choiceDoc: LIST OF Rope.ROPE, 
+default: NAT ¬ 0, timeOut: NAT ¬ 0, position: REF ¬ NIL
+] RETURNS [selection: INT ¬ 0] = {
+ENABLE UNWIND => Leave[];
+
+ComputeMenuPosition: PROC [] = {
+DefaultPos: PROC [] = {
+IF BasicTime.Period[from: lastRemoved, to: BasicTime.Now[]]>0 THEN { 
+h: INTEGER ~ mHeight/3;
+[lastMouse.x, lastMouse.y, lastMouse.display] ¬ MultiCursors.GetAMousePosition[NIL];
+IF lastMouse.x>mWidth THEN 
+lastMouse.x ¬ lastMouse.x-mWidth;
+IF lastMouse.y>h THEN 
+lastMouse.y ¬ lastMouse.y-h;
+};
+};
+IF gMouse=NIL THEN DefaultPos[]
+ELSE WITH gMouse SELECT FROM
+m: TIPUser.TIPScreenCoords => lastMouse ¬ [x: m.mouseX, y: m.mouseY, display: IF m.color THEN $color ELSE NIL]; -- display is probably bogus - mfp
+m: REF MousePosition => lastMouse ¬ m­; -- How could this ever happen??
+m: REF ViewerClasses.MouseButton => {gRefMouseButton ¬ m; DefaultPos[]};
+ENDCASE => 
+[lastMouse.x, lastMouse.y, lastMouse.display] ¬ MultiCursors.GetAMousePosition[NIL];
+mOnColor ¬ FALSE;
+};
+
+WithViewerLock: PROC [] = {
+saved: ATOM ¬ PrepareMenu[];
+escaped ¬ FALSE;
+gHelpMode ¬ allwaysHelp;
+gHelpOn ¬ -1;
+Imager.DoSave[context, PaintMenu];
+CheatDefaultMousePos[];
+SetUpTimeOutWatcher[timeOut];
+Wait[];
+RemoveMenu[saved];
+}; 
+
+Enter[];
+InputFocus.PushInputFocus[];
+InputFocus.CaptureButtons[PopUpNotify, tipTable];
+Cursors.SetCursor[menu];
+gDefault ¬ default;
+gLabel ¬ header;
+gChoice ¬ choice;
+gMouse ¬ position;
+gHelp ¬ CONS[headerDoc, choiceDoc];
+MenuSizeInPixels[header, choice];
+DO
+ComputeMenuPosition[];
+gSelection ¬ 0;
+IF mOnColor 
+THEN ViewerLocks.CallUnderColumnLock[WithViewerLock, color]
+ELSE ViewerLocks.CallUnderViewerTreeLock[WithViewerLock];
+IF ~escaped THEN EXIT;
+gMouse ¬ $Escaped
+ENDLOOP;
+InputFocus.ReleaseButtons[];
+InputFocus.PopInputFocus[];
+IF timedOut THEN selection ¬ -1 ELSE selection ¬ gSelection;
+gMouse ¬ NIL; 
+gRefMouseButton ¬ NIL; 
+Leave[];
+}; 
+
+
+MenuSizeInPixels: PROC [header: Rope.ROPE, gChoice: LIST OF Rope.ROPE] = {
+lines, width: NAT ¬ 0; 
+IF header#NIL THEN {
+lines ¬ 1; 
+width ¬ Real.Round[ImagerFont.RopeEscapement[font, header].x];
+};
+gTitleLines ¬ lines;
+FOR l: LIST OF Rope.ROPE ¬ gChoice, l.rest WHILE l#NIL DO
+lines ¬ lines+1; 
+width ¬ MAX[width, Real.Round[ImagerFont.RopeEscapement[font, l.first].x]];
+IF lines>32 THEN EXIT; --prevent menu which does not fit on screen
+ENDLOOP;
+mWidth ¬ width + border2W;
+mHeight ¬ lines*lineHeight + border2W;
+}; 
+
+PrepareMenu: PROC [] RETURNS [saved: ATOM] = {
+IF mOnColor THEN {
+sHeight ¬ ViewerSpecs.colorScreenHeight;
+sWidth ¬ ViewerSpecs.colorScreenWidth;
+context ¬ ViewerPrivate.CreateContext[color];
+}
+ELSE {
+sHeight ¬ ViewerSpecs.bwScreenHeight;
+sWidth ¬ ViewerSpecs.bwScreenWidth;
+context ¬ ViewerPrivate.CreateContext[main];
+};
+ImagerBackdoor.ViewReset[context];
+mWidth ¬ MIN[mWidth, sWidth];
+mHeight ¬ MIN[mHeight, sHeight];
+mx ¬ lastMouse.x; 
+IF mx<0 THEN mx ¬ 0 ELSE IF mx>sWidth-mWidth THEN mx ¬ sWidth-mWidth; 
+my ¬ lastMouse.y; 
+IF my<0 THEN my ¬ 0 ELSE IF my>sHeight-mHeight THEN my ¬ sHeight-mHeight; 
+ImagerBackdoor.SaveBufferRectangle[context, saved ¬ $Menu, [mx, my, mWidth, mHeight]];
+Imager.SetFont[context, font];
+}; 
+
+RemoveMenu: PROC [saved: ATOM] = {
+IF helpSave#NIL THEN {
+ImagerBackdoor.RestoreBuffer[context, helpSave]; 
+ImagerBackdoor.DiscardBuffer[context, helpSave]; 
+helpSave ¬ NIL
+};
+ImagerBackdoor.RestoreBuffer[context, saved]; 
+ImagerBackdoor.DiscardBuffer[context, saved]; 
+lastRemoved ¬ BasicTime.Now[];
+}; 
+
+PaintMenu: PROC [] = {
+tidleAdd: NAT ~ 3; 
+y: INTEGER ¬ mHeight-borderW+descent;  
+Imager.TranslateT[context, [mx, my]];
+Imager.ClipRectangleI[context, 0, 0, mWidth, mHeight];
+Box[0, 0, mWidth, mHeight, blackBorderW];
+IF gLabel#NIL THEN {
+y ¬ y-lineHeight;
+Imager.SetXYI[context, borderW, y+tidleAdd];
+Imager.ShowRope[context, gLabel];
+};
+FOR list: LIST OF Rope.ROPE ¬ gChoice, list.rest WHILE list#NIL DO
+y ¬ y-lineHeight; --clipped if to large
+Imager.SetXYI[context, borderW, y];
+Imager.ShowRope[context, list.first];
+ENDLOOP;
+Imager.SetColor[context, ImagerBackdoor.invert];
+IF gTitleLines=1 THEN 
+Imager.MaskRectangleI[context, 
+blackBorderW, 
+mHeight-borderW-lineHeight+1, 
+mWidth-2*blackBorderW, 
+lineHeight+1
+]
+}; 
+
+CheatDefaultMousePos: PROC [] = {
+IF gDefault#0 THEN {
+yDownFromMenuTop: INTEGER ¬ (gDefault+gTitleLines)*lineHeight-lineHeight/2;
+MultiCursors.SetAMousePosition[x: mx+mWidth/2, y: my + mHeight - yDownFromMenuTop, cursor: NIL];
+};
+};
+
+ProfileChanged: UserProfile.ProfileChangedProc = {
+change: INT ¬ MAX[-whiteBorderW, 
+MIN[30, UserProfile.Number["PopUpSelection.LineHeightChange", 0]]
+];
+font ¬ VFonts.EstablishFont[
+family: UserProfile.Token["PopUpSelection.FontFamily", "Helvetica"], 
+size: UserProfile.Number["PopUpSelection.FontSize", 10], 
+bold: UserProfile.Boolean["PopUpSelection.FontBold", FALSE],
+italic: UserProfile.Boolean["PopUpSelection.FontItalic", FALSE],
+defaultOnFailure: TRUE
+];
+lineHeight ¬ VFonts.FontHeight[font]+whiteBorderW+change;
+descent ¬ VFonts.FontHeight[font]-VFonts.FontAscent[font];
+allwaysHelp ¬ UserProfile.Boolean["PopUpSelection.AllwaysHelp", TRUE]
+};
+
+InitTipTable: PROC [] = {
+tipTable ¬ TIPUser.InstantiateNewTIPTable["PopUpSelection.tip" ! RuntimeError.UNCAUGHT => CONTINUE];
+IF tipTable=NIL THEN 
+tipTable ¬ TIPUser.InstantiateNewTIPTable[Rope.Concat[SystemNames.CedarDir["PopUpMenus"], "PopUpSelection.tip"]];
+};
+
+UserProfile.CallWhenProfileChanges[ProfileChanged];
+InitTipTable[];
+Leave[]; --initializes monitor locks
+END.
+
+  ¾  PopUpSelectionImpl.mesa  
+Copyright Ó 1983, 1987, 1988, 1989, 1990, 1991 by Xerox Corporation.  All rights reserved.
+Created by Christian Jacobi, November 9, 1983 12:14 pm
+Christian Jacobi, August 11, 1990 11:50 pm PDT
+Pier, June 23, 1986 11:39:21 am PDT
+Willie-Sue, October 11, 1989 5:46:39 pm PDT
+Willie-s, December 11, 1991 8:11 pm PST
+Michael Plass, February 25, 1992 4:52 pm PST
+KeyGlyphs USING [ESC, TAB],
+PeriodicalFork USING [Register],
+UserInput USING [GetLatestKeySymState],
+
+--global variables are protected with MONITOR Enter and Leave
+UnWedgeProcess: PROC [x: REF] = {
+IF ( UserInput.GetLatestKeySymState[uiHandle, KeyGlyphs.ESC] = down ) AND ( UserInput.GetLatestKeySymState[uiHandle, KeyGlyphs.TAB] = down ) THEN {
+SetDone[];
+};
+};
+
+--SetDone and Wait for scheduling interaction menu
+
+--Enter and Leave for scheduling module entrance
+
+--timeout nonsense
+--monitored call only
+--does not modify timeOutKey
+--never called with key=NIL
+--TimeOutWatcherProcess is NOT monitored
+
+--help and move 
+--Cursors.GetCursorInfo[].hotX.. is already included in x, y by window package...
+--called sequentially only by viewer package
+-- sets variables lastMouse and mOnColor
+-- Only use real cursor coordinates if interval since last popup menu call is big enough
+-- Reuse same position if call is immediately following, and is using a different menu;
+-- In doupt change position, to make it possible to visualize area below pop up menu. 
+--default: use position position or last position according of time
+--offset menu [creature comfort]
+--else reuse last position position
+--sorry but for now only one screen is implemented
+mOnColor _ lastMouse.color; 
+--computes lines and width (in pixels) of menu and save area
+--sets variables mWidth, mHeight
+--must be called with DoSave; does translation
+--sets the cursor such that it points into the default field
+--reset the font globals
+--do not catch errors again; land in debugger
+PeriodicalFork.Register[1500, UnWedgeProcess];
+Êâ  –(cedarcode) style•NewlineDelimiter
+˜ codešœ™Kšœ
+ÏeœO™ZKšœ6™6K™.K™#K™+K™'K™,—K˜ šÏk	˜	Kšœ
+žœžœ˜,Kšœžœ˜+K˜K˜Kšœžœ˜ŒKšœžœH˜\Kšœžœ,˜=KšœžœA˜QKšœ
+žœžœžœ™Kšœžœ™ Kšœžœ˜Kšœžœ"˜0Kšœžœ˜Kšœžœžœ˜$Kšœžœžœ˜Kšœžœ˜Kšœžœ5˜CKšœ
+žœ™'KšœžœF˜XKšœžœ)˜6Kšœžœ˜.Kšœžœ0˜AKšœžœ˜$KšœžœF˜WK˜ —šÏbœžœž˜!KšžœaÏcœ: œ=˜€Kšžœ˜—Kšžœ˜K™ Kšœ=™=K˜ Kšœžœ 6˜UKšœžœ ˜9Kšœžœ :˜PKšœ" ˜1Kšœ
+žœžœ '˜@Kšœžœ ˜DKšœžœžœžœžœžœ˜AKšœ"žœ 7˜`Kšœžœžœ˜K˜ Kšœ	ž	œ˜1K˜ Kšœ	žœžœ ˜"Kšœžœžœ *˜DKšœ	žœžœ˜K˜ Kšœžœ˜Kšœžœ˜Kšœ	žœ˜-Kšœ
+žœ˜$K˜ Kšœžœ˜Kšœžœ ˜-Kšœžœ˜Kš	œ	žœžœžœžœ˜!Kšœ
+žœ˜Kšœžœžœ˜Kšœžœžœ˜5Kšœžœžœžœ˜Kšœ	žœ˜Kšœžœžœ˜K˜ Kšœ˜Kšœžœ˜Kšœžœ˜Kšœ	žœ˜K˜ šÏnœžœžœ™!š
+žœ6žœžœ6žœžœ™“Kšœ
+™
+K™—Kšœ™—K™ Kšœ2™2K˜ š¡œžœžœ˜Kšœ
+žœ˜Kšž	œ˜Kšœ˜—K˜ š¡
+œžœžœžœ˜%Kšžœžœžœžœ˜BKšž	œ˜Kšœ˜—K˜ š¡œžœžœ˜Kšœ
+žœ˜Kšžœ
+žœžœ	žœ˜'Kšœ˜K˜ —K™ Kšœ0™0K˜ š¡œžœžœ˜Kšžœžœžœ	žœ˜*Kšœž˜Kšœ˜—K˜ š¡œžœžœ˜Kšœžœ˜Kšž	œ˜Kšœ˜—K˜ K™ Jšœ™K˜ š¡œžœžœ˜&Kšœ™Kšœžœ˜Kš	žœžœ	žœžœ !˜Jšžœ˜Kšœžœžœ)˜GKšžœžœ*˜FK˜—Kšœ˜—K˜ Kšœ
+žœ˜šœžœ
+žœžœ˜%Kš D˜D—K˜ š¡œžœžœžœ˜8Kšœ™Kš ™Kš (™(Kšœ"˜"šž˜Kšœ˜Kšžœžœžœ -˜LKšžœžœžœ ˜*šžœ5žœ 
+˜HKšœ˜K˜—Kšžœ˜—Kšœ˜—K˜ J™ Jšœ™K˜ Kšœ
+žœžœ˜K˜ š¡œžœžœžœžœžœžœ
+žœžœ˜[šžœžœžœžœžœžœž˜6Kšžœžœžœ˜!K˜Kšžœ˜—K˜—K˜ š¡œžœžœ˜+Kšœ'˜'Kšœ+˜+Kšœ'˜'Kšœ0˜0Kšœ9˜9Kšœ0˜0Kšœ9˜9Kšœ˜—K˜ š¡œžœžœ˜"šžœžœ˜Kšœ
+žœžœ˜K˜šžœ
+žœžœ˜Kšœ1˜1Kšœ1˜1Kšœž˜Kšœ˜—K˜!šžœžœ˜Kšœžœžœ˜!K˜>Kšœžœžœ  ˜FKšœžœžœ2 ˜XKšœžœ +˜EKšœžœžœ *˜Kšžœžœ˜K˜Kšžœžœžœ˜K˜—K˜NKšœ˜Kšœ'˜'KšœG˜GKšœ˜K˜—K˜—K˜—K˜ š
+¡
+œžœžœžœžœ˜5Kšžœžœžœ˜š¡œžœžœ˜&Kšœk˜kKšœ˜—Kšœžœ˜KšœQ™QKšžœ	žœžœ˜šžœž˜šžœžœžœ˜8šžœžœ˜Kšžœžœžœ˜BKšœ˜—šžœžœž˜K˜:—K˜——šžœžœ˜Kšœ0˜0Kšžœžœ+˜?K˜Kšžœžœ+˜?Kšžœžœ˜*Kšœ˜—Kšœ˜—K˜ šÐbnœ˜)Kšœ,™,K˜ š¡œžœ	žœžœžœžœ˜2Kšžœ	žœ˜šžœ˜šžœžœžœžœžœžœžœž˜>šžœžœž˜šœ#˜#K˜:—šœžœ˜Kšœžœ-˜4šžœž˜Kšœžœžœžœ˜%Kšœžœžœžœ˜+Kšœžœžœžœ˜(Kšœžœ˜Kšžœžœ˜—Kšœ
+˜
+K˜—Kšžœ˜—Kšžœ˜——Kšœ˜—K˜ Kšœ%žœžœ	˜>Kšžœ'˜,Kšœ˜—K˜ š"¡œžœžœžœ
+žœžœžœžœžœžœžœžœžœžœžœžœžœ	˜ÕKšžœžœ˜K˜ š¡œžœ˜ Kšœ(™(KšœX™XKšœW™WK™Vš¡
+œžœ˜KšœC™Cšžœ<žœ˜EKšœžœ˜KšœOžœ˜TK™ šžœžœ˜K˜!—šžœžœ˜K˜—K˜—Kš #™#K˜—Kšžœžœžœ˜šžœžœžœž˜Kš
+œNžœ	žœžœžœ "˜’Kšœžœ" ˜GKšœžœB˜HKšžœ˜KšœOžœ˜T—Kšœ2™2Kšœ™Kšœžœ˜Kšœ˜—K˜ š¡œžœ˜Kšœžœ˜Kšœ
+žœ˜K˜K˜Kšœ"˜"Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜K˜ —Kšœ˜K˜Kšœ1˜1Kšœ˜K˜K˜K˜K˜Kšœžœ˜#Kšœ!˜!šž˜Kšœ˜K˜šžœ
+˜Kšžœ7˜;Kšžœ5˜9—Kšžœ
+žœžœ˜K˜Kšžœ˜—K˜K˜Kšžœ
+žœžœ˜<Kšœ	žœ˜Kšœžœ˜Kšœ˜Kšœ˜—K˜ K˜ š¡œžœžœžœžœžœ˜JKšœ<™<Kšœ ™ Kšœžœ˜šžœžœžœ˜K˜K˜>K˜—K˜šžœžœžœžœžœžœž˜9K˜Kšœžœ@˜KKšžœ
+žœžœ +˜BKšžœ˜—K˜K˜&Kšœ˜—K˜ š¡œžœžœ	žœ˜.šžœ
+žœ˜K˜(K˜&K˜-K˜—šžœ˜K˜%K˜#K˜,K˜—K˜"Kšœ	žœ˜Kšœ
+žœ˜ ˜Kš
+žœžœžœžœžœ˜F—˜Kš
+žœžœžœžœžœ˜J—K˜VKšœ˜Kšœ˜—K˜ š¡
+œžœ	žœ˜"šžœ
+žœžœ˜Kšœ1˜1Kšœ1˜1Kšœž˜Kšœ˜—Kšœ.˜.Kšœ.˜.K˜Kšœ˜—K˜ š¡	œžœ˜K™.Kšœ
+žœ˜Kšœžœ˜'Kšœ%˜%Kšœ6˜6Kšœ)˜)šžœžœžœ˜K˜Kšœ,˜,Kšœ!˜!K˜—šžœžœžœžœžœžœž˜BKšœ ˜'Kšœ#˜#Kšœ%˜%Kšžœ˜—Kšœ0˜0šžœžœ˜šœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜K˜——Kšœ˜K˜ —š¡œžœ˜!Kšœ<™<šžœžœ˜Kšœžœ2˜KKšœ[žœ˜`K˜—Kšœ˜K˜ —š¢œ$˜2Kš ™šœžœžœ˜!Kšžœ>˜AKšœ˜—˜KšœE˜EKšœ9˜9Kšœ5žœ˜<Kšœ9žœ˜@Kšœž˜Kšœ˜—K˜9K˜:Kšœ@žœ˜EKšœ˜—K˜ š¡œžœ˜KšœNžœžœ˜dšžœ
+žœžœ˜K˜q—Kšœ-™-Kšœ˜—K˜ Kšœ3˜3Kšœ˜Kšœ	 ˜$Kšœ.™.Kšžœ˜K˜ — …—    1R  Iò  

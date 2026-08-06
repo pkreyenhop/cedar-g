@@ -1,0 +1,1627 @@
+
+DIRECTORY
+Ascii USING [Lower, Upper],
+Basics,
+Char USING [XCHAR],
+CharOps USING [Char0, Prop],
+List USING [Append, DReverse, Nconc, Reverse],
+NodeReader USING [CharInfo, Fetch, FetchChar, FetchLooks, New, Ref, SetParts],
+RegularExpression USING [altSepToken, anyToken, beginAllToken, beginAltToken, beginClassToken, beginFieldToken, beginNodeToken, boundSepToken, CharClass, CharClassContent, ClassArray, closureToken, Code, CodeContent, endAllToken, endAltToken, endClassToken, endFieldToken, endPatternToken, fieldSepToken, FinderRecord, greedyClosureToken, greedyPlusToken, IgnoreLooks, Index, LegalCharacters, LegalInputCharacters, NameArray, nodeBreakToken, notToken, OpCode, ParseTree, ParseTreeContent, ParseTypes, PatternErrorCode, PatternDataArray, PatternLooksArray, PatternNextArray, PatternOpCodeArray, PatternStackArray, plusToken, powerToken, ReturnCode, ReturnCodeArray, StackContent, subRangeToken, TextStackArray],
+Rope USING [Concat, Equal, Fetch, FromChar, Replace, ROPE, Size],
+RuntimeError USING [BoundsFault],
+TextLooks USING [LooksAND, LooksOR],
+TextNode USING [Offset],
+Tioga USING [allLooks, Looks, Node, noLooks, Runs];
+
+
+RegularExpressionImpl: CEDAR MONITOR
+IMPORTS Ascii, Basics, Char, CharOps, List, NodeReader, Rope, RuntimeError, TextLooks
+EXPORTS RegularExpression = {
+OPEN RegularExpression;
+
+RegExpPatternErrorCode: TYPE = {
+tooBig,		-- The pattern is too big.
+illegalCharacter,
+improperAltSeparator,
+notInsideAlt,
+notInsideField,
+moreThanOneBeginAll,
+noMatchingBeginAll,
+nameMustBeAString,
+theAllNameIsReserved,
+secondOccurenceOfFieldMustNotContainPattern,
+expectedEndOfField,
+unexpectedEndOfPattern,
+noClosingEndAll,
+invalidNot,
+illegalOctalNumber,
+unknownAbbreviation
+};
+
+
+emptyCharClass: CharClassContent = ALL[FALSE];
+allCharClass: CharClassContent = [FALSE,
+TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE,
+TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE,
+TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE,
+TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE,
+TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE,
+TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE,
+TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE,
+TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE,
+TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE,
+TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE,
+TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE,
+TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE,
+TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE];
+
+charClassList: LIST OF ParseTree ¨ NIL;
+numCharClasses: Index;
+NodeBreakType: TYPE = {beginning, end, both, none};
+
+MalformedPattern: PUBLIC ERROR [ec: RegularExpression.PatternErrorCode] = CODE;
+MaxLen: Offset = LAST[Offset];
+
+Finder: TYPE = REF FinderRec;
+FinderRec: PUBLIC TYPE = FinderRecord;
+Offset: TYPE = TextNode.Offset;
+ROPE: TYPE = Rope.ROPE;
+
+
+NameLoc: PUBLIC PROC [finder: Finder, name: ROPE] RETURNS [at, atEnd: Offset] = {
+nameArray: REF NameArray ¨ IF finder # NIL THEN finder.nameArray ELSE NIL;
+at ¨ atEnd ¨ 0;
+IF nameArray = NIL THEN RETURN;
+IF Rope.Equal["all", name, FALSE] THEN RETURN [nameArray[0].at, nameArray[0].atEnd];
+FOR i:NAT IN [0..nameArray.length) DO
+IF Rope.Equal[nameArray[i].name, name] THEN
+RETURN [nameArray[i].at, nameArray[i].atEnd];
+ENDLOOP;
+};
+
+NameLooks: PUBLIC PROC [finder: Finder, name: ROPE] RETURNS [looks: Tioga.Looks] = {
+nameArray: REF NameArray ¨ IF finder # NIL THEN finder.nameArray ELSE NIL;
+looks ¨ Tioga.noLooks;
+IF nameArray = NIL THEN RETURN;
+IF Rope.Equal["all", name, FALSE] THEN RETURN [nameArray[0].looks];
+FOR i:NAT IN [0..nameArray.length) DO
+IF Rope.Equal[nameArray[i].name, name] THEN RETURN [nameArray[i].looks];
+ENDLOOP;
+};
+
+Create: PUBLIC PROC [pattern: Tioga.Node, literal, word, ignoreLooks, ignoreCase, addBounds: BOOLEAN, patternStart: INT ¨ 0, patternLen: INT ¨ LAST[INT]] RETURNS [finder: Finder] = {
+patternRope: ROPE ¨ pattern.rope;
+patternRuns: Tioga.Runs ¨ pattern.runs;
+RETURN [CreateFromParts[patternRope,patternRuns,literal,word,
+ignoreLooks,ignoreCase,addBounds,patternStart,patternLen]];
+};	
+
+
+CreateFromRope: PUBLIC PROC [pattern: ROPE, literal, word, ignoreCase, addBounds: BOOLEAN, patternStart: Offset, patternLen: Offset] RETURNS [finder: Finder] = {
+RETURN [CreateFromParts[pattern,NIL,literal,word,TRUE,
+ignoreCase,addBounds,patternStart,patternLen]] 
+};
+
+
+CreateFromParts: PROC [patternRope: ROPE, patternRuns: Tioga.Runs--of CharLooksItem--, literal, word, ignoreLooks, ignoreCase, addBounds: BOOLEAN, patternStart: Offset, patternLen: Offset] RETURNS [finder: Finder] = {
+ENABLE RuntimeError.BoundsFault => ERROR MalformedPattern[toobig];
+SimpleSymbolTableEntry: TYPE = RECORD[name: ROPE, number: Index];
+SimpleSymbolTable: TYPE = LIST OF REF SimpleSymbolTableEntry;
+nameList: SimpleSymbolTable;
+numberOfFields: Index;
+parsedPatternList: LIST OF ParseTree;
+forwardPattern, backwardPattern: ParseTree;
+char, patternChar: CHAR ¨ 377C;
+pEnd, pPos: Offset;
+numCharClasses: Index ¨ 0;
+charClassList: LIST OF ParseTree ¨ NIL;
+insideNamedPat: BOOLEAN ¨ FALSE;
+lastPhysicalCharUnread: BOOL ¨ FALSE;
+theLastPhysicalCharUnread: CHAR;
+inAbbreviation: BOOL ¨ FALSE;
+abbreviationPos: Offset;
+abbreviation: ROPE;
+lastCharacterRead: CHAR;
+looksRead: Tioga.Looks ¨ Tioga.noLooks;
+GetNextChar: PROC [eofOK: BOOL] RETURNS [c: CHAR] = {
+IF lastPhysicalCharUnread THEN {
+lastPhysicalCharUnread ¨ FALSE;
+RETURN[theLastPhysicalCharUnread];
+};
+IF inAbbreviation THEN {
+abbreviationPos ¨ abbreviationPos + 1;
+IF abbreviationPos < abbreviation.Size[]
+THEN c ¨ abbreviation.Fetch[abbreviationPos]
+ELSE inAbbreviation ¨ FALSE;
+};
+IF ~inAbbreviation THEN {
+chi: NodeReader.CharInfo;
+IF pPos >= pEnd THEN GOTO gotEnd;
+pPos ¨ pPos + 1;
+chi ¨ NodeReader.Fetch[finder.nodeReader, pPos-1];
+IF finder.doLooks THEN looksRead ¨ chi.looks ELSE looksRead ¨ IgnoreLooks;
+c ¨ CharOps.Char0[chi.char]
+};
+IF ignoreCase THEN c ¨ Ascii.Upper[c];
+EXITS
+gotEnd => {
+c ¨ endPatternToken;
+looksRead ¨ Tioga.noLooks;
+IF ~eofOK THEN SyntaxError[unexpectedEndOfPattern];
+};
+};
+UnReadLastPhysicalChar: PROC [c: CHAR] = {
+IF lastPhysicalCharUnread THEN ERROR;
+theLastPhysicalCharUnread ¨ c;
+lastPhysicalCharUnread ¨ TRUE;
+};
+AbbreviationRec: TYPE = RECORD[char: CHAR, abbreviation: ROPE];
+abbreviations: LIST OF AbbreviationRec ¨ LIST[
+['A, "([a..zA..Z0..9]++)"],
+['B, "([ '011..'015]++)"],
+['D, "([0..9]+.[0..9]**|[0..9]*.[0..9]++|[0..9]++)"],
+['N, "('015)"],
+['Q, "(\"[~\"]*\"|``[~'']*''''|`[~'']*'')"],
+['S, "([~ '011..'015]++)"],
+['W, "([a..zA..Z]++)"],
+['^, "['001..'037]"]
+];
+SetUpAbbreviation: PROC [c: CHAR] = {
+IF inAbbreviation THEN ERROR;
+c ¨ Ascii.Upper[c];
+FOR l: LIST OF AbbreviationRec ¨ abbreviations, l.rest UNTIL l = NIL DO
+IF c = l.first.char THEN {
+inAbbreviation ¨ TRUE;
+abbreviationPos ¨ -1;
+abbreviation ¨ l.first.abbreviation;
+RETURN;
+};
+ENDLOOP;
+SyntaxError[unknownAbbreviation];
+};
+charUnRead: BOOL ¨ FALSE;
+GetToken: PROC [] RETURNS [char: CHAR] = {
+IF charUnRead THEN {
+charUnRead ¨ FALSE;
+RETURN[lastCharacterRead];
+};
+lastCharacterRead ¨ char ¨ GetNextChar[TRUE]; 
+IF literal THEN 
+IF char = endPatternToken OR char IN LegalInputCharacters
+THEN RETURN[char] ELSE SyntaxError[illegalCharacter];
+IF char IN ['A..'Z] OR char IN ['a..'z] OR char IN ['0..'9] THEN RETURN[char];
+SELECT char FROM
+'[ => char ¨ beginClassToken;
+'] => char ¨ endClassToken;
+'~ => char ¨ notToken;
+'# => char ¨ anyToken;
+'$ => char ¨ nodeBreakToken;
+'^ => char ¨ beginNodeToken;
+'! => char ¨ powerToken;
+'( => char ¨ beginAltToken;
+') => char ¨ endAltToken;
+'| => char ¨ altSepToken;
+'< => char ¨ beginFieldToken;
+'> => char ¨ endFieldToken;
+': => char ¨ fieldSepToken;
+', => char ¨ boundSepToken;
+'{ => char ¨ beginAllToken;
+'} => char ¨ endAllToken;
+'' => {
+char ¨ GetNextChar[FALSE];
+IF char IN ['0..'7] THEN {
+c2: CHAR ¨ GetNextChar[FALSE];
+c3: CHAR ¨ GetNextChar[FALSE];
+octalIndex: CARDINAL;
+IF ~(c2 IN ['0..'7]) OR ~(c3 IN ['0..'7]) THEN 
+SyntaxError[illegalOctalNumber];
+octalIndex ¨ (char-'0)*64 + (c2-'0)*8+(c3-'0);
+IF octalIndex > 127 THEN SyntaxError[illegalOctalNumber];
+char ¨ VAL[octalIndex];
+};
+IF ~(char IN LegalInputCharacters) THEN SyntaxError[illegalCharacter];
+};
+'* => {
+c: CHAR ¨ GetNextChar[TRUE];
+IF c = '*
+THEN
+char ¨ greedyClosureToken
+ELSE {
+UnReadLastPhysicalChar[c];
+char ¨ closureToken;
+};
+};
+'+ => {
+c: CHAR ¨ GetNextChar[TRUE];
+IF c = '+
+THEN
+char ¨ greedyPlusToken
+ELSE {
+UnReadLastPhysicalChar[c];
+char ¨ plusToken;
+};
+};
+'. => {
+c: CHAR ¨ GetNextChar[TRUE];
+IF c = '.
+THEN
+char ¨ subRangeToken
+ELSE {
+UnReadLastPhysicalChar[c];
+char ¨ '.;
+};
+};
+'\\ => {
+c: CHAR ¨ GetNextChar[FALSE];
+SetUpAbbreviation[c];
+RETURN[GetToken[]];
+};
+endPatternToken => NULL;
+ENDCASE => IF ~(char IN LegalInputCharacters) THEN SyntaxError[illegalCharacter];
+lastCharacterRead ¨ char;
+RETURN[char];
+};
+UnReadToken: PROC[] = {
+IF charUnRead THEN ERROR;
+charUnRead ¨ TRUE;
+};
+SyntaxError: PROC[kind: RegExpPatternErrorCode] = {
+ERROR MalformedPattern[toobig];
+};
+ParseCharClass: PROC [] RETURNS [r: ParseTree] = {
+ccr: REF ParseTreeContent.class ¨ NEW[ParseTreeContent.class];
+complement: BOOL ¨ FALSE;
+c, lastChar: CHAR ¨ beginClassToken;
+charClass: CharClass ¨ NEW[CharClassContent ¨ ALL[FALSE]];
+charClassList ¨ CONS[ccr, charClassList];
+ccr.classNumber ¨ numCharClasses;
+numCharClasses ¨ numCharClasses + 1;
+IF GetToken[] = notToken THEN
+complement ¨ TRUE
+ELSE
+UnReadToken[];
+ccr.looks ¨ looksRead;
+ccr.class ¨ charClass;
+r ¨ ccr;
+WHILE (c ¨ GetToken[]) # endClassToken DO
+SELECT c FROM
+subRangeToken => {
+IF ~(lastChar IN LegalInputCharacters) THEN SyntaxError[illegalCharacter];
+c ¨ GetToken[];
+IF ~(c IN LegalInputCharacters) THEN SyntaxError[illegalCharacter];
+FOR x: CHAR IN [lastChar..c] DO
+charClass[x] ¨ TRUE;
+ENDLOOP;
+lastChar ¨ subRangeToken;
+};
+NOT IN LegalInputCharacters =>
+SyntaxError[illegalCharacter]
+ENDCASE => {
+lastChar ¨ c;
+charClass[c] ¨ TRUE;
+};
+ENDLOOP;
+IF ignoreCase THEN
+FOR x: CHAR IN ['a..'z] DO
+SELECT TRUE FROM
+charClass[x] => charClass[x-'a+'A] ¨ TRUE;
+charClass[x-'a+'A] => charClass[x] ¨ TRUE;
+ENDCASE => NULL;
+ENDLOOP;
+IF complement THEN
+FOR x: CHAR IN LegalInputCharacters DO
+charClass[x] ¨ ~charClass[x];
+ENDLOOP;
+};
+
+ParseX: PROC [] RETURNS [p: ParseTree ¨ NIL] = {
+c: CHAR ¨ GetToken[];
+SELECT c FROM
+IN LegalInputCharacters =>
+IF ignoreCase AND c IN ['A..'Z] THEN 
+p ¨ NEW[ParseTreeContent.charIC ¨ [charIC[c, looksRead]]]
+ELSE
+p ¨ NEW[ParseTreeContent.char ¨ [char[c, looksRead]]];
+beginClassToken =>
+p ¨ ParseCharClass[];
+anyToken =>
+p ¨ NEW[ParseTreeContent.anyChar ¨ [anyChar[looksRead]]];
+nodeBreakToken =>
+p ¨ NEW[ParseTreeContent.nodeBreak];
+beginNodeToken =>
+p ¨ NEW[ParseTreeContent.beginNode];
+ENDCASE => UnReadToken[];
+};
+
+ParseZ: PROC [] RETURNS [p: ParseTree ¨ NIL] = {
+c: CHAR ¨ GetToken[];
+SELECT c FROM
+beginAltToken => {
+l: LIST OF ParseTree ¨ NIL;
+DO
+q: ParseTree ¨ ParseP[];
+IF q = NIL THEN q ¨ NEW[ParseTreeContent.noOp];
+l ¨ CONS[q, l];
+c ¨ GetToken[];
+SELECT c FROM
+endAltToken => EXIT;
+altSepToken => {};
+ENDCASE => SyntaxError[improperAltSeparator];
+ENDLOOP;
+SELECT TRUE FROM
+l = NIL => RETURN [NIL];
+l.rest = NIL => RETURN [l.first];
+ENDCASE => TRUSTED {
+RETURN[NEW[ParseTreeContent.alt ¨ [alt[LOOPHOLE[List.Reverse[LOOPHOLE[l]]]]]]];
+};
+};
+endAltToken, altSepToken => {
+UnReadToken[];
+RETURN[NIL]
+}
+ENDCASE => {
+UnReadToken[];
+p ¨ ParseX[];
+};
+};
+ParseP: PROC [] RETURNS [ParseTree] = {
+l: LIST OF ParseTree ¨ NIL;
+p: ParseTree;
+DO
+c: CHAR ¨ GetToken[];
+IF c = notToken
+THEN
+p ¨ NEW[ParseTreeContent.skipTo ¨ [skipTo[ParseZ[]]]]
+ELSE {
+UnReadToken[];
+p ¨ ParseZ[];
+IF p = NIL THEN EXIT;
+c ¨ GetToken[];
+SELECT c FROM
+closureToken => 
+p ¨ NEW[ParseTreeContent.closure ¨ [closure[p]]];
+greedyClosureToken => 
+p ¨ NEW[ParseTreeContent.greedyClosure ¨ [greedyClosure[p]]];
+plusToken => 
+p ¨ NEW[ParseTreeContent.concat ¨ [concat[LIST[p, NEW[ParseTreeContent.closure ¨ [closure[p]]]]]]];
+greedyPlusToken => 
+p ¨ NEW[ParseTreeContent.concat ¨ [concat[LIST[p, NEW[ParseTreeContent.greedyClosure ¨ [greedyClosure[p]]]]]]];
+powerToken => {
+l: LIST OF ParseTree ¨ NIL;
+iterations: Index ¨ ParseNumber[FALSE];
+WHILE iterations > 0 DO
+l ¨ CONS[p, l];
+iterations ¨ iterations - 1;
+ENDLOOP;
+p ¨ NEW[ParseTreeContent.concat ¨ [concat[l]]];
+};
+ENDCASE => UnReadToken[];
+};
+IF p.type = concat
+THEN {
+pp: REF ParseTreeContent.concat ¨ NARROW[p];
+FOR ll: LIST OF ParseTree ¨ pp.concats, ll.rest UNTIL ll = NIL DO
+l ¨ CONS[ll.first, l];
+ENDLOOP;
+}
+ELSE
+l ¨ CONS[p, l];
+IF l.first.type = closure
+THEN {
+q: REF ParseTreeContent.closure ¨ NARROW[l.first];
+IF q.p.type = closure OR q.p.type = greedyClosure THEN
+l.first ¨ q.p;
+}
+ELSE IF l.first.type = greedyClosure THEN {
+q: REF ParseTreeContent.greedyClosure ¨ NARROW[l.first];
+IF q.p.type = closure THEN {
+qq: REF ParseTreeContent.closure ¨ NARROW[q.p];
+q.p ¨ qq.p;
+}
+ELSE IF q.p.type = greedyClosure THEN
+l.first ¨ q.p;
+};
+ENDLOOP;
+SELECT TRUE FROM
+l = NIL => RETURN[NIL];
+l.rest = NIL => RETURN[l.first];
+ENDCASE => TRUSTED {
+RETURN[NEW[ParseTreeContent.concat ¨ [concat[LOOPHOLE[List.Reverse[LOOPHOLE[l]]]]]]];
+};
+};
+
+
+ParseTopLevel: PROC [] RETURNS [l: LIST OF ParseTree ¨ NIL, nameList: SimpleSymbolTable ¨ NIL, numberFields: Index ¨ 0] = {
+seenBeginAllToken, seenEndAllToken: BOOL ¨ FALSE;
+DO
+c: CHAR ¨ GetToken[];
+SELECT c FROM
+beginFieldToken => {
+field: ParseTree ¨ NIL;
+[field, nameList, numberFields] ¨ ParseField[nameList, numberFields];
+l ¨ CONS[field, l];
+};
+endFieldToken => SyntaxError[notInsideField];
+beginAllToken => {
+IF seenBeginAllToken THEN SyntaxError[moreThanOneBeginAll];
+seenBeginAllToken ¨ TRUE;
+l ¨ CONS[NEW[ParseTreeContent.beginALL], l];
+};
+endAllToken => {
+IF ~seenBeginAllToken OR seenEndAllToken THEN
+SyntaxError[noMatchingBeginAll];
+seenEndAllToken ¨ TRUE;
+l ¨ CONS[NEW[ParseTreeContent.endALL], l];
+};
+endPatternToken => {
+IF ~seenBeginAllToken THEN
+l ¨ CONS[NEW[ParseTreeContent.endALL], l];
+IF seenBeginAllToken AND ~seenEndAllToken THEN
+SyntaxError[noClosingEndAll];
+l ¨ CONS[NEW[ParseTreeContent.endAll], l];
+EXIT;
+};
+ENDCASE => {
+p: ParseTree;
+UnReadToken[];
+p ¨ ParseP[];
+IF p = NIL THEN SyntaxError[illegalCharacter];
+WITH p SELECT FROM
+z: REF ParseTreeContent.concat => TRUSTED {
+l ¨ LOOPHOLE[List.Nconc[List.Reverse[LOOPHOLE[z.concats]], LOOPHOLE[l]]];
+};
+ENDCASE => l ¨ CONS[p, l];
+};
+ENDLOOP;
+TRUSTED {l ¨ LOOPHOLE[List.Reverse[LOOPHOLE[l]]]};
+IF ~seenBeginAllToken THEN
+l ¨ CONS[NEW[ParseTreeContent.beginALL], l];
+l ¨ CONS[NEW[ParseTreeContent.beginAll], l];
+};
+
+ParseField: PROC [names: SimpleSymbolTable, number: Index] RETURNS [field: ParseTree, newNames: SimpleSymbolTable, newNumber: Index] = {
+s: ParseTree ¨ NIL;
+name: ROPE ¨ NIL;
+c: CHAR ¨ Ascii.Lower[GetToken[]];
+nameLooks: Tioga.Looks ¨ looksRead;
+bound: INT ¨ -1;
+newNames ¨ names;
+DO 
+IF ~(c IN  ['a..'z]) THEN EXIT;
+name ¨ Rope.Concat[name, Rope.FromChar[c]];
+c ¨ Ascii.Lower[GetToken[]];
+ENDLOOP;
+IF name = NIL THEN SyntaxError[nameMustBeAString];
+IF Rope.Equal[name, "all", FALSE] THEN
+SyntaxError[theAllNameIsReserved]; 
+FOR l: SimpleSymbolTable ¨ names, l.rest UNTIL l = NIL DO
+IF Rope.Equal[name, l.first.name, FALSE] THEN {
+IF c # endFieldToken THEN
+SyntaxError[secondOccurenceOfFieldMustNotContainPattern];
+IF ignoreCase THEN
+field ¨ NEW[ParseTreeContent.fieldEqualsIC ¨ [fieldEqualsIC[l.first.number]]]
+ELSE 
+field ¨ NEW[ParseTreeContent.fieldEquals ¨  [fieldEquals[l.first.number]]];
+RETURN[field, names, number];
+};
+ENDLOOP;
+newNumber ¨ number + 1;
+newNames ¨ CONS[NEW[SimpleSymbolTableEntry ¨ [name, newNumber]], newNames];
+IF c = boundSepToken THEN
+bound ¨ ParseNumber[FALSE];
+SELECT c FROM
+fieldSepToken => {
+s ¨ ParseP[];
+IF GetToken[] # endFieldToken THEN SyntaxError[expectedEndOfField];
+};
+endFieldToken => {
+s ¨ NEW[ParseTreeContent.closure ¨ [closure[NEW[ParseTreeContent.anyChar ¨ [anyChar[nameLooks]]]]]];
+};
+ENDCASE => SyntaxError[expectedEndOfField];
+
+field ¨ NEW[ParseTreeContent.field ¨  [field[newNumber, bound, s]]];
+};
+ParseNumber: PROC [octal: BOOL] RETURNS [number: Index ¨ 0] = {
+c: CHAR;
+IF octal
+THEN 
+WHILE (c ¨ GetToken[]) IN ['0..'7] DO
+number ¨ 8*number + c - '0;
+ENDLOOP
+ELSE
+WHILE (c ¨ GetToken[]) IN ['0..'9] DO
+number ¨ 10*number + c - '0;
+ENDLOOP;
+IF c # '. THEN UnReadToken[];
+};
+
+IF addBounds THEN {
+IF literal THEN {
+FOR i: INT DECREASING IN [0 .. patternRope.Size) DO
+SELECT CharOps.Prop[patternRope.Fetch[i]] FROM
+blank, alphaNumeric => NULL;	-- ??
+punctuation, other => patternRope ¨ patternRope.Replace[start: i, len: 0, with: "'"];
+ENDCASE => ERROR;
+ENDLOOP;
+literal ¨ FALSE;
+};
+patternRope ¨ Rope.Concat["^", Rope.Concat[patternRope, "$"]];
+};
+
+pEnd ¨ MIN[Rope.Size[patternRope], patternStart+patternLen];
+patternStart ¨ MIN[patternStart,pEnd];
+pPos ¨ patternStart;
+finder ¨ NEW[FinderRec];
+
+IF word THEN finder.wordSearch ¨ TRUE;
+finder.nodeReader ¨ NodeReader.New[];
+NodeReader.SetParts[finder.nodeReader, patternRope, patternRuns, NIL, NIL];
+IF patternRuns # NIL AND ~ignoreLooks THEN finder.doLooks ¨ TRUE;
+
+[parsedPatternList, nameList, numberOfFields] ¨ ParseTopLevel[];
+finder.nameArray ¨ NEW[NameArray[numberOfFields+1]];
+FOR l: SimpleSymbolTable ¨ nameList, l.rest UNTIL l = NIL DO
+finder.nameArray[l.first.number].name ¨ l.first.name;
+ENDLOOP;
+forwardPattern ¨ NEW[ParseTreeContent.concat ¨ 
+[concat[CONS[NEW[ParseTreeContent.closure ¨ 
+[closure[NEW[ParseTreeContent.anyChar ¨ [anyChar[IgnoreLooks]]]]]], parsedPatternList]]]];
+[forwardPattern, charClassList, numCharClasses] ¨ OptimizeForwardSearch[forwardPattern, charClassList, numCharClasses];
+TRUSTED {
+backwardPattern ¨ NEW[ParseTreeContent.concat ¨ 
+[concat[LOOPHOLE[List.Append[
+LOOPHOLE[parsedPatternList], 
+LOOPHOLE[LIST[NEW[ParseTreeContent.closure ¨ 
+[closure[NEW[ParseTreeContent.anyChar ¨ [anyChar[IgnoreLooks]]]]]]]]]]]]];
+};
+[backwardPattern, charClassList, numCharClasses] ¨ OptimizeBackwardSearch[backwardPattern, charClassList, numCharClasses];
+finder.classes ¨ NEW[ClassArray[numCharClasses]];
+FOR l: LIST OF ParseTree ¨ charClassList, l.rest UNTIL l = NIL DO
+WITH l.first SELECT FROM
+x: REF ParseTreeContent.class => finder.classes[x.classNumber] ¨ x.class;
+x: REF ParseTreeContent.skipOverClass => finder.classes[x.classNumber] ¨ x.class;
+ENDCASE => ERROR;
+ENDLOOP;
+finder.stack ¨ NEW[StackContent ¨ [0, NEW[PatternStackArray[100]], NEW[TextStackArray[100]], NEW[ReturnCodeArray[100]]]];  -- Interim hack.
+finder.forwardProgram ¨ Compile[forwardPattern];
+finder.backwardProgram ¨ Compile[backwardPattern];
+finder.wordSearch ¨ word;
+};
+
+SearchRope: PUBLIC PROC [finder: Finder, rope: ROPE, start: Offset, len: Offset, interrupt: REF BOOL] RETURNS [found: BOOL, at, atEnd, before, after: Offset] = {
+[found, at, atEnd, before, after] ¨ Search[finder, rope, NIL, start, len, FALSE, interrupt]
+};
+
+Try: PUBLIC PROC [finder: Finder, text: Tioga.Node, start: Offset, len: Offset, looksExact: BOOL, interrupt: REF BOOL] RETURNS [found: BOOL, at, atEnd, before, after: Offset] = {
+[found, at, atEnd, before, after] ¨ 
+Search[finder, text.rope, text.runs, start, len, looksExact, interrupt];
+};
+
+Search: PUBLIC PROC [finder: Finder, rope: ROPE, runs: Tioga.Runs, start: Offset, len: Offset, looksExact: BOOLEAN, interrupt: REF BOOL ¨ NIL] RETURNS [found: BOOLEAN, at, atEnd, before, after: Offset] = {
+IF finder.wordSearch THEN DO -- repeat search until find a word
+[found, at, atEnd, before, after] ¨ TryToFind[finder, rope, runs, start, len, looksExact, interrupt];
+IF ~found OR (interrupt#NIL AND interrupt≠) THEN RETURN; -- failed
+IF IsWord[rope, at, atEnd] THEN RETURN; -- got it
+start ¨ after; -- try again
+ENDLOOP;
+[found, at, atEnd, before, after] ¨
+TryToFind[finder, rope, runs, start, len, looksExact, interrupt];
+};
+
+IsWord: PROC [rope: ROPE, at, atEnd: Offset] RETURNS [BOOLEAN] = {
+IF at > 0 AND
+CharOps.Prop[Rope.Fetch[rope,at-1]] = alphaNumeric THEN RETURN [FALSE];
+IF atEnd < Rope.Size[rope] AND
+CharOps.Prop[Rope.Fetch[rope,atEnd]] = alphaNumeric THEN RETURN [FALSE];
+RETURN [TRUE];
+};
+
+TryToFind: PROC [finder: Finder, rope: ROPE, runs: Tioga.Runs--of CharLooksItem--, start: Offset, len: Offset, looksExact: BOOLEAN, interrupt: REF BOOL] RETURNS [found: BOOLEAN, at, atEnd, before, after: Offset] = {
+Character: TYPE = Index;
+currentChar: Character;
+currentCHAR: CHAR;
+end: Offset ¨ start+MIN[len, Rope.Size[rope]-start];
+nextPos: Offset ¨ start;
+NoMoreChars: Character = 666;
+NoNodeBreakBound: Index = 32177;
+pc: Index ¨ 0;
+nodeBreakBound: Index ¨ NoNodeBreakBound;
+opCode: REF PatternOpCodeArray ¨ finder.forwardProgram.opCodes;
+looks: REF PatternLooksArray ¨ finder.forwardProgram.looks;
+data: REF PatternDataArray ¨ finder.forwardProgram.data;
+next: REF PatternNextArray ¨ finder.forwardProgram.next;
+pcStack: REF PatternStackArray ¨ finder.stack.pc;
+nextPosStack: REF TextStackArray ¨ finder.stack.nextPos;
+returnCodeStack: REF ReturnCodeArray ¨ finder.stack.returnCode;
+charClass: REF ClassArray ¨ finder.classes;
+stackPos: Index ¨ 0;
+nodeReader: NodeReader.Ref ¨ finder.nodeReader;
+AdvanceChar: PROC [] = {
+IF nextPos < end
+THEN {
+xc: Char.XCHAR ¨ NodeReader.FetchChar[nodeReader, nextPos];
+currentChar ¨ (currentCHAR ¨ CharOps.Char0[xc]) - 0C;
+nextPos ¨ nextPos + 1;
+}
+ELSE {
+currentChar ¨ NoMoreChars;
+currentCHAR ¨ '\000;
+nextPos ¨ end + 1;
+};
+};
+PushPos: PROC [returnCode: ReturnCode] = {
+pcStack[stackPos] ¨ pc;
+nextPosStack[stackPos] ¨ nextPos;
+returnCodeStack[stackPos] ¨ returnCode;
+stackPos ¨ stackPos + 1;
+};
+TestLooks: PROC [] RETURNS [BOOL] = {
+sourcelks: Tioga.Looks;
+IF runs=NIL THEN RETURN [FALSE]; -- pattern has looks and text doesn't
+IF nextPos NOT IN (start..end] THEN RETURN [FALSE]; -- boundary char has no looks
+sourcelks ¨ NodeReader.FetchLooks[nodeReader, nextPos-1];
+RETURN[
+looks[pc]=(IF looksExact THEN sourcelks ELSE TextLooks.LooksAND[sourcelks, looks[pc]])]; 
+};
+Begin: PROC [] = {
+IF start < end THEN {
+nextPos ¨ start;
+NodeReader.SetParts[nodeReader, rope, runs, NIL, NIL]};
+AdvanceChar[];
+};
+DoFieldEquals: PROC [ignoreCase: BOOL] RETURNS [BOOL] = {
+pos: Offset ¨ finder.nameArray[data[pc]].at;
+WHILE pos < finder.nameArray[data[pc]].atEnd DO
+c: CHAR ¨ rope.Fetch[pos];
+IF ignoreCase
+THEN {
+IF Ascii.Upper[c] # Ascii.Upper[currentCHAR] THEN RETURN [FALSE];
+}
+ELSE
+IF c # currentCHAR THEN RETURN [FALSE];
+pos ¨ pos + 1;
+AdvanceChar[];
+ENDLOOP;
+RETURN[TRUE];
+};
+DoFieldEqualsLooks: PROC [ignoreCase: BOOL] RETURNS [BOOL] = {
+pos: Offset ¨ finder.nameArray[data[pc]].at;
+IF runs=NIL THEN RETURN [FALSE]; -- pattern has looks and text doesn't
+WHILE pos < finder.nameArray[data[pc]].atEnd DO
+c: CHAR ¨ rope.Fetch[pos];
+fieldLooks, nextLooks: Tioga.Looks;
+IF ignoreCase
+THEN {
+IF Ascii.Upper[c] # Ascii.Upper[currentCHAR] THEN RETURN [FALSE];
+}
+ELSE
+IF c # currentCHAR THEN RETURN [FALSE];
+IF nextPos NOT IN (start..end] THEN RETURN [FALSE];
+fieldLooks ¨ NodeReader.FetchLooks[nodeReader, pos];
+nextLooks ¨ NodeReader.FetchLooks[nodeReader, nextPos-1];
+IF fieldLooks # (IF looksExact THEN nextLooks ELSE TextLooks.LooksAND[fieldLooks, nextLooks]) THEN RETURN[FALSE];
+pos ¨ pos + 1;
+AdvanceChar[];
+ENDLOOP;
+RETURN[TRUE];
+};
+DoCarefulGreedyClosureEnd: PROC [] RETURNS [BOOL] = {
+lastCarefulNextPos: Basics.LongNumber;
+lastCarefulNextPos.lo ¨ data[next[data[pc]]+1];
+lastCarefulNextPos.hi ¨ next[next[data[pc]]+1];
+TRUSTED {
+RETURN[lastCarefulNextPos # LOOPHOLE[nextPos]];
+};
+};
+Begin[];
+DO
+DO
+{
+SELECT opCode[pc] FROM
+matchChar => 
+IF currentChar = data[pc] THEN GO TO advance ELSE GO TO Failure;
+matchCharIC =>
+IF Ascii.Upper[currentCHAR] = VAL[data[pc]]
+THEN GO TO advance ELSE GO TO Failure;
+matchCharLooks =>
+IF currentChar = data[pc] AND TestLooks[]
+THEN GO TO advance ELSE GO TO Failure;
+matchCharLooksIC =>
+IF Ascii.Upper[currentCHAR] = VAL[data[pc]] AND TestLooks[]
+THEN GO TO advance ELSE GO TO Failure;
+matchClass => 
+IF currentCHAR IN LegalCharacters AND charClass[data[pc]][currentCHAR]
+THEN GO TO advance
+ELSE GO TO Failure;
+matchClassLooks =>
+IF currentCHAR IN LegalCharacters AND
+charClass[data[pc]][currentCHAR] AND
+TestLooks[]
+THEN GO TO advance ELSE GO TO Failure;
+matchAnyChar => 
+IF currentChar # NoMoreChars THEN GO TO advance ELSE GO TO Failure;
+matchAnyCharLooks =>
+IF currentChar # NoMoreChars AND TestLooks[]
+THEN GO TO advance ELSE GO TO Failure;
+matchNodeBreak =>
+IF ~(nextPos=Rope.Size[rope]+1 AND currentChar=NoMoreChars)
+THEN GO TO Failure;
+skipToNodeBreak => {
+IF end < Rope.Size[rope] THEN GO TO Failure;
+nextPos ¨ end;
+GO TO advance;
+};
+skipToNodeBreakLooks => {
+IF end < Rope.Size[rope] THEN GO TO Failure;
+WHILE currentChar # NoMoreChars DO
+IF ~TestLooks[] THEN GO TO Failure;
+AdvanceChar[];
+ENDLOOP;
+};
+matchBeginNode => IF nextPos # 1 THEN GO TO Failure;
+fail => GO TO Failure;
+succeed => GO TO AbsoluteSuccess;
+noOp => NULL;
+skipOverClass => {
+ccl: CharClass ¨ charClass[data[pc]];
+WHILE currentCHAR IN LegalCharacters AND ccl[currentCHAR] DO
+AdvanceChar[];
+ENDLOOP;
+<<GO TO failAtEnd;>>
+};
+skipOverClassLooks => { 
+ccl: CharClass ¨ charClass[data[pc]];
+WHILE currentCHAR IN LegalCharacters AND ccl[currentCHAR] AND TestLooks[] DO
+AdvanceChar[];
+ENDLOOP;
+<<GO TO failAtEnd;>>
+};
+skipOverChar => {
+c: CHAR ¨ VAL[data[pc]];
+WHILE currentCHAR = c DO
+AdvanceChar[];
+ENDLOOP;
+<<GO TO failAtEnd;>>
+};
+skipOverCharLooks => {
+c: CHAR ¨ VAL[data[pc]];
+WHILE currentCHAR = c AND TestLooks[] DO
+AdvanceChar[];
+ENDLOOP;
+<<GO TO failAtEnd;>>
+};
+skipOverCharIC => {
+c: CHAR ¨ VAL[data[pc]];
+WHILE Ascii.Upper[currentCHAR] = c DO
+AdvanceChar[];
+ENDLOOP;
+<<GO TO failAtEnd;>>
+};
+skipOverCharLooksIC => {
+c: CHAR ¨ VAL[data[pc]];
+WHILE Ascii.Upper[currentCHAR] = c AND TestLooks[] DO
+AdvanceChar[];
+ENDLOOP;
+<<GO TO failAtEnd;>>
+};
+skipToChar => {
+c: CHAR ¨ VAL[data[pc]];
+UNTIL currentCHAR = c DO
+IF currentChar = NoMoreChars THEN GO TO Failure;
+AdvanceChar[];
+ENDLOOP;
+};
+skipToCharLooks => {
+c: CHAR ¨ VAL[data[pc]];
+UNTIL currentCHAR = c AND TestLooks[] DO
+IF currentChar = NoMoreChars THEN GO TO Failure;
+AdvanceChar[];
+ENDLOOP;
+};
+skipToCharIC => {
+c: CHAR ¨ VAL[data[pc]];
+UNTIL Ascii.Upper[currentCHAR] = c DO
+IF currentChar = NoMoreChars THEN GO TO Failure;
+AdvanceChar[];
+ENDLOOP;
+};
+skipToCharLooksIC => {
+c: CHAR ¨ VAL[data[pc]];
+UNTIL Ascii.Upper[currentCHAR] = c AND TestLooks[] DO
+IF currentChar = NoMoreChars THEN GO TO Failure;
+AdvanceChar[];
+ENDLOOP;
+};
+skipToString => {
+PushPos[skipToStringRet];
+};
+endOfSkipToString => {
+stackPos ¨ stackPos-1;
+nextPos ¨ nextPosStack[stackPos]-1;
+GO TO advance;
+};
+skipToEnd => {
+nextPos ¨ end;
+GO TO advance;
+};
+skipToBeginning => { 
+nextPos ¨ start;
+GO TO advance;
+};
+closure, greedyClosure, alt =>
+PushPos[closureRet];
+carefulClosure => {
+PushPos[closureRet];
+data[data[pc]+1] ¨ Basics.LowHalf[nextPos];
+next[data[pc]+1] ¨ Basics.HighHalf[nextPos];
+};
+carefulClosure, carefulGreedyClosure => {
+PushPos[closureRet];
+data[next[pc]+1] ¨ Basics.LowHalf[nextPos];
+next[next[pc]+1] ¨ Basics.HighHalf[nextPos];
+};
+carefulClosureEnd => {
+lastCarefulNextPos: Basics.LongNumber;
+lastCarefulNextPos.lo ¨ data[data[data[pc]]+1];
+lastCarefulNextPos.hi ¨ next[data[data[pc]]+1];
+IF lastCarefulNextPos = LOOPHOLE[nextPos] THEN GO TO Failure;
+};
+carefulGreedyClosureEnd => IF ~DoCarefulGreedyClosureEnd[] THEN GO TO Failure;
+fieldStart => finder.nameArray[data[pc]].at ¨ nextPos-1;
+fieldEnd => finder.nameArray[data[pc]].atEnd ¨ MAX[nextPos-1, finder.nameArray[data[pc]].at];
+boundNodeBreaks => nodeBreakBound ¨ data[pc];
+fieldEquals => IF ~DoFieldEquals[FALSE] THEN GO TO Failure;
+fieldEqualsLooks => IF ~DoFieldEqualsLooks[FALSE] THEN GO TO Failure;
+fieldEqualsIC => IF ~DoFieldEquals[TRUE] THEN GO TO Failure;
+fieldEqualsLooksIC => IF ~DoFieldEqualsLooks[TRUE] THEN GO TO Failure;
+beginAll => before ¨ nextPos-1;
+endAll => {
+after ¨ MAX[nextPos-1, before];
+GO TO AbsoluteSuccess;
+};
+ENDCASE => ERROR;
+EXITS
+advance => AdvanceChar[];
+};
+pc ¨ next[pc];
+REPEAT
+Failure => {
+IF interrupt # NIL AND interrupt≠ THEN GO TO AbsoluteFailure;
+IF stackPos = 0 THEN GO TO AbsoluteFailure;
+stackPos ¨ stackPos - 1;
+SELECT returnCodeStack[stackPos] FROM
+skipToStringRet => {
+pc ¨ pcStack[stackPos];
+nextPos ¨ nextPosStack[stackPos];
+};
+closureRet, greedyClosureRet, altRet, carefulClosureRet, carefulGreedyClosureRet => {
+pc ¨ data[pcStack[stackPos]];
+nextPos ¨ nextPosStack[stackPos]-1;
+};
+ENDCASE => ERROR;
+AdvanceChar[];
+};
+ENDLOOP;
+REPEAT
+AbsoluteFailure => {
+found ¨ FALSE;
+};
+AbsoluteSuccess => {
+found ¨ TRUE;
+at ¨ finder.nameArray[0].at;
+atEnd ¨ finder.nameArray[0].atEnd;
+};
+ENDLOOP;
+}; 
+
+SearchRopeBackwards: PUBLIC PROC [finder: Finder, rope: ROPE, start: Offset, len: Offset, interrupt: REF BOOL ¨ NIL] RETURNS [found: BOOLEAN, at, atEnd, before, after: Offset] = {
+[found, at, atEnd, before, after] ¨
+Search[finder, rope, NIL, start, len, FALSE, interrupt];
+};
+
+TryBackwards: PUBLIC PROC [finder: Finder, text: Tioga.Node, start: Offset, len: Offset, looksExact: BOOLEAN ¨ FALSE, interrupt: REF BOOL ¨ NIL] RETURNS [found: BOOLEAN, at, atEnd, before, after: Offset] = {
+[found, at, atEnd, before, after] ¨
+Search[finder, text.rope, text.runs, start, len, looksExact, interrupt];
+};
+
+OptimizeForwardSearch: PUBLIC ENTRY PROC[p: ParseTree, ccl: LIST OF ParseTree, numCcl: Index] RETURNS [np: ParseTree, newCcl: LIST OF ParseTree, newNumCcl: Index] = {
+ENABLE UNWIND => NULL;
+follow: CharClass ¨ NEW[CharClassContent ¨ allCharClass];
+charClassList ¨ ccl;
+numCharClasses ¨ numCcl;
+np ¨ Optimize[TRUE, p, follow, ALL[TRUE], end].np;
+newCcl ¨ charClassList;
+charClassList ¨ NIL;
+newNumCcl ¨ numCharClasses;
+};
+
+OptimizeBackwardSearch: PUBLIC ENTRY PROC[p: ParseTree, ccl: LIST OF ParseTree, numCcl: Index] RETURNS [np: ParseTree, newCcl: LIST OF ParseTree, newNumCcl: Index] = {
+ENABLE UNWIND => NULL;
+follow: CharClass ¨ NEW[CharClassContent ¨ allCharClass];
+charClassList ¨ ccl;
+numCharClasses ¨ numCcl;
+np ¨ Optimize[FALSE, p, follow, ALL[TRUE], beginning].np;
+newCcl ¨ charClassList;
+charClassList ¨ NIL;
+newNumCcl ¨ numCharClasses;
+};
+
+Optimize: PROC [forwards: BOOL, p: ParseTree, follow: CharClass, looksFollow: Tioga.Looks, nodeBreak: NodeBreakType] RETURNS [np: ParseTree, looksStart: Tioga.Looks, nodeBreakStart: NodeBreakType, matchesNull: BOOL] = {
+np ¨ p;
+matchesNull ¨ FALSE;
+WITH p SELECT FROM 
+x: REF ParseTreeContent.concat => {
+l: LIST OF ParseTree; 
+[l, looksStart, nodeBreakStart, matchesNull] ¨ 
+IF forwards THEN OptimizeConcatForwards[x.concats, follow, looksFollow, nodeBreak]
+ELSE OptimizeConcatBackwards[x.concats, follow, looksFollow, nodeBreak];
+np ¨ NEW[ParseTreeContent.concat ¨ [concat[l]]];
+};
+x: REF ParseTreeContent.alt => {
+ll: LIST OF ParseTree;
+xp: ParseTree;
+xStart: CharClass ¨ NEW[CharClassContent];
+start: CharClass ¨ NEW[CharClassContent ¨ emptyCharClass];
+xLooksStart: Tioga.Looks;
+xNodeBreakStart: NodeBreakType;
+start≠ ¨ follow≠;
+[xp, looksStart, nodeBreakStart, matchesNull] ¨ Optimize[forwards, x.alts.first, start, looksFollow, nodeBreak];
+ll ¨ CONS[xp, NIL];
+FOR l: LIST OF ParseTree ¨ x.alts.rest, l.rest UNTIL l = NIL DO
+oneAltMatchesNull: BOOL ¨ FALSE;
+xStart≠ ¨ follow≠;
+[xp, xLooksStart, xNodeBreakStart, oneAltMatchesNull] ¨ Optimize[forwards, l.first, xStart, looksFollow, nodeBreak];
+matchesNull ¨ matchesNull OR oneAltMatchesNull;
+ll ¨ CONS[xp, ll];
+CharClassUnion[start, xStart];
+looksStart ¨ TextLooks.LooksOR[looksStart, xLooksStart];
+IF nodeBreakStart = none THEN
+nodeBreakStart ¨ xNodeBreakStart
+ELSE IF xNodeBreakStart # none AND nodeBreakStart # xNodeBreakStart THEN
+nodeBreakStart ¨ both; 
+ENDLOOP;
+follow≠ ¨ start≠;
+TRUSTED {ll ¨ LOOPHOLE[List.DReverse[LOOPHOLE[ll]]]};
+np ¨ NEW[ParseTreeContent.alt ¨ [alt[ll]]];
+};
+x: REF ParseTreeContent.field => {
+xp: ParseTree;
+[xp, looksStart, nodeBreakStart, matchesNull] ¨ Optimize[forwards, x.p, follow, looksFollow, nodeBreak];
+np ¨ NEW[ParseTreeContent.field ¨ [field[x.number, x.bound, xp]]];
+};
+x: REF ParseTreeContent.char => {
+follow≠ ¨ ALL[FALSE];
+follow[x.char] ¨ TRUE;
+looksStart ¨ x.looks;
+nodeBreakStart ¨ none;
+};
+x: REF ParseTreeContent.charIC => {
+follow≠ ¨ ALL[FALSE];
+follow[x.char] ¨ TRUE;
+follow[Ascii.Lower[x.char]] ¨ TRUE;
+looksStart ¨ x.looks;
+nodeBreakStart ¨ none;
+};
+x: REF ParseTreeContent.class => {
+follow≠ ¨ x.class≠;
+looksStart ¨ x.looks;
+nodeBreakStart ¨ none;
+};
+x: REF ParseTreeContent.anyChar => {
+follow≠ ¨ allCharClass;
+looksStart ¨ x.looks;
+nodeBreakStart ¨ none;
+};
+x: REF ParseTreeContent.nodeBreak => {
+follow≠ ¨ ALL[FALSE];
+looksStart ¨ Tioga.noLooks;
+nodeBreakStart ¨ end;
+matchesNull ¨ TRUE;
+};
+x: REF ParseTreeContent.beginNode => {
+follow≠ ¨ ALL[FALSE];
+looksStart ¨ Tioga.noLooks;
+nodeBreakStart ¨ beginning;
+matchesNull ¨ TRUE;
+};
+x: REF ParseTreeContent.succeed => {
+follow≠ ¨ allCharClass;
+looksStart ¨ Tioga.allLooks;
+nodeBreakStart ¨ none;
+};
+x: REF ParseTreeContent.skipToChar => {
+follow≠ ¨ allCharClass;
+looksStart ¨ TextLooks.LooksOR[x.looks, looksFollow];
+nodeBreakStart ¨ nodeBreak;
+matchesNull ¨ TRUE;
+};
+x: REF ParseTreeContent.skipOverChar => {
+follow[x.char] ¨ TRUE;
+looksStart ¨ TextLooks.LooksOR[x.looks, looksFollow];
+nodeBreakStart ¨ nodeBreak;
+matchesNull ¨ TRUE;
+};
+x: REF ParseTreeContent.skipToCharIC => {
+follow≠ ¨ allCharClass;
+looksStart ¨ TextLooks.LooksOR[x.looks, looksFollow];
+nodeBreakStart ¨ nodeBreak;
+matchesNull ¨ TRUE;
+};
+x: REF ParseTreeContent.skipOverCharIC => {
+follow[x.char] ¨ TRUE;
+follow[Ascii.Lower[x.char]] ¨ TRUE;
+looksStart ¨ TextLooks.LooksOR[x.looks, looksFollow];
+nodeBreakStart ¨ nodeBreak;
+matchesNull ¨ TRUE;
+};
+x: REF ParseTreeContent.skipTo => {
+xp: ParseTree;
+[xp, looksStart, nodeBreakStart, matchesNull] ¨ Optimize[forwards, x.p, follow, looksFollow, nodeBreak];
+np ¨ OptimizeSkipTo[NEW[ParseTreeContent.skipTo ¨ [skipTo[xp]]]];
+follow≠ ¨ allCharClass;
+looksStart ¨ Tioga.allLooks;
+nodeBreakStart ¨ both;
+matchesNull ¨ TRUE;
+};
+x: REF ParseTreeContent.skipOver => {
+xp: ParseTree;
+start: CharClass ¨ NEW[CharClassContent ¨ follow≠];
+[xp, looksStart, nodeBreakStart, matchesNull] ¨ Optimize[forwards, x.p, start, looksFollow, nodeBreak];
+np ¨ NEW[ParseTreeContent.skipOver ¨ [skipOver[xp]]];
+CharClassUnion[follow, start];
+looksStart ¨ TextLooks.LooksOR[looksStart, looksFollow];
+IF nodeBreakStart = none THEN
+nodeBreakStart ¨ nodeBreak
+ELSE IF nodeBreak # none AND nodeBreakStart # nodeBreak THEN
+nodeBreakStart ¨ both; 
+matchesNull ¨ TRUE;
+};
+x: REF ParseTreeContent.closure =>
+[np, looksStart, nodeBreakStart, matchesNull] ¨ 
+OptimizeClosure[closure, forwards, x.p, follow, looksFollow, nodeBreak];
+x: REF ParseTreeContent.greedyClosure => 
+[np, looksStart, nodeBreakStart, matchesNull] ¨ 
+OptimizeClosure[greedyClosure, forwards, x.p, follow, looksFollow, nodeBreak];
+ENDCASE => {
+SELECT p.type FROM
+fieldEquals, fieldEqualsIC, fail => {
+follow≠ ¨ allCharClass;
+looksStart ¨ Tioga.allLooks;
+nodeBreakStart ¨ both;
+matchesNull ¨ TRUE;
+};
+noOp, beginAll, endAll, beginALL, endALL => {
+looksStart ¨ looksFollow;
+nodeBreakStart ¨ nodeBreak;
+matchesNull ¨ TRUE;
+};
+ENDCASE => ERROR;
+};
+};
+
+
+OptimizeConcatForwards: PROC [l: LIST OF ParseTree, follow: CharClass, looksFollow: Tioga.Looks, nodeBreak: NodeBreakType] RETURNS [lp: LIST OF ParseTree, looksStart: Tioga.Looks, nodeBreakStart: NodeBreakType, matchesNull: BOOL] = TRUSTED {
+[lp, looksStart, nodeBreakStart, matchesNull] ¨ OptimizeConcat[TRUE, LOOPHOLE[List.Reverse[LOOPHOLE[l]]], follow, looksFollow, nodeBreak];
+};
+
+OptimizeConcatBackwards: PROC [l: LIST OF ParseTree, follow: CharClass, looksFollow: Tioga.Looks, nodeBreak: NodeBreakType] RETURNS [lp: LIST OF ParseTree, looksStart: Tioga.Looks, nodeBreakStart: NodeBreakType, matchesNull: BOOL] = TRUSTED {
+[lp, looksStart, nodeBreakStart, matchesNull] ¨ OptimizeConcat[FALSE, LOOPHOLE[List.Append[LOOPHOLE[l]]], follow, looksFollow, nodeBreak];
+};
+
+OptimizeConcat: PROC [forwards: BOOL, l: LIST OF ParseTree, follow: CharClass, looksFollow: Tioga.Looks, nodeBreak: NodeBreakType] RETURNS [lp: LIST OF ParseTree, looksStart: Tioga.Looks, nodeBreakStart: NodeBreakType, matchesNull: BOOL ¨ TRUE] = {
+looksStart ¨ looksFollow;
+nodeBreakStart ¨ nodeBreak;
+lp ¨ NIL;
+WHILE l # NIL DO
+first: LIST OF ParseTree ¨ l;
+thisOneMatchesNull: BOOL;
+l ¨ l.rest;
+first.rest ¨ lp;
+lp ¨ first;
+[lp.first, looksStart, nodeBreakStart, thisOneMatchesNull] ¨ Optimize[forwards, lp.first, follow, looksStart, nodeBreakStart];
+matchesNull ¨ matchesNull AND thisOneMatchesNull;
+ENDLOOP;
+};
+
+OptimizeClosure: PROC [kind: ParseTypes, forwards: BOOL, p: ParseTree, follow: CharClass, looksFollow: Tioga.Looks, nodeBreak: NodeBreakType] RETURNS [np: ParseTree, looksStart: Tioga.Looks, nodeBreakStart: NodeBreakType, matchesNull: BOOL ¨ TRUE] = {
+Make: PROC[p: ParseTree] RETURNS [cl: ParseTree] = {
+SELECT kind FROM
+closure => cl ¨ NEW[ParseTreeContent.closure ¨ [closure[p]]];
+greedyClosure => cl ¨ NEW[ParseTreeContent.greedyClosure ¨ [greedyClosure[p]]];
+ENDCASE => ERROR;
+};
+MakeCareful: PROC[p: ParseTree] RETURNS [cl: ParseTree] = {
+SELECT kind FROM
+closure => cl ¨ NEW[ParseTreeContent.carefulClosure ¨ [carefulClosure[p]]];
+greedyClosure => cl ¨ NEW[ParseTreeContent.carefulGreedyClosure ¨ [carefulGreedyClosure[p]]];
+ENDCASE => ERROR;
+};
+WITH p SELECT FROM
+z: REF ParseTreeContent.anyChar => {
+IF follow≠ = emptyCharClass THEN {
+IF (nodeBreak = beginning AND forwards) OR (nodeBreak = end AND ~forwards) THEN
+np ¨ NEW[ParseTreeContent.noOp]
+ELSE IF (nodeBreak = end AND forwards) OR (nodeBreak = beginning AND ~forwards)  THEN
+np ¨ NEW[ParseTreeContent.skipToNodeBreak ¨ [skipToNodeBreak[z.looks]]]
+ELSE
+np ¨ Make[p];
+}
+ELSE IF follow≠ # allCharClass THEN {
+start: CharClass ¨ NEW[CharClassContent ¨ allCharClass];
+rest: CharClass ¨ NEW[CharClassContent ¨ follow≠];
+q: ParseTree;
+CharClassDifference[start, rest];
+q ¨ SkipOverClassNode[start, z.looks];
+np ¨ NEW[ParseTreeContent.concat ¨ 
+[concat[LIST[q, Make[NEW[ParseTreeContent.concat ¨ [concat[LIST[MatchClassNode[rest, z.looks], q]]]]]]]]];
+}
+ELSE
+np ¨ Make[p];
+follow≠ ¨ allCharClass;
+looksStart ¨ TextLooks.LooksOR[z.looks, looksFollow];
+nodeBreakStart ¨ nodeBreak;
+};
+z: REF ParseTreeContent.char => {
+IF ~follow[z.char] THEN
+np ¨ NEW[ParseTreeContent.skipOverChar ¨ [skipOverChar[z.char, z.looks]]]
+ELSE
+np ¨ Make[p];
+follow[z.char] ¨ TRUE;
+looksStart ¨ TextLooks.LooksOR[z.looks, looksFollow];
+nodeBreakStart ¨ nodeBreak;
+};
+z: REF ParseTreeContent.charIC => {
+IF ~follow[z.char] AND ~follow[Ascii.Lower[z.char]] THEN
+np ¨ NEW[ParseTreeContent.skipOverCharIC ¨ [skipOverCharIC[z.char, z.looks]]]
+ELSE
+np ¨ Make[p];
+
+follow[z.char] ¨ TRUE;
+follow[Ascii.Lower[z.char]] ¨ TRUE;
+looksStart ¨ TextLooks.LooksOR[z.looks, looksFollow];
+nodeBreakStart ¨ nodeBreak;
+};
+z: REF ParseTreeContent.class => {
+IF follow≠ = emptyCharClass THEN
+np ¨ NEW[ParseTreeContent.skipOverClass ¨ [skipOverClass[z.class, z.looks, z.classNumber]]]
+ELSE {
+thisClass: CharClass ¨ NEW[CharClassContent ¨ z.class≠];
+rest: CharClass ¨ NEW[CharClassContent ¨ follow≠];
+CharClassIntersection[rest, thisClass];
+CharClassDifference[thisClass, rest];
+IF rest≠ = emptyCharClass THEN
+np ¨ SkipOverClassNode[thisClass, z.looks]
+ELSE IF thisClass≠ # emptyCharClass THEN {
+q: ParseTree ¨ SkipOverClassNode[thisClass, z.looks];
+np ¨ NEW[ParseTreeContent.concat ¨ 
+[concat[LIST[q, Make[NEW[ParseTreeContent.concat ¨ [concat[LIST[MatchClassNode[rest, z.looks], q]]]]]]]]];
+}
+ELSE
+np ¨ Make[p];
+CharClassUnion[follow, thisClass];
+};
+CharClassUnion[follow, z.class];
+looksStart ¨ TextLooks.LooksOR[z.looks, looksFollow];
+nodeBreakStart ¨ nodeBreak;
+};
+ENDCASE => {
+xp: ParseTree;
+thisOneMatchesNull: BOOL;
+[xp, looksStart, nodeBreakStart, thisOneMatchesNull] ¨ Optimize[forwards, p, follow, looksFollow, nodeBreak];
+IF thisOneMatchesNull THEN
+np ¨ MakeCareful[xp]
+ELSE
+np ¨ Make[xp];
+looksStart ¨ TextLooks.LooksOR[looksStart, looksFollow];
+IF nodeBreakStart = none THEN
+nodeBreakStart ¨ nodeBreak
+ELSE IF nodeBreak # none AND nodeBreakStart # nodeBreak THEN
+nodeBreakStart ¨ both; 
+};
+};
+
+OptimizeSkipTo: PROC [x: REF ParseTreeContent.skipTo] RETURNS [ParseTree] = {
+IF x.p.type = concat THEN {
+q: REF ParseTreeContent.concat ¨ NARROW[x.p];
+FOR l: LIST OF ParseTree ¨ q.concats, l.rest UNTIL l = NIL DO
+SELECT l.first.type FROM
+char, charIC, class, anyChar => NULL;
+ENDCASE => RETURN[x];
+ENDLOOP;
+RETURN[NEW[ParseTreeContent.skipToString ¨ [skipToString[x.p]]]];
+};
+RETURN[x];
+};
+
+
+ClassType: TYPE = {wholeSet, char, charIC, notChar, notCharIC};
+AnalyzeClass: PROC [x: CharClass] RETURNS [kind: ClassType, c: CHAR] = {
+classPopulation: NAT = LegalInputCharacters.LAST - LegalInputCharacters.FIRST + 1;
+lastC, lastNotC: CHAR;
+population: NAT ¨ 0;
+c ¨ 'a;
+FOR chars: CHAR IN LegalInputCharacters DO
+IF x[chars] THEN {
+population ¨ population + 1;
+lastC ¨ chars;
+}
+ELSE
+lastNotC ¨ chars;
+ENDLOOP;
+SELECT population FROM
+0 => ERROR;
+1 => {
+kind ¨ char;
+c ¨ lastC;
+};
+2 => {
+IF lastC IN ['a..'z] AND x[Ascii.Upper[lastC]] THEN {
+kind ¨ charIC;
+c ¨ Ascii.Upper[lastC];
+}
+ELSE 
+kind ¨ wholeSet;
+};
+classPopulation-2 => {
+IF lastNotC IN ['a..'z] AND ~x[Ascii.Upper[lastNotC]] THEN {
+kind ¨ notCharIC;
+c ¨ Ascii.Upper[lastNotC];
+}
+ELSE 
+kind ¨ wholeSet;
+};
+classPopulation-1 => {
+kind ¨ notChar;
+c ¨ lastNotC;
+};
+classPopulation => ERROR;
+ENDCASE => kind ¨ wholeSet;
+};
+
+SkipOverClassNode: PROC [class: CharClass, looks: Tioga.Looks] RETURNS [p: ParseTree] = {
+classType: ClassType;
+c: CHAR;
+[classType, c] ¨ AnalyzeClass[class];
+SELECT classType FROM 
+wholeSet => {
+p ¨ NEW[ParseTreeContent.skipOverClass ¨ [skipOverClass[NEW[CharClassContent ¨ class≠], looks, numCharClasses]]];
+charClassList ¨ CONS[p, charClassList];
+numCharClasses ¨ numCharClasses + 1;
+};
+char => p ¨ NEW[ParseTreeContent.skipOverChar ¨ [skipOverChar[char: c, looks: looks]]];
+charIC => p ¨ NEW[ParseTreeContent.skipOverCharIC ¨ [skipOverCharIC[char: c, looks: looks]]];
+notChar => p ¨ NEW[ParseTreeContent.skipToChar ¨ [skipToChar[char: c, looks: looks]]];
+notCharIC => p ¨ NEW[ParseTreeContent.skipToCharIC ¨ [skipToCharIC[char: c, looks: looks]]];
+ENDCASE => ERROR;
+};
+
+MatchClassNode: PROC [class: CharClass, looks: Tioga.Looks] RETURNS [p: ParseTree] = {
+classType: ClassType;
+c: CHAR;
+[classType, c] ¨ AnalyzeClass[class];
+SELECT classType FROM 
+wholeSet, notChar, notCharIC => {
+p ¨ NEW[ParseTreeContent.class ¨ [class[NEW[CharClassContent ¨ class≠], looks, numCharClasses]]];
+charClassList ¨ CONS[p, charClassList];
+numCharClasses ¨ numCharClasses + 1;
+};
+char => p ¨ NEW[ParseTreeContent.char ¨ [char[c, looks]]];
+charIC => p ¨ NEW[ParseTreeContent.charIC ¨ [charIC[c, looks]]];
+ENDCASE => ERROR;
+};
+
+wordsInSet: NAT = BITS[CharClassContent]/BITS[WORD];
+PseudoSet: TYPE = REF ARRAY [0..wordsInSet) OF WORD;
+
+CharClassUnion: PROC[c1, c2: CharClass] = TRUSTED {
+ps1: PseudoSet ¨ LOOPHOLE[c1];
+ps2: PseudoSet ¨ LOOPHOLE[c2];
+FOR i: CARDINAL IN [0..wordsInSet) DO
+ps1[i] ¨ Basics.BITOR[ps1[i], ps2[i]];
+ENDLOOP;
+};
+
+CharClassIntersection: PROC[c1, c2: CharClass] = TRUSTED {
+ps1: PseudoSet ¨ LOOPHOLE[c1];
+ps2: PseudoSet ¨ LOOPHOLE[c2];
+FOR i: CARDINAL IN [0..wordsInSet) DO
+ps1[i] ¨ Basics.BITAND[ps1[i], ps2[i]];
+ENDLOOP;
+};
+
+CharClassDifference: PROC[c1, c2: CharClass] = TRUSTED {
+ps1: PseudoSet ¨ LOOPHOLE[c1];
+ps2: PseudoSet ¨ LOOPHOLE[c2];
+FOR i: CARDINAL IN [0..wordsInSet) DO
+ps1[i] ¨ Basics.BITAND[ps1[i], Basics.BITNOT[ps2[i]]];
+ENDLOOP;
+c1[0C] ¨ FALSE;
+};
+
+Compile: PUBLIC PROC [p: ParseTree] RETURNS [code: Code] = { 
+CompileIt: PROC [p: ParseTree, self, next: Index] = {
+WITH p SELECT FROM 
+x: REF ParseTreeContent.concat => {
+FOR l: LIST OF ParseTree ¨ x.concats, l.rest UNTIL l = NIL DO
+IF l.rest = NIL
+THEN
+CompileIt[l.first, self, next]
+ELSE {
+middle: Index ¨ Alloc[];
+CompileIt[l.first, self, middle];
+self ¨ middle;
+};
+ENDLOOP;
+};
+x: REF ParseTreeContent.char =>
+Set[self, IF x.looks = IgnoreLooks THEN matchChar ELSE matchCharLooks, x.looks, ORD[x.char], next];
+x: REF ParseTreeContent.charIC =>
+Set[self, IF x.looks = IgnoreLooks THEN matchCharIC ELSE matchCharLooksIC, x.looks, ORD[x.char], next];
+x: REF ParseTreeContent.class =>
+Set[self, IF x.looks = IgnoreLooks THEN matchClass ELSE matchClassLooks, x.looks, x.classNumber, next];
+x: REF ParseTreeContent.anyChar =>
+Set[self, IF x.looks = IgnoreLooks THEN matchAnyChar ELSE matchAnyCharLooks, x.looks, notUsed, next];
+x: REF ParseTreeContent.nodeBreak =>
+Set[self, matchNodeBreak, IgnoreLooks, notUsed, next];
+x: REF ParseTreeContent.skipToNodeBreak =>
+Set[self, IF x.looks = IgnoreLooks THEN skipToNodeBreak ELSE skipToNodeBreakLooks, x.looks, notUsed, next];
+x: REF ParseTreeContent.beginNode =>
+Set[self, matchBeginNode, IgnoreLooks, notUsed, next];
+x: REF ParseTreeContent.fail => 
+Set[self, fail, IgnoreLooks, notUsed, next];
+x: REF ParseTreeContent.succeed =>
+Set[self, succeed, IgnoreLooks, notUsed, next];
+x: REF ParseTreeContent.noOp =>
+Set[self, noOp, IgnoreLooks, notUsed, next];
+x: REF ParseTreeContent.skipOverClass =>
+Set[self, IF x.looks = IgnoreLooks THEN skipOverClass ELSE skipOverClassLooks, x.looks, x.classNumber, next];
+x: REF ParseTreeContent.skipOverChar =>
+Set[self, IF x.looks = IgnoreLooks THEN skipOverChar ELSE skipOverCharLooks, x.looks, ORD[x.char], next];
+x: REF ParseTreeContent.skipOverCharIC =>
+Set[self, IF x.looks = IgnoreLooks THEN skipOverCharIC ELSE skipOverCharLooksIC, x.looks, ORD[x.char], next];
+x: REF ParseTreeContent.skipOver => 
+-- ERROR MalformedPattern[invalidNot,0];
+ERROR MalformedPattern[toobig]; 
+x: REF ParseTreeContent.skipToChar =>
+Set[self, IF x.looks = IgnoreLooks THEN skipToChar ELSE skipToCharLooks, x.looks, ORD[x.char], next];
+x: REF ParseTreeContent.skipToCharIC =>
+Set[self, IF x.looks = IgnoreLooks THEN skipToCharIC ELSE skipToCharLooksIC, x.looks, ORD[x.char], next];
+x: REF ParseTreeContent.skipToString => {
+endOfStringInstructions: Index ¨ Alloc[];
+stringInstructions: Index ¨ Alloc[];
+Set[endOfStringInstructions, endOfSkipToString, IgnoreLooks, notUsed, next];
+Set[self, skipToString, IgnoreLooks, notUsed, stringInstructions];
+CompileIt[x.p, stringInstructions, endOfStringInstructions];
+};
+x: REF ParseTreeContent.skipTo => 
+-- ERROR MalformedPattern[invalidNot,0];
+ERROR MalformedPattern[toobig];  
+x: REF ParseTreeContent.skipToEnd =>
+Set[self, skipToEnd, IgnoreLooks, notUsed, next];
+x: REF ParseTreeContent.skipToBeginning =>
+Set[self, skipToBeginning, IgnoreLooks, notUsed, next];
+x: REF ParseTreeContent.closure => {
+body: Index ¨ Alloc[];
+Set[self, closure, IgnoreLooks, body, next];
+CompileIt[x.p, body, self];
+};
+x: REF ParseTreeContent.carefulClosure => {
+body: Index ¨ Alloc[];
+bodyPlusOne: Index ¨ Alloc[];
+check: Index ¨ Alloc[];
+Set[self, carefulClosure, IgnoreLooks, body, next];
+Set[check, carefulClosureEnd, IgnoreLooks, self, self];
+CompileIt[x.p, body, check];
+};
+x: REF ParseTreeContent.greedyClosure => {
+body: Index ¨ Alloc[];
+Set[self, greedyClosure, IgnoreLooks, next, body];
+CompileIt[x.p, body, self];
+};
+x: REF ParseTreeContent.carefulGreedyClosure => {
+body: Index ¨ Alloc[];
+bodyPlusOne: Index ¨ Alloc[];
+check: Index ¨ Alloc[];
+Set[self, carefulGreedyClosure, IgnoreLooks, next, body];
+Set[check, carefulGreedyClosureEnd, IgnoreLooks, self, self];
+CompileIt[x.p, body, check];
+};
+x: REF ParseTreeContent.alt => { 
+FOR l: LIST OF ParseTree ¨ x.alts, l.rest UNTIL l = NIL DO
+IF l.rest = NIL
+THEN
+CompileIt[l.first, self, next]
+ELSE {
+instr: Index ¨ Alloc[];
+nextAlt: Index ¨ Alloc[];
+Set[self, alt, IgnoreLooks, nextAlt, instr];
+CompileIt[l.first, instr, next];
+self ¨ nextAlt;
+};
+ENDLOOP;
+};
+x: REF ParseTreeContent.field => {
+instr: Index ¨ Alloc[];
+endInstr: Index ¨ Alloc[];
+Set[self, fieldStart, IgnoreLooks, x.number, instr];
+IF x.bound # -1 THEN {
+extraInstr: Index ¨ Alloc[];
+Set[instr, boundNodeBreaks, IgnoreLooks, x.bound, extraInstr];
+instr ¨ extraInstr;
+};
+Set[endInstr, fieldEnd, IgnoreLooks, x.number, next];
+CompileIt[x.p, instr, endInstr];
+};
+x: REF ParseTreeContent.fieldEquals =>
+Set[self, fieldEquals, IgnoreLooks, x.number, next];
+x: REF ParseTreeContent.fieldEqualsIC =>
+Set[self, fieldEqualsIC, IgnoreLooks, x.number, next];
+x: REF ParseTreeContent.beginALL =>
+Set[self, fieldStart, IgnoreLooks, 0, next];
+x: REF ParseTreeContent.endALL =>
+Set[self, fieldEnd, IgnoreLooks, 0, next];
+x: REF ParseTreeContent.beginAll =>
+Set[self, beginAll, IgnoreLooks, 0, next];
+x: REF ParseTreeContent.endAll =>
+Set[self, endAll, IgnoreLooks, 0, next];
+ENDCASE => ERROR;
+};
+codePC: Index ¨ 0;
+codeSize: Index ¨ 0;
+StandardSizeIncrement: Index = 100;
+notUsed: NAT = 0;
+Alloc: PROC [] RETURNS [pc: Index] = {
+pc ¨ codePC;
+IF pc >= codeSize THEN {
+newCodeSize: INT ¨ codeSize*2 + StandardSizeIncrement;
+newCode: Code ¨ NEW[CodeContent ¨ [
+NEW[PatternOpCodeArray[newCodeSize]], 
+NEW[PatternLooksArray[newCodeSize]],
+NEW[PatternDataArray[newCodeSize]], 
+NEW[PatternNextArray[newCodeSize]]]]; 
+IF codeSize > 0 THEN
+FOR i: Index IN [0..pc) DO
+newCode.opCodes[i] ¨ code.opCodes[i];
+newCode.looks[i] ¨ code.looks[i];
+newCode.data[i] ¨ code.data[i];
+newCode.next[i] ¨ code.next[i];
+ENDLOOP;
+code ¨ newCode;
+codeSize ¨ newCodeSize;
+};
+codePC ¨ codePC+1;
+};
+Set: PROC [pc: Index, opCode: OpCode, looks: Tioga.Looks, data: NAT, next: Index] = {
+code.opCodes[pc] ¨ opCode;
+code.looks[pc] ¨ looks;
+code.data[pc] ¨ data;
+code.next[pc] ¨ next;
+};
+first: Index ¨ Alloc[];
+CompileIt[p, first, 0];
+};
+}.
+
+  ‡  
+RegularExpressionImpl.Mesa
+Copyright ” 1985, 1988, 1992 by Xerox Corporation.  All rights reserved.
+congealed from RegExpFind2Impl, RegExpFindCompileImpl, RegExpFindImpl, and RegExpFindOptimizeImpl to (sigh) save GFI's -- rbh
+derived from Paxton's TextFindImpl of Tioga
+which was derived from EditFind.Mesa of Laurel 6
+Nix, December 21, 1983 4:22 pm
+Russ Atkinson (RRA) April 25, 1985 5:18:31 am PST
+Peter Kessler September 30, 1986 12:40:58 pm PDT
+Last tweaked by Mike Spreitzer on May 7, 1992 10:31 am PDT
+Doug Wyatt, December 19, 1986 3:43:52 pm PST
+Bob Hagmann July 28, 1988 5:11:42 pm PDT
+Willie-s, April 24, 1992 2:07 pm PDT
+***** Operations *****
+MalformedPattern[kind, MAX[0, IF lastPhysicalCharUnread THEN pPos-2 ELSE pPos-1]];
+Parses the character class notation, which in its simplest form is a sequence of characters between []'s, e.g. [0123456789], which specifies a pattern that will match any character in the sequence.  Ranges of characters may be specified with .., e.g. [A..F] is the same as [ABCDEF].  Special characters can and must be quoted, e.g. ['(')''] will match either a left parenthesis, a right parenthesis, or a quote.  All characters but those in the class may be matched by using a ~ as the first symbol in the class, e.g. [~A..Za..z0..9] will match all but the alphanumeric characters.  If ignoreCase is true, then if the set includes a lower case 'x, it will be made to also include the upper case 'X, and vice-versa.
+X ::= 
+non-special character	Not one of '[]~#$*+(){}<>\ ..	
+'special character	One of the above.  (Handled in tokenizer)
+'nnn		octal control characters.  (Handled in tokenizer)
+[character class]	Character class notation, A..Z means ASCII interval A..Z
+[~character class]	Not the characters in this class.
+#		Any character.
+$		Node break.
+^		Beginning of node.
+\x		Predefined patterns; x is an alphanumeric character, or <string>.
+			(Handled in tokenizer)
+Z ::=
+X	A single-character pattern.
+(P|P|...|P)	Alternation.
+
+The pattern matching fragments for full patterns.
+P ::= 
+null	The empty pattern.
+Z							 
+Z*P	Min-matching closure.
+Z**P	Greedy closure.
+Z+P	PP*
+Z++P	PP**
+~ZP	Deterministically match anything up to but not including P.
+A simple A-list symbol table that maps field names to numbers.
+The top level syntax.
+T ::= 
+<name:P>T		Named portions.  Valid only at top level.  Reserved name ALL.
+<name,number:P>T	Bound the number of CR's matched by P to number.
+PT		Concatenation.
+P		Or just a pattern.
+The tipity-top level syntax.
+TT  ::=
+T
+T{T}T		Delimits the virtual start and end of the text matched by <ALL>.
+This routine parses a field, which is of the form <name,bound:pattern>.  The name is a sequence of alphabetic characters; the bound is a non-negative integer, and the pattern is a P.  The bound and pattern are optional.  By default, there is no bound and the pattern is #* with whatever looks the name began with. 
+so Try will know to make sure don't have adjacent alphanumerics
+
+failAtEnd => IF currentChar = NoMoreChars THEN GO TO Failure;
+preserve follow^
+ ù :i  ïNewlineDelimiter
+ñ(cedarcode) styleô codeöúœcôKöú
+œeú=ôHKöú}ô}Köù+ô+Köúùô0KôKô1Kô0Kô:Kô,Kô(Kô$óKò öœk	ò	KöúüúòKòKöúüúüúòKöúüúòKöúüú$ò.Köúüú>òNKöúüúØò∆Köúüú+üúòAKöúüúò!Köú
+üúò$Köú	üú
+òKöúüú(ò3Kò Kò óöœbúüúüò$KöüúNòUKöüúòKöüúòKò óöúüúò Köú	ùò#KöúòKöúòKòKòKöúòKöúòKöúòKöúòKöú,ò,KöúòKòKòKòKòKòKòóKò Kò Köú#üúüúò.öú"üúò(Köüúüúüúüúüúüúüúüúüúüúò;Köüúüúüúüúüúüúüúüúüúüúò;Köüúüúüúüúüúüúüúüúüúüúò;Köüúüúüúüúüúüúüúüúüúüúò;Köüúüúüúüúüúüúüúüúüúüúò;Köüúüúüúüúüúüúüúüúüúüúò;Köüúüúüúüúüúüúüúüúüúüúò;Köüúüúüúüúüúüúüúüúüúüúò;Köüúüúüúüúüúüúüúüúüúüúò;Köüúüúüúüúüúüúüúüúüúüúò;Köüúüúüúüúüúüúüúüúüúüúò;Köüúüúüúüúüúüúüúüúüúüúò;Köüúüúüúüúüúüúüúò*Kò óKöúüúüúüúò'KòKöúüú ò3Kò Köúüúüú,üúòOKöúüú	òKò KöúüúüúòKöúüúüúò&KöúüúòKöüúüúüúòKò KöùôKò ö
+œnúüúüúüúüúòQKöúüúüú
+üúüúüúüòJKòKöüúüúüúüúòKöüúüúüúüú'òTöüúüúüúüò%öüú%üò+Köüú'ò-óKöüúòóKòKò óö
+°	úüúüúüúüúòTKöúüúüú
+üúüúüúüúòJKòKöüúüúüúüúòKöüúüúüúüúòCöüúüúüúüò%Köüú%üúüúòHKöüúòóKòKò óö°úüúüúJüúüúüúüúüúüúò∂Köúüúò!Kò'öüú7ò=Kò;óKòKò Kò óö°úüúüúüú(üú,üúò°öüúüúüúò6Kò/óKòKò Kò óö°úüúüúùú5üú,üúòŸKöüúüúòBKöúüúüúüúòAKö	úüúüúüúüúò=KöúòKòKöúüúüúò%Kò+KöúüúòKòKòKöúüúüúüúò'Köúüúüúò Köúüúüúò%Köúüúò KöúüúüúòKòKöúüúòKöúüúòKò'ö
+°úüú	üúüúüúò5öüúüúò KöúüúòKöüúò"KòóöüúüúòKò&öüú&ò(Köüú(ò,KöüúüúòóKòóöüúüúòKòKöüúüúüúò!KòKò2KöüúüúüúòJKòKòóKöüúüúò&öüòòKòKòKöüúüú%ò3KòóóKòóö°úüúüúò*Köüúüúüúò%KòKöúüúòKòóKö	úüúüúüúüúò?öúüúüúüúò.KöúòKöúòKöú5ò5KöúòKò,KöúòKöúòKòKòóö°úüúüúò%KöüúüúüúòKòöüúüúüú)üúüúüòGöüúüúòKöúüúòKòKò$KöüúòKòóKöüúòóKò!KòóKöúüúüúòö°úüúüúüúò*öüúüúòKöúüúòKöüúòKòóKöú'üúò.öüú	üúòKöüúüúüúüúüúüúòoóKöüúüú
+üúüú
+üúüú
+üúòNöüúüòKòKòKòKòKòKòKòKòKòKòKòKòKòKòKòKòöúòKöúüúòöüúüú
+üúòKöúüúüúòKöúüúüúòKöúüúòö
+üúüúüúüúüúò/Kò óKò.Köüúüú!ò9KöúüúòKòóKöüúüúüúòFKòóöúòKöúüúüúòöüúò	öüòKòóöüúòKöúòKòKòóóKòóöúòKöúüúüúòöüúò	öüòKòóöüúòKöúòKòKòóóKòóòKöúüúüúòöüúò	öüòKòóöüúòKöúòKò
+KòóóKòóòKöúüúüúòKòKöüúòKòóKöúüúòKöüúüúüúüúòQóKòKöüúòKòóö°úüúòKöüúüúüúòKöúüúòKòóö°úüú"ò3KöüúòKöúRôRKòóKöú ô ö°úüúüúò2Köúüúüúò>KöúüúüúòKöúüúò$Köúüúüúüúò:Köúüúò)Kò!Kò$öüúüòKöúüòóöüòKòóKòKòKòöüú"üò)öüúüòöúòKöüúüúüúòJKòKöüúüúüúòCöüúüúüúüòKöúüúòKöüúòóKòKòóöüúüúòKöúòóöüúòKòKöúüúòKòóóKöüúòóöüúüòöüúüúüú
+üòöüúüúüòKöú%üúò*Köú%üúò*KöüúüúòóKöüúòóóöüúüòöüúüúüúüò&KòKöüúòóóKòKò óöúôKöùúô4Köú<ô<Köú7ô7Kö
+ú,üúüúüú
+üúüôJKöú4ô4KöúôKöúôKôKô_óö°úüúüúüúò0Köúüúòöüúüòöüúòöüúüúüú
+üúò%Köúüú2ò9óöüòKöúüú/ò6óóòKòóòKöúüú2ò9óòKöúüúò$óòKöúüúò$óKöüúòóKòKò óöúôKöúôKöúôóö°úüúüúüúò0KöúüúòöüúüòöúòKöúüúüúüúòöüòKòKöüúüúüúüúò/KöúüúòKòöüúüòKöúüúòKöúòKöüú&ò-óKöüúòóöüúüúüòKöúüúüúüúòKöú	üúüúò!öüúüúòKöüúüúüúüú
+òOKòóóKòóöúòKòKöüúüúòKòóöüúòKòKòKòóóKòóKô Köú1ô1öúôKöúôKöú	ô	KöúôKöúôKöúôKöú	ô	Köú?ô?óö°úüúüúò'KöúüúüúüúòKöúòöüòKöúüúòöüúòöüòKöúüú.ò5óöüúòKòKòKöüúüúüúüúòKòöüúüòöúòKöúüú*ò1óòKöúüú6ò=óöúòKöúüú#üúüú.òcóöúòKöúüú#üúüú:òoóòKöúüúüúüúòKöú üúò'öüúüòKöúüúòKòKöüúòóKöúüú(ò/KòóKöüúòóKòóóöüúòöüúòKöúüúüúò,öüúüúüú!üúüúüòAKöúüúòKöüúòóKòóöüòKöúüúòóóöüúòöüúòKöúüúüú
+ò2öüúüúüò6KòóKòóöüúüúüúò+Köúüú"üú
+ò8öüúüúòKöúüúüúò/KòKòóöüúüúüò%KòóKòóóKöüúòóöüúüúüòKöúüúüúüúòKöú	üúüú
+ò öüúüúòKöüúüú#üúüú
+òUKòóóKòKò óKöú>ô>Kò KöúôöúôKöúHôHKöúAôAKöúôKöúôóKöúôöúôKöúôKöúGôGóö°úüúüúüúüúüú üúò{Köú$üúüúò1öüòKöúüúòöüúüòöúòKöúüúòKòEKöúüúòKòóKò-òKöüúüú"ò;KöúüúòKöúüúüú ò,Kòóòöüúüúüò-Köú ò óKöúüúòKöúüúüúò*KòóöúòöüúüòKöúüúüúò*óöüúüúüò.KòóKöúüúüúò*KöüúòKòóöüúòKòKòKòKöüúüúüúò.öüúüúüòöúüúüúò+KöúüúüúüúòIKòóKöüúüúòóKòóóKöüúòóKöüúüúüúò2öüúüòKöúüúüú ò,óKöúüúüú ò,KòKò óö°
+úüú+üúFòàKöú∫ô∫KöúüúòKöúüúüúòKöúüúò"Kò#KöúüúòKòöüúòKöüúüúüúüúòKò+KòKöüúòóKöüúüúüú ò2öüúüúüò&Köú#ò#óöüú&üúüúüò9öüú üúüúò/öüúüòKöú9ò9óöüúüòKöúüúBòMóöüúòKöúüú@òKóKöüúòKòóKöüúòóKòKöúüúüú8òKöüúüòKöúüúòóöüúüòöúòKòKöüúüú!òCKòóöúòKöúüú%üú5òdKòóöüú$ò+Kò óóKöúüú9òDKòóö°úüú	üúüúò?Köúüúòöüúòöüúòöüúüú
+üò%KòKöüòóóöüòöüúüú
+üò%KòKöüúòóóóKöüúüúòKòóKò öüúüúòöüú	üúòö	üúüúü
+úüúüò3öüú$üò.Köúüúùò"KòUKöüúüúòóKöüúòóKöú
+üúòKòóKò>KöúòKò óKöúüú2ò<Köúüúò&KòKöú	üúòKò öüúüúüúò&Köú?ô?óKô Kò%KöúAüúüúòKKö
+üúüúüúüúüúòAKò Kò@Köúüúò4öüú)üúüúüò<Kò5Köüúòóöúüúò/öúüúüúò,Köú	üúNòZóóKòwöüúò	öúüúò0öúüúòKöüúòöüúüúüúò-Köú	üú>òJóóóKöúòóKòzKöúüúò1öüúüúüú#üúüúüòAöüú	üúüòKöúüúCòIKöúüúKòQKöüúüúòóKöüúòóKö
+úüúüúüúüúùòãKò0Kò2KòKöüúòKò óö°
+úüúüúüú)üúüúüú	üú'ò°Köú9üúüúò[KöúòKò óö°úüúüúLüúüúüúüú	üú'ò≤ò$KòHóKòóKò ö°úüúüúüú<üúüúüúüúüú	üú'òÕöüúüúüúù"ò?KòeKöüúüúüúüúüúüúù	òBKöüúüúüúù	ò1KöúùòKöüúòóò#KöúAòAóKöúòóKò ö
+°úüúüúüúüúòBöüúüòKöú3üúüúüúòGóöüúüòKöú4üúüúüúòHóKöüúüúòKòKò óö°	úüúüúùú*üúüúüúüú	üú'ò◊Köúüú	òKöúòKöúüúòKöúüúò4KòKòKò KòKò)Köúüú4ò?Köúüú1ò;Köúüú/ò8Köúüú/ò8Köú	üú%ò1Köúüú'ò8Köúüú+ò?Köúüúò+KòKò/ö°úüúòöüúòöüúòKöú	üú-ò;Kò5KòKòóöüúòKòKòKòKòóóKòóö°úüúò*KòKò!Kò'KòKòóö°	úüúüúüúò%KòKöüúüúüúüúüúù%òFKöüú	üúüúüúüúüúùòQKò9öüúòKöúüúüúüú-òYóKöúòóö°úüúòöüúüúòKòKöú,üúüúò7óKöúòKòóö
+°úüúüúüúüúò9Kò,öüú(üò/KöúüúòöüúòöüúòKöüú+üúüúüúòAKòóöüòKöüúüúüúüúò'óóKòKòKöüúòóKöüúüúòKòóö
+°úüúüúüúüúò>Kò,Köüúüúüúüúüúù%òFöüú(üò/KöúüúòKò#öüúòöüúòKöüú+üúüúüúòAKòóöüòKöüúüúüúüúò'óóKöüú	üúüúüúüúüúò3Kò4Kò9Köüúüúüúüú,üúüúüúòqKòKòKöüúòóKöüúüúòKòóö°úüúüúüúò5Kò&Kò/Kò/öüúò	Köüúüúò/KòóKòóKòöüòöüòòöüúüòöúòKö
+üúüúüúüú	ü
+ú	ò@óöúòKöüúüúüúüúüúüú	òRóöúòKöüúüúüúüúüúüú	òPóöúòKöüúüúüúüúüúüúüú	òbóöúòöüúüúüú!òFKöüúüúüúòKöüúüúüú	òóóöúòöüúüúüú"üúòVKöüúüúüúüú	ò&óóòKö
+üúüúüúüúüú	òCóòKöüúüúüúüúüúüú	òSóòKö
+üúüúüúüúüú	òOóöúòKöüúüúüúüú	ò,KòKöüúüú	òKòóöúòKöüúüúüúüú	ò,öüúüò"Köüúüúüúüú	ò#KöúòKöüúòóKòóKö	úüúüúüúüú	ò4Köúüúüú	òKöúüúüúò!KöúüúòöúòKò%öüúüúüúüò<KòKöüúòóKöúüúüúòKòóöúòKò%ö	üúüúüúüúüòLKòKöüúòóKöúüúüúòKöúòóöúòKöúüúüúòöüúüòKòKöüúòóKöüúüúüòKòóöúòKöúüúüúòöüúüúüò(KòKöüúòóKöüúüúüòKòóöúòKöúüúüúòöüúüò%KòKöüúòóKöüúüúüòKòóöúòKöúüúüúòöüúüúüò5KòKöüúòóKöüúüúüòKòóöúòKöúüúüúòöüúüòKöüúüúüúüú	ò0KòKöüúòóKòóöúòKöúüúüúòöüúüúüò(Köüúüúüúüú	ò0KòKöüúòóKòóöúòKöúüúüúòöüúüò%Köüúüúüúüú	ò0KòKöüúòóKòóöúòKöúüúüúòöüúüúüò5Köüúüúüúüú	ò0KòKöüúòóKòóòKòKòóòKòKò#Köüúüú	òKòóòKòKöüúüú	òKòóòKòKöüúüú	òKòóöúòKòóöúòKòKò+Kò,Kòóöú)ò)KòKò+Kò,KòóöúòKò&Kò/Kò/Köüúüú
+üúüú	ò=KòóKö	úüúüúüúüú	òNKò8Köú/üú+ò]Kò-Köúüúüúüúüúüú	ò;Köúüúüúüúüúüú	òEKöúüúüúüúüúüú	ò<Köúüúüúüúüúüú	òFKòöúòKöúüúòKöüúüúòKòóKöüúüúòóöüòKö	úüúüúüúüú	ô=KöúòóKòóKòöüòòKöüúüúüúüúüúüúò=Köüúüúüúüúò+Kòöüúüò%òKòKò!KòóöúUòUKòKò#KòóKöüúüúòóKòKòóóKöüúòóöüòöúòKöúüúòKòóöúòKöúüúòKòKò"KòóóKöüúòóKöúòóKò ö°úüúüúüúüúüúüúüúüú	üú'ò≥ò#Köúüúüúò8óKöúòKò óö°úüúüúLüúüúüúüúüúüú	üú'òœò#KòHóKöúòóKò ö°úüúüúüúüúüúüúüúüú!ò¶KöüúüúüúòKöúüú"ò9KòKòKöúüúüúüúò2KòKöúüúòKòKòKò óö°úüúüúüúüúüúüúüúüú!òßKöüúüúüúòKöúüú"ò9KòKòKöúüúüúüúò9KòKöúüúòKòKòKò óö
+°úüúüúWüúVüúò€KòKöúüúòöüúüúüúòöúüúò#Köúüúüúòò/Köüú
+üúBòRKöüúDòHóKöúüú(ò0Kòóöúüúò KöúüúüúòKòKöúüúò*Köúüú$ò:KòKöúòKòKòpKöúüúüúòöüúüúüú!üúüúüò?Köúüúüúò KòKòtKöúüúò/Köúüú	òKöúòKò8öüúüòKò óöüúüúüú"üòHKòóKöüúòóKòKöüúüúüúò5Köúüú#ò+Kòóöúüúò"KòKòhKöúüú:òBKòóöúüúò!Köú
+üúüúòKöúüúòKòKòKòóöúüúò#Köú
+üúüúòKöúüúòKöúüúò#KòKòKòóöúüúò"KòKòKòKòóöúüúò$KòKòKòKòóöúüú ò&Köú
+üúüúòKòKòKöúüúòKòóöúüú ò&Köú
+üúüúòKòKòKöúüúòKòóöúüúò$KòKòKòKòóöúüú!ò'KòKò5KòKöúüúòKòóöúüú#ò)KöúüúòKò5KòKöúüúòKòóöúüú#ò)KòKò5KòKöúüúòKòóöúüú%ò+KöúüúòKöúüúò#Kò5KòKöúüúòKòóöúüúò#KòKòhKöúüú*òAKòKòKòKöúüúòKòóöúüúò%KòKöúüúò3KògKöúüú-ò5KöúòKò8öüúüòKòóöüúüúüúüò<KòóKöúüúòKòóöúüúò"ò0KöúHòHóóöúüú#ò)ò0KöúNòNóóöüúòöüúüòöú%ò%KòKòKòKöúüúòKòóöú-ò-KöùôKòKòKöúüúòKòóKöüúüúòóKòóóKòKò Kò óö°úüúüúüúSüúüúüúQüúüúòÒKöú?üúüúüú'òäKòKò óö°úüúüúüúSüúüúüúQüúüúòÚKöú?üúüúüú'òäKòóKò ö°úüúüúüúüúSüúüúüúQüúüúò¯KòKòKöúüúò	öüúüúüòKöúüúüúòKöúüúòKòKòKòKò~Köúüúò1KöüúòóKòKò óö°úüúüúWüúVüúüúò˚ö°úüúüúò4öüúüòKöúüú*ò=Köúüú6òOKöüúüúòóKòóö°úüúüúò;öüúüòKöúüú8òKKöúüúDò]KöüúüúòóKòóöüúüúüòöúüúò$öüúüúò"ö	üúüúüúüúüòOKöúüúòóöüúüúüúüúüúüòUKöúüú?òGóöüòKòóKòóöüúüúüúò%Köúüú"ò8Köúüúò2KöúòKò!Kò&öúüúò#Köúüú	üú#üú+òjóKòóöüòKòóKòKò5KòKòóöúüúò!öüúüòKöúüúAòIóöüòKòóKöúüúòKò5KòKòóöúüúò#öüúüúüò8KöúüúEòMóöüòKòKò óKöúüúòKöúüúò#Kò5KòKòóöúüúò"öüúüò KöúüúSò[óöüúòKöúüúò8Köúüúò2Köú'ò'Köú%ò%öüúüòKò*óöüúüúüúò*Kò5öúüúò#Köúüú	üú#üú+òjóKòóöüòKòóKò"KòóKöú ò Kò5KòKòóöüúòKòKöúüúòKòmöüúüòKòóöüòKòóKò8öüúüòKòóöüúüúüúüò<KòóKòóóKòKò óö°úüúüúüúòMöüúüúòKöúüúüúò-öüúüúüúüúüúüò=öüúüòKöú üúò%KöüúüúòóKöüúòóKöüúüú7òAKòóKöüúò
+KòKò Kò óKöúüú0ò?ö°úüúüúüúòHKöúüúüúüúòRKöúüúòKöúüúòKòöüúüúüúüò*öüú
+üúòKòKòKòóöüòKòóKöüúòóöüúüòKöúüúòòKòKò
+Kòóòöüúüú
+üúüúò5KòKòKòóöüúòKòóKòóòöüú
+üú
+üúüúò<KòKòKòóöüúòKòóKòóòKòKòKòóKöúüúòKöüúòóKòóKò ö°úüú(üúòYKòKöúüúòKò%öüúüúòöúòKöúüú1üú6òqKöúüúò'Kò$KòóKöúüúHòWKöúüúLò]KöúüúDòVKöúüúHò\KöüúüúòóKòKò óö°úüú(üúòVKòKöúüúòKò%öüúüúòöú!ò!Köúüú!üú6òaKöúüúò'Kò$KòóKöúüú+ò:Köúüú/ò@KöüúüúòóKòKò óKö	úüúüúüúüúò4Köúüúüúüúüúüúò4Kò ö°úüúüúò3KöúüúòKöúüúòöüúüúüúüò%Köúüúò&KöüúòóKòKò óö°úüúüúò:KöúüúòKöúüúòöüúüúüúüò%Köúüúò'KöüúòóKòKò óö°úüúüúò8KöúüúòKöúüúòöüúüúüúüò%Köúüúüú
+ò6KöüúòóKöú	üúòKòKò óö°úüúüúüúò=ö°	úüú&ò5öüúüúüúòöúüúò#öüúüúüúüúüúüò=öüú
+üòöüòKòóöüúòKòKò!KòKòóóKöüúòóKòóöúüúòKö	ú
+üúüúüúüúòcóöúüúò!Kö	ú
+üúüúüúüúògóöúüúò Köú
+üúüúüú0ògóöúüúò"Köú
+üúüúüú,òeóöúüúò$Köú6ò6óöúüú$ò*Köú
+üúüúüú/òkóöúüúò$Köú6ò6óöúüúò Köú,ò,óöúüúò"Köú/ò/óöúüúòKöú,ò,óöúüú"ò(Köú
+üúüúüú3òmóöúüú!ò'Kö	ú
+üúüúüúüúòióöúüú#ò)Kö	ú
+üúüúüúüúòmóöúüúò$Köúüú ò(Köüúò óöúüúò%Kö	ú
+üúüúüúüúòeóöúüú!ò'Kö	ú
+üúüúüúüúòióöúüú#ò)Kò)Kò$KöúLòLKöúBòBKò<Kòóöúüúò"Köúüú ò(Köüúò!óöúüúò$Köú1ò1óöúüú$ò*Köú7ò7óöúüúò$KòKöú,ò,KòKòóöúüú%ò+KòKòKòKöú3ò3Köú7ò7KòKòóöúüú$ò*KòKöú2ò2KòKòóöúüú+ò1KòKòKòKöú9ò9Köú=ò=KöúòKòóöúüúò!öüúüúüúüúüúüò:öüú
+üòöüòKòóöüúòKòKòKöú,ò,Kò KòKòóóKöüúòóKòóöúüúò"KòKòKöú4ò4öüúüúòKòKöú>ò>KòKòóKöú5ò5Kò Kòóöúüú ò&Köú4ò4óöúüú"ò(Köú6ò6óöúüúò#Köú,ò,óöúüúò!Köú*ò*óöúüúò#Köú*ò*óöúüúò!Köú(ò(óKöüúüúòóKòóKòKòKöú#ò#Köú	üúòö°úüúüúò&KòöüúüúòKöúüú&ò6öúüúò#Köüú#ò&Köüú!ò$Köüú!ò$Köüú#ò&óöüúüòöüú
+üú	üòKò%Kò!KòKòKöüúòóóKòKòKòóKòKòóö°úüú7üúòUKòKòKòKòKòóKòKòKòóKöúòKò ó Öó    æ¥  ˝ 

@@ -1,0 +1,678 @@
+
+DIRECTORY BasicTime, Spy, IO, Rope, Basics, Process, SafeStorage, SignalStatistics;
+
+SpyImpl: MONITOR
+IMPORTS BasicTime, IO, Rope, Process, SafeStorage, SignalStatistics
+EXPORTS Spy
+~ BEGIN
+
+ROPE: TYPE ~ Rope.ROPE;
+ProgramCounter: TYPE = CARD32;
+PC: TYPE = CARD32;
+WatchAllocationType: TYPE ~ Spy.WatchAllocationType;
+
+Ref: TYPE ~ REF SpyRep;
+SpyRep: PUBLIC TYPE ~ RECORD [
+missed: CARD32 ¬ 0,
+startTime: BasicTime.GMT,
+stopTime: BasicTime.GMT,
+watchAllocations: WatchAllocationType ¬ none,
+tree: Tree,
+nAlloc: NAT,
+limit: NAT,
+pAlloc: POINTER TO MemUnit,
+stackBuffer: ARRAY [0..stackLimit) OF ProgramCounter,
+mem: SEQUENCE size: NAT OF MemUnit
+];
+stackLimit: NAT ~ 1024;
+
+Tree: TYPE ~ POINTER TO TreeRep;
+TreeRep: TYPE ~ RECORD [
+children: OSet ¬ NIL,
+pc: ProgramCounter ¬ 0,
+count: CARD ¬ 0
+];
+
+OSet: TYPE = POINTER TO OSetNode; -- represents an pc-ordered collection of Tree objects
+OSetNode: TYPE = RECORD [
+left: OSet, -- smaller items
+item: Tree, -- the child tree
+right: OSet -- larger items
+];
+
+MemUnit: TYPE ~ RECORD [
+oSetNode: OSetNode,
+treeRep: TreeRep
+];
+
+running: BOOL ¬ FALSE;
+currentSpy: Ref ¬ NIL;
+lock: PACKED ARRAY [0..4) OF BYTE ¬ ALL[0];
+missed: CARD32 ¬ 0;
+
+TestAndSet: UNSAFE PROC [f: POINTER TO PACKED ARRAY [0..4) OF BYTE] RETURNS [BYTE]
+~ UNCHECKED MACHINE CODE { "PCSpy_TestAndSet" };
+
+ObtainSpy: PROC RETURNS [Ref] ~ {
+old: BYTE ~ TestAndSet[@lock];
+RETURN [IF old = 0 THEN currentSpy ELSE NIL];
+};
+
+ReleaseSpy: PROC [spy: Ref] ~ {
+IF spy # currentSpy THEN ERROR;
+lock ¬ ALL[0];
+};
+Start: PUBLIC ENTRY SAFE PROC [watchThreadSwitches: BOOL ¬ TRUE, watchAllocations: WatchAllocationType ¬ none, watchSignals: BOOL ¬ FALSE, count: NAT ¬ 10000] RETURNS [BOOL] ~ TRUSTED {
+spy: Ref ¬ NIL;
+IF running THEN RETURN [FALSE];
+lock ¬ ALL[BYTE.LAST];
+spy ¬ SafeStorage.GetUntracedZone[].NEW[SpyRep[count + 1]];
+spy.nAlloc ¬ 0;
+spy.limit ¬ spy.size-1;
+spy.pAlloc ¬ @(spy.mem[0]);
+spy.tree ¬ GetAvail[spy].item;
+spy.tree­ ¬ [children: NIL, pc: 0, count: 0];
+spy.startTime ¬ BasicTime.Now[];
+spy.stopTime ¬ BasicTime.nullGMT;
+spy.watchAllocations ¬ watchAllocations;
+IF watchThreadSwitches THEN {
+RegisterSwitchCallback[ExamineNavel, NIL];
+Process.Detach[FORK Preemptor];
+};
+SELECT watchAllocations FROM
+$count => RegisterAllocatorCallback[CountAllocations, NIL];
+$words => RegisterAllocatorCallback[CountWordsAllocated, NIL];
+ENDCASE;
+IF watchSignals THEN {
+RegisterSignalCallback[ExamineNavel];
+};
+currentSpy ¬ spy;
+running ¬ TRUE;
+missed ¬ 0;
+lock ¬ ALL[0];
+RETURN[TRUE];
+};
+
+Stop: PUBLIC ENTRY SAFE PROC RETURNS [Ref] ~ TRUSTED {
+ENABLE UNWIND => NULL;
+IF NOT running THEN RETURN [NIL];
+RegisterSwitchCallback[NIL, NIL];
+RegisterAllocatorCallback[NIL, NIL];
+RegisterSignalCallback[NIL];
+FOR i: NAT IN [0..100) DO
+spy: Ref ~ ObtainSpy[];
+IF spy # NIL THEN {
+spy.missed ¬ missed;
+currentSpy ¬ NIL;
+spy.stopTime ¬ BasicTime.Now[];
+running ¬ FALSE;
+RETURN[spy];
+};
+IF i MOD 16 = 0 THEN Process.Pause[1] ELSE Process.Yield[];
+ENDLOOP;
+currentSpy ¬ NIL;
+running ¬ FALSE;
+lock ¬ ALL[BYTE.LAST];
+RETURN [NIL];
+};
+JmpBufPtr: TYPE ~ POINTER TO JmpBuf;
+JmpBuf: TYPE ~ <<VERY>> MACHINE DEPENDENT RECORD [
+pc: PC, -- the program counter
+fp: WORD, -- Not used on SPARCs
+sp: SP -- the stack pointer
+];
+
+SP: TYPE = POINTER TO StackFrame;
+StackFrame: TYPE ~ <<VERY>> MACHINE DEPENDENT RECORD [
+local: ARRAY [0..8) OF CARD32,
+in: ARRAY [0..6) OF CARD32,
+callersSP: SP,
+callersPC: PC
+];
+
+SigtrampStackFrame: TYPE ~ <<VERY>> MACHINE DEPENDENT RECORD [
+frame: StackFrame,
+signalNumber: CARD,
+signalCode: CARD,
+sigcontextPtr: POINTER TO SigContext,
+addr: CARD
+];
+
+ForceStackToMemory: PROC [jb: JmpBufPtr]
+~ TRUSTED MACHINE CODE { "XR_ForceStackToMemory" };
+
+ProcessRep: TYPE ~ MACHINE DEPENDENT RECORD [
+thread: POINTER TO ThreadRep,
+generationNumber: CARD
+];
+
+ThreadRep: TYPE ~ UNSPECIFIED; -- don't care about details.
+
+SigContext: TYPE ~ MACHINE <<SunOS>> DEPENDENT RECORD [
+flag: CARD32, -- on signal stack flag
+mask: CARD32, -- old signal mask
+oldSP: SP, -- old sp
+oldPC: PC, -- old pc
+oldNPC: PC, --old npc
+oldPSR: CARD32, -- old psr
+oldG1: CARD32, -- old g1
+oldO1: CARD32 -- old o0
+];
+
+ILSymEntryRep: TYPE ~ MACHINE DEPENDENT RECORD [ -- IncrementalLoad.h
+name: POINTER TO Basics.RawChars,
+type: CARD32,
+value: CARD32,
+size: CARD32,
+ilfe: POINTER TO ILFileEntryRep
+];
+
+ILFileEntryRep: TYPE ~ MACHINE DEPENDENT RECORD [ -- IncrementalLoad.h
+seqNum: CARD32,
+commitPoint: CARD,
+fName: POINTER TO Basics.RawChars
+];
+
+sigtrampName: PACKED ARRAY [0..12) OF CHAR ¬ ['_,'_,'s,'i,'g,'t,'r,'a,'m,'p,'\000,'\000];
+sigtrampStart, sigtrampEnd: PC ¬ 0; -- init below
+SigTrampStart: PROC RETURNS [PC] = {RETURN [sigtrampStart]};
+SigTrampEnd: PROC RETURNS [PC] = {RETURN [sigtrampEnd]};
+InitSigtramp: PROC ~ {
+ILGetMatchingSymEntryByValue: PROC [ilse: POINTER TO ILSymEntryRep, val: CARD, wantedTypes: CARD, ignoredClasses: CARD, numToSkip: INT] RETURNS [POINTER TO ILSymEntryRep] ~ MACHINE CODE {
+"XR_ILGetMatchingSymEntryByValue"
+};
+ILGetMatchingSymEntryByName: PROC [ilse: POINTER TO ILSymEntryRep, pattern: POINTER, caseSensitive: BOOL, wantedTypes: CARD, ignoredClasses: CARD, numToSkip: INT] RETURNS [POINTER TO ILSymEntryRep] ~ MACHINE CODE {
+"XR_ILGetMatchingSymEntryByName"
+};
+e1: POINTER TO ILSymEntryRep ~ ILGetMatchingSymEntryByName[
+ilse: NIL,
+pattern: @sigtrampName,
+caseSensitive: TRUE,
+wantedTypes: 4, -- text
+ignoredClasses: 0,
+numToSkip: 1];
+IF e1 # NIL THEN {
+e2: POINTER TO ILSymEntryRep ~ ILGetMatchingSymEntryByValue[
+ilse: e1,
+val: 0,
+wantedTypes: 4, -- text
+ignoredClasses: 0,
+numToSkip: 1
+];
+sigtrampStart ¬ e1.value;
+sigtrampEnd ¬ e2.value;
+};
+};
+
+debug: RECORD [
+badPCcount: CARD ¬ 0,
+badPC: CARD ¬ 0,
+badSPcount: CARD ¬ 0,
+prevSP: CARD ¬ 0,
+badSP: CARD ¬ 0,
+sigtrampCount: CARD ¬ 0,
+goodSigtrampCount: CARD ¬ 0,
+zeroSP: CARD ¬ 0
+];
+
+SpyDebugData: PROC RETURNS [POINTER] ~ {
+RETURN [@debug]
+};
+
+SpyDebugReset: PROC ~ {
+debug ¬ [];
+};
+
+ValidSP: PROC [sp: SP, prevSP: SP] RETURNS [BOOL] ~ {
+IF sp = NIL THEN RETURN [FALSE]; -- the only invalid SP we really expect to see.
+IF LOOPHOLE[sp, CARD] >= 8*1024 AND LOOPHOLE[sp, CARD] MOD 8 = 0 AND (prevSP = NIL OR LOOPHOLE[sp, CARD]-LOOPHOLE[prevSP, CARD] <=16*1024) THEN RETURN [TRUE];
+debug.badSPcount ¬ debug.badSPcount + 1;
+debug.badSP ¬ LOOPHOLE[sp];
+debug.prevSP ¬ LOOPHOLE[prevSP];
+RETURN [FALSE]
+};
+
+trapPC: PC ¬ 0;
+SetTrapPC: PROC [pc: PC] RETURNS [old: PC] ~ {
+old ¬ trapPC;
+trapPC ¬ pc;
+};
+
+ValidPC: PROC [pc: PC] RETURNS [BOOL] ~ INLINE {
+RETURN [pc >= 8*1024 AND pc MOD 4 = 0]
+};
+
+startProcess: PROCESS ¬ Process.GetCurrent[];
+safeProcess: PROCESS ¬ NIL;
+Debug: PROC ~ { safeProcess ¬ startProcess };
+Help: PROC = {
+ENABLE ABORTED => CONTINUE;
+safeProcess ¬ NIL;
+ERROR;
+};
+
+GetThreadIndex: UNSAFE PROC [ct: POINTER TO ProcessRep] RETURNS [[0..2**14)] ~ UNCHECKED {
+CirioNubLocalGetThreadIndex: UNSAFE PROC [ct: POINTER] RETURNS [INT32] ~ MACHINE CODE {"<xr/CirioNubLocalProcs.h>.CirioNubLocalGetThreadIndex"};
+ans: INT ¬ CirioNubLocalGetThreadIndex[ct];
+RETURN [IF ans IN [0..2**14) THEN ans ELSE 2**14-1];
+};
+
+SampleMyStack: PUBLIC SAFE PROC [ignoreHottest: NAT, increment: CARD] ~ TRUSTED {
+self: ProcessRep ¬ LOOPHOLE[Process.GetCurrent[]];
+selfID: CARD ~ (GetThreadIndex[@self]*32768+self.generationNumber)*4+3;
+jb: JmpBuf;
+k: NAT ¬ 0;
+spy: Ref ¬ ObtainSpy[];
+IF spy = NIL THEN {missed ¬ missed + 1; RETURN};
+IF spy.tree # NIL THEN {
+t: Tree ¬ spy.tree;
+prevSP: SP ¬ NIL;
+nextSP: SP ¬ NIL;
+ForceStackToMemory[@jb];
+FOR sp: SP ¬ jb.sp, nextSP WHILE ValidSP[sp, prevSP] AND k < stackLimit DO
+pc: PC ¬ sp.callersPC;
+spy.stackBuffer[k] ¬ pc;
+k ¬ k + 1;
+nextSP ¬ sp.callersSP;
+IF trapPC # 0 AND pc = trapPC THEN { trapPC ¬ 0; ERROR}; -- hahahaha
+IF pc IN [sigtrampStart..sigtrampEnd) AND ValidSP[nextSP, sp] AND ValidSP[nextSP.callersSP, nextSP] THEN {
+sf: POINTER TO SigtrampStackFrame ~ LOOPHOLE[nextSP.callersSP];
+sigcontextPtr: POINTER TO SigContext ~ sf.sigcontextPtr;
+pc: PC ¬ sigcontextPtr.oldPC;
+IF ValidPC[pc] THEN {
+debug.goodSigtrampCount ¬ debug.goodSigtrampCount + 1;
+IF k < stackLimit THEN {
+IF ignoreHottest = 3 THEN ignoreHottest ¬ k;
+spy.stackBuffer[k] ¬ pc;
+k ¬ k + 1;
+};
+nextSP ¬ sigcontextPtr.oldSP;
+} ELSE { debug.badPC ¬ pc; debug.badPCcount ¬ debug.badPCcount + 1 };
+};
+prevSP ¬ sp;
+ENDLOOP;
+IF k > 0 THEN { IF spy.stackBuffer[k-1] = 0 THEN k ¬ k - 1 ELSE increment ¬ 100000 };
+t.count ¬ t.count + increment;
+t ¬ Insert[t, selfID, spy];
+IF t # NIL THEN {
+t.count ¬ t.count + increment;
+FOR i: NAT DECREASING IN [ignoreHottest..k) DO
+t ¬ Insert[t, spy.stackBuffer[i], spy];
+IF t = NIL THEN EXIT;
+t.count ¬ t.count + increment;
+ENDLOOP;
+};
+ReleaseSpy[spy];
+};
+};
+RegisterSwitchCallback: PROC [callback: PROC, save: POINTER TO PROC] ~ MACHINE CODE {
+"XR_RegisterSwitchCallback"
+};
+
+ExamineNavel: SAFE PROC ~ TRUSTED {
+SampleMyStack[ignoreHottest: 3, increment: 1];
+};
+
+Preemptor: PROC ~ {
+Process.SetPriority[Process.priorityLast];
+WHILE running DO
+Process.Pause[1];
+ENDLOOP;
+};
+
+CProc: TYPE = POINTER TO INSTRUCTION;
+INSTRUCTION: TYPE = WORD;
+Proc: TYPE ~ POINTER TO ProcRep;
+ProcRep: TYPE ~ MACHINE DEPENDENT RECORD [pcStart: CProc, staticLink: CARD32];
+CProcFromProc: PROC [p: PROC ANY RETURNS ANY] RETURNS [CProc] = {
+s: Proc = LOOPHOLE[p];
+zero: [0..0] = s.staticLink; -- check for top-level.
+RETURN [s.pcStart]
+};
+
+AllocatorCallbackType: TYPE ~ PROC [bytesRequested: CARD, isAtomic: BOOL, clientData: POINTER] RETURNS [POINTER ¬ NIL];
+
+RegisterAllocatorCallback: PROC [callback: AllocatorCallbackType, clientData: POINTER ¬ NIL] ~ {
+fn: CProc ¬ IF callback = NIL THEN NIL ELSE CProcFromProc[callback];
+oldFn: CProc ¬ NIL;
+oldClientData: POINTER ¬ NIL;
+GCRegisterAllocCallback: PROC [fn: CProc, clientData: POINTER, pOfn: POINTER TO CProc, oOclientData: POINTER TO POINTER] ~ MACHINE CODE {
+"GC_register_alloc_callback"
+};
+GCRegisterAllocCallback[fn, clientData, @oldFn, @oldClientData];
+};
+
+CountAllocations: PROC [bytesRequested: CARD, isAtomic: BOOL, clientData: POINTER] RETURNS [POINTER ¬ NIL] ~ {
+SampleMyStack[ignoreHottest: 3, increment: 1];
+};
+
+CountWordsAllocated: PROC [bytesRequested: CARD, isAtomic: BOOL, clientData: POINTER] RETURNS [POINTER ¬ NIL] ~ {
+wordsRequested: CARD ~ (bytesRequested+(BYTES[WORD]-1))/BYTES[WORD];
+SampleMyStack[ignoreHottest: 3, increment: wordsRequested];
+};
+
+RegisterSignalCallback: PROC [callback: SAFE PROC] ~ {
+[] ¬ SignalStatistics.RegisterSignalSpy[callback];
+};
+GetAvail: PROC [spy: Ref] RETURNS [oset: OSet ¬ NIL] = {
+IF spy.nAlloc < spy.limit THEN {
+p: POINTER TO MemUnit ~ spy.pAlloc;
+p.oSetNode.left ¬ NIL;
+p.oSetNode.item ¬ @(p.treeRep);
+p.oSetNode.right ¬ NIL;
+p.treeRep.children ¬ NIL;
+p.treeRep.pc ¬ 0;
+p.treeRep.count ¬ 0;
+spy.nAlloc ¬ spy.nAlloc + 1;
+spy.pAlloc ¬ spy.pAlloc + SIZE[MemUnit];
+RETURN [@(p.oSetNode)]
+};
+};
+
+FreeAvail: PROC [spy: Ref, oset: OSet] = {
+p: POINTER TO MemUnit ~ spy.pAlloc - SIZE[MemUnit];
+IF @(p.oSetNode) = oset THEN {
+spy.pAlloc ¬ p;
+spy.nAlloc ¬ spy.nAlloc - 1;
+};
+};
+
+Insert: PROC [tree: Tree, pc: ProgramCounter, avail: Ref] RETURNS [Tree] = {
+new: OSet ¬ GetAvail[avail];
+IF tree # NIL AND new # NIL THEN {
+children: OSet ¬ Splay[tree.children, pc, new];
+IF new # children THEN FreeAvail[avail, new];
+tree.children ¬ children;
+RETURN [children.item]
+};
+RETURN [NIL]
+};
+STTree: TYPE = OSet;
+Key: TYPE = ProgramCounter;
+KeyField: PROC [s: STTree] RETURNS [Key] = INLINE {RETURN [s.item.pc]};
+Splay: PROC [s: STTree, key: Key, dummy: STTree] RETURNS [STTree] ~ {
+state: {N, L, R} ¬ N;
+l: STTree ¬ dummy;
+r: STTree ¬ dummy;
+p: STTree ¬ NIL;
+dummy.left ¬ dummy.right ¬ NIL;
+UNTIL s=NIL DO
+SELECT KeyField[s] FROM
+< key => {
+SELECT state FROM
+N, R => {l.right ¬ s; p ¬ l; l ¬ s; s ¬ s.right; state ¬ L};
+L => {l.right ¬ s.left; p.right ¬ s; s.left ¬ l; p ¬ NIL; l ¬ s; s ¬ s.right; state ¬ N};
+ENDCASE;
+};
+> key => {
+SELECT state FROM
+N, L => {r.left ¬ s; p ¬ r; r ¬ s; s ¬ s.left; state ¬ R};
+R => {r.left ¬ s.right; p.left ¬ s; s.right ¬ r; p ¬ NIL; r ¬ s; s ¬ s.left; state ¬ N};
+ENDCASE;
+};
+ENDCASE => {
+l.right ¬ s.left;
+r.left ¬ s.right;
+s.left ¬ dummy.right;
+s.right ¬ dummy.left;
+RETURN[s];
+};
+ENDLOOP;
+l.right ¬ NIL;
+r.left ¬ NIL;
+{left: OSet ¬ dummy.right; right: OSet ¬ dummy.left;
+s ¬ dummy;
+s.left ¬ left;
+s.right ¬ right;
+s.item.children ¬ NIL;
+s.item.pc ¬ key;
+s.item.count ¬ 0;
+RETURN[s];
+};
+};
+
+WriteTree: PUBLIC SAFE PROC [stream: IO.STREAM, ref: Ref] ~ TRUSTED {
+indent: NAT ¬ 0;
+Inner: PROC [tree: Tree] ~ {
+nest: INT ¬ 0; -- paren nest count for this invokation of Inner.
+DO -- loop back here if this has a singleton child.
+offset: CARD ¬ 0;
+IO.PutChar[stream, '(];
+nest ¬ nest + 1;
+IF tree = NIL THEN EXIT; -- should not happen, but what the hey?
+IO.Put1[stream, [cardinal[tree.count]]];
+IO.PutChar[stream, ' ];
+offset ¬ PutPCInfo[stream, tree.pc];
+IO.PutChar[stream, ' ];
+IO.Put1[stream, [cardinal[tree.pc-offset]]];
+IO.PutChar[stream, ' ];
+IO.Put1[stream, [cardinal[offset]]];
+IF tree.children # NIL AND tree.children.left = NIL AND tree.children.right = NIL
+THEN {
+IO.PutChar[stream, ' ];
+tree ¬ tree.children.item;
+LOOP;
+}
+ELSE {
+indent ¬ indent + 1;
+IF tree.children # NIL THEN {
+[] ¬ Insert[tree, FirstKey[tree.children], ref];
+DO
+IO.PutChar[stream, '\n];
+IO.PutRope[stream, spaces, 0, indent];
+Inner[tree.children.item];
+IF tree.children.right = NIL THEN EXIT;
+[] ¬ Insert[tree, FirstKey[tree.children.right], ref];
+ENDLOOP;
+};
+indent ¬ indent - 1;
+EXIT;
+};
+ENDLOOP;
+UNTIL nest = 0 DO
+IO.PutChar[stream, ')];
+nest ¬ nest - 1;
+ENDLOOP;
+};
+sav: NAT ~ ref.limit;
+ref.limit ¬ ref.size;
+WriteStats[stream, ref];
+Inner[ref.tree];
+IF ref.nAlloc > sav THEN ERROR;
+ref.limit ¬ sav;
+};
+
+WriteStats: PROC [stream: IO.STREAM, ref: Ref] ~ {
+stream.PutF1[";;; Spy\tstart:\t%g\n", [time[ref.startTime]]];
+stream.PutF1[";;;     \tstop:\t%g\n", [time[ref.stopTime]]];
+SELECT ref.watchAllocations FROM
+$count => stream.PutRope[";;;     \twatching allocations\n"];
+$words => stream.PutRope[";;;     \twatching words allocated\n"];
+ENDCASE;
+stream.PutF1[";;;     \tran for %g s\n", [integer[BasicTime.Period[from: ref.startTime, to: ref.stopTime]]]];
+stream.PutF1[";;;     \tused %g tree nodes ", [cardinal[ref.nAlloc]]];
+stream.PutF1["(of %g)\n", [cardinal[ref.limit]]];
+IF ref.missed # 0 THEN stream.PutF1[";;;      \tmissed %g samples due to contention.\n", [cardinal[ref.missed]]];
+};
+
+FirstKey: PROC [oSet: OSet] RETURNS [PC] ~ {
+UNTIL oSet.left = NIL DO
+oSet ¬ oSet.left;
+ENDLOOP;
+RETURN [oSet.item.pc]
+};
+
+Dbl: PROC [a: ROPE] RETURNS [ROPE] ~ INLINE {RETURN[Rope.Concat[a,a]]};
+spaces: ROPE ~ Dbl[Dbl[Dbl[Dbl[Dbl["                                "]]]]];
+PutUXString: PROC [stream: IO.STREAM, p: POINTER TO Basics.RawChars] ~ {
+end: INT ¬ 200;
+FOR i: NAT IN [0..200) DO
+IF p[i] = VAL[0] THEN {end ¬ i; EXIT};
+ENDLOOP;
+IO.UnsafePutBlock[stream, [LOOPHOLE[p], 0, end]];
+};
+
+PutBaseUXString: PROC [stream: IO.STREAM, p: POINTER TO Basics.RawChars] ~ {
+start: INT ¬ 0;
+end: INT ¬ 0;
+FOR i: NAT IN [0..200) DO
+c: CHAR ~ p[i];
+SELECT c FROM
+'/ => start ¬ i+1;
+'. => IF end <= start THEN end ¬ i;
+VAL[0] => {
+IF end <= start THEN end ¬ i;
+EXIT;
+};
+ENDCASE;
+ENDLOOP;
+IO.UnsafePutBlock[stream, [base: LOOPHOLE[p], startIndex: start, count: end-start]];
+};
+
+CirioNubSymEntryRep: TYPE ~ MACHINE DEPENDENT RECORD [ -- CirioNubTypes.h
+symID: CARD32,
+name: POINTER TO Basics.RawChars,
+type: CARD32,
+value: CARD32,
+size: CARD32,
+fileSeqNum: CARD32
+];
+
+PutPCInfo: PROC [stream: IO.STREAM, pc: PC] RETURNS [offset: CARD ¬ 0]= {
+IO.PutChar[stream, '\"];
+IF pc MOD 4 = 3
+THEN {
+w: CARD ~ (pc-3)/4;
+g: CARD ~ w MOD 32768;
+t: CARD ~ (w - g) / 32768;
+IO.PutRope[stream, "T"];
+IO.Put1[stream, [cardinal[t]]];
+IO.PutRope[stream, ".G"];
+IO.Put1[stream, [cardinal[g]]];
+}
+ELSE {
+PCtoInfoInner: PROC [pc: CARD32, buf: POINTER TO SWPCInfo] RETURNS [INT32] ~
+MACHINE CODE  { "CirioNubLocalPCtoInfo" };
+SWPCInfo: TYPE ~ MACHINE DEPENDENT RECORD [
+procName: POINTER TO Basics.RawChars,
+procSymID: CARD32,
+fileName: POINTER TO Basics.RawChars,
+fileSeqNum: CARD32,
+guessedEmbeddedFileName: POINTER TO Basics.RawChars,
+guessedEmbeddedFileSymID: CARD32
+];
+info: SWPCInfo;
+res: INT32 ¬ PCtoInfoInner[pc, @info];
+IF res=0 THEN {
+wantAllTypes: CARD ~ CARD.LAST; -- IncrementalLoad.h
+ignoreNone: CARD ~ 0; -- IncrementalLoad.h
+CirioNubLocalLookupSymEntryByID: PROC [symID: CARD32, buf: POINTER TO CirioNubSymEntryRep] RETURNS [INT] ~ MACHINE CODE {
+"CirioNubLocalLookupSymEntryByID"
+};
+buffer: CirioNubSymEntryRep;
+res: INT32 ¬ CirioNubLocalLookupSymEntryByID[symID: info.procSymID, buf: @buffer];
+PutBaseUXString[stream, info.guessedEmbeddedFileName];
+IO.PutChar[stream, '.];
+IF res=0 THEN {
+PutUXString[stream, buffer.name];
+offset ¬ pc-buffer.value;
+};
+};
+};
+IO.PutChar[stream, '\"];
+};
+
+InitSigtramp[];
+
+END.
+
+   Ö  
+SpyImpl.mesa
+Copyright Ó 1990, 1991 by Xerox Corporation.  All rights reserved.
+Michael Plass, May 4, 1992 1:57 pm PDT
+Types
+Global State
+Synchronization (without monitors)
+Starting and Stopping
+Stack sampling
+(c.f. .../SUNSRC/lib/libc/sys/common/sparc/sigtramp.s)
+etc...
+After seeing some bogus backpointers that miraculously cure themselves by the time any kind of debugger can look at this stack, the check against prevSP was added.
+This SP looks funny; squirrel it away to look at later.
+This was called by sigtramp.  But sigtramp does not return normally, so we need to poke around to find the actual pc at which the signal occured.  HIGHLY SPARC AND SunOS DEPENDENT
+(c.f. .../SUNSRC/lib/libc/sys/common/sparc/sigtramp.s)
+Args to sigfunc are (sig, code, &sigcontext, addr)
+Thread Switch Routines
+This process runs at top priority to try to ensure that at least one preemption happens on every tick.  This will even preempt the garbage collector!
+Allocator Callback Registration
+Allocator Sampling Routines
+Signal Callback Registration
+Tree management
+
+Abstraction for Splay operation
+The Sleator-Tarjan splay-tree operation; rebalances s so that nodes nearest key are near the root.  Needs dummy as scratch.
+IF s.item = NIL THEN DieAnytimeNow;
+
+Output
+Only one child, so don't do line break or indent further.
+Uses the splay operation to enumerate the children, using a bounded stack.
+Fake PC encodes a thread identifier.
+overlays the CirioNubPCInfo structure of CirioNubTypes.h.
+ÊÆ  –(cedarcode) style•NewlineDelimiter
+™ codešœ™Kšœ
+Ïeœ7™BK™&—K˜ KšÏk	œžœ7˜SK˜ KšÐlnœž˜Kšžœžœ.˜CKšžœ˜šœž˜K˜ —head™Kšžœžœžœ˜Kšœžœžœ˜Kšžœžœžœ˜šœžœ˜4K˜ —Kšœžœžœ˜šœžœžœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœ-˜-Kšœ˜Kšœžœ˜Kšœžœ˜Kšœžœžœ	˜Kšœžœžœ˜5Kšœžœžœžœ˜"Kšœ˜—šœžœ˜K˜ —Kšœžœžœžœ	˜ šœ	žœžœ˜Kšœžœ˜K˜Kšœžœ˜Kšœ˜K˜ —KšœžœžœžœÏc6˜Xšœ
+žœžœ˜Kšœ ˜Kšœ ˜Kšœ ˜Kšœ˜K˜ —šœ	žœžœ˜Kšœ˜Kšœ˜Kšœ˜K˜ ——™Kšœ	žœžœ˜Kšœžœ˜Kšœžœžœžœžœžœ˜+šœžœ˜K˜ ——™"šÏn
+œžœžœžœžœžœžœžœžœžœžœ˜RKšœž	œžœžœ˜0K˜ —š¡	œžœžœ
+˜!Kšœžœ˜Kš
+žœžœ	žœžœžœ˜-Kšœ˜K˜ —š¡
+œžœ˜Kšžœžœžœ˜Kšœžœ˜Kšœ˜——™š¡œžœžœžœžœžœžœ>žœžœ	žœ
+žœžœžœ˜¹Kšœžœ˜Kšžœ	žœžœžœ˜Kšœžœžœžœ˜Kšœ$žœ˜;Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœžœ˜-Kšœ ˜ Kšœ!˜!Kšœ(˜(šžœžœ˜Kšœ%žœ˜*Kšœžœ˜Kšœ˜—šžœž˜Kšœ6žœ˜;Kšœ9žœ˜>Kšžœ˜—šžœžœ˜K˜%Kšœ˜—Kšœ˜Kšœ
+žœ˜Kšœ˜Kšœžœ˜Kšžœžœ˜Kšœ˜K˜ —š¡œžœžœžœžœžœ	žœ˜6Kšžœžœžœ˜Kš
+žœžœ	žœžœžœ˜!Kšœžœžœ˜!Kšœžœžœ˜$Kšœžœ˜šžœžœžœ
+ž˜Kšœ˜šžœžœžœ˜Kšœ˜Kšœžœ˜Kšœ˜Kšœ
+žœ˜Kšžœ˜Kšœ˜—Kšžœžœžœžœ˜;Kšžœ˜—Kšœžœ˜Kšœ
+žœ˜Kšœžœžœžœ˜Kšžœžœ˜Kšœ˜——™Kšœžœžœžœ˜$š	œžœžœž	œžœ˜2Kšœžœ ˜Kšœžœ ˜Kšœžœ ˜Kšœ˜K˜ —Kšžœžœžœžœ˜!š	œžœžœž	œžœ˜6Kšœžœžœžœ˜Kšœžœžœžœ˜Kšœžœ˜Kšœž˜Kšœ˜K˜ —šœžœžœžœž	œžœ˜>Kšœ6™6Kšœ˜Kšœžœ˜Kšœžœ˜Kšœžœžœ˜%Kšœž˜
+Kšœ˜K˜ —š¡œžœ˜(Kšœžœžœžœ˜3K˜ —šœžœžœ˜-Kšœžœžœ˜Kšœž˜Kšœ˜K˜ —šœžœžœ ˜;K˜ —š	œžœžœž	œžœ˜7Kšœžœ ˜%Kšœžœ˜ K˜K˜K˜Kšœžœ˜Kšœžœ˜Kšœžœ
+˜Kšœ˜K˜ —šœžœžœ Ðbc˜EKšœžœžœ˜!Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœžœ˜K˜K˜ —šœžœžœ ¢˜FKšœžœ˜Kšœžœ˜Kšœžœžœ˜!K™K˜K˜ —Kš	œžœžœ	žœžœ/˜YKšœžœ ˜1Kš
+¡œžœžœžœžœ˜<Kš
+¡œžœžœžœžœ˜8š¡œžœ˜š¡œžœžœžœžœžœžœžœžœžœžœžœžœ˜»Kšœ¡œ˜!Kšœ˜—š¡œžœžœžœžœžœžœžœžœžœžœžœžœžœ˜ÖKšœ¡œ˜ Kšœ˜—šœžœžœ-˜;Kšœžœ˜
+Kšœ˜Kšœžœ˜Kšœ ˜K˜Kšœ˜—šžœžœžœ˜šœžœžœ.˜<Kšœ	˜	Kšœ˜Kšœ ˜Kšœ˜Kšœ˜Kšœ˜—Kšœ˜Kšœ˜Kšœ˜—Kšœ˜K˜ —šœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœ˜K˜ —š¡œžœžœžœ˜(Kšžœ	˜Kšœ˜K˜ —š¡œžœ˜Kšœ˜Kšœ˜K˜ —š¡œžœžœ
+žœžœžœ˜5Kšœ£™£Kšžœžœžœžœžœ /˜PKš"žœžœžœžœžœžœžœžœžœžœžœžœžœ	žœžœžœžœ˜žK™7Kšœ(˜(Kšœžœ˜Kšœžœ	˜ Kšžœžœ˜Kšœ˜K˜ —Kšœžœ˜š
+¡	œžœžœžœžœ˜.Kšœ˜Kšœ˜Kšœ˜K˜ —š¡œžœžœžœžœžœ˜0Kšžœžœžœ˜&Kšœ˜K˜ —Kšœžœ˜-Kšœžœžœ˜Kš¡œžœ"˜-š¡œžœ˜Kšžœžœžœ˜Kšœžœ˜Kšžœ˜Kšœ˜K˜ —š¡œžœžœžœžœžœž	œ˜ZKš¡œžœžœžœžœžœžœžœ;˜Kšœžœ#˜+Kš
+žœžœžœžœžœ
+˜4K˜K˜ —š¡œžœžœžœžœžœžœ˜QKšœžœ˜2Kšœžœ;˜GKšœ˜Kšœžœ˜Kšœ˜Kšžœžœžœžœ˜0šžœžœžœ˜Kšœ˜Kšœžœžœ˜Kšœžœžœ˜Kšœ˜š	žœžœžœžœž˜JKšœžœ˜Kšœ˜Kšœ
+˜
+Kšœ˜Kš	žœžœžœžœ ˜Dš
+žœžœžœžœ#žœ˜jJšœ“ÏtÏb £™µKšœ6™6Kšœ2™2Kšœžœžœžœ˜?Kšœžœžœ˜8Kšœžœ˜šžœžœ˜Kšœ6˜6šžœžœ˜Kšžœžœ˜,Kšœ˜Kšœ
+˜
+Kšœ˜—Kšœ˜Kšœžœ?˜E—Kšœ˜—Kšœ˜Kšžœ˜—Kš
+žœžœžœžœžœ˜UK˜Kšœ˜šžœžœžœ˜K˜š	žœžœž
+œžœž˜.Kšœ'˜'Kšžœžœžœžœ˜K˜Kšžœ˜—Kšœ˜—Kšœ˜Kšœ˜—Kšœ˜——™š¡œžœžœžœžœžœžœžœ˜UK˜Kšœ˜K˜ —š¡œžœžœžœ˜#Kšœ.˜.Kšœ˜K˜ —š¡	œžœ˜K™•Kšœ*˜*šžœ	ž˜K˜Kšžœ˜—Kšœ˜K˜ ——™Kš	œžœžœžœžœ˜%Kšžœžœžœ˜Kšœžœžœžœ	˜ Kšœ	žœžœž	œžœžœ˜Nš¡œžœžœžœžœžœžœ˜AKšœ
+žœ˜Kšœ ˜4Kšžœ˜K˜K˜ —šœžœžœžœžœžœžœžœžœ˜wK˜ —š¡œžœ/žœžœ˜`Kšœžœžœžœžœžœ˜DKšœžœ˜Kšœžœžœ˜š¡œžœžœžœžœžœžœžœžœžœ˜‰Iascii˜Kšœ˜—Kšœ@˜@Kšœ˜K˜ ——™š¡œžœžœžœžœžœžœžœ˜nKšœ.˜.Kšœ˜K˜ —š¡œžœžœžœžœžœžœžœ˜qKšœžœžœžœžœžœ˜DKšœ;˜;Kšœ˜K˜ ——™š¡œžœžœžœ˜6K˜2K˜——™š¡œžœžœžœ˜8šžœžœ˜ Kšœžœžœ˜#Kšœžœ˜Kšœ˜Kšœžœ˜Kšœžœ˜Kšœ˜Kšœ˜Kšœ˜Kšœžœ
+˜(Kšžœ˜Kšœ˜—Kšœ˜K˜ —š¡	œžœ˜*Kšœžœžœžœ
+˜3šžœžœ˜Kšœ˜Kšœ˜Kšœ˜—Kšœ˜K˜ —š¡œžœ.žœ˜LKšœ˜š
+žœžœžœžœžœ˜"Kšœ/˜/Kšžœžœ˜-Kšœ˜Kšžœ˜Kšœ˜—Kšžœžœ˜Kšœ˜K™ —™Kšœžœ˜Kšœžœ˜Kš
+¡œžœžœ	žœžœ˜G—š¡œžœ&žœ˜EKšœ{™{Kšœ˜Kšœ˜Kšœ˜Kšœžœ˜Kšœžœ˜šžœžœž˜šžœž˜šœ
+˜
+šžœž˜Kšœ<˜<Kšœ5žœ!˜YKšžœ˜—Kšœ˜—šœ
+˜
+šžœž˜Kšœ:˜:Kšœ5žœ ˜XKšžœ˜—Kšœ˜—šžœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšžœ˜
+Kšœ˜——Kšžœ˜—Kšœ
+žœ˜Kšœ	žœ˜šœ4˜4Kšœ
+˜
+Kšœ˜Kšœ˜Kšžœ
+žœžœ™#Kšœžœ˜K˜Kšœ˜Kšžœ˜
+K˜—Kšœ˜—K™ —™K˜ š¡	œžœžœžœ
+žœžœžœ˜EKšœžœ˜š¡œžœ˜Kšœžœ 1˜@šžœ 0˜3Kšœžœ˜Kšžœ˜K˜Kš	žœžœžœžœ '˜@Kšžœ&˜(Kšžœ˜Kšœ$˜$Kšžœ˜Kšžœ*˜,Kšžœ˜Kšžœ"˜$šžœžœžœžœžœž˜Qšžœ˜J™9Kšžœ˜Kšœ˜Kšžœ˜Kšœ˜—šžœ˜Kšœ˜K™Jšžœžœžœ˜Kšœ0˜0šž˜Kšžœ˜Kšžœ$˜&Kšœ˜Kšžœžœžœžœ˜'Kšœ6˜6Kšžœ˜—Kšœ˜—Kšœ˜Kšžœ˜Kšœ˜——Kšžœ˜—šžœ
+ž˜Kšžœ˜K˜Kšžœ˜—Kšœ˜—Kšœžœ˜Kšœ˜Kšœ˜Kšœ˜Kšžœžœžœ˜Kšœ˜Kšœ˜K˜ —š¡
+œžœ
+žœžœ˜2Kšœ=˜=Kšœ<˜<šžœž˜ Kšœ=˜=KšœA˜AKšžœ˜—Kšœm˜mKšœF˜FKšœ1˜1Kšžœžœ[˜qKšœ˜K˜ —š¡œžœžœžœ˜,šžœžœž˜Kšœ˜Kšžœ˜—Kšžœ˜Kšœ˜K˜ —Kš¡œžœžœžœžœžœžœ˜GKšœžœ?˜Kš¡œžœ
+žœžœžœžœ˜HKšœžœ˜šžœžœžœ
+ž˜Kšžœžœžœžœ˜&Kšžœ˜—Kšžœžœ˜1Kšœ˜K˜ —š¡œžœ
+žœžœžœžœ˜LKšœžœ˜Kšœžœ˜šžœžœžœ
+ž˜Kšœžœ˜šžœž˜Kšœ˜Kšœžœžœ	˜#šžœ˜Kšžœžœ	˜Kšžœ˜K˜—Kšžœ˜—Kšžœ˜—Kšžœžœ+˜TKšœ˜K˜ —šœžœžœ ¢˜IKšœžœ˜Kšœžœžœ˜!Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœž˜K˜K˜ —š¡	œžœ
+žœžœžœžœ
+žœ˜IKšžœ˜šžœžœ˜šžœ˜K™$Kšœžœ˜Kšœžœžœ˜Kšœžœ˜Kšžœ˜Kšžœ˜Kšžœ˜Kšžœ˜Kšœ˜—šžœ˜Kš¡œžœžœžœžœžœžœžœžœ˜wš	œ
+žœžœž	œžœ˜+Kšœ9™9Kšœ
+žœžœ˜%Kšœžœ˜Kšœ
+žœžœ˜%Kšœžœ˜Kšœžœžœ˜4Kšœž˜ K˜—Kšœ˜Kšœžœ˜&šžœžœ˜Kšœžœžœžœ¢˜4Kšœžœ¢˜*š¡œžœ	žœžœžœžœžœžœžœ˜yKšœ!˜!Kšœ˜—Kšœ˜KšœžœH˜RKšœ6˜6Kšžœ˜šžœžœ˜Kšœ!˜!Kšœ˜Kšœ˜—Kšœ˜—Kšœ˜——Kšžœ˜Kšœ˜K˜ —Kšœ˜K˜ —Kšžœ˜K˜ — …—    @º  bV  

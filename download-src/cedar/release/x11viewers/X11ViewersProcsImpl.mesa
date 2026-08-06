@@ -1,0 +1,662 @@
+
+DIRECTORY
+Cursors,
+Imager,
+ImagerColor,
+LRUCache,
+Rope,
+ViewersWorld,
+ViewersWorldClasses,
+X11Viewers,
+Xl,
+XlColorAccess,
+XlCutBuffers,
+XlCursor,
+XTk,
+XTkNotification;
+
+X11ViewersProcsImpl: CEDAR MONITOR
+IMPORTS ImagerColor, LRUCache, X11Viewers, Xl, XlColorAccess, XlCutBuffers, XlCursor, XTk, XTkNotification, ViewersWorld
+EXPORTS X11Viewers ~ 
+BEGIN 
+
+ScreenServerData: TYPE = X11Viewers.ScreenServerData;
+lastData: ScreenServerData ¨ NIL;
+CursorInfo: TYPE = REF CursorInfoRec;
+CursorInfoRec: PUBLIC TYPE = RECORD [
+connection: Xl.Connection ¨ NIL,
+garbageCollectCursor: Xl.Cursor ¨ Xl.nullCursor,
+gc: Xl.GContext,
+pixmap, bigPixmap: Xl.Pixmap, --contains cursor picture
+cache: LRUCache.Handle,
+last: CRef ¨ NIL,
+gcCursorUsedRecently: BOOL ¨ FALSE,
+hasBigCursor: BOOL ¨ FALSE,
+didQueryBigCursur: BOOL ¨ FALSE
+];
+
+cacheSize: NAT = 99;
+
+CRef: TYPE = REF CData;
+CData: TYPE = RECORD [
+hotx, hoty: INTEGER ¨ 0,
+isBig: BOOL ¨ FALSE,
+cursor: Xl.Cursor ¨ Xl.nullCursor,
+actualXCursorColor: REF Xl.RGBRec ¨ NIL,
+w: XTk.Widget ¨ NIL, --a copy, so operations on "last" have correct connection 
+patternName: ATOM ¨ NIL,
+small: ViewersWorldClasses.CursorArray ¨ ALL[0],
+big: ViewersWorldClasses.Cursor32ArrayRef ¨ NIL
+];
+
+cfree: CRef ¨ NIL;
+
+NewCursorRec: ENTRY PROC [w: XTk.Widget] RETURNS [cref: CRef] = {
+cref ¨ cfree; cfree ¨ NIL;
+IF cref=NIL THEN cref ¨ NEW[CData];
+cref.w ¨ w;
+cref.small ¨ ALL[0]; cref.big ¨ NIL;
+};
+
+CursorRecHash: PROC [x: REF] RETURNS [CARDINAL] = {
+c: CRef ~ NARROW[x];
+cnt: INT ¨ c.hotx*31+c.hoty;
+IF c.isBig AND c.big#NIL 
+THEN
+FOR i: INT IN [0..15] DO
+cnt ¨ (cnt MOD 10000000H)*31 + LOOPHOLE[c.big[2*i]]
+ENDLOOP
+ELSE
+FOR i: INT IN [0..7] DO
+add: INT16 ¨ LOOPHOLE[c.small[2*i]];
+cnt ¨ (cnt MOD 10000000H)*31 + add
+ENDLOOP;
+RETURN [LOOPHOLE[cnt]]
+};
+
+CursorRecEqual: PROC [x: REF, y: REF] RETURNS [BOOL] = {
+c1: CRef ~ NARROW[x];
+c2: CRef ~ NARROW[y];
+IF c1.patternName#c2.patternName THEN RETURN [FALSE];
+IF c1.hotx#c2.hotx OR c1.hoty#c2.hoty THEN RETURN [FALSE];
+IF c1.isBig#c2.isBig THEN RETURN [FALSE];
+IF c1.isBig AND c1.big#NIL AND c2.big#NIL
+THEN {IF c1.big≠#c2.big≠ THEN RETURN [FALSE]}
+ELSE {IF c1.small#c2.small THEN RETURN [FALSE]};
+RETURN [TRUE];
+};
+
+GetCursorPattern: PROC [screenServerData: REF, cursor: REF ¨ NIL] RETURNS [deltaX, deltaY: INTEGER ¨ 0, cursorPattern: Cursors.CursorArray, patternName: ATOM ¨ NIL] = {
+WITH screenServerData SELECT FROM
+data: ScreenServerData => {
+ci: REF CursorInfoRec ~ data.cursorInfo;
+IF ci#NIL AND ~data.instable THEN {
+cref: CRef ~ ci.last;
+IF cref#NIL AND ~cref.isBig THEN {
+deltaX ¨ cref.hotx;
+deltaY ¨ cref.hoty;
+patternName ¨ cref.patternName;
+cursorPattern ¨ cref.small;
+};
+};
+};
+ENDCASE => {};
+};
+
+GetBigCursorPattern: ViewersWorldClasses.GetBigCursorPatternProc = {
+WITH screenServerData SELECT FROM
+data: ScreenServerData => {
+ci: REF CursorInfoRec ~ data.cursorInfo;
+IF ci#NIL AND ~data.instable THEN {
+cref: CRef ~ ci.last;
+IF cref#NIL AND cref.isBig THEN {
+deltaX ¨ cref.hotx;
+deltaY ¨ cref.hoty;
+cursorPattern ¨ cref.big;
+patternName ¨ cref.patternName;
+};
+};
+};
+ENDCASE => {};
+};
+
+Cleanup: PROC [screenServerData: REF ANY] = {
+ResetCursorCache: PROC [ci: CursorInfo] = {
+IF ci#NIL THEN {
+h: LRUCache.Handle ~ ci.cache;
+IF h#NIL THEN LRUCache.Reset[h]
+};
+};
+WITH screenServerData SELECT FROM
+data: ScreenServerData => ResetCursorCache[data.cursorInfo];
+ENDCASE => {};
+};
+
+FixCursor: PROC [cref: CRef, data: ScreenServerData] = {
+w: XTk.Widget ~ cref.w;
+axc: REF Xl.RGBRec ¨ cref.actualXCursorColor; 
+xc: REF Xl.RGBRec ~ EnsureCursorColor[data];
+IF axc#xc THEN {
+IF axc=NIL OR axc≠#xc≠ THEN {
+cref.actualXCursorColor ¨ axc ¨ xc;
+Xl.ReColorCursor[c: w.connection, cursor: cref.cursor, foreground: axc]
+};
+};
+Xl.ChangeWindowAttributes[w.connection, w.window, [cursor: cref.cursor]];
+Xl.Flush[w.connection];
+};
+
+SetCursorPattern: PROC [screenServerData: REF ANY, deltaX, deltaY: INTEGER, cursorPattern: Cursors.CursorArray, patternName: ATOM, cursor: REF] = {
+ENABLE UNCAUGHT => IF ~X11Viewers.debugging THEN {Cleanup[screenServerData]; GOTO oops};
+WITH screenServerData SELECT FROM
+data: ScreenServerData => {
+ci: CursorInfo ~ data.cursorInfo;
+IF ci#NIL AND ~data.instable THEN {
+w: XTk.Widget ~ data.bitmap;
+IF w#NIL AND w.state=realized AND w.fastAccessAllowed=ok THEN {
+used: REF; insert: BOOL; 
+cref: CRef ¨ NewCursorRec[w];
+cref.isBig ¨ FALSE;
+cref.hotx ¨ deltaX; cref.hoty ¨ deltaY;
+cref.small ¨ cursorPattern; cref.patternName ¨ patternName;
+[insert: insert, used: used] ¨ LRUCache.Include[ci.cache, cref];
+IF ~insert THEN {cfree ¨ cref; cref ¨ NARROW[used]};
+IF cref.cursor=Xl.nullCursor 
+THEN TRUSTED {
+space: PACKED ARRAY [0..16) OF CARD16;
+FOR i: INTEGER IN [0..16) DO space[i] ¨ cref.small[i] ENDLOOP;
+Xl.PutImage[c: cref.w.connection, drawable: ci.pixmap.drawable, gc: ci.gc, size: [16, 16], dest: [0, 0], base: @space, offx: 0, offy: 0, scanLineBytes: 2];
+BEGIN
+xc: REF Xl.RGBRec ~ EnsureCursorColor[data];
+hot: Xl.Point ¨ [-cref.hotx, -cref.hoty];
+hot.x ¨ MAX[MIN[hot.x, 16], 0]; hot.y ¨ MAX[MIN[hot.y, 16], 0];
+cref.cursor ¨ Xl.CreateCursor[c: cref.w.connection, source: ci.pixmap, mask: ci.pixmap, hotP: hot, foreground: xc];
+cref.actualXCursorColor ¨ xc;
+END;
+};
+IF ci.last=cref THEN {
+IF ci.gcCursorUsedRecently 
+THEN ci.gcCursorUsedRecently ¨ FALSE
+ELSE RETURN;
+};
+ci.last ¨ cref;
+FixCursor[cref, data];
+};
+};
+};
+ENDCASE => {};
+EXITS oops => {};
+};
+
+SetBigCursorPattern: ViewersWorldClasses.SetBigCursorPatternProc = {
+ENABLE UNCAUGHT => 
+IF ~X11Viewers.debugging THEN {Cleanup[screenServerData]; GOTO oops};
+WITH screenServerData SELECT FROM
+data: ScreenServerData => {
+ci: CursorInfo ~ data.cursorInfo;
+IF ci#NIL AND ~data.instable AND cursorPattern#NIL THEN {
+w: XTk.Widget ~ data.bitmap;
+IF w#NIL AND w.state=realized AND w.fastAccessAllowed=ok THEN {
+used: REF; insert: BOOL; 
+cref: CRef ¨ NewCursorRec[w];
+cref.hotx ¨ deltaX; cref.hoty ¨ deltaY;
+cref.big ¨ cursorPattern; cref.patternName ¨ patternName;
+cref.isBig ¨ TRUE;
+[insert: insert, used: used] ¨ LRUCache.Include[ci.cache, cref];
+IF ~insert THEN {cfree ¨ cref; cref ¨ NARROW[used]};
+IF cref.cursor=Xl.nullCursor 
+THEN TRUSTED {
+Xl.PutImage[c: w.connection, drawable: ci.bigPixmap.drawable, gc: ci.gc, size: [32, 32], dest: [0, 0], base: LOOPHOLE[cref.big], offx: 0, offy: 0, scanLineBytes: 4];
+BEGIN
+xc: REF Xl.RGBRec ~ EnsureCursorColor[data];
+hot: Xl.Point ¨ [-cref.hotx, -cref.hoty];
+hot.x ¨ MAX[MIN[hot.x, 32], 0]; hot.y ¨ MAX[MIN[hot.y, 32], 0];
+cref.cursor ¨ Xl.CreateCursor[c: w.connection, source: ci.bigPixmap, mask: ci.bigPixmap, hotP: hot, foreground: xc];
+cref.actualXCursorColor ¨ xc;
+END;
+};
+IF ci.last=cref THEN {
+IF ci.gcCursorUsedRecently 
+THEN ci.gcCursorUsedRecently ¨ FALSE
+ELSE RETURN;
+};
+ci.last ¨ cref;
+FixCursor[cref, data];
+};
+};
+};
+ENDCASE => {};
+EXITS oops => {};
+};
+
+BigCursorsSupported: ViewersWorldClasses.BigCursorsSupportedProc = {
+WITH screenServerData SELECT FROM
+data: ScreenServerData => {
+ci: REF CursorInfoRec ~ data.cursorInfo;
+IF ci#NIL AND ~data.instable THEN {
+sd: Xl.ScreenDepth ~ data.top.screenDepth;
+IF sd#NIL AND ~ci.didQueryBigCursur THEN {
+screen: Xl.Screen ~ sd.screen;
+s: Xl.Size;
+s ¨ Xl.QueryBestSize[screen.connection, cursor, screen.root.drawable, [32, 32] ! 
+UNCAUGHT => {s ¨ [0, 0]; CONTINUE}
+];
+ci.didQueryBigCursur ¨ TRUE;
+ci.hasBigCursor ¨ s.width>=32 AND s.height>=32;
+};
+RETURN [ci.hasBigCursor];
+};
+};
+ENDCASE => {};
+RETURN [FALSE]
+};
+
+IsBigCursorPattern: ViewersWorldClasses.IsBigCursorPatternProc = {
+WITH screenServerData SELECT FROM
+data: ScreenServerData => {
+ci: REF CursorInfoRec ~ data.cursorInfo;
+IF ci#NIL AND ~data.instable THEN {
+cref: CRef ~ ci.last;
+IF cref#NIL THEN RETURN [cref.isBig]
+};
+};
+ENDCASE => {};
+RETURN [FALSE]
+};
+
+ToX11ViewersColor: PROC [color: Imager.Color, invGamma: REAL ¨ 0.4545454] RETURNS [rgbRef: REF Xl.RGBRec] = {
+rgb: ImagerColor.RGB ~ ImagerColor.RGBFromColor[NARROW[color]];
+rgbRef ¨ NEW[Xl.RGBRec ¨ [
+red: XlColorAccess.RealColorValToXColorVal[rgb.R, invGamma],
+green: XlColorAccess.RealColorValToXColorVal[rgb.G, invGamma],
+blue: XlColorAccess.RealColorValToXColorVal[rgb.B, invGamma]
+]];
+};
+
+SetCursorColor: ViewersWorldClasses.SetCursorColorProc = {
+ENABLE UNCAUGHT => {IF ~X11Viewers.debugging THEN {Cleanup[screenServerData]; GOTO oops}};
+WITH screenServerData SELECT FROM
+data: ScreenServerData => {
+ci: CursorInfo ~ data.cursorInfo;
+data.xCursorColor ¨ ToX11ViewersColor[color, data.invGamma];
+data.imagerCursorColor ¨ color;
+IF ci#NIL AND ~data.instable THEN {
+cref: CRef ¨ ci.last;
+IF cref#NIL THEN FixCursor[cref, data]; --does too much, but it really doesn't matter
+};
+}
+ENDCASE => {};
+EXITS oops => {};
+};
+
+InitData: XTk.WidgetNotifyProc = {
+WITH callData SELECT FROM
+data: ScreenServerData => {
+Cleanup[data];
+[] ¨ EnsureCursorColor[data];
+lastData ¨ data;
+};
+ENDCASE => {};
+};
+
+defaultCursorColor: Imager.Color ~ ImagerColor.ColorFromRGB[[1, 0, 0]];
+
+EnsureCursorColor: PROC [data: ScreenServerData] RETURNS [xc: REF Xl.RGBRec] = INLINE {
+xc ¨ data.xCursorColor;
+IF xc=NIL THEN { 
+data.xCursorColor ¨ xc ¨ ToX11ViewersColor[defaultCursorColor];
+data.imagerCursorColor ¨ defaultCursorColor;
+};
+};
+
+GetCursorColor: ViewersWorldClasses.GetCursorColorProc = {
+WITH screenServerData SELECT FROM
+data: ScreenServerData => color ¨ data.imagerCursorColor;
+ENDCASE => {};
+IF color=NIL THEN color ¨ defaultCursorColor;
+};
+
+SetGCMode: PUBLIC PROC [doingGC: BOOL] = {
+WITH lastData SELECT FROM
+data: ScreenServerData => {
+ci: CursorInfo ~ data.cursorInfo;
+IF ci#NIL AND ~data.instable THEN {
+cref: CRef ~ ci.last;
+IF cref#NIL THEN {
+w: XTk.Widget ~ cref.w;
+IF w#NIL AND w.state=realized AND w.fastAccessAllowed=ok THEN {
+c: Xl.Connection ~ w.connection;
+cursor: Xl.Cursor ~ IF doingGC THEN ci.garbageCollectCursor ELSE cref.cursor;
+Xl.ChangeWindowAttributes[c, w.window, [cursor: cursor]];
+Xl.Flush[c];
+IF doingGC THEN ci.gcCursorUsedRecently ¨ TRUE;
+};
+};
+};
+};
+ENDCASE => {};
+};
+SetMousePosition: PROC [screenServerData: REF ANY, x, y: INTEGER, display: REF ¨ NIL, device: REF ¨ NIL] = {
+ENABLE UNCAUGHT => IF ~X11Viewers.debugging THEN {Cleanup[screenServerData]; GOTO oops};
+WITH screenServerData SELECT FROM
+data: ScreenServerData => {
+w: XTk.Widget ~ data.bitmap;
+IF w#NIL AND ~data.instable THEN {
+IF x<0 OR y<0 OR x>w.actual.size.width OR y>w.actual.size.height THEN RETURN;
+IF data.actualSurfaceUnitsPerPixel=2 THEN {x ¨ x*2; y ¨ x*2};
+Xl.WarpPointer[c: w.connection, dstWindow: w.window, dstPos: [x: x, y: w.actual.size.height-y], srcWindow: w.window];
+Xl.Flush[w.connection];
+};
+};
+ENDCASE => {};
+EXITS oops => {}
+};
+
+GetMousePosition: PROC [screenServerData: REF ANY, device: REF ¨ NIL] RETURNS [x, y: INTEGER ¨ 0, display: REF ¨ NIL] = {
+ENABLE UNCAUGHT => IF ~X11Viewers.debugging THEN {Cleanup[screenServerData]; GOTO oops};
+valid: BOOL ¨ FALSE; --its computed, but I don't know what to do with it...
+WITH screenServerData SELECT FROM
+data: ScreenServerData => {
+w: XTk.Widget ~ data.bitmap;
+IF w#NIL AND ~data.instable THEN {
+reply: Xl.PointerReply = Xl.QueryPointer[w.connection, w.window];
+IF reply.sameScreen THEN {
+valid ¨ TRUE;
+IF reply.pos.x<0 OR reply.pos.x>w.actual.size.width 
+THEN valid ¨ FALSE
+ELSE x ¨ reply.pos.x;
+IF reply.pos.y<0 OR reply.pos.y>w.actual.size.height 
+THEN valid ¨ FALSE
+ELSE y ¨ w.actual.size.height-reply.pos.y;
+IF data.actualSurfaceUnitsPerPixel=2 THEN {x ¨ x/2; y ¨ y/2};
+};
+};
+};
+ENDCASE => {};
+EXITS oops => {RETURN[]}
+};
+
+GetDeviceSize: PROC [screenServerData: REF, display: REF ¨ NIL] RETURNS [w, h: NAT ¨ 0] = {
+WITH screenServerData SELECT FROM
+data: ScreenServerData => {w ¨ data.width; h ¨ data.height};
+ENDCASE => {};
+};
+
+Sound: PROC [screenServerData: REF ANY, display: REF, frequency: CARDINAL, duration: CARDINAL] = {
+ENABLE UNCAUGHT => IF ~X11Viewers.debugging THEN {Cleanup[screenServerData]; GOTO oops};
+WITH screenServerData SELECT FROM
+data: ScreenServerData => {
+top: XTk.Widget ~ data.top;
+c: Xl.Connection ~ IF top#NIL THEN top.connection ELSE NIL;
+IF Xl.Alive[c] AND ~data.instable THEN Xl.Bell[c]
+};
+ENDCASE => {};
+EXITS oops => {};
+};
+
+CutBufferPushTioga: PROC [c: Xl.Connection, data: Rope.ROPE] = {
+tioga: Xl.XAtom ~ Xl.InternAtom[c, "Tioga", TRUE].atom;
+Xl.ChangeProperty[c: c, w: Xl.FirstRoot[c], property: tioga, type: tioga, mode: replace, data: data];
+Xl.Flush[c];
+};
+
+SetCutBuffer: PROC [screenServerData: REF ANY, buffer: ATOM, data: Rope.ROPE] = {
+ENABLE UNCAUGHT => {IF ~X11Viewers.debugging THEN GOTO oops};
+WITH screenServerData SELECT FROM
+d: ScreenServerData => {
+top: XTk.Widget ~ d.top;
+c: Xl.Connection ~ IF top#NIL THEN top.connection ELSE NIL;
+IF Xl.Alive[c] AND ~d.instable THEN {
+SELECT buffer FROM
+$Ascii, $xterm, NIL => XlCutBuffers.Put[c, data];
+$Tioga => CutBufferPushTioga[c, data];
+ENDCASE => {};
+};
+};
+ENDCASE => {};
+EXITS oops => {};
+};
+
+CutBufferGetTioga: PROC [c: Xl.Connection] RETURNS [data: Rope.ROPE] = {
+tioga: Xl.XAtom ~ Xl.InternAtom[c, "Tioga", TRUE].atom;
+pr: Xl.PropertyReturnRec ¨ Xl.GetProperty[c: c, w: Xl.FirstRoot[c], property: tioga, supposedFormat: 8];
+WITH pr.value SELECT FROM
+r: Rope.ROPE => data ¨ r;
+ENDCASE => {}; 
+};
+
+GetCutBuffer: PROC [screenServerData: REF ANY, buffer: ATOM] RETURNS [Rope.ROPE ¨ NIL] = {
+ENABLE UNCAUGHT => {IF ~X11Viewers.debugging THEN GOTO oops};
+WITH screenServerData SELECT FROM
+d: ScreenServerData => {
+top: XTk.Widget ~ d.top;
+c: Xl.Connection ~ IF top#NIL THEN top.connection ELSE NIL;
+IF Xl.Alive[c] AND ~d.instable THEN {
+SELECT buffer FROM
+$Tioga => RETURN [ CutBufferGetTioga[c] ];
+$Ascii, $xterm, NIL => RETURN [ XlCutBuffers.Get[c] ];
+ENDCASE => RETURN [NIL];
+};
+};
+ENDCASE => {};
+EXITS oops => {RETURN [NIL]};
+};
+
+NewCursorInfo: PROC [bitmap: XTk.Widget] RETURNS [ci: REF CursorInfoRec ¨ NIL] = {
+c: Xl.Connection ~ bitmap.connection;
+sd: Xl.ScreenDepth ~ bitmap.screenDepth;
+IF Xl.Alive[c] AND sd#NIL THEN {
+drawable: Xl.Drawable ~ sd.screen.root.drawable;
+ci ¨ NEW[CursorInfoRec];
+ci.connection ¨ c;
+ci.cache ¨ LRUCache.Create[cacheSize, CursorRecHash, CursorRecEqual];
+ci.pixmap ¨ Xl.CreatePixmap[c: c, drawable: drawable, size: [16, 16], depth: 1];
+ci.bigPixmap ¨ Xl.CreatePixmap[c: c, drawable: drawable, size: [32, 32], depth: 1];
+ci.gc ¨ Xl.MakeGContext[c, drawable];
+Xl.SetGCGraphicsExposures[ci.gc, FALSE];
+Xl.SetGCGrounds[gc: ci.gc, foreground: 1, background: 0];
+ci.garbageCollectCursor ¨ XlCursor.SharedStandardCursor[c, boxSpiral];
+};
+};
+
+NewOrCachedCursorInfo: PROC [bitmap: XTk.Widget] RETURNS [REF CursorInfoRec ¨ NIL] = {
+c: Xl.Connection ~ bitmap.connection;
+IF ~Xl.Alive[c] THEN RETURN [NIL];
+WITH XTk.GetWidgetProp[bitmap, $CursorInfoRec] SELECT FROM
+ci: REF CursorInfoRec => IF ci.connection=c THEN RETURN [ci];
+ENDCASE => {};
+BEGIN
+ci: REF CursorInfoRec ~ NewCursorInfo[bitmap];
+IF ci#NIL THEN XTk.PutWidgetProp[bitmap, $CursorInfoRec, ci];
+RETURN [ci];
+END;
+};
+
+Reset: PUBLIC PROC [screenServerData: REF ANY] = {
+ENABLE UNCAUGHT => {IF ~X11Viewers.debugging THEN GOTO oops};
+WITH screenServerData SELECT FROM
+data: ScreenServerData => {
+bitmap: XTk.Widget ~ data.bitmap;
+IF bitmap=NIL OR bitmap.fastAccessAllowed#ok OR ~Xl.Alive[bitmap.connection] 
+THEN {
+data.instable ¨ TRUE;  data.cursorInfo ¨ NIL;
+} 
+ELSE {
+ci: REF CursorInfoRec ~ NewOrCachedCursorInfo[bitmap];
+data.cursorInfo ¨ ci;
+IF ci=NIL OR ~Xl.Alive[ci.connection] 
+THEN --breakpoint here-- data.instable ¨ TRUE
+ELSE --breakpoint here-- data.instable ¨ FALSE
+};
+}
+ENDCASE => {};
+EXITS oops => {};
+};
+
+Warning: PUBLIC PROC [screenServerData: REF ANY, screen: INT ¨ -1] = {
+WITH screenServerData SELECT FROM
+data: ScreenServerData => {
+WITH data.cursorInfo SELECT FROM
+ci: REF CursorInfoRec => {
+bitmap: XTk.Widget ~ data.bitmap;
+IF bitmap#NIL AND bitmap.fastAccessAllowed=ok THEN {
+c: Xl.Connection ¨  bitmap.connection;
+IF Xl.Alive[c] THEN RETURN; --warning arrives after problem has been fixed 
+}; 
+};
+ENDCASE => {};
+data.instable ¨ TRUE; data.cursorInfo ¨ NIL;
+};
+ENDCASE => {};
+};
+
+AllocateColorMapIndex: ViewersWorldClasses.AllocateColorMapIndexProc = {
+ERROR ViewersWorld.outOfColormapEntries
+};
+
+FreeColorMapIndex: ViewersWorldClasses.FreeColorMapIndexProc = {
+};
+
+SetColorMapEntry: ViewersWorldClasses.SetColorMapEntryProc = {
+};
+
+GetColorMapEntry: ViewersWorldClasses.GetColorMapEntryProc = {
+red ¨ green ¨ blue ¨ 0;
+};
+
+FastAccessStopped: XTk.WidgetNotifyProc = {
+Warning[registerData];
+};
+
+RegisterFastAccessStopped: XTk.WidgetNotifyProc = {
+data: ScreenServerData ~ NARROW[callData];
+w: XTk.Widget ~ data.top;
+XTk.RegisterNotifier[w, XTk.preStopFastAccessKey, FastAccessStopped, data];
+};
+X11Viewers.baseClass.bigCursorsSupported ¨ BigCursorsSupported;
+X11Viewers.baseClass.isBigCursorPattern ¨ IsBigCursorPattern;
+X11Viewers.baseClass.setBigCursorPattern ¨ SetBigCursorPattern;
+X11Viewers.baseClass.getBigCursorPattern ¨ GetBigCursorPattern;
+X11Viewers.baseClass.setCursorColor ¨ SetCursorColor;
+X11Viewers.baseClass.getCursorColor ¨ GetCursorColor;
+X11Viewers.baseClass.getCursorPattern ¨ GetCursorPattern;
+X11Viewers.baseClass.setCursorPattern ¨ SetCursorPattern;
+
+X11Viewers.baseClass.setMousePosition ¨ SetMousePosition;
+X11Viewers.baseClass.getMousePosition ¨ GetMousePosition;
+X11Viewers.baseClass.getDeviceSize ¨ GetDeviceSize;
+X11Viewers.baseClass.blink ¨ Sound;
+X11Viewers.baseClass.getCutBuffer ¨ GetCutBuffer;
+X11Viewers.baseClass.setCutBuffer ¨ SetCutBuffer;
+X11Viewers.baseClass.allocateColorMapIndex ¨ AllocateColorMapIndex;
+X11Viewers.baseClass.freeColorMapIndex ¨ FreeColorMapIndex;
+X11Viewers.baseClass.setColorMapEntry ¨ SetColorMapEntry;
+X11Viewers.baseClass.getColorMapEntry ¨ GetColorMapEntry;
+ 
+XTkNotification.RegisterGlobal[X11Viewers.beforeWindowCreation, InitData];
+XTkNotification.RegisterGlobal[X11Viewers.afterWidgetCreation, RegisterFastAccessStopped];
+END.
+
+  ¸  X11ViewersProcsImpl.mesa
+Copyright ” 1988, 1989, 1990, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Created by Christian Jacobi, November 28, 1988 5:15:06 pm PST
+Christian Jacobi, August 16, 1993 12:19 pm PDT
+Willie-s, October 30, 1991 11:58 am PST
+Michael Plass, February 25, 1992 4:05 pm PST
+
+Initialization order matters: must be started after X11ViewersImpl
+
+Cursors
+--Used to be a overlayd record, but since for Cedar1.0 one element was changed to a ref this is safer.
+--used for lru-cache
+--color is NOT part of hash
+--used for lru-cache
+--color is NOT considered
+Returns last value set with SetCursorPattern procedure
+Returns last value set with SetCursorPattern procedure
+Call this after an error occured to free the cursor cache
+Associates this cursorPattern to window on screenServer
+delta: hot spot
+--Data structure established, but cursor needs initialization
+--Copy pattern to make sure scan lines length is known independent whether type is packed or NOT 
+--Coordinate transform from Cedar Viewers's hotspot to X Cursors hotspot very experimental due to not really understanding the Cedar side.  
+--I assume Viewers takes the left upper point of the cursor pattern to be the origin and defines the hotspot from there using a coordinate system pointing upward and to the right. (Explained by textcursor having hotspot 0, 0 and bullseye having negative offsets).
+--X (consistent, as always) takes the left upper point of the cursor pattern to be the origin and defines the hotspot from there using a coordinate system pointing to the right and down. 
+--X restricts the hotspot to be inside. 
+--already established; maybe we can skip the work 
+Associates this cursorPattern to window on screenServer
+delta: hot spot
+--Data structure established, but cursor needs initialization
+--Coordinate transform from Cedar Viewers's hotspot to X Cursors hotspot very experimental due to not really understanding the Cedar side.  
+--I assume Viewers takes the left upper point of the cursor pattern to be the origin and defines the hotspot from there using a coordinate system pointing upward and to the right. (Explained by textcursor having hotspot 0, 0 and bullseye having negative offsets).
+--X (consistent, as always) takes the left upper point of the cursor pattern to be the origin and defines the hotspot from there using a coordinate system pointing to the right and down. 
+--X restricts the hotspot to be inside. 
+--already established; maybe we can skip the work 
+Allways returns a non-NIL REF Xl.RGBRec 
+Use a funny cursor to denote gc...
+No error catching because done by caller  
+Device, Mouse, Blink
+This procedure might or might not noop if called while cursor is grabbed by other application.
+Result undefined if x, y outside window.
+All the way to the X server; eventually this position will be reported to the input mechanisms.
+Use for forced cursor movements, not for general cursor tracking.
+Returns position as thought by X11Viewer; this might be ahead of other input mechanisms
+Use for forced cursor movements, not for general cursor tracking.
+Returns size of screen containing screenServerData
+Rings the bell; Ignores display, frequency and duration...
+Cut buffers
+Pushes data into a cut buffer
+for buffer = $Ascii data is Ascii string
+for buffer = $Tioga data is encoded Tioga node
+for unknown buffer noop
+Gets data from cut buffer
+might or might not flush the contents of the cut buffer
+for buffer = $Ascii returned data is Ascii string
+for buffer = $Tioga returned data is encoded Tioga node
+for unknown buffer NIL
+Others
+Initializations
+ù Á  ïNewlineDelimiter
+ñ(cedarcode) styleò codeôKöú
+œeúIôTKöú:œkô=Kô.Kô'Kô,Kô KöœbBôBKô óöû	ò	KöúòKöúòKöúòKöú	ò	KöúòKòKöúòKòKöúòKòKöúòKöú	ò	KöúòKöúòóKò öœnúûúûò"Köûú(úIòxKöûúòóKöûúòKò Köúûúò5Köúûúò!headôKöúûúûúò%öúûúûúûúò%Köúûúò Köú0ò0KöúòKöúœcò7KòKöúûúòKöúûúûúò#KöúûúûúòKöúûúûòKòKò óöúûúòKò óKöúûúûúòöúûúûúòKöúûúòKöúûúûúòKöú"ò"Köúûúûúò(Köúûú°:òOKöúûúûúòKöúfôfKöú)ûúò0Köú,ûò/KòKò óKöúûúòKò ö†úûúûúûúòAKöúûúòKöûúûúûúûúò#KòKöúûúûúò$KòKò óö
+†úûúûúûúûúò3Kö°ôKö°ôKöú
+ûúòKöúûúòöûú	ûúûúòöûòöûúûúûú	ûòKöúûúûúò3KöûòóóöûòöûúûúûúûòKöúûúûúò$Köúûúò"KöûúòóóóKöûúûúòKòKò óö†úûúûúûúûúûúò8Kö°ôKö°ôKöúûúòKöúûúòKöûúûúûúûúò5Kö
+ûúûúûúûúûúò:Köûúûúûúûúò)öûú
+ûúûúûò)Kö
+ûúûúûúûúûúò-Kö
+ûúûúûúûúûúò0óKöûúûúòKòKò óö†úûúûú
+ûúûúûúûú7ûúûúò®Kô6öûúûúûò!òKöúûú!ò(öûúûúûúûúò#Kòöûúûúûúûúò"KòKòKòKòKòóKòóKòóKöûúòóKòKò óö†ú1òDKô6öûúûúûò!òKöúûú!ò(öûúûúûúûúò#Kòöûúûúûúûúò!KòKòKòKòKòóKòóKòóKöûúòóKòKò óö†úûúûúûúò-Kô9ö†úûúò+öûúûúûúòKòKöûúûúûúòKòóKòóöûúûúûò!Kò<KöûúòóKòKò óö†	úûú)ò8KòKöúûú&ò.Köúûú%ò,öûúûúòöûúûúûú
+ûúòKò#KòGKòóKòóKöúIòIKòKòóKò ö†úûúûúûúûú3ûú
+ûúòìKô7KôKö
+ûúûúûúûúûúòXöûúûúûò!òKò!öûúûúûúûúò#Kòö
+ûúûúûúûúûúò?Köúûú
+ûúòKòKöúûúòKò'Kò;Kò@Köûú	ûúûúò4öûúòöûúûúòKö°=ô=Kö°aôaKö	úûúûú	ûúûúò&Kö
+ûúûúûú	ûúûúò>KöúõòõöûòKöúûú%ò,KôåKôáKôªKöú)ò)Kô(Kö	úûúûúûúûúò?KòsKòKöûúòóKòóóöûúûúòKô2öûúòKöûúûò$KöûúûúòóKòóKòKòKòóKòóKòóKöûúòóKöûúòKòKò óö†ú1òDKô7KôöûúûúòKöûúûúûúòEóöûúûúûò!òKò!öûúûúûúûúûúûúò9Kòö
+ûúûúûúûúûúò?Köúûú
+ûúòKòKò'Kò9KöúûúòKò@Köûú	ûúûúò4öûúòöûúûúòKö°=ô=Köúmûú0ò•öûòKöúûú%ò,KôåKôáKôªKöú)ò)Kô(Kö	úûúûúûúûúò?KòtKòKöûúòóKòóóöûúûúòKô2öûúòKöûúûò$KöûúûúòóKòóKòKòKòóKòóKòóKöûúòóKöûúòKòKò óö†ú1òDöûúûúûò!òKò(öûúûúûúûúò#Kò*öûúûúûúûúò*KòKòòQKöûúûúò"KöúòóKöúûúòKöúûúò/KòóKöûúòKòóKòóKöûúòóKöûúûúòKòKò óö†ú0òBöûúûúûò!òKöúûú!ò(öûúûúûúûúò#KòKöûúûúûúûúò$KòóKòóKöûúòóKöûúûúòKòKò óö
+†úûú!ûúûú
+ûúòmKöúûúûú	ò?öú	ûúòKò<Kò>Kò<KòóKòóKò ö†ú,ò:Kö
+ûúûúûúûúûúòZöûúûúûò!òKò!Kò<Kòöûúûúûúûúò#KòKöûúûúûú°-òUKòóKòóKöûúòóKöûúòKòKò óö†úò"öûú
+ûúûòòJòKòKòJòóKöûúòóKòKò óKòGKò ö
+†úûúûúûúûúòWKöúûúô(KòöûúûúûúòKò?Kò,KòóKòKò óö†ú,ò:öûúûúûò!Kò9KöûúòóKöûúûúûúò-KòKò óö†	úûúûúûúò*Kô"Kô*öûú
+ûúûòòKò!öûúûúûúûúò#KòöûúûúûúòKòö
+ûúûúûúûúûúò?Kò Köúûú	ûúûúòMKöú9ò9KöúòKöûú	ûúûúò/KòóKòóKòóKòóKöûúòóKòóóö†ôö†úûúûúûúûúûúûú
+ûúûúòlKô^Kô(Kô_KôAKö
+ûúûúûúûúûúòXöûúûúûò!òKòöûúûúûúûúò"KöûúûúûúûúûúûúòMKöûú#ûúò=KöúuòuKöúòKòóKòóKöûúòóKöûúòKòKò óö†úûúûúûú
+ûúûúûúûúûúûúòyKôWKôAKö
+ûúûúûúûúûúòXKöúûúûú°6òKöûúûúûò!òKòöûúûúûúûúò"KöúAòAöûúûúòKöúûúòöûúûú!ò4Köûú	ûòKöûúòóöûúûú"ò5Köûú	ûòKöûú&ò*óKöûú#ûúò=KòóKòóKòóKöûúòóKöûú
+ûúòKòKò óö†úûúûúûúûúûúûú	ò[Kô2öûúûúûò!Kò<KöûúòóKòKò óö†úûúûúûúûúûúûúòbKô:Kö
+ûúûúûúûúûúòXöûúûúûò!òKòKöúûúûúûúûúûúò;Köûúûúûúò1KòóKöûúòóKöûúòòKò óóóôö†úûúûúò@Köú,ûúò7KöúeòeKöúòKòKò óö†úûúûúûú
+ûúûúòQJôJô(Jô.JôKö
+ûúûúûúûúûúò=öûúûúûò!òKòKöúûúûúûúûúûúò;öûúûúûúò%öûúûòKöúûúò1Kò&KöûúòóKòóKòóKöûúòóKöûúòKòKò óö†úûúûúûúòHKöú,ûúò7Köúhòhöûú
+ûúûòKöúûúòKöûúòóKöúòKò óö†úûúûúûú
+ûúûúûúûúòZJôJô7Jô1Jô7JöúûôKö
+ûúûúûúûúûúò=öûúûúûò!òKòKöúûúûúûúûúûúò;öûúûúûúò%öûúûòKöú
+ûúò*Köúûúûúò6KöûúûúûúòóKòóKòóKöûúòóKöûú
+ûúûúòKòKò óóôö
+†úûúûúûúûúòRKò%Kò(öûúûúûúûúò Kò0KöúûúòKòKöúEòEKòPKòSKò%Köú!ûúò(Köú9ò9KòFKòóKòKò óö
+†úûúûúûúûúòVKò%Köûúûúûúûúò"öûú+ûúûò:Kö	úûúûúûúûúò=KöûúòóöûòKöúûú'ò.Köûúûúûú/ò=KöûúòKöûúòóKòKò óö
+†úûúûúûúûúò2Kö
+ûúûúûúûúûúò=öûúûúûò!òKò!öûúûúûúûúòMöûúòKöúûúûúò-KòóöûúòKöúûú/ò6Kòöûúûúûúò&Köûú°úûò-Köûú°úûò.óKòóóKòóKöûúòóKöûúòKòKò óö†úûúûúûúûú
+ûú
+òFöûúûúûò!òöûúûúûò öúûúòKò!öûúûúûúûúò4Jò&Jöûúûúûú°/òKJòóJòóJöûúòóKöúûúûúò,KòóKöûúòóKòKò óö†ú3òHKöûú!ò'KòKò óö†ú/ò@KòKò óö†ú.ò>KòKò óö†ú.ò>KòKòóKò ö†úò+KöúòKöúòKò óö†úò3Köúûúò*KòKòKKòóóôKò?Kò=Kò?Kò?Kò5Kò5Kò9ò9Kò óKò9Kò9Kò3Kò#Kò1Kò1KòCKò;Kò9ò9KòóKòJKöúZòZóKöûúòKò ó Öó    D‘  h∑  

@@ -1,0 +1,698 @@
+
+DIRECTORY
+Ascii,
+Basics,
+BasicTime USING [GMT],
+CStrings USING [CString],
+PFS USING [Error, PathFromRope],
+PFSBackdoor,
+PFSNames,
+Random USING [ChooseInt],
+RefText,
+Rope USING [Cat, Concat, Compare, Equal, Fetch, IsEmpty, IsPrefix, Length, NewText, ROPE, Text, Substr, Translate, TranslatorType],
+UnixDirectory,
+UnixErrno,
+UnixFSPrivate,
+UnixSysCalls,
+UXStrings,
+UnixTypes,
+VUXFiles
+; 
+
+VUXDirImpl: CEDAR MONITOR
+IMPORTS Ascii, PFS, PFSBackdoor, PFSNames, Rope, Random, RefText, UnixDirectory, UnixErrno, UnixFSPrivate, UnixSysCalls, UXStrings, VUXFiles
+EXPORTS VUXFiles
+SHARES Rope
+~ {
+GMT: TYPE ~ BasicTime.GMT;
+ROPE: TYPE ~ Rope.ROPE;
+Mode: TYPE ~ UnixTypes.Mode;
+Stat: TYPE ~ UnixTypes.Stat;
+RES: TYPE ~ UnixTypes.RES;
+PATH: TYPE ~ PFSNames.PATH;
+CString: TYPE ~ CStrings.CString;
+Version: TYPE ~ PFSNames.Version;
+initialRemoteDirTTL: CARDINAL ¬ 1200;
+initialCreateModeTTL: CARDINAL ¬ 1200;
+defaultCreateMode: Mode ¬ [owner~[true, true, false], group~[true, false, false]];
+fsModeFileName: ROPE ¬ ".~fsmode~";
+dirSearchBlocksize: CARD ¬ 8 * 1024; 
+initialDirContentTTL: CARDINAL ¬ 900;
+maxDirEntryHeight: CARDINAL ~ 16;
+tooBig: INT ¬ LAST[INT] - 1;
+
+FHandle: TYPE = ROPE;
+
+DirHandle: TYPE ~ VUXFiles.DirHandle;
+DirObject: TYPE ~ VUXFiles.DirObject;
+
+DirOpRes: TYPE ~ VUXFiles.DirOpRes;
+
+
+NotDirectory: PUBLIC ERROR [] ~ CODE;
+CantCreate: PUBLIC ERROR [errno: UnixErrno.Errno] ~ CODE;
+CantStat: PUBLIC ERROR [errno: UnixErrno.Errno] ~ CODE;
+
+FixModeForRegularFile: PUBLIC PROC [mode: Mode] RETURNS [Mode] ~ {
+mode.fmt ¬ reg;
+mode.owner.write ¬ false;
+mode.group.write ¬ false;
+mode.others.write ¬ false;
+RETURN [mode];
+};
+
+FixModeForDirectory: PUBLIC PROC [mode: Mode] RETURNS [Mode] ~ {
+mode.fmt ¬ dir;
+mode.sgid ¬ true;
+mode.owner ¬ [true, true, true];
+IF mode.group.write=true THEN mode.group.read ¬ true;
+IF mode.group.read=true THEN mode.group.exec ¬ true;
+IF mode.others.write=true THEN mode.others.read ¬ true;
+IF mode.others.read=true THEN mode.others.exec ¬ true;
+RETURN [mode];
+};
+
+GetModeAccessBits: PUBLIC PROC [mode: Mode] RETURNS [Mode] ~ {
+mode.fmt ¬ LOOPHOLE[0]; -- invalid format
+RETURN[mode];
+};
+
+UpdateModeAccessBits: PUBLIC PROC [mode: Mode, newAccessBits: Mode] RETURNS [Mode] ~ {
+newAccessBits.fmt ¬ mode.fmt;
+RETURN[newAccessBits];
+};
+strcmp: PROC [s1, s2: CString] RETURNS [INT] ~ TRUSTED MACHINE CODE {
+"strcmp"
+};
+
+strdup: PROC [s1: CString] RETURNS [CString] ~ TRUSTED MACHINE CODE {
+"strdup"
+};
+FindDirChild: ENTRY PROC [dH: DirHandle, childName: ROPE]
+RETURNS [dHChild: DirHandle] ~ {
+ENABLE UNWIND => NULL;
+FOR dHChild ¬ dH.child, dHChild.sibling WHILE dHChild # NIL DO
+IF Rope.Equal[dHChild.nameComponent, childName, TRUE] THEN {
+dHChild.useCount ¬ dHChild.useCount.SUCC;
+RETURN;
+};
+ENDLOOP;
+};
+
+InsertDirChild: PUBLIC ENTRY PROC [dH: DirHandle, childName: ROPE, fHandle: FHandle] RETURNS [dHChild: DirHandle] ~ {
+ENABLE UNWIND => NULL;
+dHChild ¬ NEW[DirObject ¬ [parent~dH, sibling~dH.child, nameComponent~childName, fHandle~fHandle, ownerUID~0, ownerGID~0, createMode~[], createModeTTL~0, contentMTime~0, contentTTL~0, contentKnownStale~TRUE, contentLocked~FALSE, useCount~1, ttl~initialRemoteDirTTL]];
+dH.child ¬ dHChild;
+};
+
+PinDirPath: PUBLIC ENTRY PROC [dH: DirHandle] ~ {
+ENABLE UNWIND => NULL;
+WHILE dH # NIL DO
+dH.useCount ¬ dH.useCount.SUCC;
+dH ¬ dH.parent;
+ENDLOOP;
+};
+
+UnPinDir: PUBLIC ENTRY PROC [dH: DirHandle]
+RETURNS [dHParent: DirHandle] ~ {
+ENABLE UNWIND => NULL;
+dH.useCount ¬ dH.useCount.PRED;
+dH.ttl ¬ initialRemoteDirTTL;
+RETURN[dH.parent];
+};
+
+UnPinDirPath: PUBLIC ENTRY PROC [dH: DirHandle] ~ {
+ENABLE UNWIND => NULL;
+WHILE dH # NIL DO
+dH.useCount ¬ dH.useCount.PRED;
+dH.ttl ¬ initialRemoteDirTTL;
+dH ¬ dH.parent;
+ENDLOOP;
+};
+
+dirRoot: DirHandle ¬ NEW[DirObject ¬ [parent~NIL, sibling~NIL, nameComponent~NIL, fHandle~"/", ownerUID~0, ownerGID~0, createMode~[], createModeTTL~0, contentMTime~0, contentTTL~0, contentKnownStale~TRUE, contentLocked~FALSE, useCount~1, ttl~initialRemoteDirTTL]];
+
+GetDirRoot: PUBLIC ENTRY PROC []
+RETURNS [dH: DirHandle] ~ {
+ENABLE UNWIND => NULL;
+dH ¬ dirRoot;
+dH.useCount ¬ dH.useCount.SUCC;
+};
+
+VerifySubdirectory: PROC [dH: DirHandle, name: ROPE] RETURNS [fH: FHandle] ~ {
+reply: DirOpRes;
+reply ¬ DirLookup[dH, name];
+SELECT reply.status FROM
+ok => {
+IF reply.attributes.mode.fmt # dir AND reply.attributes.mode.fmt # lnk THEN 
+PFSBackdoor.ProduceError[code: $unknownFile, explanation: "Child is not a directory", info: NIL];
+fH ¬ reply.file;
+};
+ENOENT => {
+fH ¬ NIL;
+};
+ENDCASE => {
+PFSBackdoor.ProduceError[code: $unknownFile, explanation: "Child is not a directory", info: NIL];
+};
+};
+
+CreateSubdirectory: PUBLIC PROC [dH: DirHandle, name: ROPE, desiredMode: Mode] RETURNS [fH: FHandle] ~ {
+reply: VUXFiles.DirOpRes;
+fullName: ROPE ~ Rope.Cat[dH.fHandle, IF dH.fHandle.Fetch[dH.fHandle.Length[]-1]#'/ THEN "/" ELSE NIL, name];
+dirMode: Mode ~ FixModeForDirectory[desiredMode];
+res: RES;
+{ ENABLE UNWIND => NULL;
+uName: CString ~ UXStrings.Create[fullName];
+res ¬ UnixSysCalls.MkDir[uName, dirMode];
+SELECT res FROM
+success => {
+fH ¬ fullName;
+};
+ENDCASE => {
+errno: UnixErrno.Errno ~ UnixErrno.GetErrno[];
+UnixFSPrivate.ReportFailure[errno, Rope.Concat["VUXDirImpl.CreateSubdirectory: Couldn't create directory ", fullName]];
+};
+IF UnixSysCalls.ChMod[uName, dirMode] # success THEN {
+errno: UnixErrno.Errno ~ UnixErrno.GetErrno[];
+UnixFSPrivate.ReportFailure[errno, Rope.Concat["VUXDirImpl.CreateSubdirectory: ChMod failed for ", fullName]];
+};
+dH.contentKnownStale ¬ TRUE;
+};
+};
+DirEntries: TYPE ~ VUXFiles.DirEntries;
+DirEntriesObject: TYPE ~ VUXFiles.DirEntriesObject;
+
+DirNode: TYPE ~ VUXFiles.DirNode;
+DirNodeObject: TYPE ~ VUXFiles.DirNodeObject;
+
+DirEntry: TYPE ~ VUXFiles.DirEntry;
+
+AllocateDirNode: PROC [maxHeight: CARDINAL] RETURNS [node: DirNode] ~ {
+bits: INT ¬ Random.ChooseInt[NIL, 0, INT[INTEGER.LAST]];
+height: CARDINAL ¬ 1;
+WHILE (height < maxHeight) AND ((bits MOD 2) = 0) DO
+height ¬ height + 1;
+bits ¬ bits / 2;
+ENDLOOP;
+node ¬ NEW[DirNodeObject[height]]; 
+};
+
+IsCaseVersion: PROC [v: Version] RETURNS [BOOL] ~ INLINE {
+RETURN[ v.versionKind=numeric AND v.version=0 ];
+};
+
+Less: PROC [n1, n2: DirEntry] RETURNS [BOOL] ~ {
+RETURN [
+SELECT Rope.Compare[n1.nameWithoutVersion, n2.nameWithoutVersion, FALSE] FROM
+less => TRUE,
+greater => FALSE,
+ENDCASE =>
+SELECT TRUE FROM
+IsCaseVersion[n1.version] AND NOT IsCaseVersion[n2.version] => TRUE,
+IsCaseVersion[n2.version] => FALSE,
+n1.version.versionKind=none AND n2.version.versionKind#none=> TRUE,
+n2.version.versionKind=none => FALSE,
+ENDCASE => (n1.version.version < n2.version.version)
+];
+
+};
+
+InsertDirEntry: PROC [newEntry: DirEntry, dirEntries: DirEntries] RETURNS [newNode: DirNode] ~ {
+leftNode: DirNode;
+path: ARRAY [0 .. maxDirEntryHeight) OF DirNode;
+leftNode ¬ dirEntries.leftNode;
+newNode ¬ AllocateDirNode[1+leftNode.height];
+newNode.entry ¬ newEntry;
+IF newNode.height > leftNode.height THEN {
+temp: DirNode ~ NEW[DirNodeObject[newNode.height]];
+FOR i: CARDINAL IN [0 .. leftNode.height) DO
+temp.link[i] ¬ leftNode.link[i];
+ENDLOOP;
+leftNode ¬ dirEntries.leftNode ¬ temp;
+};
+FOR level: CARDINAL DECREASING IN [0 .. dirEntries.leftNode.height) DO
+rightNode: DirNode ¬ leftNode.link[level];
+WHILE (rightNode # NIL) AND Less[rightNode.entry, newEntry] DO
+leftNode ¬ rightNode;
+rightNode ¬ leftNode.link[level];
+ENDLOOP;
+IF level < newNode.height THEN path[level] ¬ leftNode;
+ENDLOOP;
+FOR level: CARDINAL IN [0 .. newNode.height) DO
+leftNode ¬ path[level];
+newNode.link[level] ¬ leftNode.link[level];
+leftNode.link[level] ¬ newNode;
+ENDLOOP;
+};
+
+CNameFromDirEntP: PROC [dp: UnixDirectory.DirEntPtr] RETURNS [CString] ~ TRUSTED INLINE {
+RETURN[LOOPHOLE[@(dp.name)]];
+};
+
+NullTerminatedFlatRopeFromCString: PROC [s: CString] RETURNS [Rope.Text] ~ TRUSTED {
+len: INT ¬ 0;
+newText: Rope.Text;
+newTextChar: POINTER TO Basics.RawChars;
+IF s = NIL THEN RETURN [NIL];
+WHILE s­[len]#'\000 DO len ¬ len + 1 ENDLOOP;
+IF len = 0 THEN RETURN [NIL];
+newText ¬ Rope.NewText[len+1];
+newTextChar ¬ LOOPHOLE[RefText.BaseFromTextRope[newText]];
+FOR i: NAT IN [0..len] DO
+newTextChar[i] ¬ s­[i];
+ENDLOOP;
+newText.length ¬ len;
+RETURN [newText];
+};
+
+InsertOrUpdateDirEntry: PROC [dp: UnixDirectory.DirEntPtr, generation: INT, prevNode: DirNode, dirEntries: DirEntries] RETURNS [currNode: DirNode] ~ {
+finger: DirNode ¬ IF prevNode # NIL THEN prevNode.nextPhysical ELSE NIL;
+stringName: CString ¬ CNameFromDirEntP[dp];
+IF finger#NIL THEN TRUSTED {
+entryName: REF TEXT ~ LOOPHOLE [RefText.TrustTextRopeAsText[finger.entry.unixName]];
+IF strcmp[stringName, UXStrings.ViewRefText[entryName]]=0 THEN {
+finger.entry.generation ¬ generation;
+RETURN[finger];
+};
+};
+{
+unixName: Rope.Text ~ NullTerminatedFlatRopeFromCString[stringName];
+nameWithoutVersion: Rope.ROPE; 
+version: VUXFiles.Version;
+newEntry: DirEntry;
+[nameWithoutVersion, version] ¬ SplitUName[unixName];
+newEntry ¬ [nameWithoutVersion, version, TRUE, generation, unixName];
+finger ¬ FindFirstNode[nameWithoutVersion, dirEntries];
+WHILE (finger#NIL) AND NOT Less[newEntry, finger.entry] DO -- Less is case insensitive...
+IF Rope.Equal[nameWithoutVersion, finger.entry.nameWithoutVersion, TRUE] AND version = finger.entry.version THEN {
+finger.entry.generation ¬ newEntry.generation;
+IF prevNode#NIL THEN prevNode.nextPhysical ¬ finger;
+RETURN[finger];
+};
+finger ¬ finger.link[0];
+ENDLOOP;
+currNode ¬ InsertDirEntry[newEntry, dirEntries];
+IF prevNode#NIL THEN {
+currNode.nextPhysical ¬ prevNode.nextPhysical; -- best guess; confirmed on next iteration
+prevNode.nextPhysical ¬ currNode; -- correct
+};
+};
+};
+
+FindFirstNode: PROC [nameWithoutVersion: ROPE, dirEntries: DirEntries]
+RETURNS [firstNode: DirNode] ~ {
+target: DirEntry ~ [ nameWithoutVersion, [numeric, 0], FALSE, 0];
+firstNode ¬ dirEntries.leftNode;
+FOR level: CARDINAL DECREASING IN [0 .. dirEntries.leftNode.height) DO
+rightNode: DirNode ¬ firstNode.link[level];
+WHILE (rightNode # NIL) AND Less[rightNode.entry, target] DO
+firstNode ¬ rightNode;
+rightNode ¬ firstNode.link[level];
+ENDLOOP;
+ENDLOOP;
+RETURN[firstNode.link[0]];
+};
+
+NewDirEntries: PROC RETURNS [dirEntries: DirEntries] ~ {
+leftNode: DirNode ¬ NEW[DirNodeObject[1]];
+dirEntries ¬ NEW[DirEntriesObject ¬ [leftNode~leftNode]];
+};
+
+RefreshDirContent: PROC [dH: DirHandle, staleOK: BOOL]  RETURNS [content: DirEntries] ~ {
+mTime, oldMTime: CARD ¬ 0;
+knownStale: BOOL;
+CheckOutContent: ENTRY PROC RETURNS [locked: BOOL] ~ {
+ENABLE UNWIND => NULL;
+WHILE dH.contentLocked DO WAIT dH.contentAvailable ENDLOOP;
+content ¬ dH.content;
+oldMTime ¬ dH.contentMTime;
+locked ¬ dH.contentLocked ¬ ((NOT staleOK) OR (dH.contentTTL = 0));
+};
+NewContentGeneration: ENTRY PROC RETURNS [generation: INT] ~ {
+ENABLE UNWIND => NULL;
+RETURN[ dH.contentGenStarted ¬ dH.contentGenStarted+1 ];
+};
+CheckInContent: ENTRY PROC ~ {
+ENABLE UNWIND => NULL;
+dH.content ¬ content;
+dH.contentMTime ¬ mTime;
+dH.contentTTL ¬ initialDirContentTTL;
+dH.contentKnownStale ¬ FALSE;
+dH.contentGenFinished ¬ dH.contentGenStarted;
+dH.contentLocked ¬ FALSE;
+BROADCAST dH.contentAvailable;
+};
+UnlockContent: ENTRY PROC ~ {
+ENABLE UNWIND => NULL;
+dH.contentLocked ¬ FALSE;
+BROADCAST dH.contentAvailable;
+};
+IF NOT CheckOutContent[].locked THEN RETURN;
+{
+ENABLE UNWIND => {
+UnlockContent[];
+};
+{
+res: DirOpRes ~ DirLookup[dH, NIL];
+IF res.status # ok THEN ERROR VUXFiles.CantStat[res.status];
+knownStale ¬ ((mTime ¬ res.attributes.mtime) # oldMTime) OR dH.contentKnownStale;
+};
+WHILE knownStale DO 
+dirString: CString ~ UXStrings.Create[dH.fHandle];
+dirp: UnixDirectory.DirPtr ~ UnixDirectory.OpenDir[dirString];
+prevNode: DirNode ¬ NIL;
+generation: INT;
+IF dirp = NIL THEN {
+content ¬ NIL;
+CheckInContent[];
+RETURN;
+};
+IF content=NIL THEN content ¬ NewDirEntries[];
+generation ¬ NewContentGeneration[];
+FOR dp: UnixDirectory.DirEntPtr ¬ UnixDirectory.ReadDir[dirp], UnixDirectory.ReadDir[dirp] WHILE dp # NIL DO 
+prevNode ¬ InsertOrUpdateDirEntry[
+dp~dp,
+generation~generation, 
+prevNode~prevNode,
+dirEntries~content
+];
+ENDLOOP;
+[] ¬ UnixDirectory.CloseDir[dirp];
+{
+res: DirOpRes ~ DirLookup[dH, NIL];
+IF res.status # ok THEN ERROR VUXFiles.CantStat[res.status];
+oldMTime ¬ mTime;
+knownStale ¬ (mTime ¬ res.attributes.mtime) # oldMTime;
+};
+ENDLOOP;
+};
+CheckInContent[];
+};
+
+caseFileNamePrefix: ROPE ~ ".~case~";
+caseFileNamePrefixLen: INT ~ Rope.Length[caseFileNamePrefix];
+
+SplitUName: PROC [uName: Rope.ROPE] RETURNS [namePart: Rope.ROPE, version: Version] = {
+baseLength: INT; 
+versionPart: INT;
+[baseLength, versionPart] ¬ SplitBaseAndVersion[uName];
+SELECT TRUE FROM
+versionPart>0 => 
+RETURN [Rope.Substr[uName, 0, baseLength], [numeric, versionPart]]; -- versioned file encoding
+Rope.IsPrefix[caseFileNamePrefix, uName, TRUE] => 
+RETURN [Rope.Substr[uName, caseFileNamePrefixLen], [numeric, 0]]; -- case file encoding
+ENDCASE => 
+RETURN [uName, [none]]; -- versionless file or directory encoding
+};
+
+SplitBaseAndVersion: PROC [uName: Rope.ROPE] RETURNS [--baseLength:--INT, --version:-- INT] = {
+ch: CHAR;  
+length: INT ¬ Rope.Length[uName];
+idx: INT ¬ length-1;
+version: INT ¬ 0;
+power: INT ¬ 1;
+IF idx<4 OR Rope.Fetch[uName, idx]#'~ THEN RETURN [length, -1];
+DO
+idx ¬ idx-1;
+IF idx<2 OR version>=tooBig THEN RETURN [length, -1];
+ch ¬ Rope.Fetch[uName, idx];
+SELECT TRUE FROM
+Ascii.Digit[ch] => {
+version ¬ version + (ORD[ch]-ORD['0])*power; 
+power ¬ power*10; 
+};
+ch='~ => {
+IF version>0 AND Rope.Fetch[uName, idx-1]='. 
+THEN RETURN [idx-1, version]
+ELSE RETURN [length, -1];
+};
+ENDCASE => RETURN [length, -1]; 
+ENDLOOP;
+};
+
+EnumerateDirectory: PUBLIC PROC [dH: DirHandle, eachDirEntry: VUXFiles.EachDirEntryProc, lowNameWithoutVersion: ROPE, staleOK: BOOL] ~ {
+content: DirEntries;
+finger: DirNode;	
+generation: INT;
+content ¬ RefreshDirContent[dH, staleOK];
+generation ¬ dH.contentGenFinished;
+IF content = NIL THEN RETURN; -- e.g., the directory was unreadable
+finger ¬ (IF lowNameWithoutVersion = NIL
+THEN content.leftNode.link[0]
+ELSE FindFirstNode[lowNameWithoutVersion, content].firstNode);
+WHILE finger # NIL DO
+IF finger.entry.generation >= generation THEN {
+IF NOT eachDirEntry[finger.entry].continue THEN RETURN;
+};
+finger ¬ finger.link[0];
+ENDLOOP;
+};
+
+GetCreateMode: PUBLIC PROC [dH: DirHandle, forDirectory: BOOL]
+RETURNS [createMode: Mode] ~ {
+rawMode: Mode ¬ RefreshCreateMode[dH];
+RETURN [IF forDirectory THEN FixModeForDirectory[rawMode] ELSE FixModeForRegularFile[rawMode]];
+};
+
+RefreshCreateMode: PROC [dH: DirHandle]
+RETURNS [createMode: Mode] ~ {
+CheckOutCreateMode: ENTRY PROC RETURNS [ok: BOOL] ~ --INLINE-- {
+ENABLE UNWIND => NULL;
+createMode ¬ dH.createMode;
+ok ¬ (dH.createModeTTL > 0);
+};
+CheckInCreateMode: ENTRY PROC ~ --INLINE-- {
+ENABLE UNWIND => NULL;
+dH.createMode ¬ createMode;
+dH.createModeTTL ¬ initialCreateModeTTL;
+};
+IF dH = NIL THEN RETURN [defaultCreateMode];
+IF CheckOutCreateMode[].ok THEN RETURN;
+{ reply: DirOpRes ¬ DirLookup[dH, fsModeFileName];
+SELECT reply.status FROM
+ok => createMode ¬ GetModeAccessBits[reply.attributes.mode];
+ENOENT => createMode ¬ RefreshCreateMode[dH.parent];
+ENDCASE => ERROR VUXFiles.CantStat[reply.status];
+};
+CheckInCreateMode[];
+};
+ToLower: Rope.TranslatorType ~ {
+RETURN [Ascii.Lower[ch: old]];
+};
+
+GetDirComponent: PUBLIC PROC [path: PATH, pos: INT, smashCase: BOOL] RETURNS [ROPE] ~ {
+r: ROPE ¬ IF pos >= PFSNames.ComponentCount[path] THEN NIL ELSE PFSNames.ComponentRope[PFSNames.Fetch[path, pos]];
+IF smashCase THEN r ¬ Rope.Translate[base: r, translator: ToLower];
+RETURN[r];
+};
+
+FollowDirPath: PUBLIC PROC [path: PATH, case: BOOL, create: BOOL] RETURNS [dH: DirHandle ¬ NIL] ~ {
+ENABLE UNWIND => {
+IF dH # NIL THEN UnPinDirPath[dH];
+};
+pos: INT ¬ 0; -- skip the server component; increment before use.
+dir: PATH ¬ PFSNames.Directory[path];
+dH ¬ GetDirRoot[];
+DO
+dHParent: DirHandle ~ dH;
+created: BOOL;
+component: ROPE ~ GetDirComponent[path~dir, pos~pos ¬ pos+1, smashCase~TRUE];
+IF Rope.IsEmpty[component] THEN EXIT;
+[dH, created] ¬ GetDirChild[dH~dH, childName~component, create~create];
+IF created THEN {
+componentWithCase: ROPE ~ GetDirComponent[path~dir, pos~pos, smashCase~FALSE];
+VUXFiles.CreateCaseFile[dHParent, componentWithCase ! PFS.Error => CONTINUE];
+};
+ENDLOOP;
+};
+
+GetDirChild: PUBLIC PROC [dH: DirHandle, childName: ROPE, create: BOOL]
+RETURNS [dHChild: DirHandle, created: BOOL ¬ FALSE] ~ {
+fH: FHandle;
+fH ¬ VerifySubdirectory[dH, childName];
+IF (fH#NIL) AND ((dHChild ¬ FindDirChild[dH, childName]) # NIL) THEN RETURN;
+IF fH = NIL THEN {
+desiredMode: Mode;
+IF NOT create THEN 
+PFSBackdoor.ProduceError[code: $unknownFile, explanation: "Child is not a directory", info: NIL]; 
+desiredMode ¬ GetCreateMode[dH, TRUE];
+fH ¬ CreateSubdirectory[dH, childName, desiredMode];
+created ¬ TRUE;
+};
+IF dHChild=NIL THEN dHChild ¬ InsertDirChild[dH, childName, fH];
+};
+
+SweepDirCache: PUBLIC ENTRY PROC [root: DirHandle, seconds: CARD] ~ {
+ENABLE UNWIND => NULL;
+SweepInner: PROC [dH: DirHandle] ~ {
+prev: DirHandle ¬ NIL;
+FOR p: DirHandle ¬ dH.child, p.sibling WHILE p # NIL DO
+SweepInner[p];
+IF (p.ttl = 0) AND (p.child = NIL) AND (p.useCount = 0)
+THEN {
+IF prev = NIL THEN dH.child ¬ p.sibling ELSE prev.sibling ¬ p.sibling;
+}
+ELSE {
+prev ¬ p;
+};
+ENDLOOP;
+IF dH.ttl > seconds THEN dH.ttl ¬ dH.ttl - seconds ELSE dH.ttl ¬ 0;
+IF dH.contentTTL > seconds
+THEN {
+dH.contentTTL ¬ dH.contentTTL - seconds;
+}
+ELSE {
+dH.contentTTL ¬ 0;
+IF NOT dH.contentLocked THEN {
+dH.content ¬ NIL;
+dH.contentMTime ¬ 0;
+};
+};
+IF dH.createModeTTL > seconds
+THEN dH.createModeTTL ¬ dH.createModeTTL - seconds
+ELSE dH.createModeTTL ¬ 0;
+};
+IF root # NIL THEN SweepInner[root];
+};
+UXO: PROC[r: REF] RETURNS [CString] ~ INLINE{
+RETURN[UXStrings.CreateScratch[r]];
+};
+UXR: PROC[s: CString] ~ INLINE{
+UXStrings.ReleaseScratch[s];
+};
+maxAttachmentLength: CARD ~ 1000;
+GetAttachment: PROC [fH: ROPE] RETURNS [attachedTo: PATH] ~ TRUSTED {
+fHandle: CString ~ UXO[fH];
+buf: CString ~ UXStrings.ObtainScratch[maxAttachmentLength];
+linkSize: INT ~ UnixSysCalls.ReadLink[fHandle, buf, maxAttachmentLength];
+IF linkSize<0 THEN {
+errno: UnixErrno.Errno ~ UnixErrno.GetErrno[];
+message: ROPE ~ Rope.Concat["VUXDirImpl.GetAttachment: ReadLink failed for ", UXStrings.ToRope[fHandle]];
+UXR[fHandle];
+UXR[buf];
+UnixFSPrivate.ReportFailure[errno, message];
+};
+attachedTo ¬ PFS.PathFromRope[UXStrings.ToRope[buf, linkSize]];
+UXR[buf];
+UXR[fHandle];
+};
+
+Lookup: PUBLIC PROC [dH: DirHandle, name: ROPE] RETURNS [dirOpRes: DirOpRes, attachedTo: PATH] ~ TRUSTED {
+fullPathName: ROPE ~ Rope.Cat[dH.fHandle, IF dH.fHandle.Fetch[dH.fHandle.Length[]-1]#'/ THEN "/" ELSE NIL, name];
+unixName: CString ¬ UXO[fullPathName];
+res: RES ¬ UnixSysCalls.LStat[unixName, @dirOpRes.attributes ];
+IF res=success AND dirOpRes.attributes.mode.fmt=lnk THEN {
+res2: RES ¬ UnixSysCalls.Stat[unixName, @dirOpRes.attributes ];
+attachedTo ¬ GetAttachment[fullPathName];
+IF res2#success THEN dirOpRes.attributes.size ¬ LOOPHOLE[-1];
+};
+UXR[unixName];
+dirOpRes.file ¬ fullPathName;
+dirOpRes.status ¬ IF res=success THEN ok ELSE UnixErrno.GetErrno[];
+};
+
+DirLookup: PUBLIC PROC [dH: DirHandle, name: ROPE] RETURNS [dirOpRes: DirOpRes] ~ TRUSTED {
+fullPathName: ROPE ~ Rope.Cat[dH.fHandle, IF dH.fHandle.Fetch[dH.fHandle.Length[]-1]#'/ THEN "/" ELSE NIL, name];
+unixName: CString ¬ UXO[fullPathName];
+res: RES ~ UnixSysCalls.Stat[unixName, @dirOpRes.attributes ];
+UXR[unixName];
+dirOpRes.file ¬ fullPathName;
+dirOpRes.status ¬ IF res=success THEN ok ELSE UnixErrno.GetErrno[];
+};
+}...
+
+  Î  
+VUXDirImpl.mesa
+Copyright Ó 1987, 1991 by Xerox Corporation.  All rights reserved.
+Demers, February 19, 1988 5:16:03 pm PST
+Xerox3, January 14, 1988 12:09:48 pm PST
+JKF November 16, 1988 4:49:13 pm PST
+Carl Hauser, September 13, 1989 12:02:01 pm PDT
+Chauser, June 23, 1992 1:47 pm PDT
+Willie-s, August 21, 1991 11:36 am PDT
+Michael Plass, September 7, 1993 3:01 pm PDT
+Copied Types
+Parameters
+Local Types
+Errors
+File mode stuff
+C  String Manipulation
+Cache of directory handles
+Return fHandle for subdirectory if it exists; return NIL if subdirectory doesn't exist, else raise appropriate PFS.Error. 
+Create subdirectory in the directory specified by dH.
+To force the mode to what is required, in the presence of unix umasks, requires an explicit chmod.
+Pugh Tables for Directory Contents
+This implementation must be careful about the order of operations so concurrent enumerators see a legal data structure.
+notice that lower levels are filled before upper levels so a concurrent enumerator will not have trouble
+Assert: NOT Less[finger.entry, newEntry];
+but for the next comparison we require an exact cased match
+Read directory content from server if it has changed since oldMTime.
+--given a (short) file name, splits it into its name part and version part
+--given a (short) file name, returns length of base part and version 
+--returns -1 for version part if uName doesn't look right
+File Create Modes
+The returned create mode has no type bits set ...
+Follow Paths
+Ascii.Lower is an inline, but I need to pass it as a translator
+Given a (pinned) DirHandle, return a (pinned) DirHandle for the named child, if that child exists and is a directory.  Otherwise raise PFS.Error[...].
+Daemon
+Note this can't delete the root!
+Lookup 
+
+
+ Ê>  –(cedarcode) style•NewlineDelimiter
+™ codešœ™Kšœ
+Ïeœ7™BKšœ%Ïk™(Kšœ%ž™(Kšžœ!™$K™/K™"K™&K™,K˜ —šž	˜	K˜K˜Kšœ
+žœžœ˜Kšœ	žœ˜Kšžœžœ˜ K˜K˜	Kšœžœ˜K˜KšœžœJžœ+˜ƒK˜K˜
+Kšœ˜K˜K˜
+K˜
+K˜Kšœ˜K˜ —šÏn
+œžœž˜Kšžœžœz˜ŒKšžœ	˜Kšžœ˜K˜head™Kšžœžœžœ˜Kšžœžœžœ˜Kšœžœ˜Kšœžœ˜Kšžœžœžœ˜Kšžœžœžœ˜Kšœ	žœ˜!Kšœ	žœ˜!—™
+Kšœžœ˜%Kšœžœ˜&KšœR˜RKšœžœ˜#Kšœžœ˜%Kšœžœ˜%Kšœžœ˜!Kšœžœžœžœ˜K˜ Kšœ	žœžœ˜K˜ —™Kšœžœ˜%šœžœ˜%K˜ —šœ
+žœ˜#K˜ —K˜ —™KšŸœžœžœžœ˜%KšŸ
+œžœžœžœ˜9KšŸœžœžœžœ˜7—™K˜ šŸœžœžœžœ˜BKšœ˜K˜K˜Kšœ˜Kšžœ˜K˜K˜ —šŸœžœžœžœ˜@Kšœ˜K˜K˜ Kšžœžœ˜5Kšžœžœ˜4Kšžœžœ˜7Kšžœžœ˜6Kšžœ˜K˜K˜ —šŸœžœžœžœ˜>KšœžœÏc˜)Kšžœ˜K˜K˜ —šŸœžœžœ#žœ˜VK˜Kšžœ˜K˜——™šœžœžœžœžœžœžœ˜EK˜Kšœ˜K˜ —šœžœžœžœžœžœ˜EKšœ˜Kšœ˜——™š
+Ÿœžœžœžœžœ˜ZKšžœžœžœ˜šžœ%žœžœž˜>šžœ.žœžœ˜<Kšœ$žœ˜)Kšžœ˜K˜—Kšžœ˜—K˜K˜ —šŸœžœžœžœžœžœ˜uKšžœžœžœ˜Kšœ
+žœ½žœžœ(˜‹K˜K˜K˜ —šŸ
+œžœžœžœ˜1Kšžœžœžœ˜šžœžœž˜Kšœžœ˜K˜Kšžœ˜—K˜K˜ —š
+Ÿœžœžœžœžœ˜MKšžœžœžœ˜Kšœžœ˜K˜Kšžœ˜K˜K˜ —šŸœžœžœžœ˜3Kšžœžœžœ˜šžœžœž˜Kšœžœ˜K˜K˜Kšžœ˜—K˜K˜ —Kšœžœžœ
+žœžœwžœžœ(˜ˆK˜ š
+Ÿ
+œžœžœžœžœ˜<Kšžœžœžœ˜Kšœ˜Kšœžœ˜K˜K˜ —šŸœžœžœžœ˜NKšœ5žœ7žœ™zK˜Kšœ˜šžœž˜˜šžœ!žœžœ˜LKšœ\žœ˜a—Kšœ˜K˜—šžœ˜Kšœžœ˜	K˜—šžœ˜Kšœ\žœ˜aK˜——K˜K˜ —š
+Ÿœžœžœžœžœ˜hKšœ5™5K˜Kšœ
+žœžœ,žœžœžœ˜mKšœ1˜1Kšœžœ˜	šœžœžœžœ˜Kšœ,˜,Kšœ)˜)šžœž˜˜Kšœ˜K˜—šžœ˜K˜.K˜wK˜——KšœDÏbœ™bšžœ.žœ˜6K˜.K˜nKšœ˜—Kšœžœ˜K˜—K˜——™"Kšœžœ˜'šœžœ˜3K˜ —Kšœ	žœ˜!šœžœ˜-K˜ —šœ
+žœ˜#K˜ —šŸœžœžœžœ˜GKšœžœžœžœžœžœ˜8Kšœžœ˜šžœžœžœ	ž˜4Kšœ˜Kšœ˜Kšžœ˜—Kšœžœ˜#K˜—K˜ š
+Ÿœžœžœžœžœ˜:Kšžœžœ˜0K˜K˜ —šŸœžœžœžœ˜0šžœ˜šžœ<žœž˜MKšœžœ˜Kšœžœ˜šžœ˜
+šžœžœž˜Kšœžœžœžœ˜DKšœžœ˜#Kšœžœžœ˜CKšœžœ˜%Kšžœ-˜4———K˜—K˜ K˜K˜ —KšŸœžœ.žœ˜`™wKšœ˜Kšœžœžœ	˜0Kšœ˜K˜-K˜šžœ"žœ˜*Kšœžœ ˜3šžœžœžœž˜,Kšœ ˜ Kšžœ˜—Kšœ&˜&K˜—š	žœžœž
+œžœ#ž˜FKšœ*˜*šžœžœžœ!ž˜>K˜Kšœ!˜!Kšžœ˜—Kšžœžœ˜6Kšžœ˜—šžœžœžœž˜/K™hK˜K˜+K˜Kšžœ˜—K˜K˜ —š
+Ÿœžœžœžœžœ˜YKšžœžœ˜K˜K˜ —šŸ!œžœžœžœ˜TKšœžœ˜K˜Kšœžœžœ˜(Kš
+žœžœžœžœžœ˜Kšžœžœžœ˜-Kšžœ	žœžœžœ˜Kšœ˜Kšœžœ$˜:šžœžœžœ
+ž˜K˜Kšžœ˜—K˜Kšžœ˜K˜K˜ —šŸœžœ+žœ-žœ˜–Kšœžœžœžœžœžœ˜HKšœ+˜+šžœžœžœžœ˜Kšœžœžœžœ6˜Tšžœ8žœ˜@Kšœ%˜%Kšžœ	˜K˜—Kšœ˜—šœ˜KšœD˜DKšœžœ˜K˜Kšœ˜Kšœ5˜5Kšœ)žœ˜EKšœ7˜7Kšœ)™)šžœ	žœžœžœžœ ˜YK™;šžœAžœžœ žœ˜rK˜.Kšžœ
+žœžœ ˜4Kšžœ	˜K˜—K˜Kšžœ˜—K˜0šžœ
+žœžœ˜Kšœ/ *˜YKšœ" 
+˜,K˜—Kšœ˜—K˜K˜ —šŸœžœžœžœ˜gKšœ7žœ˜AKšœ ˜ š	žœžœž
+œžœ#ž˜FKšœ+˜+šžœžœžœž˜<Kšœ˜Kšœ"˜"Kšžœ˜—Kšžœ˜—Kšžœ˜K˜K˜ —šŸœžœžœ˜8Kšœžœ˜*Kšœžœ)˜9K˜K˜ —šŸœžœžœžœ˜YK™DKšœžœ˜Kšœžœ˜š
+Ÿœžœžœžœ
+žœ˜6Kšžœžœžœ˜Kšžœžœžœžœ˜;K˜K˜Kšœžœ
+žœ˜CK˜—š
+Ÿœžœžœžœžœ˜>Kšžœžœžœ˜Kšžœ2˜8K˜—šŸœžœžœ˜Kšžœžœžœ˜K˜K˜Kšœ%˜%Kšœžœ˜Kšœ-˜-Kšœžœ˜Kšž	œ˜K˜—šŸœžœžœ˜Kšžœžœžœ˜Kšœžœ˜Kšž	œ˜K˜—Kšžœžœžœžœ˜,šœ˜šžœžœ˜K˜K˜—šœ˜Kšœžœ˜#Kšžœžœžœ˜<Kšœ9žœ˜QK˜—šžœžœ˜Kšœ2˜2Kšœ>˜>Kšœžœ˜Kšœžœ˜šžœžœžœ˜Kšœ
+ž˜Kšœ˜Kšž˜Kšœ˜—Kšžœ	žœžœ˜.Kšœ$˜$šžœXžœžœžœ˜mšœ"˜"Kšœ˜Kšœ˜K˜K˜K˜—Kšžœ˜—Kšœ"˜"šœ˜Kšœžœ˜#Kšžœžœžœ˜<Kšœ˜Kšœ7˜7K˜—Kšžœ˜—Kšœ˜—Kšœ˜K˜K˜ —Kšœžœ˜%Kšœžœ#˜=K˜ š
+Ÿ
+œžœžœžœžœ˜WKš J™JKšœžœ˜Kšœžœ˜Kšœ7˜7šžœžœž˜šœ˜Kšžœ> ˜^—šœ)žœ˜2Kšžœ< ˜W—šžœ˜Kšžœ )˜A——Kšœ˜K˜ —šŸœžœžœžœ žœ œžœ˜_Kš E™EKš 9™9Kšœžœ˜Kšœžœ˜!Kšœžœ˜Kšœ	žœ˜Kšœžœ˜Kšžœžœžœžœ˜?šž˜Kšœ˜Kšžœžœžœžœ˜5Kšœ˜šžœžœž˜šœ˜Kšœžœžœ˜-Kšœ˜Kšœ˜—˜
+šžœžœ˜-Kšžœžœ˜Kšžœžœ˜—K˜—Kšžœžœ˜ —Kšžœ˜—K˜K˜ —š
+ŸœžœžœQžœžœ˜ˆKšœ˜K˜Kšœžœ˜Kšœ)˜)Kšœ#˜#Kš	žœžœžœžœ %˜Cšœ
+žœž˜(Kšžœ˜Kšžœ:˜>—šžœ
+žœž˜šžœ'žœ˜/Kšžœžœ%žœžœ˜7K˜—K˜Kšžœ˜—K˜K˜ ——™š
+Ÿœžœžœžœžœ˜]Kšœ&˜&Kšžœžœžœžœ!˜_K˜—K˜ šŸœžœžœ˜FK™1šŸœžœžœžœžœ 
+œ˜@Kšžœžœžœ˜K˜Kšœ˜K˜—šŸœžœžœ 
+œ˜,Kšžœžœžœ˜K˜Kšœ(˜(K˜—Kšžœžœžœžœ˜,Kšžœžœžœ˜'šœ2˜2šžœž˜K˜<Kšžœ.˜4Kšžœžœ!˜1—K˜—Kšœ˜K˜——™šŸœ˜ K™?Kšžœ˜K˜K˜ —šŸœžœžœžœžœžœžœžœ˜WKšœžœžœ&žœžœžœ3˜rKšžœžœ2˜CKšžœ˜
+Kšœ˜K˜ —šŸœžœžœžœžœ
+žœžœžœ˜cšžœžœ˜Kšžœžœžœ˜"K˜—Kšœžœ 3˜AKšœžœ˜%K˜šž˜Kšœ˜Kšœ	žœ˜Kšœžœ7žœ˜MKšžœžœžœ˜%KšœG˜Gšžœ	žœ˜Kšœžœ/žœ˜NKšœ6žœ
+žœ˜MK˜—Kšžœ˜—K˜K˜ —šŸœžœžœžœ
+žœžœžœžœ˜Kšœ‡žœ™–Kšœ˜K˜'Kšžœžœžœ,žœžœžœ˜Lšžœžœžœ˜Kšœ˜šžœžœžœ˜Kšœ\žœ˜b—Kšœ žœ˜&Kšœ4˜4Kšœ
+žœ˜K˜—Kšžœ	žœžœ-˜@K˜K˜ ——™š
+Ÿœžœžœžœžœ˜EK™ Kšžœžœžœ˜šŸ
+œžœ˜$Kšœžœ˜šžœ$žœžœž˜7K˜šžœžœžœžœ˜7šžœ˜Kšžœžœžœžœ˜FK˜—šžœ˜K˜	K˜——Kšžœ˜—Kšžœžœžœ˜Cšžœ˜šžœ˜Kšœ(˜(K˜—šžœ˜Kšœ˜šžœžœžœ˜Kšœžœ˜K˜K˜—K˜——šžœ˜Kšžœ.˜2Kšžœ˜—K˜—Kšžœžœžœ˜$K˜——™š
+žœžœžœžœžœ˜-Kšžœ˜#K˜K™ —šžœžœžœ˜Kšœ˜K˜K™ —Kšœžœ˜!šŸœžœžœžœžœžœ˜EKšœžœ˜Kšœ<˜<Kšœ
+žœ<˜Išžœžœ˜K˜.Kšœ	žœ\˜iKšžœ
+˜Kšžœ˜	K˜,Kšœ˜—Kšœžœ/˜?Kšžœ˜	Kšžœ
+˜K˜K˜ —šŸœžœžœžœžœ"žœžœ˜jKšœžœžœ,žœžœžœ˜qKšœžœ˜&Kšœžœ7˜?šžœžœ"žœ˜:Kšœžœ6˜?Kšœ)˜)Kšžœžœžœ˜=Kšœ˜—Kšžœ˜Kšœ˜Kšœžœžœžœ˜CK˜K˜ —šŸ	œžœžœžœžœžœ˜[Kšœžœžœ,žœžœžœ˜qKšœžœ˜&Kšœžœ6˜>Kšžœ˜Kšœ˜Kšœžœžœžœ˜CK˜——K˜—K˜ — …—    K^  kj  

@@ -1,0 +1,640 @@
+DIRECTORY
+Process USING [GetCurrent, MsecToTicks, Pause],
+UserProfile USING [Boolean, CallWhenProfileChanges, ProfileChangedProc],
+ViewerClasses USING [Column, Lock, Viewer],
+ViewerLocks USING [],
+ViewerGroupLocks USING [],
+ViewerOps USING [BlinkDisplay, EnumerateChildren, EnumerateViewers, EnumProc],
+ViewerPrivate,
+ViewerSpecs;
+
+ViewerLocksImpl: CEDAR MONITOR
+IMPORTS -- AMEvents2, -- Process, UserProfile, ViewerOps, ViewerSpecs
+EXPORTS ViewerLocks, ViewerGroupLocks, ViewerPrivate
+= BEGIN
+CARD: TYPE = LONG CARDINAL;
+Column: TYPE = ViewerClasses.Column;
+Lock: TYPE = ViewerClasses.Lock;
+Viewer: TYPE = ViewerClasses.Viewer;
+debugging: BOOL ¨ TRUE;
+ProfileChanged: UserProfile.ProfileChangedProc ~ {
+debugging ¨ UserProfile.Boolean["Viewers.debugging", TRUE];
+};
+
+lockFree: CONDITION;
+
+readLocksExclusive: BOOL ¨ FALSE;
+
+treeOwner: PROCESS ¨ NIL;
+treeUsers: CARDINAL ¨ 0;
+
+ColumnInfo: TYPE = RECORD [lock: Lock, wedgeCount: CARDINAL];
+ColumnInfoInit: TYPE = ColumnInfo ¨ [lock: [process: NIL, count: 0], wedgeCount: 0];
+
+ColumnsRep: TYPE ~ RECORD[SEQUENCE c: Column OF ColumnInfoInit];
+columns: REF ColumnsRep ¨ NEW[ColumnsRep[ViewerSpecs.nColumns]];
+CallRootUnderWriteLock: PUBLIC PROC [proc: PROC, viewer: Viewer] = {
+CallUnderWriteLock[proc, viewer];
+};
+
+CallRootAndLinksUnderWriteLock: PUBLIC PROC [proc: PROC, viewer: Viewer] = {
+WHILE viewer # NIL AND NOT viewer.destroyed DO
+root: Viewer ¨ GetRoot[viewer];
+link1: Viewer ¨ IF root = NIL THEN NIL ELSE root.link;
+link2: Viewer ¨ IF link1 = NIL THEN NIL ELSE link1.link;
+quick: BOOL ¨ TRUE;
+inner: PROC = {
+IF root # GetRoot[viewer] THEN RETURN;
+IF root.link # link1 THEN RETURN;
+IF quick AND (link1 # NIL AND link2 # root) THEN RETURN;
+proc[];
+win ¨ TRUE;
+};
+win: BOOL ¨ FALSE;
+SELECT TRUE FROM
+root = viewer AND link1 = NIL => CallUnderWriteLock[inner, viewer];
+link1 = NIL OR link2 = root => CallUnderWriteLocks[inner, viewer, root, link1];
+ENDCASE => {quick ¨ FALSE; CallUnderViewerTreeLock[inner]};
+IF win THEN RETURN;
+ENDLOOP;
+};
+LockViewerTree: PUBLIC ENTRY PROC = {
+<<ENABLE UNWIND => NULL;>>
+process: PROCESS = CurrentProcess[];
+DO
+IF treeOwner = process THEN EXIT;
+
+FOR c: Column IN [Column.FIRST..VAL[ViewerSpecs.nColumns]) DO
+IF columns[c].wedgeCount # 0 THEN RETURN WITH ERROR Wedged[c];
+ENDLOOP;
+IF treeUsers = 0 THEN {
+IF treeOwner # NIL THEN ViewerLocksError[];
+EXIT;
+};
+WAIT lockFree;
+ENDLOOP;
+treeUsers ¨ treeUsers + 1;
+treeOwner ¨ process;
+};
+
+ReleaseViewerTree: PUBLIC ENTRY PROC = {
+<<ENABLE UNWIND => NULL;>>
+IF CurrentProcess[] # treeOwner THEN ViewerLocksError[];
+IF treeUsers = 0 THEN ViewerLocksError[];
+treeUsers ¨ treeUsers - 1;
+IF treeUsers=0 THEN treeOwner ¨ NIL;
+BROADCAST lockFree;
+};
+
+CallUnderViewerTreeLock: PUBLIC PROC [proc: PROC] = {
+LockViewerTree[];
+proc[! UNWIND => ReleaseViewerTree[]];
+ReleaseViewerTree[];
+};
+Wedged: PUBLIC SAFE ERROR [wedged: Column] = CODE;
+
+CallUnderColumnLock: PUBLIC PROC [proc: PROC, column: Column] = {
+Wait: ENTRY PROC = {<<ENABLE UNWIND => NULL;>> WAIT lockFree};
+AcquireColumnWriteLock[column ! Wedged => {Wait[]; RETRY}];
+proc[! UNWIND => ReleaseColumnWriteLock[column]];
+ReleaseColumnWriteLock[column];
+};
+
+CallUnderColumnLocks: PUBLIC PROC [proc: PROC, c0, c1: Column] = {
+Wait: ENTRY PROC = {<<ENABLE UNWIND => NULL;>> WAIT lockFree};
+IF c0 < c1 THEN {c: Column ¨ c0; c0 ¨ c1; c1 ¨ c};
+AcquireColumnWriteLock[c0 ! Wedged => {Wait[]; RETRY}];
+AcquireColumnWriteLock[c1 ! Wedged => {Wait[]; RETRY}];
+proc[! UNWIND => {ReleaseColumnWriteLock[c1]; ReleaseColumnWriteLock[c0]}];
+ReleaseColumnWriteLock[c1];
+ReleaseColumnWriteLock[c0];
+};
+
+AcquireColumnWriteLock: PUBLIC ENTRY PROC [column: Column] = {
+<<ENABLE UNWIND => NULL;>>
+IF ~ColumnWriteLockInternal[column] THEN RETURN WITH ERROR Wedged[column];
+};
+
+ColumnWriteLockInternal: INTERNAL PROC [column: Column]
+RETURNS [success: BOOL ¨ TRUE] = {
+process: PROCESS ~ CurrentProcess[];
+count: CARDINAL ¨ 0;
+
+DO
+IF columns[column].wedgeCount>0 THEN
+RETURN [FALSE];
+count ¨ columns[column].lock.count;
+IF count=0 OR columns[column].lock.process = process THEN
+IF treeOwner = process OR treeOwner = NIL THEN EXIT;
+WAIT lockFree;
+ENDLOOP;
+
+treeUsers ¨ treeUsers + 1;
+columns[column].lock ¨ [process, count+1];
+};
+
+ReleaseColumnWriteLock: PUBLIC ENTRY PROC [column: Column] = {
+<<ENABLE UNWIND => NULL;>>
+ReleaseColumnLockInternal[column];
+};
+
+ReleaseColumnLockInternal: INTERNAL PROC [column: Column] = {
+IF columns[column].lock.count = 0 THEN ViewerLocksError[];
+IF treeUsers = 0 THEN ViewerLocksError[];
+
+treeUsers ¨ treeUsers - 1;
+IF treeUsers = 0 THEN {
+treeOwner ¨ NIL;
+BROADCAST lockFree;
+};
+
+IF (columns[column].lock.count ¨ columns[column].lock.count-1) = 0 THEN {
+columns[column].lock.process ¨ NIL;
+BROADCAST lockFree;
+};
+};
+
+ReadLockColumn: INTERNAL PROC [viewer: Viewer ¨ NIL, column: Column ¨ static] RETURNS [success: BOOL ¨ TRUE] = {
+process: PROCESS ~ CurrentProcess[];
+
+DO
+IF viewer # NIL THEN column ¨ ViewerColumn[viewer];
+IF columns[column].wedgeCount>0 THEN
+RETURN [FALSE];
+SELECT columns[column].lock.process FROM
+NIL, process =>
+IF treeOwner = process OR treeOwner = NIL THEN EXIT;
+ENDCASE;
+WAIT lockFree;
+ENDLOOP;
+
+treeUsers ¨ treeUsers + 1;
+columns[column].lock.count ¨ columns[column].lock.count+1;
+};
+
+ColumnWedged: PUBLIC ENTRY PROC [column: Column]
+RETURNS [wedged, write: BOOL] = TRUSTED {
+<<ENABLE UNWIND => NULL;>>
+RETURN [columns[column].wedgeCount # 0, columns[column].lock.process # NIL];
+};
+
+MarkViewerWedged: PUBLIC PROC [viewer: Viewer] = {
+IF viewer # NIL THEN {
+viewer.paintingWedged ¨ TRUE;
+MarkColumnUnWedged[ViewerColumn[viewer]];
+};
+};
+
+MarkViewerUnWedged: PUBLIC PROC [viewer: Viewer] = {
+IF viewer # NIL THEN {
+viewer.paintingWedged ¨ FALSE;
+MarkColumnUnWedged[ViewerColumn[viewer]];
+};
+};
+
+MarkColumnWedged: PUBLIC ENTRY PROC [column: Column] = {
+ENABLE UNWIND => NULL;
+IF debugging THEN RETURN;
+IF columns[column].wedgeCount = 0 THEN THROUGH [0..2) DO
+ViewerOps.BlinkDisplay[];
+Process.Pause[Process.MsecToTicks[200]];
+ENDLOOP;
+columns[column].wedgeCount ¨ columns[column].wedgeCount+1;
+};
+
+MarkColumnUnWedged: PUBLIC ENTRY PROC [column: Column] = {
+<<ENABLE UNWIND => NULL;>>
+IF debugging THEN RETURN;
+IF (columns[column].wedgeCount ¨ columns[column].wedgeCount-1) = 0
+THEN BROADCAST lockFree;
+};
+LockOrder: PUBLIC PROC [v0, v1: Viewer] RETURNS [BOOL] = {
+SELECT TRUE FROM
+v0 = NIL => GO TO swapped;
+v1 = NIL => {};
+ENDCASE => {
+c0: Column ¨ IF v0.iconic THEN static ELSE v0.column;
+c1: Column ¨ IF v1.iconic THEN static ELSE v1.column;
+SELECT TRUE FROM
+c0 > c1 => {};
+c0 < c1 => GO TO swapped;
+LOOPHOLE[v0, CARD] < LOOPHOLE[v1, CARD] => GO TO swapped;
+ENDCASE;
+};
+RETURN [TRUE];
+EXITS swapped => RETURN [FALSE];
+};
+
+CallUnderWriteLock: PUBLIC PROC [proc: PROC, viewer: Viewer] = {
+IF viewer # NIL THEN DO
+root: Viewer ¨ GetRoot[viewer];
+AcquireWriteLock[root];
+IF root # GetRoot[viewer] THEN {ReleaseWriteLock[root]; LOOP};
+IF NOT viewer.destroyed THEN proc[
+!
+UNWIND => ReleaseWriteLock[root];
+];
+ReleaseWriteLock[root];
+RETURN;
+ENDLOOP;
+};
+
+CallUnderWriteLocks: PUBLIC PROC [proc: PROC, v0, v1, v2: Viewer ¨ NIL] = {
+DO
+r0: Viewer ¨ GetRoot[v0];
+r1: Viewer ¨ GetRoot[v1];
+r2: Viewer ¨ GetRoot[v2];
+AcquireWriteLocks[r0, r1, r2];
+IF r0 = GetRoot[v0] AND r1 = GetRoot[v1] AND r2 = GetRoot[v2] THEN {
+proc[
+!
+UNWIND => ReleaseWriteLocks[r0, r1, r2];
+];
+ReleaseWriteLocks[r0, r1, r2];
+RETURN;
+};
+ReleaseWriteLocks[r0, r1, r2];
+ENDLOOP;
+};
+
+CallUnderReadLock: PUBLIC PROC [proc: PROC, viewer: Viewer] = {
+IF viewer # NIL THEN DO
+root: Viewer ¨ GetRoot[viewer];
+AcquireReadLock[root];
+IF root # GetRoot[viewer] THEN {ReleaseReadLock[root]; LOOP};
+IF NOT viewer.destroyed THEN proc[
+!
+UNWIND => ReleaseReadLock[root];
+];
+ReleaseReadLock[root];
+RETURN;
+ENDLOOP;
+};
+
+CallUnderReadLocks: PUBLIC PROC [proc: PROC, v0, v1, v2: Viewer ¨ NIL] = {
+DO
+r0: Viewer ¨ GetRoot[v0];
+r1: Viewer ¨ GetRoot[v1];
+r2: Viewer ¨ GetRoot[v2];
+AcquireReadLocks[r0, r1, r2];
+IF r0 = GetRoot[v0] AND r1 = GetRoot[v1] AND r2 = GetRoot[v2] THEN {
+proc[
+!
+UNWIND => ReleaseReadLocks[r0, r1, r2];
+];
+ReleaseReadLocks[r0, r1, r2];
+RETURN;
+};
+ReleaseReadLocks[r0, r1, r2];
+ENDLOOP;
+};
+
+AcquireWriteLock: PUBLIC ENTRY PROC [viewer: Viewer] = {
+<<ENABLE UNWIND => NULL;>>
+IF NOT ReadLockColumn[viewer] THEN
+RETURN WITH ERROR Wedged[ViewerColumn[viewer]];
+WriteLockInternal[viewer];
+};
+
+WriteLockInternal: INTERNAL PROC [viewer: Viewer] = {
+IF viewer # NIL THEN {
+process: PROCESS ~ CurrentProcess[];
+UNTIL (viewer.lock.count=0 OR viewer.lock.process=process) DO WAIT lockFree; ENDLOOP;
+viewer.lock ¨ [process, viewer.lock.count+1];
+};
+};
+
+ReleaseWriteLock: PUBLIC ENTRY PROC [viewer: Viewer] = {
+<<ENABLE UNWIND => NULL;>>
+IF viewer # NIL THEN ReleaseLockInternal[viewer];
+};
+
+AcquireWriteLocks: PUBLIC ENTRY PROC [v0, v1, v2: Viewer ¨ NIL] = {
+ENABLE UNWIND => NULL;
+c: Column;
+{
+[v0, v1, v2] ¨ LockColumnsForViewers[v0, v1, v2
+! Wedged => {c ¨ wedged; GO TO wedgedError}
+];
+EXITS wedgedError => RETURN WITH ERROR Wedged[c];
+};
+IF v0 # NIL THEN WriteLockInternal[v0];
+IF v1 # NIL THEN WriteLockInternal[v1];
+IF v2 # NIL THEN WriteLockInternal[v2];
+};
+
+ReleaseWriteLocks: PUBLIC ENTRY PROC [v0, v1, v2: Viewer ¨ NIL] = {
+<<ENABLE UNWIND => NULL;>>
+IF v0 # NIL THEN ReleaseLockInternal[v0];
+IF v1 # NIL THEN ReleaseLockInternal[v1];
+IF v2 # NIL THEN ReleaseLockInternal[v2];
+};
+
+AcquireReadLock: PUBLIC ENTRY PROC [viewer: Viewer] = {
+<<ENABLE UNWIND => NULL; >>
+IF NOT ReadLockColumn[viewer] THEN
+RETURN WITH ERROR Wedged[ViewerColumn[viewer]];
+ReadLockInternal[viewer];
+};
+
+ReadLockInternal: INTERNAL PROC [viewer: Viewer] = {
+process: PROCESS = CurrentProcess[];
+UNTIL (viewer.lock.process=NIL OR viewer.lock.process=process) DO WAIT lockFree; ENDLOOP;
+IF readLocksExclusive THEN viewer.lock.process ¨ process;
+viewer.lock.count ¨ viewer.lock.count+1;
+};
+
+ReleaseReadLock: PUBLIC ENTRY PROC [viewer: Viewer] = {
+<<ENABLE UNWIND => NULL;>>
+IF viewer # NIL THEN ReleaseLockInternal[viewer];
+};
+
+AcquireReadLocks: PUBLIC ENTRY PROC [v0, v1, v2: Viewer ¨ NIL] = {
+ENABLE UNWIND => NULL;
+c: Column;
+{
+[v0, v1, v2] ¨ LockColumnsForViewers[v0, v1, v2
+! Wedged => {c ¨ wedged; GO TO wedgedError}
+];
+EXITS wedgedError => RETURN WITH ERROR Wedged[c];
+};
+IF v0 # NIL THEN ReadLockInternal[v0];
+IF v1 # NIL THEN ReadLockInternal[v1];
+IF v2 # NIL THEN ReadLockInternal[v2];
+};
+
+ReleaseReadLocks: PUBLIC ENTRY PROC [v0, v1, v2: Viewer ¨ NIL] = {
+<<ENABLE UNWIND => NULL;>>
+IF v0 # NIL THEN ReleaseLockInternal[v0];
+IF v1 # NIL THEN ReleaseLockInternal[v1];
+IF v2 # NIL THEN ReleaseLockInternal[v2];
+};
+
+ReleaseLockInternal: INTERNAL PROC [viewer: Viewer] = {
+ReleaseColumnLockInternal[ViewerColumn[viewer]];
+IF viewer.lock.count = 0 THEN ViewerLocksError[];
+IF (viewer.lock.count ¨ viewer.lock.count-1) = 0 THEN {
+viewer.lock.process ¨ NIL;
+BROADCAST lockFree;
+};
+};
+ViewerLocksError: PROC = {
+ERROR;
+};
+
+GetRoot: ENTRY PROC [viewer: Viewer] RETURNS [root: Viewer] = {
+<<ENABLE UNWIND => NULL;>>
+root ¨ viewer;
+IF root # NIL THEN DO
+next: Viewer ¨ root.parent;
+IF next = NIL THEN EXIT;
+root ¨ next;
+ENDLOOP;
+};
+
+SetReadExclusive: PROC [state: BOOL ¨ TRUE] = {
+LockViewerTree[];
+readLocksExclusive ¨ state;
+ReleaseViewerTree[];
+};
+
+ClearAllLocks: ENTRY PROC = {
+ENABLE UNWIND => NULL;
+ClearLock: ViewerOps.EnumProc = {
+IF v.parent = NIL THEN ViewerOps.EnumerateChildren[v, ClearLock];
+v.lock ¨ [NIL, 0];
+};
+FOR c: Column IN [Column.FIRST..VAL[ViewerSpecs.nColumns]) DO
+columns[c] ¨ [[NIL, 0], 0];
+ENDLOOP;
+ViewerOps.EnumerateViewers[ClearLock];
+treeOwner ¨ NIL;
+treeUsers ¨ 0;
+BROADCAST lockFree;
+};
+
+LockColumnsForViewers: INTERNAL PROC [v0, v1, v2: Viewer] RETURNS [Viewer, Viewer, Viewer] = {
+DO
+c0, c1, c2: Column ¨ static;
+b0, b1, b2: BOOL ¨ FALSE;
+FreeAllColumns: INTERNAL PROC = {
+IF b0 THEN ReleaseColumnLockInternal[c0];
+IF b1 THEN ReleaseColumnLockInternal[c1];
+IF b2 THEN ReleaseColumnLockInternal[c2];
+};
+[v0, v1] ¨ SortViewers2[v0, v1];
+[v1, v2] ¨ SortViewers2[v1, v2];
+[v0, v1] ¨ SortViewers2[v0, v1];
+
+
+IF v0 = NIL THEN EXIT;
+b0 ¨ ReadLockColumn[column: c0 ¨ ViewerColumn[v0]];
+IF ~b0 THEN {FreeAllColumns[]; ERROR Wedged[c0]};
+IF c0 # ViewerColumn[v0] THEN {FreeAllColumns[]; LOOP};
+
+IF v1 = NIL THEN EXIT;
+b1 ¨ ReadLockColumn[column: c1 ¨ ViewerColumn[v1]];
+IF ~b1 THEN {FreeAllColumns[]; ERROR Wedged[c1]};
+IF c1 # ViewerColumn[v1] THEN {FreeAllColumns[]; LOOP};
+
+IF v2 = NIL THEN EXIT;
+b2 ¨ ReadLockColumn[column: c2 ¨ ViewerColumn[v2]];
+IF ~b2 THEN {FreeAllColumns[]; ERROR Wedged[c2]};
+IF c2 # ViewerColumn[v2] THEN {FreeAllColumns[]; LOOP};
+
+EXIT;
+ENDLOOP;
+RETURN [v0, v1, v2];
+};
+
+SortViewers2: PROC [v0, v1: Viewer] RETURNS [Viewer, Viewer] = INLINE {
+SELECT TRUE FROM
+v0 = NIL => GO TO swapped;
+v1 = NIL => {};
+ENDCASE => {
+c0: Column ¨ IF v0.iconic THEN static ELSE v0.column;
+c1: Column ¨ IF v1.iconic THEN static ELSE v1.column;
+SELECT TRUE FROM
+c0 > c1 => {};
+c0 < c1 => GO TO swapped;
+LOOPHOLE[v0, CARD] < LOOPHOLE[v1, CARD] => GO TO swapped;
+ENDCASE;
+};
+RETURN [v0, v1];
+EXITS swapped => RETURN [v1, v0];
+};
+
+ViewerColumn: PROC [viewer: Viewer] RETURNS [column: Column] = INLINE {
+RETURN [IF viewer.iconic THEN static ELSE viewer.column];
+};
+
+CurrentProcess: PROC RETURNS [PROCESS] = TRUSTED INLINE {
+RETURN [LOOPHOLE[Process.GetCurrent[]]];
+};
+
+UserProfile.CallWhenProfileChanges[ProfileChanged];
+
+END.
+   X  
+ViewerLocksImpl.mesa
+Copyright ” 1985, 1986, 1987, 1988, 1991 by Xerox Corporation.  All rights reserved.
+Russ Atkinson (RRA) March 3, 1987 6:32:29 pm PST
+Michael Plass, October 12, 1989 11:04:31 am PDT
+Doug Wyatt, September 21, 1987 2:21:21 pm PDT
+Christian Jacobi, October 24, 1991 5:06 pm PDT
+Last tweaked by Mike Spreitzer on May 16, 1988 1:22:42 pm PDT
+Ken Pier, November 13, 1988 9:32:34 pm PST
+Bier, December 1, 1988 11:26:48 pm PST
+Willie-s, October 29, 1991 6:31 pm PST
+
+AMEvents2 USING [Debugged, Debugging],
+DebuggerSwap USING [CallDebugger],
+Rationale
+There are 3 tiers of locks: tree, column, and viewer.  
+Tree:
+write lock gives exclusive access to the whole viewer tree
+read lock prevents tree write locks
+at least a read lock is required for column access
+Column:
+write lock gives exclusive access to the column
+read lock prevents write locks on the column
+at least a read lock is required for viewer access
+Viewer:
+write lock gives exclusive access to the viewer
+read lock prevents write locks
+(currently the readLocksExclusive flag causes read locks to be exclusive)
+Write locks are owned by processes.
+Multiple requests by a process for a lock it already owns will be granted.
+Possession of a read lock without a write lock prevents acquiring a write lock.
+Acquisition order:
+Locks must be acquired first by tree, then by column, then by viewer.
+Within a tier, locks are acquired by column number or viewer address.
+Locks may be released in any order, but once a lock is released, no more should be acquired!
+Types
+Global variables
+When using a debugging world, the column-wedge detection is a pain, but otherwise it's nice to have.
+No, it's not!
+
+BROADCAST when any lock is released
+If TRUE, then read locks on viewers will be exclusive access to the locking process.  This is a hack for debugging purposes right now.
+The current process holding onto the whole tree
+The current # of users of the tree (outdated: should be the sum of the column locks)
+Root viewer operations
+Note: no longer different than CallUnderWriteLock
+First check to see if the viewer structure is the same as when we started
+Tree lock tier
+This entry acquires a write lock on the tree to get exclusive access to all columns and viewers.
+If we already own the lock then we exit quickly.
+At each iteration, check for any column being wedged.
+This entry releases the write lock on the tree.
+Column lock tier
+ENABLE { 
+AMEvents2.Debugging => MarkColumnWedged[column];
+AMEvents2.Debugged => MarkColumnUnWedged[column]};
+ENABLE { 
+AMEvents2.Debugging => {MarkColumnWedged[c0]; MarkColumnWedged[c1]};
+AMEvents2.Debugged => {MarkColumnUnWedged[c0]; MarkColumnUnWedged[c1]};
+};
+This must agree with LockOrder and SortViewers2!  DKW
+No errors raised (ChJ)
+Get a read lock on the tree and a write lock on the column.  Don't exit unless we can get both of them simultaneously.
+The column is wedged, so we can't get acquire the lock.
+We can have the column write lock
+We can have the tree read lock, too.
+When we can't get the tree read lock OR the column write lock we wait for something to happen and retry.  So far we have not made any global changes.
+Finally bump the counts on the locks for the tree and column
+No recoverable errors raised (ChJ)
+First, test for error conditions and crash if they show up.
+Now release the tree read lock that we got for this column
+Now release the column read|write lock
+Get a read lock on the column and the tree.  Don't exit unless we can get both of them simultaneously.
+The column is wedged, so we can't get acquire the lock.
+We can have the read lock
+We can have the tree lock, too.
+When we can't get the tree read lock OR the column read lock we wait for something to happen and retry.  So far we have not made any global changes.
+Finally bump the counts on the locks for the tree and column
+Viewer lock tier
+AMEvents2.Debugging => MarkViewerWedged[root];
+AMEvents2.Debugged => MarkViewerUnWedged[root];
+AMEvents2.Debugging => {
+IF r0 # NIL THEN MarkViewerWedged[r0];
+IF r1 # NIL THEN MarkViewerWedged[r1];
+IF r2 # NIL THEN MarkViewerWedged[r2]};
+AMEvents2.Debugged => {
+IF r0 # NIL THEN MarkViewerUnWedged[r0];
+IF r1 # NIL THEN MarkViewerUnWedged[r1];
+IF r2 # NIL THEN MarkViewerUnWedged[r2]};
+AMEvents2.Debugging => MarkViewerWedged[root];
+AMEvents2.Debugged => MarkViewerUnWedged[root];
+AMEvents2.Debugging => {
+IF r0 # NIL THEN MarkViewerWedged[r0];
+IF r1 # NIL THEN MarkViewerWedged[r1];
+IF r2 # NIL THEN MarkViewerWedged[r2]};
+AMEvents2.Debugged => {
+IF r0 # NIL THEN MarkViewerUnWedged[r0];
+IF r1 # NIL THEN MarkViewerUnWedged[r1];
+IF r2 # NIL THEN MarkViewerUnWedged[r2]};
+Locks the given viewer, assuming that the columns are already locked.  No errors should occur in this routine.
+Viewers must be sorted so that they are locked from highest to lowest, by column and by address.  We also need to lock the columns BEFORE locking the viewers themselves, since we can otherwise get deadlock for viewers in multiple columns.
+no sort required
+Acquires the read lock for the viewer, assuming that the column lock is already acquired
+RRA: note this test.  It is a debugging aid to determine if it prevents painting bugs.
+viewers must be sorted so that they are locked from highest to lowest.  As with write locks, we need to acquire the columns first to prevent deadlocks with multiple columns
+no sort required
+No recoverables errors raisd (ChJ)
+Utilities
+So bad that it is ok to raise this error with the lock hold (ChJ)
+KAP for PCedar November 13, 1988
+DebuggerSwap.CallDebugger["ViewerLocks bug"L];
+Safely change the state of readLocksExclusive.
+This is a desperately unsafe operation!
+Given three viewers, first sort them by column and address order.  Then try to acquire the column lock(s) for those viewers in that order.  There are two ways that this will fail:
+1.  If any column in the viewers is wedged, then release all of the column locks acquired, and raise ERROR Wedged[column] for the wedged column.
+2.  If any viewer column changes before all of the locks are acquired, then release all of the acquired column locks and try again.  Since column changes are rare, this should eventually succeed.
+The viewers are returned in sorted order so that subsequent read or write locks can be acquired in the proper (non-deadlock) order.  This relies on everyone acquiring locks in the same order.
+Now the viewers are in column order (and address order).  The column order should not change while we are waiting, or there will be trouble!  For now, we check this to make sure that it stays the same, and loop if it changes.
+This is a helpful routine for LockColumnsForViewers.  It is INLINE to save on procedure calls (is this necessary?), and should have the same sort order as LockOrder.
+Initialization
+ù ‘  ñ(cedarcode) styleïNewlineDelimiter
+ô codeöúôKöú
+œeúIôTKô0Kô/Kô-Kô.Kô=Kô*Kô&Kô&Kô öœk	ò	Köú
+ûúô&Köúûúô"Köúûú"ò/Köúûú7òHKöúûúò+KöúûúòKöúûúòKöú
+ûú?òNKöúòKöúòóóKò ö–blúûúûòKöûú>òEKöûú-ò4Köúûòóheadô	öú7ô7ôKô:Kô#Kô2óôKô/Kô,Kô2óôKô/ôKöúIôIóóóô#KôJKôOóôKôEKôEKô\óóôKöûúûúûúûúòKöúûúò$Köúûúò Köúûúò$óôöúûúûúòKöúdôdKôKô óöœnú$ò2Köú5ûúò;KòKò óöú
+û	úòKöû	úô#óKò öúûúûúò!KöúûúôÜóKò öúûúûúòKöú/ô/óöúûúòKôTóKò Köúûúûúûúò=Köúûú!ûúòTKò Kö	úûúûúûúûúò@Köú	ûúûú#ò@óôö†úûúûúûúòDKöú1ô1Köú!ò!KöúòKò óö†úûúûúûúòLö	ûú
+ûúûúûúûò.KöúòKöúûúûúûúûúûúò6Köúûú	ûúûúûúûúò8KöúûúûúòöúûúòKöúIôIKöûúûúûúò&Köûúûúûúò!Köûúûú
+ûúûúûúûúò8KöúòKöúûúòKòóKöúûúûúòöûúûúûòKöúûú	ûú&òCKöúûúûúAòOKöûúûú"ò;óKöûúûúûúòKöûúòóKöúòóóôö†úûúûúûúò%Köú`ô`KöûúûúûúûòKöú	ûúò$öûòKöú0ô0Köûúûúûúò!Kò Köú5ô5ö	ûúûú	ûúûúûò=Kö
+ûúûúûúûúûúò>KöûúòóöûúûúòKöûúûúûúò+KöûúòKöúòóKöûú
+òKöûúòóKöúòKöúòKöúòóKò ö†úûúûúûúò(Köú/ô/KöûúûúûúûòKöûúûúò8Köûúûúò)KöúòKöûúûúûúò$Köû	ú
+òKöúòKò óö†úûúûúûúò5KöúòKöúûúò&KöúòKöúòóóôö	úûúûúûúûúò2Kò óö†úûúûúûúòAöûúô	Köú0ô0Köú2ô2óKö†úûúûúûúò>Köú3ûúò;Köúûú$ò1KöúòKöúòKò óö†úûúûúûúòBöûúô	KöúDôDKöúGôGKöúôóKö†úûúûúûúò>öûú	ûú#ò2Kô6óKöú/ûúò7Köú/ûúò7Köúûú>òKKöúòKöúòKöúòKò óö†úûúûúûúò>KöûúûúûúûòKö
+ûú"ûúûúûúûúòJKöúòKò óö†úûúûúûúûúûúòZKöúôKöú	ûúò$KöúûúòKò Köúvôvöûòöûúûò$Köú7ô7KöûúûúòóKöú#ò#öûú	ûú(ûò9Köú!ô!ö
+ûúûúûúûúûúò4Köú$ô$óóöûú
+òKöúïôïóKöûúòKò óKöú<ô<KöúòKöú*ò*KöúòKò óö†úûúûúûúò>KöûúûúûúûòKöú"ò"KöúòKò óö†úûúûúò=Köú"ô"Köú;ô;Köûú ûúò:Köûúûúò)Kò Köú:ô:KöúòöûúûúòKöúûúòKöû	ú
+òKòKò óKöú&ô&öûúAûúòIKöúûúò#Köû	ú
+òKöúòóKöúòKò óö†úûúûúûúûúûúûúòpKöú	ûúò$Kò KöúfôföûòKöûú
+ûúûúò3öûúûò$Köú7ô7Köûúûúòóöûúûò(öûúòKöúôö
+ûúûúûúûúûúò4KöúôóóKöûúòóöûú
+òKöúîôîóKöûúòKò óKöú<ô<KöúòKöú:ò:KöúòKò óö†úûúûúûúûúûúûúòZKöûúûúûúûòKöûúAûúòLKöúòKò óö†úûúûúò2öûú
+ûúûúòKöúûúòKöú)ò)KöúòóKöúòKò óö†úûúûúò4öûú
+ûúûúòKöúûúòKöú)ò)KöúòóKöúòKò óö†úûúûúûúò8KöûúûúûúòKöûúûúûúòöûú ûúûúûò8KòKò(KöûúòóKöú:ò:KöúòKò óö†úûúûúûúò:KöúòKöûúûúûúòöûú@òBKöûúû	ú
+òóKöúòóóôö
+†	úûúûúûúûúò:öûúûúûòKöúûúûúûú	òKöúûúòöûúòKöúûúûúûúò5Köúûúûúûúò5öûúûúûòKöúòKöúûúûú	òKöûúûúûúûúûúûú	ò9KöûúòóKòóóKöûúûúòKöûúûúûúò KöúòKò óö†úûúûúûúò@öûú
+ûúûòKöúòKöúòKöûúûúûúò>öûúûúûúò"öúòKöûúò!Köú.ô.Köú/ô/óKöúòóKöúòKöûúòKöûúòóKöúòKò óö
+†úûúûúûúûúòKöûòKòKòKòKöúòöûúûúûúûúòDöúòöúòKöûú"ò(öúôKöûúûúûúô&Köûúûúûúô&Köûúûúûúô'óöúôKöûúûúûúô(Köûúûúûúô(Köûúûúûúô)óóKöúòóKöúòKöûúòKòóKöúòKöûúòóKöúòKò óö†úûúûúûúò?öûú
+ûúûòKöúòKöúòKöûúûúûúò=öûúûúûúò"öúòKöûúò Köú.ô.Köú/ô/óKöúòóKöúòKöûúòKöûúòóKöúòKò óö
+†úûúûúûúûúòJöûòKòKòKòKöúòöûúûúûúûúòDöúòöúòKöûú!ò'öúôKöûúûúûúô&Köûúûúûúô&Köûúûúûúô'óöúôKöûúûúûúô(Köûúûúûúô(Köûúûúûúô)óóKöúòóKöúòKöûúòKòóKöúòKöûúòóKöúòKò óö†úûúûúûúò8Köûúûúûúòöûúûúûò"Köûúûúûúò/óKöúòKöúòKò óö†úûúûúò5Köúnônöûú
+ûúûúòKöú	ûúò$Kö
+ûúûúûúûúûúòUKöú-ò-KòóKöúòKò óö†úûúûúûúò8KöûúûúûúûòKöûú
+ûúûúò1KöúòKò óö
+†úûúûúûúûúòCKöúÉûúeôÓKöûúûúûúòKò
+òöú/ò/Köúûúûúò+KöúòóKöûúûúûúûúò1KòóKöûúûúûúò'Köûúûúûúò'Köûúûúûúò'KöúòKò óö
+†úûúûúûúûúòCKöúôKöûúûúûúûòKöûúûúûúò)Köûúûúûúò)Köûúûúûúò)KöúòKò óö†úûúûúûúò7Köûúûúûúûòöûúûúûò"Köûúûúûúò/óKöúòKöúòKò óö†úûúûúò4KöúXôXKöú	ûúò$KöûúûúûúûúûúûúòYöûúûúò9KöûúSôVóKöú(ò(KöúòKò óö†úûúûúûúò7KöûúûúûúûòKöûú
+ûúûúò1KöúòKò óö
+†úûúûúûúûúòBKöú¨ô¨KöûúûúûúòKò
+òöú/ò/Köúûúûúò+KöúòóKöûúûúûúûúò1KòóKöûúûúûúò&Köûúûúûúò&Köûúûúûúò&KöúòKò óö
+†úûúûúûúûúòBKöúôKöûúûúûúûòKöûúûúûúò)Köûúûúûúò)Köûúûúûúò)KöúòKò óö†úûúûúò7Köú"ô"Köú0ò0Köûúûúò1öûú/ûúò7KöúûúòKöû	ú
+òKöúòóKöúòóóô	ö†úûúòKöúAôAKöûúô Köú.ô.KöûúòKöúòKò óö†úû
+úûúò?KöûúûúûúûòKòöûúûúûúûòKòKöûúûúûúûúòKòKöûúòóKòKò óö†úûú	ûúûúò/Köú.ô.KöúòKöúòKöúòKòóKò ö†úûúûúòKöú'ô'Köûúûúûúòöú!ò!Köûúûúûú+òAKöú
+ûúòKöúòóö	ûúûú	ûúûúûò=Köúûú	òKöûúòóKò&KöúûúòKöúòKöû	ú
+òKöúòKò óö†úûúûúûúò^öú≥ô≥KöúêôêKô√óKôøöûòKòKöúûúûúòöúûúûúò!Köûúûúò)Köûúûúò)Köûúûúò)KòóKöú ò Köú ò Köú ò Kò Köú·ô·Kò KöûúûúûúûúòKöú3ò3Köûúûúûúò1Köûúûúûúò7Kò KöûúûúûúûúòKöú3ò3Köûúûúûúò1Köûúûúûúò7Kò KöûúûúûúûúòKöú3ò3Köûúûúûúò1Köûúûúûúò7Kò KöûúòKöûúòóKöûúòKòKò óö†úûúûúûúòGKöú<ûúcô•öûúûúûòKöúûúûúûú	òKöúûúòöûúòKöúûúûúûúò5Köúûúûúûúò5öûúûúûòKöúòKöúûúûú	òKöûúûúûúûúûúûú	ò9KöûúòóKòóóKöûú
+òKöûúûú
+ò!KòKò óö†úûúûúûúòGKöûúûúûúûúò9KöúòKò óö†úûúûúûúûúûúò9Köûúûúò(KòKò óóôKò3óKò Köûúòó Öó    3ö  f∆  

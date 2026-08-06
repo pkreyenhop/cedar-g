@@ -1,0 +1,843 @@
+DIRECTORY
+Alloc USING [AddNotify, Bounds, DropNotify, Handle, Notifier, Top, Trim, Units],
+Basics USING [MoveBytes, FillWords],
+CinderSysOps USING [Close, Open, OpenKind],
+CountedVM,
+ConvertUnsafe USING [SubString],
+MobComData USING [data],
+MobControlDefs,
+MobDefs,
+MobErrorDefs USING [ErrorNameBase],
+MobHashOps USING [Reset],
+MobUtilDefs,
+MobSymbols USING [CXIndex, HTIndex, HTNull, STIndex, stNull],
+MobTree USING [Index, Link, Scan, ConfigSons],
+MobTreeOps USING [GetNode, ScanList],
+IO USING [GetLength, SetIndex, SetLength, STREAM, --PutRope,-- UnsafePutBlock, UnsafeGetBlock],
+OSMiscOps USING [bytesPerFilePage, bytesPerUnit, mobFormat, Stamp, StampToTime],
+Process USING [CheckForAbort],
+Rope USING [Concat, Flatten, FromProc, Length, ROPE],
+Table USING [Base, Selector],
+VM USING [AddressForPageNumber, Allocate, Free, Interval, PageNumber, wordsPerPage];
+
+MobWrite: PROGRAM
+IMPORTS Alloc, Basics, CountedVM, MobErrorDefs, MobUtilDefs, IO, MobHashOps, OSMiscOps, Process, Rope, MobTreeOps, VM, MobComData, CinderSysOps
+EXPORTS MobControlDefs = {
+OPEN MobDefs; 
+
+Span: TYPE = RECORD[base, pages: NAT];
+IOSegment: TYPE = RECORD[file: IO.STREAM, span: Span];
+Sons: TYPE = MobTree.ConfigSons;
+Map: TYPE = RECORD[
+fti: FTIndex,
+type: SegClass,
+filename: Rope.ROPE];
+CopyMap: TYPE = REF CopyMapSeq;
+CopyMapSeq: TYPE = RECORD[SEQUENCE length: CARDINAL OF BOOL];
+FileMap: TYPE = REF FileMapSeq;
+FileMapSeq: TYPE = RECORD[SEQUENCE length: CARDINAL OF FTIndex];
+SymbolMap: TYPE = REF Map;
+
+tb, stb, ctb, mtb, etb, itb, sgb, tyb, tmb, ftb, ntb, spb, fpb, cxb: Table.Base ¬ NIL;
+ssb: LONG STRING;
+fileMap: FileMap ¬ NIL;
+
+nullStream: IO.STREAM = NIL;
+bytesPerUnit: CARD = BYTES[UNIT];
+bytesPerFilePage: CARD = OSMiscOps.bytesPerFilePage;
+unitsPerVMPage: CARDINAL = VM.wordsPerPage;
+bytesPerVMPage: CARDINAL = unitsPerVMPage*OSMiscOps.bytesPerUnit;
+unitsPerFilePage: CARD = bytesPerFilePage/bytesPerUnit;
+bytesPerWord32: CARD = 4;
+
+MobWriteError: PUBLIC ERROR = CODE;
+Error: PROC = {ERROR MobWriteError};
+UserAbort: ERROR = CODE;  -- raised on ­DEL during code or symbol copying
+
+UnitsToBytes: PROC[units: INT] RETURNS[INT] = {
+RETURN[units*bytesPerUnit]};
+
+UnitsToFilePages: PROC[units: INT] RETURNS[INT] = {
+RETURN[(units+unitsPerFilePage-1)/unitsPerFilePage]};
+
+FilePagesToUnits: PROC[pages: INT] RETURNS[INT] = {
+RETURN[pages*unitsPerFilePage]};
+
+BytesToFilePages: PROC[bytes: INT] RETURNS[INT] = {
+RETURN[(bytes+bytesPerFilePage-1)/bytesPerFilePage]};
+
+FilePagesToBytes: PROC[pages: INT] RETURNS[INT] = {
+RETURN[pages*bytesPerFilePage]};
+
+VMPagesToBytes: PROC[pages: CARD] RETURNS[CARD] = {
+RETURN[pages*bytesPerVMPage]};
+
+
+WriteMob: PUBLIC PROC[root: MobTree.Link] = {
+
+Notifier: Alloc.Notifier = {
+tb  ¬ base[treetype];  
+stb ¬ base[sttype];
+ctb ¬ base[cttype];    
+mtb ¬ base[mttype];  
+tyb ¬ base[typtype];   
+tmb ¬ base[tmtype];
+etb ¬ base[exptype];   
+itb ¬ base[imptype];
+sgb ¬ base[sgtype];    
+ftb ¬ base[fttype];
+spb ¬ base[sptype];    
+fpb ¬ base[fptype];
+ntb ¬ base[nttype];    
+ssb ¬ base[sstype];
+cxb ¬ base[cxtype];
+IF mobh # NIL THEN {
+IF mobh.bases # MobUtilDefs.nullBases THEN { -- CHECK THIS for perf. problems
+mobh.bases.ctb ¬ ctb;  
+mobh.bases.mtb ¬ mtb;
+mobh.bases.tyb ¬ tyb; 
+mobh.bases.tmb ¬ tmb;  
+mobh.bases.spb ¬ spb; 
+mobh.bases.fpb ¬ fpb}
+};
+};
+
+CopyImport: MobTree.Scan = {
+OPEN MobSymbols;
+sti: STIndex ¬ stNull;
+olditi, iti: IMPIndex;
+WITH t SELECT FROM
+symbol => sti ¬ index;
+subtree =>
+WITH s1:tb[index].son[1] SELECT FROM
+symbol => sti ¬ s1.index;
+ENDCASE => Error[];
+ENDCASE => Error[];
+olditi ¬ stb[sti].impi;
+IF sti = stNull OR olditi = IMPNull THEN RETURN;
+iti ¬ MobUtilDefs.EnterImport[mobh, olditi, TRUE];
+itb[iti].file ¬ MapFile[itb[iti].file, mobh];
+IF mobh.bHeader.firstdummy = 0 THEN mobh.bHeader.firstdummy ¬ itb[iti].modIndex;
+mobh.bHeader.nImports ¬ mobh.bHeader.nImports + 1;
+mobh.bHeader.nDummies ¬ mobh.bHeader.nDummies + 1};
+
+CopyExport: MobTree.Scan = {
+OPEN MobSymbols;
+sti: STIndex ¬ stNull;
+hti: HTIndex ¬ HTNull;
+neweti: EXPIndex ¬ EXPNull;
+oldeti: EXPIndex ¬ EXPNull;
+WITH t SELECT FROM
+symbol => sti ¬ index;
+subtree =>
+WITH s1:tb[index].son[1] SELECT FROM
+symbol => {sti ¬ s1.index; hti ¬ stb[sti].hti};
+ENDCASE => Error[];
+ENDCASE => Error[];
+WITH s:stb[sti] SELECT FROM
+external => 
+WITH m:s.map SELECT FROM
+interface => {
+OPEN new: etb[neweti];
+oldeti ¬ m.expi;
+neweti ¬ MobUtilDefs.EnterExport[mobh, oldeti, TRUE];
+FOR i: CARD16 IN [0..new.nLinks) DO new[i] ¬ mobh.bases.etb[oldeti][i]; ENDLOOP;
+new.file ¬ MapFile[new.file, mobh]};
+module => [] ¬ NewExportForModule[m.mti, HTNull];
+ENDCASE => RETURN;
+ENDCASE => RETURN;
+mobh.bHeader.nExports ¬ mobh.bHeader.nExports + 1};
+
+mobh: MobUtilDefs.MobHandle ¬ NIL;
+saveIndex: CARDINAL = MobComData.data.textIndex;
+node, subNode: MobTree.Index;
+symbolMap: SymbolMap ¬ NIL;
+copyMap: CopyMap ¬ NIL;
+
+Alloc.AddNotify[MobComData.data.table, Notifier];
+node ¬ MobTreeOps.GetNode[root];
+[mobh, symbolMap, copyMap] ¬ Initialize[];
+CopyConfigs[mobh];
+CopyModules[mobh];
+CopySpaces[mobh];  
+CopyFramePacks[mobh];
+subNode ¬ MobTreeOps.GetNode[tb[node].son[3]];
+MobComData.data.textIndex ¬ tb[subNode].info;
+MobTreeOps.ScanList[tb[subNode].son[1], CopyImport];
+MobTreeOps.ScanList[tb[subNode].son[2], CopyExport];
+IF tb[subNode].attrs[$exportsALL] THEN
+ExportCx[MobUtilDefs.ContextForTree[tb[subNode].son[Sons.name.ORD]], mobh];
+IF MobComData.data.copySymbols THEN EnterMissingSymbolFiles[mobh, copyMap];
+TableOut[mobh, symbolMap, copyMap];
+Finalize[mobh];  
+symbolMap ¬ NIL;
+MobComData.data.textIndex ¬ saveIndex;
+Alloc.DropNotify[MobComData.data.table, Notifier];  
+};
+
+Initialize: PROC RETURNS [mobh: MobUtilDefs.MobHandle, symbolMap: SymbolMap, copyMap: CopyMap ¬ NIL] = {
+impSize, expSize, sgSize, fSize, nSize, ssSize: CARDINAL;
+nSgis: CARDINAL;
+b: Table.Base;
+desc: ConvertUnsafe.SubString;
+table: Alloc.Handle = MobComData.data.table;
+vmh: CountedVM.Handle;
+
+symbolMap ¬ NIL;
+desc.base ¬ LOOPHOLE[Rope.Flatten[MobComData.data.sourceName]];
+desc.offset ¬ 0;
+desc.length ¬ Rope.Length[MobComData.data.sourceName];
+IF MobComData.data.copySymbols THEN symbolMap ¬ InitSymbolCopy[];
+impSize ¬ Alloc.Bounds[table, imptype].size;
+expSize ¬ Alloc.Bounds[table, exptype].size;
+sgSize ¬ Alloc.Bounds[table, sgtype].size;
+nSgis ¬ sgSize/SGRecord.SIZE;
+fSize ¬ Alloc.Bounds[table, fttype].size;
+nSize ¬ Alloc.Bounds[table, nttype].size;
+ssSize ¬ Alloc.Bounds[table, sstype].size;
+fileMap ¬ NEW[FileMapSeq[fSize/FTRecord.SIZE]];
+FOR i: CARDINAL IN [0..fileMap.length) DO fileMap[i] ¬ FTNull ENDLOOP;
+vmh ¬ CountedVM.SimpleAllocate[
+Mob.SIZE + impSize + expSize + sgSize + fSize + nSize + ssSize];
+
+mobh ¬ NEW[MobUtilDefs.MobObject ¬ [LOOPHOLE[vmh.pointer], vmh, MobUtilDefs.nullBases, MobUtilDefs.nullLimits]];
+b ¬ LOOPHOLE[mobh.bHeader, Table.Base] + Mob.SIZE;
+Basics.MoveBytes[dstBase~(mobh.bases.etb ¬ b), dstStart~0, srcBase~etb, srcStart~0, count~expSize*BYTES[UNIT]];
+b ¬ b + expSize;  Alloc.Trim[table, exptype, 0];
+Basics.MoveBytes[dstBase~(mobh.bases.itb ¬ b), dstStart~0, srcBase~itb, srcStart~0, count~impSize*BYTES[UNIT]];
+b ¬ b + impSize;  Alloc.Trim[table, imptype,0];
+Basics.MoveBytes[dstBase~(mobh.bases.ftb ¬ b), dstStart~0, srcBase~ftb, srcStart~0, count~fSize*BYTES[UNIT]];
+b ¬ b + fSize;  Alloc.Trim[table, fttype,0];
+Basics.MoveBytes[dstBase~(mobh.bases.ntb ¬ b), dstStart~0, srcBase~ntb, srcStart~0, count~nSize*BYTES[UNIT]];
+b ¬ b + nSize;  Alloc.Trim[table, nttype,0];
+Basics.MoveBytes[dstBase~(mobh.bases.ssb ¬ b), dstStart~0, srcBase~LOOPHOLE[ssb], srcStart~0, count~ssSize*BYTES[UNIT]];
+b ¬ b + ssSize;
+MobHashOps.Reset[];
+InitHeader[
+mob: mobh.bHeader, 
+objectVersion: OSMiscOps.StampToTime[MobComData.data.objectStamp], 
+source: MobUtilDefs.EnterName[desc], 
+sourceVersion: MobComData.data.sourceVersion];
+mobh.bases.ctb ¬ Alloc.Bounds[table, cttype].base;
+mobh.bases.mtb ¬ Alloc.Bounds[table, mttype].base;
+mobh.bases.tyb ¬ Alloc.Bounds[table, typtype].base;
+mobh.bases.tmb ¬ Alloc.Bounds[table, tmtype].base;
+mobh.bases.spb ¬ Alloc.Bounds[table, sptype].base;
+mobh.bases.fpb ¬ Alloc.Bounds[table, fptype].base;
+IF MobComData.data.copySymbols THEN {
+MapSymbolFiles[mobh, symbolMap]; 
+copyMap ¬ InitCopyMap[nSgis]};
+mobh.bases.sgb ¬ Alloc.Bounds[table, sgtype].base;
+MapSegments[$code, mobh]; -- CHECK THIS can we get rid of this?
+IF ~MobComData.data.copySymbols THEN MapSegments[$symbols, mobh];
+};
+
+Finalize: PROC [mobh: MobUtilDefs.MobHandle] = {
+fileMap ¬ NIL;  
+mobh.limits ¬ MobUtilDefs.nullLimits;
+mobh.bases ¬ MobUtilDefs.nullBases;
+mobh.bHeader ¬ NIL;
+IF mobh.countedVMHandle # NIL THEN CountedVM.Free[mobh.countedVMHandle];
+};
+
+CopyName: PROC[olditem, newitem: Namee, mobh: MobUtilDefs.MobHandle] = {
+newNti: NTIndex = LOOPHOLE[Alloc.Units[MobComData.data.table, nttype, NTRecord.SIZE]];
+FOR nti: NTIndex ¬ NTIndex.FIRST, nti+NTRecord.SIZE DO
+OPEN old: mobh.bases.ntb[nti];
+IF old.item = olditem THEN {
+OPEN new: ntb[newNti];
+new.item ¬ newitem; new.name ¬ MobUtilDefs.MapName[mobh, old.name];
+RETURN};
+ENDLOOP
+};
+
+CopyConfigs: PROC [mobh: MobUtilDefs.MobHandle] = {
+cti: CTIndex ¬ CTIndex.FIRST;
+ctLimit: CTIndex = LOOPHOLE[Alloc.Top[MobComData.data.table, cttype]];
+UNTIL cti = ctLimit DO
+mobh.bHeader.nConfigs ¬ mobh.bHeader.nConfigs + 1;
+ctb[cti].name ¬ MobUtilDefs.MapName[mobh, ctb[cti].name];
+ctb[cti].file ¬ MapFile[ctb[cti].file, mobh];
+IF ctb[cti].namedInstance THEN CopyName[[0,0,config[cti]], [0,0,config[cti]], mobh];
+cti ¬ cti + (CTRecord.SIZE + ctb[cti].nControls*Namee.SIZE);
+ENDLOOP
+};
+
+CopyModules: PROC [mobh: MobUtilDefs.MobHandle] = {
+
+MapOne: PROC[mti: MTIndex] RETURNS[BOOL ¬ FALSE] = {
+OPEN m: mtb[mti];
+mobh.bHeader.nModules ¬ mobh.bHeader.nModules + 1;
+m.name ¬ MobUtilDefs.MapName[mobh, m.name];
+m.file ¬ MapFile[m.file, mobh];
+IF m.namedInstance THEN CopyName[[0,0,module[mti]], [0,0,module[mti]], mobh]};
+
+EnumerateModules[MapOne]};
+
+EnumerateModules: PROC[p: PROC[MTIndex] RETURNS[BOOL]] = {
+mti: MTIndex ¬ MTIndex.FIRST;
+mtLimit: MTIndex = LOOPHOLE[Alloc.Top[MobComData.data.table, mttype]];
+UNTIL mti = mtLimit DO
+IF p[mti] THEN EXIT;
+mti ¬ mti + MTRecord.SIZE;
+ENDLOOP
+};
+
+CopySpaces: PROC [mobh: MobUtilDefs.MobHandle] = {
+
+MapOne: PROC[spi: SPIndex] RETURNS[BOOL ¬ FALSE] = {
+FOR i: CARDINAL IN [0..spb[spi].length) DO
+spb[spi].spaces[i].name ¬ MobUtilDefs.MapName[mobh, spb[spi].spaces[i].name];
+ENDLOOP
+};
+
+EnumerateSpaces[MapOne]};
+
+EnumerateSpaces: PROC[p: PROC[SPIndex] RETURNS[BOOL]] = {
+spi: SPIndex ¬ SPIndex.FIRST; 
+spLimit: SPIndex = LOOPHOLE[Alloc.Top[MobComData.data.table, sptype]];
+UNTIL spi = spLimit DO
+IF p[spi] THEN EXIT;
+spi ¬ spi + SPRecord.SIZE + spb[spi].length*SpaceID.SIZE;
+ENDLOOP
+};
+
+CopyFramePacks: PROC [mobh: MobUtilDefs.MobHandle] = {
+
+MapOne: PROC[fpi: FPIndex] RETURNS[BOOL ¬ FALSE] = {
+fpb[fpi].name ¬ MobUtilDefs.MapName[mobh, fpb[fpi].name]};
+
+EnumerateFramePacks[MapOne]};
+
+EnumerateFramePacks: PROC[p: PROC[FPIndex] RETURNS[BOOL]] = {
+fpi: FPIndex ¬ FPIndex.FIRST;
+fpLimit: FPIndex = LOOPHOLE[Alloc.Top[MobComData.data.table, fptype]];
+UNTIL fpi = fpLimit DO
+IF p[fpi] THEN RETURN;
+fpi ¬ fpi + FPRecord.SIZE + fpb[fpi].length*MTIndex.SIZE;
+ENDLOOP};
+<<
+NewExportForModule: PROC[mti: MTIndex, name: MobSymbols.HTIndex]
+RETURNS[eti: EXPIndex] = {
+OPEN MobSymbols;
+eti ¬ LOOPHOLE[Alloc.Units[MobComData.data.table, exptype, EXPRecord.SIZE+1*Link.SIZE]];
+etb[eti].name ¬ mtb[mti].name;
+etb[eti].port ¬ $module;
+etb[eti].namedInstance ¬ name # HTNull;
+etb[eti].typeExported ¬ FALSE;
+etb[eti].file ¬ mtb[mti].file;
+etb[eti].links[0].from ¬ [tag: $var, modIndex: mtb[mti].modIndex, offset: 0];
+IF name # HTNull THEN {
+nti: NTIndex = LOOPHOLE[Alloc.Units[MobComData.data.table, nttype, NTRecord.SIZE]];
+ntb[nti] ¬ [name: MobUtilDefs.NameForHti[name], item: [0,0,module[mti]]]};
+RETURN};
+>>
+NewExportForModule: PROC[mti: MTIndex, name: MobSymbols.HTIndex]
+RETURNS[eti: EXPIndex] = {
+OPEN MobSymbols;
+tempLink: MobDefs.Link;
+tempFile: MobDefs.FTIndex;
+eth: MobDefs.EXPHandle;
+eti ¬ LOOPHOLE[Alloc.Units[MobComData.data.table, exptype, EXPRecord.SIZE+1*Link.SIZE]];
+eth ¬ @etb[eti];
+eth.name ¬ mtb[mti].name;
+eth.port ¬ $module;
+eth.namedInstance ¬ name # HTNull;
+eth.typeExported ¬ FALSE;
+--eth.file ¬ mtb[mti].file;
+tempFile ¬ mtb[mti].file;
+eth.file ¬ tempFile;
+--eth.links[0].from ¬ [tag: $var, modIndex: mtb[mti].modIndex, offset: 0];
+tempLink ¬ [tag: $var, modIndex: mtb[mti].modIndex, offset: 0];
+eth.links[0].from ¬ tempLink;
+IF name # HTNull THEN {
+nti: NTIndex = LOOPHOLE[Alloc.Units[MobComData.data.table, nttype, NTRecord.SIZE]];
+ntb[nti] ¬ [name: MobUtilDefs.NameForHti[name], item: [0,0,module[mti]]]};
+RETURN};
+
+SameExport: PROC[a, b: LONG POINTER TO MobDefs.EXPRecord] RETURNS[BOOL] = {
+RETURN[
+a.name = b.name
+AND a.file = b.file
+AND a.port = b.port
+AND a.namedInstance = b.namedInstance
+AND a.typeExported = b.typeExported];
+};
+
+ExportCx: PROC[cx: MobSymbols.CXIndex, mobh: MobUtilDefs.MobHandle] = {
+OPEN MobSymbols;
+neweti, oldeti: EXPIndex ¬ EXPNull;
+FOR sti: STIndex ¬ cxb[cx].link, stb[sti].link UNTIL sti = stNull DO {
+IF ~stb[sti].filename THEN 
+WITH s: stb[sti] SELECT FROM
+external =>
+WITH m: s.map SELECT FROM
+interface => {  
+OPEN old: mobh.bases.etb[oldeti], new: etb[neweti];
+existingEti: EXPIndex ¬ EXPIndex.FIRST;
+etLimit: EXPIndex = LOOPHOLE[Alloc.Top[MobComData.data.table, exptype]];
+oldeti ¬ m.expi;
+UNTIL existingEti = etLimit DO
+IF SameExport[@old, @etb[existingEti]] THEN GO TO AlreadyExported;
+existingEti ¬ existingEti + SIZE[EXPRecord[etb[existingEti].nLinks]];
+ENDLOOP;  
+neweti ¬ MobUtilDefs.EnterExport[mobh, oldeti, TRUE];
+FOR i: CARD16 IN [0..new.nLinks) DO new[i] ¬ old[i]; ENDLOOP;
+new.file ¬ MapFile[new.file, mobh];
+mobh.bHeader.nExports ¬ mobh.bHeader.nExports + 1};
+ENDCASE;
+ENDCASE;
+EXITS
+AlreadyExported => NULL}; 
+ENDLOOP
+};
+
+
+IndexForFti: PROC[fti: FTIndex] RETURNS[CARD] = INLINE {
+RETURN[LOOPHOLE[fti,CARD]/FTRecord.SIZE]};
+
+MapFile: PROC[fti: FTIndex, mobh: MobUtilDefs.MobHandle] RETURNS[FTIndex] = {
+SELECT fti FROM
+FTNull, FTSelf => RETURN[fti];
+ENDCASE => {
+fileIndex: CARD = IndexForFti[fti];
+IF fileMap[fileIndex] = FTNull THEN fileMap[fileIndex] ¬ MobUtilDefs.MergeFile[mobh, fti];
+RETURN[fileMap[fileIndex]]}
+};
+
+InitHeader: PROC[
+mob: MobDefs.MobBase,
+objectVersion: VersionStamp,
+source: NameRecord ¬ NullName,
+sourceVersion: VersionStamp ¬ NullVersion] = {
+IF mob # NIL THEN Basics.FillWords[LOOPHOLE[mob], BYTES[MobDefs.Mob]/bytesPerWord32, 0];
+mob.versionIdent ¬ MobDefs.VersionID;
+mob.format ¬ OSMiscOps.mobFormat;
+mob.version ¬ objectVersion;
+mob.creator ¬ MobComData.data.binderVersion;
+mob.definitions ¬ (MobComData.data.op = $conc);
+mob.typeExported ¬ MobComData.data.typeExported;
+mob.source ¬ source;  
+mob.sourceVersion ¬ sourceVersion;
+mob.repackaged ¬ 
+Alloc.Bounds[MobComData.data.table, sptype].size # 0 OR Alloc.Bounds[MobComData.data.table, fptype].size # 0;
+mob.inlineFloat ¬ FALSE;
+mob.mappingStarted ¬ FALSE;
+mob.mappingFinished ¬ FALSE;
+};
+
+InitSymbolCopy: PROC RETURNS [symbolMap: SymbolMap] = {
+
+Setup: PROC[file: Rope.ROPE, type: SegClass] RETURNS[SymbolMap] = {
+RETURN[NEW[Map ¬ [
+type: type,
+filename: file,
+fti: IF file = NIL THEN FTSelf 
+ELSE MobUtilDefs.EnterFile[LOOPHOLE[Rope.Flatten[file]]]
+]]]
+};
+
+symbolMap ¬ Setup[MobComData.data.symbolName, $symbols];
+};
+
+MapSymbolFiles: PROC [mobh: MobUtilDefs.MobHandle, symbolMap: SymbolMap] = {
+symbolMap.fti ¬ MapFile[symbolMap.fti, mobh]};
+
+EnumerateSegments: PROC[proc: PROC[SGIndex]] = {
+sgLimit: SGIndex = LOOPHOLE[Alloc.Top[MobComData.data.table, sgtype]];
+FOR sgi: SGIndex ¬ SGIndex.FIRST, sgi + SGRecord.SIZE UNTIL sgi = sgLimit DO 
+proc[sgi] ENDLOOP
+};
+
+MapSegments: PROC[type: SegClass, mobh: MobUtilDefs.MobHandle] = {
+CopySegment: PROC[sgi: SGIndex] = {
+IF sgb[sgi].class = type THEN sgb[sgi].file ¬ MapFile[sgb[sgi].file, mobh]};
+EnumerateSegments[CopySegment]};
+
+BumpVersion: PROC[v: VersionStamp, n: CARDINAL] RETURNS[VersionStamp] = {
+v[0] ¬ v[0] + n;  RETURN[v]};
+
+MoveToPageBoundary: PROC[stream: IO.STREAM, page: CARDINAL] = {
+pos: INT = page * FilePagesToBytes[1];
+IF pos > stream.GetLength THEN stream.SetLength[pos];
+stream.SetIndex[pos]};
+
+WriteFromPages: PROC[
+stream: IO.STREAM, pages: IOSegment, bytes: CARDINAL] = {
+bufferPages: CARDINAL = MIN[pages.span.pages, 16];
+bufferInterval: VM.Interval ¬ VM.Allocate[bufferPages];
+{ ENABLE UNWIND => bufferInterval.Free[];
+base: CARDINAL ¬ pages.span.base;
+pointer: LONG POINTER ¬ VM.AddressForPageNumber[bufferInterval.page];
+WHILE bytes # 0 DO
+bytesToTransfer: INT = MIN[bytes, VMPagesToBytes[bufferPages]];
+pagesToTransfer: INT = BytesToFilePages[bytesToTransfer];
+IO.SetIndex[pages.file, FilePagesToBytes[base]];
+[] ¬ IO.UnsafeGetBlock[pages.file, [pointer, 0, bytesToTransfer]];
+IO.UnsafePutBlock[stream, [pointer, 0, bytesToTransfer]];
+base ¬ (base + pagesToTransfer);
+bytes ¬ (bytes - bytesToTransfer);
+ENDLOOP;
+};
+bufferInterval.Free[]};
+
+WrongOldSegVersion: PROC[s: IOSegment, version: MobDefs.VersionStamp] 
+RETURNS[reply: BOOL] = {
+h: MobDefs.MobBase;
+headerInterval: VM.Interval ¬ VM.Allocate[1];
+{ ENABLE UNWIND => headerInterval.Free[];
+h ¬ LOOPHOLE[VM.AddressForPageNumber[headerInterval.page]];
+IO.SetIndex[s.file, 0];
+[] ¬ IO.UnsafeGetBlock[s.file, [LOOPHOLE[h], 0, VMPagesToBytes[1]]];
+reply ¬ (h.version # version);
+};
+headerInterval.Free[];
+RETURN[reply]};
+
+
+IndexForSgi: PROC[sgi: SGIndex] RETURNS[CARD] = INLINE {
+RETURN[LOOPHOLE[sgi,CARD]/SGRecord.SIZE]};
+
+SgiForIndex: PROC[i: CARD] RETURNS[SGIndex] = INLINE {
+RETURN[SGIndex.FIRST + i*SGRecord.SIZE]};
+
+InitCopyMap: PROC[nsgis: CARDINAL]  RETURNS [copyMap: CopyMap] = {
+copyMap ¬ NEW[CopyMapSeq[nsgis]];
+FOR i: CARDINAL IN [0..nsgis) DO copyMap[i] ¬ FALSE ENDLOOP;};
+
+SetCopied: PROC[sgi: SGIndex, copyMap: CopyMap] = {copyMap[IndexForSgi[sgi]] ¬ TRUE};
+
+Copied: PROC[sgi: SGIndex, copyMap: CopyMap] RETURNS [BOOL] = {
+RETURN[copyMap[IndexForSgi[sgi]]]};
+
+ReadSgMap: PROC[old: SGIndex] RETURNS[SGIndex] = {
+RETURN[old]};
+
+FixAllSgis: PROC = {
+
+FixModule: PROC[mti: MTIndex] RETURNS[BOOL ¬ FALSE] = {
+OPEN m: mtb[mti];
+m.code.sgi ¬ ReadSgMap[m.code.sgi];
+m.sseg ¬ ReadSgMap[m.sseg]};
+
+FixSpace: PROC[spi: SPIndex] RETURNS[BOOL ¬ FALSE] = {
+OPEN sp: spb[spi];
+sp.seg ¬ ReadSgMap[sp.seg]};
+
+EnumerateModules[FixModule];
+EnumerateSpaces[FixSpace]};
+
+
+EstimateCopiedPages: PROC [mobh: MobUtilDefs.MobHandle] RETURNS[symbolPages: CARDINAL ¬ 0] = {
+packaged: BOOL ¬ FALSE;
+AddModule: PROC[mti: MTIndex] RETURNS[BOOL ¬ FALSE] = {
+OPEN m: mtb[mti];
+IF MobComData.data.copySymbols AND m.sseg # SGNull THEN {
+OPEN seg: mobh.bases.sgb[m.sseg];
+symbolPages ¬ symbolPages + UnitsToFilePages[seg.units.units + seg.extraUnits.units]};
+RETURN};
+IF MobComData.data.copySymbols THEN EnumerateModules[AddModule];
+RETURN};
+
+EnterMissingSymbolFiles: PROC [mobh: MobUtilDefs.MobHandle, copyMap: CopyMap] = {
+CheckOneMobSymbolsFileSeg: PROC[oldSgi: SGIndex] = { 
+OPEN seg: mobh.bases.sgb[oldSgi];
+IF (seg.class = $symbols) AND ~Copied[oldSgi, copyMap] AND (seg.file # FTNull) THEN
+[] ¬ MapFile[mobh.bases.sgb[oldSgi].file, mobh]
+};
+EnumerateSegments[CheckOneMobSymbolsFileSeg]};
+
+MoveSymbolSegments: PROC[copiedPages: CARDINAL, mobh: MobUtilDefs.MobHandle, curPage: CARD, symbolMap: SymbolMap, copyMap: CopyMap] RETURNS [nextMobPage: CARDINAL] = {
+stream: IO.STREAM;
+nextPage: CARDINAL;
+
+MoveOne: PROC[oldSgi: SGIndex] = { 
+OPEN seg: mobh.bases.sgb[oldSgi];
+f: IO.STREAM ¬ nullStream;
+newSgi: SGIndex;
+Process.CheckForAbort[];
+IF (seg.class # $symbols) OR Copied[oldSgi, copyMap] OR (seg.file = FTNull) THEN RETURN;
+newSgi ¬ ReadSgMap[oldSgi];
+f ¬ FileForFti[seg.file, mobh]; -- Does a CinderSysOps.Open
+IF f = nullStream THEN {
+MobErrorDefs.ErrorNameBase[
+class: $warning, s: "could not be opened to copy symbols", 
+name: mobh.bases.ftb[seg.file].name, base: mobh.bases.ssb];
+sgb[newSgi] ¬ mobh.bases.sgb[oldSgi];
+sgb[newSgi].file ¬ MapFile[mobh.bases.sgb[oldSgi].file, mobh]}
+ELSE {
+s: IOSegment = [
+file: f,
+span: [
+base: UnitsToFilePages[seg.base.units], 
+pages: UnitsToFilePages[seg.units.units + seg.extraUnits.units]]];
+IF WrongOldSegVersion[s, mobh.bases.ftb[seg.file].version] THEN {
+MobErrorDefs.ErrorNameBase[
+class: $error, s: "on disk has incorrect version",
+name: mobh.bases.ftb[seg.file].name, base: mobh.bases.ssb];
+mobh.bHeader.versionIdent ¬ 0}
+ELSE {
+segPages: CARDINAL = s.span.pages;
+sgb[newSgi].file ¬ symbolMap.fti;
+sgb[newSgi].base.units ¬ FilePagesToUnits[nextPage];
+MoveToPageBoundary[stream: stream, page: (nextPage-1)];
+WriteFromPages[
+stream: stream, pages: s, 
+bytes: FilePagesToBytes[segPages]];
+nextPage ¬ nextPage + segPages};
+IF f # NIL THEN {
+[] ¬ CinderSysOps.Close[f];
+f ¬ nullStream;
+};
+};
+SetCopied[oldSgi, copyMap]};
+
+IF symbolMap.fti = FTSelf
+THEN {
+nextPage ¬ curPage;
+stream ¬ MobComData.data.outputStream; 
+}
+ELSE {
+-- Workaround for mimosa bug, old code:
+Long: PROC [p: LONG POINTER] RETURNS [LONG POINTER] = { RETURN[p]};
+lh: MobDefs.Mob;
+mobPages: CARDINAL = UnitsToFilePages[MobDefs.Mob.SIZE];
+version: VersionStamp = BumpVersion[
+OSMiscOps.StampToTime[MobComData.data.objectStamp], 2 ]; 
+MobUtilDefs.SetFileVersion[symbolMap.fti, version];
+stream ¬ CinderSysOps.Open[symbolMap.filename, $write].stream;
+IO.SetLength[stream, FilePagesToBytes[mobPages + copiedPages]];
+InitHeader[mob: @lh, objectVersion: version];
+lh.version ¬ ftb[symbolMap.fti].version;
+IO.UnsafePutBlock[stream, [LOOPHOLE[Long[@lh]], 0, UnitsToBytes[MobDefs.Mob.SIZE]]];
+nextPage ¬ mobPages + 1;
+};
+EnumerateSegments[MoveOne];
+IF symbolMap.fti = FTSelf THEN nextMobPage ¬ nextPage 
+ELSE [] ¬ CinderSysOps.Close[stream]};
+
+FileForFti: PROC[oldFti: MobDefs.FTIndex, mobh: MobUtilDefs.MobHandle] RETURNS[f: IO.STREAM] = {
+name: MobDefs.NameRecord = mobh.bases.ftb[oldFti].name;
+ssd: ConvertUnsafe.SubString ¬ [
+base: mobh.bases.ssb, offset: name+1, length: mobh.bases.ssb.text[name].ORD];
+f ¬ nullStream;
+f ¬ CinderSysOps.Open[NormalizeFileName[ssd], $read].stream;
+RETURN};
+
+NormalizeFileName: PROC[in: ConvertUnsafe.SubString] RETURNS[Rope.ROPE] = {
+dot: BOOL ¬ FALSE;
+i: CARDINAL ¬ in.offset;
+
+EachChar: SAFE PROC RETURNS[c: CHAR] ~ TRUSTED {
+c ¬ in.base[i];  i ¬ i + 1;
+SELECT c FROM
+'. => dot ¬ TRUE;
+ENDCASE;
+RETURN};
+
+name: Rope.ROPE = Rope.FromProc[in.length, EachChar];
+RETURN[IF ~dot THEN name.Concat[".mob"] ELSE name]};
+
+
+WriteSubTable: PROC[selector: Table.Selector] = {
+base: Table.Base;
+size: CARDINAL;
+[base, size] ¬ Alloc.Bounds[MobComData.data.table, selector];
+IO.UnsafePutBlock[MobComData.data.outputStream, [base, 0, UnitsToBytes[size]]]};
+
+TableOut: PROC [mobh: MobUtilDefs.MobHandle, symbolMap: SymbolMap, copyMap: CopyMap] = { 
+d, s: INT;
+nextMobPage, mobPages, symbolPages: CARDINAL;
+basePages: CARDINAL;
+table: Alloc.Handle = MobComData.data.table;
+saveNextPage: CARDINAL;
+BEGIN OPEN mobh.bHeader;
+IF firstdummy = 0 THEN firstdummy ¬ MobUtilDefs.GetGfi[0];
+d ¬ Mob.SIZE;
+ssOffset.units ¬ d;  d ¬ d + (s ¬ Alloc.Bounds[table, sstype].size);
+ssLimit ¬ LOOPHOLE[s];
+ctOffset.units ¬ d;  d ¬ d + (s ¬ Alloc.Bounds[table, cttype].size);
+ctLimit ¬ LOOPHOLE[s];
+mtOffset.units ¬ d;  d ¬ d + (s ¬ Alloc.Bounds[table, mttype].size);  
+mtLimit ¬ LOOPHOLE[s];  
+impOffset.units ¬ d;  d ¬ d + (s ¬ Alloc.Bounds[table, imptype].size);
+impLimit ¬ LOOPHOLE[s];
+expOffset.units ¬ d;  d ¬ d + (s ¬ Alloc.Bounds[table, exptype].size);
+expLimit ¬ LOOPHOLE[s];
+evOffset.units ¬ d;  d ¬ d + (s ¬ Alloc.Bounds[table, evtype].size);
+evLimit ¬ LOOPHOLE[s, EVIndex];
+sgOffset.units ¬ d;  d ¬ d + (s ¬ Alloc.Bounds[table, sgtype].size);
+sgLimit ¬ LOOPHOLE[s];
+ftOffset.units ¬ d;  d ¬ d + (s ¬ Alloc.Bounds[table, fttype].size);
+ftLimit ¬ LOOPHOLE[s];
+ntOffset.units ¬ d;  d ¬ d + (s ¬ Alloc.Bounds[table, nttype].size);
+ntLimit ¬ LOOPHOLE[s];
+typOffset.units ¬ d;  d ¬ d + (s ¬ Alloc.Bounds[table, typtype].size);
+typLimit ¬ LOOPHOLE[s];
+tmOffset.units ¬ d;  d ¬ d + (s ¬ Alloc.Bounds[table, tmtype].size);
+tmLimit ¬ LOOPHOLE[s];
+spOffset.units ¬ d;  d ¬ d + (s ¬ Alloc.Bounds[table, sptype].size);
+spLimit ¬ LOOPHOLE[s];
+fpOffset.units ¬ d;  d ¬ d + (s ¬ Alloc.Bounds[table, fptype].size);
+fpLimit ¬ LOOPHOLE[s];
+lfOffset.units ¬ d;  d ¬ d + (s ¬ Alloc.Bounds[table, lftype].size);
+lfLimit ¬ LOOPHOLE[s];
+rfOffset.units ¬ d;  d ¬ d + (s ¬ Alloc.Bounds[table, rftype].size);
+rfLimit ¬ LOOPHOLE[s];
+tfOffset.units ¬ d;  d ¬ d + (s ¬ Alloc.Bounds[table, tftype].size);
+tfLimit ¬ LOOPHOLE[s];
+rtOffset.units ¬ d;
+rtLimit.units ¬ 0; -- rt Table is always empty
+basePages ¬ UnitsToFilePages[d];
+extended ¬ TRUE;
+nBytes ¬ FilePagesToBytes[mobPages ¬ basePages-- + rtPageCount--];
+END;
+symbolPages ¬ EstimateCopiedPages[mobh];
+IF MobComData.data.copySymbols AND symbolMap.fti = FTSelf THEN
+mobPages ¬ mobPages + symbolPages;
+saveNextPage ¬ nextMobPage ¬ BytesToFilePages[mobh.bHeader.nBytes] + 1;
+IF MobComData.data.copySymbols THEN 
+nextMobPage ¬ MoveSymbolSegments[symbolPages, mobh, nextMobPage, symbolMap, copyMap
+! UserAbort => {GO TO AbortRequested}];
+IO.SetIndex[MobComData.data.outputStream, 0];
+IO.UnsafePutBlock[MobComData.data.outputStream, [LOOPHOLE[mobh.bHeader], 0, UnitsToBytes[Mob.SIZE]]];
+WriteSubTable[sstype];
+WriteSubTable[cttype];
+WriteSubTable[mttype];
+WriteSubTable[imptype];
+WriteSubTable[exptype];
+WriteSubTable[evtype];
+WriteSubTable[sgtype];
+WriteSubTable[fttype];
+WriteSubTable[nttype];
+WriteSubTable[typtype];
+WriteSubTable[tmtype];
+WriteSubTable[sptype];
+WriteSubTable[fptype];
+WriteSubTable[lftype];
+WriteSubTable[rftype];
+WriteSubTable[tftype];
+IF nextMobPage # saveNextPage THEN
+MoveToPageBoundary[stream: MobComData.data.outputStream, page: (nextMobPage-1)];
+MobComData.data.nConfigs ¬ mobh.bHeader.nConfigs; 
+MobComData.data.nModules ¬ mobh.bHeader.nModules;
+MobComData.data.nImports ¬ mobh.bHeader.nImports; 
+MobComData.data.nExports ¬ mobh.bHeader.nExports;
+MobComData.data.nPages ¬ BytesToFilePages[mobh.bHeader.nBytes];
+EXITS
+AbortRequested => MobComData.data.aborted ¬ TRUE
+};
+
+}.
+
+   à  
+MobWrite.mesa
+Copyright Ó 1985, 1987, 1989, 1991 by Xerox Corporation.  All rights reserved.
+Satterthwaite on April 18, 1986 11:57:26 am PST
+Russ Atkinson (RRA) January 21, 1987 1:16:04 pm PST
+Andy Litman May 31, 1988 10:49:19 pm PDT
+Bob Hagmann July 18, 1988 6:22:14 pm PDT
+JKF July 22, 1989 4:46:30 pm PDT
+Willie-s, September 25, 1991 9:17 pm PDT
+
+TYPES
+GLOBALS
+CONSTANTS
+ERRORS
+inline utilities
+headerInterval.Free[];
+IF MobComData.data.copySymbols THEN FreeCopyMap[];
+Mob (re)construction
+
+configs are already copied, only map names and files
+modules are already copied, only map names and files
+spaces are already copied, only map names (and segments?)
+framepacks are already copied, only map names
+first make sure that old is not already exported
+file mapping
+
+header processing
+
+... moves the index to the given page boundary.  However, if the size of the file will not permit this, extend the file via SetLength to allow SetIndex to succeed.
+Code Packing
+
+Segment Mapping
+replace all sgis with ReadSgMap[sgi]
+code and symbol copying
+estimates ignore possible packing of code
+insure that a file entry exists for this file 
+IN ['A..'Z] => c _ Ascii.Lower[c];
+Mob Output Routines
+this should be fixed to use Alloc.Bounds[table, rttype]
+Ê  –(cedarcode) style•NewlineDelimiter
+™ šœ™Jšœ
+ÏeœC™NJšÏy,Ðky™/JšœÏkœ ™3Jšž%Ÿ™(Icodešœ% ™(Kš œ™ K™(J™ —š 	˜	Kšœ œE˜PKšœ œ˜$Kšœ œ˜+Kšœ
+˜
+Kšœ œ˜ Kšœ œ˜Kšœ˜Kšœ˜Kšœ œ˜#Kšœ œ	˜Kšœ˜Kšœ œ-˜=Kšœ œ!˜.Kšœ œ˜%Kš œ œ" œ œ ˜_Kšœ
+ œA˜PKšœ œ˜Kšœ œ% œ˜5Kšœ œ˜Kš œ œL˜TK˜ —šÏnœ ˜Kš œ6 œ4 œ˜Kš œ˜Kš œ
+˜K˜ Jš ™Kšœ œ œ œ˜&Kš	œ œ œ œ œ˜6Kšœ œ˜ šœ œ œ˜K˜K˜Kšœ œ˜—Kšœ	 œ œ˜Kšœ œ œ œ	 œ œ œ˜=Kšœ	 œ œ˜Kšœ œ œ œ	 œ œ
+˜@Kšœ œ œ˜K˜ Jš ™KšœR œ˜VKšœ œ œ˜Kšœ œ˜K˜ Jš 	™	Kšœ œ œ œ˜Kšœ œ œ œ˜!Kšœ œ˜4Kšœ œ œ˜+Kšœ œ)˜AKšœ œ!˜7Kšœ œ˜K˜ Jš ™Kš¡œ œ œ œ˜#Kš¡œ œ œ˜$Kš¡	œ œ œÏc/˜IK˜ š
+¡œ œ œ œ œ˜/Kš œ˜—K˜ š
+¡œ œ œ œ œ˜3Kš œ/˜5——˜ š
+¡œ œ œ œ œ˜3Kš œ˜ ——˜ š
+¡œ œ œ œ œ˜3Kš œ/˜5——˜ š
+¡œ œ œ œ œ˜3Kš œ˜ K˜ —š
+¡œ œ œ œ œ˜3Kš œ˜K˜ ——šœ™K˜ š¡œ œ œ˜-K˜ š¡œ˜K˜K˜K˜K˜K˜K˜K˜K˜K˜K˜K˜K˜K˜K˜K˜š œ œ œ˜š œ$ œ¢ ˜MKšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜—K˜—K˜K˜ —š¡
+œ˜Kš œ˜K˜K˜š œ œ ˜K˜˜
+š œ œ ˜$K˜Kš œ˜——Kš œ˜—K˜Kš œ œ œ œ˜0Kšœ, œ˜2K˜-Kš œ œ-˜PKšœ2˜2Kšœ3˜3K˜ —š¡
+œ˜Kš œ˜K˜K˜Kšœ˜Kšœ˜š œ œ ˜K˜˜
+š œ œ ˜$K˜/Kš œ˜——Kš œ˜—š œ œ ˜˜š œ	 œ ˜˜Kš œ˜K˜Kšœ/ œ˜5Kš
+ œ œ œ œ% œ˜PK˜$—K˜1Kš œ œ˜——Kš œ œ˜—Kšœ3˜3K˜ —Kšœ œ˜"Kšœ œ˜0Kšœ˜Kšœ œ˜Kšœ œ˜K˜ Kšœ1˜1K˜ Kšœ*˜*Kšœ˜Kšœ˜Kšœ˜Kšœ˜K˜.Kšœ-˜-K˜4K˜4š œ  ˜&Kšœ> œ
+˜K—Kš œ œ(˜KKšœ#˜#Kšœ˜Kšœ œ˜Kšœ&˜&Kšœ4˜4Kšœ˜K˜ —š¡
+œ œ œH œ˜hKšœ0 œ˜9Kšœ œ˜K˜K˜Kšœ,˜,Kšœ˜K˜ Kšœ œ˜Kšœ œ+˜?K˜Kšœ6˜6Kš œ œ˜AK˜,K˜,K˜*Kšœ œ˜K˜)K˜)K˜*Kšœ
+ œ œ˜/Kš
+ œ œ œ œ œ˜Fšœ˜Kšœ œ8˜@—K˜ Kšœ œ œD˜pKšœ œ! œ˜2šœb œ œ˜oK˜0—šœb œ œ˜oK˜/—šœ` œ œ˜mK˜,—šœ` œ œ˜mK˜,—šœC œ  œ œ˜xK˜—K˜˜Kšœ˜KšœC˜CK˜%Kšœ.˜.—Kšœ2˜2Kšœ2˜2Kšœ3˜3Kšœ2˜2Kšœ2˜2Kšœ2˜2š œ œ˜%Kšœ!˜!Kšœ˜—Kšœ2˜2Kšœ¢%˜?Kš œ œ˜AK˜K˜ —š¡œ œ"˜0Kšœ
+ œ˜Kšœ%˜%Kšœ#˜#Kšœ œ˜Kš œ œ œ&˜HJšœ™Jšœ2™2Kšœ˜K˜ ——šœ™J™ š¡œ œ:˜HKšœ œ5 œ˜Vš œ œ œ ˜6Kš œ˜š œ œ˜Kš œ˜KšœC˜CKš œ˜—Kš ˜—K˜K˜ —š¡œ œ"˜3Jšœ4™4Kšœ œ˜Kšœ œ+˜Fš œ ˜Kšœ2˜2Kšœ9˜9K˜-Kš œ œ6˜TKšœ œ œ˜<Kš ˜—K˜K˜ —š¡œ œ"˜3Jšœ4™4K˜ š
+¡œ œ œ œ œ˜4Kš œ˜Kšœ2˜2Kšœ+˜+K˜Kš œ œ7˜NK˜ —K˜K˜ —š
+¡œ œ œ
+ œ œ˜:Kšœ œ˜Kšœ œ+˜Fš œ ˜Kš œ œ œ˜Kšœ œ˜Kš ˜—K˜K˜ —š¡
+œ œ"˜2Jšœ9™9K˜ š
+¡œ œ œ œ œ˜4š œ œ œ ˜*KšœM˜MKš ˜—˜K˜ ——K˜K˜ —š
+¡œ œ œ
+ œ œ˜9Kšœ œ˜Kšœ œ+˜Fš œ ˜Kš œ œ œ˜Kšœ œ œ˜9Kš ˜—K˜K˜ —š¡œ œ"˜6Jšœ-™-K˜ š
+¡œ œ œ œ œ˜4Kšœ:˜:K˜ —K˜K˜ —š
+¡œ œ œ
+ œ œ˜=Kšœ œ˜Kšœ œ+˜Fš œ ˜Kš œ œ œ˜Kšœ œ œ˜9Kš œ˜	K˜——š¡œ œ(˜@Kš œ˜Kš œ˜Kšœ œ7 œ œ˜XK˜K˜K˜'Kšœ œ˜K˜K˜Mš œ œ˜Kšœ œ5 œ˜SK˜J—Kš œ˜K˜—š¡œ œ(˜@Kš œ˜Kš œ˜K˜K˜K˜Kšœ œ7 œ œ˜XK˜K˜K˜K˜"Kšœ œ˜Kšœ˜K˜Kšœ˜KšœJ˜JK˜?Kšœ˜š œ œ˜Kšœ œ5 œ˜SK˜J—Kš œ˜K˜ —š¡
+œ œ œ œ œ œ œ˜Kš œ˜K˜Kš œ˜Kš œ˜Kš œ"˜%Kš œ"˜%—K˜K˜ —š¡œ œ9˜GKš œ˜Kšœ#˜#š œ, œ œ˜Fš œ œ˜š œ œ ˜˜š œ
+ œ ˜˜Kš œ/˜3Jšœ0™0Kšœ! œ˜'Kšœ œ,˜HK˜š œ ˜Kš œ% œ œ œ˜BKšœ œ%˜EKš œ˜
+—Kšœ/ œ˜5Kš
+ œ œ œ œ œ˜=K˜#Kšœ3˜3—Kš œ˜——Kš œ˜——š ˜Kšœ œ˜—Kš ˜—K˜K˜ K˜ ——šœ™J™ š
+¡œ œ œ œ œ˜8Kš œ œ œ œ˜*K˜ —š¡œ œ, œ˜Mš œ ˜Kšœ œ˜š œ˜Kšœ œ˜#Kš œ œ7˜ZKš œ˜——K˜K˜ ——šœ™J™ š¡
+œ œ˜Kšœ˜K˜K˜K˜.Kš
+ œ œ œ œ œ!˜XKšœ%˜%Kšœ!˜!Kšœ˜Kšœ,˜,Kšœ/˜/Kšœ0˜0Kšœ˜Kšœ"˜"šœ˜Kšœ5 œ6˜m—Kšœ œ˜Kšœ œ˜Kšœ œ˜Kšœ˜K˜ —š¡œ œ œ˜7K˜ š¡œ œ œ œ˜Cš œ œ˜K˜K˜Kšœ œ œ œ˜Kš œ œ˜8Kšœ˜—˜K˜ ——Kšœ8˜8Kšœ˜K˜ —š¡œ œ8˜LKšœ.˜.K˜ —š¡œ œ œ˜0Kšœ œ+˜Fš
+ œ œ œ œ œ˜MKšœ
+ ˜—K˜K˜ —š¡œ œ1˜Bš¡œ œ˜#Kš œ œ/˜L—K˜ K˜ —š¡œ œ œ œ˜IKšœ œ˜K˜ —š
+¡œ œ	 œ œ œ˜?Jšœ£™£Kšœ œ˜&Kš œ œ˜5K˜K˜ ——šœ™J™ š¡œ œ˜Kšœ œ œ œ˜9Kšœ œ œ˜2Kšœ œ œ˜7šœ œ œ˜)Kšœ œ˜!Kšœ	 œ œ œ+˜Eš œ ˜Kšœ œ œ%˜?Kšœ œ%˜9Kš œ.˜0Kšœ œ;˜BKš œ7˜9K˜ K˜"Kš œ˜——K˜K˜K˜ —š¡œ œ.˜FKš œ œ˜K˜Kšœ œ œ˜-šœ œ œ˜)Kšœ œ œ,˜;Kš œ˜Kšœ œ œ˜DK˜—K˜K˜Kš œ	˜K˜ ——šœ™K˜ š
+¡œ œ œ œ œ˜8Kš œ œ œ œ˜*K˜ —š
+¡œ œ œ œ œ˜6Kš œ	 œ œ˜)K˜ —š¡œ œ œ œ˜BKšœ
+ œ˜!Kš œ œ œ œ œ œ˜>K˜ —š¡	œ œ@ œ˜UK˜ —š¡œ œ! œ œ˜?Kš œ˜#K˜ —š¡	œ œ œ˜2Kš œ˜K˜ —š¡
+œ œ˜Jšœ$™$K˜ š
+¡	œ œ œ œ œ˜7Kš œ˜K˜#K˜K˜ —š
+¡œ œ œ œ œ˜6Kš œ˜K˜K˜ —K˜K˜K˜ ——šœ™K˜ š¡œ œ œ œ	˜^Jšœ)™)Kšœ
+ œ œ˜š
+¡	œ œ œ œ œ˜7Kš œ˜š œ œ œ˜9Kš œ˜!K˜V—Kš œ˜—Kš œ œ˜@Kš œ˜K˜ —š¡œ œ4˜Qš¡œ œ˜5Kš œ˜!š œ œ œ ˜SJšœ.™.Kšœ/˜/—K˜—Kšœ.˜.K˜ —š¡œ œ œ( œ* œ œ˜§Kšœ œ œ˜Kšœ
+ œ˜K˜ š¡œ œ˜#Kš œ˜!Kšœ œ œ˜K˜K˜Kš
+ œ œ œ œ œ˜XK˜Kšœ;˜;š œ œ˜˜K˜;Kšœ;˜;—Kšœ%˜%Kšœ>˜>—š œ˜˜K˜˜K˜(K˜B——š œ9 œ˜A˜˜2Kšœ;˜;——Kšœ˜—š œ˜Kšœ
+ œ˜"K˜!K˜4K˜7˜K˜K˜#—K˜ —š œ œ œ˜Kšœ˜Kšœ˜K˜—K˜—Kšœ˜K˜ —š œ˜š œ˜Kšœ˜Kšœ'˜'Kšœ˜—š œ˜K˜'K˜CKšœ˜Kšœ
+ œ  œ˜8˜$Kšœ9˜9—Kšœ3˜3Kšœ>˜>Kš œ=˜?K˜-Kšœ(˜(Kš œ œ) œ˜TKšœ˜K˜——Kšœ˜Kš œ œ˜6Kš œ"˜&K˜ —š
+¡
+œ œ7 œ œ œ˜`Kšœ7˜7˜ KšœH œ˜M—K˜Kšœ<˜<Kš œ˜K˜ —š¡œ œ œ œ˜KKšœ œ œ˜Kšœ œ˜K˜ š¡œ œ œ œ œ œ˜0K˜š œ ˜Jš œ ™"Kšœ œ˜Kš œ˜—Kš œ˜K˜ —Kšœ œ&˜5Kš œ œ œ œ˜4K˜ ——šœ™K˜ š¡œ œ˜1K˜Kšœ œ˜Kšœ=˜=Kš œN˜PK˜ —š¡œ œK˜YKšœ œ˜
+Kšœ$ œ˜-Kšœ œ˜Kšœ,˜,šœ œ˜Kš œ œ˜Kš œ œ$˜:Kšœ œ˜K˜DKšœ
+ œ˜K˜DKšœ
+ œ˜K˜FKšœ
+ œ˜K˜FKšœ œ˜K˜FKšœ œ˜K˜DKšœ
+ œ˜K˜DKšœ
+ œ˜K˜DKšœ
+ œ˜K˜DKšœ
+ œ˜K˜FKšœ œ˜K˜DKšœ
+ œ˜K˜DKšœ
+ œ˜K˜DKšœ
+ œ˜K˜DKšœ
+ œ˜K˜DKšœ
+ œ˜K˜DKšœ
+ œ˜K˜Kšœ¢˜.Jšœ7™7Kšœ ˜ Kšœ œ˜Kšœ.¢œ˜BKš œ˜—K˜(š œ œ ˜>K˜"—KšœG˜Gš œ œ˜$KšœS˜SKšœ œ œ˜'—Kš œ+˜-Kš œ/ œ$ œ˜eK˜K˜K˜K˜K˜K˜K˜K˜K˜K˜K˜K˜K˜K˜K˜K˜š œ ˜"KšœP˜P—Kšœ2˜2Kšœ1˜1Kšœ2˜2Kšœ1˜1Kšœ?˜?š ˜Kšœ, ˜0—˜K˜ ——K˜K˜ —— …—    dX  „T  

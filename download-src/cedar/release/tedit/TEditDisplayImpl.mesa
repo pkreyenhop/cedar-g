@@ -1,0 +1,748 @@
+DIRECTORY
+Carets USING [StopCaretsInViewer],
+Char USING [XCHAR, Widen],
+EditSpan USING [afterMoved1, afterMoved2],
+Imager USING [black, Color, Context, DoWithBuffer, DoSave, MaskFill, MaskRectangleI, SetColor, SetGray, SetXY, white],
+ImagerBackdoor USING [GetTransformation, MoveViewRectangle, TestViewRectangle],
+ImagerPath USING [PathProc],
+ImagerTransformation USING [Destroy, EasyTransformation, Transformation],
+InputFocus USING [GetInputFocus],
+NodeReader USING [Ref, New, Free, FetchChar],
+NodeStyle USING [GetInt, Ref],
+NodeStyleOps USING [Alloc, ApplyAll, Free, OfStyle],
+Rope USING [ROPE, Equal],
+Scaled USING [Float, FromInt, Round],
+TEditCompile USING [minAvgLineLeading],
+TEditDocument USING [LineBreak, LineTable, LineTableRec, LineRec, maxClip, Selection, SelectionId, TEditDocumentData, maxAscent, maxDescent],
+TEditFormat USING [Allocate, FormatLine, LineInfo, Paint, Release],
+TEditLocks USING [LockDocAndTdd, LockRef, UnlockDocAndTdd, WaitingForWrite],
+TEditPrivate USING [],
+TEditScrolling USING [AutoScroll],
+TEditSelection USING [AdjustSelStates, FixUpAfterDisplay, fSel, InsertionPoint, pSel, SelectionRoot, ShowSelection, sSel, TakeDownForRedisplay, TakeSelectionDown],
+TEditSelectionPrivate USING [InvalidateLineCache],
+TEditTouchup USING [fullUpdate, PreScrollDownRec, refresh, RefreshOver],
+TextEdit USING [Size, GetNewlineDelimiter],
+TextNode USING [FirstChild, ForwardClipped, Level, Location, Ref, RefTextNode, Root, StepForward],
+ViewerClasses USING [PaintProc, PaintRectangle, Viewer],
+ViewerOps USING [FetchProp, UserToScreenCoords];
+
+TEditDisplayImpl: CEDAR PROGRAM
+IMPORTS Carets, Char, EditSpan, Imager, ImagerBackdoor, ImagerTransformation, InputFocus, NodeReader, NodeStyle, NodeStyleOps, Scaled, TextEdit, TextNode, Rope, TEditFormat, TEditLocks, TEditScrolling, TEditSelection, TEditSelectionPrivate, TEditTouchup, ViewerOps
+EXPORTS TEditPrivate
+= BEGIN
+
+LineTable: TYPE ~ TEditDocument.LineTable;
+TEditDocumentData: TYPE ~ TEditDocument.TEditDocumentData;
+Viewer: TYPE ~ ViewerClasses.Viewer;
+
+maxAscent: NAT ~ TEditDocument.maxAscent;
+maxDescent: NAT ~ TEditDocument.maxDescent;
+
+<<giveUpPulses: BasicTime.Pulses ¬ BasicTime.MicrosecondsToPulses[3000000];>>
+
+PaintTEditDocument: PUBLIC ViewerClasses.PaintProc = {
+WITH self.data SELECT FROM
+tdd: TEditDocumentData => {
+interrupt: BOOL ¬ clear OR whatChanged=TEditTouchup.fullUpdate OR whatChanged=NIL OR ISTYPE[whatChanged, ViewerClasses.PaintRectangle];
+lock: TEditLocks.LockRef ¬ NIL;
+Cleanup: PROC = {
+IF lock # NIL THEN {
+TEditLocks.UnlockDocAndTdd[tdd];
+TEditTouchup.RefreshOver[];
+lock ¬ NIL;
+};
+};
+lock ¬ TEditLocks.LockDocAndTdd[tdd, "PaintTEditDocument", read, interrupt, TRUE];
+tdd.invisible ¬ FALSE; -- or else we wouldn't have been called
+IF lock=NIL
+THEN { IF NOT interrupt THEN ERROR }
+ELSE {
+quit ¬ LockedPaint[self, context, whatChanged, clear, tdd, lock
+! UNWIND => Cleanup[]];
+};
+Cleanup[];
+};
+ENDCASE => NULL;
+};
+
+BiggerLineTable: PROC [oldTable: LineTable, newSize: INT] RETURNS [lineTable: LineTable] ~ {
+lineTable ¬ NEW[TEditDocument.LineTableRec[newSize]];
+lineTable.lastLine ¬ oldTable.lastLine;
+lineTable.lastY ¬ oldTable.lastY;
+FOR n: NAT IN [0..oldTable.lastLine] DO -- copy old data
+lineTable[n] ¬ oldTable[n];
+ENDLOOP;
+};
+
+InvalidateLines: PROC [lineTable: LineTable, start, end: INT] ~ {
+FOR i: INT IN [start..end) DO
+lineTable[i].valid ¬ FALSE;
+ENDLOOP;
+};
+
+Rect: TYPE ~ RECORD [xmin, ymin, w, h: INT];
+
+Intersects: PROC [a, b: Rect] RETURNS [BOOL] ~ {
+ymin: INT ~ MAX[a.ymin, b.ymin];
+ymax: INT ~ MIN[a.ymin+a.h, b.ymin+b.h];
+xmin: INT ~ MAX[a.xmin, b.xmin];
+xmax: INT ~ MIN[a.xmin+a.w, b.xmin+b.w];
+RETURN [xmax > xmin AND ymax > ymin];
+};
+
+Inside: PROC [a, b: Rect] RETURNS [BOOL] ~ {
+RETURN [
+a.ymin>=b.ymin AND a.ymin+a.h<b.ymin+b.h AND
+a.xmin>=b.xmin AND a.xmin+a.w<b.xmin+b.w
+];
+};
+
+LineRectangle: PROC [lineTable: LineTable, i: INT, ch: INT] RETURNS [Rect] ~ {
+lineRec: TEditDocument.LineRec ~ lineTable[i];
+ascent: INTEGER ~ IF lineRec.ascent = maxAscent THEN ch ELSE lineRec.ascent;
+descent: INTEGER ~ IF lineRec.descent = maxDescent THEN ch ELSE lineRec.descent;
+RETURN [[lineRec.xOffset, ch-lineRec.yOffset-descent, lineRec.width, ascent+descent]];
+};
+
+InvalidateLinesOutsideOfRectangle: PROC [lineTable: LineTable, rect: Rect, ch: INT] ~ {
+FOR i: INTEGER IN [0..lineTable.lastLine] DO
+IF NOT Inside[LineRectangle[lineTable, i, ch], rect] THEN lineTable[i].valid ¬ FALSE;
+ENDLOOP;
+};
+
+InvalidateLinesTouchingRectangle: PROC [lineTable: LineTable, rect: Rect, ch: INT] ~ {
+FOR i: INT IN [0..lineTable.lastLine] DO
+IF Intersects[LineRectangle[lineTable, i, ch], rect] THEN lineTable[i].valid ¬ FALSE;
+ENDLOOP;
+};
+
+everPainted: BOOL ¬ FALSE; -- only gets set, never cleared, so don't monitor.
+
+normalNewlineDelimiter: Rope.ROPE ~ "\n";
+
+DisplayNewlineIndicator: PROC [root: TextNode.Ref, context: Imager.Context, cw, ch: INTEGER] ~ {
+white: BOOL ~ Rope.Equal[TextEdit.GetNewlineDelimiter[root], normalNewlineDelimiter];
+Path: ImagerPath.PathProc = {
+moveTo[[cw, ch-6]];
+lineTo[[cw-6, ch]];
+lineTo[[cw, ch]];
+};
+Inner: PROC ~ {
+Imager.SetGray[context: context, f: IF white THEN 0 ELSE 1];
+Imager.MaskFill[context: context, path: Path];
+};
+IF NOT white THEN everPainted ¬ TRUE;
+IF everPainted THEN Imager.DoSave[context: context, action: Inner];
+};
+
+LockedPaint: PROC [self: Viewer, context: Imager.Context, whatChanged: REF, clear: BOOL, tdd: TEditDocumentData, lock: TEditLocks.LockRef] 
+RETURNS [quit: BOOL ¬ FALSE] ~ {
+newSize: INT ~ (self.ch/TEditCompile.minAvgLineLeading)+1;
+typescript: BOOL ~ tdd.tsInfo # NIL;
+refreshing: BOOL ¬ whatChanged=TEditTouchup.refresh;
+redisplay: BOOL ¬ clear OR refreshing OR whatChanged=TEditTouchup.fullUpdate OR whatChanged=NIL;
+moveDownLines: INTEGER ¬ 0; -- used with scrolling down
+moveDownDistance: INT ¬ 0; -- used with scrolling down
+Carets.StopCaretsInViewer[self];
+IF newSize > tdd.lineTable.maxLines THEN {
+tdd.lineTable ¬ BiggerLineTable[tdd.lineTable, newSize];
+};
+IF redisplay
+THEN {
+IF clear THEN TEditSelection.AdjustSelStates[self];
+IF NOT refreshing THEN InvalidateLines[tdd.lineTable, 0, tdd.lineTable.lastLine+1];
+}
+ELSE {
+WITH whatChanged SELECT FROM
+x: REF TEditTouchup.PreScrollDownRec => {
+IF clear THEN ERROR;
+moveDownLines ¬ x.lines;
+moveDownDistance ¬ x.distance;
+refreshing ¬ redisplay ¬ TRUE;
+};
+rect: ViewerClasses.PaintRectangle => {
+sx, sy: INT ¬ 0;
+[sx, sy] ¬ ViewerOps.UserToScreenCoords[self, 0, 0];
+InvalidateLinesOutsideOfRectangle[tdd.lineTable, [rect.x-sx, rect.y-sy, rect.w, rect.h], self.ch];
+tdd.lineTable[tdd.lineTable.lastLine].valid ¬ FALSE;
+refreshing ¬ redisplay ¬ TRUE;
+};
+atom: ATOM => {
+SELECT atom FROM
+$TakeDownPSel => TEditSelection.TakeSelectionDown[primary, self, context];
+$ShowPSel => TEditSelection.ShowSelection[primary, self, context];
+$TakeDownSSel => TEditSelection.TakeSelectionDown[secondary, self, context];
+$ShowSSel => TEditSelection.ShowSelection[secondary, self, context];
+$TakeDownFSel => TEditSelection.TakeSelectionDown[feedback, self, context];
+$ShowFSel => TEditSelection.ShowSelection[feedback, self, context];
+ENDCASE => ERROR;
+};
+ENDCASE => ERROR;
+};
+IF redisplay THEN {
+TEditSelection.TakeDownForRedisplay[primary, self, context];
+TEditSelection.TakeDownForRedisplay[secondary, self, context];
+TEditSelection.TakeDownForRedisplay[feedback, self, context];
+IF typescript THEN CheckBottomVisible[self, tdd];
+IF NOT tdd.lineTable[0].valid THEN CheckStartLocation[self, tdd];
+TEditSelectionPrivate.InvalidateLineCache[]; -- since selection impl keeps accelerators
+RefreshViewer[self, tdd, context, clear, (refreshing AND NOT typescript), lock, moveDownLines, moveDownDistance];
+};
+SELECT whatChanged FROM
+$TakeDownPSel, $TakeDownSSel, $TakeDownFSel => {};
+ENDCASE =>
+SELECT TRUE FROM
+refreshing AND NOT typescript AND TEditLocks.WaitingForWrite[lock] => {};
+ENDCASE => {
+TEditSelection.FixUpAfterDisplay[primary, self, context, ~tdd.readOnly];
+TEditSelection.FixUpAfterDisplay[secondary, self, context, TRUE];
+TEditSelection.FixUpAfterDisplay[feedback, self, context, FALSE] 
+};
+IF NOT tdd.dirty THEN SELECT tdd.scroll FROM
+no => NULL;
+endofdoc => 
+AutoScroll[self, tdd.scrollGlitch, TRUE, primary];
+endofsel => {
+sel: TEditDocument.Selection = SELECT tdd.scrollSelectionId FROM
+primary => TEditSelection.pSel,
+secondary => TEditSelection.sSel,
+feedback => TEditSelection.fSel,
+ENDCASE => ERROR;
+IF TEditSelection.SelectionRoot[sel]=tdd.text THEN
+AutoScroll[self, tdd.scrollGlitch, FALSE, tdd.scrollSelectionId];
+};
+ENDCASE => ERROR;
+IF self.class.flavor = $Text THEN DisplayNewlineIndicator[tdd.text, context, self.cw, self.ch];
+};
+
+checkBottomVisible: BOOL ¬ TRUE;
+CheckBottomVisible: PROC [self: Viewer, tdd: TEditDocumentData] ~ {
+IF NOT checkBottomVisible THEN RETURN;
+IF NOT tdd.lineTable[tdd.lineTable.lastLine].valid THEN RETURN;
+IF self.ch < tdd.lineTable[tdd.lineTable.lastLine].yOffset THEN {
+delta: INT = tdd.lineTable[tdd.lineTable.lastLine].yOffset - self.ch;
+n: INTEGER ¬ 0;
+UNTIL n=tdd.lineTable.lastLine OR tdd.lineTable[n].yOffset > delta DO
+n ¬ n+1;
+ENDLOOP;
+tdd.lineTable[0] ¬ tdd.lineTable[MIN[tdd.lineTable.lastLine, n+1]];
+tdd.lineTable[0].valid ¬ FALSE;
+};
+};
+
+xCR: Char.XCHAR ~ Char.Widen['\r];
+xLF: Char.XCHAR ~ Char.Widen['\l];
+xSP: Char.XCHAR ~ Char.Widen[' ];
+
+CheckStartLocation: PROC [self: Viewer, tdd: TEditDocumentData] ~ {
+startLoc: TextNode.Location ¬ [NIL, 0];
+CheckLocNode: PROC [loc: TextNode.Location] RETURNS [BOOL] = {
+startLoc ¬ loc;
+RETURN [ loc.node # NIL AND TextNode.Root[loc.node] = tdd.text ] 
+}; 
+IF NOT CheckLocNode[tdd.lineTable[0].pos] THEN {
+IF (InputFocus.GetInputFocus[].owner = self AND CheckLocNode[TEditSelection.InsertionPoint[]])
+OR CheckLocNode[EditSpan.afterMoved1]
+OR CheckLocNode[EditSpan.afterMoved2]
+THEN tdd.fixStart ¬ TRUE
+ELSE startLoc ¬ [TextNode.FirstChild[tdd.text], 0] 
+};
+IF startLoc.node # NIL THEN {
+size: INT = TextEdit.Size[startLoc.node];
+IF startLoc.where NOT IN [0..size) THEN {
+tdd.lineTable[0].valid ¬ FALSE;
+tdd.fixStart ¬ TRUE;
+startLoc.where ¬ MAX[MIN[size-1, startLoc.where], 0] 
+}
+};
+IF tdd.fixStart AND startLoc.node # NIL AND startLoc.where > 0 THEN {  
+rdr: NodeReader.Ref ~ NodeReader.New[startLoc.node];
+minIndex: INT ~ MAX[INT[startLoc.where]-200, 0];
+fallback: INT ¬ startLoc.where;
+foundBreak: INT ¬ startLoc.where;
+FOR i: INT DECREASING IN [minIndex..startLoc.where) DO
+char: Char.XCHAR ~ NodeReader.FetchChar[rdr, i];
+SELECT char FROM
+xCR, xLF => { foundBreak ¬ i+1; EXIT};
+xSP => { fallback ¬ i+1 };
+ENDCASE;
+REPEAT FINISHED => foundBreak ¬ 0;
+ENDLOOP;
+startLoc.where ¬ MIN[foundBreak, fallback];
+NodeReader.Free[rdr];
+};
+tdd.fixStart ¬ FALSE;
+tdd.lineTable[0].pos ¬ startLoc;
+IF tdd.clipLevel < TEditDocument.maxClip THEN -- check level of startLoc
+tdd.clipLevel ¬ MAX[tdd.clipLevel, TextNode.Level[startLoc.node]]; 
+};
+
+AutoScroll: PROC [self: Viewer, tryToGlitch, toEndOfDoc: BOOL, id: TEditDocument.SelectionId] = {
+ENABLE ABORTED => GOTO Quit;
+IF self # NIL THEN WITH self.data SELECT FROM
+tdd: TEditDocumentData => {
+IF NOT tdd.dirty THEN tdd.scroll ¬ no; -- there is something bogus about this that neither nor I understand. RJB
+TEditScrolling.AutoScroll[self, tryToGlitch, toEndOfDoc, id];
+TEditTouchup.RefreshOver[];
+};
+ENDCASE => NULL;
+EXITS Quit => NULL 
+};
+
+RefreshViewer: PROC [viewer: Viewer, tdd: TEditDocumentData, dc: Imager.Context, displayClear, refresh: BOOL, lock: TEditLocks.LockRef, moveDownLines, moveDownDistance: INT] = {
+n: INTEGER ¬ 0;
+start, end: INTEGER ¬ 0;
+lines: TEditDocument.LineTable ¬ tdd.lineTable;
+Imager.SetColor[dc, Imager.black];
+UNTIL n > lines.lastLine DO -- search for an invalid line
+IF lines[n].valid
+THEN n ¬ n+1
+ELSE {
+start ¬ n;
+UNTIL n+1 > lines.lastLine DO
+IF lines[n+1].valid THEN EXIT;
+n ¬ n+1;
+ENDLOOP;
+end ¬ n;
+IF start > 0 AND lines[start].pos.node # lines[start-1].pos.node THEN {
+lines[start].pos.where ¬ 0;
+IF (lines[start].pos.node ¬ TextNode.ForwardClipped[lines[start-1].pos.node,tdd.clipLevel].nx) = NIL THEN
+start ¬ start-1 --have deleted end of document-- 
+};
+n ¬ WhileInPosRange[viewer, tdd, dc, start, end, displayClear,
+refresh, lock, moveDownLines, moveDownDistance];
+moveDownLines ¬ moveDownDistance ¬ 0; -- only do this the first time
+IF (refresh AND TEditLocks.WaitingForWrite[lock]) OR tdd.interrupt > 0 THEN {
+tdd.dirty ¬ TRUE;
+RETURN;
+};
+};
+ENDLOOP;
+tdd.movedIn ¬ tdd.movedOut ¬ tdd.dirty ¬ FALSE;
+};
+
+WhileInPosRange: PROC [viewer: Viewer, tdd: TEditDocumentData, dc: Imager.Context, start, end: INTEGER, displayClear, refresh: BOOL, lock: TEditLocks.LockRef, moveDownLines, moveDownDistance: INT] RETURNS [line: INTEGER] = {
+lines: TEditDocument.LineTable ¬ tdd.lineTable;
+oldBottomY: INT ¬ MAX[INT[lines[start].yOffset] - lines[start].ascent, 0];
+kindOfStyle: NodeStyleOps.OfStyle ~ IF ViewerOps.FetchProp[viewer, $StyleKind] = $Print THEN print ELSE screen;
+IF lines[start].ascent = maxAscent THEN oldBottomY ¬ 0;
+lines[start].valid ¬ FALSE;
+WHILE start>0 AND (lines[start-1].yOffset + lines[start-1].descent > oldBottomY OR lines[start-1].descent = maxDescent) DO
+start ¬ start-1;
+lines[start].valid ¬ FALSE;
+ENDLOOP;
+{
+node: TextNode.RefTextNode ¬ lines[start].pos.node;
+pos: INT ¬ lines[start].pos.where;
+leading: INT ¬ 0;
+topLeading: INT ¬ 0;
+bottomLeading: INT ¬ 0;
+nodeLeading: INT ¬ 0;
+knowBottomLeading: BOOL ¬ (start = 0); -- otherwise need to get it
+y: INT ¬ 0;
+nodeSize: INT ¬ TextEdit.Size[node];
+styleInit: BOOL ¬ TRUE;
+yMatchRun: BOOL ¬ TRUE;
+yMatch: BOOL ¬ FALSE;
+eraseToEnd: BOOL ¬ FALSE;
+lineInfo: TEditFormat.LineInfo ¬ TEditFormat.Allocate[];
+nodeStyle: NodeStyle.Ref ¬ NodeStyleOps.Alloc[];
+Cleanup: PROC = {
+TEditFormat.Release[lineInfo]; lineInfo ¬ NIL;
+NodeStyleOps.Free[nodeStyle]; nodeStyle ¬ NIL;
+};
+styleInfoNode: TextNode.Ref ¬ NIL; -- node for which we were last called to get style info
+GetStyleInfo: PROC [node: TextNode.Ref] = {
+IF node = styleInfoNode THEN RETURN; -- already have the style info
+styleInfoNode ¬ node;
+IF NOT knowBottomLeading AND pos=0 THEN { -- get it from previous node
+NodeStyleOps.ApplyAll[nodeStyle, lines[line-1].pos.node, kindOfStyle];
+bottomLeading ¬ NodeStyle.GetInt[nodeStyle, bottomLeading];
+};
+NodeStyleOps.ApplyAll[nodeStyle, node, kindOfStyle];
+leading ¬ NodeStyle.GetInt[nodeStyle, leading];
+topLeading ¬ MAX[bottomLeading, NodeStyle.GetInt[nodeStyle, topLeading]];
+nodeLeading ¬ MAX[bottomLeading, topLeading];
+bottomLeading ¬ NodeStyle.GetInt[nodeStyle, bottomLeading];
+knowBottomLeading ¬ TRUE;
+};
+checkedVisible, fullyVisible: BOOL ¬ FALSE;
+FullyVisible: PROC RETURNS [BOOL] = {
+IF NOT checkedVisible THEN {
+m: ImagerTransformation.Transformation ~ ImagerBackdoor.GetTransformation[context: dc, from: client, to: view];
+fullyVisible ¬ ImagerTransformation.EasyTransformation[m] AND m.tx=0 AND m.ty=0 
+AND ImagerBackdoor.TestViewRectangle[dc, 0, 0, viewer.cw, viewer.ch]=all;
+ImagerTransformation.Destroy[m];
+checkedVisible ¬ TRUE;
+};
+RETURN [fullyVisible];
+};
+found: INT ¬ 0; -- set by FindBelow
+TryMoveUp: PROC RETURNS [ok: BOOL] = {
+to, from, num, dist, bottom: INT;
+diff: INTEGER;
+dirtyScanlinesInFirstTextline: NAT ¬ 0;
+FindBelow: PROC RETURNS [ok: BOOL] = {
+FOR n: INTEGER IN [line..lines.lastLine] DO
+IF lines[n].valid AND lines[n].pos=[node,pos] THEN {
+found ¬ n;
+RETURN [lines[n].yOffset-lines[n].ascent > oldBottomY];
+};
+ENDLOOP;
+RETURN [FALSE];
+};
+IF NOT FullyVisible[] OR NOT FindBelow[] THEN RETURN [FALSE];
+IF found=lines.lastLine AND lines[found].yOffset+lines[found].descent >= viewer.ch
+THEN RETURN [FALSE]; -- bottom is clipped
+IF found>0 AND (
+dirtyScanlinesInFirstTextline ¬
+MAX[0,
+lines[found-1].yOffset+lines[found-1].descent - lines[found].yOffset-lines[found].ascent
+]
+) > 0 THEN lines[found].valid ¬ FALSE;
+to ¬ y-lines[found].ascent + dirtyScanlinesInFirstTextline;
+from ¬ lines[found].yOffset-lines[found].ascent + dirtyScanlinesInFirstTextline;
+IF to < 0 THEN { -- top of line is clipped
+from ¬ from-to; -- move source down by amount to be clipped
+to ¬ 0;
+};
+dist ¬ from-to; -- the distance to move
+IF dist < 0 THEN RETURN [FALSE]; -- skip this bizarre case
+bottom ¬ MIN[viewer.ch, lines.lastY];
+num ¬ bottom-from; -- number of scan lines to move
+IF num <= 0 THEN RETURN [FALSE];
+ClearLine[oldBottomY, to]; -- clear gap above destination
+MoveScanLines[to, from, num]; -- move the good scan lines up
+ClearLine[bottom-dist, bottom]; -- clear the space at the bottom
+lines.lastY ¬ lines.lastY-dist; -- lastY tells last used scan line in viewer
+diff ¬ found-line; -- number of lines skipped
+IF diff # 0 THEN { -- update the line table info
+FOR n: INTEGER IN [line..lines.lastLine-diff] DO
+lines[n] ¬ lines[n+diff]; -- move all the info up to new location
+ENDLOOP;
+ClearEntries[lines.lastLine-diff+1, lines.lastLine]; -- these lines no longer in use
+lines.lastLine ¬ lines.lastLine-diff;
+end ¬ end-diff;
+};
+FOR n: INTEGER IN [line..lines.lastLine] DO -- adjust the baselines
+lines[n].yOffset ¬ lines[n].yOffset-dist;
+ENDLOOP;
+lines[lines.lastLine].valid ¬ FALSE;
+RETURN [TRUE] 
+};
+ClearEntries: PROC [from, to: INTEGER] = {
+FOR n: INTEGER IN [from..to] DO
+lines[n] ¬ [pos: [NIL, 0], valid: FALSE, yOffset: 0, xOffset: 0, width: 0, ascent: 0, descent: 0];
+ENDLOOP 
+};
+MoveScanLines: PROC [to, from, height: INT] = {
+IF viewer.class.flavor = $Text THEN DisplayNewlineIndicator[NIL, dc, viewer.cw, viewer.ch];
+IF height>0 THEN ImagerBackdoor.MoveViewRectangle[context: dc,
+width: viewer.cw, -- full width of viewer
+height: height, -- height of source
+fromX: 0, fromY: viewer.ch-from-height,
+toX: 0, toY: viewer.ch-to-height
+];
+};
+TryMoveDown: PROC [nchars: INTEGER, end: TEditDocument.LineBreak] = {
+next: TextNode.Location;
+from, lead, dist: INT;
+IF NOT FullyVisible[] OR NOT lines[line].valid THEN RETURN;
+from ¬ lines[line].yOffset-lines[line].ascent;
+IF oldBottomY > from THEN RETURN; -- overwritten it already
+next ¬ IF end=eon THEN [NextNode[], 0] ELSE [node, pos+nchars];
+IF lines[line].pos # next THEN RETURN;
+IF end=eon THEN { -- need to get leading info for the next node
+GetStyleInfo[next.node]; lead ¬ nodeLeading;
+}
+ELSE lead ¬ leading;
+dist ¬ y+lead-lines[line].yOffset; -- how far down to move it
+MoveLinesDown[line, 1, from, dist, TRUE] 
+};
+MoveLinesDown: PROC [startLine, numLines: INTEGER, from, dist: INT, clear: BOOL] = {
+to: INT;
+num: INT;
+bottom: INT;
+visible: BOOL ¬ FALSE;
+dirtyScanlinesInFirstTextline: INT;
+IF dist <= 0 THEN RETURN; -- skip this weird case
+to ¬ from+dist;
+bottom ¬ MIN[lines.lastY+dist, viewer.ch]; -- new bottom after blt
+num ¬ bottom-to; -- the number of scan lines to blt
+IF num <= 0 THEN RETURN; -- stuff to move down won't be visible
+MoveScanLines[from+dist, from, num];
+IF startLine > 0 AND (dirtyScanlinesInFirstTextline ¬ lines[startLine-1].yOffset+lines[startLine-1].descent -  lines[startLine].yOffset-lines[startLine].ascent) > 0
+THEN {
+lines[startLine].valid ¬ FALSE;
+ClearLine[from, to + dirtyScanlinesInFirstTextline];
+}
+ELSE ClearLine[from, to]; -- clear the gap
+FOR n: INTEGER DECREASING IN [startLine..lines.lastLine] DO
+newOffset: INT;
+IF n+numLines >= lines.maxLines THEN LOOP; -- avoid bounds fault
+newOffset ¬ lines[n].yOffset+dist; -- the new baseline
+IF newOffset-lines[n].ascent > viewer.ch THEN LOOP; -- off the bottom of viewer
+IF NOT visible AND newOffset+lines[n].descent <= viewer.ch THEN {
+visible ¬ TRUE;
+lines.lastLine ¬ n+numLines;
+lines[n].valid ¬ FALSE; -- force repaint at bottom of viewer
+lines.lastY ¬ newOffset+lines[n].descent;
+ClearLine[lines.lastY, viewer.ch] 
+};
+lines[n+numLines] ¬ lines[n]; -- move all the info down by numLines
+lines[n+numLines].yOffset ¬ newOffset; -- adjust the baseline
+IF NOT visible THEN {
+lines.lastLine ¬ n+numLines;
+lines.lastY ¬ newOffset+lines[n].descent;
+lines[n+numLines].valid ¬ FALSE;
+};
+ENDLOOP;
+};
+level: INTEGER ¬ 0; -- in case we are doing level clipping
+maxLevel: INTEGER = tdd.clipLevel;
+levelClipping: BOOL = maxLevel < TEditDocument.maxClip;
+last, next: TextNode.Ref;
+NextNode: PROC RETURNS [TextNode.Ref] = {
+IF node=last THEN RETURN [next]; -- 1 entry cache
+last ¬ node;
+IF levelClipping THEN [next, level] ¬ TextNode.ForwardClipped[node,maxLevel,level]
+ELSE next ¬ TextNode.StepForward[node];
+RETURN [next] 
+};
+ClearLine: PROC [oldBottomY, newBottomY: INT] = {
+IF oldBottomY >= newBottomY THEN RETURN;
+Imager.SetColor[dc, Imager.white];
+Imager.MaskRectangleI[dc, 0, viewer.ch-newBottomY, viewer.cw, newBottomY-oldBottomY];
+Imager.SetColor[dc, Imager.black];
+};
+ContinueReason: TYPE ~ {dont, inRange, invalidLine, whitewashed};
+continueReason: ContinueReason ¬ dont;
+WhyGoOn: PROC [lineNumber: INTEGER] RETURNS [cr: ContinueReason] ~ {
+SELECT TRUE FROM
+(line >= lines.maxLines) => cr ¬ dont;
+(line <= end) => cr ¬ inRange;
+NOT (line <= lines.lastLine AND lines[line].valid AND lines[line].pos=[node, pos] AND yMatch) => cr ¬ invalidLine;
+((NOT displayClear) AND line > 0 AND (lines[line].ascent = maxAscent OR lines[line-1].descent = maxDescent OR lines[line].yOffset-lines[line].ascent < lines[line-1].yOffset+lines[line-1].descent)) => cr ¬ whitewashed;
+ENDCASE => cr ¬ dont;
+continueReason ¬ cr;
+};
+
+<<paintStartPulses: BasicTime.Pulses ~ BasicTime.GetClockPulses[];>>
+firstTimeThrough: BOOL ¬ TRUE;
+
+IF node = NIL OR (line ¬ start) > lines.lastLine OR end < 0 THEN {
+IF node=NIL THEN lines[start] ¬ [pos: [NIL, 0], valid: TRUE];
+Cleanup[];
+RETURN};
+checkedVisible ¬ FALSE;
+IF moveDownLines > 0 AND FullyVisible[] THEN {
+MoveLinesDown[0, moveDownLines, 0, moveDownDistance, FALSE];
+};
+UNTIL WhyGoOn[line] = dont DO
+yPrevious: INT ¬ y;
+stopIt: BOOL ¬ (refresh AND TEditLocks.WaitingForWrite[lock]) OR tdd.interrupt > 0;
+<<IF NOT stopIt AND NOT firstTimeThrough AND viewer.class.flavor = $Text AND BasicTime.GetClockPulses[]-paintStartPulses > giveUpPulses THEN {
+stopIt ¬ TRUE;
+tdd.dirty ¬ TRUE;
+MonitoredQueue.AddToSet[tdd.text, TEditRefresh.dirtyDocs];
+};>>
+IF stopIt THEN {
+ClearEntries[from: line, to: lines.lastLine];
+lines.lastLine ¬ line;
+lines[line].pos ¬ [node, pos];
+lines.lastY ¬ viewer.ch;
+lines[line].yOffset ¬ oldBottomY;
+lines[line].ascent ¬ 0;
+lines[line].descent ¬ maxDescent;
+lines[line].valid ¬ FALSE;
+Cleanup[];
+RETURN [INTEGER.LAST];
+};
+GetStyleInfo[node];
+y --baseline-- ¬ (
+IF line=0 THEN NodeStyle.GetInt[nodeStyle, topIndent]
+ELSE (IF line#start THEN y ELSE lines[line-1].yOffset) -- baseline --
++ (IF pos=0 THEN nodeLeading ELSE leading) -- leading --
+);
+yMatch ¬ y=lines[line].yOffset;
+IF line>0 AND (IF node.hasArtwork THEN yPrevious+lines[line-1].descent ELSE y) >= viewer.ch THEN {eraseToEnd ¬ TRUE; EXIT};
+oldBottomY ¬ IF line=0 THEN 0 ELSE lines[line-1].yOffset+lines[line-1].descent;
+IF displayClear OR NOT TryMoveUp[] THEN {
+backgroundColor: Imager.Color ¬ NIL;
+painter: PROC ~ {
+firstTimeThrough ¬ FALSE;
+Imager.SetXY[dc, [Scaled.Float[lineInfo.xOffset], viewer.ch-y]];
+SELECT TRUE FROM
+displayClear, backgroundColor#NIL => {};
+ENDCASE => ClearLine[oldBottomY, y-lineInfo.ymin];
+oldBottomY ¬ y-lineInfo.ymin;
+TEditFormat.Paint[lineInfo, dc];
+};
+TEditFormat.FormatLine[lineInfo: lineInfo, node: node, startOffset: pos, nodeStyle: nodeStyle, lineWidth: Scaled.FromInt[viewer.cw]];
+IF NOT displayClear THEN TryMoveDown[lineInfo.nChars, lineInfo.break];
+{clearToY: INT ~ y-lineInfo.ymax;
+IF oldBottomY <= clearToY THEN {
+backgroundColor ¬ Imager.white;
+IF NOT displayClear THEN ClearLine[oldBottomY, clearToY];
+oldBottomY ¬ clearToY;
+};
+};
+IF displayClear THEN painter[]
+ELSE {
+ymin: INT ¬ viewer.ch-y+lineInfo.ymin;
+ymax: INT ¬ viewer.ch-y+lineInfo.ymax;
+IF continueReason = whitewashed THEN {
+ymin ¬ MAX[viewer.ch-oldBottomY, ymin];
+backgroundColor ¬ NIL;
+};
+IF ymin < ymax THEN {
+Imager.DoWithBuffer[
+context: dc, 
+action: painter, 
+x: 0, y: ymin,
+w: viewer.cw, h: ymax-ymin, 
+backgroundColor: backgroundColor
+];
+};
+};
+lines[line] ¬ [valid: TRUE, pos: [node, pos], nChars: lineInfo.nChars, end: lineInfo.break, yOffset: MIN[MAX[y, INTEGER.FIRST], INTEGER.LAST], xOffset: MIN[MAX[Scaled.Round[lineInfo.xOffset], INTEGER.FIRST], INTEGER.LAST], width: lineInfo.xmax-lineInfo.xmin, ascent: MIN[MAX[lineInfo.ymax, 0], maxAscent], descent: MIN[MAX[-lineInfo.ymin, 0], maxDescent]];
+};
+pos ¬ pos + lines[line].nChars;
+line ¬ line + 1;
+IF continueReason = whitewashed THEN EXIT;
+IF pos >= nodeSize AND lines[line-1].end#cr THEN {
+node ¬ NextNode[];
+IF node = NIL THEN {eraseToEnd ¬ TRUE; EXIT};
+nodeSize ¬ TextEdit.Size[node];
+pos ¬ 0;
+};
+ENDLOOP;
+IF eraseToEnd OR line>=lines.maxLines
+THEN {
+bottomOfNewLines: INT ¬ 0;
+IF line # 0 THEN {
+descent: NAT ¬ lines[line-1].descent;
+IF descent = maxDescent THEN bottomOfNewLines ¬ viewer.ch
+ELSE bottomOfNewLines ¬ lines[line-1].yOffset + descent;
+};
+lines.lastLine ¬ MAX[line,1]-1; -- set end mark
+ClearEntries[lines.lastLine+1, lines.maxLines-1];
+IF NOT displayClear AND bottomOfNewLines < lines.lastY THEN
+ClearLine[bottomOfNewLines, lines.lastY];
+lines.lastY ¬ bottomOfNewLines;
+}
+ELSE {
+lines.lastLine ¬ MAX[lines.lastLine, MAX[line,1]-1];
+lines.lastY ¬ MAX[MIN[y+lines[lines.lastLine].descent, viewer.ch], lines.lastY];
+};
+Cleanup[];
+};
+};
+
+END.
+    
+TEditDisplayImpl.mesa
+Copyright Ó 1985, 1986, 1987, 1988, 1989, 1990, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Russ Atkinson (RRA) July 2, 1985 4:03:26 pm PDT
+Rick Beach, November 7, 1986 11:31:51 am PST
+Bier, February 22, 1989 1:36:05 am PST
+Michael Plass, September 5, 1989 5:08:27 pm PDT
+Doug Wyatt, May 26, 1992 4:43 pm PDT
+
+If we have been painting longer than this, fork a refresh and exit.
+move down to make room for new lines at top
+Mark the last line as invalid so that the lines after it will be painted as needed.
+fix up the selections
+If a typescript viewer gets smaller such that bottom line is no longer visible, automatically scroll it up to keep bottom line on screen.
+N.B. CheckLocNode has the side effect of setting startLoc.
+move startLoc to after CR or space or at start of node
+need to reinitialize the start pos; may have deleted start node
+The following procedure is passed two document line positions; the meaning is to paint all the lines marked as invalid and then continue painting within each node until the ripple has subsided.  Returns line where stopped.
+
+This is used to avoid redoing GetStyleInfo after have peeked at next node style as part of trying to move lines down.
+use value of bottomLeading left from previous node
+use previous value of bottomLeading
+Returns true if found the desired line at a lower location on the screen.  Blts the line and all following lines, clears out screen below them, then updates line table.
+returns true if finds the desired line
+Looks for valid line at or below current line with desired start location.  Assumes oldBottomY has been set to bottom of previous line, so if found line starts below that it will be ok on the screen still.  If finds such a line, stores its index in "found" and returns true.
+top of clean part of new line is destination for blt
+uppermost source scan line
+Set the last line invalid to force repaint to fill in gap at bottom of viewer.
+We are about to put [node, pos] in line.  It will contain nchars with break specified by end.  This procedure looks to see if we will overwrite what we will next want to put in line+1.  If so, move it down now.  This happens whenever insert a single line.
+This proc may need to call GetStyleInfo, so use all the style info you're interested in before you call it.
+Repaint the top line if it got dirtied by descenders.
+first fully visible line
+line must be partly visible at bottom of screen
+returns next node to display
+For future reference, TEditScrollingImpl.ScrollTEditDocument also has code to calculate next node for display to handle scrolling up in 1 line viewers.
+Main body starts here
+
+update not on screen
+Halfhearted attempt to do something innocuous and allow caller to make progress.
+move things down before start repainting.  This accelerates scrolling down.
+Paint lines until the line we would paint is:
+(1) valid,
+(2) past the range we were told to paint,
+(3) matches the line table offsets (i.e. no ripple going forward), and
+(4) matches in the Y coord.
+(5) not partially whitened by paint of earlier lines.
+An exit for end of text and off end of viewer are included below.
+An edit or a complete repaint is pending or we have been painting for too long.
+true if the new line is baseline aligned with the previous bits on the screen
+if not the first line and baseline (or node above an artwork node) would be off bottom of viewer, don't show it.
+bottom of the previous line
+Need to finish with style info before call this.  May call GetStyleInfo for next node.
+nothing more to display in this node.
+clear former bottom lines if we run off end of text or viewer (partial line must be clipped)
+eraseToEnd starts false. set true if reach end of document or stop with line that would have baseline below bottom of viewer.
+white out old lines
+take this branch if got back in synch during repaint
+Êô  –(cedarcode) style•NewlineDelimiter
+™ codešœ™Kšœ
+Ïeœ[™fK™/K™,K™&Kšœ/™/K™$K™ —šÏk	˜	Kšœžœ˜"Kšœžœžœ	˜Kšœ	žœ˜*Kšœžœj˜vKšœžœ;˜OKšœžœ˜Kšœžœ/˜IKšœžœ˜!Kšœžœ˜-Kšœ
+žœ˜Kšœžœ"˜4Kšœžœžœ	˜Kšœžœ˜%Kšœžœ˜'Kšœžœz˜Kšœžœ2˜CKšœžœ<˜LKšœžœ˜Kšœžœ˜"Kšœžœ˜£Kšœžœ˜2Kšœžœ6˜HKšœ	žœ˜+Kšœ	žœT˜bKšœžœ%˜8Kšœ
+žœ!˜0—K˜ šÏnœžœž˜Kšžœ˜ˆKšžœ˜Kšœž˜K˜ Kšœžœ˜*Kšœžœ#˜:šœžœ˜$K˜ —Kšœžœ˜)Kšœžœ˜+K˜ šÏyM˜MK™CK˜ —šŸœžœ˜6šžœžœž˜šœ˜Kšœžœ	žœ%žœžœžœžœ,˜‡Kšœžœ˜šŸœžœ˜šžœžœžœ˜Kšœ ˜ Kšœ˜Kšœžœ˜Kšœ˜—Kšœ˜—KšœLžœ˜RKšœžœÏc'˜>šžœž˜Kš
+žœžœžœžœžœ˜$šžœ˜šœ?˜?Kšœžœ˜—Kšœ˜——Kšœ
+˜
+Kšœ˜—Kšžœžœ˜—K˜—K˜ šŸœžœ žœžœ˜\Kšœžœ&˜5Kšœ'˜'Kšœ!˜!š	žœžœžœžœ¡˜8K˜Kšžœ˜—K˜K˜ —šŸœžœ$žœ˜Ašžœžœžœž˜Kšœžœ˜Kšžœ˜—K˜K˜ —šœžœžœžœ˜,K˜ —šŸ
+œžœžœžœ˜0Kšœžœžœ˜ Kšœžœžœ˜(Kšœžœžœ˜ Kšœžœžœ˜(Kšžœžœ˜%Kšœ˜K˜ —šŸœžœžœžœ˜,šžœ˜Kšœžœž˜,Kšœžœ˜(Kšœ˜—Kšœ˜K˜ —š
+Ÿœžœžœžœžœ˜NKšœ.˜.Kš	œžœžœžœžœ˜LKš	œ	žœžœžœžœ˜PKšžœP˜VKšœ˜K˜ —šŸ!œžœ(žœ˜Wšžœžœžœž˜,Kšžœžœ/žœžœ˜UKšžœ˜—K˜K˜ —šŸ œžœ(žœ˜Všžœžœžœž˜(Kšžœ3žœžœ˜UKšžœ˜—K˜K˜ —šœžœžœ¡2˜MK˜ —šœžœ˜)K˜ —šŸœžœ7žœ˜`K•StartOfExpansion+[context: Imager.Context, action: PROC]šœžœJ˜U–¡ -- [moveTo: ImagerPath.MoveToProc, lineTo: ImagerPath.LineToProc, curveTo: ImagerPath.CurveToProc, conicTo: ImagerPath.ConicToProc, arcTo: ImagerPath.ArcToProc]šŸœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜—šŸœžœ˜K–&[context: Imager.Context, f: REAL]šœ$žœžœžœ˜<K–Q[context: Imager.Context, path: ImagerPath.PathProc, oddWrap: BOOL _ FALSE]šœ.˜.Kšœ˜—Kšžœžœžœžœ˜%Kšžœžœ0˜CKšœ˜K˜ —šŸœžœ6žœ	žœ5žœžœžœ˜¬Kšœ	žœ.˜:Kšœžœžœ˜$Kšœžœ$˜4Kšœžœ	žœžœ%žœžœ˜`Kšœžœ¡˜7Kšœžœ¡˜6K˜ šžœ"žœ˜*Kšœ8˜8Kšœ˜—šžœ
+˜šžœ˜Kšžœžœ&˜3Kšžœžœžœ=˜SK˜—šžœ˜šžœžœž˜šœžœ#˜)Kšœ+™+Kšžœžœžœ˜K˜K˜Kšœžœ˜K˜—šœ'˜'Kšœžœ˜Kšœ4˜4Kšœb˜bšœ.žœ˜4K™S—Kšœžœ˜K˜—šœžœ˜šžœž˜K˜JK˜BK˜LK˜DK˜KK˜CKšžœžœ˜—K˜—Kšžœžœ˜—Kšœ˜——šžœžœ˜K˜<K˜>K˜=Kšžœžœ˜1Kšžœžœžœ˜AKšœ-¡*˜WKšœ5žœžœ5˜qK˜—šžœž˜Kšœ2˜2šžœ˜
+šžœžœž˜Kšœžœžœžœ(˜Išžœ˜Kšœ™K˜HKšœ;žœ˜AKšœ:žœ˜AK˜————š	žœžœžœžœž˜,Kšœžœ˜šœ˜Kšœ#žœ˜2—˜šœžœž˜@K˜K˜!K˜ Kšžœžœ˜—šžœ,ž˜2Kšœ#žœ˜A—K˜—Kšžœžœ˜—Kšžœžœ>˜_Kšœ˜K˜ —Kšœžœžœ˜ šŸœžœ+˜CKšžœžœžœžœ˜&Kšžœžœ-žœžœ˜?šžœ9žœ˜AKšœ‰™‰Kšœžœ;˜EKšœžœ˜šžœžœ"ž˜EKšœ˜Kšžœ˜—Kšœ!žœ˜CKšœžœ˜K˜—Kšœ˜K˜ —Kšœ
+žœ˜"Kšœ
+žœ˜"šœ
+žœ˜!K˜ —šŸœžœ+˜CKšœžœ˜'šŸœžœžœžœ˜>K˜Kšžœžœžœ&˜AK˜—Kšœ:™:šžœžœ$žœ˜0šžœ*žœ0žœ$žœ#˜ªKšžœž˜Kšžœ/˜3—K˜—šžœžœžœ˜Kšœžœ ˜)šžœžœžœžœ˜)Kšœžœ˜Kšœžœ˜Kšœžœžœ˜5K˜—K˜—š
+žœžœžœžœžœ˜GKšœ6™6Kšœ4˜4Kšœ
+žœžœžœ˜0Kšœ
+žœ˜Kšœžœ˜!š	žœžœž
+œžœž˜6Kšœžœ ˜0šžœž˜Kšœ žœ˜&Kšœ˜Kšžœ˜—Kšžœžœ˜"Kšžœ˜—Kšœžœ˜+Kšœ˜K˜—Kšœžœ˜K˜ Kšžœ'žœ¡˜HKšœžœ0˜CKšœ˜K˜ —šŸ
+œžœ)žœ$˜aKšžœžœžœ˜šžœžœžœžœžœž˜-šœ˜Kšžœžœžœ¡I˜pK˜=K˜Kšœ˜—Kšžœžœ˜—Kšžœ	žœ˜K˜K˜ —šŸœžœUžœ=žœ˜±Kšœžœ˜Kšœžœ˜K˜/Kšœ"˜"šžœžœ¡˜9šžœ˜Kšžœ˜šžœ˜K˜
+šžœž˜Kšžœžœžœ˜K˜Kšžœ˜—K˜šžœžœ1žœ˜GKšœ?™?K˜šžœ_žœž˜iKšœ¡ œ˜1—K˜—šœÏbœ+˜>K˜0—Kšœ&¡˜Dšžœ
+žœ#žœžœ˜MKšœžœ˜Kšžœ˜K˜—K˜——Kšžœ˜—Kšœ)žœ˜/K˜K˜ —šœÞ™ÞK™ —šŸœžœJžœžœ=žœžœžœ˜àK˜/Kšœžœžœžœ1˜JKšœ$žœ2žœžœ˜oKšžœ!žœ˜7Kšœžœ˜šžœ	žœ?žœ&ž˜zK˜Kšœžœ˜Kšžœ˜—˜K˜3Kšœžœ˜"Kšœ	žœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ¡˜BKšœžœ˜Kšœ
+žœ˜$Kšœžœžœ˜Kšœžœžœ˜Kšœžœžœ˜Kšœžœžœ˜K˜8K˜0šŸœžœ˜Kšœ*žœ˜.Kšœ*žœ˜.Kšœ˜—Kšœžœ¡7˜ZKšœu™ušŸœžœ˜+Kšžœžœžœ¡˜CK˜š	žœžœžœžœ¡˜FK˜FK˜;K˜—K˜4K˜/šœžœ9˜IKšœ2™2—šœžœ˜-Kšœ#™#—K˜;Kšœžœ˜K˜—Kšœžœžœ˜+šŸœžœžœžœ˜%šžœžœžœ˜K–[[context: Imager.Context, from: ImagerBackdoor.CoordSys, to: ImagerBackdoor.CoordSys]šœo˜oKšœš˜šK–*[m: ImagerTransformation.Transformation]šœ ˜ Kšœžœ˜Kšœ˜—Kšžœ˜K˜—Kšœžœ¡˜#šŸ	œžœžœžœ˜&Kšœ¨™¨Kšœžœ˜!Kšœžœ˜Kšœžœ˜'šŸ	œžœžœžœ˜&Kšœ&™&Kšœ’™’šžœžœžœž˜+šžœžœžœ˜4Kšœ
+˜
+Kšžœ1˜7K˜—Kšžœ˜—Kšžœžœ˜K˜—Kšžœžœžœžœžœžœžœ˜=Kšžœžœ7˜RKšžœžœžœ¡˜)šžœ	žœ˜˜šžœ˜K˜XK˜—Kšœžœžœ˜&——šœ;˜;Kšœ4™4—šœP˜PKšœ™—šžœžœ¡˜*Kšœ¡+˜;K˜K˜—Kšœ¡˜'Kš	žœ
+žœžœžœ¡˜:Kšœ	žœ˜%Kšœ¡˜2Kšžœ
+žœžœžœ˜ Kšœ¡˜9Kšœ¡˜<Kšœ ¡ ˜@Kšœ ¡,˜LKšœ¡˜-šžœ
+žœ¡˜0šžœžœžœž˜0Kšœ¡'˜AKšžœ˜—Kšœ5¡˜TK˜%K˜K˜—š	žœžœžœžœ¡˜CKšœ)˜)Kšžœ˜—šœžœ˜$KšœN™N—Kšžœžœ˜K˜—šŸœžœžœ˜*šžœžœžœž˜Kšœžœžœ;˜bKšžœ˜—K˜—šŸœžœžœ˜/Kšžœžœžœ˜[šžœ
+žœ.˜>Kšœ¡˜)Kšœ¡˜#K˜'K˜ K˜—K˜—šŸœžœ
+žœ#˜EKšœÿ™ÿKšœk™kK˜Kšœžœ˜Kšžœžœžœžœžœžœ˜;K˜.Kšžœžœžœ¡˜;Kšœžœ	žœžœ˜?Kšžœžœžœ˜&šžœ	žœ¡-˜?K˜,K˜—Kšžœ˜Kšœ#¡˜=Kšœ#žœ˜)K˜—š
+Ÿœžœžœžœ	žœ˜TKšœžœ˜Kšœžœ˜	Kšœžœ˜Kšœ	žœžœ˜Kšœžœ˜#Kšžœžœžœ¡˜1K˜Kšœ	žœ¡˜BKšœ¡"˜3Kšžœ
+žœžœ¡&˜?K˜$šžœžœ!žœ7žœ5˜¤šžœ˜Kšœ5™5Kšœžœ˜K˜4K˜—Kšžœ¡˜*—š	žœžœž
+œžœž˜;Kšœžœ˜Kšžœžœžœ¡˜@Kšœ#¡˜6Kšžœ'žœžœ¡˜Ošžœžœ	žœ)žœ˜AKšœ™Kšœ
+žœ˜K˜Kšœžœ¡$˜<K˜)K˜"K˜—Kšœ¡%˜CKšœ'¡˜=šžœžœ	žœ˜Kšœ/™/K˜K˜)Kšœžœ˜ K˜—Kšžœ˜—K˜—Kšœžœ¡&˜:Kšœ
+žœ˜"Kšœžœ$˜7K˜šŸœžœžœ˜)Kšœ™Kšœ—™—Kšžœžœžœ	¡˜1K˜šžœžœ=˜RKšžœ#˜'—Kšžœ˜K˜—šŸ	œžœžœ˜1Kšžœžœžœ˜(K˜"K˜UK˜"K˜—Kšœžœ-˜AKšœ&˜&šŸœžœžœžœ˜Dšžœžœž˜Kšœ&˜&Kšœ˜Kšžœžœžœžœ˜rKšœžœžœ
+žœ!žœ$žœl˜ÙKšžœ˜—Kšœ˜Kšœ˜K˜ —Kš D˜Dšœžœžœ˜K˜ —šœ™K™ —š
+žœžœžœ!žœ	žœ˜BKšœ™š
+žœžœžœžœžœ˜=K™P—K˜
+Kšžœ˜—Kšœžœ˜šžœžœžœ˜.KšœK™KKšœ5žœ˜<K˜—šœ-™-Kšœ
+™
+Kšœ)™)KšœF™FKšœ™K™5KšœA™A—šžœž˜Kšœžœ˜Kšœžœžœ#žœ˜SšÐky £ £ £ £ £ <£ ˜ŽKš 	£ ˜K–™[viewer: ViewerClasses.Viewer, hint: ViewerClasses.PaintHint, clearClient: BOOL _ TRUE, whatChanged: REF ANY _ NIL, tryShortCuts: BOOL _ FALSE]š £ ˜Kš :˜:Kš £˜—šžœžœ˜KšœO™OKšœ-˜-Kšœ˜K˜Kšœ˜Kšœ!˜!Kšœ˜Kšœ!˜!Kšœžœ˜Kšœ
+˜
+Kšžœžœžœ˜K˜—Kšœ˜šœ¡œ˜Kšžœžœ'˜5Kš	žœžœžœžœ¡˜EKšœžœžœžœ
+¡˜8Kšœ˜—˜KšœM™M—šžœžœžœžœ!žœžœžœžœ˜{Kšœp™p—šœžœžœžœ-˜OKšœ™—šžœžœžœžœ˜)Kšœ žœ˜$šœ	žœ˜Kšœžœ˜K˜@šžœžœž˜Kšœžœ˜(Kšžœ+˜2—K˜K˜ Kšœ˜—Kšœ…˜…Kšžœžœžœ.˜FKšœV™Všœžœ˜!šžœžœ˜ Kšœ˜Kšžœžœžœ!˜9Kšœ˜Kšœ˜—K˜—Kšžœžœ
+˜šžœ˜Kšœžœ˜&Kšœžœ˜&šžœžœ˜&Kšœžœ˜'Kšœžœ˜Kšœ˜—šžœžœ˜šœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜KšœÑdlxœ
+˜ Kšœ˜—Kšœ˜—Kšœ˜—Kš#œžœKžœžœžœžœžœžœžœžœ!žœžœžœžœ/žœžœ)žœžœ"˜äKšœ˜—K˜K˜Kšžœžœžœ˜*šžœžœžœ˜2Kšœ%™%K˜Kš
+žœžœžœžœžœ˜-Kšœ˜K˜K˜—Kšžœ˜—Kšœ\™\šžœžœ˜%šžœ˜Kšœ}™}Kšœžœ˜šžœ
+žœ˜Kšœ	žœ˜%Kšžœžœ˜9Kšžœ4˜8Kšœ˜—Kšœžœ¡˜/K˜1šžœžœžœ ž˜;Kšœ™Kšœ)˜)—K˜K˜—šžœ˜Kšœ4™4Kšœžœžœ˜4Kšœžœžœ;˜PK˜——K˜
+K˜—K˜—K˜ —Kšžœ˜— …—    a   *  

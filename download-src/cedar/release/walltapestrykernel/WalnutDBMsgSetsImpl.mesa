@@ -1,0 +1,953 @@
+
+DIRECTORY
+Ascii USING [Lower], 
+Atom USING [MakeAtomFromRefText, GetPName], 
+IO,
+LoganBerry,
+LoganBerryEntry,
+RefTab USING [Ref, Val, Create, Delete, Fetch, Store],
+RefText USING [line, InlineAppendChar],
+Rope,
+WalnutDefs USING [dontCareDomainVersion, dontCareMsgSetVersion, Error, MsgSet, VersionMismatch, WalnutOpsHandle],
+WalnutDB,
+WalnutRegistry USING [MsgGroup, MsgGroupSize],
+WalnutRegistryPrivate USING [ CheckForMsgGroupRegistration,  NotifyForEvent, NotifyForMove, NotifyForMsgEvent, NotifyForMsgGroup],
+WalnutRoot USING [CommitAndContinue, RootHandle],
+WalnutSchema;
+
+WalnutDBMsgSetsImpl: CEDAR PROGRAM
+IMPORTS
+Ascii, Atom, IO, LoganBerry, LoganBerryEntry, RefTab, RefText, Rope,
+WalnutDefs, WalnutDB,
+WalnutRegistryPrivate,
+WalnutRoot
+
+EXPORTS WalnutDB, WalnutDefs =
+
+BEGIN OPEN WalnutDB, WalnutSchema;
+ROPE: TYPE = Rope.ROPE;
+Relship: TYPE = LoganBerry.Entry;
+
+WalnutOpsHandle: TYPE = WalnutDefs.WalnutOpsHandle;
+RootHandle: TYPE = WalnutRoot.RootHandle;
+SchemaHandle: TYPE = WalnutSchema.SchemaHandle;
+SchemaHandleRec: PUBLIC TYPE = WalnutSchema.SchemaHandleRec;
+MsgSet: TYPE = WalnutDefs.MsgSet;
+
+dontCareDomainVersion: INT = WalnutDefs.dontCareDomainVersion;
+dontCareMsgSetVersion: INT = WalnutDefs.dontCareMsgSetVersion;
+CheckReportProc: TYPE = WalnutDB.CheckReportProc;
+
+Value: TYPE = LoganBerry.AttributeValue;
+DBMinusOneInt: Value ¨ LoganBerryEntry.I2V[-1];
+DBZeroInt: Value ¨ LoganBerryEntry.I2V[0];
+DBTrueBool: Value ¨ LoganBerryEntry.B2V[TRUE];
+DBFalseBool: Value ¨ LoganBerryEntry.B2V[FALSE];
+nullValue: Value = NIL;
+ActiveMsgSetName: ROPE = "Active";
+DeletedMsgSetName: ROPE = "Deleted";
+timeToDelete: CARD16 ¨ 40;
+
+IsEntity: TYPE = RECORD [entity: LoganBerry.Entry, exists: BOOL];
+MSInfo: TYPE = REF MSInfoObject;
+MSInfoObject: TYPE = RECORD [canonicalName: ROPE, entity: ROPE, versionRel: Relship];
+nameText: REF TEXT = NEW[TEXT[RefText.line]]; 
+
+LazyEnumerator: TYPE = REF LazyEnumeratorRec;
+LazyEnumeratorRec: PUBLIC TYPE = RECORD[
+opsH: WalnutOpsHandle,
+msgSet: MsgSet,
+pos: INT,
+set: LoganBerry.Cursor,
+valid: BOOL,
+checkShow: BOOL
+];
+
+MsgSetExists: PUBLIC PROC[opsH: WalnutOpsHandle, name: ROPE, msDomainVersion: INT] RETURNS[existed: BOOL, msVersion: INT] = {
+msI: MSInfo;
+CheckDomainVersion[opsH, msDomainVersion];
+[msI, msVersion] ¨ GetMsgSetAndVersion[opsH, name];
+existed ¨ msI # NIL;
+};
+
+CreateMsgSet: PUBLIC PROC[opsH: WalnutOpsHandle, name: ROPE, msDomainVersion: INT] RETURNS [existed: BOOL, msVersion: INT] = {
+msI: MSInfo;
+mse: ROPE;
+cName: ROPE;
+aName: ATOM;
+sH: SchemaHandle = opsH.schemaHandle;
+CheckDomainVersion[opsH, msDomainVersion];
+[msI, msVersion] ¨ GetMsgSetAndVersion[opsH, name];
+IF existed ¨ (msI # NIL) THEN RETURN;
+cName ¨ Atom.GetPName[aName ¨ CanonicalName[name]];
+mse ¨ cName;
+msI ¨ NEW[MSInfoObject ¨ [canonicalName: cName, entity: mse, versionRel: NIL] ];
+msI.versionRel ¨ LIST [ 
+[$Key, Rope.Concat[sH.msBasicInfo, mse]],
+[sH.msPrintNameIs, name],
+[sH.msBICount, "0"],
+[sH.msBIVersion, "1"]
+];
+LoganBerry.WriteEntry[db: opsH.db, entry: msI.versionRel];
+ChangeGlobalMsgSetInfo[opsH, 1];
+[] ¨ RefTab.Store[sH.msgSetsTable, aName, msI];
+};
+
+NumInMsgSet: PUBLIC PROC[opsH: WalnutOpsHandle, name: ROPE]
+	RETURNS[num: INT, msVersion: INT] = {
+sH: WalnutSchema.SchemaHandle = opsH.schemaHandle;
+msI: MSInfo;
+CountOne: PROC[msg, tocEntry: ROPE, hasBeenRead: BOOL, startOfSubject: INT]
+RETURNS[continue: BOOL¨TRUE] ~ { num ¨ num+1; };
+num ¨ 0;
+[msI, msVersion] ¨ GetMsgSetAndVersion[opsH, name];
+IF msI # NIL THEN []¨EnumerateMsgsInSet[opsH, name, TRUE, CountOne];
+};
+
+EmptyMsgSet: PUBLIC PROC[opsH: WalnutOpsHandle, msgSet: MsgSet, report: CheckReportProc]
+	RETURNS[someInDeleted: BOOL ¨ FALSE] = {
+sH: WalnutSchema.SchemaHandle = opsH.schemaHandle;
+numIn: INT;
+msI: MSInfo;
+IF WalnutDB.EqMsgSets[msgSet.name, DeletedMsgSetName] THEN {
+WalnutDB.SetOpInProgressPos[opsH, -1];
+ERROR WalnutDefs.Error[$db, $InvalidOperation, "Can't empty the Deleted MsgSet"];
+};
+
+msI ¨ CheckMsgSetEntity[opsH, msgSet];
+IF msI = NIL THEN RETURN;
+numIn ¨ LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[msI.versionRel, sH.msBICount]];
+someInDeleted ¨ EmptyThisMsgSet[opsH, msI.entity, msgSet.name, report];
+IF numIn # 0 THEN WalnutDB.ChangeCountInMsgSet[opsH, msI.entity, -numIn];
+};
+
+DestroyMsgSet: PUBLIC PROC[opsH: WalnutOpsHandle, msgSet: MsgSet, msDomainVersion: INT, report: CheckReportProc]
+	RETURNS[someInDeleted: BOOL ¨ FALSE] = {
+msI: MSInfo;
+sH: SchemaHandle = opsH.schemaHandle;
+IF WalnutDB.EqMsgSets[msgSet.name, DeletedMsgSetName] THEN {
+WalnutDB.SetOpInProgressPos[opsH, -1];
+ERROR WalnutDefs.Error[$db, $InvalidOperation, "Can't destroy the Deleted MsgSet"];
+};
+CheckDomainVersion[opsH, msDomainVersion];
+msI ¨ CheckMsgSetEntity[opsH, msgSet];
+IF msI = NIL THEN RETURN;
+someInDeleted ¨ EmptyThisMsgSet[opsH, msI.entity, msgSet.name, report];
+LoganBerry.DeleteEntry[db: opsH.db, key: $Key, value: Rope.Concat[sH.msBasicInfo, msI.entity]];
+msI.versionRel ¨ NIL;
+ChangeGlobalMsgSetInfo[opsH, -1];
+};
+
+VerifyMsgSet: PUBLIC PROC[opsH: WalnutOpsHandle, msgSet: MsgSet]
+	RETURNS[exists: BOOL] = {
+msI: MSInfo ¨ CheckMsgSetEntity[opsH, msgSet];
+exists ¨ msI # NIL;
+};
+
+VerifyDomainVersion: PUBLIC PROC[opsH: WalnutOpsHandle, msDomainVersion: INT] =
+{ CheckDomainVersion[opsH, msDomainVersion] };
+
+ExpungeMsgs: PUBLIC PROC[opsH: WalnutOpsHandle, deletedVersion: INT, report: CheckReportProc] = {
+OPEN WalnutDB;
+sH: SchemaHandle = opsH.schemaHandle;
+msI: MSInfo = CheckMsgSetEntity[opsH, [DeletedMsgSetName, deletedVersion]];
+BEGIN
+deletedCount: INT = LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[msI.versionRel, sH.msBICount]];
+rs: LoganBerry.Cursor ¨ LoganBerry.GenerateEntries[db: opsH.db, key: sH.cdMsgSet, start: sH.deletedEntity, end: sH.deletedEntity];
+sinceLastCommit: INT ¨ 0;
+commitFrequency: CARDINAL = WalnutRegistry.MsgGroupSize;
+delArray: WalnutRegistry.MsgGroup;
+numDel: CARDINAL ¨ 0;
+count: INT ¨ 0;
+doMsgGroup: BOOL ¨ WalnutRegistryPrivate.CheckForMsgGroupRegistration[];
+IF doMsgGroup THEN delArray ¨ ALL[NIL];
+IF deletedCount # 0 THEN {
+ChangeCountInMsgSet[opsH, sH.deletedEntity, -deletedCount];
+ChangeCountOfMsgs[opsH, -deletedCount];
+sinceLastCommit ¨ sinceLastCommit + 1
+};
+
+BEGIN ENABLE UNWIND => NULL;
+rel: Relship;
+rLogInfo: Relship = LoganBerry.ReadEntry[db: opsH.db, key: $Key, value: sH.gLogInfo].entry;
+bytesDestroyed: INT ¨ LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[rLogInfo, sH.gBytesInDestroyedMsgs]];
+firstDestroyedPos: INT ¨ LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[rLogInfo, sH.gFirstDestroyedMsgPos]];
+UNTIL (rel ¨ LoganBerry.NextEntry[cursor: rs]) = NIL DO
+me: ROPE = LoganBerryEntry.GetAttr[rel, sH.cdMsg];
+textRel: Relship = LoganBerry.ReadEntry[db: opsH.db, key: $Key, value: Rope.Concat[sH.mMsgInfo, me]].entry;
+startPos: INT ¨ LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[textRel, sH.mMIEntryStart]];
+thisLen: INT ¨ LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[textRel, sH.mMITextOffset]] +
+LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[textRel, sH.mMITextLen]] + LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[textRel, sH.mMIFormatLen]];
+bytesDestroyed ¨ bytesDestroyed + thisLen;
+IF firstDestroyedPos = 0 OR startPos < firstDestroyedPos THEN
+firstDestroyedPos ¨ startPos;
+IF doMsgGroup THEN {
+delArray[numDel] ¨ me;
+numDel ¨ numDel + 1;
+};
+LoganBerry.DeleteEntry[db: opsH.db, key: $Key, value: Rope.Concat[sH.mMsgInfo, me]];
+LoganBerry.DeleteEntry[db: opsH.db, key: $Key, value: Rope.Concat[sH.mDisplayInfo, me]];
+LoganBerry.DeleteEntry[db: opsH.db, key: $Key, value: Rope.Concat[sH.mInfo, me]];
+LoganBerry.DeleteEntry[db: opsH.db, key: $Key, value: Rope.Concat[sH.cdRelation, me]];
+LoganBerry.DeleteEntry[db: opsH.db, key: $Key, value: Rope.Concat[sH.toRelation, me]];
+LoganBerry.DeleteEntry[db: opsH.db, key: $Key, value: Rope.Concat[sH.ccRelation, me]];
+LoganBerry.DeleteEntry[db: opsH.db, key: $Key, value: Rope.Concat[sH.fromRelation, me]];
+IF (sinceLastCommit ¨ sinceLastCommit + 1) >= commitFrequency THEN {
+LoganBerryEntry.SetAttr[rLogInfo, sH.gBytesInDestroyedMsgs, LoganBerryEntry.I2V[bytesDestroyed]];
+LoganBerryEntry.SetAttr[rLogInfo, sH.gFirstDestroyedMsgPos, LoganBerryEntry.I2V[firstDestroyedPos]];
+LoganBerry.WriteEntry[db: opsH.db, entry: rLogInfo, replace: TRUE];
+WalnutRoot.CommitAndContinue[opsH];
+sinceLastCommit ¨ 0;
+IF doMsgGroup THEN {
+WalnutRegistryPrivate.NotifyForMsgGroup[destroyed, delArray];
+delArray ¨ ALL[NIL];		-- clear out the Array
+numDel ¨ 0;
+};
+};
+IF report # NIL THEN count ¨ CheckCount[opsH, count, report];
+ENDLOOP;
+LoganBerry.EndGenerate[cursor: rs];
+IF sinceLastCommit # 0 THEN {
+LoganBerryEntry.SetAttr[rLogInfo, sH.gBytesInDestroyedMsgs, LoganBerryEntry.I2V[bytesDestroyed]];
+LoganBerryEntry.SetAttr[rLogInfo, sH.gFirstDestroyedMsgPos, LoganBerryEntry.I2V[firstDestroyedPos]];
+LoganBerry.WriteEntry[db: opsH.db, entry: rLogInfo, replace: TRUE];
+};
+BEGIN		-- change the version number of Deleted
+delRel: Relship = LoganBerry.ReadEntry[db: opsH.db, key: $Key, value: Rope.Concat[sH.msBasicInfo, sH.deletedEntity]].entry;
+LoganBerryEntry.SetAttr[delRel, sH.msBIVersion, LoganBerryEntry.I2V[LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[delRel, sH.msBIVersion]] + 1]];
+LoganBerry.WriteEntry[db: opsH.db, entry: delRel, replace: TRUE];
+WalnutRoot.CommitAndContinue[opsH];
+IF doMsgGroup AND (numDel # 0) THEN
+WalnutRegistryPrivate.NotifyForMsgGroup[destroyed, delArray];
+WalnutRegistryPrivate.NotifyForEvent[expungeComplete];
+END;
+DestroyOrphanAddrsAndSubjs[opsH, report];
+END;
+END;
+};
+MsgSetsInfo: PUBLIC PROC[opsH: WalnutOpsHandle] RETURNS[version, num: INT] = {
+sH: WalnutSchema.SchemaHandle = opsH.schemaHandle;
+rVersionInfo: Relship = LoganBerry.ReadEntry[db: opsH.db, key: $Key, value: sH.gVersionInfo].entry;
+version ¨ LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[rVersionInfo, sH.gMsgSetsVersion]];
+num ¨ LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[rVersionInfo, sH.gMsgSetCount]];
+};
+
+AddMsg: PUBLIC PROC[opsH: WalnutOpsHandle, msg: ROPE, from, to: MsgSet]
+	RETURNS[exists: BOOL] = {
+m: IsEntity;
+msI: MSInfo;
+sH: SchemaHandle = opsH.schemaHandle;
+exists ¨ FALSE;
+IF WalnutDB.EqMsgSets[to.name, DeletedMsgSetName] THEN RETURN;
+m ¨ GetMsgEntity[opsH, msg];
+IF ~m.exists THEN RETURN;
+[] ¨ CheckMsgSetEntity[opsH, from];
+msI ¨ CheckMsgSetEntity[opsH, to];
+IF msI = NIL THEN RETURN;		-- can't create msgset here
+{ rel: Relship ¨ LoganBerry.ReadEntry[db: opsH.db, key: $Key, value: Rope.Concat[sH.cdRelation, msg]].entry;
+wasInDeleted: BOOL ¨ FALSE;
+FOR msL: LIST OF ROPE ¨ LoganBerryEntry.GetAllAttrs[rel, sH.cdMsgSet], msL.rest WHILE msL # NIL DO
+msgSet: ROPE ¨ msL.first;
+IF Rope.Equal[msI.entity, msgSet, FALSE] THEN { exists ¨ TRUE; EXIT };
+IF Rope.Equal[msgSet, sH.deletedEntity, FALSE] THEN {
+rel ¨ LoganBerryEntry.RemoveAttr[rel, sH.cdMsgSet, msgSet];
+LoganBerry.WriteEntry[db: opsH.db, entry: rel, replace: TRUE];
+WalnutDB.ChangeCountInMsgSet[opsH, sH.deletedEntity, -1]
+}
+ENDLOOP;
+};
+IF NOT exists THEN AddMsgTo[opsH, msg, to.name];
+};
+
+RemoveMsg: PUBLIC PROC[opsH: WalnutOpsHandle, msg: ROPE, from: MsgSet, deletedVersion: INT] RETURNS[deleted: BOOL] = {
+m: IsEntity;
+msI: MSInfo;
+rel, thisCDRel: Relship;
+sH: SchemaHandle = opsH.schemaHandle;
+deleted ¨ FALSE;
+
+IF NOT (m¨ GetMsgEntity[opsH, msg]).exists THEN RETURN;
+IF (msI¨ CheckMsgSetEntity[opsH, from]) = NIL THEN RETURN;
+
+deleted ¨ TRUE;  -- We're committed to deleting the message unless we find it in another message set
+rel ¨ LoganBerry.ReadEntry[db: opsH.db, key: $Key, value: Rope.Concat[sH.cdRelation, msg]].entry;
+FOR msL: LIST OF ROPE ¨ LoganBerryEntry.GetAllAttrs[rel, sH.cdMsgSet], msL.rest WHILE msL # NIL DO
+IF Rope.Equal[msI.entity, msL.first, FALSE] THEN thisCDRel ¨ rel
+ELSE deleted ¨ FALSE
+ENDLOOP;
+IF thisCDRel = NIL THEN { deleted ¨ FALSE; RETURN };  -- Something strange here
+WalnutDB.ChangeCountInMsgSet[opsH, msI.entity, -1];
+IF NOT deleted 
+THEN {
+thisCDRel ¨ LoganBerryEntry.RemoveAttr[thisCDRel, sH.cdMsgSet, msI.entity];
+LoganBerry.WriteEntry[db: opsH.db, entry: thisCDRel, replace: TRUE];
+WalnutDB.ChangeCountInMsgSet[opsH, msI.entity, -1];
+}
+ELSE {
+LoganBerryEntry.SetAttr[thisCDRel, sH.cdMsgSet, sH.deletedEntity];
+LoganBerry.WriteEntry[db: opsH.db, entry: thisCDRel, replace: TRUE];
+};
+};
+
+MoveMsg: PUBLIC PROC[opsH: WalnutOpsHandle, msg: ROPE, from: MsgSet, to: MsgSet]
+	RETURNS [exists: BOOL ¨ FALSE] = {
+m: IsEntity;
+fromMsI, toMsI: MSInfo;
+sH: SchemaHandle = opsH.schemaHandle;
+rel, fromCDRelship, toCDRelship: Relship;
+IF WalnutDB.EqMsgSets[from.name, to.name] THEN RETURN[TRUE]; -- don't do anything
+
+IF NOT (m ¨ GetMsgEntity[opsH, msg]).exists THEN RETURN;
+IF (fromMsI ¨ CheckMsgSetEntity[opsH, from]) = NIL THEN RETURN;
+IF (toMsI ¨ CheckMsgSetEntity[opsH, to]) = NIL THEN RETURN;
+rel ¨ LoganBerry.ReadEntry[db: opsH.db, key: $Key, value: Rope.Concat[sH.cdRelation, msg]].entry;
+FOR msL: LIST OF ROPE ¨ LoganBerryEntry.GetAllAttrs[rel, sH.cdMsgSet], msL.rest WHILE msL # NIL DO
+IF Rope.Equal[fromMsI.entity, msL.first, FALSE] THEN
+fromCDRelship ¨ rel
+ELSE IF Rope.Equal[toMsI.entity, msL.first, FALSE] THEN
+toCDRelship ¨ rel;
+ENDLOOP;
+IF fromCDRelship = NIL THEN {exists ¨ FALSE; RETURN};
+exists ¨ toCDRelship # NIL;
+rel ¨ LoganBerryEntry.RemoveAttr[rel, sH.cdMsgSet, fromMsI.entity];
+IF NOT exists THEN {
+rel ¨ LoganBerryEntry.AddAttr[rel, sH.cdMsgSet, toMsI.entity];
+};
+LoganBerry.WriteEntry[db: opsH.db, entry: rel, replace: TRUE];
+WalnutDB.ChangeCountInMsgSet[opsH, fromMsI.entity, -1];
+IF NOT exists THEN WalnutDB.ChangeCountInMsgSet[opsH, toMsI.entity, 1];
+};
+
+MsgsEnumeration: PUBLIC PROC [opsH: WalnutOpsHandle, alphaOrder: BOOL]
+	RETURNS [mL: LIST OF ROPE] = {
+ok: BOOL ¨ FALSE;
+sH: WalnutSchema.SchemaHandle = opsH.schemaHandle;
+
+MEnum: PROC = {
+last: LIST OF ROPE;
+enum: LoganBerry.Cursor ¨
+IF alphaOrder 
+THEN LoganBerry.GenerateEntries[db: opsH.db, key: $Key, start: Rope.Concat[sH.mMsgInfo, "\000"], end: Rope.Concat[sH.mMsgInfo, "\177"]] 
+ELSE LoganBerry.GenerateEntries[db: opsH.db, key: $Key, start: sH.mMsgInfo, end: Rope.Concat[sH.mMsgInfo, "\255"]];
+mL ¨ NIL;
+BEGIN ENABLE UNWIND => GOTO end;
+e: LoganBerry.Entry;
+msg: ROPE;
+count: INT ¨ 0;
+FOR e ¨ LoganBerry.NextEntry[cursor: enum], LoganBerry.NextEntry[cursor: enum] UNTIL e = NIL DO
+msg ¨ LoganBerryEntry.GetAttr[e, sH.mMIOf];
+IF mL = NIL THEN mL ¨ last ¨ CONS[msg, NIL] ELSE
+{ last.rest ¨ CONS[msg, NIL]; last ¨ last.rest};
+count ¨ CheckForCommit[opsH, count];
+ENDLOOP;
+ok ¨ TRUE;
+EXITS end => NULL;
+END;
+LoganBerry.EndGenerate[cursor: enum ! LoganBerry.Error => CONTINUE];
+};
+MEnum[];
+IF ok THEN RETURN
+ELSE WalnutDefs.Error[$db, $DatabaseInaccessible, "During Msgs enumeration"];
+};
+
+MsgsInSetEnumeration: PUBLIC PROC[opsH: WalnutOpsHandle, name: ROPE, fromStart: BOOL] RETURNS [mL: LIST OF ROPE, msVersion: INT ¨ -1] = {
+ok: BOOL ¨ FALSE;
+sH: SchemaHandle = opsH.schemaHandle;
+
+MEnum: PROC = {
+msI: MSInfo;
+enum: LoganBerry.Cursor;
+checkShow: BOOL;
+count: INT ¨ 0;
+lastInList: LIST OF ROPE ¨ NIL;
+mL ¨ NIL;
+
+[msI, msVersion] ¨ GetMsgSetAndVersion[opsH, name];
+IF msI = NIL THEN {ok ¨ TRUE; RETURN};
+checkShow ¨  name.Equal["Active", FALSE];
+
+enum ¨
+LoganBerry.GenerateEntries[db: opsH.db, key: sH.cdMsgSet, start: msI.entity, end: msI.entity];
+BEGIN ENABLE UNWIND => GOTO end;
+DO
+rel: Relship = LoganBerry.NextEntry[cursor: enum];
+me: ROPE;
+IF rel = NIL THEN EXIT;
+me ¨ LoganBerryEntry.GetAttr[rel, sH.cdMsg];
+IF checkShow THEN {
+sRel: Relship = LoganBerry.ReadEntry[db: opsH.db, key: $Key, value: Rope.Concat[sH.mInfo, me]].entry;
+IF NOT Rope.Equal[LoganBerryEntry.GetAttr[sRel, sH.mShowIs], "NULL"] THEN LOOP; -- mShowIs is unaccepted
+};  
+IF fromStart THEN {
+thisL: LIST OF ROPE = CONS[me, NIL];
+IF mL = NIL THEN mL ¨ lastInList ¨ thisL
+ELSE {
+lastInList.rest ¨ thisL;
+lastInList ¨ lastInList.rest;
+};
+}
+ELSE mL ¨ CONS[me, mL];
+count ¨ CheckForCommit[opsH, count];
+ENDLOOP;
+ok ¨ TRUE;
+EXITS end => NULL;
+END;
+LoganBerry.EndGenerate[cursor: enum ! LoganBerry.Error => CONTINUE]
+};
+MEnum[];
+IF ok THEN RETURN
+ELSE WalnutDefs.Error[$db, $DatabaseInaccessible, "During MsgSets enumeration"];
+};
+
+MsgSetsNames: PUBLIC PROC[opsH: WalnutOpsHandle, alphaOrder: BOOL]
+	RETURNS[msL: LIST OF ROPE, msDomainVersion: INT ¨ -1] = {
+ok: BOOL ¨ FALSE;
+sH: SchemaHandle = opsH.schemaHandle;
+
+MSEnum: PROC = {
+last: LIST OF ROPE;
+rVersionInfo: Relship = LoganBerry.ReadEntry[db: opsH.db, key: $Key, value: sH.gVersionInfo].entry;
+enum: LoganBerry.Cursor ¨
+IF alphaOrder 
+THEN LoganBerry.GenerateEntries[db: opsH.db, key: $Key, start: Rope.Concat[sH.msBasicInfo, "\000"], end: Rope.Concat[sH.msBasicInfo, "\177"]] 
+ELSE LoganBerry.GenerateEntries[db: opsH.db, key: $Key, start: sH.msBasicInfo, end: Rope.Concat[sH.msBasicInfo, "\255"]];
+msDomainVersion ¨ LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[rVersionInfo, sH.gMsgSetsVersion]];
+msL ¨ NIL;
+BEGIN ENABLE UNWIND => GOTO end;
+FOR e: LoganBerry.Entry ¨ LoganBerry.NextEntry[cursor: enum], LoganBerry.NextEntry[cursor: enum] UNTIL e = NIL DO
+thisName: ROPE =
+LoganBerryEntry.GetAttr[e, sH.msPrintNameIs];
+IF msL = NIL THEN msL ¨ last ¨ CONS[thisName, NIL] ELSE
+{ last.rest ¨ CONS[thisName, NIL]; last ¨ last.rest};
+ENDLOOP;
+ok ¨ TRUE;
+EXITS end => NULL;
+END;
+LoganBerry.EndGenerate[cursor: enum ! LoganBerry.Error => CONTINUE]
+};
+MSEnum[];
+IF ok THEN RETURN
+ELSE WalnutDefs.Error[$db, $DatabaseInaccessible, "During MsgSets enumeration"];
+};
+
+EnumerateMsgSets: PUBLIC PROC[opsH: WalnutOpsHandle, alphaOrder: BOOL, proc: PROC[msgSet: MsgSet] RETURNS[continue: BOOL] ]
+RETURNS[msDomainVersion: INT ¨ -1] = {
+ok: BOOL ¨ FALSE;
+sH: SchemaHandle = opsH.schemaHandle;
+
+MSEnum: PROC = {
+enum: LoganBerry.Cursor ¨
+IF alphaOrder 
+THEN LoganBerry.GenerateEntries[db: opsH.db, key: $Key, start: Rope.Concat[sH.msBasicInfo, "\000"], end: Rope.Concat[sH.msBasicInfo, "\177"]] 
+ELSE LoganBerry.GenerateEntries[db: opsH.db, key: $Key, start: sH.msBasicInfo, end: Rope.Concat[sH.msBasicInfo, "\255"]];
+rVersionInfo: Relship = LoganBerry.ReadEntry[db: opsH.db, key: $Key, value: sH.gVersionInfo].entry;
+msDomainVersion ¨ LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[rVersionInfo, sH.gMsgSetsVersion]];
+BEGIN ENABLE UNWIND => GOTO end;
+FOR e: LoganBerry.Entry ¨ LoganBerry.NextEntry[cursor: enum], LoganBerry.NextEntry[cursor: enum] UNTIL e = NIL DO
+msgSet: MsgSet ¨
+[LoganBerryEntry.GetAttr[e, sH.msPrintNameIs], LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[e, sH.msBIVersion]]];
+IF NOT proc[msgSet] THEN EXIT;
+ENDLOOP;
+ok ¨ TRUE;
+EXITS end => NULL;
+END;
+LoganBerry.EndGenerate[cursor: enum ! LoganBerry.Error => CONTINUE]
+};
+MSEnum[];
+IF ok THEN RETURN
+ELSE ERROR WalnutDefs.Error[$db, $DatabaseInaccessible, "During MsgSets enumeration"]
+};
+
+EnumerateMsgsInSet: PUBLIC PROC [
+opsH: WalnutOpsHandle,
+name: ROPE,
+fromStart: BOOL ¨ TRUE,
+proc: PROC[msg, tocEntry: ROPE, hasBeenRead: BOOL, startOfSubject: INT] RETURNS[continue: BOOL] ]
+RETURNS [msVersion: INT ¨ -1] = {
+ok: BOOL ¨ FALSE;
+sH: SchemaHandle = opsH.schemaHandle;
+MEnum: PROC = {
+msI: MSInfo;
+enum: LoganBerry.Cursor;
+checkShow: BOOL;
+count: INT ¨ 0;
+
+[msI, msVersion] ¨ GetMsgSetAndVersion[opsH, name];
+IF msI = NIL THEN {ok¨ TRUE; RETURN};
+checkShow ¨ name.Equal["Active", FALSE];
+
+enum ¨
+LoganBerry.GenerateEntries[db: opsH.db, key: sH.cdMsgSet, start: msI.entity, end: msI.entity];
+BEGIN ENABLE UNWIND => GOTO end;
+DO
+rel: Relship = LoganBerry.NextEntry[cursor: enum];
+msg, tocEntry: ROPE;
+hasBeenRead: BOOL;
+startOfSubject: INT;
+IF rel = NIL THEN EXIT;
+msg ¨ LoganBerryEntry.GetAttr[rel, sH.cdMsg];
+IF checkShow THEN {
+sRel: Relship = LoganBerry.ReadEntry[db: opsH.db, key: $Key, value: Rope.Concat[sH.mInfo, msg]].entry;
+IF NOT Rope.Equal[LoganBerryEntry.GetAttr[sRel, sH.mShowIs], "NULL"] THEN LOOP; -- mShowIs is unaccepted
+};
+[hasBeenRead, tocEntry, startOfSubject] ¨ WalnutDB.GetMsgDisplayInfo[opsH, msg];
+IF NOT proc[msg, tocEntry, hasBeenRead, startOfSubject] THEN EXIT;
+count ¨ CheckForCommit[opsH, count];
+ENDLOOP;
+ok¨ TRUE;
+EXITS end => NULL;
+END;
+LoganBerry.EndGenerate[cursor: enum ! LoganBerry.Error => CONTINUE]
+};
+MEnum[];
+IF ok THEN RETURN
+ELSE ERROR WalnutDefs.Error[$db, $DatabaseInaccessible, "During MsgSets enumeration"]
+};
+
+EnumerateMsgsInMsgSet: PUBLIC PROC[opsH: WalnutOpsHandle, msgSet: MsgSet]
+	RETURNS[lazyEnum: WalnutDB.LazyEnumerator] = {
+sH: SchemaHandle = opsH.schemaHandle;
+lazyEnum ¨ NEW[LazyEnumeratorRec];
+lazyEnum.opsH ¨ opsH;
+lazyEnum.msgSet ¨ msgSet;
+lazyEnum.pos ¨ 0;
+lazyEnum.checkShow ¨ Rope.Equal[msgSet.name, ActiveMsgSetName];
+lazyEnum.set ¨
+LoganBerry.GenerateEntries[db: opsH.db, key: sH.cdMsgSet, start: msgSet.name, end: msgSet.name];
+lazyEnum.valid ¨ TRUE;
+};
+
+NextMsgInMsgSet: PUBLIC PROC[lazyEnum: WalnutDB.LazyEnumerator]
+	RETURNS[msgID: ROPE, valid: BOOL ¨ FALSE] = {
+howManyIterations: INT ¨ 0;
+sH: SchemaHandle = lazyEnum.opsH.schemaHandle;
+GetNextMsg: PROC = {
+me: ROPE;
+IF lazyEnum.valid = FALSE THEN { valid ¨ FALSE; RETURN };
+DO
+rel: Relship = LoganBerry.NextEntry[cursor: lazyEnum.set];
+howManyIterations ¨ howManyIterations+1;
+IF rel = NIL THEN { LoganBerry.EndGenerate[cursor: lazyEnum.set]; lazyEnum.valid ¨ FALSE; EXIT };
+me ¨ LoganBerryEntry.GetAttr[rel, sH.cdMsg];
+IF lazyEnum.checkShow THEN {
+sRel: Relship = LoganBerry.ReadEntry[db: lazyEnum.opsH.db, key: $Key, value: Rope.Concat[sH.mInfo, me]].entry;
+IF NOT Rope.Equal[LoganBerryEntry.GetAttr[sRel, sH.mShowIs], "NULL"] THEN LOOP ELSE EXIT }
+ELSE EXIT
+ENDLOOP;
+IF me # NIL THEN msgID ¨ me;
+valid ¨ TRUE
+};
+ResetToStart: PROC = {
+lazyEnum.set ¨ LoganBerry.GenerateEntries[db: lazyEnum.opsH.db, key: sH.cdMsgSet, start: lazyEnum.msgSet.name, end: lazyEnum.msgSet.name];
+FOR i: INT IN [0..lazyEnum.pos) DO [] ¨ LoganBerry.NextEntry[cursor: lazyEnum.set] ENDLOOP;
+howManyIterations ¨ 0 };
+
+IF NOT VerifyMsgSet[lazyEnum.opsH, lazyEnum.msgSet] THEN RETURN[NIL, FALSE];
+FOR tryRestart: BOOL ¨ TRUE, FALSE WHILE tryRestart DO
+failed: BOOL ¨ FALSE;
+GetNextMsg[ ! LoganBerry.Error => { failed ¨ TRUE; CONTINUE } ];
+IF NOT failed THEN { lazyEnum.pos ¨ lazyEnum.pos+howManyIterations; RETURN };
+ResetToStart[]
+ENDLOOP
+};
+
+EnumerateUnacceptedMsgs: PUBLIC PROC[opsH: WalnutOpsHandle, activeVersion: INT, proc: PROC[msg, tocEntry: ROPE, startOfSubject: INT] ] = {
+ok: BOOL ¨ FALSE;
+sH: SchemaHandle = opsH.schemaHandle;
+
+Eum: PROC = {
+enum: LoganBerry.Cursor;
+count: INT ¨ 0;
+[] ¨ CheckMsgSetEntity[opsH, [ActiveMsgSetName, activeVersion]];
+enum ¨ LoganBerry.GenerateEntries[db: opsH.db, key: sH.mShowIs, start: sH.unacceptedEntity, end: sH.unacceptedEntity];
+
+BEGIN ENABLE UNWIND => GOTO end;
+showRel: Relship;
+msg: ROPE;
+UNTIL (showRel ¨ LoganBerry.NextEntry[cursor: enum]) = NIL DO
+tocEntry: ROPE;
+startOfSubject: INT;
+me: ROPE = LoganBerryEntry.GetAttr[showRel, sH.mInfoOf];
+msg ¨ me;
+[ , tocEntry, startOfSubject] ¨ WalnutDB.GetMsgDisplayInfo[opsH, me];
+proc[msg, tocEntry, startOfSubject];
+count ¨ CheckForCommit[opsH, count];
+ENDLOOP;
+ok¨ TRUE;
+EXITS end => NULL;
+END;
+LoganBerry.EndGenerate[cursor: enum ! LoganBerry.Error => CONTINUE]
+};
+
+Eum[];
+IF ok THEN RETURN;
+ERROR WalnutDefs.Error[$db, $DatabaseInaccessable, "During Get New Mail"];
+};
+
+AcceptNewMail: PUBLIC PROC[opsH: WalnutOpsHandle, pos, activeVersion: INT] = {
+rs: LoganBerry.Cursor;
+es: LoganBerry.Cursor;
+commitFrequency: CARDINAL = WalnutRegistry.MsgGroupSize;
+accArray: WalnutRegistry.MsgGroup;
+numAcc: CARDINAL ¨ 0;
+sinceLastCommit: INT ¨ 0;
+sH: SchemaHandle = opsH.schemaHandle;
+rNewMailInfo, rLogInfo: Relship;
+activeRel: Relship = LoganBerry.ReadEntry[db: opsH.db, key: $Key, value: Rope.Concat[sH.msBasicInfo, sH.activeEntity]].entry;
+doMsgGroup: BOOL ¨ WalnutRegistryPrivate.CheckForMsgGroupRegistration[];
+
+[] ¨ CheckMsgSetEntity[opsH, [ActiveMsgSetName, activeVersion]];
+IF doMsgGroup THEN accArray ¨ ALL[NIL];
+
+BEGIN ENABLE UNWIND => NULL;
+showRel: Relship;
+rs ¨ LoganBerry.GenerateEntries[db: opsH.db, key: sH.mShowIs, start: sH.unacceptedEntity, end: sH.unacceptedEntity];
+UNTIL (showRel ¨ LoganBerry.NextEntry[cursor: rs]) = NIL DO
+me: ROPE = LoganBerryEntry.GetAttr[showRel, sH.mInfoOf];
+LoganBerryEntry.SetAttr[showRel, sH.mShowIs, "NULL"];
+LoganBerry.WriteEntry[db: opsH.db, entry: showRel, replace: TRUE];
+IF doMsgGroup THEN {
+accArray[numAcc] ¨ me;
+numAcc ¨ numAcc + 1;
+};
+IF (sinceLastCommit ¨ sinceLastCommit + 1) >= commitFrequency THEN {
+newCount: INT = LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[activeRel, sH.msBICount]] + sinceLastCommit;
+LoganBerryEntry.SetAttr[activeRel, sH.msBICount, LoganBerryEntry.I2V[newCount]];
+LoganBerry.WriteEntry[db: opsH.db, entry: activeRel, replace: TRUE];
+WalnutRoot.CommitAndContinue[opsH];
+sinceLastCommit ¨ 0;
+IF doMsgGroup THEN {
+WalnutRegistryPrivate.NotifyForMsgGroup[added, accArray];
+accArray ¨ ALL[NIL];
+numAcc ¨ 0;
+};
+};
+ENDLOOP;
+LoganBerry.EndGenerate[cursor: rs];
+END;
+BEGIN ENABLE UNWIND => NULL;
+es ¨ LoganBerry.GenerateEntries[db: opsH.db, key: $Key, start: Rope.Concat[sH.sBasicInfo, "\000"], end: Rope.Concat[sH.sBasicInfo, "\177"]];
+FOR se: LoganBerry.Entry ¨ LoganBerry.NextEntry[cursor: es], LoganBerry.NextEntry[cursor: es] UNTIL se = NIL DO
+rel: Relship = se;
+LoganBerryEntry.SetAttr[rel, sH.sBINum, DBZeroInt];
+LoganBerry.WriteEntry[db: opsH.db, entry: rel, replace: TRUE];
+ENDLOOP;
+LoganBerry.EndGenerate[cursor: es];
+END;
+
+IF sinceLastCommit # 0 THEN
+LoganBerryEntry.SetAttr[activeRel, sH.msBICount, LoganBerryEntry.I2V[LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[activeRel, sH.msBICount]] + sinceLastCommit]];
+
+LoganBerryEntry.SetAttr[activeRel, sH.msBIVersion, LoganBerryEntry.I2V[LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[activeRel, sH.msBIVersion]] + 1]];
+LoganBerry.WriteEntry[db: opsH.db, entry: activeRel, replace: TRUE];
+rNewMailInfo ¨ LoganBerry.ReadEntry[db: opsH.db, key: $Key, value: sH.gNewMailInfo].entry;
+LoganBerryEntry.SetAttr[rNewMailInfo, sH.gAcceptNewMailLogPos, LoganBerryEntry.I2V[pos]];
+LoganBerry.WriteEntry[db: opsH.db, entry: rNewMailInfo, replace: TRUE];
+rLogInfo ¨ LoganBerry.ReadEntry[db: opsH.db, key: $Key, value: sH.gLogInfo].entry;
+LoganBerryEntry.SetAttr[rLogInfo, sH.gOpInProgressPos, DBMinusOneInt];
+LoganBerry.WriteEntry[db: opsH.db, entry: rLogInfo, replace: TRUE];
+WalnutRoot.CommitAndContinue[opsH];
+IF doMsgGroup AND (numAcc # 0) THEN
+WalnutRegistryPrivate.NotifyForMsgGroup[added, accArray];
+};
+
+mismatchReport: ROPE = "Msgset: %g: version is %g, version expected is: %g";
+
+GetMsgSetBasicInfoRel: PROC[opsH: WalnutOpsHandle, ms: ROPE] RETURNS[rel: Relship] =
+{ RETURN[LoganBerry.ReadEntry[db: opsH.db, key: $Key, value: Rope.Concat[opsH.schemaHandle.msBasicInfo, ms]].entry] };
+
+GetMsgEntity: PROC[opsH: WalnutOpsHandle, msg: ROPE] RETURNS[e: IsEntity] = {
+sH: WalnutSchema.SchemaHandle = opsH.schemaHandle;
+e.entity ¨ LoganBerry.ReadEntry[db: opsH.db, key: $Key, value: Rope.Concat[sH.mMsgInfo, msg]].entry;
+e.exists ¨ (e.entity # NIL);
+};
+
+GetMsgSetAndVersion: PROC[opsH: WalnutOpsHandle, name: ROPE]
+	RETURNS[msI: MSInfo, version: INT] = {
+sH: WalnutSchema.SchemaHandle = opsH.schemaHandle;
+msI ¨ GetMsgSetEntity[opsH, name];
+IF msI # NIL THEN version ¨ LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[msI.versionRel, sH.msBIVersion]]
+ELSE version¨ -1;
+};
+
+GetMsgSetEntity: PROC[opsH: WalnutOpsHandle, name: ROPE] RETURNS[msInfo: MSInfo] = {
+sH: WalnutSchema.SchemaHandle = opsH.schemaHandle;
+aName: ATOM = CanonicalName[name];		-- all lower case
+cName: ROPE;
+found: BOOL;
+val: RefTab.Val;
+mse: ROPE;
+IF opsH.schemaHandle.msgSetsTable = NIL THEN {
+rVersionInfo: Relship = LoganBerry.ReadEntry[db: opsH.db, key: $Key, value: sH.gVersionInfo].entry;
+numMsgSets: INT ¨ LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[rVersionInfo, sH.gMsgSetCount]];
+opsH.schemaHandle.msgSetsTable ¨ RefTab.Create[MAX[numMsgSets*2+1, 16]];
+};
+
+[found, val] ¨ RefTab.Fetch[opsH.schemaHandle.msgSetsTable, aName];
+IF found THEN {
+msInfo ¨ NARROW[val];
+IF msInfo.versionRel # NIL THEN RETURN;
+msInfo.versionRel ¨ GetMsgSetBasicInfoRel[opsH, msInfo.entity];
+IF msInfo.versionRel = NIL THEN {		-- no longer exists
+[] ¨ RefTab.Delete[opsH.schemaHandle.msgSetsTable, aName];
+RETURN[NIL]
+};
+RETURN;
+};
+mse ¨ cName ¨ Atom.GetPName[aName];
+msInfo ¨ NEW[MSInfoObject ¨ [canonicalName: cName, entity: mse]];
+msInfo.versionRel ¨ GetMsgSetBasicInfoRel[opsH, mse];
+IF msInfo.versionRel = NIL THEN RETURN[NIL];		-- return NIL IF msgSet doesn't exist
+[] ¨ RefTab.Store[opsH.schemaHandle.msgSetsTable, aName, msInfo];
+};
+
+CanonicalName: PUBLIC PROC[name: ROPE] RETURNS[aName: ATOM] = {
+nameText.length ¨ 0;
+FOR i: INT IN [0 .. name.Length[]) DO
+[] ¨ RefText.InlineAppendChar[nameText, Ascii.Lower[name.Fetch[i]]];
+ENDLOOP;
+aName ¨ Atom.MakeAtomFromRefText[nameText];
+};
+
+CheckDomainVersion: PROC[opsH: WalnutOpsHandle, version: INT] = {
+sH: WalnutSchema.SchemaHandle = opsH.schemaHandle;
+is: INT;
+rVersionInfo: Relship;
+IF version = dontCareDomainVersion THEN RETURN;
+rVersionInfo ¨ LoganBerry.ReadEntry[db: opsH.db, key: $Key, value: sH.gVersionInfo].entry;
+IF version # (is ¨ LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[rVersionInfo, sH.gMsgSetsVersion]]) THEN {
+rLogInfo: Relship ¨ LoganBerry.ReadEntry[db: opsH.db, key: $Key, value: sH.gLogInfo].entry;
+LoganBerryEntry.SetAttr[rLogInfo, sH.gOpInProgressPos, DBMinusOneInt];
+LoganBerry.WriteEntry[db: opsH.db, entry: rLogInfo, replace: TRUE];
+ERROR WalnutDefs.VersionMismatch[
+IO.PutFR["Domain version is %g, version expected is: %g", [integer[is]], [integer[version]]] ];
+};
+};
+
+CheckMsgSetVersion: PROC[opsH: WalnutOpsHandle, msgSet: MsgSet]
+	RETURNS[msI: MSInfo, version: INT] = {
+sH: WalnutSchema.SchemaHandle = opsH.schemaHandle;
+[msI, version] ¨ GetMsgSetAndVersion[opsH, msgSet.name];
+};
+
+CheckMsgSetEntity: PROC[opsH: WalnutOpsHandle, msgSet: MsgSet] RETURNS[msI: MSInfo] = {
+sH: WalnutSchema.SchemaHandle = opsH.schemaHandle;
+msI ¨ GetMsgSetEntity[opsH, msgSet.name];
+};
+
+commitFreq: INT ¨ 500;
+
+CheckForCommit: PROC[opsH: WalnutOpsHandle, count: INT] RETURNS[new: INT] = {
+IF ( (new ¨ count + 1) MOD commitFreq ) = 0 THEN WalnutRoot.CommitAndContinue[opsH];
+};
+
+EmptyThisMsgSet: PROC[opsH: WalnutOpsHandle, mse: ROPE, name: ROPE, report: CheckReportProc]
+	RETURNS[someInDeleted: BOOL] = {
+sH: SchemaHandle = opsH.schemaHandle;
+rs: LoganBerry.Cursor = LoganBerry.GenerateEntries[db: opsH.db, key: sH.cdMsgSet, start: mse, end: mse];
+BEGIN ENABLE UNWIND => NULL;
+rel: Relship;
+de: ROPE = sH.deletedEntity;
+commitFrequency: CARDINAL = WalnutRegistry.MsgGroupSize;
+delArray: WalnutRegistry.MsgGroup;
+remArray: WalnutRegistry.MsgGroup;
+numDel: CARDINAL ¨ 0;
+numRem: CARDINAL ¨ 0;
+sinceLastCommit: INT ¨ 0;
+count: INT ¨ 0;
+someInDeleted ¨ FALSE;
+UNTIL (rel ¨ LoganBerry.NextEntry[cursor: rs]) = NIL DO
+me: ROPE = LoganBerryEntry.GetAttr[rel, sH.cdMsg];
+deleted: BOOL;
+rel ¨ LoganBerryEntry.RemoveAttr[rel, sH.cdMsgSet, mse];
+deleted ¨ LoganBerryEntry.GetAttr[rel, sH.cdMsgSet] = NIL;
+IF deleted THEN {
+rel ¨ LoganBerryEntry.AddAttr[rel, sH.cdMsgSet, sH.deletedEntity];
+delArray[numDel] ¨ me;
+numDel ¨ numDel + 1;
+}
+ELSE {
+remArray[numRem] ¨ me;
+numRem ¨ numRem + 1;
+};
+LoganBerry.WriteEntry[db: opsH.db, entry: rel, replace: TRUE];
+
+someInDeleted¨ someInDeleted OR deleted;
+IF (sinceLastCommit ¨ sinceLastCommit + 1) >= commitFrequency THEN {
+WalnutRoot.CommitAndContinue[opsH];
+sinceLastCommit ¨ 0;
+FOR i: CARDINAL IN [0 .. numDel) DO
+WalnutRegistryPrivate.NotifyForMsgEvent[deleted, delArray[i]]; ENDLOOP;
+FOR i: CARDINAL IN [0 .. numRem) DO
+WalnutRegistryPrivate.NotifyForMove[msg: remArray[i], to: NIL, from: name];
+ENDLOOP;
+numDel ¨ numRem ¨ 0;
+};
+IF report # NIL THEN count ¨ CheckCount[opsH, count, report];
+ENDLOOP;
+LoganBerry.EndGenerate[cursor: rs];
+IF sinceLastCommit # 0 THEN {
+WalnutRoot.CommitAndContinue[opsH];
+FOR i: CARDINAL IN [0 .. numDel) DO
+WalnutRegistryPrivate.NotifyForMsgEvent[deleted, delArray[i]]; ENDLOOP;
+FOR i: CARDINAL IN [0 .. numRem) DO
+WalnutRegistryPrivate.NotifyForMove[msg: remArray[i], to: NIL, from: name];
+ENDLOOP;
+};
+END;
+};
+
+ChangeGlobalMsgSetInfo: PROC[opsH: WalnutOpsHandle, delta: INT] = {
+sH: WalnutSchema.SchemaHandle = opsH.schemaHandle;
+rVersionInfo: Relship = LoganBerry.ReadEntry[db: opsH.db, key: $Key, value: sH.gVersionInfo].entry;
+numNow: INT ¨ LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[rVersionInfo, sH.gMsgSetCount]];
+newV: INT = LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[rVersionInfo, sH.gMsgSetsVersion]] + 1;
+LoganBerryEntry.SetAttr[rVersionInfo, sH.gMsgSetsVersion, LoganBerryEntry.I2V[newV]];
+LoganBerryEntry.SetAttr[rVersionInfo, sH.gMsgSetCount, LoganBerryEntry.I2V[numNow + delta]];
+LoganBerry.WriteEntry[db: opsH.db, entry: rVersionInfo, replace: TRUE];
+};
+
+AddMsgTo: PROC[opsH: WalnutOpsHandle, me: ROPE, mse: ROPE] = {
+sH: WalnutSchema.SchemaHandle = opsH.schemaHandle;
+rel: Relship ¨ LoganBerry.ReadEntry[db: opsH.db, key: $Key, value: Rope.Concat[sH.cdRelation, me]].entry;
+rel ¨ LoganBerryEntry.AddAttr[rel, sH.cdMsgSet, mse];
+LoganBerry.WriteEntry[db: opsH.db, entry: rel, replace: TRUE];
+WalnutDB.ChangeCountInMsgSet[opsH, mse, 1]
+};
+
+CheckCount: PROC[opsH: WalnutOpsHandle, count: INT, report: CheckReportProc]
+	RETURNS[c: INT] = {
+IF count = 0 THEN report[opsH, "  "];		-- put out spaces first
+IF (c ¨ count + 1) MOD 10 # 0 THEN RETURN;
+IF c MOD 100 = 0 THEN report[opsH, "! "] ELSE report[opsH, "&"];
+};
+
+DestroyOrphanAddrsAndSubjs: PROC[opsH: WalnutOpsHandle, report: CheckReportProc] = {
+};
+
+END.
+     
+WalnutDBMsgSetsImpl.mesa
+Copyright ” 1984, 1988, 1989, 1992 by Xerox Corporation.  All rights reserved. 
+Willie-Sue, March 29, 1989 6:04:55 pm PST
+Donahue, May 12, 1986 2:13:42 pm PDT  
+Jack Kent, June 23, 1987 6:57:27 pm PDT 
+Doug Terry, August 28, 1990 5:35:08 pm PDT
+TerryTest, November 15, 1990 12:40 pm PST
+
+Contents: types and procedures dealing with the Walnut message database
+Initiated by Willie-Sue, September 24, 1984
+Swinehar, February 25, 1991 9:50 am PST
+
+Types
+
+Internal Types and Variables
+
+MSInfo's are stored in the msgSetsTable
+
+Operations on Message Sets
+Does this message set already exist in the database.
+Create this message set if it doesn't already exist in the database.
+IF msI = NIL THEN num_ 0
+ELSE num _ LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[msI.versionRel, sH.msBICount]];
+Replaced by:
+Could now update msI.versionRel entry.
+Removes any messages from msgSet - long running op
+Destroys the given msgSet, removing any messages from it first (uses equivalent of RemoveMsgFromMsgSet below).  If the message set is "Deleted" then WalnutDefs.IError[$db, $InvalidMsgSet] - long running op
+Destroys the Deleted message set - long running op
+
+If the counts are wrong, change them.  They may already have been changed if you're restarting an Expunge
+This counts as one operation
+Destroy all information about message
+now change the length of the last log back to -1
+
+
+Operations to Move Messages Among Message Sets
+Adds Msg to MsgSet, if it's not already in it.  IF msgSet=deletedMsgSet, does nothing and returns exists=FALSE
+IF removing msg from msgSet would leave it in no MsgSet, then msg gets added to the distinguished MsgSet Deleted, and returns deleted = TRUE
+Move the message.  Note that the result of a move may be that a message becomes deleted (if to was the Deleted message set) or undeleted (if from is the Deleted message set)
+
+Enumerations
+Note: fromStart is ignored.
+Note: fromStart is ignored.
+long running op
+
+Internal procedures
+changes name to all lower case, to get canonical names
+Commented out since I don't know why we need message set versions.  ... DBT
+BEGIN
+rLogInfo: Relship;
+IF msI = NIL THEN RETURN;
+IF msgSet.version = dontCareMsgSetVersion THEN RETURN;
+IF msgSet.version = version THEN RETURN;
+rLogInfo _ LoganBerry.ReadEntry[db: opsH.db, key: $Key, value: sH.gLogInfo].entry;
+LoganBerryEntry.SetAttr[rLogInfo, sH.gOpInProgressPos, DBMinusOneInt];
+LoganBerry.WriteEntry[db: opsH.db, entry: rLogInfo, replace: TRUE];
+ERROR WalnutDefs.VersionMismatch[IO.PutFR[mismatchReport,
+[rope[msgSet.name]], [integer[version]], [integer[msgSet.version]]] ];
+END;
+End of commented out code.  ... DBT
+Commented out since I don't know why we need message set versions.  ... DBT
+BEGIN
+is: INT;
+rLogInfo: Relship;
+IF msI = NIL THEN RETURN;
+IF msgSet.version = dontCareMsgSetVersion THEN RETURN;
+IF msgSet.version = (is _ LoganBerryEntry.V2I[LoganBerryEntry.GetAttr[msI.versionRel, sH.msBIVersion]]) THEN RETURN;
+rLogInfo _ LoganBerry.ReadEntry[db: opsH.db, key: $Key, value: sH.gLogInfo].entry;
+LoganBerryEntry.SetAttr[rLogInfo, sH.gOpInProgressPos, DBMinusOneInt];
+LoganBerry.WriteEntry[db: opsH.db, entry: rLogInfo, replace: TRUE];
+ERROR WalnutDefs.VersionMismatch[IO.PutFR[mismatchReport,
+[rope[msgSet.name]], [integer[is]], [integer[msgSet.version]]] ];
+END;
+End of commented out code.  ... DBT
+Now a no-op.
+
+ù &  ïNewlineDelimiter
+ñ(cedarcode) styleô codeöúôKöú
+œeúDôOKöú)ô)Köœy!–kyûô&Köú(ô(Kô*Kô)Kô KöúGôGKöú+ô+Kô'óKò öœk	ò	Köú†ú
+òKöú†ú"ò,Kö†úòKöúòKöúòKöú†ú*ò6Köú†úò'KöúòKöú†úaòqKöú	ò	Köú†úò.Köú†úgòÇKöú†ú!ò1KòKò óöœnú†ú†ò"ö†òKöú†ú5òDKöúòKöúòKöú
+ò
+óKò Kö†úòKò óKö†ú†úò"Kô öœbôKö†ú†ú†úòKöú	†úò!Kò Köú†úò3Köú†úò)Köú†úò/Köú†ú†ú ò<Köú†úò!Kò Köú†ú$ò>Köú†ú$ò>Köú†úò1óKô ö¢ôKò Köú†úò(Kö°ú"ò/Kö°	ú!ò*Kö°
+ú†úò.Kö°ú†úò0Köú†úòKö°ú†úò"Kö°ú†úò$Köú†úòKò Köú
+†ú†ú$†úòAKô Köú'ô'Köú†ú†úò Kö	ú†ú†ú†ú
+†úòUKö	ú
+†ú†ú†ú†úò.Kò Köú†ú†úò-öú†ú†ú†úò(KöúòKöúòKöú†úò	KöúòKöú†úòKöú†òKöúòóóKô ö¢ôKò ö°ú†ú†ú†ú†ú†ú
+†ú†úò}Köú4ô4KòKöú*ò*Kò3Köú†úòKòóKò ö°ú†ú†ú†ú†ú†ú†ú†úò~KöúDôDKöúòKöú†úò
+Köú†úòKöú†úòKöú%ò%Köú*ò*Kò3Kö†ú†ú†ú†úò%Kò3KòKöú†ú@†úòPöú†úòKöú)ò)KöúòKöúòKöúòKöúòóKöú:ò:Köú ò Kò/KòóKò ö°ú†ú†ú†úò;Köú†ú†ú†úò&Köú2ò2Köúòö
+°ú†ú†ú†ú†úòKKö†ú†ú†úò0óKòKò3ö†ú†ú†úôKö†úRôVóKôKö†ú†ú†ú3òDKô&KòóKò ö°ú†ú†ú@òXKöú†ú†ú†úò)Köú2ô2Köú2ò2Köú†úòKöúòö†ú4†úò<Köú&ò&Kö†úLòQKòóKò Kò&Kö†ú†ú†ú†úòKòSKòGKö†ú†ú8òIKòóKò ö°ú†ú†ú9†úòpKöú†ú†ú†úò)KöúÕôÕKöúòKöú%ò%ö†ú4†úò<Köú&ò&Kö†úNòSKòóKöú*ò*Kò&Kö†ú†ú†ú†úòKòGKöú_ò_Köú†úòKöú!ò!KòóKò ö°ú†ú†ú'ò@Köú†ú	†úòKò.Köú†úòKöúòóKò ö°ú†ú†ú)†úòOKöú.ò.óKò ö°ú†ú†ú(†úòaKöú2ô2Kö†ú
+òKöú%ò%KöúKòKKö†òKöú†úNò_KïStartOfExpansionm[conv: LoganBerry.Conv _ NIL, db: LoganBerry.OpenDB, key: ATOM, start: ROPE _ NIL, end: ROPE _ NIL]òÇKöú†úòKöú†úò8Köú"ò"Köú†úòKöú†úòKöú†ú8òHKö†ú†ú†ú†úò'Kô Köúiôiö†ú†úòKöú;ò;Köú'ò'KöúôKò%KöúòóKò ö†ú†ú†ú†úòKòKöú[ò[Köú†úTògKöú†úTòjö†ú,†ú†ò7Köú†ú†úò2KöúkòkKöú
+†úKòXöú	†úLòXKöúéòéóKò*ö†ú†ú†ò=Kòóö†ú†úòKòKòKòóKñT[conv: LoganBerry.Conv _ NIL, db: LoganBerry.OpenDB, key: ATOM, value: ROPE]ô%KöúTòTKñT[conv: LoganBerry.Conv _ NIL, db: LoganBerry.OpenDB, key: ATOM, value: ROPE]öúXòXKñT[conv: LoganBerry.Conv _ NIL, db: LoganBerry.OpenDB, key: ATOM, value: ROPE]öúQòQKñT[conv: LoganBerry.Conv _ NIL, db: LoganBerry.OpenDB, key: ATOM, value: ROPE]öúVòVKñT[conv: LoganBerry.Conv _ NIL, db: LoganBerry.OpenDB, key: ATOM, value: ROPE]öúVòVKñT[conv: LoganBerry.Conv _ NIL, db: LoganBerry.OpenDB, key: ATOM, value: ROPE]öúVòVKñT[conv: LoganBerry.Conv _ NIL, db: LoganBerry.OpenDB, key: ATOM, value: ROPE]öúXòXö†ú<†úòDKöúaòaKöúdòdKöú=†úòCKöú#ò#Kòö†ú†úòKöú=ò=Köú†ú†úœcò,KòKòóKòóKö†ú
+†ú†ú)ò=Kö†úòóKöú#ò#ö†ú†úòKöúaòaKöúdòdKöú=†úòCKòóö†ú£'ò.Köú{ò{KöúèòèKöú;†úòAKô0Köú#ò#ö†ú†ú†ò#Köú=ò=óKöú6ò6Kö†úòóKöú)ò)Kö†úòóKö†úòKöúòóKô ö
+°ú†ú†ú†ú†úòNKöú2ò2KöúcòcKòYKòRKòóóKô ö¢.ô.Kò ö°ú†ú†ú†úòGKöú†ú	†úòKöú0†ú7†ônKöúòKòKöú%ò%Köú	†úòKö†ú0†ú†úò>KòKö†ú†ú†úòKò#Kò"Kö	†ú†ú†ú†ú£ò6òlKöú†ú†úòö†ú†ú†ú†ú†ú)†ú†ú†òbKöú†úòKö
+†ú †ú†ú†ú†úòFö†ú&†ú†úò5Kò;Köú8†úò>Köú8ò8KöúòóKö†úòóKöúòóKö†ú†ú†úò0KòóKò ö°	ú†ú†ú†ú †ú†ú
+†úòvKö†úÜ†ôåKòKòKöúòKöú%ò%Köú
+†úòKò Kö†ú†ú%†ú†úò7Kö†ú(†ú†ú†úò:Kò Köú
+†ú£SòdKòaö†ú†ú†ú†ú†ú)†ú†ú†òbKö†ú#†ú†úò@Kö†ú†òKö†úòóKö†ú†ú†ú†ú†ú£òOKöú3ò3ö†ú†ú	òö†ú†òKòKKöú>†úòDKöú3ò3Kòóö†úòKöúBòBKöú>†úòDKöúòóóKòKò óö°ú†ú†ú†úòPKöú†ú
+†ú†úò#Kô≠KòKòKöú%ò%Köú)ò)Kö	†ú(†ú†ú†ú£òQKò Kö†ú†ú&†ú†úò8Kö†ú-†ú†ú†úò?Kö†ú)†ú†ú†úò;Kòaö†ú†ú†ú†ú†ú)†ú†ú†òbö†ú'†ú†ò4Kòóö†ú†ú%†ú†ò7KòóKö†úòóKö
+†ú†ú†ú†ú†úò5Köú†úòKòCö†ú†ú†úòKò>KòóKöú8†úò>Köú7ò7Kö†ú†ú†ú5òGKòóóKô ôKò ö°ú†ú†ú%†úòFKö	ú†ú†ú†ú†úòKöú†ú†úòKöú2ò2Kò ö°ú†úòKöú†ú†ú†úòòö†úòKö†úÑòàKö†úoòsóóKöú†úò	ö†ú†ú†ú†úò KöúòKöú†úò
+Köú†úòö†úL†ú†ú†ò_Kò+ö†ú†ú†ú†ú†ú†ò0Köú†ú†úò0óKò$Kö†úòóKöú†úò
+Kö†ú†úòóKö†úòKöú:†úòDKòóKöúòö†ú†ú†òKö†úIòMóKöúòóKò ö°ú†ú†ú†ú†ú†ú†ú†ú†ú†ú
+òâKöúôKöú†ú†úòKöú%ò%Kò ö°ú†úòKöúòKöúòKöú†úòKöú†úòKö	ú†ú†ú†ú†úòKöú†úò	Kò Kò3Kö
+†ú†ú†ú†ú†úò&Köú"†úò)Kò òKöú^ò^óö†ú†ú†ú†úò ö†òKöú2ò2Köú†úò	Kö†ú†ú†ú†úòKò,ö†ú†úòKöúeòeKö†ú†ú†ú$†ú†ú£òhKöúòóö†ú†úòKöú†ú†ú†ú†ú†úò$ö†ú†ú†úò(ö†úòKòKòKòóKòóKö†ú†ú	òóKò$Kö†úòóKöú†úò
+Kö†ú†úòKö†úòóKöú:†úòCKòóKöúòö†ú†ú†òKö†úLòPóKöúòóKò ö°ú†ú†ú$†úòBKöú†ú†ú†ú†ú†ú
+ò:Köú†ú†úòKöú%ò%Kò ö°ú†úòKöú†ú†ú†úòKöúcòcòö†úòKö†úäòéKö†úuòyóóKòaKöú†úò
+ö†ú†ú†ú†úò ö†ú^†ú†ú†òqöú
+†úòKöú-ò-óö†ú†ú†ú†ú†ú†ò7Köú†ú†úò5óKö†úòóKöú†úò
+Kö†ú†úòóKö†úòKöú:†úòCKòóKöú	ò	ö†ú†ú†òKö†úLòPóKöúòóKò ö°ú†ú†ú$†ú†ú†ú†ú†ú†ú
+ò¢Köú†ú†úòKöú%ò%Kò ö°ú†úòòö†úòKö†úäòéKö†úuòyóóKöúcòcKòaö†ú†ú†ú†úò ö†ú^†ú†ú†òqòKöúpòpóKö†ú†ú†ú†úòKö†úòóKöú†úò
+Kö†ú†úòóKö†úòKöú:†úòCKòóKöú	ò	ö†ú†ú†òKö†ú†úKòUóKòóKò ö°ú†ú†ú †ú†ú†ú†ú†ú†ú†ú†ú†úòæKö†ú†ú
+ò!KöúôKöú†ú†úòKöú%ò%ö°ú†úòKöúòKöúòKöú†úòKöú†úòKò Kò3Kö
+†ú†ú†ú†ú†úò%Köú!†úò(Kò òKöú^ò^óö†ú†ú†ú†úò ö†òKöú2ò2Köú†úòKöú†úòKöú†úòKö†ú†ú†ú†úòKò-ö†ú†úòKöúfòfKö†ú†ú†ú$†ú†ú£òhKöúòóKòPKö†ú†ú2†ú†úòBKò$Kö†úòóKöú†úò	Kö†ú†úòKö†úòóKöú:†úòCKòóKöúòö†ú†ú†òKö†ú†úKòUóKòKò óö°ú†ú†ú'òIKöú†ú'ò/Köú%ò%Köú†úò"KòKòKòKò?òKñm[conv: LoganBerry.Conv _ NIL, db: LoganBerry.OpenDB, key: ATOM, start: ROPE _ NIL, end: ROPE _ NIL]öú`ò`óKöú†úòKöúòóKò ö°ú†ú†ú#ò?Kö	ú†ú†ú	†ú†úò.Köú†úòKöú.ò.ö°
+ú†úòKöú†úò	Kö
+†ú†ú†ú†ú†úò9ö†òKöú:ò:Kò(Kö
+†ú†ú†úB†ú†úòaKò,ö†ú†úòKöúnònKö†ú†ú†ú$†ú†ú†ú†úòZóKö†ú†ò	Kö†úòóKö†ú†ú†úòKöú†òKöúòóö°ú†úòKòäKö
+†ú†ú†ú†ú1†úò[KòóKò Kö†ú†ú.†ú†ú†ú†úòLö†ú†ú†ú†ú†ú†ò6Köú†ú†úòKöú-†ú†úò@Kö†ú†ú†ú2†úòMKöúòKö†òóKöúòóKò ö°ú†ú†ú'†ú†ú†ú†úòäKöú†ú†úòKöú%ò%Kò ö°ú†úòKöúòKöú†úòKò@KòvKò ö†ú†ú†ú†úò KöúòKöú†úò
+ö†ú2†ú†ò=Köú
+†úòKöú†úòKöú†ú†úò8Kò	KòEKöú$ò$Kò$Kö†úòóKöú†úò	Kö†ú†úòKö†úòóKöú:†úòCKòóKò KöúòKö†ú†ú†úòKö†úEòJKòóKò ö°ú†ú†ú,†úòNKö£ôKöúòKòKöú†úò8Köú"ò"Köú†úòKöú†úòKöú%ò%Köú ò Köú}ò}Köú†ú8òHKò Kò@Kö†ú†ú†ú†úò'Kò ö†ú†ú†ú†úòKòKòtö†ú0†ú†ò;Köú†ú†úò8Köú5ò5Köú<†úòBö†ú†úòKòKòKòóö†ú<†úòDKöú
+†ú[òhKöúPòPKöú>†úòDKöú#ò#Kòö†ú†úòKöú9ò9Köú†ú†úòKòKòóKòóKö†úòóKöú#ò#Kö†úòóö†ú†ú†ú†úòKòåö†ú[†ú†ú†òoKöúòKöú3ò3Köú8†úò>Kö†úòóKöú"†ò#óKö†úòKò ö†ú†òKöúüòüóKò KöúïòïKöú>†úòDKòZKöúYòYKöúA†úòGKòRKöúFòFKöú=†úòCKöú#ò#ö†ú†ú†ò#Köú9ò9óKòóóKô ö¢ôKò Köú†ú8òLKò ö°ú†ú†ú†úòTKöú†únòvóKò ö°ú†ú†ú†úòMKöú2ò2KòdKöú†úòKòóKò ö°ú†ú†úò<Köú†ú†úò'Köú2ò2Kò"ö†ú†ú†úWòhKö†úòóKòóKò ö°ú†ú†ú†úòTKöú2ò2Köú†ú£ò5Köú†úòKöú†úòKòKöú†úò
+ö†ú"†ú†úò.KöúcòcKöú†úOò^Köú/†úòHKòóKò KòCö†ú†úòKöú	†úòKö†ú†ú†ú†úò'Kò?ö†ú†ú†ú£ò6Kò:Kö†ú†úòKöúòóKö†úòKòóKò#Köú	†ú5òAKò5Kö†ú†ú†ú†ú†ú£%òSKòAKòóKò Köú6ô6ö°ú†ú†ú†ú†ú†úò?Kòö†ú†ú†ú†ò%KòDKö†úòóKò+KòóKò ö°ú†ú!†úòAKöú2ò2Köú†úòKöúòKö†ú!†ú†úò/KòZö†úa†úòiKò[KöúFòFKöú=†úòCö†úò!Kö†ú]ò_óKòóKòóKò ö°ú†ú'ò?Köú†ú†úò'Köú2ò2Kò8KôKö†ôKöúôKö†ú†ú†ú†úôKö†ú(†ú†úô6Kö†ú†ú†úô(KöúRôRKöúFôFKöú=†úôCö†ú†úô9KöúFôFóKö†úôóKô#KòóKò ö°ú†ú(†úòWKöú2ò2Kò)KôKö†ôKöú†úôKöúôKö†ú†ú†ú†úôKö†ú(†ú†úô6Kö†úf†ú†úôtKöúRôRKöúFôFKöú=†úôCö†ú†úô9KöúAôAóKö†úôóKô#KòKò óöú†úòKò óö
+°ú†ú†ú†ú†úòMKö†ú†ú†ú$òTKòóKò ö°ú†ú†ú†úò\Köú†ú†úò!Kò%Köúhòhö†ú†ú†ú†úòKòKöú†úòKöú†úò8Köú"ò"Köú"ò"Köú†úòKöú†úòKöú†úòKöú†úòKöú†úòö†ú,†ú†ò7Köú†ú†úò2Köú	†úòKò8Köú
+†ú†úò:ö†ú	†úòKòBKòKòKòö†úòKòKòKòóóKöú8†úò>Kò Köú†ú	ò(ö†ú<†úòDKò#Kòö†ú†ú†ú†ò#Köú?†úòGóö†ú†ú†ú†ò#öú:†úòKKö†úòóóKòKòóKö†ú
+†ú†ú)ò=Kö†úòóKöú#ò#ö†ú†úòKò#ö†ú†ú†ú†ò#Köú?†úòGóö†ú†ú†ú†ò#Köú:†úòKKö†úòóKòóóKö†úòKòóKò ö°ú†ú†úòCKöú2ò2KöúcòcKöú†úOòZKöú†úVò_KöúUòUKöú\ò\KöúA†úòGKòóKò ö°ú†ú†ú†úò>Köú2ò2KòiKò5Köú8†úò>Köú*ò*KöúòóKò ö°
+ú†ú†úòLKöú†ú†úòKö†ú†ú£ò>Kö†ú†ú†ú†úò*Kö†ú†ú	†ú†úò@KòKò óö°ú†ú4òTKôKöúòKò óóKö†úòKô ó Öó    Ä÷  ≥˙  

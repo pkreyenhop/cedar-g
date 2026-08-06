@@ -1,0 +1,1166 @@
+
+DIRECTORY
+BasicTime USING [Now],
+Commander USING [CommandProc, Register],
+CommanderOps USING [ArgumentVector, Failed, Parse],
+EditSpan USING [Copy],
+FileNames USING [ResolveRelativePath],
+FS USING [defaultStreamOptions, Error, FileInfo, StreamOpen, StreamOptions],
+IO USING [Close, EndOfStream, GetBlock, GetCedarToken, GetCedarTokenRope, GetChar, GetIndex, noWhereStream, PeekChar, Put1, PutChar, PutF, PutF1, PutRope, SetIndex, SkipWhitespace, STREAM, TokenKind],
+NodeProps USING [PutProp],
+PFS USING [PathFromRope],
+Process USING [CheckForAbort],
+RefText USING [AppendRope, Equal, Fetch, InlineAppendChar, Length, TrustTextAsRope],
+Rope USING [Cat, Concat, Equal, Fetch, Flatten, FromRefText, Length, Match, ROPE],
+SymTab USING [Create, EachPairAction, Fetch, FetchText, Insert, Pairs, Ref],
+TextNode USING [LastWithin, Level, MakeNodeLoc, MakeNodeSpan, Ref, StepForward],
+TiogaFileOps USING [AddLooks, CreateRoot, InsertAsLastChild, Ref, SetContents, Store],
+TiogaIO USING [FromFile];
+Waterlily: CEDAR PROGRAM
+IMPORTS BasicTime, Commander, CommanderOps, EditSpan, FileNames, FS, IO, NodeProps, PFS, Process, RefText, Rope, SymTab, TextNode, TiogaFileOps, TiogaIO = {
+
+ROPE: TYPE = Rope.ROPE;
+STREAM: TYPE = IO.STREAM;
+
+SymbolTableEntry: TYPE = REF SymbolTableEntryRep;
+SymbolTableEntryRep: TYPE = RECORD[
+oldList: InstanceList,	-- the old instances
+newList: InstanceList,	-- the new instances
+key: ROPE		-- the key used for the lookup
+];
+
+InstanceList: TYPE = LIST OF InstanceRep;
+InstanceRep: TYPE = RECORD [
+line: INT,	-- -1 => not yet assigned
+pos: INT,	-- -1 => not yet assigned (node number if mergeFiles)
+node: TextNode.Ref¬NIL,	-- the node, if mergeFiles, instead of line
+len: NAT,	-- length of original token
+peek: CHAR	-- non-blank character after this token
+];
+
+FileArray: TYPE = REF FileArrayRep;
+FileArrayRep: TYPE = RECORD [entry: SEQUENCE index: NAT OF FileArrayEntry];
+
+FileArrayEntry: TYPE = REF FileArrayEntryRep;
+FileArrayEntryRep: TYPE = RECORD [
+symEntry: SymbolTableEntry,
+instance: InstanceList,
+otherIndex: INT,
+node: TextNode.Ref¬NIL,
+typeOfPntr: {symTable, lineNum},
+len: NAT ¬ 0];
+
+Ref: TYPE = TextNode.Ref;
+Node: TYPE = REF NodeBody;
+NodeBody: TYPE = RECORD [root: Ref¬NIL, node: Ref¬NIL ];
+
+LongHelpMsgW: ROPE =
+"Waterlily compares two source files.  The command format is one of:
+	Waterlily file1 file2
+	Waterlily difFile _ file1 file2
+where switches are syntactically before any argument.  Differences found are written on the difFile, with default extension '.dif'.  The available switches are:
+   t    Tioga format files (default: TRUE)
+   b   Bravo format files (default: FALSE)
+   u   Unformatted files
+   a   treat '_ & '¬, '^ & '­ as equivalent (default: TRUE)
+   i    Ignore blank lines (default: TRUE)
+   s    Strip digits trailing a _ char (for c2c)
+   x    Output file is a merger of input files (ran out of mnemonics already!)
+   	Input files must be Tioga-format files.
+  #m  # of matching lines (default: 3)
+  #c   # of trailing context lines (default: 1)
+";
+LongHelpMsgC: ROPE =
+"CedarLily compares two Cedar-program source files.  Comparison is made at the source-language token level, so that only lexical differences will be found (formatting changes and modified comments will not affect the comparison).  The command format is one of:
+	CedarLily file1 file2
+	CedarLily difFile _ file1 file2
+where switches are syntactically before any argument.  Differences found are written on the difFile, with default extension '.dif'.  The available switches are:
+   u   Unformatted files
+   i    Ignore blank lines (default: TRUE)
+  #m  # of matching lines (default: 3)
+  #c   # of trailing context lines (default: 1)
+";
+LongHelpMsgM: ROPE =
+"Tigerlily produces a merged version of two Tioga-format files.  Nodes unique to file1 are included and indicated by overstriking.  Nodes unique to file2 are included and indicated by underlining.  Nodes that are common to both files are unchanged.  The command format is one of:
+	Tigerlily file1 file2
+	Tigerlily mergedFile _ file1 file2
+where switches are syntactically before any argument.  The merged file is written on the mergedFile, with default extension '.merger'.  The available switches are:
+  #m  # of matching lines (default: 3)
+  #c   # of trailing context lines (default: 1)
+";
+
+repeats: NAT ¬ 1;
+debugging: BOOL ¬ FALSE;
+WaterlilyProc: Commander.CommandProc = {
+
+Alarm: ERROR = CODE;
+
+oldArray: FileArray;
+newArray: FileArray;
+out: STREAM ¬ cmd.out;
+pData: REF ¬ cmd.procData.clientData;
+
+totalNewLines: INT ¬ 0;
+totalOldLines: INT ¬ 0;
+
+posInNewFile: INT ¬ 0;
+posInOldFile: INT ¬ 0;
+nodeCount: INT ¬ 0;
+
+newFile: REF; -- IO.STREAM or Node;
+oldFile: REF; -- IO.STREAM or Node;
+difFile: STREAM;
+difFileNode: Node ¬ NIL;
+
+newFileName: ROPE ¬ NIL;
+oldFileName: ROPE ¬ NIL;
+difFileName: ROPE ¬ NIL;
+
+Asterisks: ROPE = "**************************************";
+filler: ROPE = "->->->->->->";
+
+FileType: TYPE = {tioga, bravo, unform};
+switchNewFileType, switchOldFileType: FileType ¬ tioga;
+switchIgnoreEmptyLinesNewFile, switchIgnoreEmptyLinesOldFile: BOOL ¬ TRUE;
+switchEquivalentArrows: BOOL ¬ TRUE;
+switchTokens: BOOL ¬ FALSE;
+switchMergeFiles: BOOL ¬ FALSE;
+stripLeadingBlanks: BOOL ¬ FALSE;
+stripDigitsTrailingArrow: BOOL ¬ FALSE;
+
+switchLinesForMatch: NAT ¬ 3;
+switchLinesForContext: NAT ¬ 1;
+
+anyDifferencesSeen: BOOL ¬ FALSE;
+indexN: INT;
+indexO: INT;
+
+LineType: TYPE = {new, old, both};
+Vintage: TYPE = LineType[new..old];
+
+SetSymbolTableEntry: PROC
+[key: ROPE, node: TextNode.Ref, newOrOld: Vintage,
+line: INT, pos: INT, len: NAT, peek: CHAR] = {
+symTabEntry: SymbolTableEntry ¬ NIL;
+list: InstanceList ¬ LIST[[line: line, pos: pos, len: len, node: node, peek: peek]];
+WITH SymTab.Fetch[symbolTable, key].val SELECT FROM
+x: SymbolTableEntry => symTabEntry ¬ x;
+ENDCASE => {
+symTabEntry ¬ NEW[SymbolTableEntryRep ¬ [
+oldList: NIL, newList: NIL, key: key]];
+[] ¬ SymTab.Insert[symbolTable, key, symTabEntry];
+};
+SELECT newOrOld FROM
+new => {
+list.rest ¬ symTabEntry.newList;
+symTabEntry.newList ¬ list;
+};
+old => {
+list.rest ¬ symTabEntry.oldList;
+symTabEntry.oldList ¬ list;
+};
+ENDCASE => ERROR;
+};
+
+PruneList: PROC [list: InstanceList, pos: INT] RETURNS [pruned: InstanceList] = {
+IF list = NIL THEN RETURN [NIL];
+IF list.first.pos = pos THEN RETURN [list.rest];
+pruned ¬ list;
+DO
+lag: InstanceList ¬ list;
+list ¬ list.rest;
+IF list = NIL THEN RETURN;
+IF list.first.pos = pos THEN {lag.rest ¬ list.rest; RETURN};
+ENDLOOP;
+};
+
+ConnectEntries: PROC [symTabEntry: SymbolTableEntry, indexO, indexN: INT, entryO, entryN: FileArrayEntry] = {
+entryN.typeOfPntr ¬ entryO.typeOfPntr ¬ lineNum;
+entryN.otherIndex ¬ indexO;
+entryO.otherIndex ¬ indexN;
+symTabEntry.newList ¬ PruneList[symTabEntry.newList, entryN.instance.first.pos];
+symTabEntry.oldList ¬ PruneList[symTabEntry.oldList, entryO.instance.first.pos];
+};
+
+EndOfFile: ERROR = CODE;
+
+token: REF TEXT ¬ NEW[TEXT[128]];
+
+GetLine: PROC [stream: STREAM, token: REF TEXT] RETURNS [REF TEXT] = {
+token.length ¬ 0;
+DO
+c: CHAR;
+IF lineBufferPos >= lineBufferLen THEN {
+lineBuffer.length ¬ 0;
+lineBufferLen ¬ IO.GetBlock[stream, lineBuffer, 0, lineBufferSize
+! IO.EndOfStream => EXIT];
+IF lineBufferLen = 0 THEN {
+IF token.length = 0 THEN ERROR IO.EndOfStream[stream];
+EXIT;
+};
+lineBuffer.length ¬ lineBufferLen;
+lineBufferPos ¬ 0;
+};
+c ¬ lineBuffer[lineBufferPos];
+lineBufferPos ¬ lineBufferPos + 1;
+inputPos ¬ inputPos + 1;
+IF IsEndOfLine[c] THEN EXIT;
+token ¬ RefText.InlineAppendChar[token, c];
+ENDLOOP;
+RETURN [token];
+};
+lineBufferSize: NAT ¬ 1024;
+lineBuffer: REF TEXT ¬ NEW[TEXT[lineBufferSize]];
+lineBufferPos: NAT ¬ 0;
+lineBufferLen: NAT ¬ 0;
+inputPos: INT ¬ 0;
+
+ReadLineFromFile: PROC
+[source: REF, localFileType: FileType, localIgnoreEmpties: BOOL]
+RETURNS [key: ROPE, node: TextNode.Ref, peek: CHAR, pos: INT, len: NAT] = {
+SetToken: PROC [value: ROPE, append: BOOL ¬ FALSE] = {
+IF NOT append THEN token.length ¬ 0;
+token ¬ RefText.AppendRope[token, value];
+};
+in: STREAM;
+inNode: Node;
+WITH source SELECT FROM
+str: STREAM => in ¬ str;
+ref: Node => inNode ¬ ref;
+ENDCASE => ERROR;
+key ¬ NIL;
+node ¬ NIL;
+pos ¬ -1;
+len ¬ 0;
+peek ¬ 0C;
+DO
+Process.CheckForAbort[];
+SELECT pData FROM
+$Cedar => {
+kind: IO.TokenKind;
+token.length ¬ 0;
+[] ¬ IO.SkipWhitespace[stream: in, flushComments: TRUE
+! IO.EndOfStream => CONTINUE];
+pos ¬ IO.GetIndex[in];
+[tokenKind: kind, token: token, charsSkipped: ] ¬ IO.GetCedarToken[in, token
+! IO.EndOfStream => ERROR EndOfFile];
+IF kind = tokenEOF THEN ERROR EndOfFile;
+len ¬ IO.GetIndex[in] - pos;
+IF ( TRUE ) THEN SELECT kind FROM
+tokenROPE => {
+len: NAT ~ RefText.Length[token];
+lastChar: CHAR ~ IF ( len # 0 ) THEN RefText.Fetch[token, len.PRED] ELSE 0C;
+SELECT lastChar FROM
+'L => { token.length ¬ len.PRED }; -- disregard frame specifiers for strings!
+'G => { token.length ¬ len.PRED }; -- disregard frame specifiers for strings!
+ENDCASE;
+};
+tokenSINGLE => {
+char: CHAR ¬ token[0];
+SELECT char FROM
+'_ => IF switchEquivalentArrows THEN token[0] ¬ '¬; -- Char code finesse
+'^ => IF switchEquivalentArrows THEN token[0] ¬ '­; -- Char code finesse
+'; => LOOP;
+'} => {
+[] ¬ IO.SkipWhitespace[stream: in, flushComments: TRUE
+! IO.EndOfStream => CONTINUE];
+peek ¬ IO.PeekChar[in
+! IO.EndOfStream => {peek ¬ 0C; CONTINUE}];
+IF peek = '. THEN ERROR EndOfFile;
+};
+ENDCASE;
+};
+tokenID => {
+char: CHAR ¬ token[0];
+[] ¬ IO.SkipWhitespace[stream: in, flushComments: TRUE
+! IO.EndOfStream => CONTINUE];
+peek ¬ IO.PeekChar[in
+! IO.EndOfStream => {peek ¬ 0C; CONTINUE}];
+SELECT char FROM
+'B => SELECT TRUE FROM
+RefText.Equal[token, "BEGIN"] => SetToken["{"];
+RefText.Equal[token, "BOOLEAN"] => SetToken["BOOL"];
+ENDCASE;
+'C => SELECT TRUE FROM
+RefText.Equal[token, "CHARACTER"] => SetToken["CHAR"];
+RefText.Equal[token, "CARD"] => SetToken["CARD32"];
+ENDCASE;
+'E => SELECT TRUE FROM
+RefText.Equal[token, "END"] => {
+SetToken["}"];
+char ¬ '};
+IF peek = '. THEN ERROR EndOfFile;
+};
+ENDCASE;
+'I => SELECT TRUE FROM
+RefText.Equal[token, "INT"] => SetToken["INT32"];
+ENDCASE;
+'L => SELECT TRUE FROM
+RefText.Equal[token, "LONG"] => {
+key ¬ IO.GetCedarTokenRope[in].token;
+SELECT TRUE FROM
+Rope.Equal[key, "CARDINAL"] => SetToken["CARD32"];
+Rope.Equal[key, "INTEGER"] => SetToken["INT32"];
+ENDCASE => {SetToken["LONG "]; SetToken[key, TRUE]};
+};
+ENDCASE;
+'P => SELECT TRUE FROM
+RefText.Equal[token, "PROCEDURE"] => SetToken["PROC"];
+ENDCASE;
+ENDCASE;
+SELECT peek FROM
+'_ => {
+ch: CHAR ¬ IO.GetChar[in];
+peek ¬ '¬;
+};
+'^ => {
+ch: CHAR ¬ IO.GetChar[in];
+peek ¬ '­;
+};
+':, '¬, '­, '., ',, '~ => {
+peek ¬ IO.GetChar[in];
+};
+ENDCASE => GO TO noHack;
+token ¬ RefText.InlineAppendChar[token, peek];
+len ¬ IO.GetIndex[in] - pos;
+EXITS noHack => {};
+};
+ENDCASE;
+WITH SymTab.FetchText[symbolTable, token].val SELECT FROM
+symTabEntry: SymbolTableEntry => key ¬ symTabEntry.key;
+ENDCASE => key ¬ Rope.FromRefText[token];
+EXIT;
+};
+ENDCASE;
+
+IF switchMergeFiles
+THEN {
+pos ¬ nodeCount;
+nodeCount ¬ nodeCount+1;
+node ¬ inNode.node ¬ TextNode.StepForward[TR[inNode.node]];
+IF node = NIL THEN ERROR EndOfFile;
+token.length ¬ 0;
+token ¬ RefText.AppendRope[token, node.rope];
+}
+ELSE {
+pos ¬ inputPos;
+token ¬ GetLine[in, token ! IO.EndOfStream => ERROR EndOfFile];
+len ¬ token.length;
+};
+IF stripDigitsTrailingArrow OR stripLeadingBlanks OR localFileType = bravo THEN {
+srcPos: NAT ¬ 0;
+dstPos: NAT ¬ 0;
+tLen: NAT = token.length;
+IF stripLeadingBlanks THEN
+WHILE srcPos < tLen DO
+SELECT token[srcPos] FROM
+' , '\t => srcPos ¬ srcPos + 1;
+ENDCASE => EXIT;
+ENDLOOP;
+IF stripDigitsTrailingArrow OR localFileType = bravo THEN {
+skipDigits: BOOL ¬ FALSE;
+WHILE srcPos < tLen DO
+c: CHAR ¬ token[srcPos];
+srcPos ¬ srcPos + 1;
+SELECT c FROM
+'_ => skipDigits ¬ stripDigitsTrailingArrow;
+IN ['0..'9] => IF skipDigits THEN LOOP;
+'\032 => IF localFileType = bravo THEN EXIT;
+ENDCASE => skipDigits ¬ FALSE;
+token[dstPos] ¬ c;
+dstPos ¬ dstPos + 1;
+ENDLOOP;
+};
+len ¬ srcPos;
+IF stripLeadingBlanks THEN
+WHILE dstPos # 0 DO
+SELECT token[dstPos-1] FROM
+' , '\t => dstPos ¬ dstPos - 1;
+ENDCASE => EXIT;
+ENDLOOP;
+token.length ¬ dstPos;
+};
+WITH SymTab.FetchText[symbolTable, token].val SELECT FROM
+symTabEntry: SymbolTableEntry => key ¬ symTabEntry.key;
+ENDCASE => key ¬ Rope.FromRefText[token];
+IF localIgnoreEmpties THEN {
+FOR i: NAT IN [0..token.length) DO
+SELECT token[i] FROM
+' , '\t => {};
+ENDCASE => GO TO Gotit;
+ENDLOOP;
+peek ¬ peek;
+}
+ELSE GOTO Gotit;
+ENDLOOP;
+len ¬ len;
+EXITS Gotit => pos ¬ pos
+};
+
+FinishUp: PROC [difMsg: ROPE] = {
+IO.PutRope[out, difMsg];
+IO.PutRope[out, "\n"];
+IF switchMergeFiles THEN RETURN;
+IF difFile = NIL THEN OpenDifFileAndWriteHeader[];
+IO.PutRope[difFile, difMsg];
+IO.PutRope[difFile, "\n"];
+IO.Close[difFile];
+};
+
+WorkingMsg: PROC [char: CHAR] = {
+Process.CheckForAbort[];
+IO.PutChar[out, IF debugging THEN char ELSE '.];
+};
+
+OpenDifFileAndWriteHeader: PROC = {
+IF anyDifferencesSeen THEN RETURN;
+anyDifferencesSeen ¬ TRUE;
+difFileName ¬ DefaultExtension[difFileName,
+IF switchMergeFiles THEN ".merger" ELSE ".dif", TRUE];
+IF switchMergeFiles THEN {
+difFile ¬ IO.noWhereStream;
+difFileNode ¬ NewNode[];
+RETURN;
+};
+difFile ¬ FS.StreamOpen[difFileName, $create];
+IO.PutRope[difFile, IF pData = $Cedar THEN "\nCedarlily" ELSE "\nWaterlily"];
+IO.PutF[difFile, "\n   run on %g\n   File 1: %g\n   File 2: %g\n\n",
+[time[BasicTime.Now[]]], [rope[oldFileName]], [rope[newFileName]]];
+};
+
+OpenFile: PROC [tempFileName: ROPE, switchFileType: FileType]
+RETURNS [fileName: ROPE, file: REF] = {
+streamOptions: FS.StreamOptions ¬ FS.defaultStreamOptions;
+streamOptions[tiogaRead] ¬ (switchFileType = tioga);
+tempFileName ¬ DefaultExtension[tempFileName, ".mesa", FALSE];
+fileName ¬ FS.FileInfo[tempFileName].fullFName;
+IF switchMergeFiles
+THEN file ¬ NodeFromFile[fileName]
+ELSE file ¬ FS.StreamOpen[fileName, $read, streamOptions];
+};
+
+
+symbolTable: SymTab.Ref ¬ SymTab.Create[mod: 1023, case: TRUE];
+fillerNode: Node ¬ NewNode[];
+fillerNode.node ¬ TR[TiogaFileOps.InsertAsLastChild[FR[fillerNode.root]]];
+TiogaFileOps.SetContents[FR[fillerNode.node], filler];
+TiogaFileOps.AddLooks[FR[fillerNode.node], 0, filler.Length[], 'b, FR[fillerNode.root]];
+NodeProps.PutProp[fillerNode.node, $Comment, NEW[BOOL¬TRUE]];
+
+result ¬ NIL;
+msg ¬ NIL;
+
+{
+args: CommanderOps.ArgumentVector ¬ CommanderOps.Parse[cmd
+! CommanderOps.Failed => {msg ¬ "Syntax error."; GO TO fatalError}
+];
+
+fileCount: NAT ¬ 0;
+defaultFileType: FileType ¬ tioga;
+ignoreEmptyLines: BOOL ¬ TRUE;
+equivalentArrows: BOOL ¬ TRUE;
+IF pData=$Merge THEN { switchMergeFiles ¬ TRUE; ignoreEmptyLines ¬ FALSE; };
+
+FOR i: NAT IN [1..args.argc) DO
+arg: ROPE = args[i];
+sense: BOOL ¬ TRUE;
+IF Rope.Match["-*", arg] THEN {
+len: NAT ¬ Rope.Length[arg];
+number: INT ¬ 0;
+FOR i: NAT IN [1..len) DO
+c: CHAR ¬ Rope.Fetch[arg, i];
+SELECT c FROM
+'~ => sense ¬ NOT sense;
+'a, 'A => equivalentArrows ¬ sense;
+'b, 'B => defaultFileType ¬ bravo;
+'t, 'T => defaultFileType ¬ tioga;
+'u, 'U => defaultFileType ¬ unform;
+'i, 'I => ignoreEmptyLines ¬ sense;
+'s, 'S => stripDigitsTrailingArrow ¬ stripLeadingBlanks ¬ sense;
+'x, 'X => {
+switchMergeFiles ¬ sense;
+IF sense THEN ignoreEmptyLines ¬ FALSE;
+};
+IN ['0..'9] => {number ¬ number*10 + (c-'0); LOOP};
+'m, 'M => IF number >= 1 THEN switchLinesForMatch ¬ number;
+'c, 'C => IF number >= 1 THEN switchLinesForContext ¬ number;
+ENDCASE;
+number ¬ 0;
+ENDLOOP;
+LOOP;
+};
+IF Rope.Match["_", arg] THEN {
+IF fileCount # 1 THEN GO TO usageError;
+fileCount ¬ 0;
+difFileName ¬ oldFileName;
+LOOP;
+};
+SELECT fileCount FROM
+0 => {
+fileCount ¬ 1;
+switchOldFileType ¬ defaultFileType;
+switchIgnoreEmptyLinesOldFile ¬ ignoreEmptyLines;
+switchEquivalentArrows ¬ equivalentArrows;
+oldFileName ¬ FileNames.ResolveRelativePath[arg];
+IF difFileName = NIL THEN difFileName ¬ ShortName[arg];
+};
+1 => {
+fileCount ¬ 2;
+switchNewFileType ¬ defaultFileType;
+switchIgnoreEmptyLinesNewFile ¬ ignoreEmptyLines;
+switchEquivalentArrows ¬ equivalentArrows;
+newFileName ¬ FileNames.ResolveRelativePath[arg];
+};
+ENDCASE => {GO TO usageError};
+ENDLOOP;
+IF fileCount # 2 THEN GO TO usageError;
+
+out.PutRope["Comparing "];
+{
+ENABLE FS.Error => {
+IF error.group # bug THEN msg ¬ error.explanation;
+GO TO fatalError;
+};
+[oldFileName, oldFile] ¬ OpenFile[oldFileName, switchOldFileType];
+[newFileName, newFile] ¬ OpenFile[newFileName, switchNewFileType];
+};
+WorkingMsg['-];
+};
+
+{
+nextLine: ROPE ¬ NIL;
+nextNode: TextNode.Ref ¬ NIL;
+peek: CHAR;
+inputPos ¬ 0;
+lineBufferLen ¬ 0;
+lineBufferPos ¬ 0;
+DO
+key: ROPE;
+len: NAT;
+[key, nextNode, peek, posInNewFile, len] ¬ ReadLineFromFile[newFile, switchNewFileType, switchIgnoreEmptyLinesNewFile
+! EndOfFile => EXIT];
+SetSymbolTableEntry[key, nextNode, new, totalNewLines, posInNewFile, len, peek];
+totalNewLines ¬ totalNewLines + 1;
+ENDLOOP;
+IF totalNewLines = 0 THEN GOTO emptyfile;
+newArray ¬ NEW[FileArrayRep[totalNewLines]];
+WorkingMsg['!];
+
+inputPos ¬ 0;
+lineBufferLen ¬ 0;
+lineBufferPos ¬ 0;
+DO
+key: ROPE;
+len: NAT;
+[key, nextNode, peek, posInOldFile, len] ¬ ReadLineFromFile[oldFile, switchOldFileType, switchIgnoreEmptyLinesOldFile
+! EndOfFile => EXIT];
+SetSymbolTableEntry[key, nextNode, old, totalOldLines, posInOldFile, len, peek];
+totalOldLines ¬ totalOldLines + 1;
+ENDLOOP;
+IF totalOldLines = 0 THEN GOTO emptyfile;
+oldArray ¬ NEW[FileArrayRep[totalOldLines]];
+WorkingMsg['@];
+
+{
+Test: SymTab.EachPairAction = {
+symTabEntry: SymbolTableEntry ¬ NARROW[val];
+newList: InstanceList ¬ symTabEntry.newList;
+oldList: InstanceList ¬ symTabEntry.oldList;
+FOR each: InstanceList ¬ newList, each.rest WHILE each # NIL DO
+newArray[each.first.line] ¬ NEW[FileArrayEntryRep ¬ [
+symEntry: symTabEntry,
+instance: each,
+otherIndex: -1,
+node: each.first.node,
+typeOfPntr: symTable,
+len: each.first.len]];
+ENDLOOP;
+FOR each: InstanceList ¬ oldList, each.rest WHILE each # NIL DO
+oldArray[each.first.line] ¬ NEW[FileArrayEntryRep ¬ [
+symEntry: symTabEntry,
+instance: each,
+otherIndex: -1,
+node: each.first.node,
+typeOfPntr: symTable,
+len: each.first.len]];
+ENDLOOP;
+RETURN[FALSE];
+};
+[] ¬ SymTab.Pairs[symbolTable, Test];
+WorkingMsg['#];
+};
+
+EXITS emptyfile => FinishUp["At least one of these files is effectively empty."];
+};
+
+THROUGH [0..repeats) DO
+
+{
+Test: SymTab.EachPairAction = {
+symTabEntry: SymbolTableEntry ¬ NARROW[val];
+newList: InstanceList ¬ symTabEntry.newList;
+oldList: InstanceList ¬ symTabEntry.oldList;
+Process.CheckForAbort[];
+SELECT TRUE FROM
+newList = NIL, oldList = NIL => {};
+newList.rest # NIL, oldList.rest # NIL => {
+};
+ENDCASE => {
+indexO ¬ oldList.first.line;
+indexN ¬ newList.first.line;
+ConnectEntries[symTabEntry, indexO, indexN, oldArray[indexO], newArray[indexN]];
+};
+RETURN[FALSE];
+};
+[] ¬ SymTab.Pairs[symbolTable, Test];
+WorkingMsg['$];
+};
+
+{
+indexN ¬ 0;
+WHILE indexN < totalNewLines DO
+entry: FileArrayEntry = newArray[indexN];
+Process.CheckForAbort[];
+indexN ¬ indexN + 1;
+IF entry.typeOfPntr = lineNum THEN {
+indexO ¬ entry.otherIndex + 1;
+WHILE indexN < totalNewLines AND indexO < totalOldLines DO
+entryN: FileArrayEntry = newArray[indexN];
+entryO: FileArrayEntry = oldArray[indexO];
+symEntry: SymbolTableEntry ¬ entryN.symEntry;
+SELECT TRUE FROM
+entryN.typeOfPntr = symTable
+AND entryO.typeOfPntr = symTable
+AND symEntry = entryO.symEntry =>
+ConnectEntries[symEntry, indexO, indexN, entryO, entryN];
+entryN.typeOfPntr # lineNum
+OR entryO.typeOfPntr # lineNum
+OR entryN.otherIndex # indexO
+OR entryO.otherIndex # indexN => EXIT;
+ENDCASE;
+indexN ¬ indexN + 1;
+indexO ¬ indexO + 1;
+ENDLOOP;
+};
+ENDLOOP;
+WorkingMsg['%];
+};
+
+{
+indexN ¬ totalNewLines - 1;
+WHILE indexN >= 0 DO
+entry: FileArrayEntry = newArray[indexN];
+Process.CheckForAbort[];
+indexN ¬ indexN - 1;
+IF entry.typeOfPntr = lineNum THEN {
+indexO ¬ entry.otherIndex - 1;
+WHILE indexN >= 0 AND indexO >= 0 DO
+entryN: FileArrayEntry = newArray[indexN];
+entryO: FileArrayEntry = oldArray[indexO];
+symEntry: SymbolTableEntry ¬ entryN.symEntry;
+Process.CheckForAbort[];
+SELECT TRUE FROM
+entryN.typeOfPntr = symTable
+AND entryO.typeOfPntr = symTable
+AND symEntry = entryO.symEntry => {
+ConnectEntries[symEntry, indexO, indexN, entryO, entryN];
+};
+entryN.typeOfPntr # lineNum
+OR entryO.typeOfPntr # lineNum
+OR entryN.otherIndex # indexO
+OR entryO.otherIndex # indexN =>
+EXIT;
+ENDCASE;
+indexN ¬ indexN - 1;
+indexO ¬ indexO - 1;
+ENDLOOP;
+};
+ENDLOOP;
+WorkingMsg['~];
+};
+
+ENDLOOP;
+
+{
+CancelMatch: PROC [array1, array2: FileArray, totalNumOfLinesFile1, index: INT] = {
+DO
+entry1: FileArrayEntry ¬ array1[index];
+IF entry1.typeOfPntr = symTable THEN EXIT;
+entry1.typeOfPntr ¬ symTable;
+array2[entry1.otherIndex].typeOfPntr ¬ symTable;
+index ¬ index + 1;
+IF ((index >= totalNumOfLinesFile1)
+OR (entry1.otherIndex # array1[index - 1].otherIndex + 1)) THEN EXIT;
+ENDLOOP;
+};
+
+IF switchLinesForMatch > 1 THEN {
+indexN ¬ 0;
+DO
+oldIndexN: INT ¬ indexN;
+indexN ¬ indexN + 1;
+Process.CheckForAbort[];
+IF indexN >= totalNewLines THEN EXIT;
+IF newArray[indexN].typeOfPntr = lineNum THEN {
+WHILE ((indexN < totalNewLines)
+AND (newArray[indexN].otherIndex = newArray[indexN-1].otherIndex + 1)) DO
+indexN ¬ indexN + 1;
+ENDLOOP;
+IF (indexN - oldIndexN) < switchLinesForMatch AND indexN < totalNewLines THEN
+CancelMatch[newArray, oldArray, totalNewLines, oldIndexN];
+};
+ENDLOOP;
+};
+WorkingMsg['&];
+
+{
+LeadingNumber: PROC [char: CHAR, number: INT] = {
+leadingZeroes: INTEGER ¬ columns - 1;
+tempIndex: INT ¬ number;
+IF switchMergeFiles THEN RETURN;
+Process.CheckForAbort[];
+difFile.PutF1["%g/", [character[char]]];
+DO
+IF tempIndex < 10 THEN EXIT;
+tempIndex ¬ tempIndex/10;
+leadingZeroes ¬ leadingZeroes - 1;
+ENDLOOP;
+THROUGH [0..leadingZeroes) DO difFile.PutChar['0]; ENDLOOP;
+difFile.Put1[[integer[number]]];
+difFile.PutRope[") "];
+};
+PrintDelta: PROC [file: REF, which: CHAR, entry: FileArrayEntry] = {
+st: STREAM = NARROW[file];
+pos: INT = entry.instance.first.pos;
+LeadingNumber[which, pos];
+IO.SetIndex[st, pos];
+THROUGH [0..entry.len) DO
+c: CHAR ¬ IO.GetChar[st ! IO.EndOfStream => EXIT];
+IO.PutChar[difFile, c];
+ENDLOOP;
+IO.PutChar[difFile, '\n];
+};
+PrintCedarDelta: PROC [file: REF, index, start, total: INT, array: FileArray]
+RETURNS [INT] = {
+st: STREAM = NARROW[file];
+IF start < total THEN {
+leadChar: CHAR ¬ IF file = oldFile THEN '1 ELSE '2;
+lastChar: CHAR ¬ 0C;
+lastIndex: NAT ¬ MIN[index+1, total] - 1;
+lastEntry: FileArrayEntry = array[lastIndex];
+pos: INT ¬ array[start].instance.first.pos;
+end: INT ¬ lastEntry.instance.first.pos+lastEntry.instance.first.len;
+WHILE pos > 0 DO
+IO.SetIndex[st, pos - 1];
+lastChar ¬ IO.GetChar[st];
+IF IsEndOfLine[lastChar] THEN EXIT;
+pos ¬ pos - 1;
+ENDLOOP;
+LeadingNumber[leadChar, pos];
+IO.SetIndex[st, pos];
+DO
+lastChar ¬ IO.GetChar[st ! IO.EndOfStream => EXIT];
+IF IsEndOfLine[lastChar]
+THEN {
+IF pos >= end THEN EXIT;
+IO.PutChar[difFile, '\n];
+LeadingNumber[leadChar, pos];
+}
+ELSE IO.PutChar[difFile, lastChar];
+pos ¬ pos + 1;
+ENDLOOP;
+IO.PutChar[difFile, '\n];
+
+WHILE index < total DO
+IF array[index].instance.first.pos >= end THEN EXIT;
+index ¬ index + 1;
+ENDLOOP;
+};
+RETURN [index];
+};
+DumpOutDiffAndMoveAhead: PROC = {
+IF NOT anyDifferencesSeen THEN {
+OpenDifFileAndWriteHeader[];
+difFile.PutF["%g%g\n", [rope[Asterisks]], [rope[Asterisks]]];
+};
+SELECT TRUE FROM
+(indexN >= totalNewLines) OR (indexO >= totalOldLines) => {
+indexN ¬ totalNewLines;
+indexO ¬ totalOldLines;
+};
+newArray[indexN].typeOfPntr = lineNum =>
+indexO ¬ newArray[indexN].otherIndex
+ENDCASE =>
+indexN ¬ oldArray[indexO].otherIndex;
+SELECT pData FROM
+$Cedar => {
+indexO ¬ PrintCedarDelta[oldFile, indexO, startDifO, totalOldLines, oldArray];
+difFile.PutF1["%g\n", [rope[Asterisks]]];
+indexN ¬ PrintCedarDelta[newFile, indexN, startDifN, totalNewLines, newArray];
+};
+ENDCASE => {
+IF switchMergeFiles
+THEN CopySpan[oldArray, startDifO, indexO-1, oldFile, old, totalOldLines]
+ELSE {
+FOR index: INT IN [startDifO..indexO) DO
+entry: FileArrayEntry = oldArray[index];
+PrintDelta[oldFile, '1, entry];
+ENDLOOP;
+FOR index: INT IN [indexO..indexO + switchLinesForContext)
+WHILE (index < totalOldLines) DO
+entry: FileArrayEntry = oldArray[index];
+PrintDelta[oldFile, '1, entry];
+ENDLOOP;
+};
+indexO ¬ indexO + switchLinesForContext;
+difFile.PutF1["%g\n", [rope[Asterisks]]];
+IF switchMergeFiles
+THEN CopySpan[newArray, startDifN, indexN-1, newFile, new, totalNewLines]
+ELSE {
+FOR index: INT IN [startDifN..indexN) DO
+entry: FileArrayEntry = newArray[index];
+PrintDelta[newFile, '2, entry];
+ENDLOOP;
+FOR index: INT IN [indexN..indexN + switchLinesForContext)
+WHILE (index < totalNewLines) DO
+entry: FileArrayEntry = newArray[index];
+PrintDelta[newFile, '2, entry];
+ENDLOOP;
+};
+indexN ¬ indexN + switchLinesForContext;
+};
+
+difFile.PutF["\n%g%g\n", [rope[Asterisks]], [rope[Asterisks]]];
+
+IF switchMergeFiles THEN
+CopySpan[newArray, indexN-switchLinesForContext, indexN-1, newFile, both, totalNewLines];
+
+startDifN ¬ indexN;
+WHILE indexN < totalNewLines AND newArray[indexN].typeOfPntr # symTable DO
+IF newArray[indexN].otherIndex
+# newArray[indexN - 1].otherIndex + 1 THEN EXIT;
+indexN ¬ indexN + 1;
+indexO ¬ indexO + 1;
+ENDLOOP;
+
+IF switchMergeFiles AND indexN>startDifN THEN
+CopySpan[newArray, startDifN, indexN-1, newFile, both, totalNewLines];
+startDifN ¬ indexN;
+startDifO ¬ indexO;
+};
+TryToResolveConflicts: PROC [array1, array2: FileArray, index1, index2: INT]
+RETURNS [okToDumpDiff: BOOL] = {
+entry1: FileArrayEntry ¬ array1[index1];
+lastRange1: INT ¬ index1 + entry1.otherIndex - index2;
+FOR tempIndex: INT IN [index2..entry1.otherIndex) DO
+entry2: FileArrayEntry ¬ array2[tempIndex];
+IF entry2.typeOfPntr = lineNum THEN {
+IF entry2.otherIndex > lastRange1
+THEN CancelMatch[array2, array1, totalOldLines, tempIndex]
+ELSE {
+CancelMatch[array1, array2, totalNewLines, index1];
+RETURN[FALSE];
+};
+};
+ENDLOOP;
+RETURN [TRUE];
+};
+CopySpan: PROC [array: FileArray, index1, index2: INT, in: REF, lineType: LineType ¬ both, limit: INT¬-1] = {
+inNode: Node = NARROW[in];
+nesting: INT;
+IF limit>=0 THEN { IF index1 >= limit THEN RETURN; index2 ¬ MIN[index2, limit-1]; };
+IF index1>index2 THEN RETURN;
+nesting ¬ TextNode.Level[array[index1].node] - TextNode.Level[difFileNode.node];
+WHILE nesting > 1 DO
+[]¬EditSpan.Copy[difFileNode.root, fillerNode.root, TextNode.MakeNodeLoc[difFileNode.node], TextNode.MakeNodeSpan[fillerNode.node, fillerNode.node], after, 1];
+nesting ¬ nesting - 1;
+ENDLOOP;
+[]¬EditSpan.Copy[difFileNode.root, inNode.root, TextNode.MakeNodeLoc[difFileNode.node], TextNode.MakeNodeSpan[array[index1].node, array[index2].node], after, nesting];
+IF lineType=both
+THEN difFileNode.node ¬ TextNode.LastWithin[difFileNode.root]
+ELSE {
+node: TextNode.Ref;
+WHILE (node¬TextNode.StepForward[difFileNode.node])#NIL DO
+len: INT = Rope.Length[node.rope];
+difFileNode.node ¬ node;
+SELECT lineType FROM
+old  => TiogaFileOps.AddLooks[FR[node], 0, len, 'y];
+new => TiogaFileOps.AddLooks[FR[node], 0, len, 'z];
+ENDCASE;
+ENDLOOP;
+};
+};
+startDifN: INT;
+startDifO: INT;
+dumpDiff: BOOL;
+columns: NAT ¬ 1;
+max: INT ¬ MAX[posInNewFile, posInOldFile];
+DO
+IF max < 10 THEN EXIT;
+max ¬ max/10;
+columns ¬ columns + 1;
+ENDLOOP;
+indexN ¬ 0;
+indexO ¬ 0;
+IF switchMergeFiles THEN OpenDifFileAndWriteHeader[];
+DO
+IF indexN >= totalNewLines OR indexO >= totalOldLines
+THEN EXIT
+ELSE {
+entryN: FileArrayEntry ¬ newArray[indexN];
+entryO: FileArrayEntry ¬ oldArray[indexO];
+IF entryN.typeOfPntr # lineNum THEN EXIT;
+IF entryO.typeOfPntr # lineNum THEN EXIT;
+IF entryN.otherIndex # indexO THEN EXIT;
+IF entryO.otherIndex # indexN THEN EXIT;
+indexN ¬ indexN + 1;
+indexO ¬ indexO + 1;
+};
+ENDLOOP;
+IF switchMergeFiles AND indexN>0 THEN
+CopySpan[newArray, 0, indexN-1, newFile, both];
+
+startDifN ¬ indexN;
+startDifO ¬ indexO;
+dumpDiff ¬ FALSE;
+WHILE ((indexN < totalNewLines) AND (indexO < totalOldLines)) DO
+entryN: FileArrayEntry = newArray[indexN];
+entryO: FileArrayEntry = oldArray[indexO];
+IF entryN.typeOfPntr = lineNum OR entryO.typeOfPntr = lineNum THEN {
+IF entryN.typeOfPntr = lineNum AND entryO.typeOfPntr = lineNum THEN {
+IF entryN.otherIndex = indexO AND entryO.otherIndex = indexN THEN GOTO dumpoutthedifference;
+IF (entryN.otherIndex - indexO) > (entryO.otherIndex - indexN)
+THEN CancelMatch[newArray, oldArray, totalNewLines, indexN]
+ELSE CancelMatch[oldArray, newArray, totalOldLines, indexO];
+};
+IF entryN.typeOfPntr = lineNum 
+THEN dumpDiff ¬ TryToResolveConflicts[newArray, oldArray, indexN, indexO]
+ELSE dumpDiff ¬ TryToResolveConflicts[oldArray, newArray, indexO, indexN];
+EXITS dumpoutthedifference => dumpDiff ¬ TRUE;
+};
+IF dumpDiff
+THEN {
+DumpOutDiffAndMoveAhead[];
+dumpDiff ¬ FALSE;
+}
+ELSE {
+indexN ¬ indexN + 1;
+indexO ¬ indexO + 1;
+};
+ENDLOOP;
+IF startDifN < totalNewLines OR startDifO < totalOldLines THEN
+DumpOutDiffAndMoveAhead[];
+WorkingMsg['*];
+IF switchMergeFiles THEN TiogaFileOps.Store[FR[difFileNode.root], difFileName];
+};
+
+IF anyDifferencesSeen
+THEN FinishUp[Rope.Cat[IF switchMergeFiles THEN "merged version written on file " ELSE " differences written on file ", difFileName, ".\n"]]
+ELSE FinishUp[" no differences encountered.\n"];
+
+IF ~switchMergeFiles THEN {
+IO.Close[NARROW[oldFile]];
+IO.Close[NARROW[newFile]];
+}
+};
+
+EXITS
+usageError => {msg ¬ "Usage error: Waterlily file1 file2\n"; result ¬ $Failed};
+fatalError => {result ¬ $Failed};
+
+};
+
+ShortName: PROC [name: ROPE] RETURNS [ROPE] = {
+bang: INT ¬ Rope.Length[name];
+pos: INT ¬ bang;
+WHILE (pos ¬ pos - 1) > 0 DO
+SELECT Rope.Fetch[name, pos] FROM
+'>, '/, '] => {pos ¬ pos + 1; EXIT};
+'!, '. => bang ¬ pos;
+ENDCASE;
+ENDLOOP;
+RETURN [Rope.Flatten[name, pos, bang - pos]];
+};
+
+DefaultExtension: PROC [name: ROPE, ext: ROPE, forceExt: BOOL] RETURNS [ROPE] = {
+len: INT ¬ Rope.Length[name];
+pos: INT ¬ len;
+WHILE (pos ¬ pos - 1) > 0 DO
+SELECT Rope.Fetch[name, pos] FROM
+'>, '/, '] => EXIT;
+'., '! => RETURN [name];
+ENDCASE;
+ENDLOOP;
+IF forceExt THEN RETURN[Rope.Concat[name, ext]];
+[] ¬ FS.FileInfo[name ! FS.Error => GOTO NoFile];
+RETURN [name]; -- if file exists, don't change its name
+EXITS NoFile => RETURN[Rope.Concat[name, ext]];
+};
+
+
+TR: PROC[ref: REF] RETURNS [TextNode.Ref] = TRUSTED INLINE {
+RETURN[LOOPHOLE[ref]]; };
+
+FR: PROC[ref: REF] RETURNS [TiogaFileOps.Ref] = TRUSTED INLINE {
+RETURN[LOOPHOLE[ref]]; };
+
+NewNode: PROC RETURNS [node: Node] = {
+node ¬ NEW[NodeBody ¬ [TR[TiogaFileOps.CreateRoot[]]]];
+node.node ¬ node.root;
+NodeProps.PutProp[n: NARROW[node.root, TextNode.Ref], name: $NewlineDelimiter, value: Rope.Flatten["\n"]];
+};
+
+NodeFromFile: PROC[fileName: ROPE] RETURNS [node: Node] = {
+node ¬ NEW[NodeBody ¬ []];
+node.root ¬ TiogaIO.FromFile[PFS.PathFromRope[fileName]].root;
+node.node ¬ node.root;
+};
+
+IsEndOfLine: PROC [c: CHAR] RETURNS [BOOL] = INLINE {
+RETURN [c = '\n OR c = 015C OR c = 012C];
+};
+
+Commander.Register[key: "Waterlily", proc: WaterlilyProc, doc: LongHelpMsgW, clientData: NIL];
+Commander.Register[key: "Cedarlily", proc: WaterlilyProc, doc: LongHelpMsgC, clientData: $Cedar];
+Commander.Register[key: "Tigerlily",
+proc: WaterlilyProc, doc: LongHelpMsgM, clientData: $Merge];
+Commander.Register[key: "MergeLily",
+proc: WaterlilyProc, doc: LongHelpMsgM, clientData: $Merge]; -- The old name
+}.
+
+
+
+
+
+
+
+   $  
+Waterlily.mesa
+Copyright Ó 1984, 1985, 1988, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Swinehart, November 18, 1985 2:35:32 pm PST
+Russ Atkinson (RRA) July 28, 1988 0:47:53 am PDT
+Last tweaked by Mike Spreitzer on October 17, 1988 4:48:07 pm PDT
+Bill Jackson (bj) November 17, 1988 5:14:01 pm PST
+Jules Bloomenthal February 20, 1991 1:10 pm PST
+Michael Plass, October 9, 1991 2:40 pm PDT
+Willie-s, February 17, 1992 4:42 pm PST
+Part of this algorithm cribbed from Heckel, Paul.  A Technique For Isolating Differences Between Files.  Comm. ACM 21,4 (April 1978), 264-268.  Pointer to which courtesy of Ed Taft.
+
+Make this greater to experiment with multiple phases of match finding
+Turn this on to get different characters for different phases of the process.
+PROC [cmd: Handle] RETURNS [result: REF _ NIL, msg: ROPE _ NIL];
+these switches are global or local.
+these switches are global only.
+We need a new buffer
+We are at the end of the stream.  If the token is empty, then raise EndOfStream.
+Special processing for Cedar tokens
+Now do a little canonicalization to avoid reporting meaningless differences.
+Semicolons are quite common, but not very important, and are often optional.  So we can safely ignore them.
+This may just be the end of the interesting part of the file.
+This may just be the end of the interesting part of the file.
+This is an interesting little hack.  It tends to improve token uniqueness by appending the peek character, tends to reduce the number of tokens in the table (by swallowing lots of single-character tokens), and thereby improves matching.
+Character code finesse
+Character code finesse
+We only get here when we are using full lines as tokens.
+Here we process the token to make it canonical
+start here.
+Process arguments
+Switches specified here
+The old file name is really the dif file name
+Pass 1 & 2
+Pass 1
+In Pass 1 we scan the new file (the second one mentioned in the command line) for lines (or tokens), and enter them into the symbol table.
+Pass 2
+Pass 2 is like Pass1, except that we are scanning the old file (the first one mentioned in the command line).
+Pass 3
+In Pass 3 we transform all of the instances into file array entries.
+[key: SymTab.Key, val: SymTab.Val] RETURNS [quit: BOOL]
+Pass 4
+In Pass 4 we run through the symbol table to connect all lines (or tokens) that appear only once in both files (OR appear once with a given peek char).  Those lines (or tokens) are the places where the files are known to coincide.
+[key: SymTab.Key, val: SymTab.Val] RETURNS [quit: BOOL]
+Pass 5
+In Pass 5 we extend matching entries outwards by scanning forwards.
+Pass 6
+In Pass 6 we extend matching entries outwards by scanning backwards.
+Passes 7 and 8
+Pass 7
+In Pass 7 we cancel matches that don't extend far enough.  This is to prevent excessive context switching in reporting differences.
+Pass 8
+In Pass 8 we actually print the differences, skipping over the matches.
+must be a better way to do this.
+Dump out the line indicated by the entry
+Dump out the difference indicated, extending the difference through the start of the line containing the first token, and through the end of the line containing the last token.  Return the index after the last token on the last line printed.
+First, get to the preceding line start by scanning backwards
+Now, put out lines until the rem count is exhausted
+Now skip over tokens we inadvertently covered during our printing to the end of line.  The index returned is the one after the one we printed.
+If merging, print the context lines here.
+Move ahead to get beyond the last line from the old file.
+Node Management
+
+ Ê(û  •NewlineDelimiter
+–(cedarcode) style™ headšœ™Icodešœ
+ÏeœI™TL™+L™0L™AL™2L™/L™*L™'L˜ Lšœµ™µL™ šÏk	˜	Lšœ
+žœ˜Lšœ
+žœ˜(Lšœžœ!˜3Lšœ	žœ˜Lšœ
+žœ˜&LšžœžœD˜LLšžœžœ­žœ˜ÈLšœ
+žœ˜Lšžœžœ˜Lšœžœ˜LšœžœG˜TLšœžœBžœ˜RLšœžœ@˜LLšœ	žœB˜PLšœžœD˜VLšœžœ˜——šœžœž˜Lšžœ:žœžœžœE˜œL˜ Lšžœžœžœ˜Lšžœžœžœžœ˜L˜ Lšœžœžœ˜1šœžœžœ˜#LšœÏc˜+LšœŸ˜+LšœžœŸ˜)Lšœ˜L˜ —Lšœžœžœ˜)šœžœžœ˜LšœžœŸ˜$LšœžœŸ5˜?LšœžœŸ+˜CLšœžœŸ˜%LšœžœŸ'˜2L˜—L˜ Lšœžœžœ˜#Lšœžœžœ	žœžœžœ˜KL˜ Lšœžœžœ˜-šœžœžœ˜"Lšœ˜Lšœ˜Lšœžœ˜Lšœžœ˜L˜ Lšœžœ˜L˜ —Lšœžœ˜Lšœžœžœ
+˜Lš	œ
+žœžœžœžœ˜8L˜ šœžœ˜L˜ù—šœžœ˜Lšœû˜û—šœžœ˜LšœÐ˜ÐL˜ —šœ	žœ˜LšœE™E—šœžœžœ˜LšœM™M——šœ(˜(Lšžœžœ
+žœžœžœžœ™@L˜ Lšœžœžœ˜L˜ Lšœ˜Lšœ˜Lšœžœ˜šœžœ˜%L˜ —Lšœžœ˜Lšœžœ˜L˜ Lšœžœ˜Lšœžœ˜Lšœžœ˜L˜ Lšœ	žœŸ˜#Lšœ	žœŸ˜#Lšœ	žœ˜Lšœžœ˜L˜ Lšœžœžœ˜Lšœžœžœ˜Lšœžœžœ˜L˜ Lšœžœ,˜;Lšœžœ˜L˜ Lšœ#™#Lšœ
+žœ˜(L˜7Lšœ>žœžœ˜JLšœžœžœ˜$Lšœžœžœ˜Lšœžœžœ˜Lšœžœžœ˜!Lšœžœžœ˜'L˜ Lšœ™Lšœžœ˜Lšœžœ˜L˜ Lšœžœžœ˜!Lšœžœ˜Lšœžœ˜L˜ Lšœ
+žœ˜"Lšœ	žœ˜#L˜ šÏnœžœžœ/žœžœžœžœ˜{Lšœ žœ˜$Lšœžœ;˜Tšžœ$žœž˜3Lšœ'˜'šžœ˜šœžœ˜)Lšœ	žœžœ˜'—Lšœ2˜2L˜——šžœ
+ž˜šœ˜Lšœ ˜ Lšœ˜Lšœ˜—šœ˜Lšœ ˜ Lšœ˜Lšœ˜—Lšžœžœ˜—L˜L˜ —š 	œžœžœžœ˜QLš
+žœžœžœžœžœ˜ Lšžœžœžœ˜0Lšœ˜šž˜Lšœ˜L˜Lšžœžœžœžœ˜Lšžœžœžœ˜<Lšžœ˜—L˜L˜ —š œžœ1žœ%˜mLšœ0˜0Lšœ˜Lšœ˜LšœP˜PLšœP˜PL˜L˜ —Lšœžœžœ˜L˜ Lš	œžœžœžœžœ˜!L˜ š œžœ
+žœ	žœžœžœžœžœ˜FLšœ˜šž˜Lšœžœ˜šžœ žœ˜(L™Lšœ˜šœžœ/˜ALšœžœžœ˜—šžœžœ˜LšœP™PLšžœžœžœžœ˜6Lšžœ˜L˜—Lšœ"˜"Lšœ˜Lšœ˜—Lšœ˜Lšœ"˜"Lšœ˜Lšžœžœžœ˜Lšœ+˜+Lšžœ˜—Lšžœ	˜L˜—Lšœžœ˜Lš	œžœžœžœžœ˜1Lšœžœ˜Lšœžœ˜Lšœ
+žœ˜L˜ š œžœ	žœ/žœžœžœžœžœžœ˜£š
+ œžœ	žœ
+žœžœ˜6Lšžœžœžœ˜$L˜)L˜—Lšœžœ˜Lšœ˜šžœžœž˜Lšœžœ˜Lšœ˜Lšžœžœ˜—Lšœžœ˜
+Lšœžœ˜Lšœ	˜	Lšœ˜Lšœ
+˜
+šž˜Lšœ˜šžœž˜˜L™#Lšœžœ˜Lšœ˜šœžœ+ž˜6Lšœžœžœ˜—Lšœžœ˜šœ2žœ˜LLšœžœžœ˜%—Lšžœžœžœ˜(Lšœžœ˜LšœL™Lš	žœžœžœžœž˜!šœ˜Lšœžœ˜!Lšœ
+žœžœžœžœžœ˜Lšžœ
+ž˜LšœžœŸ*˜MLšœžœŸ*˜MLšžœ˜—L˜—šœ˜Lšœžœ˜šžœž˜LšœžœžœŸ˜HLšœžœžœŸ˜Hšœžœ˜Lšœk™k—šœ˜L™=šœžœ+ž˜6Lšœžœžœ˜—šœžœ˜Lšœžœžœ˜+—Lšžœžœžœ˜"L˜—Lšžœ˜—L˜—šœ˜Lšœžœ˜šœžœ+ž˜6Lšœžœžœ˜—šœžœ˜Lšœžœžœ˜+—šžœž˜šœžœžœž˜Lšœ/˜/Lšœ4˜4Lšžœ˜—šœžœžœž˜Lšœ6˜6Lšœ3˜3Lšžœ˜—šœžœžœž˜šœ ˜ L™=Lšœ˜Lšœ
+˜
+Lšžœžœžœ˜"Lšœ˜—Lšžœ˜—šœžœžœž˜Lšœ1˜1Lšžœ˜—šœžœžœž˜šœ!˜!Lšœžœ˜%šžœžœž˜Lšœ2˜2Lšœ0˜0Lšžœ&žœ˜4—Lšœ˜—Lšžœ˜—šœžœžœž˜Lšœ6˜6Lšžœ˜—Lšžœ˜—Lšœì™ìšžœž˜šœ˜Lšœ™Lšœžœžœ˜L˜
+L˜—šœ˜Lšœ™Lšœžœžœ˜L˜
+L˜—šœ˜Lšœžœ˜Lšœ˜—Lšžœžœžœ˜—L˜.Lšœžœ˜Lšžœ˜L˜—Lšžœ˜—šžœ*žœž˜9Lšœ7˜7Lšžœ"˜)—Lšžœ˜Lšœ˜—Lšžœ˜L˜ —Lšœ8™8šžœ˜šžœ˜L˜L˜Lšœ*žœ˜;Lšžœžœžœžœ˜#L˜L˜-L˜—šžœ˜Lšœ˜Lšœžœžœ˜?L˜L˜——šžœžœžœžœ˜QL™.Lšœžœ˜Lšœžœ˜Lšœžœ˜šžœž˜šžœž˜šžœž˜Lšœ˜Lšžœžœ˜—Lšžœ˜——šžœžœžœ˜;Lšœžœžœ˜šžœž˜Lšœžœ˜Lšœ˜šžœž˜Lšœ,˜,Lšžœžœžœžœ˜'Lšœ	žœžœžœ˜,Lšžœžœ˜—Lšœ˜Lšœ˜Lšžœ˜—L˜—Lšœ˜šžœž˜šžœž˜šžœž˜Lšœ˜Lšžœžœ˜—Lšžœ˜——Lšœ˜L˜—šžœ*žœž˜9Lšœ7˜7Lšžœ"˜)—šžœžœ˜šžœžœžœž˜"šžœ
+ž˜L˜Lšžœžœžœ˜—Lšžœ˜—L˜L˜—Lšžœžœ˜Lšžœ˜—L˜
+Lšžœ˜Lšœ˜L˜ —š œžœ
+žœ˜!Lšžœ˜Lšžœ˜Lšžœžœžœ˜ Lšžœžœžœ˜2Lšžœ˜Lšžœ˜Lšžœ˜Lšœ˜L˜ —š 
+œžœžœ˜!Lšœ˜Lšžœžœžœžœ˜0L˜L˜ —š œžœ˜#Lšžœžœžœ˜"Lšœžœ˜Lš	œ,žœžœžœ	žœ˜bšžœžœ˜Lšœ
+žœ˜Lšœ˜Lšžœ˜Lšœ˜—Lšœ
+žœ"˜.Lšžœžœžœžœ˜MšžœB˜DLšœC˜C—šœ˜L˜ ——š œžœžœžœžœžœ˜eLšœžœžœ˜:L˜4Lšœ7žœ˜>Lšœžœ"˜/šžœ˜Lšžœ˜"Lšžœžœ,˜:—šœ˜L˜ ——Lšœ™L˜ Lšœ9žœ˜?L˜Lšœžœ žœ˜JLšœžœ˜6Lšœžœ+žœ˜XLšœ-žœž	œ˜=L˜ Lšœ	žœ˜Lšœžœ˜
+L˜ LšÏb™šœ˜šœ:˜:Lšœ1žœžœ˜BL˜L˜ —Lšœžœ˜Lšœ"˜"Lšœžœžœ˜Lšœžœžœ˜šžœžœžœžœ˜LL˜ —šžœžœžœž˜Lšœžœ˜Lšœžœžœ˜šžœžœ˜Lšœ™Lšœžœ˜Lšœžœ˜šžœžœžœ
+ž˜Lšœžœ˜šžœž˜Lšœžœ˜L˜#L˜"L˜"Lšœ#˜#Lšœ#˜#Lšœ@˜@˜L˜Lšžœžœžœ˜'L˜—Lšžœ+žœ˜3Lšœ
+žœžœ˜;Lšœ
+žœžœ ˜=Lšžœ˜—L˜Lšžœ˜—Lšžœ˜L˜—šžœžœ˜Lšœ-™-Lšžœžœžœžœ˜'Lšœ˜Lšœ˜Lšžœ˜L˜—šžœž˜˜Lšœ˜Lšœ$˜$Lšœ1˜1L˜*Lšœ1˜1Lšžœžœžœ˜7Lšœ˜—˜Lšœ˜Lšœ$˜$Lšœ1˜1L˜*Lšœ1˜1Lšœ˜—Lšžœžœžœ˜—Lšžœ˜—Lšžœžœžœžœ˜'L˜ L˜šœ˜šžœžœ˜Lšžœžœ˜2Lšžœžœ˜Lšœ˜—LšœB˜BLšœB˜BL˜—Lšœ˜Lšœ˜—L˜ Lš¡
+™
+šœ˜š¡™L™Š—Lšœ
+žœžœ˜Lšœžœ˜Lšœžœ˜L˜Lšœ˜Lšœ˜šž˜Lšœžœ˜
+Lšœžœ˜	šœu˜uLšœžœ˜—LšœP˜PL˜"Lšžœ˜—Lšžœžœžœ˜)Lšœžœ˜,Lšœ˜L˜ š¡™L™m—L˜Lšœ˜Lšœ˜šž˜Lšœžœ˜
+Lšœžœ˜	šœu˜uLšœžœ˜—LšœP˜PL˜"Lšžœ˜—Lšžœžœžœ˜)Lšœžœ˜,Lšœ˜L˜ š¡™LšœD™D—šœ˜•StartOfExpansion; -- [key: SymTab.Key, val: SymTab.Val] RETURNS [quit: BOOL]š œ˜Lšœ#žœžœ™7Lšœ žœ˜,Lšœ,˜,Lšœ,˜,šžœ)žœžœž˜?šœžœ˜5Lšœ˜Lšœ˜Lšœ˜L˜Lšœ˜Lšœ˜—Lšžœ˜—šžœ)žœžœž˜?šœžœ˜5Lšœ˜Lšœ˜Lšœ˜L˜Lšœ˜Lšœ˜—Lšžœ˜—Lšžœžœ˜Lšœ˜—Lšœ%˜%Lšœ˜Lšœ˜—L˜ LšžœL˜QLšœ˜L˜ —šžœž˜L˜ š¡™L–; -- [key: SymTab.Key, val: SymTab.Val] RETURNS [quit: BOOL]šœæ™æ—šœ˜š œ˜Lšœ#žœžœ™7Lšœ žœ˜,Lšœ,˜,Lšœ,˜,Lšœ˜šžœžœž˜Lšœ
+žœžœ˜#šœžœžœ˜+Lšœ˜—šžœ˜Lšœ˜Lšœ˜LšœP˜PL˜——Lšžœžœ˜Lšœ˜—Lšœ%˜%Lšœ˜Lšœ˜L˜ —š¡™L–; -- [key: SymTab.Key, val: SymTab.Val] RETURNS [quit: BOOL]šœC™C—˜L˜šžœž˜Lšœ)˜)Lšœ˜L˜šžœžœ˜$Lšœ˜šžœžœž˜:Lšœ*˜*Lšœ*˜*Lšœ-˜-šžœžœž˜šœžœžœ˜_Lšœ9˜9—Lš	œžœžœžœžœ˜Lšžœ˜—L˜L˜Lšžœ˜—Lšœ˜—Lšžœ˜—Lšœ˜L˜—L˜ š¡™L–; -- [key: SymTab.Key, val: SymTab.Val] RETURNS [quit: BOOL]šœD™D—˜L˜šžœž˜Lšœ)˜)Lšœ˜L˜šžœžœ˜$Lšœ˜šžœžœž˜$Lšœ*˜*Lšœ*˜*Lšœ-˜-Lšœ˜šžœžœž˜šœžœžœ ˜aLšœ9˜9Lšœ˜—šœžœžœžœ˜yLšžœ˜—Lšžœ˜—L˜L˜Lšžœ˜—Lšœ˜—Lšžœ˜—Lšœ˜L˜L˜ —Lšžœ˜—L˜ Lš¡™šœ˜š œžœ:žœ˜Sšž˜Lšœ'˜'Lšžœžœžœ˜*Lšœ˜Lšœ0˜0L˜Lšžœ"žœ9ž	œ˜iLšžœ˜—šœ˜L˜ ——š¡™L™ƒ—šžœžœ˜!Lšœ˜šž˜Lšœžœ
+˜L˜Lšœ˜Lšžœžœžœ˜%šžœ'žœ˜/šžœžœDž˜iLšœ˜Lšžœ˜—šžœ,žœž˜MLšœ:˜:—Lšœ˜—Lšžœ˜—Lšœ˜—Lšœ˜L˜ š¡™L™G—šœ˜š œžœžœ
+žœ˜1Lšœ ™ Lšœžœ˜%Lšœžœ
+˜Lšžœžœžœ˜ Lšœ˜L˜(šž˜Lšžœžœžœ˜L˜L˜"Lšžœ˜—Lšžœžœžœ˜;L˜ L˜Lšœ˜—š 
+œžœžœ	žœ˜DLšœ(™(Lšœžœžœ˜Lšœžœ˜$Lšœ˜Lšžœ˜šžœž˜Lš	œžœžœžœžœ˜2Lšžœ˜Lšžœ˜—Lšžœ˜L˜—š œžœžœžœžœžœ˜_Lšœñ™ñLšœžœžœ˜šžœžœ˜Lš	œ
+žœžœžœžœ˜3Lšœ
+žœ˜Lšœžœžœ˜)Lšœ-˜-Lšœžœ#˜+Lšœžœ=˜EL™<šžœ	ž˜Lšžœ˜Lšœžœ˜Lšžœžœžœ˜#Lšœ˜Lšžœ˜—L™3Lšœ˜Lšžœ˜šž˜Lšœžœžœžœ˜3šžœ˜šžœ˜Lšžœžœžœ˜Lšžœ˜Lšœ˜L˜—Lšžœžœ˜#—Lšœ˜Lšžœ˜—Lšžœ˜L˜ LšœŽ™Žšžœž˜Lšžœ(žœžœ˜4L˜Lšžœ˜—L˜—Lšžœ	˜L˜—š œžœ˜!šžœžœžœ˜ Lšœ˜Lšœ=˜=Lšœ˜—šžœžœž˜šœžœ˜;Lšœ˜L˜L˜—šœ(˜(Lšœ$˜$—šžœ˜
+Lšœ%˜%——šžœž˜˜LšœN˜NL˜)LšœN˜NL˜—šžœ˜šžœ˜LšžœE˜Išžœž˜šžœžœžœž˜(Lšœ(˜(Lšœ˜Lšžœ˜—š	žœžœžœ*žœž˜[Lšœ(˜(Lšœ˜Lšžœ˜—L˜——Lšœ(˜(L˜)šžœ˜LšžœE˜Išžœ˜šžœžœžœž˜(Lšœ(˜(Lšœ˜Lšžœ˜—š	žœžœžœ*žœž˜[Lšœ(˜(Lšœ˜Lšžœ˜—L˜——Lšœ(˜(L˜—L˜ —Lšœ?˜?L˜ L™)šžœž˜LšœY˜YL˜ —Lšœ9™9L˜šžœžœ'ž˜JLšžœCžœžœ˜OLšœ˜Lšœ˜Lšžœ˜—L˜ šžœžœž˜-LšœF˜F—L˜L˜Lšœ˜—š
+ œžœ-žœžœžœ˜mLšœ(˜(Lšœžœ'˜6šžœžœžœž˜4Lšœ+˜+šžœžœ˜%šžœ˜!Lšžœ6˜:šžœ˜Lšœ3˜3Lšžœžœ˜Lšœ˜——Lšœ˜—Lšžœ˜—Lšžœžœ˜Lšœ˜—š
+ œžœ$žœžœ$žœ˜mLšœžœ˜Lšœ	žœ˜Lšžœ
+žœžœžœžœžœ˜TLšžœžœžœ˜LšœP˜Pšžœž˜L˜ŸL˜Lšžœ˜—L˜§šžœ˜Lšžœ9˜=šžœ˜L˜šžœ/žœž˜:Lšœžœ˜"L˜šžœ
+ž˜Lšœžœ˜4Lšœžœ˜3Lšžœ˜—Lšžœ˜—L˜——Lšœ˜—Lšœžœ˜Lšœžœ˜Lšœ
+žœ˜Lšœ	žœ˜Lšœžœžœ˜+šž˜Lšžœ
+žœžœ˜L˜L˜Lšžœ˜—L˜L˜Lšžœžœ˜5šž˜šžœžœ˜5Lšžœž˜	šžœ˜Lšœ*˜*Lšœ*˜*Lšžœžœžœ˜)Lšžœžœžœ˜)Lšžœžœžœ˜(Lšžœžœžœ˜(L˜L˜L˜——Lšžœ˜—šžœžœ
+ž˜%Lšœ/˜/L˜ —L˜L˜Lšœžœ˜šžœžœž˜@Lšœ*˜*Lšœ*˜*šžœžœžœ˜Dšžœžœžœ˜ELšžœžœžœžœ˜\šžœ<˜>Lšžœ7˜;Lšžœ8˜<—Lšœ˜—šžœ˜LšžœE˜ILšžœF˜J—Lšžœ$žœ˜.Lšœ˜—šžœ	˜šžœ˜Lšœ˜Lšœžœ˜Lšœ˜—šžœ˜Lšœ˜L˜Lšœ˜——Lšžœ˜—šžœžœž˜>Lšœ˜—Lšœ˜Lšžœžœžœ!˜OLšœ˜——˜ šžœ˜Lšžœžœžœ#žœ6˜ŒLšžœ,˜0L˜ —šžœžœ˜Lšžœžœ˜Lšžœžœ˜L˜—Lšœ˜—L˜ šž˜LšœO˜OLšœ!˜!—L˜ Lšœ˜L˜ —š
+ 	œžœžœžœžœ˜/Lšœžœ˜Lšœžœ˜šžœž˜šžœž˜!Lšœžœ˜$L˜Lšžœ˜—Lšžœ˜—Lšžœ'˜-L˜L˜ —š œžœžœžœžœžœžœ˜QLšœžœ˜Lšœžœ˜šžœž˜šžœž˜!Lšœžœ˜Lšœ
+žœ˜Lšžœ˜—Lšžœ˜—Lšžœ
+žœžœ˜0Lšœžœžœ
+žœ	˜1LšžœŸ)˜7Lšžœžœ˜/L˜L˜ —L˜ ™L™ š
+Ðknœžœžœžœžœ˜<Lšžœžœ
+˜—L˜ š
+¢œžœžœžœžœ˜@Lšžœžœ
+˜L˜ —š œžœžœ˜&Lšœžœžœ˜7L˜L–[node: TextEdit.RefTextNode, name: ATOM, value: REF ANY, event: TextEdit.Event _ NIL, root: TextEdit.RefTextNode _ NIL]šœžœO˜jL˜L˜ —š œžœžœžœ˜;Lšœžœ˜Lšœžœ˜>L˜L˜L˜ —š œžœžœžœžœžœ˜5Lšžœ
+žœ
+žœ˜)L˜—L˜ —LšœYžœ˜^L˜a˜$L˜<—˜$Lšœ=Ÿ˜L—Kšœ˜L˜ L˜ L˜ L˜ L˜ L˜ L˜ — …—    x  ¯'  

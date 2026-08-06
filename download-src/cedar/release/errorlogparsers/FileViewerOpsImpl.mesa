@@ -1,0 +1,343 @@
+DIRECTORY
+FileViewerOps USING [],
+FileViewerOpsBackdoor,
+FS,
+Icons,
+IO USING [PutF1, PutRope, ROS, STREAM],
+Menus USING [AppendMenuEntry, ClickProc, CreateEntry, FindEntry, MenuEntry, MouseButton, ReplaceMenuEntry],
+MessageWindow USING [Append],
+PFS,
+PFSCanonicalNames,
+Process USING [CheckForAbort, Pause, SecondsToTicks],
+RefTab USING [Fetch, Create, Delete, Ref, Store],
+Rope USING [Concat, Equal, Fetch, Find, Index, Length, Replace, ROPE, Run, Substr],
+TiogaMenuOps USING [DefaultMenus, Load, Open],
+ViewerClasses USING [Viewer],
+ViewerOps USING [BlinkIcon, CreateViewer, DestroyViewer, EnumerateViewers, EnumProc, OpenIcon, PaintViewer];
+FileViewerOpsImpl: CEDAR PROGRAM
+IMPORTS IO, Menus, MessageWindow, PFSCanonicalNames, PFS, Process, RefTab, Rope,  TiogaMenuOps, ViewerOps
+EXPORTS FileViewerOps, FileViewerOpsBackdoor
+= BEGIN OPEN FileViewerOpsBackdoor;
+
+ROPE: TYPE = Rope.ROPE;
+STREAM: TYPE = IO.STREAM;
+Viewer: TYPE = ViewerClasses.Viewer;
+ViewerSaveStatus: TYPE = {none, old, new, saving};
+
+ShowLog: PUBLIC PROC [fileName: ROPE, destroyIt: BOOL ¨ FALSE, createIconic: BOOL ¨ FALSE, blinkIfIconic: BOOL ¨ TRUE] = {
+logViewer: Viewer ¨ FindFileViewer[StripVersion[fileName]];
+FOR v: Viewer ¨ logViewer, v.link UNTIL v = NIL DO
+[] ¨ RefTab.Delete[viewerTable, v];
+IF v.link = logViewer THEN EXIT;
+ENDLOOP;
+IF destroyIt 
+THEN {IF logViewer # NIL THEN ViewerOps.DestroyViewer[logViewer]}
+ELSE {
+icon: Icons.IconFlavor ~ SELECT TRUE FROM
+Rope.Find[fileName, ".errlog", 0, FALSE] # -1 => typescript,
+Rope.Find[fileName, ".log", 0, FALSE] # -1 => typescript,
+Rope.Find[fileName, ".mesa", 0, FALSE] # -1 => needsToBeCompiled,
+ENDCASE => document;
+IF logViewer = NIL
+THEN logViewer ¨ CreateLog[fileName, icon, createIconic]
+ELSE logViewer ¨ SetContents[logViewer, fileName, icon, createIconic];
+IF logViewer # NIL AND logViewer.iconic AND blinkIfIconic THEN ViewerOps.BlinkIcon[logViewer]};
+};
+
+StripVersion: PROC [fileName: ROPE] RETURNS [ROPE] ~ {
+RETURN Rope.Substr[base: fileName, start: 0, len: fileName.Index[s2: "!"]]};
+
+WaitUntilSaved: PUBLIC PROC [fileName: ROPE, feedBack: STREAM ¨ NIL] = {
+lastState: ViewerSaveStatus ¨ none;
+fileNameLen: INT ¨ Rope.Length[fileName ¨ ExpandName[fileName]];
+IF feedBack = NIL THEN feedBack ¨ IO.ROS[];
+DO
+state: ViewerSaveStatus ¨ none;
+vName: ROPE ¨ NIL;
+innerCheck: ViewerOps.EnumProc = {
+IF Rope.Run[fileName, 0, v.file, 0, FALSE] # fileNameLen THEN RETURN;
+vName ¨ v.file;
+state ¨ CheckViewer[v];
+SELECT state FROM
+new, saving => {vName ¨ v.file; RETURN [FALSE]};
+ENDCASE => RETURN [TRUE];
+};
+Process.CheckForAbort[];
+state ¨ none;
+vName ¨ NIL;
+ViewerOps.EnumerateViewers[innerCheck];
+IF lastState # none AND state # lastState THEN IO.PutRope[feedBack, "\n"];
+SELECT state FROM
+none => RETURN;
+lastState => {};
+new => IO.PutF1[feedBack, "** Please save %g ...", [rope[vName]] ];
+saving => IO.PutF1[feedBack, "** Saving %g ...", [rope[vName]] ];
+ENDCASE => RETURN;
+Process.CheckForAbort[! ABORTED => IO.PutRope[feedBack, "\n"]];
+lastState ¨ state;
+Process.Pause[Process.SecondsToTicks[1]];
+ENDLOOP;
+};
+
+AttachErrorLog: PUBLIC PROC [sourceFileName: ROPE] = {
+viewer: Viewer ¨ FindFileViewer[sourceFileName];
+IF viewer # NIL THEN {
+AppendMenuEntry[viewer, "ErrorLog", OpenErrorLog];
+SetIcon[viewer: viewer, from: document, to: needsToBeCompiled]};
+};
+
+RemoveErrorLog: PUBLIC PROC [sourceFileName: ROPE] = {
+errlogName: ROPE;
+errlog: Viewer;
+viewer: Viewer ¨ FindFileViewer[sourceFileName];
+IF viewer # NIL THEN {
+RemoveMenuEntry[viewer, "ErrorLog"];
+SetIcon[viewer: viewer, from: needsToBeCompiled, to: document];
+};
+errlogName ¨ ErrorLogName[sourceFileName];
+WHILE (errlog ¨ FindFileViewer[errlogName]) # NIL DO
+ViewerOps.DestroyViewer[errlog];
+ENDLOOP;
+};
+
+AppendMenuEntry: PROC [viewer: Viewer, name: ROPE, proc: Menus.ClickProc] = {
+FOR v: Viewer ¨ viewer, v.link WHILE v # NIL DO
+entry: Menus.MenuEntry ¨ Menus.FindEntry[v.menu, name];
+IF entry = NIL THEN {
+entry ¨ Menus.CreateEntry[name: name, proc: proc, fork: FALSE];
+Menus.AppendMenuEntry[menu: v.menu, line: 0, entry: entry];
+IF NOT v.iconic THEN ViewerOps.PaintViewer[v, menu];
+};
+IF v.link = viewer THEN EXIT;
+ENDLOOP;
+};
+
+RemoveMenuEntry: PROC [viewer: Viewer, name: ROPE] = {
+FOR v: Viewer ¨ viewer, v.link WHILE v # NIL DO
+entry: Menus.MenuEntry ¨ Menus.FindEntry[v.menu, name];
+IF entry # NIL THEN {
+Menus.ReplaceMenuEntry[v.menu, entry]; -- deletes it
+IF NOT v.iconic THEN ViewerOps.PaintViewer[v, menu];
+};
+IF v.link = viewer THEN EXIT;
+ENDLOOP;
+};
+
+OpenErrorLog: Menus.ClickProc = {
+log: Viewer;
+procList: LIST OF ProcListItem;
+viewer: Viewer = NARROW[parent];
+name: ROPE = ErrorLogName[viewer.name];
+repeat: BOOLEAN;
+
+log ¨ FindFileViewer[name];
+IF log = NIL 
+THEN log ¨ CreateLog[name, typescript, FALSE]
+ELSE IF log.iconic 
+THEN ViewerOps.OpenIcon[log]
+ELSE {
+FOR v: ViewerClasses.Viewer ¨ parent, v.link UNTIL v = NIL DO
+[found: repeat] ¨ RefTab.Fetch[viewerTable, v];
+IF repeat OR v.link = parent THEN EXIT;
+ENDLOOP;
+procList ¨ GetProcList[];
+FOR left: LIST OF ProcListItem ¨ procList, left.rest UNTIL left =NIL DO
+left.first.proc[log, repeat, left.first.data, parent, mouseButton, shift, control];
+ENDLOOP;
+[] ¨ RefTab.Store[viewerTable, parent, parent];
+}
+};
+
+RegisterErrorLogProc: PUBLIC PROC[proc: ErrorLogProc, clientData: REF ANY] = {
+item: ProcListItem;
+
+item ¨ NEW[ProcListItemRec];
+item.proc ¨ proc;
+item.data ¨ clientData;
+procList ¨ CONS[item, procList];
+};
+
+UnregisterErrorLogProc: PUBLIC PROC[proc: ErrorLogProc] = {
+prev: LIST OF ProcListItem;
+
+IF procList.first.proc = proc THEN
+procList ¨ procList.rest
+ELSE {
+prev ¨ procList;
+FOR left: LIST OF ProcListItem ¨ procList.rest, left.rest UNTIL left = NIL DO
+IF left.first.proc = proc THEN {
+prev.rest ¨ left.rest;
+EXIT;
+};
+prev ¨ prev.rest;
+ENDLOOP;
+};
+};
+
+GetProcList: PUBLIC PROC RETURNS [LIST OF ProcListItem] = {RETURN [procList];};
+
+ErrorLogName: PROC [file: ROPE] RETURNS [errlog: ROPE] = {
+pos: INT ¨ Rope.Length[file];
+WHILE (pos ¨ pos - 1) > 0 DO
+SELECT Rope.Fetch[file, pos] FROM
+'. => RETURN [Rope.Replace[base: file, start: pos+1, with: "errlog"]];
+'>, '], '/ => EXIT;
+ENDCASE;
+ENDLOOP;
+RETURN [Rope.Concat[file, ".errlog"]];
+};
+
+FindFileViewer: PROC [file: ROPE] RETURNS [viewer: Viewer] = {
+FindViewer: ViewerOps.EnumProc = {
+IF v.class # NIL AND v.class.flavor = $Text AND Rope.Run[s1: v.file, s2: file, case: FALSE] = file.Length THEN {
+viewer ¨ v;
+RETURN [FALSE];
+};
+RETURN [TRUE];
+};
+file ¨ ExpandName[file];
+ViewerOps.EnumerateViewers[FindViewer];
+RETURN};
+
+CreateLog: PROC [fileName: ROPE, icon: Icons.IconFlavor, iconic: BOOL]
+RETURNS [viewer: Viewer] = {
+fullFName: ROPE ~ ResolveName[fileName];
+IF fullFName=NIL THEN {
+MessageWindow.Append[Rope.Concat[fileName, " does not exist."], TRUE];
+RETURN;
+};
+IF iconic
+THEN {
+viewer ¨ ViewerOps.CreateViewer[flavor: $Text, info: [name: fullFName, file: fullFName, iconic: iconic, icon: icon]];
+IF viewer # NIL THEN TiogaMenuOps.DefaultMenus[viewer];
+}
+ELSE {
+viewer ¨ TiogaMenuOps.Open[fileName];
+IF viewer # NIL THEN viewer.icon ¨ icon;
+}; 
+};
+
+SetContents: PROC [viewer: Viewer, fileName: ROPE, icon: Icons.IconFlavor, iconic: BOOL]
+RETURNS [Viewer] = {
+fullFName: ROPE ~ ResolveName[fileName];
+IF fullFName=NIL THEN {
+MessageWindow.Append[Rope.Concat[fileName, " does not exist."], TRUE];
+ViewerOps.DestroyViewer[viewer];
+RETURN [NIL];
+};
+IF Rope.Equal[fullFName, viewer.file, FALSE] THEN RETURN [viewer];
+IF iconic AND viewer.iconic
+THEN {
+ViewerOps.DestroyViewer[viewer: viewer];
+viewer ¨ ViewerOps.CreateViewer[flavor: $Text, info: [name: fullFName, file: fullFName, iconic: iconic, icon: icon]];
+IF viewer # NIL THEN TiogaMenuOps.DefaultMenus[viewer];
+RETURN [viewer];
+}
+ELSE {
+TiogaMenuOps.Load[viewer, IF iconic THEN fullFName ELSE fileName];
+RETURN [viewer];
+}; 
+};
+
+ResolveName: PROC [fileName: ROPE] RETURNS [fullFName: ROPE --NIL if file doesn't exist; otherwise has version--] ~ {
+bytes: INT ¨ -1;
+fullFNamePath: PFS.PATH;
+[fullFName: fullFNamePath, bytes: bytes] ¨ PFS.FileInfo[PFSCanonicalNames.ParseName[fileName] ! PFS.Error => CONTINUE];
+RETURN [IF bytes >= 0 THEN PFSCanonicalNames.UnparseName[fullFNamePath] ELSE NIL];
+};
+
+ExpandName: PROC [fileName: ROPE] RETURNS [fullFileName: ROPE] =
+BEGIN
+RETURN [PFSCanonicalNames.UnparseName[PFS.AbsoluteName[PFSCanonicalNames.ParseName[fileName]]]];
+END;
+
+SetIcon: PROC [viewer: Viewer, from, to: Icons.IconFlavor] = {
+IF to = unInit THEN RETURN;
+FOR v: Viewer ¨ viewer, v.link WHILE v # NIL DO
+IF from = unInit OR v.icon = from THEN IF v.icon # to THEN {
+v.icon ¨ to;
+IF v.iconic THEN ViewerOps.PaintViewer[v, all];
+};
+IF v.link = viewer THEN EXIT;
+ENDLOOP;
+};
+
+CheckViewer: PROC [viewer: Viewer] RETURNS [ViewerSaveStatus] = { 
+IF viewer # NIL AND NOT viewer.destroyed THEN {
+v: Viewer ¨ viewer;
+IF viewer.saveInProgress THEN RETURN [saving];
+WHILE (v ¨ v.link) # NIL AND (v # viewer) DO
+IF v.saveInProgress THEN RETURN [saving];
+ENDLOOP;
+IF viewer.newVersion THEN RETURN [new];
+RETURN [old];
+};
+RETURN [none];
+};
+
+procList: LIST OF ProcListItem;
+viewerTable: RefTab.Ref;
+needsToBeCompiled: Icons.IconFlavor ¨ document;
+{
+viewerTable ¨ RefTab.Create[];
+procList ¨ NIL;
+};
+END.
+
+   p  
+FileViewerOpsImpl.mesa
+Copyright ” 1984, 1985, 1986, 1987, 1991 by Xerox Corporation.  All rights reserved.
+Bob Hagmann February 6, 1985 8:20:38 am PST
+Russ Atkinson (RRA) March 10, 1987 10:39:35 am PST
+Last tweaked by Mike Spreitzer on February 16, 1988 8:57:02 am PST
+David Goldberg April 27, 1989 6:48:23 pm PDT
+Theimer, March 13, 1990 10:28 pm PST
+Michael Plass, September 30, 1991 4:29 pm PDT
+Willie-s, October 31, 1991 1:00 pm PST
+
+A fresh compile occured, so remove viewer and all its splits from table
+[v: Viewer] RETURNS [BOOL _ TRUE]
+PROC[parent: ViewerClasses.Viewer, clientData: REF ANY _ NIL, mouseButton: ViewerClasses.MouseButton _ red, shift: BOOL _ FALSE, control: BOOL _ FALSE]
+icon: Icons.IconFlavor;
+icon _ Icons.NewIconFromFile["InterpreterTool.icons", 6
+! FS.Error => GO TO noGood];
+IF icon # unInit THEN needsToBeCompiled _ icon;
+EXITS noGood => {};
+ù ù  ñ(cedarcode) styleïNewlineDelimiter
+ô codeôKöú
+œeúIôTKô+Kô2KôBKô,Kô$Kô-Kô&Kô öœk	ò	KöúûúòKöúûòKöûúòKöúòKöûúûúûúûúò'Köúûú`òkKöúûú
+òKòKöúòKöúûú(ò5Köúûú%ò1Köúûú6ûúòSKöúûúò.Köúûú
+òKöú
+ûú]òlóóheadöúûúûò Köûúûú_òiöûú%ò,Köúûúûúò#óKò KöûúûúûúòKöûúûúûúûúòKöúûúò$Köúûúò2Kò óöœnúûúûúûúûúûúûúûúûúòzKöú;ò;KöúGôGöûúûúûúûò2Köú#ò#Köûúûúûúò KöûúòóöûúòKöûúûúûúûú$òAöûúòöúûúûúûò)Köú"ûúò<Köúûúò9Köú ûúòAKöûúòóöûúûòKöûú4ò8KöûúBòFóKö
+ûúûúûúûúûú!ò_óóKòKò óö
+üúûúûúûúûúò6KöûúFòLKò óöüúûúûúûúûúûúòHKöú#ò#Köúûú0ò@Kö
+ûúûúûúûúûúò+öûòKöúòKöúûúûúòïStartOfExpansion3 -- [v: ViewerClasses.Viewer] RETURNS [BOOL _ TRUE]ò"Kö–ckú†ô!Köûú"ûúûúûúòEKöúòKöúòöûúûòKöú ûúûúò0KöûúûúûúòóKòóKöúòKöúòKöúûúòKò'KöûúûúûúûúòJöûúûòKöúûúòKöúòKöúûú:òCKöú
+ûú5òAKöûúûúòóKöúûúûúò?KòKöú)ò)KöûúòóKòKò óöüúûúûúûúò6Köú0ò0öûú
+ûúûúòKöú2ò2Kò@óKòKò óöüúûúûúûúò6KöúûúòKòKöú0ò0öûú
+ûúûúòKöú$ò$Kò?KòóKöú*ò*öûú)ûúûò4Köú ò KöûúòóKòKò óöüúûúûúòMöûúûúûúûò/Köú7ò7öûú	ûúûúòKöú8ûúò?Köú;ò;Köûúûú
+ûú ò4KòóKöûúûúûúòKöûúòóKòKò óöüúûúûúò6öûúûúûúûò/Köú7ò7öûú	ûúûúòKöú'œcò4Köûúûú
+ûú ò4KòóKöûúûúûúòKöûúòóKòKò óñó -- [parent: ViewerClasses.Viewer, clientData: REF ANY _ NIL, mouseButton: ViewerClasses.MouseButton _ red, shift: BOOL _ FALSE, control: BOOL _ FALSE]öüúò!KöúóôóKòKöú
+ûúûúòKöúûú	ò Köúûúò'KöúûúòKò KöúòöûúûúòKöûú#ûúò-öûúûúòKöûúòöûúòöûú*ûúûúûò=Köú/ò/Köûúûúûúûúò'KöûúòóKöúòöûúûúûú$ûúûúûòGKòSKöûúòóKöú/ò/KöúòóóóKòKò óöüúûú!ûúûúòNKöúòKò KöúûúòKòKòKöúûúò KöúòKò óöüúûúò;KöúûúûúòKò öûúûò"KòóöûòKöúòöûúûúûú)ûúûúûòMöûúûúò KöúòKöûúòKöúòóKöúòKöûúòóKòóKöúòKò óKöüúûúûúûúûúûúûúòOKò ö
+üúûúûúûú
+ûúò:Köúûúòöûúûòöûúûò!Köúûú:òFKöúûúòKöûúòóKöûúòóKöûú ò&KöúòKò óöüúûúûúûúò>öü
+úò"öûúûúûúûú&ûúûúòpKöúòKöûúûúòKöúòóKöûúûúòKòóKöúòKò'KöûúòKò óö
+ü	úûúûú"ûúûúòcKöúûúò(öûúûúûúòKöú@ûúòFKöûòKöúòóöûúò	öûúòKöúuòuKöûú
+ûúûú#ò7KòóöûúòKöú%ò%Köûú
+ûúûúò(KöúòóóKòKò óö
+üúûúûú"ûúûúòmKöúûúò(öûúûúûúòKöú@ûúòFKöú ò KöûúûúòKöúòóKöûú$ûúûúûú
+òBöûúûúòöûúòKöú(ò(KöúuòuKöûú
+ûúûú#ò7Köûú
+òKòóöûúòKöúûúûúûúòBKöûú
+òKöúòóóKòKò óöüúûúûúûúûú°4úòuKöúûúòKöúûúûòKöú+ûú2ûú
+ûúòwKö
+ûúûúûú.ûúûúòRKòóKò ö
+ü
+úûúûúûúûúò@KöûòKöûúZò`KöûúòKò óöüúûú0ò>Köûúûúûúòöûúûúûúûò/ö
+ûúûúûúûúûúò<KöúòKöûú
+ûúò/KöúòóKöûúûúûúòKöûúòóKòKò óöüúûúûúòBö
+ûú
+ûúûúûúûúò/KöúòKöûúûúûú
+ò.öûúûúûúûò,Köûúûúûú
+ò)KöûúòóKöûúûúûúò'KöûúòKòóKöûúòKòKò óKöú
+ûúûúòKöúòKöú/ò/òKöúôKöúòKöúûúòöú7ô7Köúûú
+ûúûú	ôóKöûúûúô/KöûúôKòóKöûúòKò ó Öó    #Ü  4ì  

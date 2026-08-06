@@ -1,0 +1,505 @@
+DIRECTORY
+BasicTime USING [GetClockPulses, MicrosecondsToPulses, Pulses, PulsesToMicroseconds ],
+Convert USING [RopeFromInt],
+FinchSmarts USING [RegisterForReports, ReportConversationStateProc, ReportRequestStateProc],
+MessageWindow USING [Append, Blink ],
+Process USING [Detach, MsecToTicks, Pause, Priority, priorityRealTime, SetPriority ],
+Rope USING [Concat, ROPE ],
+TextEdit USING [GetCharProp, ReplaceByRope, PutCharProp, Size ],
+TextLooks USING [RopeToLooks ],
+TextNode USING [Ref],
+TiogaExtraOps USING [GetTextKey, PutTextKey, RemoveTextKey, TextKeyNotFound ],
+TiogaOps USING [CallWithLocks, CommandProc, FirstChild, GetSelection, NoSelection, Root, SelectionGrain, SetSelection, ViewerDoc ],
+TiogaOpsDefs USING [Location, Ref ],
+TiogaVoicePrivate USING [ ApplyToLockedChars, BuildVoiceViewer, ButtonParams, CancelPlayBack, DeleteVoiceFromChar, DescribeSelection, LockedAddCharMark, MakeVoiceEdited, PlayBackInProgress, RedrawViewer, ReplaceSelectionWithSavedInterval, Selection, SelectionRec, SelectionsAfterRedraw, SetParentViewer, SetPlayBackState, SetViewerContents, SetVoiceViewerEditStatus, SoundChars, SoundInterval, SoundIntervalRec, SoundList, SoundListFromIntervalSpecs, soundRopeCharLength, soundRopeCharsPerSecond, thrushHandle, VoiceViewerInfo, VoiceWindowRec ],
+ViewerClasses USING [MouseButton, Viewer ],
+ViewerOps USING [DestroyViewer, FetchProp],
+VoiceRope USING [DescribeRope, GetClientData, NB, NewRequestID, RecordNB, RequestID, StopNB, VoiceRope, VoiceRopeInterval ]
+;
+VoiceRecordImpl: CEDAR MONITOR
+IMPORTS BasicTime, Convert, FinchSmarts, MessageWindow, Process, Rope, TextEdit, TextLooks, TiogaExtraOps, TiogaOps, TiogaVoicePrivate, ViewerOps, VoiceRope EXPORTS TiogaVoicePrivate = {
+
+recordingState: RECORD [
+recordingInProgress: BOOLEAN ¨ FALSE,
+addingIntoTextViewer: BOOLEAN,
+node: TiogaOpsDefs.Ref,
+textViewer: ViewerClasses.Viewer,
+soundSelection: TiogaVoicePrivate.Selection,
+cueInsertPosition: INT, -- where the little arrows will go 
+timeInSoundChars: INT,
+requestID: VoiceRope.RequestID,
+nb: VoiceRope.NB,
+nextWakeUp: BasicTime.Pulses, -- clock for timing recording
+timerState: {off, quit, on},
+newRope: VoiceRope.VoiceRope
+];
+
+timerOff, recordingDone: CONDITION;
+
+RecordingInProgress: PUBLIC PROC RETURNS [BOOLEAN] = { 
+RETURN [recordingState.recordingInProgress] };
+CancelProc: PUBLIC TiogaOps.CommandProc = { 
+IF VoiceRope.StopNB[TiogaVoicePrivate.thrushHandle] # $success THEN {
+StopRecording[];
+TiogaVoicePrivate.CancelPlayBack[];
+};
+};
+
+AddVoiceProc: PUBLIC ENTRY TiogaOps.CommandProc = {
+buttonParams: TiogaVoicePrivate.ButtonParams ¨ NARROW[ViewerOps.FetchProp[viewer, $ButtonParams]];
+mouseButton: ViewerClasses.MouseButton ¨ IF buttonParams#NIL THEN buttonParams.mouseButton ELSE $red;
+IF recordingState.recordingInProgress THEN {
+BlinkMessageWindow["Already recording"];
+RETURN;
+};
+
+IF TiogaVoicePrivate.PlayBackInProgress[] THEN {
+BlinkMessageWindow["Cancel playback before trying to record"];
+RETURN;
+}; -- PlayBackInProgress is only a hint: to be sure we'll do a cancel to avoid race conditions
+TiogaVoicePrivate.CancelPlayBack[];
+
+IF ~PrepareSelection[] THEN RETURN;
+
+StartRecording[mouseButton = $red];
+};
+PrepareSelection: INTERNAL PROC RETURNS [succeeded: BOOLEAN ¨ FALSE] = {
+targetViewer: ViewerClasses.Viewer;
+targetStart, targetEnd: TiogaOpsDefs.Location;
+targetCaretBefore, targetPendingDelete: BOOLEAN;
+
+alreadyBeingEdited: BOOLEAN ¨ FALSE;
+alreadyVoiceThere: BOOLEAN ¨ FALSE;
+suitableViewer: BOOLEAN;
+
+DoIt: INTERNAL PROC [root: TiogaOpsDefs.Ref] = {
+level: TiogaOps.SelectionGrain;
+
+[viewer: targetViewer, start: targetStart, end: targetEnd, caretBefore: targetCaretBefore, pendingDelete: targetPendingDelete, level: level] ¨ TiogaOps.GetSelection[];
+suitableViewer ¨ targetViewer.class.flavor = $Text;
+
+IF suitableViewer THEN {
+recordingState.addingIntoTextViewer ¨ ViewerOps.FetchProp[targetViewer, $voiceViewerInfo] = NIL;
+IF recordingState.addingIntoTextViewer THEN {
+targetChar: TiogaOpsDefs.Location ¨ IF targetCaretBefore THEN targetStart ELSE targetEnd;
+node: TextNode.Ref ¨ targetChar.node; -- just a type convertor
+IF targetPendingDelete THEN {
+TiogaVoicePrivate.ApplyToLockedChars[TiogaVoicePrivate.DeleteVoiceFromChar];
+TiogaOps.SetSelection[viewer: targetViewer, start: targetStart, end: targetEnd, level: level, caretBefore: targetCaretBefore,
+pendingDelete: FALSE, which: primary] -- simply makes not pending delete
+};
+IF TextEdit.Size[node] <= targetChar.where THEN
+targetChar.where ¨ MAX[targetChar.where-1, 0];
+alreadyVoiceThere ¨ TextEdit.GetCharProp[node, targetChar.where, $voice] # NIL;
+recordingState.node ¨ targetChar.node;
+recordingState.textViewer ¨ targetViewer;
+IF ~alreadyVoiceThere THEN TiogaExtraOps.PutTextKey[targetChar.node, targetChar.where, $recordingMark]
+}
+ELSE {
+[selection: recordingState.soundSelection, failed: alreadyBeingEdited]  ¨ TiogaVoicePrivate.DescribeSelection[which: primary, forceDelete: FALSE, returnSoundInterval: FALSE];
+IF alreadyBeingEdited THEN RETURN;
+IF recordingState.soundSelection.ropeInterval.length # 0 -- pending delete
+AND TiogaVoicePrivate.ReplaceSelectionWithSavedInterval[
+recordingState.soundSelection, NIL, FALSE].viewerDeleted 
+    THEN NewDictationWindow[]; -- this means "if applicable, do the pending delete. If that delete should reduce the window contents to zero it will disappear, so create a new one"
+recordingState.cueInsertPosition ¨ recordingState.soundSelection.ropeInterval.start/ TiogaVoicePrivate.soundRopeCharLength
+}
+}
+};  -- end of DoIt
+
+TiogaOps.CallWithLocks[DoIt ! TiogaOps.NoSelection => {suitableViewer ¨ FALSE; CONTINUE}];
+SELECT TRUE FROM
+NOT suitableViewer => BlinkMessageWindow["Make a selection in a Tioga viewer first"];
+alreadyBeingEdited => BlinkMessageWindow["Previous voice editing operation has yet to complete"];
+alreadyVoiceThere => BlinkMessageWindow["Cannot add sound on top of another sound"];
+ENDCASE => succeeded ¨ TRUE;
+};  -- end of PrepareSelection
+
+BlinkMessageWindow: PROC [r: Rope.ROPE] ~ {
+MessageWindow.Append[r, TRUE];
+MessageWindow.Blink[];
+};
+
+StartRecording: INTERNAL PROC[selfElseOther: BOOL¨TRUE] = {
+recordingState.recordingInProgress ¨ TRUE;
+recordingState.timerState ¨ off;
+recordingState.newRope ¨ NIL;
+recordingState.timeInSoundChars ¨ 0;
+recordingState.requestID ¨ VoiceRope.NewRequestID[];
+recordingState.nb ¨ $success;
+TRUSTED {Process.Detach[FORK RecordNewRope[selfElseOther]]};
+};
+
+RecordNewRope: PROC[selfElseOther: BOOL] = { 
+BroadcastRecordingDone: ENTRY PROC = { BROADCAST recordingDone }; -- keeps the compiler happy!
+
+[nb: recordingState.nb, voiceRope: recordingState.newRope] ¨ VoiceRope.RecordNB[handle: TiogaVoicePrivate.thrushHandle, requestID: recordingState.requestID, clientData: $TiogaVoice, selfElseOther: selfElseOther];
+SELECT recordingState.nb FROM
+$success, $noLength => BroadcastRecordingDone[];
+ENDCASE => StopRecording[];
+};
+
+RecordingTimer: PROC = {	
+aVeryLongTime: BasicTime.Pulses = BasicTime.MicrosecondsToPulses[300000000];
+cuePriority: Process.Priority = Process.priorityRealTime;
+Process.SetPriority[cuePriority]; 
+recordingState.nextWakeUp ¨ BasicTime.GetClockPulses[];
+recordingState.timerState ¨ on;
+
+DO
+now: BasicTime.Pulses ¨ BasicTime.GetClockPulses[];
+IF recordingState.nextWakeUp - now < aVeryLongTime -- so as to cope properly with wrap-around
+
+THEN Process.Pause[Process.MsecToTicks[BasicTime.PulsesToMicroseconds[ recordingState.nextWakeUp-now]/1000]];
+IF ~ IncrementRecordTimer[] THEN RETURN;
+ENDLOOP;
+};
+
+IncrementRecordTimer: ENTRY PROC RETURNS [stillRunning: BOOLEAN ¨ TRUE] = {
+IF recordingState.timerState # on THEN 
+{  recordingState.timerState ¨ off;
+BROADCAST timerOff;
+RETURN [FALSE]
+};
+
+recordingState.nextWakeUp ¨ recordingState.nextWakeUp + BasicTime.MicrosecondsToPulses[ 1000000/TiogaVoicePrivate.soundRopeCharsPerSecond];
+recordingState.timeInSoundChars ¨ recordingState.timeInSoundChars + 1;
+
+IF ~recordingState.addingIntoTextViewer THEN
+NewRecordingMarker[recordingState.soundSelection.viewer, recordingState.cueInsertPosition + recordingState.timeInSoundChars - 1];
+};
+
+NewRecordingMarker: INTERNAL PROC [viewer: ViewerClasses.Viewer, loc: INT] ~ {
+DoIt: PROC [root: TiogaOpsDefs.Ref] ~ {
+IF NOT viewer.newVersion THEN TiogaVoicePrivate.MakeVoiceEdited[viewer];
+[] ¨ TextEdit.ReplaceByRope[root: root, dest: TiogaOps.FirstChild[root], start: loc, len: 0, rope: ">",  looks: TextLooks.RopeToLooks["v"]];
+};
+TiogaOps.CallWithLocks[DoIt, TiogaOps.ViewerDoc[viewer]];
+};
+
+StopRecording: PUBLIC ENTRY PROC = {
+IF ~recordingState.recordingInProgress THEN RETURN;
+IF recordingState.timerState = on THEN recordingState.timerState ¨ quit;
+WHILE recordingState.newRope = NIL AND recordingState.nb = $success DO
+WAIT recordingDone
+ENDLOOP;
+WHILE recordingState.timerState # off DO WAIT timerOff ENDLOOP;
+
+recordingState.recordingInProgress ¨ FALSE;
+IF recordingState.addingIntoTextViewer THEN {
+badTarget: BOOLEAN ¨ FALSE;
+IF recordingState.newRope = NIL OR recordingState.newRope.length = 0 THEN
+BlinkMessageWindow["Zero length voice annotation - discarding"]
+ELSE {
+AddVoice: PROC [root: TiogaOpsDefs.Ref] = {
+TextEdit.PutCharProp[node, targetChar.where, $voice, recordingState.newRope.ropeID];
+TextEdit.PutCharProp[node, targetChar.where, $Artwork, NARROW["TalksBubble", Rope.ROPE]]; -- the NARROW prevents a REF TEXT being created
+};
+
+targetChar: TiogaOpsDefs.Location;
+node: TextNode.Ref;
+targetChar ¨ TiogaExtraOps.GetTextKey[recordingState.node, $recordingMark ! TiogaExtraOps.TextKeyNotFound => {badTarget ¨ TRUE; CONTINUE}];
+node ¨ targetChar.node; -- just a type convertor
+IF TextEdit.Size[node] <= targetChar.where OR badTarget 
+OR TextEdit.GetCharProp[node, targetChar.where, $voice] # NIL THEN { 
+voiceViewer: ViewerClasses.Viewer;
+[viewer: voiceViewer] ¨ TiogaVoicePrivate.BuildVoiceViewer[recordingState.newRope.ropeID, NIL, TRUE];
+TiogaVoicePrivate.MakeVoiceEdited[voiceViewer];
+BlinkMessageWindow["No character to add voice to; new voice viewer contains voice just recorded"];
+}
+ELSE {
+TiogaExtraOps.RemoveTextKey[recordingState.node, $recordingMark];
+TiogaOps.CallWithLocks[AddVoice, TiogaOps.Root[targetChar.node]];
+}
+}
+}
+ELSE IF recordingState.soundSelection.voiceViewerInfo.ropeInterval.ropeID = NIL THEN {
+IF recordingState.newRope = NIL OR recordingState.newRope.length = 0 THEN {
+BlinkMessageWindow["Zero length voice dictation - destroying window"];
+recordingState.soundSelection.voiceViewerInfo.editInProgress ¨ FALSE;
+ViewerOps.DestroyViewer[recordingState.soundSelection.viewer.parent]
+}
+ELSE {
+TiogaVoicePrivate.MakeVoiceEdited[recordingState.soundSelection.viewer];
+TiogaVoicePrivate.SetViewerContents[recordingState.soundSelection.viewer, recordingState.soundSelection.voiceViewerInfo, recordingState.newRope.ropeID, NIL, TRUE]
+} 
+}
+ELSE IF recordingState.newRope = NIL OR recordingState.newRope.length = 0 THEN {
+trueContents: Rope.ROPE ¨ TiogaVoicePrivate.SoundChars[recordingState.soundSelection.voiceViewerInfo].soundRope;
+MessageWindow.Append["Zero length voice addition - viewer contents unchanged", TRUE];
+[] ¨ TiogaVoicePrivate.RedrawViewer[recordingState.soundSelection.viewer, trueContents, 0, 0, 0, recordingState.soundSelection.voiceViewerInfo.remnant, FALSE, deSelected];
+TiogaVoicePrivate.SetVoiceViewerEditStatus[recordingState.soundSelection.viewer];
+recordingState.soundSelection.voiceViewerInfo.editInProgress ¨ FALSE
+}
+ELSE {
+newSoundList: TiogaVoicePrivate.SoundList ¨ TiogaVoicePrivate.SoundListFromIntervalSpecs [VoiceRope.DescribeRope[TiogaVoicePrivate.thrushHandle, recordingState.newRope], recordingState.newRope.length];
+newSound: TiogaVoicePrivate.SoundInterval ¨ NEW [TiogaVoicePrivate.SoundIntervalRec ¨ [ropeInterval: recordingState.newRope≠, soundList: newSoundList]]; 
+recordingState.soundSelection.ropeInterval.length ¨ 0;
+TiogaVoicePrivate.MakeVoiceEdited[recordingState.soundSelection.viewer];
+[] ¨ TiogaVoicePrivate.ReplaceSelectionWithSavedInterval[recordingState.soundSelection, newSound, TRUE];
+recordingState.soundSelection.voiceViewerInfo.editInProgress ¨ FALSE
+} 
+};
+NewDictationWindow: INTERNAL PROC = { 
+recordingState.addingIntoTextViewer ¨ FALSE;
+recordingState.soundSelection ¨ NEW [TiogaVoicePrivate.SelectionRec];
+[viewerInfo: recordingState.soundSelection.voiceViewerInfo, viewer: recordingState.soundSelection.viewer] ¨ TiogaVoicePrivate.BuildVoiceViewer[NIL, NIL, TRUE];
+recordingState.cueInsertPosition ¨ 1
+};
+
+
+DictationMachine: PUBLIC ENTRY TiogaOps.CommandProc = {
+
+IF recordingState.recordingInProgress THEN 
+{  ChangeVoiceInputFocus[]; -- the non-trivial case - recording in progress
+RETURN
+};
+
+IF TiogaVoicePrivate.PlayBackInProgress[] THEN {
+BlinkMessageWindow["Cancel playback before trying to record"];
+RETURN
+}; -- PlayBackInProgress is only a hint: to be sure we'll do a cancel to avoid race conditions
+TiogaVoicePrivate.CancelPlayBack[];
+
+NewDictationWindow[];
+StartRecording[];
+};
+
+ChangeVoiceInputFocus: INTERNAL PROC = {
+IF ~recordingState.addingIntoTextViewer THEN
+{  IF recordingState.soundSelection.voiceViewerInfo.ropeInterval.ropeID = NIL THEN
+{  BlinkMessageWindow["You're already using a dictation viewer."];
+RETURN
+};
+
+TiogaVoicePrivate.LockedAddCharMark[recordingState.soundSelection.viewer, MAX [recordingState.soundSelection.ropeInterval.start/TiogaVoicePrivate.soundRopeCharLength-1, 0]];
+MessageWindow.Append["Marker set where you were inserting voice", TRUE];
+recordingState.soundSelection.voiceViewerInfo.editInProgress ¨ FALSE
+};
+
+{  currentContents: Rope.ROPE ¨ " ";
+wasIntoText: BOOLEAN ¨ recordingState.addingIntoTextViewer; -- gets altered by NewDictationWindow 
+NewDictationWindow[]; -- that's an empty one: set its contents to reflect the sound already recorded
+	
+IF wasIntoText THEN
+{
+AddVoiceWindowMarker: PROC [root: TiogaOpsDefs.Ref] = {
+alreadyEdited: BOOLEAN ¨ recordingState.textViewer.newVersion;
+TextEdit.PutCharProp[node, targetChar.where, $Artwork, NARROW["TalksBubble", Rope.ROPE]]; -- the NARROW prevents a REF TEXT being created
+TextEdit.PutCharProp[node, targetChar.where, $voiceWindow, NEW[TiogaVoicePrivate.VoiceWindowRec ¨ [label: Rope.Concat["Sound Viewer #", Convert.RopeFromInt[recordingState.soundSelection.voiceViewerInfo.viewerNumber]]]]];
+TiogaVoicePrivate.SetParentViewer[recordingState.soundSelection.voiceViewerInfo, recordingState.textViewer, targetChar];
+
+};
+
+targetChar: TiogaOpsDefs.Location ¨ TiogaExtraOps.GetTextKey[recordingState.node, $recordingMark];
+node: TextNode.Ref ¨ targetChar.node; -- just a type convertor
+IF recordingState.node # targetChar.node THEN ERROR; -- **** because you've caught all those !!!
+TiogaExtraOps.RemoveTextKey[recordingState.node, $recordingMark];
+IF TextEdit.GetCharProp[node, targetChar.where, $voice] # NIL THEN RETURN; -- can happen - a store might have been performed in the intervening time
+IF TextEdit.GetCharProp[node, targetChar.where, $voiceWindow] # NIL THEN RETURN; 
+TiogaOps.CallWithLocks[AddVoiceWindowMarker, TiogaOps.Root[targetChar.node]] -- called locked because otherwise Tioga doesn't immediately repaint the artwork, also so we can muck with the 'edited' status of the viewer
+};
+
+FOR i: INT IN [1..recordingState.timeInSoundChars] DO currentContents ¨ currentContents.Concat[">"] ENDLOOP;
+currentContents ¨ currentContents.Concat[" "];
+[] ¨ TiogaVoicePrivate.RedrawViewer[recordingState.soundSelection.viewer, currentContents, 0, 0, 0, 0, FALSE, deSelected]
+}
+};
+
+RecordInPlaceOfSelection: PUBLIC ENTRY PROC [selection: TiogaVoicePrivate.Selection] = {
+recordingState.soundSelection ¨ selection;
+recordingState.addingIntoTextViewer ¨ FALSE;
+
+IF recordingState.soundSelection.ropeInterval.length # 0 THEN -- i.e. pending delete
+IF TiogaVoicePrivate.ReplaceSelectionWithSavedInterval
+[recordingState.soundSelection, NIL, FALSE].viewerDeleted THEN
+NewDictationWindow[]; -- this means "if applicable, do the pending delete. If that delete should reduce the window contents to zero it will disappear, so create a new one"
+
+recordingState.cueInsertPosition ¨ recordingState.soundSelection.ropeInterval.start/TiogaVoicePrivate.soundRopeCharLength;
+StartRecording[];
+};
+
+ForkStopRecording: PROC = {TRUSTED {Process.Detach[FORK StopRecording[]]} };
+ConversationReport: FinchSmarts.ReportConversationStateProc ~ {
+IF cDesc = NIL THEN-- RETURN;
+IF NARROW[VoiceRope.GetClientData[handle: TiogaVoicePrivate.thrushHandle, cDesc: cDesc], ATOM] = $TiogaVoice THEN
+SELECT cDesc.situation.self.state FROM
+$active => NULL;
+$idle, $neverWas, $failed => {
+TiogaVoicePrivate.CancelPlayBack[];
+ForkStopRecording[];
+};
+ENDCASE;
+};
+
+RequestReport: FinchSmarts.ReportRequestStateProc ~ {
+betterActionRequest ¨ actionRequest;
+IF cDesc = NIL THEN RETURN;
+IF NARROW[VoiceRope.GetClientData[handle: TiogaVoicePrivate.thrushHandle, cDesc: cDesc], ATOM] = $TiogaVoice THEN
+SELECT actionReport.actionClass FROM
+$recording => { 
+IF actionReport.actionID = recordingState.requestID THEN 
+SELECT actionReport.actionType FROM
+$scheduled => NULL;
+$started => TRUSTED {Process.Detach[FORK RecordingTimer[]]};
+$finished, $flushed => ForkStopRecording[];
+
+ENDCASE;
+};
+$playback => { 
+SELECT actionReport.actionType FROM
+$scheduled => RETURN;
+$started => TiogaVoicePrivate.SetPlayBackState[actionReport.actionID, busy];
+$finished, $flushed => TiogaVoicePrivate.SetPlayBackState[actionReport.actionID, done];
+
+$paused => TiogaVoicePrivate.SetPlayBackState[actionReport.actionID, paused];
+$resumed => TiogaVoicePrivate.SetPlayBackState[actionReport.actionID,
+ resumed];
+ENDCASE;
+};
+ENDCASE;
+betterActionRequest ¨ actionRequest; -- a place to stand during debugging
+};
+
+FinchSmarts.RegisterForReports[key: $TiogaVoice, c: ConversationReport, r: RequestReport, other: $VoiceRope, before: FALSE];
+
+}.
+
+  )x  
+VoiceRecordImpl.mesa
+Copyright ” 1987, 1992 by Xerox Corporation.  All rights reserved.
+Ades, September 24, 1986 5:11:21 pm PDT
+Swinehart, June 7, 1992 9:39 am PDT
+Polle Zellweger (PTZ) September 12, 1988 8:39:59 pm PDT
+Venkat Rangan November 4, 1989 4:36:44 pm PST
+
+basic code to add voice to windows of both text and voice, also the DictationMachine button which transfers input from a current window to a newly created dictation window 
+
+the selection where the voice is to be added, as a TiogaOps node: a text key gives the position within the node but that is implicitly represented by the atom $recordingMark
+the selection where the voice is to be added, as a TiogaOps node: a text key gives the position within the node but that is implicitly represented by the atom $recordingMark
+the viewer where the voice is to be added, if a text viewer
+the selection where the voice is to be added, as a TiogaVoicePrivate selection
+how long has the recording been going on, in terms of sound characters generated
+the rope that is created as the result of this recording process
+
+PROC [viewer: Viewer _ NIL] RETURNS [recordAtom: BOOL _ TRUE, quit: BOOL _ FALSE]; viewer prop $ButtonParams = TiogaVoicePrivate.ButtonParams
+Otherwise these shouldn't be needed - $finished reports should clear recording/playback queues automatically.
+PROC [viewer: Viewer _ NIL] RETURNS [recordAtom: BOOL _ TRUE, quit: BOOL _ FALSE]; viewer prop $ButtonParams = TiogaVoicePrivate.ButtonParams
+the procedure behind all AddVoice buttons
+
+this procedure locks the selection and fills in the TiogaOps target info above. If the selection is a voice selection then recordingState.soundSelection is set up. If the selection is text then a text key is placed in the text. If the selection is pending delete then the delete is done. If the selection is a voice selection then the viewer is locked [against other voice edits]
+point selection with no following char, try preceding char if there is one
+recordingState.cueInsertPosition _ MIN [targetSoundSelection.ropeInterval.start/TiogaVoicePrivate.soundRopeCharLength, TextEdit.Size[TiogaOps.FirstChild[TiogaOps.ViewerDoc[targetSoundSelection.viewer]]]-1] -- because you can't position the cursor as a point after the last character
+test for failure conditions and report them to the user after releasing the viewer lock
+
+Fork process to call VoiceRope.RecordNB. It will return when a VoiceRope.StopNB occurs.  It will then place the ID of the Rope in the appropriate state variable, where the routine called when the $finished report is received can get it.
+Process to time the recording will be forked when the $started report is received, and will be terminated when the $finished report is received or the conversation fails.
+
+something failed in conversation or recording setup; guaranteed not to WAIT for recordingDone This control mechanism is pretty kludgy
+see comments in VoicePlayBackImpl on this constant
+try to keep this process up to time: however there is compensation for delay in each wake-up by looking at a real time clock; see below
+
+this code adds another marker into a voice viewer to indicate how much has been recorded
+Note: all voice viewers contain only one node.
+'> is used as an 'inserting voice' indicator
+this gets called every time a STOP button is clicked, after VoiceRope.StopNB has been called
+next line places a 'talks bubble' on the selected character - see TalksBubbleImpl
+A store might have been performed in the intervening time, or there might be just a point selection at the end of some node.
+Called locked because otherwise Tioga doesn't immediately repaint the artwork
+This is a new dictation window, so just set its contents to the new rope
+just making sure; so the old voice viewer will allow itself to be destroyed
+this will cause the event proc which clears down the voiceViewerInfo etc. to be called
+Shouldn't be needed - should have already been done while recording the new rope.
+If the new rope to be added is of zero length then just redraw the viewer
+This will always say edited now, because we make the voice viewer edited in NewRecordingMarker when we put the first '> character in
+This may already be the case, but if not we already did the delete before starting to record, so set it zero. If we did the delete then recordingState.soundSelection.ropeInterval will not bear the correct ropeID but recordingState.soundSelection.voiceViewerInfo will and that is the ropeID which is used
+Shouldn't be needed - should have already been done while recording the new rope.
+
+Creates a new dictation window and sets recordingState.soundSelection up correctly to refer to it, also sets recordingState.addingIntoTextViewer false
+BuildVoiceViewer[NIL] will set the voiceRope represented by the rope to NIL, the test used for a currently 'empty' viewer in StopRecording above
+Dictation machine creation stuff [the previous procedure is a general one for creating window with no voice in it]:
+PROC [viewer: Viewer _ NIL] RETURNS [recordAtom: BOOL _ TRUE, quit: BOOL _ FALSE]; viewer prop $ButtonParams = TiogaVoicePrivate.ButtonParams
+the procedure behind all DictationMachine buttons: if a recording is in progress then transfer it into another [newly created] window, otherwise make a new window and start recording
+the rest of this procedure implements the case of DictationMachine bugged when no recording is in progress: create a new viewer and start recording into it
+DictationMachine was bugged when a recording was in progress: create a new voice viewer and alter the recording focus to it. In the case where recording into a voice viewer, leave a marker where the focus was. In the case where recording into a text viewer, place a VoiceWindow marker where the focus was. 
+this procedure not only sets the mark but also redraws the viewer, removing the voice input markers
+**** this is all a bit dubious - the pointer enables a SAVE of the voice to work, but if the text is SAVED before the voice is either saved or destroyed, the bubble will hang around without voice underneath it   **** no longer true, uses record
+
+this line places a 'talks bubble' on the selected character - see TalksBubbleImpl
+because we are under a Tioga lock, it is safe to muck with the 'edited' status of the viewer
+philosophically, putting a source marker in a voice viewer does not constitute editing it, so keep the 'edited' status of the viewer constant through this operation
+IF ~alreadyEdited THEN
+{  recordingState.textViewer.newVersion _ FALSE;
+ViewerOps.PaintViewer[recordingState.textViewer, caption, FALSE]
+}  -- not needed with container-based voice viewers: PTZ, January 12, 1988
+this gets called by TiogaVoicePrivate when a selection [possibly zero length, in which case don't delete it] is to be replaced by new voice input: the selection is assumed to be locked with GetVoiceLock and there is assumed to be no playback or recording in progress at the time of the call
+
+StopRecording may WAIT; don't want to hang up FinchSmarts reporting process
+
+[ nb: NB, cDesc: ConvDesc, remark: ROPE_NIL ]
+likely to be ours
+restore quiescent state: stop all cues, discard pending requests
+[ cDesc: ConvDesc, actionReport: Thrush.ActionReport, actionRequest: REF ] RETURNS [betterActionRequest: REF]
+likely to be ours
+Initialization
+
+Swinehart, April 10, 1987 9:38:29 am PDT
+Merged VoicePlayImpl and VoiceRecordImpl, from Ades. Fixed some nested ML problems resulting from merging two MONITORs.
+changes to: AddVoiceProc, DictationMachine, AbortCues, CancelPlayBack
+Polle Zellweger (PTZ) May 22, 1987 5:15:23 pm PDT
+Split back into VoicePlaybackImpl and VoiceRecordImpl: too many monitor lock difficulties to fix quickly.
+changes to: DIRECTORY, AddVoiceProc, DictationMachine
+Polle Zellweger (PTZ) June 15, 1987 4:24:18 pm PDT
+Avoid blowing up if the user has a point selection (or some other difficulty) at the end of recording; open a voice viewer on the voice rope to allow user to store elsewhere.
+changes to: DIRECTORY, StopRecording
+Polle Zellweger (PTZ) June 17, 1987 11:13:54 am PDT
+Notice when voice viewer has been edited & change icon.
+changes to: DIRECTORY, NewRecordingMarker, StopRecording
+Polle Zellweger (PTZ) July 17, 1987 6:24:28 pm PDT
+Register with FinchSmarts for request/connection reports; base timing of cues on reports; notice when conversation fails & clean up.
+changes to: DIRECTORY, timerState, AddVoiceProc, RecordNewRope, StopRecording, RecordInPlaceOfSelection
+new: recordingRequestID, recordingNB, convDesc, StartRecording, ConversationReport, RequestReport, initialization
+Polle Zellweger (PTZ) July 20, 1987 5:16:41 pm PDT
+More of the above.
+changes to: CancelProc, RequestReport, StartRecording, RecordNewRope, RecordInPlaceOfSelection, ConversationReport, DIRECTORY
+Polle Zellweger (PTZ) July 21, 1987 12:27:42 pm PDT
+Create recordingState record.
+changes to: recordingState, timerState, RecordingInProgress, AddVoiceProc, PrepareSelection, StartRecording, RecordNewRope, RecordingTimer, IncrementRecordTimer, StopRecording, AddVoice (local of StopRecording), NewDictationWindow, DictationMachine, ChangeVoiceInputFocus, AddVoiceWindowMarker (local of ChangeVoiceInputFocus), RecordInPlaceOfSelection, RequestReport, DIRECTORY, CancelProc, VoiceRecordImpl
+Polle Zellweger (PTZ) July 27, 1987 4:52:06 pm PDT
+changes to: DIRECTORY, VoiceRecordImpl, StartRecording, RecordNewRope, ForkStopRecording, ConversationReport, RequestReport, RecordingTimer, StopRecording
+Polle Zellweger (PTZ) July 27, 1987 5:25:56 pm PDT
+changes to: DictationMachine
+Polle Zellweger (PTZ) November 5, 1987 2:19:54 pm PST
+Interface to reporting seems to have changed: must return non-NIL actionRequest.
+changes to: RequestReport
+Polle Zellweger (PTZ) January 11, 1988 2:26:51 pm PST
+Remove ToggleDictationMenu (part of installing PopUpButtons)
+changes to: DIRECTORY, DictationMachine, ChangeVoiceInputFocus
+Polle Zellweger (PTZ) January 12, 1988 7:12:21 pm PST
+Make AddVoice act the same as the new Store (Store fix in VoiceInTextImpl).  Also random cleanup.
+changes to: DIRECTORY, PrepareSelection, DoIt (local of PrepareSelection), BlinkMessageWindow, ChangeVoiceInputFocus, AddVoiceWindowMarker (local of ChangeVoiceInputFocus)
+Polle Zellweger (PTZ) January 20, 1988 11:34:18 am PST
+Set editInProgress for old viewer FALSE so it can be destroyed; refer to outer container when destroying voice viewer.
+changes to: StopRecording
+Polle Zellweger (PTZ) September 12, 1988 8:39:59 pm PDT
+Changes to allow clients to alter button behaviors via Tioga registry (for WalnutTiogaVoice).
+changes to: DIRECTORY, CancelProc, AddVoiceProc, DictationMachine
+
+ ù …  ïNewlineDelimiter
+ñ(cedarcode) styleô öúôIcodeöú
+œeú7ôBJöú$œkô'Kô#Köúûú#ô7Kô-Kô óöû	ò	Köú
+ûúGòVKöúûúòKöúûúKò\Köúûúò%KöúûúHòUKöúûú
+ûúòKöú	ûú2ò@Köú
+ûúòKöú	ûúòKöúûú;òNKöú	ûúuòÉKöúûúò$Köúûúäò°Köúûúò+Köú
+ûúò+Köú
+ûúûúKò{Kòóö–blúûúûòKöûúñûúò∫óKò ô¨Jô óöúûúòKöúûúûúò%öúûúòJô≠óòJô≠óöú!ò!Jô;óöú,ò,JôNóKöúûúœc#ò;öúûúòJôPóKöúòKöúûúòKöú†ò;KòòJô@óòKò óóöúû	úò#Kò óö
+œnúûúûúûúûúò7Köûú(ò.Jô óö°
+úûúò,Köûúûúûúûúûúûúûú=ôçöûú<ûúòEKòKò#JômKòóKöúòKò óö°úûúûúò3Köûúûúûúûúûúûúûú=ôçJô)Köú/ûú-òbKö	ú)ûúûúûúûúòeöûú$ûúò,Köú(ò(KöûòKöúòóKò öûú(ûúò0Köú>ò>KöûòKöú†[ò^óKöú#ò#Kò Köûúûúûúò#Kò Köú#ò#KòJô óö°úûúûúûúûúûúòHJöú˚ô˚Köú#ò#Köú.ò.Köú(ûúò0Kò Köúûúûúò$Köúûúûúò#KöúûúòKò ö°úûúûúò0KöúòKò KòßKò3Kò öûúûúòKöú\ûúò`öûú%ûúò-Köú$ûúûúûúòYKöú&†ò>öûúûúòKöúLòLKöúçûú†"ò∆Kòóöûú)ûò/JöúJôJKöúûúò.óKöúKûúòOKò&Kò)KöûúûúLòfKöúòóöûúòKöúãûúûúòÆKöûúûúûúò"öûú6†òJKöûúUûúûúòrKöúûú†ïò¥óJöú#ûú®†LôöKòzKòóKòóKöú†òóKò KöúHûúûúòZJôWöûúûúûòKöûúRòUKöúaòaKöúTòTKöûúûúòóKöú†òKò óö°úûú
+ûúò+KöúûúòKöúòKòKò óö
+°úûúûúûúûúò;Köú%ûúò*Kò KöúûúòKò$Kò4KòJô JöúpûúzôÏJöú™ô™Jô Köûúûú ò<KòKò óö°úûúûúò-Kö	°úûúûúû	ú†ò^Kò Kò‘öûúûòKöú0ò0öûúòKöú^œtú'¢ôáóóKöúòKò óö°úûúòKöúLòLJô2Köú9ò9Köú"ò"KôàKò7KòKò öûòKò3Köûú1†*ò]Kò KöûúiòmKöûúûúûò(KöûòóKòKò óö°úûúûúûúûúûúòKKöûú ûúò'ò#Köû	ú
+òKöûúûúòóKòKò KòãKòFKò öûú&ûò,KöúÅòÅóKòKò óö°úûúûú%ûúòNKöúXôXö°úûúò'Kô.Köûúûúûú+òHòåKöú,ô,óKòóKöú9ò9KòKò óö°úûúûúûúò$Köúûú:ô\Köûú%ûúûúò3Köûú ûú"òHöûúûúûúûòFKöûúòKöûúòóKöûú!ûúûú
+ûúò?Kò Köú%ûúò+öûú%ûúò-Köúûúûúòöûúûúûú#ûòIKöú?ò?óöûúòö°úûúò+KöúTòTJôQKöú7ûúûú†/òâKòóKò Köú"ò"KöúòKöúzûúûúòãKöú†ò0ö
+ûú)ûúûú8ûúûúò~Jöú|ô|Köú"ò"KöúZûúûúòeKöú/ò/KöúbòbKòóöûúòKöúAòAöúAòAKöúMôMóKòóKòóKòóöûúûúEûúûúòVKöúHôHöûúûúûú#ûúòKKöúFòFöú?ûúòEJôKóKöúDòDJôVKòóöûúòöúHòHKôQóKöúòûúûúò¢KöúòóKòóö
+ûúûúûúûú#ûúòPKöúIôIKöúûúYòpKöúOûúòUKöúòûúò´öúQòQJö¢úÑ¢ôÜóKöú?ûòDKòóöûúòKò…Köú,ûújòôKò6KöúØôØöúHòHKôQóKöúbûúòhKöú?ûòDKòóKòJô óö°úûúûúò&KöúñôñKöú&ûúò,Köú ûú"òEKöúèûúûúûúòüKöúûú4ûúEôêKò$KòKò óöúsôsKò óö°úûúûúò7Köûúûúûúûúûúûúûú=ôçKöú∂ô∂Kò Köûú$ûúò+öú†/òKKöûòóKöúòKò Jöúõôõöûú(ûúò0Köú>ò>KöûòKöú†[ò^óKöú#ò#Kò KöúòKòKòKò óö°úûúûúò(Köú≤ô≤Köûú&ûò,öúûúEûúûòRöúBòBKöûòóKöúòKò KöúJûú`ò≠KôcKöúBûúòHKöú?ûòDóKòKò öúûúò$Köúûú(†&òbKöú†NòdKòKöûúûòòö°úûúò7Köú7ûú*ûúäôÙKô Köúûú(ò>JôQKöú7ûúûú†/òâKöú;ûúûò‹KöúxòxKò Jöú\ô\Jô§Jöûúûôöú*ûúô0Jöú:ûúô@óJôJóKòóò KòbKöú&†ò>Köûú'ûúûú†+ò`KöúAòAKö	ûú8ûúûúûú†IòîKöûú>ûúûúûúòQKöúM†åòŸóKòKò Kö
+ûúûúûú&ûú/ûúòlKò.KöúgûúòyóKòKòKò óö°úûúûúûú-òXKô¢Kò*Köú&ûúò,Kò öûú7ûú†òTöûúUûúûúûòuKöú†ïò´óóKò òzJô óKöúòKòKò óö°úûúûúûúòLJôKJô óö°ú-ò?Köúûúûúûúô-Köûú	ûúûúûúòöûúûúPûúûòqKöúôöûúûò&KöúûúòöúòJöú@ô@Köú#ò#KöúòKöúòóKöûúòóóKòKò óö°ú(ò5KöúEûúûúûúômKò$Köûú	ûúûúûúòöûúûúPûúûòqKöúôöûúûò$öúòöûú1ûúò9öûúûò#KöúûúòKöúûúûúò<Kò,KöûúòóóKòóöúòöûúûò#KöúûúòKöúLòLKòXKòMKòEóóò
+KöûúòKòóKöûúòóóKöú%†$òIKöúòKò óJöüôô Köúuûúò|óKò KòKò öú%ûô(KöúGûú.ôwKöúœr9ôEóöúûúûô1KöúiôiKöú–kr	£ ô5óöúûúô2KôÆKöú§	£ô$óöúûúô3Kô7Köú§	£#ô8óô2KôÑKöú§	£RôgKöú£lôqóô2KôKöú£qô}óô3KôKöú£≠ú£Sú!£Qôóóô2Köú£éôöóô2Köú£ôóô5KôPKöú£ôóô5Kô<Köú£2ô>óô5KôaKöú£!ú£Aú!ô´óô6KôvKöú£ôóô7Kô]Köú£5ôAóKô ó Öó    D“    

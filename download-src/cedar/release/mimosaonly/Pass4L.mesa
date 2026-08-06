@@ -1,0 +1,1250 @@
+
+DIRECTORY
+Alloc USING [Notifier],
+Basics USING [BITAND, BITLSHIFT, BITOR, BITRSHIFT, LowHalf],
+CompilerUtil USING [AppendMobUnits],
+MimData USING [bitsToAlignment, idANY, importCtx, interface, linkCount, nBodies, nSigCodes, switches, textIndex, wordAlignment],
+MimosaLog USING [ErrorSei, WarningSei],
+MimP4 USING [],
+MimZones USING [tempZone],
+MobDefs USING [Link, LinkFrag],
+Pass4Parms USING [links, localOverheadBits],
+SourceMap USING [Loc],
+Symbols USING [Alignment, Base, BitAddress, BitCount, BodyLink, bodyType, BTIndex, BTNull, CBTIndex, CSEIndex, CTXIndex, CTXNull, ctxType, ISEIndex, ISENull, lL, nullName, RecordSEIndex, RecordSENull, RootBti, SERecord, seType, Type, UNSPEC],
+SymbolOps USING [ArgCtx, ArgRecord, BitsForRange, Cardinality, DecodeBitAddr, DecodeCard, DecodeLink, DecodeTreeIndex, DecodeType, EncodeBitAddr, EncodeCard, EncodeInt, FirstCtxSe, LinkMode, MakeCtxSe, NextSe, own, PackedSize, RCType, SubString, SubStringForName, TypeForm, UnderType, XferMode],
+Target: TYPE MachineParms USING [Alignments, AlignmentIndex, bitsPerAU, bitsPerLongWord, bitsPerProc, bitsPerWord, logBitsPerAU, logBitsPerWord, PackedBitCount],
+Tree USING [Base, Index, Link, Scan, nullIndex, treeType],
+TreeOps USING [GetSe, ScanList, ToLoc];
+Pass4L: PROGRAM
+IMPORTS Basics, CompilerUtil, MimData, MimosaLog, MimZones, SymbolOps, TreeOps
+EXPORTS MimP4 = {
+OPEN Symbols, Target;
+
+checkMDRecords: BOOL ¨ TRUE;
+wordAlignRecords: BOOL ¨ TRUE;
+wordAlignFields: BOOL ¨ TRUE;
+padPackedArrays: BOOL ¨ FALSE;
+
+bitsPerWord: CARDINAL = Target.bitsPerWord;
+wordFill: CARDINAL = bitsPerWord-1;
+
+
+localOrigin: CARDINAL = Pass4Parms.localOverheadBits;
+localSlots: CARDINAL = 8;
+
+globalOrigin: CARDINAL = Pass4Parms.localOverheadBits;
+frameLimit: INT = LAST[INT];
+recordLimit: INT = LAST[INT];
+
+VarLink: TYPE = RECORD [
+SELECT kind: * FROM
+symbol => [index: ISEIndex],
+body => [index: CBTIndex],
+empty => [],
+ENDCASE];
+
+VarInfo: TYPE = RECORD [link: VarLink, key: CARD];
+VarInfoList: TYPE = RECORD [SEQUENCE length: NAT OF VarInfo];
+Profile: TYPE = REF VarInfoList;
+
+FieldWordCount: TYPE = BitCount;	-- should be reduced range
+maxFieldWordCount: FieldWordCount = recordLimit / bitsPerWord;
+VarScan: TYPE = PROC [sei: ISEIndex, output: BOOL];
+
+tb: Tree.Base ¨ NIL;	-- tree base (local copy)
+seb: Symbols.Base ¨ NIL;	-- se table base (local copy)
+ctxb: Symbols.Base ¨ NIL; -- context table base (local copy)
+bb: Symbols.Base ¨ NIL;	-- body table base (local copy)
+AssignEntries: PUBLIC PROC [rootBti: BTIndex] = {
+profile: Profile;
+bti: CBTIndex;
+AssignSlot: PROC [bti: CBTIndex] = {
+IF ~bb[bti].inline AND bb[bti].info.mark = Internal THEN {
+n: CARDINAL = BodyRefs[bti];
+profile[k].link ¨ [body[index: bti]];
+profile[k].key ¨ 0;
+bb[bti].frameOffset ¨ n;
+k ¨ k+1;
+};
+};
+i: NAT ¨ 1;
+k: NAT ¨ 0;
+nEntries: CARDINAL = MAX[MimData.nBodies, MimData.nSigCodes];
+profile ¨ AllocateProfile[MimData.nBodies];
+GenBodies[rootBti, AssignSlot];
+FOR j: NAT IN [0..k) DO
+bti ¨ NARROW[profile[j].link, VarLink.body].index;
+IF bti = RootBti
+THEN bb[bti].entryIndex ¨ 0
+ELSE {bb[bti].entryIndex ¨ i; i ¨ i+1};
+ENDLOOP;
+profile ¨ NIL;
+};
+
+AUsForType: PUBLIC PROC [type: Type] RETURNS [CARD] = {
+RETURN [Basics.BITRSHIFT[
+BitsForType[type]+(Target.bitsPerAU-1),
+Target.logBitsPerAU]];
+};
+
+BitsForType: PUBLIC PROC [type: Type] RETURNS [nBits: BitCount ¨ 0] = {
+sei: CSEIndex = SymbolOps.UnderType[SymbolOps.own, type];
+WITH se: seb[sei] SELECT FROM
+definition => nBits ¨ Target.bitsPerLongWord;
+basic => nBits ¨ se.length;
+real => nBits ¨ se.length;
+signed => nBits ¨ se.length;
+unsigned => nBits ¨ se.length;
+enumerated =>
+IF NOT se.empty THEN
+nBits ¨ SymbolOps.BitsForRange[SymbolOps.Cardinality[SymbolOps.own, sei]-1];
+ref => nBits ¨ se.length;
+transfer => nBits ¨ se.length;
+arraydesc => nBits ¨ se.length;
+relative => nBits ¨ BitsForType[se.offsetType];
+zone => nBits ¨ se.length;
+record => IF se.mark4 THEN nBits ¨ se.length ELSE GO TO oops;
+opaque => IF se.mark4 THEN nBits ¨ se.length ELSE GO TO oops;
+array => IF NOT se.mark4 THEN GO TO oops ELSE {
+n: CARD = SymbolOps.Cardinality[SymbolOps.own, se.indexType];
+b: BitCount ¨ BitsForType[se.componentType];
+IF b # 0 AND n # 0 THEN {
+IF se.packed AND b <= Target.PackedBitCount.LAST
+THEN b ¨ SymbolOps.PackedSize[b]
+ELSE b ¨ RoundUpBits[b];
+IF b <= 0 OR CARD[BitCount.LAST]/n < CARD[b] THEN GO TO oops;
+nBits ¨ n*b;
+IF padPackedArrays AND nBits > bitsPerWord THEN nBits ¨ RoundUpBits[nBits];
+};
+};
+subrange => 
+SELECT TRUE FROM
+NOT se.mark4 => GO TO oops;
+NOT se.filled => GO TO oops;
+NOT se.empty =>
+nBits ¨ SymbolOps.BitsForRange[SymbolOps.Cardinality[SymbolOps.own, sei]-1];
+ENDCASE;
+ENDCASE;
+EXITS oops => 
+MimosaLog.ErrorSei[typeLength,
+IF seb[type].seTag = id THEN LOOPHOLE[type, ISEIndex] ELSE ISENull];
+};
+
+CheckBlock: PUBLIC PROC [bti: BTIndex] = {
+CheckVar: VarScan = {
+saveIndex: SourceMap.Loc = MimData.textIndex;
+node: Tree.Index = SymbolOps.DecodeTreeIndex[seb[sei].idValue];
+IF node # Tree.nullIndex THEN {
+MimData.textIndex ¨ TreeOps.ToLoc[tb[node].info];
+IF SymbolOps.DecodeCard[seb[sei].idInfo] = 0 THEN
+MimosaLog.WarningSei[unusedId, sei];
+};
+MimData.textIndex ¨ saveIndex;
+};
+[] ¨ GenCtxVars[bb[bti].localCtx, CheckVar, FALSE, FALSE];
+};
+
+CheckFields: PUBLIC PROC [rSei: RecordSEIndex, origin: BitCount] = {
+InsertVar: VarScan = {
+vProfile[vI] ¨ [link: [symbol[sei]], key: BitOffset[sei]];
+vI ¨ vI+1;
+};
+b, newB: BitCount ¨ origin;
+sei, lastSei: ISEIndex ¨ ISENull;
+align: Alignment ¨ seb[rSei].align;
+alignBits: NAT = BitsForAlignment[align];
+profileLen: CARDINAL ¨ GenCtxVars[seb[rSei].fieldCtx, NIL, FALSE, FALSE];
+vProfile: Profile ¨ AllocateProfile[profileLen];
+vI: CARDINAL ¨ 0;
+[] ¨ GenCtxVars[seb[rSei].fieldCtx, InsertVar, FALSE, FALSE];
+SortProfile[vProfile];
+WHILE vI > 0 DO
+vI ¨ vI - 1;
+sei ¨ NARROW[vProfile[vI].link, VarLink.symbol].index;
+SELECT SymbolOps.TypeForm[SymbolOps.own, seb[sei].idType] FROM
+union => CheckVariants[sei];
+sequence => {
+IF vI # 0 THEN MimosaLog.ErrorSei[recordOverlap, sei];
+CheckSequence[sei];
+};
+ENDCASE;
+newB ¨ vProfile[vI].key;
+SELECT newB FROM
+> b => MimosaLog.ErrorSei[recordGap, lastSei];
+< b => IF BitLength[sei] # 0 THEN MimosaLog.ErrorSei[recordOverlap, sei];
+ENDCASE;
+b ¨ MAX[b, newB + BitLength[sei]];
+lastSei ¨ sei;
+ENDLOOP;
+vProfile ¨ FreeProfile[vProfile];
+IF b > bitsPerWord AND Basics.BITAND[Basics.LowHalf[b], alignBits-1] # 0 THEN {
+rem: NAT = alignBits - Basics.BITAND[Basics.LowHalf[b], alignBits-1];
+MimosaLog.ErrorSei[recordGap, lastSei];
+b ¨ b+rem;
+};
+seb[rSei].length ¨ b;
+};
+
+LayoutArgs: PUBLIC PROC [argRecord: RecordSEIndex, origin: BitCount, body: BOOL]
+RETURNS [BitCount] = {
+w: BitCount ¨ WordsFromBits[origin];
+IF argRecord # RecordSENull THEN {
+ctx: CTXIndex = seb[argRecord].fieldCtx;
+FOR sei: ISEIndex ¨ SymbolOps.FirstCtxSe[SymbolOps.own, ctx], SymbolOps.NextSe[SymbolOps.own, sei] UNTIL sei = ISENull DO
+nW: FieldWordCount ¨ WordsForField[sei];
+IF nW <= 0 THEN {
+MimosaLog.ErrorSei[IF nW = 0 THEN emptyArray ELSE sizeClash, sei];
+nW ¨ 0;
+};
+IF ignoreBody OR NOT body THEN {
+seb[sei].idInfo ¨ SymbolOps.EncodeCard[BitsFromWords[nW]];
+seb[sei].idValue ¨ SymbolOps.EncodeCard[BitsFromWords[w]];
+};
+w ¨ w + nW;
+ENDLOOP;
+};
+RETURN [BitsFromWords[w]];
+};
+ignoreBody: BOOL ¨ TRUE;
+
+LayoutBlock: PUBLIC PROC [bti: BTIndex, origin: BitCount] RETURNS [length: BitCount] = {
+vProfile: Profile;
+CountProc: PROC [bti: CBTIndex] = {
+IF bb[bti].info.mark = Internal THEN vI ¨ vI + 1;
+};
+InsertVar: VarScan = {
+nW: FieldWordCount ¨ WordsForField[sei];
+vProfile[vI] ¨ [link: [symbol[sei]], key: SymbolOps.DecodeCard[seb[sei].idInfo]];
+vI ¨ vI+1;
+IF nW <= 0 THEN {
+saveIndex: SourceMap.Loc = MimData.textIndex;
+node: Tree.Index = SymbolOps.DecodeTreeIndex[seb[sei].idValue];
+IF node # Tree.nullIndex THEN MimData.textIndex ¨ TreeOps.ToLoc[tb[node].info];
+MimosaLog.ErrorSei[IF nW = 0 THEN emptyArray ELSE sizeClash, sei];
+MimData.textIndex ¨ saveIndex;
+nW ¨ 0;
+};
+seb[sei].idInfo ¨ SymbolOps.EncodeCard[nW*bitsPerWord];
+seb[sei].idValue ¨ SymbolOps.EncodeCard[0];
+};
+InsertProc: PROC [bti: CBTIndex] = {
+IF bb[bti].info.mark = Internal THEN {
+vProfile[vI] ¨ VarInfo[link: [body[bti]], key: bb[bti].frameOffset];
+vI ¨ vI+1;
+};
+};
+vI: CARDINAL ¨ GenCtxVars[bb[bti].localCtx, NIL, FALSE, FALSE];
+GenBodyProcs[bti, CountProc];
+vProfile ¨ AllocateProfile[vI];
+vI ¨ 0;
+[] ¨ GenCtxVars[bb[bti].localCtx, InsertVar, FALSE, FALSE];
+GenBodyProcs[bti, InsertProc];
+length ¨ AssignVars[vProfile, origin, frameLimit];
+CheckFrameOverflow[vProfile];
+vProfile ¨ FreeProfile[vProfile];
+};
+
+LayoutFields: PUBLIC PROC [rSei: RecordSEIndex, offset: BitCount] = {
+bitPos: BitCount ¨ offset;
+lastFillable: BOOL ¨ FALSE;
+lastSei: ISEIndex ¨ ISENull;
+packed: BOOL = seb[rSei].packed;
+machineDep: BOOL = seb[rSei].machineDep;
+fillLastField: BOOL = NOT machineDep;
+type: CSEIndex;
+ctx: CTXIndex = seb[rSei].fieldCtx;
+eqLengths: BOOL ¨ FALSE;
+padEnd: BitCount ¨ 0;
+vOrigin: BitCount ¨ 0;
+maxLength: BitCount ¨ 0;
+recordAlign: Symbols.Alignment ¨ seb[rSei].align;
+grain: NAT = IF machineDep THEN seb[rSei].grain ELSE bitsPerWord;
+grainAlign: Symbols.Alignment = MimData.bitsToAlignment[grain];
+AssignField: PROC [sei: ISEIndex] = {
+fieldType: Type = seb[sei].idType;
+isRC: BOOL ¨ SymbolOps.RCType[SymbolOps.own, fieldType] # none;
+saveIndex: SourceMap.Loc = MimData.textIndex;
+newIndex: SourceMap.Loc ¨ MimData.textIndex ¨ TreeOps.ToLoc[tb[SymbolOps.DecodeTreeIndex[seb[sei].idValue]].info];
+nB: BitCount ¨ BitsForType[seb[sei].idType];
+IF nB > BitCount.LAST THEN {MimosaLog.ErrorSei[addressOverflow, sei]; nB ¨ 0};
+SELECT TRUE FROM
+BitOffsetInWord[nB] = 0 => {};
+packed OR machineDep => {};
+wordAlignFields OR nB > bitsPerWord =>
+nB ¨ RoundUpBits[nB];
+ENDCASE =>
+FOR i: Target.AlignmentIndex IN Target.AlignmentIndex DO
+ab: NAT = Target.Alignments[i];
+IF ab >= nB THEN {nB ¨ ab; EXIT};
+ENDLOOP;
+IF packed AND nB <= (bitsPerWord - BitOffsetInWord[bitPos]) AND nB # 0
+THEN {
+IF NOT machineDep THEN
+recordAlign ¨ MergeAlignment[recordAlign, MimData.wordAlignment];
+}
+ELSE {
+align: Symbols.Alignment ¨ TypeAlignment[fieldType];
+alignBits: NAT = BitsForAlignment[align];
+alignMod: NAT ¨ ModForAlignment[bitPos, align];
+sizeMod: NAT ¨ ModForAlignment[nB, align];
+SELECT TRUE FROM
+machineDep => {
+SELECT TRUE FROM
+Basics.LowHalf[bitPos] MOD bitsPerWord # 0 AND isRC =>
+MimosaLog.WarningSei[paddedField, sei];
+checkMDRecords => IF alignBits # 0 THEN {
+grain: NAT = seb[rSei].grain;
+mask: NAT = grain - 1;
+modPos: NAT = Basics.BITAND[Basics.LowHalf[bitPos], mask];
+modSize: NAT = Basics.BITAND[Basics.LowHalf[nB], mask];
+IF modPos = 0 AND modSize = 0 THEN GO TO noAdjust;
+IF nB+modPos <= grain THEN GO TO noAdjust;
+MimosaLog.WarningSei[fieldPosition, sei];
+};
+ENDCASE => GO TO noAdjust;
+};
+ENDCASE;
+recordAlign ¨ MergeAlignment[recordAlign, align];
+IF alignMod # 0 THEN {
+deltaOffset: NAT ¨ alignBits-alignMod;
+IF lastFillable AND fillLastField AND deltaOffset < bitsPerWord
+THEN {
+FillBits[lastSei, deltaOffset];
+lastFillable ¨ FALSE;
+}
+ELSE MimosaLog.WarningSei[recordGap, lastSei];
+bitPos ¨ bitPos + deltaOffset;
+};
+IF sizeMod # 0 THEN
+nB ¨ nB + (alignBits-sizeMod);
+EXITS noAdjust => {}; 
+};
+
+MimData.textIndex ¨ saveIndex;
+IF nB < 0 THEN {
+MimosaLog.ErrorSei[addressOverflow, sei];
+nB ¨ 0;
+};
+seb[sei].idInfo ¨ SymbolOps.EncodeCard[nB];
+seb[sei].idValue ¨ SymbolOps.EncodeCard[bitPos];
+lastSei ¨ sei;
+bitPos ¨ bitPos+nB;
+lastFillable ¨ nB < bitsPerWord AND BitOffsetInWord[bitPos] # 0;
+IF nB = 0 THEN lastFillable ¨ FALSE;
+IF bitPos < 0 THEN {
+MimosaLog.ErrorSei[addressOverflow, sei];
+bitPos ¨ 0;
+};
+};
+FillBits: PROC [sei: ISEIndex, bits: NAT] = {
+width: BitCount = BitLength[sei];
+IF machineDep AND bits # 0 THEN
+MimosaLog.WarningSei[paddedField, sei];
+seb[sei].idInfo ¨ SymbolOps.EncodeCard[width+bits];
+};
+FillWord: PROC [sei: ISEIndex] = {
+t: BitAddress = SymbolOps.DecodeBitAddr[seb[sei].idValue];
+mod: NAT = BitOffsetInWord[t];
+width: BitCount = bitsPerWord - mod;
+IF machineDep AND width # BitLength[sei] THEN
+MimosaLog.WarningSei[paddedField, sei];
+seb[sei].idInfo ¨ SymbolOps.EncodeCard[width];
+};
+FindFit: PROC [vSei: RecordSEIndex] RETURNS [BOOL] = {
+sei: ISEIndex ¨ SymbolOps.FirstCtxSe[SymbolOps.own, seb[vSei].fieldCtx];
+type: CSEIndex;
+IF sei = ISENull THEN RETURN [FALSE];
+type ¨ SymbolOps.UnderType[SymbolOps.own, seb[sei].idType];
+WITH seb[type] SELECT FROM
+union =>
+IF controlled
+THEN sei ¨ tagSei
+ELSE RETURN [ScanVariants[caseCtx, FindFit]];
+sequence => IF controlled THEN sei ¨ tagSei ELSE RETURN [FALSE];
+ENDCASE;
+RETURN [BitsForType[seb[sei].idType] + BitOffsetInWord[bitPos] <= bitsPerWord];
+};
+AssignVariant: PROC [vSei: RecordSEIndex] RETURNS [BOOL] = {
+LayoutFields[vSei, vOrigin];
+maxLength ¨ MAX[seb[vSei].length, maxLength];
+RETURN [FALSE];
+};
+PadVariant: PROC [vSei: RecordSEIndex] RETURNS [BOOL] = {
+fillSei: ISEIndex ¨ ISENull;
+ctx: CTXIndex = seb[vSei].fieldCtx;
+FOR sei: ISEIndex ¨ SymbolOps.FirstCtxSe[SymbolOps.own, ctx], SymbolOps.NextSe[SymbolOps.own, sei] UNTIL sei = ISENull DO
+IF WordsFromBits[SymbolOps.DecodeBitAddr[seb[sei].idValue].bd]
+# WordsFromBits[bitPos] THEN EXIT;
+fillSei ¨ sei;
+ENDLOOP;
+SELECT TRUE FROM
+fillSei # ISENull => {
+fillOrigin: BitCount ¨ BitOffset[fillSei];
+currentEnd: BitCount ¨ fillOrigin + BitLength[fillSei];
+IF currentEnd < padEnd AND (currentEnd # 0 OR padEnd < bitsPerWord) THEN {
+type: CSEIndex ¨ SymbolOps.UnderType[SymbolOps.own, seb[fillSei].idType];
+WITH seb[type] SELECT FROM
+union => {
+saveLastSei: ISEIndex = lastSei;
+IF controlled THEN lastSei ¨ tagSei;	-- for messages only
+[] ¨ ScanVariants[caseCtx, PadVariant];
+lastSei ¨ saveLastSei;
+};
+ENDCASE => IF machineDep THEN MimosaLog.WarningSei[paddedField, fillSei];
+seb[fillSei].idInfo ¨ SymbolOps.EncodeCard[padEnd - fillOrigin];
+};
+};
+vOrigin < padEnd AND (vOrigin # 0 OR padEnd < bitsPerWord) => {
+IF machineDep THEN MimosaLog.WarningSei[paddedField, lastSei];
+fillSei ¨ SymbolOps.MakeCtxSe[nullName, CTXNull];
+seb[fillSei].public ¨ TRUE;
+seb[fillSei].extended ¨ FALSE;
+seb[fillSei].constant ¨ seb[fillSei].immutable ¨ FALSE;
+seb[fillSei].linkSpace ¨ FALSE;
+seb[fillSei].idType ¨ MimData.idANY;
+seb[fillSei].idValue ¨ SymbolOps.EncodeCard[bitPos];
+seb[fillSei].idInfo ¨ SymbolOps.EncodeCard[padEnd - vOrigin];
+seb[fillSei].mark3 ¨ seb[fillSei].mark4 ¨ TRUE;
+WITH seb[fillSei] SELECT FROM linked => link ¨ ctxb[ctx].seList ENDCASE => ERROR;
+ctxb[ctx].seList ¨ fillSei;
+};
+ENDCASE;
+seb[vSei].length ¨ MIN[maxLength, RoundUpBits[seb[vSei].length]];
+IF BitCount[seb[vSei].length] # maxLength THEN eqLengths ¨ FALSE;
+RETURN [FALSE];
+};
+
+SELECT TRUE FROM
+machineDep => recordAlign ¨ MimData.bitsToAlignment[grain];
+wordAlignRecords => recordAlign ¨ MergeAlignment[recordAlign, grainAlign];
+ENDCASE;
+
+FOR sei: ISEIndex ¨ SymbolOps.FirstCtxSe[SymbolOps.own, ctx], SymbolOps.NextSe[SymbolOps.own, sei] UNTIL sei = ISENull DO
+IF ~seb[sei].constant THEN {
+type ¨ SymbolOps.UnderType[SymbolOps.own, seb[sei].idType];
+WITH seb[type] SELECT FROM
+union => {
+IF NOT controlled
+THEN seb[sei].idValue ¨ SymbolOps.EncodeCard[bitPos]
+ELSE {AssignField[tagSei]; seb[sei].idValue ¨ seb[tagSei].idValue};
+IF lastFillable AND fillLastField AND BitOffsetInWord[bitPos] # 0 THEN {
+FillWord[lastSei];
+bitPos ¨ RoundUpBits[bitPos];
+};
+maxLength ¨ vOrigin ¨ bitPos;
+[] ¨ ScanVariants[caseCtx, AssignVariant];
+padEnd ¨ IF maxLength < bitsPerWord
+THEN maxLength
+ELSE BitsFromWords[MAX[WordsFromBits[vOrigin + wordFill], 1]];
+eqLengths ¨ TRUE;
+[] ¨ ScanVariants[caseCtx, PadVariant];
+hints.equalLengths ¨ eqLengths;
+{
+delta: CARD ¨ maxLength - vOrigin;
+IF controlled THEN delta ¨ delta + BitLength[tagSei];
+seb[sei].idInfo ¨ SymbolOps.EncodeCard[delta];
+};
+bitPos ¨ maxLength;
+lastFillable ¨ FALSE;
+};
+sequence => {
+IF ~controlled
+THEN seb[sei].idValue ¨ SymbolOps.EncodeCard[bitPos]
+ELSE {AssignField[tagSei]; seb[sei].idValue ¨ seb[tagSei].idValue};
+IF lastFillable AND fillLastField AND BitOffsetInWord[bitPos] # 0 THEN {
+FillWord[lastSei];
+bitPos ¨ RoundUpBits[bitPos];
+};
+seb[sei].idInfo ¨ SymbolOps.EncodeInt[bitPos - BitOffset[sei]];
+lastFillable ¨ FALSE;
+};
+ENDCASE => AssignField[sei];
+};
+ENDLOOP;
+IF lastFillable AND fillLastField
+AND BitOffsetInWord[bitPos] # 0
+AND (WordsFromBits[bitPos] > 0 OR NOT machineDep) THEN {
+FillWord[lastSei];
+bitPos ¨ RoundUpBits[bitPos];
+};
+seb[rSei].align ¨ recordAlign;
+seb[rSei].length ¨ bitPos;
+};
+
+LayoutGlobals: PUBLIC PROC [bti: CBTIndex] RETURNS [length: BitCount] = {
+CountVar: VarScan = {
+ctx: CTXIndex = seb[sei].idCtx;
+SELECT TRUE FROM
+ctxb[ctx].ctxType = imported OR ctx = MimData.importCtx => xI ¨ xI + 1;
+seb[sei].hash # nullName OR seb[sei].extended OR NOT output => vI ¨ vI + 1;
+ENDCASE;
+};
+InsertVar: VarScan = {
+saveIndex: SourceMap.Loc = MimData.textIndex;
+ctx: CTXIndex = seb[sei].idCtx;
+nRefs: CARD = SymbolOps.DecodeCard[seb[sei].idInfo];
+IF ctxb[ctx].ctxType = imported OR ctx = MimData.importCtx
+THEN {
+xProfile[xI] ¨ [link: [symbol[sei]], key: nRefs];
+xI ¨ xI+1;
+IF nRefs = 0 AND ~seb[sei].public THEN MimosaLog.WarningSei[unusedId, sei];
+}
+ELSE {
+node: Tree.Index = SymbolOps.DecodeTreeIndex[seb[sei].idValue];
+IF node # Tree.nullIndex THEN MimData.textIndex ¨ TreeOps.ToLoc[tb[node].info];
+IF seb[sei].hash # nullName OR seb[sei].extended OR ~output THEN {
+info: VarInfo = [link: [symbol[sei]], key: nRefs];
+uProfile[vI] ¨ info;
+vProfile[vI] ¨ info;
+vI ¨ vI + 1;
+};
+IF nRefs = 0 AND ~MimData.interface
+AND ~seb[sei].public AND seb[sei].hash # nullName
+AND node # Tree.nullIndex THEN
+MimosaLog.WarningSei[unusedId, sei];
+seb[sei].idValue ¨ SymbolOps.EncodeCard[0];
+};
+{
+nW: FieldWordCount ¨ WordsForField[sei];
+IF nW <= 0 THEN {
+IF NOT MimData.interface THEN
+MimosaLog.ErrorSei[IF nW = 0 THEN emptyArray ELSE sizeClash, sei];
+nW ¨ 0;
+};
+seb[sei].idInfo ¨ SymbolOps.EncodeCard[nW*bitsPerWord];
+};
+MimData.textIndex ¨ saveIndex;
+};
+uProfile, vProfile, xProfile: Profile;
+vI, xI: CARDINAL ¨ 0;
+origin: CARD ¨ 0;
+IF ~seb[bb[bti].ioType].mark4 THEN ERROR;
+GenBodyVars[bti, CountVar];
+GenImportedVars[CountVar];
+uProfile ¨ AllocateProfile[vI];
+vProfile ¨ AllocateProfile[vI];
+xProfile ¨ AllocateProfile[xI];
+vI ¨ xI ¨ 0;
+GenBodyVars[bti, InsertVar];
+GenImportedVars[InsertVar];
+LocalAssignImports[xProfile, 0];
+origin ¨ AssignVars[vProfile, globalOrigin, frameLimit];
+IF origin >= 200000B THEN {
+nI: CARDINAL ¨ 0;
+FOR pass: NAT IN [0..1] DO
+FOR i: CARDINAL IN [0..vI) DO
+info: VarInfo = uProfile[i];
+WITH v: info.link SELECT FROM
+symbol => {
+sep: LONG POINTER TO Symbols.SERecord.id = @seb[v.index];
+ss: SymbolOps.SubString
+= SymbolOps.SubStringForName[SymbolOps.own, sep.hash];
+IF ss.length # 0 AND ss.base[ss.offset] = '&
+THEN {IF pass = 1 THEN GO TO skip}
+ELSE {IF pass = 0 THEN GO TO skip};
+vProfile[nI] ¨ info;
+nI ¨ nI + 1;
+EXITS skip => {};
+};
+ENDCASE;
+ENDLOOP;
+ENDLOOP;
+origin ¨ AssignVars[vProfile, globalOrigin, frameLimit];
+};
+length ¨ MAX[origin, globalOrigin+bitsPerWord];
+CheckFrameOverflow[vProfile];
+uProfile ¨ FreeProfile[uProfile];
+vProfile ¨ FreeProfile[vProfile];
+xProfile ¨ FreeProfile[xProfile];
+};
+
+LayoutInterface: PUBLIC PROC [bti: CBTIndex] RETURNS [nEntries: CARDINAL] = {
+epN: CARDINAL ¨ 0;
+FOR sei: ISEIndex ¨ SymbolOps.FirstCtxSe[SymbolOps.own, bb[bti].localCtx], SymbolOps.NextSe[SymbolOps.own, sei] UNTIL sei = ISENull DO
+SELECT SymbolOps.LinkMode[SymbolOps.own, sei] FROM
+val, ref => {
+seb[sei].linkSpace ¨ TRUE;
+seb[sei].idValue ¨ SymbolOps.EncodeCard[epN];
+epN ¨ epN + 1;
+};
+type => {
+seb[sei].idValue ¨ SymbolOps.EncodeCard[epN];
+epN ¨ epN + 1;
+};
+ENDCASE;
+ENDLOOP;
+nEntries ¨ epN;
+};
+
+LayoutLocals: PUBLIC PROC [bti: CBTIndex] RETURNS [length: BitCount] = {
+vProfile: Profile;
+vI: CARDINAL;
+CountVar: VarScan = {
+IF seb[sei].hash # nullName OR seb[sei].extended OR ~output THEN vI ¨ vI + 1;
+};
+CountProc: PROC [bti: CBTIndex] = {
+IF bb[bti].info.mark = Internal THEN vI ¨ vI + 1;
+};
+InsertVar: VarScan = {
+saveIndex: SourceMap.Loc = MimData.textIndex;
+node: Tree.Index = SymbolOps.DecodeTreeIndex[seb[sei].idValue];
+nRefs: CARD = SymbolOps.DecodeCard[seb[sei].idInfo];
+IF node # Tree.nullIndex THEN MimData.textIndex ¨ TreeOps.ToLoc[tb[node].info];
+IF seb[sei].hash # nullName OR seb[sei].extended OR ~output THEN {
+vProfile[vI] ¨ [link: [symbol[sei]], key: nRefs]; vI ¨ vI+1};
+IF nRefs = 0 AND seb[sei].hash # nullName
+AND ~output	-- suppress message for return record
+AND node # Tree.nullIndex THEN MimosaLog.WarningSei[unusedId, sei];
+seb[sei].idInfo ¨ SymbolOps.EncodeCard[WordsForField[sei]*bitsPerWord];
+seb[sei].idValue ¨ SymbolOps.EncodeCard[0];
+MimData.textIndex ¨ saveIndex;
+};
+InsertProc: PROC [bti: CBTIndex] = {
+IF bb[bti].info.mark = Internal THEN {
+vProfile[vI] ¨ VarInfo[link: [body[bti]], key: bb[bti].frameOffset];
+vI ¨ vI+1;
+};
+};
+bodyType: Type = bb[bti].ioType;
+origin: INT ¨ IF bb[bti].level = lL THEN localOrigin ELSE localOrigin+bitsPerWord;
+IF ~seb[bodyType].mark4 THEN MarkArgs[bodyType];
+vI ¨ 0;
+GenBodyVars[bti, CountVar];
+GenBodyProcs[bti, CountProc];
+vProfile ¨ AllocateProfile[vI];
+vI ¨ 0;
+GenBodyVars[bti, InsertVar];
+GenBodyProcs[bti, InsertProc];
+origin ¨ AssignVars[vProfile, origin, localOrigin + localSlots*bitsPerWord];
+length ¨ AssignVars[vProfile, origin, frameLimit];
+CheckFrameOverflow[vProfile];
+vProfile ¨ FreeProfile[vProfile];
+};
+
+LayoutNotify: PUBLIC Alloc.Notifier = {
+tb ¨ base[Tree.treeType];
+seb ¨ base[seType];  ctxb ¨ base[ctxType];
+bb ¨ base[bodyType];
+};
+
+MarkArgs: PUBLIC PROC [sei: Type] = {
+type: CSEIndex = SymbolOps.UnderType[SymbolOps.own, sei];
+WITH t: seb[type] SELECT FROM
+transfer => {
+rSei: RecordSEIndex;
+IF (rSei ¨ SymbolOps.ArgRecord[SymbolOps.own, t.typeIn]) # RecordSENull THEN {
+[] ¨ GenCtxVars[seb[rSei].fieldCtx, NIL, FALSE, TRUE];
+seb[rSei].length ¨ LayoutArgs[rSei, 0, TRUE];
+seb[rSei].mark4 ¨ TRUE;
+};
+IF (rSei ¨ SymbolOps.ArgRecord[SymbolOps.own, t.typeOut]) # RecordSENull THEN {
+[] ¨ GenCtxVars[seb[rSei].fieldCtx, NIL, TRUE, TRUE];
+seb[rSei].length ¨ LayoutArgs[rSei, 0, TRUE];
+seb[rSei].mark4 ¨ TRUE;
+};
+t.mark4 ¨ TRUE;
+};
+ENDCASE;
+};
+
+WordsForType: PUBLIC PROC [type: Type] RETURNS [CARD] = {
+RETURN [Basics.BITRSHIFT[
+BitsForType[type]+(Target.bitsPerWord-1),
+Target.logBitsPerWord]];
+};
+AllocateProfile: PROC [n: CARDINAL] RETURNS [profile: Profile] = {
+profile ¨ MimZones.tempZone.NEW[VarInfoList[n]];
+FOR k: CARDINAL IN [0 .. n) DO profile[k].link ¨ [empty[]] ENDLOOP;
+};
+
+FreeProfile: PROC [profile: Profile] RETURNS [Profile] = {
+MimZones.tempZone.FREE[@profile];
+RETURN [NIL];
+};
+
+SortProfile: PROC [v: Profile] = {
+h: NAT ¨ v.length;
+DO
+h ¨ h/2;
+FOR j: NAT IN [h .. v.length) DO
+i: INTEGER ¨ j-h;
+k: CARD ¨ v[j].key;
+t: VarInfo ¨ v[j];
+WHILE k > v[i].key DO
+v[i+h] ¨ v[i];
+IF (i ¨ i-h) < 0 THEN EXIT;
+ENDLOOP;
+v[i+h] ¨ t;
+ENDLOOP;
+IF h <= 1 THEN EXIT;
+ENDLOOP;
+};
+
+MergeProfiles: PROC [profile1, profile2: Profile] RETURNS [profile: Profile] = {
+i, i1, i2: CARDINAL ¨ 0;
+profile ¨ MimZones.tempZone.NEW[VarInfoList[profile1.length+profile2.length]];
+WHILE i1 < profile1.length AND i2 < profile2.length DO
+IF profile1[i1].key > profile2[i2].key THEN {profile[i] ¨ profile1[i1];  i1 ¨ i1+1}
+ELSE {profile[i] ¨ profile2[i2];  i2 ¨ i2+1};
+i ¨ i + 1
+ENDLOOP;
+WHILE i1 < profile1.length DO
+profile[i] ¨ profile1[i1];  i1 ¨ i1+1;  i ¨ i + 1
+ENDLOOP;
+WHILE i2 < profile2.length DO
+profile[i] ¨ profile2[i2];  i2 ¨ i2+1;  i ¨ i + 1
+ENDLOOP;
+};
+
+GenBodies: PROC [root: BTIndex, proc: PROC [CBTIndex]] = {
+bti: BTIndex ¨ root;
+WHILE bti # BTNull DO
+next: BTIndex;
+WITH bb[bti] SELECT FROM
+Callable => proc[LOOPHOLE[bti]];
+ENDCASE;
+next ¨ bb[bti].firstSon;
+IF next = BTNull THEN
+DO
+link: Symbols.BodyLink = bb[bti].link;
+next ¨ link.index;
+IF next = BTNull THEN RETURN;
+IF link.which # parent THEN EXIT;
+bti ¨ next;
+ENDLOOP;
+bti ¨ next;
+ENDLOOP;
+};
+
+BodyRefs: PROC [bti: CBTIndex] RETURNS [count: CARDINAL¨0] = {
+sei: ISEIndex = bb[bti].id;
+CountRefs: Tree.Scan = {
+count ¨ count + SymbolOps.DecodeCard[seb[TreeOps.GetSe[t]].idInfo];
+};
+IF sei # ISENull THEN {
+node: Tree.Index = SymbolOps.DecodeTreeIndex[seb[sei].idValue];
+TreeOps.ScanList[tb[node].son[1], CountRefs];
+};
+};
+
+WordsForField: PROC [sei: ISEIndex] RETURNS [nW: FieldWordCount] = {
+nBits: BitCount = BitsForType[seb[sei].idType] + wordFill;
+IF nBits < 0
+THEN {
+MimosaLog.ErrorSei[addressOverflow, sei];
+nW ¨ maxFieldWordCount;
+}
+ELSE
+nW ¨ WordsFromBits[nBits];
+};
+
+GenCtxVars: PROC [ctx: CTXIndex, p: VarScan, output: BOOL, mark: BOOL]
+RETURNS [vI: CARDINAL ¨ 0] = {
+FOR sei: ISEIndex ¨ SymbolOps.FirstCtxSe[SymbolOps.own, ctx], SymbolOps.NextSe[SymbolOps.own, sei] UNTIL sei = ISENull DO
+IF ~seb[sei].constant THEN {
+vI ¨ vI + 1;
+IF mark THEN seb[sei].mark4 ¨ TRUE;
+IF p # NIL THEN p[sei, output];
+};
+ENDLOOP;
+};
+
+GenBodyVars: PROC [bti: CBTIndex, p: VarScan] = {
+type: Type = bb[bti].ioType;
+WITH se: seb[type] SELECT FROM
+cons =>
+WITH t: se SELECT FROM
+transfer => {
+[] ¨ GenCtxVars[SymbolOps.ArgCtx[SymbolOps.own, t.typeIn], p, FALSE, FALSE];
+[] ¨ GenCtxVars[SymbolOps.ArgCtx[SymbolOps.own, t.typeOut], p, TRUE, FALSE];
+};
+ENDCASE;
+ENDCASE;
+[] ¨ GenCtxVars[bb[bti].localCtx, p, FALSE, FALSE];
+};
+
+GenBodyProcs: PROC [bti: BTIndex, proc: PROC [CBTIndex]] = {
+sonBti: BTIndex ¨ bb[bti].firstSon;
+WHILE sonBti # BTNull DO
+WITH body: bb[sonBti] SELECT FROM
+Callable => IF ~body.inline THEN proc[LOOPHOLE[sonBti]];
+ENDCASE => NULL;
+IF bb[sonBti].link.which = parent THEN EXIT;
+sonBti ¨ bb[sonBti].link.index;
+ENDLOOP;
+};
+
+GenImportedVars: PROC [p: VarScan] = {
+ctx: CTXIndex = MimData.importCtx;
+FOR sei: ISEIndex ¨ SymbolOps.FirstCtxSe[SymbolOps.own, ctx], SymbolOps.NextSe[SymbolOps.own, sei] UNTIL sei = ISENull DO
+IF ~seb[sei].constant
+THEN p[sei, FALSE]
+ELSE {
+type: CSEIndex = SymbolOps.UnderType[SymbolOps.own, seb[sei].idType];
+WITH seb[type] SELECT FROM
+definition =>
+IF Pass4Parms.links.indirect
+THEN p[sei, FALSE]
+ELSE [] ¨ GenCtxVars[defCtx, p, FALSE, FALSE];
+ENDCASE;
+};
+ENDLOOP;
+};
+
+CheckFrameOverflow: PROC [profile: Profile] = {
+FOR i: INTEGER IN [0 .. profile.length) DO
+WITH profile[i].link SELECT FROM
+symbol => MimosaLog.ErrorSei[addressOverflow, index];
+body => MimosaLog.ErrorSei[addressOverflow, bb[index].id];
+ENDCASE;
+ENDLOOP;
+};
+
+Align: PROC [offset: BitCount, item: VarLink] RETURNS [BitCount] = {
+offset ¨ RoundUpBits[offset];
+IF bitsPerAU = bitsPerWord AND bitsPerAU = 16 THEN {
+WITH item SELECT FROM
+body => GO TO mod4eq2;
+symbol =>
+SELECT SymbolOps.XferMode[SymbolOps.own, seb[index].idType] FROM
+port => GO TO mod4eq2;
+ENDCASE;
+ENDCASE;
+EXITS mod4eq2 =>
+WHILE (Basics.LowHalf[offset] MOD bitsPerWord*4) # (bitsPerWord*2) DO
+offset ¨ offset + bitsPerWord;
+ENDLOOP;
+};
+RETURN [offset];
+};
+
+BitWidth: PROC [item: VarLink] RETURNS [CARD] = {
+WITH item SELECT FROM
+symbol => RETURN [BitLength[index]];
+body => RETURN [Target.bitsPerProc];
+ENDCASE => RETURN [0];
+};
+
+AssignBase: PROC [item: VarLink, base: CARD] = {
+WITH item SELECT FROM
+symbol => {
+sei: ISEIndex = index;
+seb[sei].idValue ¨ SymbolOps.EncodeBitAddr[[base]];
+seb[sei].mark4 ¨ TRUE;
+};
+body => {
+bti: CBTIndex = index;
+bb[bti].frameOffset ¨ base/bitsPerWord;
+};
+ENDCASE;
+};
+
+AssignVars: PROC [profile: Profile, origin, limit: BitCount] RETURNS [INT] = {
+next: CARD ¨ 0;
+start: BitCount ¨ origin;
+remainder: BitCount ¨ IF origin < limit THEN limit - origin ELSE 0;
+WHILE next < profile.length DO
+found: BOOL ¨ FALSE;
+skips: BOOL ¨ FALSE;
+i: CARDINAL ¨ next;
+WHILE ~found AND i < profile.length DO
+t: VarLink ¨ profile[i].link;
+IF t # [empty[]] THEN {
+base: BitCount ¨ Align[start, t];
+length: BitCount ¨ BitWidth[t];
+delta: BitCount ¨ base - start;
+IF length + delta <= remainder THEN {
+limit: CARD = base + length;
+subBase: CARD ¨ start;
+nRefs: CARD ¨ 0;
+FOR j: CARDINAL ¨ i+1, j+1 WHILE j < profile.length AND subBase < limit DO
+IF profile[j].link # [empty[]] THEN {
+subLength: CARD = BitWidth[profile[j].link];
+subDelta: CARD = Align[subBase, profile[j].link] - subBase;
+IF  (subDelta + subLength) > (limit - subBase) THEN EXIT;
+subBase ¨ subBase + (subDelta + subLength);
+nRefs ¨ nRefs + profile[j].key;
+};
+ENDLOOP;
+IF nRefs <= profile[i].key OR ~MimData.switches['s]
+THEN {
+found ¨ TRUE;
+AssignBase[t, base];
+profile[i].link ¨ [empty[]];
+IF base # start AND MimData.switches['s] THEN
+[] ¨ AssignVars[profile, start, base];
+start ¨ limit;
+remainder ¨ remainder - (length+delta);
+}
+ELSE IF ~skips THEN {skips ¨ TRUE; next ¨ i};
+};
+};
+i ¨ i+1;
+IF ~skips THEN next ¨ i;
+ENDLOOP;
+ENDLOOP;
+RETURN [start];
+};
+
+LocalAssignImports: PROC [profile: Profile, origin: CARDINAL] = {
+fragRef: REF MobDefs.LinkFrag ¨ NIL;
+links: CARDINAL ¨ 0;
+FOR pass: [0..1] IN [0..1] DO
+ctx: CTXIndex = MimData.importCtx;
+links ¨ 0;
+FOR sei: ISEIndex ¨ SymbolOps.FirstCtxSe[SymbolOps.own, ctx], SymbolOps.NextSe[SymbolOps.own, sei] UNTIL sei = ISENull DO
+type: CSEIndex = SymbolOps.UnderType[SymbolOps.own, seb[sei].idType];
+WITH se: seb[type] SELECT FROM
+definition =>
+FOR isei: ISEIndex ¨ SymbolOps.FirstCtxSe[SymbolOps.own, se.defCtx], SymbolOps.NextSe[SymbolOps.own, isei] UNTIL isei = ISENull DO
+IF ~seb[isei].constant THEN {
+IF pass = 1 THEN {
+link: MobDefs.Link ¨ SymbolOps.DecodeLink[seb[isei].idValue];
+fragRef[links] ¨ link;
+};
+links ¨ links + 1;
+};
+ENDLOOP;
+ENDCASE;
+ENDLOOP;
+IF pass = 1 THEN EXIT;
+fragRef ¨ MimZones.tempZone.NEW[MobDefs.LinkFrag[links]];
+fragRef.offset ¨ origin;
+ENDLOOP;
+MimData.linkCount ¨ links;
+IF ~MimData.interface THEN
+CompilerUtil.AppendMobUnits[
+LOOPHOLE[fragRef],
+SIZE[MobDefs.LinkFrag[fragRef.length]]];
+MimZones.tempZone.FREE[@fragRef];
+};
+
+TypeAlignment: PROC [type: Type] RETURNS [Symbols.Alignment] = {
+DO
+csei: Symbols.CSEIndex = SymbolOps.UnderType[SymbolOps.own, type];
+sep: LONG POINTER TO Symbols.SERecord.cons = @seb[csei];
+align: Symbols.Alignment ¨ sep.align;
+IF align # unknown THEN RETURN [align];
+WITH se: sep≠ SELECT FROM
+enumerated, subrange => {
+bits: NAT ¨ BitsForType[csei];
+align ¨ sep.align ¨ MimData.bitsToAlignment[bits];
+};
+array => {
+bits: BitCount ¨ BitsForType[csei];
+IF bits >= bitsPerWord
+THEN align ¨ TypeAlignment[se.componentType]
+ELSE {
+bits ¨ BitsForType[se.componentType];
+IF se.packed
+THEN bits ¨ SymbolOps.PackedSize[bits]
+ELSE bits ¨ bitsPerWord;
+};
+sep.align ¨ align ¨ MimData.bitsToAlignment[bits];
+};
+record => {
+};
+union => {
+eachVariant: PROC [rsei: RecordSEIndex] RETURNS [BOOL ¨ FALSE] = {
+innerAlign: Symbols.Alignment ¨ TypeAlignment[rsei];
+align ¨ MergeAlignment[align, innerAlign];
+};
+[] ¨ ScanVariants[se.caseCtx, eachVariant];
+};
+sequence => {
+bits: BitCount ¨ BitsForType[se.componentType];
+IF bits < bitsPerWord THEN bits ¨ bitsPerWord;
+align ¨ sep.align ¨ MimData.bitsToAlignment[bits];
+};
+ENDCASE;
+RETURN [align];
+ENDLOOP;
+};
+
+MergeAlignment: PROC
+[outer, inner: Symbols.Alignment] RETURNS [Symbols.Alignment] = INLINE {
+IF outer = unknown THEN RETURN [inner];
+RETURN [VAL[MAX[ORD[outer], ORD[inner]]]];
+};
+
+EasyAccessBits: PROC [bits: BitCount] RETURNS [BitCount] = {
+SELECT bits FROM
+0 => RETURN [0];
+> Target.bitsPerWord => RETURN [RoundUpBits[bits]];
+<= Target.bitsPerWord/2 => IF NOT wordAlignFields THEN {
+FOR i: Target.AlignmentIndex IN Target.AlignmentIndex DO
+ab: NAT = Target.Alignments[i];
+IF ab >= bits THEN RETURN [ab];
+ENDLOOP;
+ERROR;
+};
+ENDCASE;
+RETURN [Target.bitsPerWord];
+};
+
+BitsForAlignment: PROC [align: Symbols.Alignment] RETURNS [NAT] = INLINE {
+SELECT align FROM
+twoAU => RETURN [bitsPerAU*2];
+fourAU => RETURN [bitsPerAU*4];
+eightAU => RETURN [bitsPerAU*8];
+ENDCASE => RETURN [bitsPerAU];
+};
+
+ModForAlignment: PROC [bits: BitCount, align: Symbols.Alignment] RETURNS [NAT] = {
+low: CARD16 = Basics.LowHalf[bits];
+SELECT align FROM
+twoAU => RETURN [low MOD (bitsPerAU*2)];
+fourAU => RETURN [low MOD (bitsPerAU*4)];
+eightAU => RETURN [low MOD (bitsPerAU*8)];
+ENDCASE => RETURN [low MOD bitsPerAU];
+};
+
+BitOffset: PROC [sei: ISEIndex] RETURNS [BitCount] = INLINE {
+t: BitAddress = SymbolOps.DecodeBitAddr[seb[sei].idValue];
+RETURN [t.bd];
+};
+
+BitLength: PROC [sei: ISEIndex] RETURNS [BitCount] = INLINE {
+RETURN [SymbolOps.DecodeCard[seb[sei].idInfo]];
+};
+
+ScanVariants: PROC [caseCtx: CTXIndex, proc: PROC [RecordSEIndex] RETURNS [BOOL]]
+RETURNS [BOOL] = {
+FOR sei: ISEIndex ¨ SymbolOps.FirstCtxSe[SymbolOps.own, caseCtx], SymbolOps.NextSe[SymbolOps.own, sei] UNTIL sei = ISENull DO
+rSei: Type = SymbolOps.DecodeType[seb[sei].idInfo];
+WITH variant: seb[rSei] SELECT FROM
+cons =>
+WITH variant SELECT FROM
+record => IF proc[LOOPHOLE[rSei]] THEN RETURN [TRUE];
+ENDCASE => ERROR;
+ENDCASE;	-- skip multiple identifiers
+ENDLOOP;
+RETURN [FALSE];
+};
+
+CheckVariants: PROC [sei: ISEIndex] = {
+type: CSEIndex = SymbolOps.UnderType[SymbolOps.own, seb[sei].idType];
+started: BOOL ¨ FALSE;
+eqLengths: BOOL ¨ TRUE;
+gaps: BOOL ¨ FALSE;
+origin: BitCount ¨ 0;
+maxLength: BitCount ¨ 0;
+size: BitCount ¨ 0;
+CheckVariant: PROC [rSei: RecordSEIndex] RETURNS [BOOL] = {
+length: BitCount;
+CheckFields[rSei, origin];
+length ¨ seb[rSei].length;
+IF ~started
+THEN {maxLength ¨ length; started ¨ TRUE}
+ELSE {
+localGrainMask: WORD = seb[rSei].grain-1;
+overhang: WORD = Basics.BITOR[
+Basics.BITAND[Basics.LowHalf[length], localGrainMask],
+Basics.BITAND[Basics.LowHalf[maxLength], localGrainMask]];
+IF overhang # 0 THEN gaps ¨ TRUE;
+IF length # maxLength THEN {
+maxLength ¨ MAX[length, maxLength];
+eqLengths ¨ FALSE;
+};
+};
+RETURN [FALSE];
+};
+origin ¨ BitOffset[sei];
+WITH union: seb[type] SELECT FROM
+union => {
+IF union.controlled THEN {
+newOrigin: BitCount = BitOffset[union.tagSei];
+IF origin # newOrigin THEN MimosaLog.ErrorSei[fieldPosition, union.tagSei];
+origin ¨ newOrigin + BitLength[union.tagSei];
+};
+[] ¨ ScanVariants[union.caseCtx, CheckVariant];
+size ¨ maxLength - BitOffset[sei];
+union.hints.equalLengths ¨ eqLengths;
+IF gaps THEN MimosaLog.ErrorSei[recordGap, sei];
+SELECT BitLength[sei] FROM
+0    => seb[sei].idInfo ¨ SymbolOps.EncodeInt[size];
+size => {};
+ENDCASE => MimosaLog.ErrorSei[fieldPosition, sei];
+};
+ENDCASE => ERROR;
+};
+
+CheckSequence: PROC [sei: ISEIndex] = {
+type: CSEIndex = SymbolOps.UnderType[SymbolOps.own, seb[sei].idType];
+length: BitCount;
+origin: BitCount ¨ BitOffset[sei];
+WITH seq: seb[type] SELECT FROM
+sequence => {
+mod: NAT ¨ seq.grain;
+IF mod > bitsPerWord THEN mod ¨ bitsPerWord;
+IF seq.controlled THEN {
+newOrigin: BitCount = BitOffset[seq.tagSei];
+IF origin # newOrigin THEN MimosaLog.ErrorSei[fieldPosition, seq.tagSei];
+origin ¨ newOrigin + BitLength[seq.tagSei];
+};
+IF BitOffsetInWord[origin] MOD mod # 0 THEN MimosaLog.ErrorSei[fieldPosition, sei];
+length ¨ origin - BitOffset[sei];
+SELECT BitLength[sei] FROM
+0 => seb[sei].idInfo ¨ SymbolOps.EncodeInt[length];
+length => {};
+ENDCASE => MimosaLog.ErrorSei[fieldPosition, sei];
+};
+ENDCASE => ERROR;
+};
+RoundUpBits: PROC [bits: BitCount] RETURNS [BitCount] = INLINE {
+bits ¨ bits + wordFill;
+RETURN [bits - BitOffsetInWord[bits]];
+};
+
+BitsFromWords: PROC [card: BitCount] RETURNS [BitCount] = INLINE {
+RETURN [Basics.BITLSHIFT[card, Target.logBitsPerWord]];
+};
+
+WordsFromBits: PROC [card: BitCount] RETURNS [BitCount] = INLINE {
+RETURN [Basics.BITRSHIFT[card, Target.logBitsPerWord]];
+};
+
+BitOffsetInWord: PROC [card: BitCount] RETURNS [NAT] = INLINE {
+RETURN [Basics.LowHalf[card] MOD Target.bitsPerWord];
+};
+
+}.
+
+   r  
+Pass4L.mesa
+Copyright ” 1985, 1986, 1987, 1988, 1989, 1991 by Xerox Corporation.  All rights reserved.
+Satterthwaite, June 18, 1986 12:25:02 pm PDT
+Russ Atkinson (RRA) March 6, 1991 5:18 pm PST
+JKF August 9, 1988 12:46:38 pm PDT
+Willie-s, September 24, 1991 2:12 pm PDT
+When TRUE, check implicit MD records for unit crossings
+When TRUE, try to word align records that are not machine dependent
+When TRUE, try to word align fields in unpacked records
+When TRUE, pad packed arrays larger than a word to multiple words
+Types, constants & variables
+This is a magic number related to the number of small variables that will be promoted to small offsets in the two-pass local variable layout scheme.  At some point the layout of local and global variables will need to be revisited, since in Mimosa the layout can be changed far down the line!  At least some of the layout done in this module is quite obsolete!
+Table bases set by LayoutNotify
+Public procedures
+IF MimData.switches['s] THEN SortProfile[profile];
+assumes (an attempt at) prior processing by MimP4.DeclItem
+P4declitem has not been able to complete
+Check to see whether the record does not come out even for the specified alignment.
+RRA: body => arg records subsumed by frame
+relevant stuff: Pass4D.TypeExp
+SortProfile[vProfile];
+Nothing to adjust
+No adjustment yet
+Make the field into a word multiple
+We are trying for a relatively tight packing, and the field will fit in the current word.  However, since we rely on not crossing a word boundary for this to work, the record we are laying out has at least word alignment (this could be relaxed a little).
+The bit position for the upcoming field may not be on a good boundary.
+RC types must be word-aligned at worst
+Check for bogus unit crossings
+Round up the field position to the right alignment (preferably by padding the previous field).
+Round up the field size to the right alignment
+Rounds up the current field (given by sei) with the given # of bits.
+Rounds up the current field (given by sei) to fill out the word.
+Make the initial alignment follow the granularity option.
+Try to make "normal" records word-aligned
+Due to a stupid limitation in the MobDefs descriptions for RefLitFrag and TypeFrag objects, we have to force the &-variables to be in the first 64K bits.
+SortProfile[vProfile];
+The first round of variable assignment is an attempt to promote small variables to low indexes (I think). 
+The second round of variable assignment does the rest of the variable assignments.
+called by allocator whenever table area is repacked
+Private procedures
+Profile stuff
+Gen unique link for this imported context
+RRA: hack for PrincOps!  This should be improved!
+Hack for things that require (addr MOD 4) = 2.
+This procedure constructs a MobDefs.LinkFrag object, fills it with all of the "links" (each link is an imported item from an interface) and writes the object to the object file.  As of March 9, 1988, this information was only useful to Cinder (the Binder replacement) for determining which imports were NOT bound.  The actual links are indirect through the interface records, and are constructed only through the initialization procedure.
+We could not assign alignments to these until we knew the bounds.
+Try to make this agree with Pass4D.TypeExp, OK?
+Needs work?
+The alignment for a union DOES NOT include the tag field!
+The alignment for a sequence DOES NOT include the bounds field!
+Stupid little utilities
+ ù ($  ñ(cedarcode) styleïNewlineDelimiter
+ô headôIcodeöú
+œeúOôZLöœy,ô,Lô-Lô"Lô(óò öœk	ò	LöúüúòLöúüúüúü	úüúü	úò<Löúüúò$LöúüúsòÄLöú
+üúò'LöúüúòLöú	üúòLöúüúòLöúüúò,Löú
+üúòLöúüú›üúòÚLöú
+üúòòßLöúüúüúÇò°Löúüú0ò:Löúüúò'óóöœnúüòLöüúGòNLöüú
+òLöüúòLò öúüúüúòLöúüú.ô7óöúüúüúòLöúüú:ôCóöúüúüúòLô7óöúüúüúòLôAóLò óôLöúüúò+Löú
+üúò#Lò Lò Löúüú ò5öúüúòLôËóLò Löúüú ò6LöúüúüúüúòöúüúüúüúòLò óöú	üúüúòöüú	üòLòLòLòLöüúò	Lò óóLöú	üúüúüúò2Löúüúüúüú	üúüú
+ò=Löú	üúüúò Lò öúüúœcò;Löú>ò>óLöú	üúüúüúò3Lò öúôLöúüú°ò.Löúüú°ò6Löúüú°"ò<Löúüú°ò7óóôö†úüúüúò1LòLòö†
+úüúò$öüúüúüúò:LöúüúòLò%LòLòLòLòóLòóLöúüúòLöúüúòLöú
+üúüú%ò=Lò+LòLöüúüúô2öüúüúüúüòLöúüú&ò2öüúòLöüúòLöüú#ò'óLöüúòóLöú
+üúòLòLò óö
+†
+úüúüúüúüúò7Löüú	ü	ú@òXLòLò óö†úüúüúüúòGLô:Lò9öüúüúüòLöú-ò-LòLòLòLòòöüúüú
+üòLòLóóLöúòLöúòLöúòLöú/ò/LöúòLöú
+üú
+üúüúüúüúò=Löú
+üú
+üúüúüúüúò=öú	üúüú
+üúüúüúüúò/Löúüú6ò=Löú,ò,öüúüúüúòöüúüúüò0Löüúò LöüúòóLöüúüúüú
+üúüúüúüúüúò=LòLöüúüúüúòKLòóLòóöúòöüúüúüòLöüúüúüúòLöüúüúüúòöüúòLöúLòLóLöüúòóóLöüúòóöüú	òLöú(ô(òLöüúüúüúüú
+òDóóLòLò óö†
+úüúüúò*ö†úòLò-Lò?öüúüúòLò1Löüú+üú%òVLöúòóLòLòóLöú,üúüúò:LòLò óö†úüúüú,òDö†	úòLò:Lò
+LòóLòLò!Löú#ò#Löúüúò)Lö	úüú"üúüúüúòILöú0ò0LöúüúòLöú/üúüúò=LòöüúüòLòLöúüú*ò6öüú4üò>LòòLöüúüú(ò6LòLòóLöüúòóLöúòöüúüòLò.Löúüúüú(òILöüúòóLöúüúò"LòLöüúòóLò!öüúüúüú%üúòOLôSLöúüúüú!òELöú'ò'Löú
+ò
+LòóLòLòLò óö
+†
+úüúüú4üúüúògLò$öüúüúò"Lò(öüú`üúüòyLò(öüú	üúòLöúüúüúüúòBLöúòLòóöüúüúüúüúò Lò:Lò:LòóLòLöüúòóLòóLöüúòLòöúüúüúòöüú'ô*LöúôóóLò óö†úüúüú"üúòXLòö†	úüúò#Löüúüúò1Lòóö†	úòLöú(ò(LòQLò
+öüú	üúòLò-Lò?Löüúüú2òOLöúüúüúüúòBLòLöúòLöúòóLöú7ò7Lò+Lòóö†
+úüúò$öüúüúò&LòDLò
+LòóLòóLö	úüú üúüúüúò?LöúòLòLöúòLöú-üúüúò;LöúòLôLò2LòLò!LòLò óö†úüúüú,òELòLöúüúüúòLòLöúüúò Löúüúò(Löúüúüúò%LòLò#LöúüúüúòLòLòLòLöú1ò1Lö	úüúüúüúüúòALöú?ò?ö†úüúò%Lò"Löúüú5ò?Lò-LòrLò,Löüúü	ú4òNöüúüúüòöúòLôóöúüúòLôóöúüúò&Lô#Löúòóöüúò
+öüúüúüò8LöúüúòLöüú
+üúüúò!Löüúòóóóöüúüú/üúòFöüúòLô˛öüúüúüòLöúAòAóLöúòóöüúòLôFLöú4ò4Löúüúò)Löú
+üú"ò/Löú	üúò*öüúüúüòöúòöüúüúüòöúüúüúò6Löú'ò'Löüú$ô&óöúüúüúò)LôLöúüúòLöúüúòLöúüú
+üúò:Löú	üú
+üúò7Lö
+üúüúüúüúüú
+ò2Löüúüúüúüú
+ò*Löú)ò)LòóLöüúüúüú
+òóLòóLöüúòóLöú1ò1öüúüúòLô^Löúüúò&öüúüúüúò?öüúòLöúòLöúüúòLöúòóLöüú*ò.óLöúòLòóöüúüòLô.LöúòóLöüúòLòLò óóLòöüúüúòLò)LòLòóLò+Lò0LòLòLöú üúò@Löüúüúüúò$öüúüúòLò)LòLòóLòóö†úüúüúò-LôDLöú!ò!öüúüú
+üòLöú'ò'óLò3Lòóö†úüúò"Lô@Lò:LöúüúòLöú$ò$öüúüúüò-Lò'óLò.Lòóö†úüúüúüúò6LòHLòLöüúüúüúüúò%Lò;öüúüúüòòöüúòLöüúòLöüúüú"ò-óóLöúüúüúüúüúüúò@LöüúòóLöüúIòOLòóö†úüúüúüúò<LòLöúüúò-LöüúüúòLòóö†
+úüúüúüúò9LòLò#öüú`üúüòyLöüúUüúüúòaLòLöüúòóöüúüúüòòLò*Löú7ò7öüúüúüúüúòJLòIöüúüúüòò
+Lò Löüúüú°ò9Lò'LòLòóLöüúüúüú,òIóLò@LòóLòóöúüúüúò?Löüúüú,ò>Lò1LöúüúòLöúüúòLöú1üúò7LöúüúòLò$Lò4Lò=Löú*üúò/Lö
+üúüúüú#üúüúòQLòLòóLöüúòóLöúüú+òALöüú(üúüúòALöüúüúòLòLò óöüúüúüòöú;ò;Lô9óöúJòJLô)óLöüúòóLò öüú`üúüòyöüúüúòLò;öüúüúüòò
+öüúüúòLöüú0ò4Löüú?òCóöüúüúüúüúòHLòLòLòóLòLò*öú	üúò#Löüú
+òLöüúüú(ò>óLöúüúòLò'LòòLöúüúò"Löüúüú#ò5Löú.ò.LòóLòLöúüúòLòóòöüúòLöüú0ò4Löüú?òCóöüúüúüúüúòHLòLòLòóLò?LöúüúòLòóLöüúòóLòóLöüúòóöüúüúüúüúüúüúüúòzLòLòLòóLöúòLòLòLò óö†úüúüúüúòIö†úòLòöüúüúüòLöúüú(òGLöúüúüúüúòKLöüúòóLòóö†	úòLò-LòLöúüú)ò4öüúüúò:öüúòLò1Lò
+Löüúüúüú%òKLòóöüúòLò?Löüúüú2òOöüúüúüú	üúòBLöú2ò2LöúòLöúòLòLòóöüúüúüúüúüúüòtLò$óLò+LòóóòLöú(ò(öüú	üúòöüúüúüòLöúüúüúüúòBóLöúòLöúòóLöú7ò7LòóLòLòóLò&LöúüúòLöúüúòLöüúüúüúò)LòLòLòLòLòLòLòLòLò Löú8ò8öüúüúòLöúôôôLöúüúòöüúüúüúüòöüúüúüú	üòLöúòöüúüúüòòLöúüúüúüú%ò9LöúNòNöüúüúò,Lö
+üúüú
+üúüúüúò"Lö
+üúüú
+üúüúüúò#óLöúòLòLöüúòLòóLöüúòóLöüúòóLöüúòóLöú8ò8LòóLöú	üú#ò/LòLò!Lò!Lò!LòLò óö
+†úüúüúüúüúòMLöúüúòöüúmüúüòÜöüú(üò2òLöúüúòLò-LòLòóò	Lò-LòLòóLöüúòóLöüúòóLöúòLòLò óö†úüúüúüúòHLòLöúüúòö†úòLöüúüúüú	üúòMLòóö†	úüúò#Löüúüúò1Lòóö†	úòLò-Lò?Löúüú)ò4Löüúüú2òOöüúüúüú	üúòBLò=óöüúüúò)Löüú	°%ò1Löüúüú%òCóLöúGòGLò+LòLòóö†
+úüúò$öüúüúò&LòDLò
+LòóLòóLò Lö	úüúüúüúüúòRLöüúüúò0LòLòLòLòLòLòLòLôöúLòLLôjóò2LôRóLòLò!LòLò óö†úüúò'Lô3LòLò*LòLòLò óö†úüúüúò%Lò9öüúüúüòòLòöüúFüúòNLöú$üúüúüúò6Löú'üúò-LöúüúòLöúòóöüúGüúòOLöú$üúüúüúò5Löú'üúò-LöúüúòLöúòóLöú
+üúòLöúòóLöüúòóLòLò óö
+†úüúüúüúüúò9Löüú	ü	úDò\Lòóóôôö†úüúüúüúòBLöúüúò0Lö
+üúüúüú
+üúüúòCLòLò óö†úüúüúò:Löúüúò!LöüúüúòLòLò óö†úüúò"LöúüúòöüòLòöüúüúüúüò LöúüúòLöúüúòLòöüúüòLòLöüúüúüúòLöüúòóLòLöüúòóLöüúüúüúòLöüúòóLòLò óö†úüúüúòPLöúüúòLöúüú/òNöüúüúüò6Löüú%üú(òSLöüú)ò-Lò	LöüúòóöüúüòLò1LöüúòóöüúüòLò1LöüúòóLòóLò óö†	úüúüúò:LöúòöüúüòLòöüú	üúüòLöúüúò LöüúòóLöúòöüúüòöüòLò&LöúòLöüúüúüúòLöüúüúüúò!LöúòLöüúòóóLöúòLöüúòóòLò óóö†úüúüú	ü	úò>Lòö†	úòLòCLòóöüúüúòLò?Lò-LòóLòLò óö†úüúüúòDLò:öüú
+òöüúòLò)LòLòóöüòLòóóLòLò óö†
+úüú%üúüúüúüú	òeöüú`üúüòyöüúüúòLöúòLöüúüúüúò#LöüúüúüúòLòóLöüúòóòLò óóö†úüú ò1LòöüúüúüòòöüúüúüòòLöú>üúüúòLLöú?üúüúòLLöúòóLöüúòóóLöüúòóLöú%üúüúò3LòLò óö†úüúüúò<Löú#ò#öüúüòöüúüúüò!Löúüúüúüú
+ò8LöüúüúòóLöüú üúüúò,LòLöüúòóòLò óóö†úüúò&Lò"öüú`üúüòyöüúòLöüúüúòöüúòLòEöüúüúüòòöüúòöüúüúòLô)óLöüúüúüúò.óóLöüúòóLòóóLöüúòóòLò óóö†úüúò/öüúüúüúüò*öüúüúüò Lò5Lò:LöüúòóLöüúòóòLò óóö†úüú#üúòDLöúòöüúüúüúò4Löüú.ô1öüúüúüòLöúüúüú	òò	öüú6üò@Löúüúüú	òLöüúòóóLöüúòóöüúòLô.öüúüú"üòELöúòLöüúòóóLòóLöüú
+òòLò óóö†úüúüúüúò1öüúüúüòLöú
+üúò$Löúüúò$LöüúüúòóòLò óóö†
+úüúüúò0öüúüúüòòLòLöú3ò3LöúüúòLòóò	LòLöú'ò'LòóLöüúòóòLò óóö†
+úüú-üúüúòNLöúüúòLòLöúüúüúüúòCöüúüòLöúüúüúòLöúüúüúòLöúüúòöüúüúüò&LöúòöüúüúòLò!LòLòöüúüúò%LöúüúòLöú	üú	òLöúüúòö	üúüúüúüúüòJöüúüúò%Löúüúò,Löú
+üú-ò;Löüú-üúüúò9Lò+LòLòóLöüúòóöüúüúò3öüúòLöúüúòLòLòöüúüúüò-Lò&óLòLò'LòóLöüúüúüú
+üúò-óLòóLòóLòLöüúüú
+òLöüúòóLöüúòóLöüú	òLòLò óö†úüúüúòALô∂Löú	üúüúò$LöúüúòöüúüúüòLò"Lò
+öüú`üúüòyLòEöüúüúüòòöüúhüúüòÇöüúüúòöüú
+üúòLöú=ò=LöúòLòóLòLòóLöüúòóóLöüúòóLöüúòóLöüú
+üúüúòLöúüúò9LöúòLöüúòóLöúòöüúüòLöúüúüú$òXóLöúüúò!LòLò óö†úüúüúò@öüòLöúBòBLöúüúüúüú$ò8Löú%ò%Löüúüúüú	ò'öüú
+üúüòòLôALöúüúòLöú2ò2Lòóöú
+ò
+Löú,üúô/Löú#ò#öüúòLöüú(ò,öüúòLöú%ò%öüú
+òLöüú"ò&LöüúòóLòóóLöú2ò2LòóöúòLôLòóöú
+ò
+Löúüúüúô9ö	úüúüúüúüúòBLöú4ò4Löú*ò*LòóLò+LòóöúòLöúüúüúô?Löú/ò/Löüúüúò.Löú2ò2LòóLöüúòóLöüú	òLöüúòóLòLò óö†úüú"üúüúò]Löüúüúüú	ò'Lö
+üúüúüúüú	üúò*LòLò óö†úüúüúò<öüúüòLöúüúòLöúüúò3öúüúüúüúò8öüúüúüò8LöúüúòLöüúüúüúòLöüúòóLöüúòLöúòóLöüúòóLöüúòLòLò óö
+†úüúüúüúüúòJöüúüòLöú	üúòLöú
+üúòLöúüúò LöüúüúòóLòLò óö†úüú,üúüúòRLöúüúò#öüúüòLöú	üúüúò(Löú
+üúüúò)Löúüúüúò*Löüúüúüúò&óLòLò óö†	úüúüúüúò=Lò:LöüúòLòLò óö†	úüúüúüúò=Löüú)ò/LòLò óö†úüúüúüúüúüúüúòdöüúdüúüò}Lò3öüúüúüò#òöüú	üúüòLöú
+üúüúüúüúüúò5LöüúüúòóóLöüú°ò%óLöüúòóLöüúüúòLòLò óö†úüúò'LòELöú	üúüúòLöúüúüúòLöúüúüúòLòLòLòö†úüúüúüúò;LòLòLòöüú	òLöüú üúò)öüúòLöúüúò)Lö	ú
+üú
+üú	üú1üú-òêLöüúüúüúò!öüúüúòLöúüúò#LöúüúòLòóLòóóLöüúüúòLòóLòöüúüúüò!ò
+öüúüúòLò.Löüúüú1òKLöú-ò-LòóLò/Lò"Lò%Löüúüú$ò0öüúüòLò4LöúòLöüú+ò2óLòóLöüúüúòóLòLò óö†úüúò'LòELòLò"öüúüúüòòLöúüúòLöüúüúò,öüúüúòLò,Löüúüú/òILöú+ò+LòóLöüúüú	üú(òSLò!öüúüòLò3LòLöüú+ò2óLòóLöüúüúòóLòóóôö†úüúüúüúò@LòLöüú ò&LòLò óö†úüúüúüúòBLöüú	ü	úò7LòLò óö†úüúüúüúòBLöüú	ü	úò7LòLò óö
+†úüúüúüúüúò?Löüúüúò5LòóLò óLòLò ó Öó    á‡  Ωv  

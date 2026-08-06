@@ -1,0 +1,866 @@
+
+DIRECTORY
+BasicTime USING [GMT],
+Convert USING [IntFromRope],
+FS USING [ComponentPositions, Error, nullOpenFile, Close, GetInfo, ExpandName, OpenFile, PagesForBytes, <<SetByteCountAndCreatedTime, SetPageCount,>> StreamBufferParms, Delete, Create, Open, OpenFileFromStream, StreamFromOpenFile, <<StreamFromOpenStream,>> StreamOptions],
+IO,
+LoganBerry,
+Rope,
+WalnutDefs USING [CheckReportProc, Error, WalnutOpsHandle],
+WalnutKernelDefs USING [LogInfoFromRoot, RootEntry, WhichTempLog],
+WalnutRoot,
+WalnutStream USING [FlushStream, SetHighWaterMark];
+
+WalnutRootImpl: CEDAR MONITOR
+
+IMPORTS
+Convert, FS, IO, LoganBerry, Rope, 
+WalnutDefs, WalnutStream
+
+EXPORTS
+WalnutDefs, WalnutRoot
+
+= BEGIN
+
+GMT: TYPE = BasicTime.GMT;
+ROPE: TYPE = Rope.ROPE;
+STREAM: TYPE = IO.STREAM;
+
+WalnutOpsHandle: TYPE = WalnutDefs.WalnutOpsHandle;
+
+RootHandle: TYPE = WalnutRoot.RootHandle;
+RootHandleRec: PUBLIC TYPE = WalnutRoot.RootHandleRec;
+
+InternalLogInfo: TYPE = WalnutRoot.InternalLogInfo;
+MiscLogInfo: TYPE = WalnutRoot.MiscLogInfo;
+WhichTempLog: TYPE = WalnutRoot.WhichTempLog;
+AlpTHandle: TYPE = WalnutRoot.AlpTHandle;
+
+TransRequest: TYPE = { abort, close, continue };
+
+seriousDebugging: BOOL ¨ FALSE;
+BogusDBTrans: SIGNAL = CODE;
+
+opsHandleList: LIST OF WalnutOpsHandle ¨ NIL;
+
+rootBufferOption: FS.StreamBufferParms = [vmPagesPerBuffer: 4, nBuffers: 1];
+
+rootStreamOptions: FS.StreamOptions ¨ [
+tiogaRead: FALSE,
+truncatePagesOnClose: FALSE,
+closeFSOpenFileOnClose: TRUE  -- Note: this option is changed for opening temp logs when doing copies, so that we can Unlock the file before closing it
+];
+Open: PUBLIC ENTRY PROC[opsH: WalnutOpsHandle, newSegmentOk, masquerade, newHandle: BOOL] RETURNS[ok: BOOL] = {
+ENABLE UNWIND => NULL;
+isReadOnly: BOOL ¨ FALSE;
+
+BEGIN
+reason: ATOM;
+openFile: FS.OpenFile;
+rStream: STREAM;
+fullName: ROPE;
+cp: FS.ComponentPositions;
+rootHandle: RootHandle;
+[fullName, cp, ] ¨ FS.ExpandName[opsH.rootName];
+
+opsH.rootName ¨ fullName;
+IF opsH.rootHandle = NIL THEN
+opsH.rootHandle ¨ rootHandle ¨ NEW[WalnutRoot.RootHandleRec]
+ELSE rootHandle ¨ opsH.rootHandle;
+rootHandle.baseName ¨ fullName.Substr[0, cp.base.start];
+rootHandle.transInfo ¨ NIL;
+rootHandle.alpTH ¨ CreateTrans[opsH];
+rootHandle.dbTransH ¨ rootHandle.alpTH;
+
+
+BEGIN ENABLE FS.Error => { reason ¨ error.code; GOTO error };
+openFile ¨ FS.Open[name: opsH.rootName, lock: $read];  -- under rootHandle.alpTH
+rStream ¨ FS.StreamFromOpenFile[
+openFile: openFile,
+streamOptions: rootStreamOptions,
+streamBufferParms: streamBufferOption];
+rootHandle.createDate ¨ FS.GetInfo[openFile].created;
+EXITS error =>
+ERROR WalnutDefs.Error[$root, reason, opsH.rootName];
+END;
+
+
+BEGIN ENABLE IO.EndOfStream, IO.Error => GOTO cantParse;
+finished: BOOL ¨ FALSE;
+rStream.SetIndex[0];
+DO
+curPos: INT ¨ rStream.GetIndex[];
+rootEntry: WalnutKernelDefs.RootEntry ¨ NextRootEntry[rStream];
+DO
+IF rootEntry.ident.Equal["Key", FALSE] THEN
+{ opsH.key ¨ rootEntry.value; EXIT };
+IF rootEntry.ident.Equal["MailFor", FALSE] THEN
+{ opsH.mailFor ¨ rootEntry.value; EXIT };
+IF rootEntry.ident.Equal["Database", FALSE] THEN
+{
+IF opsH.dbName.Find["-cached", 0, FALSE] = -1 THEN
+opsH.dbName ¨ rootEntry.value.Concat["-cached"];
+EXIT;
+};
+IF rootEntry.ident.Equal["SchemaType", FALSE] THEN {
+opsH.completeSchema ¨ IF rootEntry.value.Equal["Simple", FALSE] THEN FALSE ELSE TRUE;
+EXIT;
+};
+IF rootEntry.ident.Equal["NewMailLog", FALSE] THEN {
+rootHandle.newMailLog ¨ NEW[WalnutRoot.MiscLogInfoRec ¨ [name: rootHandle.baseName.Concat[rootEntry.value] ]];
+EXIT
+};
+IF rootEntry.ident.Equal["ReadArchiveLog", FALSE] THEN {
+rootHandle.readArchiveLog ¨ NEW[WalnutRoot.MiscLogInfoRec ¨ [name: rootHandle.baseName.Concat[rootEntry.value]] ];
+EXIT
+};
+IF rootEntry.ident.Equal["LogInfo", FALSE] THEN {
+li: InternalLogInfo = NEW[WalnutRoot.InternalLogInfoObject ¨ [name: rootHandle.baseName.Concat[rootEntry.info.fileName]] ];
+li.internalFileID ¨ rootEntry.info.internalFileID;
+li.shortName ¨ rootEntry.info.fileName;
+li.logSeqNoPos ¨ rootEntry.info.seqNoPos;
+li.logSeqNo ¨ IF rootEntry.info.logSeqNo.Fetch[0] = 'E THEN -1
+ELSE Convert.IntFromRope[rootEntry.info.logSeqNo];
+IF li.logSeqNo = -1 THEN rootHandle.expungeLog ¨ li ELSE
+rootHandle.currentLog ¨ li;
+EXIT;
+};
+IF rootEntry.ident.Equal["End", FALSE] THEN {
+finished ¨ TRUE;
+EXIT
+};
+rStream.Close[ ! IO.Error, FS.Error => CONTINUE];
+FinishTransaction[rootHandle, close ! WalnutDefs.Error => CONTINUE];
+rootHandle ¨ NIL;
+ERROR WalnutDefs.Error[$log, $BadRootFile, 
+IO.PutFR["Bad entry %g in RootFile at pos %g",
+[rope[rootEntry.ident]], [integer[curPos]] ]];
+
+ENDLOOP;
+IF finished THEN EXIT;
+ENDLOOP;
+EXITS
+cantParse => {
+rStream.Close[ ! IO.Error, FS.Error => CONTINUE];
+FinishTransaction[rootHandle, close ! WalnutDefs.Error => CONTINUE];
+ERROR WalnutDefs.Error[$log, $BadRootFile, opsH.rootName];
+};
+END;
+
+rStream.Close[];
+rStream¨ NIL;		-- not needed
+
+BEGIN
+who: ROPE ¨ NIL;
+SELECT TRUE FROM
+opsH.key.Length[] = 0 => who ¨ "Key";
+opsH.dbName.Length[] = 0 => who ¨ "Database";
+opsH.mailFor.Length[] = 0 => who ¨ "MailFor";
+rootHandle.newMailLog = NIL => who ¨ "NewMailLog";
+rootHandle.readArchiveLog = NIL => who ¨ "ReadArchiveLog";
+rootHandle.currentLog = NIL => who ¨ "CurrentLog";
+rootHandle.expungeLog = NIL => who ¨ "ExpungeLog";
+ENDCASE;
+IF who # NIL THEN
+ERROR WalnutDefs.Error[$root, $BadRootFile,
+IO.PutFR1["Incomplete RootFile - %g entry is missing", [rope[who]] ] ];
+END;
+
+IF openFile # FS.nullOpenFile THEN
+FS.Close[openFile ! FS.Error => CONTINUE];
+FinishTransaction[rootHandle, close ! WalnutDefs.Error => CONTINUE];
+rootHandle.alpTH ¨ NIL;
+rootHandle.dbTransH ¨ NIL;
+END;
+
+IF newHandle THEN {
+FOR ohL: LIST OF WalnutOpsHandle ¨ opsHandleList, ohL.rest UNTIL ohL = NIL DO
+IF opsH.rootName.Equal[ohL.first.rootName, FALSE] THEN
+ERROR WalnutDefs.Error[$root, $DuplicateRootFile, opsH.rootName];
+ENDLOOP;
+opsHandleList ¨ CONS[opsH, opsHandleList];
+};
+DeclareDBSegment[opsH, newSegmentOk];
+RETURN[TRUE];
+};
+
+StartTransaction: PUBLIC PROC[opsH: WalnutOpsHandle, openDB: BOOL ¨ TRUE]
+	RETURNS[schemaInvalid: BOOL] = { 
+rH: RootHandle = opsH.rootHandle;
+IF rH.alpTH # NIL THEN {
+IF rH.rootOpenFileForLogs # FS.nullOpenFile THEN
+FS.Close[rH.rootOpenFileForLogs ! FS.Error => CONTINUE];
+CloseDBTrans[opsH];
+rH.alpTH ¨ NIL;
+};
+[rH.rootOpenFileForLogs, rH.alpTH] ¨ GetRootReadLock[opsH];
+rH.dbTransH ¨ rH.alpTH;
+IF openDB THEN schemaInvalid ¨ OpenDBTrans[opsH] ELSE schemaInvalid ¨ TRUE;
+};
+
+Shutdown: PUBLIC PROC[opsH: WalnutOpsHandle] = {
+rH: RootHandle;
+IF (rH ¨ opsH.rootHandle) = NIL THEN RETURN;
+CloseInternalLog[rH.currentLog];
+StopExpunge[opsH];
+
+CloseMLog[opsH: opsH, mli: rH.readArchiveLog];
+CloseMLog[opsH: opsH, mli: rH.newMailLog, abortIfExternal: TRUE];
+
+opsH.rootHandle ¨ NIL;
+FinishTransaction[rH, close ! WalnutDefs.Error => CONTINUE];
+};
+
+CloseTransaction: PUBLIC PROC[opsH: WalnutOpsHandle] = {
+rH: RootHandle;
+IF (rH ¨ opsH.rootHandle) = NIL THEN RETURN;
+CloseInternalLog[rH.currentLog];
+StopExpunge[opsH];
+
+CloseMLog[opsH, rH.readArchiveLog];
+
+IF rH.rootOpenFileForLogs # FS.nullOpenFile THEN
+FS.Close[rH.rootOpenFileForLogs ! FS.Error => CONTINUE];
+rH.rootOpenFileForLogs ¨ FS.nullOpenFile;
+FinishTransaction[rH, close ! WalnutDefs.Error => CONTINUE];
+
+rH.alpTH ¨ NIL;
+rH.dbTransH ¨ NIL;
+};
+
+GetOpsHandleList: PUBLIC ENTRY PROC RETURNS[LIST OF WalnutOpsHandle] = {
+ENABLE UNWIND => NULL;
+RETURN[opsHandleList]
+};
+
+ExamineHandleList: PUBLIC ENTRY PROC[proc: PROC[ohL: LIST OF WalnutOpsHandle] RETURNS[LIST OF WalnutOpsHandle] ] = {
+ENABLE UNWIND => NULL;
+opsHandleList ¨ proc[opsHandleList];
+};
+
+FinishTransaction: PROC[rootHandle: RootHandle, request: TransRequest] = {
+IF rootHandle = NIL OR rootHandle.alpTH = NIL THEN RETURN;
+SELECT request FROM
+abort => NULL;
+continue => NULL;
+close => NULL;
+ENDCASE =>
+WalnutDefs.Error[$bug, $UnknownCode, "Bad value passed to FinishTransaction"];
+};
+
+CommitAndContinue: PUBLIC PROC[opsH: WalnutOpsHandle] =
+{ FinishTransaction[opsH.rootHandle, continue] };
+
+AbortTransaction: PUBLIC PROC[opsH: WalnutOpsHandle] = {
+rH: RootHandle;
+IF (rH ¨ opsH.rootHandle) = NIL THEN RETURN;
+FinishTransaction[rH, abort];
+CloseInternalLog[rH.currentLog];
+StopExpunge[opsH];
+CloseMLog[opsH, rH.readArchiveLog];
+
+rH.alpTH ¨ NIL;
+rH.dbTransH ¨ NIL;
+};
+
+EraseDB: PUBLIC PROC[opsH: WalnutOpsHandle] = {
+rH: RootHandle = opsH.rootHandle;
+IF rH = NIL THEN
+ERROR WalnutDefs.Error[$root, $RootNotOpen, "Trying to do an EraseDB"];
+};
+
+FlushMailStream: PUBLIC PROC[opsH: WalnutOpsHandle] = {
+WalnutStream.FlushStream[strm: opsH.rootHandle.newMailLog.stream, setCreateDate: TRUE];
+IF opsH.rootHandle.newMailLog.trans = NIL THEN RETURN;
+FinishMiscTrans[alpTH: opsH.rootHandle.newMailLog.trans, abort: FALSE, continue: TRUE, opsH: opsH]
+};
+
+GetRootFileStamp: PUBLIC PROC[opsH: WalnutOpsHandle] RETURNS[rootFileStamp: GMT] = {
+reason: ATOM;
+BEGIN ENABLE FS.Error => { reason ¨ error.code; GOTO error };
+of: FS.OpenFile ¨
+FS.Open[name: opsH.rootName];   -- under opsH.rootHandle.alpTH
+rootFileStamp ¨ FS.GetInfo[of].created;
+FS.Close[of];
+EXITS
+error =>
+ERROR WalnutDefs.Error[$root, reason, opsH.rootName];
+END;
+};
+
+AcquireWriteLock: PUBLIC PROC[opsH: WalnutOpsHandle] = {
+NULL;
+};
+
+OpenLogStreams: PUBLIC PROC[opsH: WalnutOpsHandle] = {
+rH: RootHandle = opsH.rootHandle;
+IF rH = NIL --OR rH.alpTH = NIL-- THEN
+ERROR WalnutDefs.Error[$log, $TransNotOpen, "Must do Shutdown and Startup"];
+
+IF opsH.readOnly THEN rH.currentLog.readStream ¨
+ StreamOpen[name: rH.currentLog.name, readOnly: TRUE--, trans: rH.alpTH--]
+ELSE {
+rH.currentLog.writeStream ¨
+StreamOpen[name: rH.currentLog.name--, trans: rH.alpTH--];
+rH.currentLog.writeStream.SetIndex[rH.currentLog.writeStream.GetLength[]];
+rH.currentLog.readStream ¨
+FS.StreamFromOpenFile[FS.OpenFileFromStream[rH.currentLog.writeStream]];
+<<FS.StreamFromOpenStream[rH.currentLog.writeStream];>>
+}
+};
+
+ReleaseWriteLock: PUBLIC PROC[opsH: WalnutOpsHandle] = {
+currentLog: InternalLogInfo = opsH.rootHandle.currentLog;
+CloseInternalLog[currentLog];
+currentLog.writeStream ¨
+StreamOpen[name: currentLog.name--, trans: opsH.rootHandle.alpTH--];
+currentLog.writeStream.SetIndex[currentLog.writeStream.GetLength[]];
+currentLog.readStream ¨ FS.StreamFromOpenFile[FS.OpenFileFromStream[currentLog.writeStream]];
+<<currentLog.readStream ¨ FS.StreamFromOpenStream[currentLog.writeStream];>>
+};
+
+CloseLogStreams: PUBLIC PROC[opsH: WalnutOpsHandle] = {
+rH: RootHandle = opsH.rootHandle;
+IF rH = NIL THEN RETURN;
+CloseInternalLog[rH.currentLog];
+StopExpunge[opsH];
+FinishTransaction[rH, continue];
+};
+
+
+GetQuota: PUBLIC PROC[opsH: WalnutOpsHandle] RETURNS[spaceInUse, quota: INT] = {
+rH: RootHandle = opsH.rootHandle;
+spaceInUse ¨ 0;
+quota ¨ 1000000;
+};
+
+GetStreamsForExpunge: PUBLIC PROC[opsH: WalnutOpsHandle, starting: BOOL, pagesWanted: INT] = {
+rH: RootHandle = opsH.rootHandle;
+expungeLog: InternalLogInfo = opsH.rootHandle.expungeLog;
+IF expungeLog.writeStream # NIL THEN
+expungeLog.writeStream.Close[ ! IO.Error, FS.Error => CONTINUE];
+expungeLog.writeStream ¨ NIL;
+
+IF starting THEN {
+openFile: FS.OpenFile ¨ [];
+FS.Delete[name: expungeLog.name];  -- should be under transaction rH.alpTH
+openFile ¨ FS.Create[
+name: expungeLog.name,
+pages: 0];  -- under rH.alpTH
+FinishTransaction[rH, continue];
+rootStreamOptions[closeFSOpenFileOnClose] ¨ TRUE;
+rH.expungeLog.writeStream ¨
+FS.StreamFromOpenFile[openFile: openFile, accessRights: $write,
+initialPosition: $start, streamOptions: rootStreamOptions,
+streamBufferParms: streamBufferOption];
+rH.expungeLog.readStream ¨
+FS.StreamFromOpenFile[openFile];
+}
+ELSE {
+expungeLog.writeStream ¨ StreamOpen[
+name: expungeLog.name, trans: rH.alpTH, exclusive: TRUE];
+expungeLog.readStream ¨
+FS.StreamFromOpenFile[FS.OpenFileFromStream[expungeLog.writeStream]];
+};
+};
+
+SwapLogs: PUBLIC PROC[opsH: WalnutOpsHandle, expungeFileID: INT, newRootStamp: GMT] RETURNS[newLogLen: INT] = {
+rH: RootHandle = opsH.rootHandle;
+tempLog: InternalLogInfo;
+reason: ATOM;
+
+IF rH.currentLog.internalFileID = expungeFileID THEN		-- already did swap
+RETURN[rH.currentLog.writeStream.GetLength[]];
+
+IF rH.expungeLog.internalFileID # expungeFileID THEN
+ERROR WalnutDefs.Error[$expungeLog, $WrongFileID,
+IO.PutFR["FileID is: %g, FileID expected is: %g",
+[integer[rH.expungeLog.internalFileID]], [integer[expungeFileID]]] ];
+
+IF rH.expungeLog.writeStream = NIL THEN 
+ERROR WalnutDefs.Error[$expungeLog, $LogNotOpen, "Doing SwapLogs"];
+
+BEGIN ENABLE FS.Error => { reason ¨ error.code; GOTO error };
+
+of: FS.OpenFile ¨ FS.Open[
+name: opsH.rootName, wantedCreatedTime: rH.createDate,
+lock: $write];  -- under rH.alpTH
+rStream: STREAM ¨ FS.StreamFromOpenFile[
+openFile: of, accessRights: $write,
+streamOptions: rootStreamOptions,
+streamBufferParms: streamBufferOption];
+rStream.SetIndex[rH.currentLog.logSeqNoPos];
+rStream.PutRope["Expunge"];
+rStream.SetIndex[rH.expungeLog.logSeqNoPos];
+rStream.PutRope[IO.PutFR1["%07d", [integer[rH.currentLog.logSeqNo]]]];
+<<FS.SetByteCountAndCreatedTime[of, -1, newRootStamp];>>
+
+WalnutStream.SetHighWaterMark[rH.currentLog.writeStream, 0, 0];
+newLogLen ¨ rH.expungeLog.writeStream.GetLength[];
+rStream.Flush[];
+MarkDBTrans[rH.dbTransH];		-- clean up the transaction
+rStream.Close[];
+<<rH.createDate ¨ newRootStamp;>>
+rH.createDate ¨ FS.GetInfo[FS.Open[name: opsH.rootName, lock: $read]].created;
+
+CloseInternalLog[rH.currentLog];		-- release the currentLog streams
+CloseInternalLog[rH.expungeLog];		-- will want only read Lock
+
+--  swap the rootLog variables currentLog & expungeLog
+tempLog ¨ rH.currentLog;
+rH.currentLog ¨ rH.expungeLog;
+rH.expungeLog ¨ tempLog;
+rH.currentLog.logSeqNo ¨ rH.expungeLog.logSeqNo;
+rH.expungeLog.logSeqNo ¨ -1;
+EXITS
+error => ERROR WalnutDefs.Error[$root, reason, "During SwapLogs"];
+END;
+};
+
+StopExpunge: PUBLIC PROC[opsH: WalnutOpsHandle] = {
+IF opsH.rootHandle = NIL OR opsH.rootHandle.expungeLog = NIL THEN RETURN;
+IF opsH.rootHandle.expungeLog.writeStream # NIL THEN {
+opsH.rootHandle.expungeLog.writeStream.Close[ ! FS.Error, IO.Error => CONTINUE];
+opsH.rootHandle.expungeLog.writeStream ¨ NIL;
+};
+};
+
+PrepareToCopyTempLog: PUBLIC PROC[ opsH: WalnutOpsHandle, which: WhichTempLog, pagesAlreadyCopied: INT, reportProc: WalnutDefs.CheckReportProc]
+RETURNS[ok: BOOL¨FALSE] = {
+tempLogLen, pagesNeeded, actualPages, currentInUsePages: INT;
+rH: RootHandle = opsH.rootHandle;
+current: STREAM = rH.currentLog.writeStream;
+tempStream: STREAM;
+of: FS.OpenFile;
+mli: MiscLogInfo ¨ OpenTempStream[rH, which, TRUE];
+IF (tempStream ¨ mli.stream) = NIL THEN RETURN[FALSE];
+
+currentInUsePages ¨ FS.PagesForBytes[current.GetLength[]];
+tempLogLen ¨ tempStream.GetLength[];
+pagesNeeded ¨ FS.PagesForBytes[tempLogLen+200] + currentInUsePages - pagesAlreadyCopied;
+actualPages ¨ FS.GetInfo[of¨ FS.OpenFileFromStream[current]].pages;
+
+BEGIN
+IF actualPages < pagesNeeded THEN {
+BEGIN
+MarkDBTrans[rH.dbTransH];
+END;
+};
+END;
+
+RETURN[tempStream # NIL];
+};
+
+GetStreamsForCopy: PUBLIC PROC[opsH: WalnutOpsHandle, which: WhichTempLog] RETURNS[tempStream: STREAM] = {
+tempStream ¨ OpenTempStream[opsH.rootHandle, which, TRUE].stream;
+};
+FinishCopy: PUBLIC PROC[opsH: WalnutOpsHandle, which: WhichTempLog] = {
+mli: MiscLogInfo;
+fileHandle: FS.OpenFile;
+pages: INT ¨ 200;
+
+SELECT which FROM
+newMail =>  mli ¨ opsH.rootHandle.newMailLog;
+readArchive => { mli ¨ opsH.rootHandle.readArchiveLog; pages ¨ 0};
+ENDCASE => ERROR WalnutDefs.Error[$log, $UnknownLogFileType];
+IF mli.stream = NIL THEN mli ¨ OpenTempStream[opsH.rootHandle, which];
+fileHandle ¨ FS.OpenFileFromStream[mli.stream];
+<< SetLength does not appear to work for mli.stream
+WalnutStream.SetHighWaterMark[
+strm: mli.stream, hwmBytes: 0, numPages: pages, setCreateDate: TRUE];
+>>
+mli.stream.Close[ ! FS.Error, IO.Error => CONTINUE];
+
+BEGIN
+FS.Close[fileHandle ! FS.Error => CONTINUE];
+mli.stream ¨ NIL;
+IF which = newMail THEN {
+-- to get rid of potential lock conflict on newMailLog
+CloseTransaction[opsH];
+[] ¨ StartTransaction[opsH, TRUE];
+};
+END;
+};
+
+AbortTempCopy: PUBLIC PROC[opsH: WalnutOpsHandle, which: WhichTempLog] = {
+mli: MiscLogInfo;
+closeError: BOOL ¨ FALSE;
+SELECT which FROM
+newMail => mli ¨ opsH.rootHandle.newMailLog;
+readArchive => mli ¨ opsH.rootHandle.readArchiveLog;
+ENDCASE => ERROR WalnutDefs.Error[$log, $UnknownLogFileType];
+IF mli.stream = NIL THEN RETURN;
+mli.stream.Close[ ! FS.Error, IO.Error => { closeError ¨ TRUE; CONTINUE} ];
+mli.stream ¨ NIL;
+};
+
+GetNewMailStream: PUBLIC PROC[opsH: WalnutOpsHandle, lengthRequired, pagesWanted: INT]
+	RETURNS[ok: BOOL¨FALSE, actualLen: INT] = {
+mStream: STREAM;
+mailLog: MiscLogInfo;
+rH: RootHandle = opsH.rootHandle;
+CheckStamp[rH, GetRootFileStamp[opsH]];
+IF (mailLog ¨ rH.newMailLog).stream # NIL THEN RETURN[FALSE, -1];
+
+IF seriousDebugging THEN StatsReport[opsH, "\n### Trans for newMailLog"];
+
+[mailLog.rootOpenFile--, mailLog.trans--] ¨ GetRootReadLock[opsH];
+mStream ¨ mailLog.stream ¨ StreamOpen[
+name: mailLog.name--, trans: rH.newMailLog.trans--, exclusive: TRUE];
+IF (actualLen ¨ mStream.GetLength[]) < lengthRequired THEN {
+CloseMLog[opsH, mailLog];
+RETURN[FALSE, actualLen];
+};
+IF actualLen > lengthRequired THEN {
+WalnutStream.SetHighWaterMark[mStream, lengthRequired, pagesWanted, TRUE];
+mStream.Flush[];
+FinishMiscTrans[alpTH: mailLog.trans, abort: FALSE, continue: TRUE, opsH: opsH];
+};
+RETURN[TRUE, actualLen]
+};
+
+GetReadArchiveStream: PUBLIC PROC[opsH: WalnutOpsHandle, pagesWanted: INT ¨ -1]
+	RETURNS[STREAM] = {
+readArchive: MiscLogInfo;
+IF (readArchive ¨ opsH.rootHandle.readArchiveLog).stream # NIL THEN RETURN[NIL];
+CheckStamp[opsH.rootHandle, GetRootFileStamp[opsH]];
+readArchive.stream ¨ StreamOpen[
+name: readArchive.name,
+trans: opsH.rootHandle.alpTH,
+pages: pagesWanted,
+exclusive: TRUE];
+RETURN[readArchive.stream]
+};
+
+ReturnNewMailStream: PUBLIC PROC[opsH: WalnutOpsHandle] = {
+mailLog: MiscLogInfo = opsH.rootHandle.newMailLog;
+mStrm: STREAM ¨ mailLog.stream;
+mailLog.stream ¨ NIL;
+mStrm.Close[ ! FS.Error, IO.Error => CONTINUE];
+IF mailLog.rootOpenFile # FS.nullOpenFile THEN {
+trans: AlpTHandle ¨ mailLog.trans;
+FS.Close[mailLog.rootOpenFile ! FS.Error => CONTINUE];
+mailLog.rootOpenFile ¨ FS.nullOpenFile;
+mailLog.trans ¨ NIL;
+FinishMiscTrans[alpTH: trans, abort: FALSE, continue: FALSE, opsH: opsH];
+};
+};
+
+ReturnReadArchiveStream: PUBLIC PROC[opsH: WalnutOpsHandle] = {
+raStrm: STREAM ¨ opsH.rootHandle.readArchiveLog.stream;
+opsH.rootHandle.readArchiveLog.stream ¨ NIL;
+raStrm.Close[ ! FS.Error, IO.Error => CONTINUE];		-- assume flushed
+};
+
+
+RegisterStatsProc: PUBLIC PROC[opsH: WalnutOpsHandle, proc: WalnutDefs.CheckReportProc] =
+{ IF opsH.rootHandle # NIL THEN opsH.rootHandle.statsProc ¨ proc };
+
+UnregisterStatsProc: PUBLIC PROC[opsH: WalnutOpsHandle, proc: WalnutDefs.CheckReportProc] = {
+IF opsH.rootHandle = NIL THEN RETURN;
+IF opsH.rootHandle.statsProc = proc THEN opsH.rootHandle.statsProc ¨ NIL
+};
+
+StatsReport: PUBLIC WalnutDefs.CheckReportProc = {
+IF opsH.rootHandle = NIL THEN RETURN;
+IF opsH.rootHandle.statsProc # NIL THEN opsH.rootHandle.statsProc[opsH, format, v1, v2, v3]
+};
+
+CreateTrans: PROC[opsH: WalnutOpsHandle] RETURNS[alpTH: AlpTHandle] = {
+rH: RootHandle = opsH.rootHandle;
+alpTH ¨ NIL;
+};
+
+FinishMiscTrans: PROC[alpTH: AlpTHandle, abort: BOOL, continue: BOOL, opsH: WalnutOpsHandle] = {
+IF alpTH = NIL THEN RETURN;
+};
+
+GetRootReadLock: PROC[opsH: WalnutOpsHandle]
+	RETURNS[of: FS.OpenFile, alpTH: AlpTHandle] = {
+reason: ATOM;
+rootFileStamp: GMT;
+alpTH ¨ CreateTrans[opsH];
+BEGIN ENABLE FS.Error => { reason ¨ error.code; GOTO error};
+of ¨ FS.Open[
+name: opsH.rootName];
+rootFileStamp ¨ FS.GetInfo[of].created;
+EXITS
+error => {
+FS.Close[of ! FS.Error => CONTINUE];
+ERROR WalnutDefs.Error[$root, reason, opsH.rootName];
+};
+END;
+CheckStamp[opsH.rootHandle, rootFileStamp];
+};
+
+CloseInternalLog: PROC[li: InternalLogInfo] = {
+IF li = NIL THEN RETURN;
+IF li.writeStream # NIL THEN {
+li.writeStream.Close[ ! FS.Error, IO.Error => CONTINUE];
+li.writeStream ¨ NIL;
+};
+
+IF li.readStream # NIL THEN {
+li.readStream.Close[ ! FS.Error, IO.Error => CONTINUE];
+li.readStream ¨ NIL;
+};
+}; 
+
+CloseMLog: PROC[opsH: WalnutOpsHandle, mli: MiscLogInfo, abortIfExternal: BOOL ¨ FALSE] = {
+strm: STREAM;
+IF mli = NIL THEN RETURN; 
+strm ¨ mli.stream;
+mli.stream ¨ NIL;
+IF mli.rootOpenFile # NIL THEN {		-- is external
+of: FS.OpenFile ¨ mli.rootOpenFile;
+mli.rootOpenFile ¨ FS.nullOpenFile;
+IF strm # NIL THEN strm.Close[! IO.Error, FS.Error => CONTINUE];
+IF mli.trans # NIL AND mli.trans # opsH.rootHandle.alpTH THEN
+FinishMiscTrans[alpTH: mli.trans, abort: abortIfExternal, continue: FALSE, opsH: opsH ! FS.Error => CONTINUE];
+FS.Close[of ! FS.Error => CONTINUE];
+}
+ELSE
+IF strm # NIL THEN strm.Close[ ! FS.Error, IO.Error => CONTINUE];
+};
+
+OpenTempStream: PROC[rH: RootHandle, which: WhichTempLog, readOnly: BOOLEAN ¨ FALSE]
+	RETURNS[mli: MiscLogInfo] = {
+SELECT which FROM
+newMail => mli ¨ rH.newMailLog;
+readArchive => mli ¨ rH.readArchiveLog;
+ENDCASE => ERROR WalnutDefs.Error[$log, $UnknownLogFileType];
+IF mli.stream # NIL THEN {
+mli.stream.Close[ ! IO.Error, FS.Error => CONTINUE];
+mli.stream ¨ NIL;
+};
+
+mli.stream ¨ StreamOpen[name: mli.name, trans: rH.alpTH, readOnly: readOnly, exclusive: FALSE, closeFSOpenFile: FALSE];
+mli.trans ¨ rH.alpTH
+};
+
+CheckStamp: PROC[rH: RootHandle, created: GMT] = {
+IF created # rH.createDate THEN
+ERROR WalnutDefs.Error[$root, $WrongCreateDate,
+IO.PutFR[" Create date is : %g, Create date expected is: %g",
+[time[created]], [time[rH.createDate]]] ];
+};
+
+NextRootEntry: PROC[strm: STREAM] RETURNS[rte: WalnutKernelDefs.RootEntry] = {
+[] ¨ strm.SkipWhitespace[flushComments: TRUE];
+rte.ident ¨ strm.GetTokenRope[].token;
+IF rte.ident.Equal["End", FALSE] THEN RETURN;
+
+[] ¨ strm.SkipWhitespace[flushComments: TRUE];
+IF rte.ident.Equal["LogInfo", FALSE] THEN {
+lif: WalnutKernelDefs.LogInfoFromRoot;
+lif.fileName ¨ strm.GetTokenRope[IO.IDProc].token;
+IF lif.fileName.Fetch[0] = '[ OR lif.fileName.Fetch[0] = '/ THEN
+ERROR WalnutDefs.Error[$root, $OldRootFormat, "You must convert your root file to the new format"];
+[]¨ strm.SkipWhitespace[flushComments: TRUE];
+lif.internalFileID ¨ strm.GetInt[];
+[]¨ strm.SkipWhitespace[flushComments: TRUE];
+lif.seqNoPos ¨ strm.GetIndex[];
+lif.logSeqNo ¨ strm.GetTokenRope[].token;
+[]¨ strm.SkipWhitespace[flushComments: TRUE];
+rte.info ¨ lif;
+}
+ELSE
+IF rte.ident.Equal["Key", FALSE] THEN rte.value ¨ strm.GetLineRope[] 
+ELSE {
+rte.value ¨ strm.GetTokenRope[IO.IDProc].token;
+[]¨ strm.SkipWhitespace[flushComments: TRUE];
+};
+
+RETURN[rte];
+};
+
+
+StreamOpen: PROC[name: ROPE, readOnly: BOOL¨ FALSE, pages: INT ¨ 200,
+trans: AlpTHandle¨ NIL, 
+exclusive: BOOL ¨ FALSE,
+closeFSOpenFile: BOOL ¨ TRUE] RETURNS [strm: STREAM] = {
+openFile: FS.OpenFile ¨ [];
+
+IF readOnly THEN {
+openFile ¨ FS.Open[
+name: name];  -- under trans
+strm ¨ FS.StreamFromOpenFile[openFile: openFile, streamOptions: rootStreamOptions, streamBufferParms: streamBufferOption];
+}
+ELSE {
+actualPages: INT;
+openFile ¨ FS.Open[
+name: name,
+lock: $write];  -- under trans
+actualPages ¨ FS.GetInfo[openFile].pages;
+<<IF pages > actualPages THEN FS.SetPageCount[openFile, pages];>>
+
+rootStreamOptions[closeFSOpenFileOnClose] ¨ closeFSOpenFile;
+
+strm ¨ FS.StreamFromOpenFile[openFile: openFile, accessRights: $write, initialPosition: $start, streamOptions: rootStreamOptions, streamBufferParms: streamBufferOption];
+};
+};
+
+streamBufferOption: FS.StreamBufferParms = [vmPagesPerBuffer: 4, nBuffers: 4];
+
+DeclareDBSegment: PROC[opsH: WalnutOpsHandle, newSegmentOk: BOOL] = {
+protectionViolation: BOOL ¨ FALSE;
+opsH.db ¨ LoganBerry.Open[dbName: opsH.dbName];
+};
+
+OpenDBTrans: PROC[opsH: WalnutOpsHandle] RETURNS[schemaInvalid: BOOL] = {
+schemaInvalid ¨ FALSE;
+};
+
+CloseDBTrans: PROC[opsH: WalnutOpsHandle] RETURNS[] = {
+NULL;
+};
+
+MarkDBTrans: PROC[trans: WalnutRoot.TransactionHandle] RETURNS[] = {
+NULL;
+};
+
+
+END.
+   ò  
+WalnutRootImpl.mesa
+Copyright ” 1985, 1987, 1988, 1989, 1992 by Xerox Corporation.  All rights reserved.
+Willie-Sue, July 20, 1989 12:11:49 pm PDT
+Doug Terry, November 21, 1990 1:53 pm PST
+Swinehar, May 30, 1991 1:31 pm PDT
+Willie-s, April 27, 1992 1:47 pm PDT
+
+Walnut Root Operations Implementation
+
+Plan
+
+The root file provides the path names of the other files used by Walnut, plus other information about the database.  The only time the rootFile is written is when the first log gets changed.
+
+Types
+
+Variables
+
+
+Procedures
+
+Opening/closing the rootFile
+for the stream for the rootFile - it is a small file
+
+The following code is commented out since it causes the create timestamp on the root file to be updated which forces a scavenge.  ...DBT
+IF ~opsH.readOnly THEN {
+ENABLE FS.Error => { reason _ error.code; GOTO error };
+openFile _ FS.Open[name: opsH.rootName, lock: $write];  -- under rootHandle.alpTH
+FS.Close[openFile];
+
+EXITS error =>
+IF reason = $unknownFile THEN
+ERROR WalnutDefs.Error[$root, $RootNotFound, opsH.rootName]
+ELSE
+IF reason = $accessDenied THEN isReadOnly _ TRUE
+ELSE ERROR WalnutDefs.Error[$root, reason, opsH.rootName];
+}
+ELSE isReadOnly _ TRUE;
+
+opsH.readOnly _ isReadOnly;
+End of root file timestamp problem.  ... DBT
+parse the root file to get names for database, newMail, readArchive, and first logs
+default is complete - simple only if value is work simple
+check for possible duplicate segment names or numbers
+
+Managing the CurrentLog
+Establish EOF invariant for log stream, DCS, April 26, 1991
+uses same trans as before
+Establish EOF invariant for log stream, DCS, April 26, 1991
+
+Managing the ExpungeLog
+
+assert: have a write lock on the currentLog, the expungeLog is not open
+delete and re-create the expunge log, allowing alpine to place the file on the volume with the most free space
+If the file is going to be unlocked, then this option must be false
+Swaps the current log and expunge log so that they are interchanged.  The newRootStamp is ignored.
+
+Managing the TempLogs
+makes sure there is enough space to copy the WhichTempLog onto the currentLog; returns NIL for the streams if there is not enough space;  currentStream & tempStream are opened under the same transaction
+extra bytes are for start/endcopy entries
+<<FS.SetPageCount[of, pagesNeeded ! FS.Error =>
+IF error.code = $quotaExceeded THEN {
+reportProc[opsH, "\n%g\n", [rope[error.explanation]] ]; GOTO quota }
+ELSE REJECT];>>
+Setting the size of the file sets a lock on the owner database.  We remove this read lock after committing the transaction (so it will be downgraded);  note we have used the same transaction for the new log as for the root 
+<<EXITS
+quota => {
+mli.stream.Close[ ! IO.Error, FS.Error => CONTINUE];
+tempStream _ mli.stream _ NIL;
+RETURN
+};>>
+
+sets the length of the tempLog to something reasonable and closes the tempStream
+Also releases the write lock held on the temp log
+hwmBytes: INT _ FS.BytesForPages[200];
+prevPages: INT _ -1;
+IF which = newMail THEN prevPages _ FS.GetInfo[fileHandle].pages;
+
+Access to streams for the various logs, other values parsed from the rootFile
+Utilities
+
+Local Utilities
+FinishMiscTrans[alpTH, FALSE, FALSE, opsH];
+if abortIfExternal and rootOpenFile#nullOpenFile then abort
+Close the stream even though it is going to be re-opened immediately because the desired access (read vs. write) may be different.
+has special options (see below)
+If the file is going to be unlocked, then this option must be false
+ ù ˙  ïNewlineDelimiter
+ñ(cedarcode) styleô codeöœbôKöú
+œeúIôTKô)Kô)Kô"Kô$Kô Köú%ô%óKò öœk	ò	Köú
+üúüúòKöúüúòKöüúüúàòêKöüúòKòKöúòKöúüú+ò;Köúüú,òBKöúòKöúüú!ò3Kò óöùúüúüòKò öüòKöú	üúüúò#KöúòKò óöüòKòKò óKöúüòKô öùôKô KôæóKô öùôKò KöüúüúüúòKöüúüúüúòKöüúüúüúüúòKò Köúüúò3Kò Köúüúò)Köúüúüúò6Kò Köúüúò3Köúüúò+Köúüúò-Köúüúò)Kò Köúüúò0Kò óKô öù	ô	Kô KöúüúüúòKöúüúüúòKò Köúüúüúüúò-óKô Köù
+ô
+Kô öùôKò Köú4ô4Köúüú8òLKò ò'KöúüúòKöúüúòKöúüúœcyòóKòóKô öœnúüúü
+ú=üúüúüúòoKöüúüúüúòKöúüúüúòKò öüòKöúüúòKöú
+üú
+òKöú	üúòKöú
+üúòKöúüúòKöúòKöúüúò0Kò KòöüúüúüòKöúüúò<Köüúò"óKò8KöúüúòKò%Kò'Kò KôàöüúüúôKöüúüú!üú	ô7KöúQôQöüúôKô öüú	ôöüúüôKöüú6ô;óöüôKöüúüúüô0Köüúüú0ô:óóóKöúôKöüúüúôóKô KöúôKô,Kò öüúüúüú!üú	ò=Köú7†òPò KöúòKöú!ò!Köú'ò'óKöúüúò5öüú	òKöüú0ò5óóKöüúòKò KöúSôSKò Kö
+üúüúüúüú
+üúò8Köú
+üúüúòöúòöüòKöúüúò!Kò?öüòöüúüúüò+Köúüúò%óöüú"üúüò/Köú"üúò)óöüú#üúüò0Köúòöüú üúüò2Kò0óKöüúòKöúòóöüú%üúüúò4Kô9Köúüú!üúüúüúüúüúòUKöüúòKöúòóöüú%üúüúò4KöúüúSònKöüòKòóöüú)üúüúò8KöúüúSòrKöüòKòóöüú"üúüúò1Köúüúbò{Kò2Kò'Kò)öúüú'üúò>Köüú.ò2óöüúüúüò8KòóKöüúòKòóöüúüúüúò-KöúüúòKöüòKòóKöúüúüú
+üúò1Köú:üúòDKöúüúòöüú&ò+öüú,ò.Köú.ò.óKò óóKöüúòóKöüú
+üúüúòKöüúòöüòöúòKöúüúüú
+üúò1Köú:üúòDKöüú5ò:KòóóKöüúòóKò KöúòKöú	üú†òKò öüòKöúüúüúòöüúüúüòKò%Kò-Kò-Köúüúò2Köúüúò:Köúüúò2Köúüúò2Köüúòóöüúüúüòöüú&ò+KöüúEòGóóKöüúòóKò öüúüúüò"Köüúüú
+üúò*óKöú:üúòDKöúüúòKöúüúòKöüúòKò óKô5öüúüúòöüúüúüú+üúüúüòMöüú)üúüò6Köüú<òAóKöüúòóKöúüúò*KòóKò%KöüúüúòKòKò óö
+°úüúüú üúüúòIKöúüúüúò"Köú!ò!öüúüúüúòöüúüúüò0Köüú üú
+üúò8óKöúòKöúüúòKòóKò;KòKöüúüú"üúüúòKKòóKò ö°úüúüúò0KòKöüúüúüúüúò,Köú ò öúòKò óKöú.ò.Köú;üúòAKò KöúüúòKöú2üúò<KòóKò ö°úüúüúò8KòKöüúüúüúüúò,Köú ò öúòKò óKöú#ò#Kò öüúüúüò0Köüú üú
+üúò8óKöúüúò)Köú2üúò<Kò KöúüúòKöúüúòKòKò óö°úüúüúüúüúüúüúòHKöüúüúüúòKöüúòKöúòKò óö°úüúüúüúüúüúüúüúüúüúòtKöüúüúüúòKò$KòóKò ö°úüú3òJKöüúüúüúüúüúüúò:öüú	üòKöú	üúòKöúüúòKöú	üúòöüúò
+KòNóóKöúòóKò ö°úüúüúò7Köú1ò1óKò ö°úüúüúò8KöúòKöüúüúüúüúò,KöúòKöú ò KöúòKöú#ò#Kò KöúüúòKöúüúòKöúòóKò ö°úüúüúò/Köú!ò!öüúüúüòKöüúBòGóKöúòóKò ö°úüúüúò7KöúQüúòWKöüú$üúüúüúò6Köú@üúüúòbKöúòóKò ö
+°úüúüúüúüúòTKöúüúòöüúüúüú!üú	ò=öúüúòKöú †ò>óKöúüúò'KöüúòöüòöúòKöüú0ò5óóKöüúòóKòóóKô öùôKò ö°úüúüúò8KöüúòKöúòóKò ö°úüúüúò6Köú!ò!ö	üúüúüúüúüò&KöüúGòLóKò öüúüúò0Köú0üúòJöüúòòKöú:ò:óJô;KòJòKöúHòHKöú7ò7óKòóóKöúòóKò ö°úüúüúò8KôKöú9ò9KöúòòKöúDòDóJô;KòDKò]KòLKòóKò ö°úüúüúò7Köú!ò!KöüúüúüúüúòKöú ò KöúòKöú ò KòKò óóKô öùôKò ö
+°úüúüúüúüúòPKöú!ò!KòKòKòKò óö
+°úüúüú"üúüúò^Kô KôGKò!Köú9ò9öüúüúüò$Köú üúüú
+üúò@óKöúüúòKò öüú
+üúòJöúnônKòKöüú!†'òJòKöúòKöú†òóKöú ò öúCôCKöú,üúò1óòöú?ò?Köú:ò:Köú'ò'óóòKöú ò óKöúòöüòò$Köú3üúò9óòKöúEòEóKòóóKöúòóKò ö°úüúüú'üúüúüúüúòoJöúbôbKò!KòKöúüúòKò öüú.üú†òIKöüú(ò.óKò öüú.üò4öüú,ò1öüú/ò1KöúEòEóóóKò öüúüúüúò(Köüú>òCóKò öüúüúüú!üú	ò=Kò öúüúòKöú6ò6Köú!ò!óöú	üúò(Köú#ò#Köú!ò!Köú'ò'óKöú,ò,KöúòKöú,ò,Köúüú4òFKöüú2üò8Kò Köú?ò?Kò2KöúòKöú†ò6KöúòKò!Köúüú<òNKò Köú"†!òCKöú"†ò=Kò Kö†6ò6KòKòKòKò0KòöüòKöú	üú4òBóKöüúòóKòóKò ö°úüúüúò3KöüúüúüúüúüúüúòIöüú*üúüúò6öú0üúüú
+üúòPKöú)üúò-óKòóKòóóKô öùôKò ö°úüúüúBüú*üúüúüúò´Köú ô Köú9üúò=Köú!ò!Köú	üúò,KöúüúòKöúüú
+òKöú-üúò3Kö
+üúüúüúüúüúò6Kò Köúüú$ò:Kò$Köú)ô)KöúüúHòXKöúüú3òCKò öüòöüúüúò#öüú üú	ô/öüúüúô%Köú8üúôDóKöüúüúüôóKöúﬂôﬂöüòKöúòKöüúòóKöúòóöúüôöú
+ô
+Köúüúüú
+üúô4KöúüúôKöüôKöúôóóKöüúòóKò KöüúüúòKòóKò ö
+°úüúüú-üúüúòjKöú4üú	òAKòóKô ö°
+úüúüú0òGKöúPôPKô1KöúòKöúüú
+òKöúüúòKöú
+üúüúô&KöúüúôKò öüúüòKò-KòBKöüúüú-ò=óKöüúüúüú.òFKò/KöüúüúüúôAKöú3ò3öúòKöú?üúòEóKòKöúüúüú
+üúò4Kò öüòKöüúüú
+üúò,KöúüúòöüúüúòKö†6ò6KöúòKöúüúò"KòóKöüúòóKòóKò ö°úüúüú0òJKöúòKöúüúüúòöüúüòKò,Kò4Köüúüú-ò=óKöüúüúüúüúò Kö	úüúüúüúüúòKKöúüúòKòóóKô öùMôMKò ö°úüúüú5üúòVKöüúüúüúüúò,Köú	üúòKöúòKöú!ò!Köú'ò'Kö
+üú$üúüúüúüúòAKò Köüúüú1òIKò KòBò&Köú?üúòEóöüú4üúò<KöúòKöüúüúòKòóöüúüúò$KöúDüúòJKöúòKöú-üúüúòPKòóKöüúüúòKöúòóKò ö°úüúüú%üúòOKöúüúüúòKòKö
+üú9üúüúüúüúòPKöú4ò4ò KöúòKöúòKöúòKöúüúòóKöüúòKöúòóKò ö°úüúüúò;Köú2ò2KöúüúòKöúüúòKöúüúüú
+üúò/öüúüúüúò0Kò"Köüúüú
+üúò6Köúüúò'KöúüúòKöú%üúüúòIKòóKòóKò ö°úüúò?Köúüú)ò7Köú(üúò,Köúüúüú
+üú†òCKöúòóKò óöù	ô	Kò ö°úüúüú;òYKöúüúüúüú$òCóKò ö°úüúüú=ò]Köüúüúüúüúò%Köüú"üúüòHKöúòóKò ö°úüúò2Köüúüúüúüúò%Köüúüúüú4ò[KöúòóóKô öùôKò ö°úüúüúòGKò!KöúüúòKöúòóKò ö°úüúüúüúò`Köüú	üúüúüúòKòóKò ö°úüúò,Köúüúüú!ò0KöúüúòKöúüúòKòöüúüúüú!üúò<òKöúòóKöúüúò'öüòöú
+ò
+Köüúüú
+üúò$Köúüúüúô+Köüú0ò5KòóóKöüúòóKöú+ò+KòóKò ö°úüúò/KöüúüúüúüúòöüúüúüúòKöúüúüú
+üúò8KöúüúòKòóKò öüúüúüúòKöúüúüú
+üúò7KöúüúòKòóKòóKò ö°	úüú;üúüúò[Köú;ô;KöúüúòKöüúüúüúüúòKòKöúüúòöüúüúüú†ò0Köúüúò#Köúüúò#Köüúüúüúüúüú
+üúò@öüúüú!üò=KöúDüúüú
+üúònóKöüúüú
+üúò$KöúòóöüòKöüúüúüúüúüú
+üúòAóKòóKò ö°úüú0üúüúòTKöúüúòöüúüòKòKò'Köüúüú-ò=óöüúüúüúòKôÇKöúüúüú
+üúò4KöúüúòKòóKò KöúXüúüúòwKòKòóKò ö°
+úüúüúò2öüúüòöüú*ò/öüú;ò=Köú*ò*óóóKòóKò ö°úüúüúüú%òNKöú(üúò.Kò&Köüúüúüúüúò-Kò Köú(üúò.öüúüúüúò+Köú&ò&Köú!üúò2öüúüúüò@Köüú^òcóKöú'üúò-Kò#Köú'üúò-KòKò)Köú'üúò-KòKòKöüòKöüúüúüú òEöüúòKöúüúò/Köú'üúò-KòKò óóKöüúòKòKò óKöúôKò ö°
+úüúüúüúüú	üúòEKöúüúòKöúüúüúòKö	úüúüúüúüúò8òKò óöüú
+üúòòKöú†òóKòzKòóöüúòKöúüúòòKöúòKöú†òóKöúüúò)KöüúüúüúüòAKò öúCôCKò<óKò Kò©KòóKòóKò Köúüú8òNKò ö°úüú&üúòEKöúüúüúò"KïStartOfExpansion/[conv: LoganBerry.Conv _ NIL, dbName: ROPE]ò/KòóKò ö°úüúüúüúòIKöúüúòKöúòKò óö°úüúüúò7KöüúòKöúòKò óö°úüú&üúòDKöüúòKöúòóKò Kò óKöüúòóó Öó    \J  á‹  

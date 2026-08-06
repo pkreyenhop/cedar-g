@@ -1,0 +1,650 @@
+
+DIRECTORY
+Basics USING [BITSHIFT, MoveWords],
+BTree USING [Compare, CompareEntries, Comparison, EachEntryProc, Entry, EntrySize, EnumerateProc, Key, NewRecordFromEntry, PageNumber, PagePtr, PageSize, PageStorage, PageStoragePrimitives, Reason, Record, ReferencePage, ReferenceType, Relation, ReleasePage, RepresentationPrimitives, reservedWordsPerPage, State, statePage, TestEntryProc, UpdateState],
+BTreeInternal USING [AssignRefESR, BackUpOneEntry, BTreeEntrySize, BTreePagePtr, BugType, Compare, CompareEntries, entry0Offset, entry1Offset,  <<entry2Offset,>> EntryOrdinal, entryOverhead, EntrySize, EntryTable, GetDefaultPathStk, Heap, Lock, LockMode, NewRecordFromEntry, nilOffset, nilPage, OffsetTable, OffsetTableObject, PageOffset, pageOverhead, PathEntryLE, PathStk, PathStkEntry, PathStkIndex, PathStkObject, PathToMaxDescendant, ReferencePage, ReferenceStack, ReleasePage, RepairOffsets, ReturnDefaultPathStk, sealValue, Tree, TreeObject, TreeState, Unlock, WriteStatePage];
+
+BTreeRead: MONITOR
+LOCKS tree USING tree: Tree
+IMPORTS Basics, BTreeInternal      
+EXPORTS BTree, BTreeInternal
+= { OPEN BTree, BTreeInternal;
+Tree: TYPE = REF TreeObject;
+TreeObject: PUBLIC TYPE = BTreeInternal.TreeObject;
+PathStk: TYPE = REF PathStkObject;
+PathStkObject: PUBLIC TYPE = BTreeInternal.PathStkObject;
+New: PUBLIC SAFE PROC
+[repPrim: RepresentationPrimitives, storPrim: PageStoragePrimitives,
+ minEntrySize: CARD ¨ 1, initialState: State[closed..suspended] ¨ closed]
+RETURNS [tree: Tree] = CHECKED {
+tree ¨ NEW [TreeObject ¨ [state: [], repPrim: repPrim, storPrim: storPrim, minEntrySize: minEntrySize, objectState: initialState]];
+};
+Open: PUBLIC SAFE PROC
+[tree: Tree, storage: PageStorage, pageSize: PageSize,
+ initialize: BOOL ¨ FALSE, maintainRecomputableState: BOOL ¨ TRUE] = TRUSTED {
+DO
+tree.Lock[update, FALSE];
+IF tree.objectState#open THEN EXIT;
+tree.Unlock[];
+SetState[tree, closed];
+ENDLOOP;
+pageSize ¨ pageSize * SIZE[BYTE]; --Number of bytes in page
+tree.state ¨ [pageSize: pageSize];
+tree.maxFreeBytes ¨ pageSize-pageOverhead;
+tree.maxRecordsPerPage ¨ tree.maxFreeBytes/(tree.minEntrySize+entryOverhead);
+tree.awfullyFull ¨ (9*tree.maxFreeBytes)/10;
+tree.prettyFull ¨ (2*tree.maxFreeBytes)/3;
+tree.fairlyFull ¨ tree.maxFreeBytes/2;
+tree.breathingSpace ¨ tree.maxFreeBytes-tree.awfullyFull;
+tree.storage ¨ storage;
+tree.maintainRecomputableState ¨ maintainRecomputableState;
+tree.id ¨ (treeID ¨ treeID+1); -- this doesn't assign a reliably unique ID, since treeID is not protected by any monitor; but it doesn't really matter since the ID is merely protecting against client blunders anyway.
+{
+ENABLE UNWIND => tree.Unlock[];
+IF initialize
+THEN {
+statePtr: LONG POINTER TO TreeState ¨ tree.ReferencePage[statePage, new];
+LongZero[statePtr, pageSize];
+IF ~maintainRecomputableState THEN tree.state.entryCount ¨ LAST[CARD];
+statePtr≠ ¨ tree.state;
+tree.ReleasePage[statePage, endOfUpdate];
+}
+ELSE {
+statePtr: LONG POINTER TO TreeState ¨ tree.ReferencePage[statePage, read];
+IF statePtr.seal#sealValue THEN ERROR Error[badSeal];
+IF statePtr.pageSize#pageSize THEN ERROR Error[wrongPageSize];
+tree.state ¨ statePtr≠;
+tree.ReleasePage[statePage];
+IF tree.state.updateInProgress THEN SIGNAL UpdateInProgress;
+};
+tree.state.updateInProgress ¨ FALSE;
+};
+tree.objectState ¨ open;
+tree.Unlock[];
+};
+SetState: PUBLIC SAFE PROC [tree: Tree, state: State[closed..suspended]] = TRUSTED {
+DO
+WaitUnlocked: ENTRY PROC [tree: Tree] = INLINE {
+IF tree.longUpdate THEN WAIT tree.unlocked};
+tree.Lock[update, FALSE];
+IF tree.objectState#open OR ~tree.longUpdate THEN EXIT;
+tree.Unlock[];
+WaitUnlocked[tree];
+ENDLOOP;
+tree.objectState ¨ state;
+tree.storage ¨ NIL;
+tree.offsetTable ¨ NIL;
+tree.defaultPathStk ¨ NIL;
+tree.entryTable ¨ NIL;
+tree.heap ¨ NIL;
+tree.Unlock[];
+};
+GetState: PUBLIC ENTRY SAFE PROC [tree: Tree]
+RETURNS [
+  state: State,
+  entryCount: CARD,
+  greatestPage: PageNumber,
+  depth: CARD,
+  storage: PageStorage] = CHECKED {
+RETURN [
+state: tree.objectState,
+entryCount: tree.state.entryCount,
+greatestPage: tree.state.greatestPage,
+depth: tree.state.depth,
+storage: tree.storage];
+};
+Validate: PUBLIC SAFE PROC [tree: Tree] = TRUSTED {
+CheckPair: TestEntryProc = {
+size: CARD = tree.EntrySize[entry];
+IF size+entryOverhead > tree.maxFreeBytes THEN ERROR Error[entrySizesWrong];
+entryCount ¨ entryCount+1;
+IF firstEntry
+THEN firstEntry ¨ FALSE
+ELSE IF tree.CompareEntries[prevEntry, entry]#less THEN
+ERROR Error[entriesOutOfOrder];
+Basics.MoveWords[dst: LOOPHOLE[prevEntry], src: LOOPHOLE[entry],
+count: (size+BYTES[WORD]-1)/BYTES[WORD]];
+RETURN [TRUE];
+};
+PrevRecord: TYPE = RECORD [entry: SEQUENCE maxLength: [0..LAST[PageSize]] OF WORD];
+prevRecord: REF PrevRecord = NEW[PrevRecord[tree.state.pageSize-reservedWordsPerPage]];
+prevEntry: Entry = BASE[DESCRIPTOR[prevRecord.entry]];
+entryCount: CARD ¨ 0;
+firstEntry: BOOL ¨ TRUE;
+[] ¨ EnumerateEntries[tree: tree, key: NIL, Proc: CheckPair];
+IF tree.maintainRecomputableState AND entryCount#tree.state.entryCount THEN {
+tree.Lock[update];
+tree.state.entryCount ¨ entryCount;
+tree.WriteStatePage[endOfUpdate];
+tree.Unlock[];
+};
+};
+ReadRecord: PUBLIC SAFE PROC
+[tree: Tree, key: Key,
+ relation: Relation ¨ equal, pathStk: PathStk ¨ NIL, useExistingPath: BOOL ¨ FALSE]
+RETURNS [record: Record] = TRUSTED {
+EntryProc: PROC [entry: Entry] = {
+record ¨ IF entry#NIL THEN tree.NewRecordFromEntry[entry] ELSE NIL;
+};
+ReadEntry[tree: tree, key: key, relation: relation, pathStk: pathStk, useExistingPath: useExistingPath, Proc: EntryProc];
+};
+EnumerateRecords: PUBLIC SAFE PROC
+[tree: Tree, key: Key,
+ relation: Relation ¨ equal, pathStk: PathStk ¨ NIL, useExistingPath: BOOL ¨ FALSE,
+ Proc: EnumerateProc]
+RETURNS [exhausted: BOOL] = TRUSTED {
+EntryProc: TestEntryProc = {
+RETURN [Proc[tree.NewRecordFromEntry[entry]]];
+};
+exhausted ¨ EnumerateEntries[tree: tree, key: key, pathStk: pathStk, useExistingPath: useExistingPath, Proc: EntryProc];
+};
+ReadEntry: PUBLIC PROC
+[tree: Tree, key: Key,
+ relation: Relation ¨ equal, pathStk: PathStk ¨ NIL, useExistingPath: BOOL ¨ FALSE,
+ Proc: EachEntryProc] = {
+SELECT relation FROM
+less, lessEqual, equal => {
+pathStkWasNil: BOOL ¨ pathStk=NIL;
+tree.Lock[read];
+IF pathStkWasNil THEN {
+IF useExistingPath THEN ERROR Error[nilPathStk];
+pathStk ¨ tree.GetDefaultPathStk[];
+};
+{
+ENABLE UNWIND => {
+IF pathStkWasNil THEN tree.ReturnDefaultPathStk[pathStk];
+tree.Unlock[];
+};
+equal: BOOL ¨ tree.PathEntryLE[key: key, pathStk: pathStk, useExistingPath: useExistingPath].equal;
+IF equal AND relation=less THEN [] ¨ PathToPreviousEntry[tree, pathStk];
+IF pathStk.top=0 OR (~equal AND relation=equal)
+THEN Proc[NIL]
+ELSE {
+pagePtr: BTreePagePtr;
+pse: LONG POINTER TO PathStkEntry;
+[ptr: pagePtr, pse: pse] ¨ tree.ReferenceStack[pathStk];
+Proc[@pagePtr[pse.lastOffset].entry !
+UNWIND => tree.ReleasePage[pse.pageNumber]];
+tree.ReleasePage[pse.pageNumber];
+};
+};
+IF pathStkWasNil THEN tree.ReturnDefaultPathStk[pathStk];
+tree.Unlock[];
+};
+greaterEqual, greater => {
+CallWhenRelationSatisfied: TestEntryProc = {
+IF key=NIL OR tree.Compare[key, entry] <= maxComparison
+THEN {Proc[entry]; RETURN [FALSE]}
+ELSE RETURN [TRUE];
+};
+maxComparison: Comparison ¨ IF relation=greaterEqual THEN equal ELSE less;
+exhausted: BOOL ¨ EnumerateEntries[
+tree: tree, key: key, pathStk: pathStk, useExistingPath: useExistingPath,
+Proc: CallWhenRelationSatisfied];
+IF exhausted THEN Proc[NIL];
+};
+ENDCASE => ERROR;
+};
+EnumerateEntries: PUBLIC PROC
+[tree: Tree, key: Key,
+ relation: Relation ¨ equal, pathStk: PathStk ¨ NIL, useExistingPath: BOOL ¨ FALSE,
+ Proc: TestEntryProc]
+RETURNS [exhausted: BOOL] = {
+pathStkWasNil: BOOL ¨ pathStk = NIL;
+tree.Lock[read];
+IF pathStkWasNil THEN {
+IF useExistingPath THEN ERROR Error[nilPathStk];
+pathStk ¨ tree.GetDefaultPathStk[];
+};
+{
+ENABLE UNWIND => {
+IF pathStkWasNil THEN tree.ReturnDefaultPathStk[pathStk];
+tree.Unlock[];
+};
+leafStkTop: PathStkIndex;
+pse: LONG POINTER TO PathStkEntry;
+pagePtr: BTreePagePtr ¨ NIL;
+skipFirstEntry: BOOL ¨ FALSE;
+equal: BOOL;
+[equal: equal, depth: leafStkTop] ¨ tree.PathEntryLE[key: key, pathStk: pathStk, useExistingPath: useExistingPath];
+IF pathStk.top=0
+THEN {
+IF leafStkTop=0 THEN GOTO exhausted; -- empty tree
+pathStk.top ¨ leafStkTop;
+pathStk.path[leafStkTop].lastOffset ¨ entry1Offset;
+}
+ELSE
+SELECT relation FROM
+less =>
+IF equal AND ~PathToPreviousEntry[tree, pathStk] THEN {
+pathStk.top ¨ leafStkTop;
+pathStk.path[leafStkTop].lastOffset ¨ entry1Offset;
+};
+lessEqual =>
+NULL;
+equal, greaterEqual =>
+skipFirstEntry ¨ ~equal;
+greater =>
+skipFirstEntry ¨ TRUE;
+ENDCASE;
+exhausted ¨ FALSE;
+pse ¨ @pathStk.path[pathStk.top];
+DO
+offset: PageOffset ¨ pse.lastOffset;
+endOffset: PageOffset;
+IF pagePtr=NIL THEN {
+pagePtr ¨ tree.ReferencePage[pse.pageNumber];
+endOffset ¨ nilOffset+(tree.state.pageSize-pagePtr.freeBytes);
+};
+IF offset>=endOffset
+THEN {
+tree.ReleasePage[pse.pageNumber];
+IF offset>endOffset THEN ERROR Error[entrySizesWrong];
+pagePtr ¨ NIL;
+IF (pathStk.top ¨ pathStk.top-1) = 0 THEN {
+pathStk.version ¨ LAST[CARD];
+GOTO exhausted;
+};
+pse ¨ pse - SIZE[PathStkEntry];
+}
+ELSE {
+nxtPgNo: PageNumber ¨ pagePtr[offset].grPage;
+pse.offset ¨ offset + tree.BTreeEntrySize[@pagePtr[offset]];
+IF skipFirstEntry THEN skipFirstEntry ¨ FALSE
+ELSE IF ~Proc[@pagePtr[offset].entry !
+UNWIND => tree.ReleasePage[pse.pageNumber]] THEN EXIT;
+WHILE nxtPgNo#nilPage DO
+tree.ReleasePage[pse.pageNumber];
+pathStk.top ¨ pathStk.top+1;
+pse ¨ pse + SIZE[PathStkEntry];
+pagePtr ¨ tree.ReferencePage[nxtPgNo];
+pse.pageNumber ¨ nxtPgNo;
+pse.nextToLastOffset ¨ nilOffset;
+pse.lastOffset ¨ entry0Offset;
+pse.offset ¨ entry1Offset;
+endOffset ¨ nilOffset+(tree.state.pageSize-pagePtr.freeBytes);
+nxtPgNo ¨ pagePtr.minPage;
+ENDLOOP;
+};
+pse.nextToLastOffset ¨ pse.lastOffset;
+pse.lastOffset ¨ pse.offset;
+ENDLOOP;
+IF pagePtr#NIL THEN tree.ReleasePage[pse.pageNumber];
+EXITS
+exhausted => exhausted ¨ TRUE;
+};
+IF pathStkWasNil THEN tree.ReturnDefaultPathStk[pathStk];
+tree.Unlock[];
+};
+SalvageEntries: PUBLIC PROC
+[tree: Tree, Proc: TestEntryProc] RETURNS [exhausted: BOOL] = {
+tree.Lock[read];
+FOR page: PageNumber IN [statePage+1 .. tree.state.greatestPage] DO
+ENABLE UNWIND => tree.Unlock[];
+pagePtr: BTreePagePtr ¨ tree.ReferencePage[page];
+IF pagePtr.freeBytes IN [0 .. CARD[tree.state.pageSize-pageOverhead]] THEN {
+offset: PageOffset ¨ entry1Offset;
+endOffset: PageOffset = nilOffset+(tree.state.pageSize-pagePtr.freeBytes);
+WHILE offset<endOffset DO
+entSize: CARD = tree.BTreeEntrySize[@pagePtr[offset]];
+IF entSize<entryOverhead+tree.minEntrySize OR offset+entSize>endOffset THEN EXIT;
+IF ~Proc[@pagePtr[offset].entry] THEN GOTO aborted;
+offset ¨ offset+entSize;
+ENDLOOP;
+};
+tree.ReleasePage[page];
+REPEAT
+aborted => exhausted ¨ FALSE;
+FINISHED => exhausted ¨ TRUE;
+ENDLOOP;
+tree.Unlock[];
+};
+NewPathStk: PUBLIC SAFE PROC RETURNS [pathStk: PathStk] = CHECKED {
+pathStk ¨ NEW[PathStkObject];
+pathStk.version ¨ LAST[CARD]; -- not valid
+};
+PathEntryLE: PUBLIC PROC [tree: Tree, key: Key, pathStk: PathStk, useExistingPath: BOOL ¨ FALSE] RETURNS [equal: BOOL, depth: PathStkIndex] = {
+BinSearchPage: PROC RETURNS [firstG: EntryOrdinal] = {
+firstBadOffset: PageOffset = nilOffset + (tree.state.pageSize - pagePtr.freeBytes);
+midOffset: PageOffset ¨ LOOPHOLE[Basics.BITSHIFT[LOOPHOLE[firstBadOffset], -1]];
+curOffset: PageOffset ¨ entry1Offset;
+l, r: EntryOrdinal ¨ 2;
+IF key#NIL THEN DO
+IF curOffset>=midOffset THEN {
+IF curOffset>=firstBadOffset OR tree.Compare[key, @pagePtr[curOffset].entry] = less THEN EXIT;
+midOffset ¨ firstBadOffset;
+l ¨ r;
+};
+curOffset ¨ curOffset + tree.BTreeEntrySize[@pagePtr[curOffset]];
+r ¨ r+1;
+offsetTable[r] ¨ curOffset;
+ENDLOOP;
+
+IF curOffset>firstBadOffset THEN ERROR Error[entrySizesWrong];
+WHILE l<r DO
+m: EntryOrdinal ¨ Basics.BITSHIFT[l+r, -1];
+SELECT tree.Compare[key, @pagePtr[offsetTable[m]].entry] FROM
+less => r ¨ m;
+equal => {equal ¨ TRUE; RETURN [m+1]};
+greater => l ¨ m+1;
+ENDCASE;
+ENDLOOP;
+RETURN [r];
+};
+
+pse: LONG POINTER TO PathStkEntry;
+offsetTable: OffsetTable;
+curPage: PageNumber;
+pagePtr: BTreePagePtr;
+equal ¨ FALSE;
+IF useExistingPath
+AND pathStk.treeID=tree.id
+AND pathStk.version=tree.version
+AND key#NIL THEN {
+depth ¨ pathStk.top;
+IF depth=0 THEN GOTO dontUse; -- who knows whether this is the min key or not?
+WHILE pathStk.path[depth].leastSon # nilPage DO depth ¨ depth+1; ENDLOOP;
+[pse: pse, ptr: pagePtr] ¨ tree.ReferenceStack[pathStk];
+SELECT tree.Compare[key, @pagePtr[pse.lastOffset].entry] FROM
+less => useExistingPath ¨ FALSE; -- wrong key
+equal => equal ¨ TRUE; -- correct key
+greater => {
+IF depth=pathStk.top
+AND pse.offset < nilOffset+(tree.state.pageSize-pagePtr.freeBytes)
+AND tree.Compare[key, @pagePtr[pse.offset].entry] = less
+THEN NULL -- key falls between this entry and next; ok
+ELSE useExistingPath ¨ FALSE; -- wrong key, or too hard to decide 
+};
+ENDCASE;
+tree.ReleasePage[pse.pageNumber];
+IF useExistingPath THEN RETURN;
+EXITS dontUse => NULL;
+};
+pathStk.top ¨ 0;
+pathStk.path[0] ¨ [];
+offsetTable ¨ GetOffsetTable[tree];
+offsetTable[0] ¨ nilOffset;
+offsetTable[1] ¨ entry0Offset;
+offsetTable[2] ¨ entry1Offset;
+depth ¨ 0;
+pse ¨ @pathStk.path[0];
+curPage ¨ tree.state.rootPage;
+WHILE curPage#nilPage DO
+firstG: EntryOrdinal;
+pagePtr ¨ tree.ReferencePage[curPage];
+depth ¨ depth+1;
+pse ¨ pse+SIZE[PathStkEntry];
+pse.pageNumber ¨ curPage;
+firstG ¨ BinSearchPage[ !
+UNWIND => {tree.ReleasePage[curPage]; ReturnOffsetTable[tree, offsetTable]}];
+pse.offset ¨ offsetTable[firstG];
+pse.lastOffset ¨ offsetTable[firstG-1];
+pse.nextToLastOffset ¨ offsetTable[firstG-2];
+pse.leastSon ¨ pagePtr.minPage;
+IF firstG>2 THEN pathStk.top ¨ depth;  -- real entry in this page
+AssignRefESR[@pse.eslFront, NIL];
+AssignRefESR[@pse.eslRear, NIL];
+curPage ¨ pagePtr[pse.lastOffset].grPage;
+tree.ReleasePage[pse.pageNumber];
+ENDLOOP;
+pathStk.treeID ¨ tree.id;
+pathStk.version ¨ tree.version;
+ReturnOffsetTable[tree, offsetTable];
+};
+ReferenceStack: PUBLIC PROC [tree: Tree, pathStk: PathStk, type: ReferenceType ¨ read] RETURNS [pse: LONG POINTER TO PathStkEntry, ptr: PagePtr] = {
+pse ¨ @pathStk.path[pathStk.top];
+ptr ¨ tree.ReferencePage[pse.pageNumber, type];
+};
+BackUpOneEntry: PUBLIC PROC [tree: Tree, pse: LONG POINTER TO PathStkEntry] = {
+tree.RepairOffsets[pse];
+pse.offset ¨ pse.lastOffset;
+tree.RepairOffsets[pse];
+};
+RepairOffsets: PUBLIC PROC [tree: Tree, pse: LONG POINTER TO PathStkEntry] = {
+CheckProgression: PROC [offset1, offset2: PageOffset] RETURNS [ok: BOOL] = {
+RETURN [SELECT TRUE FROM
+offset2=entry0Offset => offset1=nilOffset,
+offset2=entry1Offset => offset1=entry0Offset,
+offset1>=offset2 => FALSE,
+ENDCASE => offset1+tree.BTreeEntrySize[@pagePtr[offset1]] = offset2];
+};
+pagePtr: BTreePagePtr = tree.ReferencePage[pse.pageNumber];
+IF ~(CheckProgression[pse.lastOffset, pse.offset] AND CheckProgression[pse.nextToLastOffset, pse.lastOffset]) THEN {
+newOffset: PageOffset ¨ entry1Offset;
+lastOffset: PageOffset ¨ entry0Offset;
+nextToLastOffset: PageOffset ¨ nilOffset;
+WHILE newOffset#pse.offset DO
+nextToLastOffset ¨ lastOffset;
+lastOffset ¨ newOffset;
+newOffset ¨ newOffset+tree.BTreeEntrySize[@pagePtr[newOffset]];
+ENDLOOP;
+pse.lastOffset ¨ lastOffset;
+pse.nextToLastOffset ¨ nextToLastOffset;
+};
+tree.ReleasePage[pse.pageNumber];
+};
+PathToMaxDescendant: PUBLIC PROC [tree: Tree, pathStk: PathStk, page: PageNumber] = {
+pse: LONG POINTER TO PathStkEntry;
+pagePtr: BTreePagePtr;
+WHILE page#nilPage DO
+pathStk.top ¨ pathStk.top+1;
+pse ¨ @pathStk.path[pathStk.top];
+pse.pageNumber ¨ page;
+pagePtr ¨ tree.ReferencePage[page];
+pse.offset ¨ nilOffset+(tree.state.pageSize-pagePtr.freeBytes);
+pse.lastOffset ¨ entry1Offset;
+pse.nextToLastOffset ¨ entry0Offset;
+tree.RepairOffsets[pse];
+AssignRefESR[@pse.eslFront, NIL];
+AssignRefESR[@pse.eslRear, NIL];
+pse.leastSon ¨ nilPage;
+page ¨ pagePtr[pse.lastOffset].grPage;
+tree.ReleasePage[pse.pageNumber];
+ENDLOOP;
+};
+WriteStatePage: PUBLIC PROC [tree: Tree, update: UpdateState ¨ unchanged] = {
+statePtr: LONG POINTER TO TreeState = tree.ReferencePage[statePage, write];
+statePtr≠ ¨ tree.state;
+tree.ReleasePage[statePage, update];
+};
+Lock: PUBLIC ENTRY PROC [tree: Tree, mode: LockMode, checkState: BOOL ¨ TRUE] = {
+DO
+SELECT tree.objectState FROM
+closed => IF checkState THEN RETURN WITH ERROR Error[closed];
+suspended => IF checkState THEN {WAIT tree.unlocked; LOOP};
+open => NULL
+ENDCASE;
+SELECT mode FROM
+read =>
+IF tree.lockCount>=0 THEN {tree.lockCount ¨ tree.lockCount+1; EXIT};
+update =>
+IF tree.lockCount=0 THEN {tree.lockCount ¨ -1; EXIT};
+ENDCASE;
+WAIT tree.unlocked; -- wait for tree to be unlocked
+ENDLOOP;
+};
+Unlock: PUBLIC ENTRY PROC [tree: Tree] = {
+IF tree.lockCount=0 THEN ERROR Bug[treeNotLocked];
+tree.lockCount ¨ MAX[tree.lockCount-1, 0];
+IF tree.lockCount=0 THEN BROADCAST tree.unlocked;
+};
+GetHeapAndTable: PUBLIC ENTRY PROC [tree: Tree, pathStk: PathStk] = {
+pathStk.heap ¨ tree.heap;
+tree.heap ¨ NIL;
+pathStk.entryTable ¨ tree.entryTable;
+tree.entryTable ¨ NIL;
+IF pathStk.heap#NIL
+THEN heapsReused ¨ heapsReused+1
+ELSE {
+pathStk.heap ¨ NEW[Heap[tree.maxRecordsPerPage + 1]];
+pathStk.entryTable ¨ NEW[EntryTable[3*tree.maxRecordsPerPage + 2]];
+heapsCreated ¨ heapsCreated+1;
+};
+};
+ReturnHeapAndTable: PUBLIC ENTRY PROC [tree: Tree, pathStk: PathStk] = {
+IF tree.heap=NIL THEN { tree.heap ¨ pathStk.heap; tree.entryTable ¨ pathStk.entryTable };
+pathStk.heap ¨ NIL;
+pathStk.entryTable ¨ NIL;
+};
+GetDefaultPathStk: PUBLIC ENTRY PROC [tree: Tree] RETURNS [pathStk: PathStk] = {
+pathStk ¨ tree.defaultPathStk;
+tree.defaultPathStk ¨ NIL;
+IF pathStk=NIL
+THEN { pathStk ¨ NewPathStk[]; pathStksCreated ¨ pathStksCreated+1 }
+ELSE { pathStk.version ¨ LAST [CARD]; pathStksReused ¨ pathStksReused+1 };
+};
+ReturnDefaultPathStk: PUBLIC ENTRY PROC [tree: Tree, pathStk: PathStk] = {
+IF tree.defaultPathStk=NIL THEN tree.defaultPathStk ¨ pathStk;
+};
+Error: PUBLIC SAFE ERROR [reason: Reason] = CODE;
+UpdateInProgress: PUBLIC SAFE SIGNAL = CODE;
+Bug: PUBLIC ERROR [type: BugType] = CODE;
+PathToPreviousEntry: PROC [tree: Tree, pathStk: PathStk] RETURNS [ok: BOOL] = {
+pagePtr: BTreePagePtr;
+pse: LONG POINTER TO PathStkEntry ¨ @pathStk.path[pathStk.top];
+IF pathStk.top=0 THEN RETURN [FALSE];
+tree.BackUpOneEntry[pse];
+[ptr: pagePtr, pse: pse] ¨ tree.ReferenceStack[pathStk];
+IF pagePtr[pse.lastOffset].grPage=nilPage
+THEN {
+WHILE pse.lastOffset<entry1Offset DO
+tree.ReleasePage[pse.pageNumber];
+pathStk.top ¨ pathStk.top-1;
+IF pathStk.top=0 THEN RETURN [FALSE];
+[ptr: pagePtr, pse: pse] ¨ tree.ReferenceStack[pathStk];
+ENDLOOP;
+tree.ReleasePage[pse.pageNumber];
+}
+ELSE {
+page: PageNumber ¨ pagePtr[pse.lastOffset].grPage;
+tree.ReleasePage[pse.pageNumber];
+tree.PathToMaxDescendant[pathStk: pathStk, page: page];
+};
+RETURN [TRUE];
+};
+GetOffsetTable: ENTRY PROC [tree: Tree] RETURNS [offsetTable: OffsetTable] = INLINE {
+offsetTable ¨ tree.offsetTable;
+tree.offsetTable ¨ NIL;
+IF offsetTable#NIL
+THEN offsetTablesReused ¨ offsetTablesReused+1
+ELSE {
+offsetTable ¨ NEW[OffsetTableObject[tree.maxRecordsPerPage + 2]];
+offsetTablesCreated ¨ offsetTablesCreated+1;
+};
+};
+ReturnOffsetTable: ENTRY PROC [tree: Tree, offsetTable: OffsetTable] = INLINE {
+IF tree.offsetTable=NIL THEN tree.offsetTable ¨ offsetTable;
+};
+
+LongZero: PROC [to: LONG POINTER, nwords: CARD] = {
+Block: TYPE = ARRAY [0..3] OF WORD;
+BlockPtr: TYPE = LONG POINTER TO Block;
+WHILE nwords >= 4 * SIZE[BYTE] DO
+LOOPHOLE[to, BlockPtr][0] ¨ 0;
+LOOPHOLE[to, BlockPtr][1] ¨ 0;
+LOOPHOLE[to, BlockPtr][2] ¨ 0;
+LOOPHOLE[to, BlockPtr][3] ¨ 0;
+to ¨ to + SIZE[Block];
+nwords ¨ nwords - 4 * SIZE[BYTE];
+ENDLOOP;
+};
+WordPtr: TYPE = LONG POINTER TO WORD;
+treeID: CARD ¨ 0;
+offsetTablesReused, offsetTablesCreated: CARD ¨ 0;
+heapsReused, heapsCreated: CARD ¨ 0;
+pathStksReused, pathStksCreated: CARD ¨ 0;
+
+
+}.
+
+   ‚  
+BTreeRead.mesa
+Copyright ” 1985, 1986, 1988, 1992 by Xerox Corporation.  All rights reserved.
+This module contains everything you need to open and read BTrees.
+Taft, November 25, 1983 3:02 pm
+Russ Atkinson (RRA) June 3, 1988 12:25:25 pm PDT
+Bob Hagmann April 30, 1985 7:14:30 am PDT
+Brian Oki June 14, 1989 3:58:00 PDT
+
+Loose ends:
+1. Validate's repair of the entryCount is slightly flakey since the tree is unlocked between the EnumerateEntries that counts the entries and the setting of the entryCount.
+Willie-s, April 15, 1992 12:15 pm PDT
+IO,
+Rope,
+SimpleStreams USING [Create],
+Convert;
+inStream, outStream, errStream: IO.STREAM;
+hasEcho: BOOL;
+BTree.
+first ensure that it's not already open
+this actually wakes up every time the tree is unlocked, including the call to Unlock from SetUpdateInProgress
+Tree is now locked in update mode with no update in progress
+Extra nesting required so that pathStkWasNil is visible in the catch phrase (yecch)!
+Extra nesting required so that pathStkWasNil is visible in the catch phrase (yecch)!
+key is less than any existing entry in the tree.  Set PathStk to first record in leftmost leaf page.
+ran off end of page.  Pop up a level and do the next entry in the father page
+ran off end of tree.  PathStk is no longer valid.
+enumerate this entry
+In a non-leaf page, find the leftmost right descendant of the entry we just did.
+BTreeInternal.
+Returns an index r such that offsetTable[r] is the offset of the first entry strictly greater than key, and fills in offsetTable[2] through offsetTable[r] with the offsets of all entries up to and including that one.
+
+Scan records linearly and build offsetTable until half the in-use portion of the BTree page has been examined.  Then do one key comparison to detemine which half of the page to direct our attention to, and build the rest of offsetTable only if necessary.  On the average this saves 25% of the work of building offsetTables, and costs no extra comparison since the first comparison would examine a middle record anyway (not necessarily the same one).
+At this point, offsetTable[r] is the offset of the first non-entry, which we assume to have an infinite key (which we shall never test).  We shall leave r pointing at the offset of the first entry strictly greater than key.
+Body of PathEntryLE
+supplied PathStk is still valid.  See if it is for the correct key.
+Perform the normal BTree lookup
+BROADCAST, not NOTIFY, because releasing a write lock might make multiple readers eligible to enter simultaneously.
+heap holds at most one page's worth of entries at any given time
+may have to index scroll containing up to 3 pages' worth of entries
+Private
+Backs up the PathStk to refer to the previous entry in the tree. Returns TRUE normally, FALSE if there is no previous entry.
+this is a leaf page
+hit beginning of current page: previous entry is left father
+this is not a leaf page: previous entry is rightmost left son
+Obtains the OffsetTable associated with the BTree, if it is available; otherwise makes a new one.
+Gives back the OffsetTable.
+Zero out all the bytes in the thing pointed to by to
+FOR i: [0..3] IN [0..nwords) DO -- doesn't seem necessary
+LOOPHOLE[to, BlockPtr][i] _ 0;
+ENDLOOP;
+[inStream, outStream, errStream, hasEcho] _ SimpleStreams.Create[windowSystem: $uxio];
+Bob Hagmann April 30, 1985 7:04:49 am PDT
+Catch File.Error and skip those pages during SalvageEntries
+changes to: SalvageEntries
+Russ Atkinson (RRA) March 4, 1988 5:51:29 pm PST
+converted to be Mimosa-compatible, removed dependence on File and PrincOpsUtils.
+
+
+
+ù Ú  ïNewlineDelimiter
+ñ(cedarcode) styleô codeöúôKöú
+œeúCôNKôAKöœyôJô0Kô)Kô#Kô öúôKöú¨ô¨óKô%óò öœk	ò	Köúüúüúò#Köúüú÷ò·Köúüúµò»Kò KöüúôKöúôKöúüú
+ôKöúôóóheadöœn	úüòIcode2öüúüúòMöüúò#MöüúòMöúüúòMöú üúüúô*Köú	üúôóöúôMöúüúüúòMöúüúüúò3Möú	üúüúò"Möúüúüúò9ö†úüúüúüúTüú7üúüúò≈MöúüúyòÉMöúòóö†úüúüúüúDüúüúüúüúüúòúöüòMöú'ô'MöúüúòMöüúüúüúò#MòMöúòMöüúòóMöúüúüúò;Mò"Mò*MòMMò,Mò*Mò&Mò9MòMò;MöúœcπòÿöúòMöüúüúòöüúòöüúòMöú
+üúüúüú0òIMöúòMöüúüúüúüúòFMòMöú)ò)MöúòóöüúòMöú
+üúüúüú1òJMöüúüúüúò5Möüúüúüúò>MòMöúòMöüúüúüúò<MöúòóóMöúüúò$MöúòóMòMòMöúòóö
+†úüúüúüú1üúòTöüòö†úüúüúüúò0Möüúüúüúò,óMöúüúòMöüúüúüúüúò7MòöúòMöúmômóMöüúòóMô<MòMöúüúòMöúüúòMöúüúòMöúüúòMöúüúòMòMöúòóö†úüúüúüúüú!üú'üúüúò™öüúòMöúòMöú"ò"Möú&ò&MöúòMöúòóMöúòóö
+†úüúüúüúüúò3ö†	úòMöúüúò#Möüú(üúüúòLMòöüúòMöüúüòöüúüú,üò7MöüúòóóMöúüúüúüúüúüúüúòjMöüúüúòMöúòóMöúüúüú	üúüúüúüúòSMöúüúüú7òWMöúüúü
+úò6MöúüúòMöúüúüúòMöú'üúò=öüú üú"üúòMMòMò#Mò!MòMöúòóMöúòóö†
+úüúüúüúGüúüúüúüúüúò¨ö†	úüúò"Möú	üúüúüú üúüúòCMöúòóMöúyòyMöúòóö†úüúüúüúGüúüúüúüúüúüúò…ö†	úòMöüú(ò.MöúòóMòxMöúòóö†	úüúüúGüúüúüúòõöüú
+üòöúòMöúüúüúò"MòöüúüúòMöüúüúüúò0Mò#MöúòóöúòMöúTôTöüúüúòMöüúüú$ò9MöúòMöúòóMöúüúXòcMöüúüúüú)òHöüúüú	üúò/MöüúüúòöüúòMöúòMöúüúüúüúò"Mò8öú%ò%Möüú&ò,óMöú!ò!MöúòóóMöúòóMöüúüú$ò9MòMöúòóöúòö†úò,öüúüúüú*ò7Möüúüúüúò"MöüúüúüúòóMöúòóMöúüúüúüúòJMöúüúÄòèMöüúüúüúòMöúòóMöüúüúòóMöúòóö†úüúüúGüúüúüúüúüúòºMöúüúüúò$MòöüúüúòMöüúüúüúò0Mò#MöúòóöúòMöúTôTöüúüúòMöüúüú$ò9MöúòMöúòóMöúòMöúüúüúüúò"MöúüúòMöúüúüúòMöúüúòMòsöüúòöüúòMöúdôdMöüúüúüú°ò2MòMò3Möúòóöüòöüú
+üòòöüúüú%üúò7MòMò3MöúòóóöúòMöüúòóöúòMòóöú
+ò
+MöúüúòóMöüúòóóóMöúüúòMò!öüòMò$Mòöüú	üúüúòMò-Mò>MöúòóöüúòöüúòMöúMôMMöú!ò!Möüúüúüúò6Möú
+üúòöüú#üúò+Möú1ô1MöúüúüúòMöüúòMöúòóMöúüúòMöúòóöüúòMöúôMò-Mò<Möüúüúüò-öüúò&Möüú&üúüúò6óöüúüòMöúPôPMò!MòMöúüúòMò&MòMò!MòMòMò>MòMöüúòóMöúòóóMò&MòMöüúòóMöüú	üúüú"ò5öüòMöúüúòóMöúòóMöüúüú$ò9MòMöúòóö
+†úüúüú"üúüúò[Mòöüúüú*üòCMöüúüúòMò1öüúüúüú$üúòLMò"MöúJòJöüúüòMöú	üú)ò6Möüú)üúüúüúòQMöüúüúüú	ò3MòMöüúòóMöúòóMòöüòMöúüúòMöüúüúòóMöüúòóMòMöúòóö†
+úüúüúüúüúüúòCMöú
+üúòMöúüúüú°ò*Möúòóóöúôö†úüúüú;üúüúüú	üúòèö†úüúüúò6MöúÿôÿMòSMöúüúüúüúòPMò%MòMô Möú¡ô¡öüúüúüúüòöüúüúòMöüúüú5üúüúò^MòMòMöúòóMòAMòMòMöüúòMò óMöüúüúüúò>MöúﬂôﬂöüúüòMöúüú
+ò+öüú3üò=MòMöúüúüúò&MòMöüúòóMöüúòóMöüúòMöúòóMò MôMöúüúüúüúò"MòMòMòMöúüúòöüúüúüúüúüúüúòaMöúCôCMòMöüú	üúüú
+°0òNMöüú(üúüúòIMò8öüú3üò=Möúüú°ò-Möúüú°ò%öúòöüúüú@üú5òêMöüúüú°,ò6Möüúüú°$òBóMöúòóMöüúòóMò!MöüúüúüúòMöüúüúòMöúòóMöúôMòMòMò#MòMòMòMò
+MòMòöüúüòMöúòMò&MòMöú
+üúòMòòMöüúGòMóMò!Mò'Mò-MòMöüú
+üú°òAMöúüúò!Möúüúò Mò)Möú!ò!MöüúòóMòMòMöú%ò%Möúòóö†úüúüú<üúüúüúüú òîMò!Mò/Möúòóö†úüúüúüúüúüúòOMòMòMòMöúòóö†úüúüúüúüúüúòNö†úüú üúüúòLöüúüúüúüòMò*Mò-MöúüúòMöüú>òEóMöúòóMò;öüú0üú9üúòtMò%Mò&Mò)öüúüòMòMòMò?MöüúòóMòMò(MöúòóMò!Möúòóö†úüúüú5òUMöúüúüúüúò"MòöüúüòMòMò!MòMò#Mò?MòMò$MòMöúüúò!Möúüúò MòMò&Möú!ò!MöüúòóMöúòóö†úüúüú2òMMöú
+üúüúüú2òKMòMöú$ò$Möúòóö†úüúüúüú*üúüúòQöüòöüúüòMöú
+üúüúüúüúüúò=Mö	úüúüúüúüúò;MöúüòMöüúòóöüúüòòMöüúüú%üúòDóò	Möüúüúüúò5óMöüúòóMöüú°ò3MöüúòóMöúòóö†úüúüúüúò*Möüúüúüúò2Möúüúò*öüúüúü	úò1MöúsôsóMöúòóö†úüúüúüú#òEMòMöúüúòMò%MöúüúòöüúüòMöüúò öüúòöúüú#ò5Möú@ô@óöúüú+òCMöúCôCóMòMöúòóóMöúòóö†úüúüúüú#òHMöüúüúüúDòYMöúüúòMöúüúòMöúòóö
+†úüúüúüúüúòPMòMöúüúòöüú	üòMöüú@òDMöüúüúüú'òJóMöúòóö†úüúüúüú#òJMöüúüúüúò>MöúòóMö	úüúüúüúüúò1Mö	úüúüúüúüúò,Möúüúüúüúò)óöúôö†úüú üúüúòOMöúIüúüúô|MöúòMöúüúüúüú+ò?Möüúüúüúüúò%MòMò8öüú'ò)öüúòMöúôöüúüò$Möú<ô<Möú!ò!MòMöüúüúüúüúò%Mò8MöüúòóMöú!ò!MöúòóöüúòMöú=ô=Mò2Möú!ò!Möú7ò7MöúòóóMöüúüúòMöúòóö
+†úüúüúüúüúòUMöúaôaMòMöúüúòöüúüòMöüú*ò.öüúòMöúüú0òAMò,MöúòóóMöúòóö†úüúüú*üúòOMöúôMöüúüúüú ò<MöúòMò óMöú4ô4ö
+†úüúüúüú
+üúò3Mö	úüúüúüúüúò#Mö	ú
+üúüúüúüúò'öüúüúüúüò!MöüúòMöüúòMöüúòMöüúòMöú
+üúòMöúüúüúò!Möüúòóöüúüúüô9MöüúôMöüúôóMòóMöú	üúüúüúüúüúò%MöúüúòMöú)üúò2Möúüúò$Möú!üúò*Mò MöúVôVMò óöúòMò óô)Köú;ô;Köúœrôóô0KöúO¢ôPóKô Kô Kô ó Öó    LÆ  qÇ  

@@ -1,0 +1,994 @@
+
+DIRECTORY
+Ascii USING [CR, LF, SP, TAB],
+BasicTime USING [daysPerMonth, hoursPerDay, minutesPerHour, MonthOfYear, OutOfRange, Pack, secondsPerMinute, TimeParametersNotKnown, Unpack, Unpacked, unspecifiedZone, Zone],
+DFUtilities USING [CommentItem, Date, DirectoryItem, FileItem, Filter, FilterA, FilterB, FilterC, ImportsItem, IncludeItem, ProcessItemProc, SupplyItemProc, UsingEntry, UsingForm, UsingList, WhiteSpaceItem],
+IO USING [Backup, BreakProc, EndOfStream, Error, GetChar, GetLineRope, GetToken, PeekChar, PutChar, PutFLR, PutFR, PutRope, STREAM, TokenProc],
+RefText USING [InlineAppendChar, Equal, Fetch, Length, ObtainScratch, ReleaseScratch, TrustTextAsRope],
+Rope USING [Compare, Concat, Equal, Fetch, Find, FindBackward, FromRefText, Length, ROPE, Substr];
+
+DFUtilitiesImpl: CEDAR PROGRAM
+IMPORTS BasicTime, IO, RefText, Rope
+EXPORTS DFUtilities = BEGIN
+
+ROPE: TYPE = Rope.ROPE;
+STREAM: TYPE = IO.STREAM;
+
+LineSep: CHAR ~ '\n;
+LineSepText: REF TEXT ~ "\r";
+
+IsLineSep: PROC [c: CHAR] RETURNS [BOOL] ~ INLINE {
+RETURN [(c = Ascii.LF) OR (c = Ascii.CR)];
+};
+
+
+
+ParseFromStream: PUBLIC PROC
+[in: STREAM, proc: DFUtilities.ProcessItemProc, filter: DFUtilities.Filter ¨ []] = {
+Abort: ERROR = CODE;
+ParseInner: PROC = {
+passFileItems: BOOL ¨ TRUE;
+underDirectory: BOOL ¨ FALSE;
+blankLineCount: NAT ¨ 0;
+readFakeNewline: BOOL ¨ FALSE;
+bufferT: REF TEXT = RefText.ObtainScratch[20];
+bufferN: REF TEXT = RefText.ObtainScratch[100];
+SimpleToken: IO.BreakProc -- [char: CHAR] RETURNS [IO.CharClass] --  = {
+SELECT char FROM
+Ascii.SP, Ascii.TAB => RETURN [$sepr];
+Ascii.CR, Ascii.LF => RETURN [$break];
+ENDCASE => RETURN [$other];
+};
+PreUsingToken: IO.BreakProc -- [char: CHAR] RETURNS [IO.CharClass] --  = {
+SELECT char FROM
+Ascii.SP, Ascii.TAB => RETURN [$sepr];
+Ascii.CR, Ascii.LF, '[ => RETURN [$break];
+ENDCASE => RETURN [$other];
+};
+UsingToken: IO.BreakProc -- [char: CHAR] RETURNS [IO.CharClass] --  = {
+SELECT char FROM
+'-, '_ => RETURN [$other];
+ENDCASE => RETURN [IO.TokenProc[char]];
+};
+GetTokenAsRefText: PROC [breakProc: IO.BreakProc] RETURNS [token: REF TEXT]
+= INLINE {RETURN FullGetToken[breakProc, bufferT]};
+GetToken: PROC [breakProc: IO.BreakProc] RETURNS [ROPE]
+= INLINE {RETURN [Rope.FromRefText[FullGetToken[breakProc, bufferN]]]};
+FullGetToken: PROC [breakProc: IO.BreakProc, buffer: REF TEXT] RETURNS [token: REF TEXT] ~ {
+IF breakProc = SimpleToken THEN {char: CHAR;
+DO
+char ¨ in.GetChar[!IO.EndOfStream => GOTO EOF];
+SELECT char FROM
+Ascii.SP, Ascii.TAB => NULL;
+ENDCASE => EXIT;
+ENDLOOP;
+IF char = '[ THEN {
+state: {server, startDir, finishDir, tail} ¨ server;
+buffer.length ¨ 1;
+buffer[0] ¨ char;
+DO
+char ¨ in.GetChar[!IO.EndOfStream => GOTO EOF];
+IF IsLineSep[char] THEN EXIT;
+SELECT state FROM
+server => IF char='] THEN state ¨ startDir;
+startDir => SELECT char FROM
+'< => state ¨ finishDir;
+Ascii.SP, Ascii.TAB => EXIT;
+ENDCASE => state ¨ tail;
+finishDir => IF char='> THEN state ¨ tail;
+tail => SELECT char FROM
+Ascii.SP, Ascii.TAB => EXIT;
+ENDCASE => NULL;
+ENDCASE => ERROR;
+buffer ¨ RefText.InlineAppendChar[buffer, char];
+ENDLOOP;
+in.Backup[char];
+RETURN [buffer];
+}
+ELSE in.Backup[char];
+};
+token ¨ in.GetToken[breakProc, buffer !IO.EndOfStream => GOTO EOF].token;
+RETURN;
+EXITS EOF => {readFakeNewline ¨ TRUE; token ¨ LineSepText}};
+PutBack: PROC [x: REF TEXT] = {
+IF readFakeNewline THEN {
+IF NOT RefText.Equal[x, LineSepText] THEN ERROR SyntaxError["Internal bug."];
+}
+ELSE FOR i: INT DECREASING IN [0..RefText.Length[x]) DO
+in.Backup[RefText.Fetch[x, i]];
+ENDLOOP;
+};
+EndOfLineText: PROC [t: REF TEXT] RETURNS [BOOL] = {
+RETURN [RefText.Length[t] = 1 AND IsLineSep[RefText.Fetch[t, 0]]]
+};
+EndOfLineRope: PROC [t: ROPE] RETURNS [BOOL] = {
+RETURN [t.Length[] = 1 AND IsLineSep[t.Fetch[0]]]
+};
+CheckEndOfLine: PROC = {
+IF ~EndOfLineText[GetTokenAsRefText[SimpleToken]] THEN
+ERROR SyntaxError["Unrecognizable text where end-of-line was expected."];
+};
+FlushWhiteSpace: PROC = {
+IF blankLineCount ~= 0 AND filter.comments THEN {
+IF proc[NEW[DFUtilities.WhiteSpaceItem ¨ [lines: blankLineCount]]] THEN ERROR Abort;
+CancelWhiteSpace[];
+};
+};
+CancelWhiteSpace: PROC = {blankLineCount ¨ 0};
+CancelDirectory: PROC = {underDirectory ¨ FALSE};
+ParseDirectoryItem: PROC [exported: BOOL, readOnly: BOOL, path1: ROPE ¨ NIL]
+RETURNS [REF DFUtilities.DirectoryItem ¨ NIL]  = {
+directoryFilterB: DFUtilities.FilterB = IF exported THEN $public ELSE $private;
+directoryFilterC: DFUtilities.FilterC = IF readOnly THEN $imported ELSE $defining;
+ConsiderDefiningInstance: PROC RETURNS [BOOL] = {
+RETURN [
+(filter.filterB = $all OR filter.filterB = directoryFilterB) AND
+(filter.filterC = $all OR filter.filterC = directoryFilterC)
+];
+};
+path2: ROPE ¨ NIL;
+path2IsCameFrom: BOOL ¨ FALSE;
+x: REF TEXT;
+IF path1 = NIL AND EndOfLineRope[path1 ¨ GetToken[SimpleToken]] THEN
+ERROR SyntaxError["Missing directory path."];
+IF ~EndOfLineText[x ¨ GetTokenAsRefText[SimpleToken]] THEN {
+SELECT TRUE FROM
+RefText.Equal[x, "ReleaseAs", FALSE] => path2IsCameFrom ¨ FALSE;
+RefText.Equal[x, "CameFrom", FALSE] => path2IsCameFrom ¨ TRUE;
+ENDCASE => ERROR SyntaxError["Unrecognized construct following directory path."];
+IF EndOfLineRope[path2 ¨ GetToken[SimpleToken]] THEN
+RaiseSyntaxError["Missing directory path following", x];
+CheckEndOfLine[];
+};
+underDirectory ¨ TRUE;
+IF path1.Find["/"]#-1 OR path2.Find["/"]#-1 THEN ERROR SyntaxError["Slash found in directory; use bracket instead."];
+RETURN [
+IF (passFileItems ¨ ConsiderDefiningInstance[]) THEN
+NEW[DFUtilities.DirectoryItem ¨ [
+path1: path1,
+path2: path2,
+path2IsCameFrom: path2IsCameFrom,
+exported: exported,
+readOnly: readOnly
+]]
+ELSE NIL
+]
+};
+ParseFileItem: PROC [verifyRoot: BOOL ¨ FALSE, name: ROPE ¨ NIL] RETURNS [REF DFUtilities.FileItem] = {
+PassesNameFilter: PROC [file: ROPE] RETURNS [BOOL] = {
+SELECT TRUE FROM
+filter.list # NIL => {};
+filter.filterA = $all => {};
+ClassifyFileExtension[file] = filter.filterA => {};
+ENDCASE => RETURN [FALSE];
+RETURN [SearchUsingList[file, filter.list].found]
+};
+date: DFUtilities.Date;
+IF ~underDirectory THEN ERROR SyntaxError["Missing directory statement"];
+IF name = NIL AND EndOfLineRope[name ¨ GetToken[SimpleToken]] THEN
+ERROR SyntaxError["Missing file name."];
+date ¨ GetDateAndLineSep[in, bufferN];
+IF name.Find["/"]#-1 THEN ERROR SyntaxError["Slash found in file name; use bracket instead."];
+RETURN [
+IF passFileItems AND PassesNameFilter[RemoveVersionNumber[name]] THEN
+NEW[DFUtilities.FileItem ¨ [
+name: name,
+date: date,
+verifyRoot: verifyRoot
+]]
+ELSE NIL
+]
+};
+ParseImportsItem: PROC [exported: BOOL] RETURNS [REF DFUtilities.ImportsItem] = {
+x: REF TEXT;
+path1, path2: ROPE ¨ NIL;
+date: DFUtilities.Date;
+form: DFUtilities.UsingForm ¨ $exports;
+list: REF DFUtilities.UsingList ¨ NIL;
+ConsiderImports: PROC RETURNS [BOOL] = {
+IF filter.filterC = $defining THEN RETURN [FALSE];
+IF exported AND filter.list # NIL THEN {
+RETURN [form = $all OR form = $exports OR list # NIL];
+};
+SELECT filter.filterB FROM
+$private => IF exported OR form = $exports THEN RETURN [FALSE];
+$public => IF ~exported THEN RETURN [FALSE];
+ENDCASE;
+RETURN [~(form = $list AND list = NIL)]
+};
+IF EndOfLineRope[path1 ¨ GetToken[SimpleToken]] THEN
+ERROR SyntaxError["Missing file name."];
+IF EndOfLineText[x ¨ GetTokenAsRefText[SimpleToken]] OR
+~RefText.Equal[x, "Of", FALSE] THEN
+ERROR SyntaxError["Missing 'Of' following DF name"];
+date ¨ GetDateAndLineSep[in, bufferN];
+x ¨ GetTokenAsRefText[PreUsingToken];
+IF RefText.Equal[x, "CameFrom", FALSE] THEN {
+IF EndOfLineRope[path2 ¨ GetToken[SimpleToken]] THEN
+RaiseSyntaxError["Missing directory path following", x];
+CheckEndOfLine[];
+x ¨ GetTokenAsRefText[PreUsingToken];
+};
+IF RefText.Equal[x, "Using", FALSE] THEN {
+x ¨ GetTokenAsRefText[UsingToken];
+SELECT TRUE FROM
+RefText.Equal[x, "All", FALSE] => form ¨ $all;
+RefText.Equal[x, "Exports", FALSE] => --form ¨ $exports-- NULL;
+RefText.Equal[x, "[", FALSE] => {
+verifyRoot: BOOL ¨ FALSE;
+form ¨ $list;
+DO
+index: NAT;
+inList: BOOL;
+x ¨ GetTokenAsRefText[UsingToken];
+IF RefText.Length[x] = 1 THEN
+SELECT RefText.Fetch[x, 0] FROM
+'] => EXIT;
+'+ =>
+IF ~verifyRoot THEN {verifyRoot ¨ TRUE; LOOP}
+ELSE ERROR SyntaxError["Illegally placed '+' in 'Using' list."];
+ENDCASE;
+IF RefText.TrustTextAsRope[x].Find["/"]#-1 THEN ERROR SyntaxError["Slash found in file name; use bracket instead."];
+[inList, index] ¨ SearchUsingList[RefText.TrustTextAsRope[x], filter.list];
+IF inList THEN {
+SELECT TRUE FROM
+list = NIL => {
+length: NAT = IF filter.list = NIL THEN 20 ELSE filter.list.nEntries;
+list ¨ NEW[DFUtilities.UsingList[length]];
+list.nEntries ¨ 0;
+};
+list.nEntries = list.length => {
+newList: REF DFUtilities.UsingList ¨ NEW[DFUtilities.UsingList[(list.length*3)/2]];
+newList.nEntries ¨ list.nEntries;
+FOR i: NAT IN [0..list.nEntries) DO
+newList.u[i] ¨ list.u[i];
+ENDLOOP;
+list ¨ newList;
+};
+ENDCASE;
+list.u[list.nEntries] ¨ [
+verifyRoot: verifyRoot,
+name:
+IF filter.list = NIL THEN Rope.FromRefText[x]
+ELSE filter.list.u[index].name
+];
+list.nEntries ¨ list.nEntries.SUCC;
+};
+verifyRoot ¨ FALSE;
+ENDLOOP;
+};
+ENDCASE => ERROR SyntaxError["Unrecognized construct following 'Using'."];
+CheckEndOfLine[];
+}
+ELSE {
+PutBack[x];
+};
+CancelDirectory[];
+IF path1.Find["/"]#-1 THEN ERROR SyntaxError["Slash found in DF name; use bracket instead."];
+IF path2.Find["/"]#-1 THEN ERROR SyntaxError["Slash found in directory; use bracket instead."];
+RETURN [
+IF ConsiderImports[] THEN
+NEW[DFUtilities.ImportsItem ¨ [
+path1: path1,
+date: date,
+path2: path2,
+exported: exported,
+form: form,
+list: list
+]]
+ELSE NIL
+]
+};
+ParseIncludeItem: PROC RETURNS [REF DFUtilities.IncludeItem] = {
+item: REF DFUtilities.IncludeItem = NEW[DFUtilities.IncludeItem ¨ [
+path1: GetToken[SimpleToken],
+date: ,
+path2: NIL,
+path2IsCameFrom: 
+]];
+x: REF TEXT;
+IF EndOfLineRope[item.path1] THEN ERROR SyntaxError["Missing file name."];
+IF EndOfLineText[x ¨ GetTokenAsRefText[SimpleToken]] OR
+~RefText.Equal[x, "Of", FALSE] THEN
+ERROR SyntaxError["Missing 'Of' following DF name"];
+item.date ¨ GetDateAndLineSep[in, bufferN];
+x ¨ GetTokenAsRefText[SimpleToken];
+SELECT TRUE FROM
+RefText.Equal[x, "ReleaseAs", FALSE] => item.path2IsCameFrom ¨ FALSE;
+RefText.Equal[x, "CameFrom", FALSE] => item.path2IsCameFrom ¨ TRUE;
+ENDCASE => {PutBack[x]; RETURN [item]};
+IF EndOfLineRope[item.path2 ¨ GetToken[SimpleToken]] THEN
+RaiseSyntaxError["Missing directory path following", x];
+CheckEndOfLine[];
+CancelDirectory[];
+IF item.path1.Find["/"]#-1 THEN ERROR SyntaxError["Slash found in DF name; use bracket instead."];
+IF item.path2.Find["/"]#-1 THEN ERROR SyntaxError["Slash found in directory; use bracket instead."];
+RETURN [item]
+};
+DO
+item: REF ANY ¨ NIL;
+char: CHAR = in.GetChar[ ! IO.EndOfStream => EXIT];
+SELECT char FROM
+Ascii.SP, Ascii.TAB => LOOP;  -- leading white space on line
+'* => LOOP;  -- a flag used in XDE DF files, similar to '+, we ignore it
+Ascii.CR, Ascii.LF => {
+IF filter.comments THEN blankLineCount ¨ blankLineCount.SUCC;
+LOOP
+};
+'+ => {
+FlushWhiteSpace[];
+item ¨ ParseFileItem[verifyRoot: TRUE];
+};
+'- => {
+FlushWhiteSpace[];
+IF in.PeekChar[] = '- THEN {
+comment: ROPE = Rope.Concat["-", in.GetLineRope[]];
+IF filter.comments THEN item ¨ NEW[DFUtilities.CommentItem ¨ [text: comment]];
+}
+ELSE {in.Backup[char]; item ¨ ParseFileItem[]};
+};
+'/ => {
+FlushWhiteSpace[];
+IF in.GetChar[] = '/ THEN {
+comment: ROPE ¨ NIL;
+comment ¨ in.GetLineRope[ ! IO.EndOfStream => CONTINUE];
+IF filter.comments THEN
+item ¨ NEW[DFUtilities.CommentItem ¨ [text: Rope.Concat["--", comment]]];
+}
+ELSE ERROR SyntaxError["'/' is illegal at the start of a line."];
+};
+ENDCASE => {
+x: REF TEXT;
+in.Backup[char];
+x ¨ GetTokenAsRefText[SimpleToken];
+SELECT TRUE FROM
+RefText.Equal[x, "Directory", FALSE] =>
+item ¨ ParseDirectoryItem[exported: FALSE, readOnly: FALSE];
+RefText.Equal[x, "ReadOnly", FALSE] =>
+item ¨ ParseDirectoryItem[exported: FALSE, readOnly: TRUE];
+RefText.Equal[x, "Imports", FALSE] => item ¨ ParseImportsItem[exported: FALSE];
+RefText.Equal[x, "Include", FALSE],
+RefText.Equal[x, "Includes", FALSE] => item ¨ ParseIncludeItem[];
+RefText.Equal[x, "Exports", FALSE] => {
+IF EndOfLineText[x ¨ GetTokenAsRefText[SimpleToken]] THEN
+ERROR SyntaxError["Missing directory path following 'Exports'."];
+SELECT TRUE FROM
+RefText.Equal[x, "Directory", FALSE] =>
+item ¨ ParseDirectoryItem[exported: TRUE, readOnly: FALSE];
+RefText.Equal[x, "ReadOnly", FALSE] =>
+item ¨ ParseDirectoryItem[exported: TRUE, readOnly: TRUE];
+RefText.Equal[x, "Imports", FALSE] =>
+item ¨ ParseImportsItem[exported: TRUE];
+ENDCASE =>
+item ¨ ParseDirectoryItem[
+exported: TRUE, readOnly: FALSE, path1: Rope.FromRefText[x]];
+};
+ENDCASE => item ¨ ParseFileItem[name: Rope.FromRefText[x]];
+};
+IF item ~= NIL THEN {
+FlushWhiteSpace[];
+IF proc[item] THEN ERROR Abort;
+}
+ELSE CancelWhiteSpace[];
+ENDLOOP;
+RefText.ReleaseScratch[bufferN];
+RefText.ReleaseScratch[bufferT];
+};
+SortUsingList[usingList: filter.list, nearlySorted: TRUE];
+ParseInner[ !
+Abort => CONTINUE;
+IO.EndOfStream => ERROR SyntaxError["Unexpected end of DF."];
+IO.Error => ERROR SyntaxError[NIL];
+]
+};
+
+ParseDigits: PROC [text: REF TEXT, start, stop: NAT] RETURNS [n: INT ¨ 0] ~ {
+FOR i: NAT IN[start..stop) DO
+char: CHAR ~ text[i];
+IF char IN['0..'9] THEN n ¨ n*10+(char-'0) ELSE EXIT;
+ENDLOOP;
+};
+ParseMonth: PROC [text: REF TEXT, start, stop: NAT] RETURNS [BasicTime.MonthOfYear] ~ {
+State: TYPE ~ {null, A, Ap, Apr, Au, Aug, D, De, Dec, F, Fe, Feb, J, Ja, Jan, Ju, Jul, Jun, M, Ma, Mar, May, N, No, Nov, O, Oc, Oct, S, Se, Sep};
+state: State ¨ null;
+FOR i: NAT IN[start..stop) DO
+char: CHAR ~ text[i];
+SELECT state FROM
+null => SELECT char FROM
+'A => state ¨ A; 'D => state ¨ D; 'F => state ¨ F; 'J => state ¨ J;
+'M => state ¨ M; 'N => state ¨ N; 'O => state ¨ O; 'S => state ¨ S;
+ENDCASE => GOTO bogus;
+A => SELECT char FROM 'p => state ¨ Ap; 'u => state ¨ Au; ENDCASE => GOTO bogus;
+Ap => SELECT char FROM 'r => state ¨ Apr; ENDCASE => GOTO bogus;
+Au => SELECT char FROM 'g => state ¨ Aug; ENDCASE => GOTO bogus;
+D => SELECT char FROM 'e => state ¨ De; ENDCASE => GOTO bogus;
+De => SELECT char FROM 'c => state ¨ Dec; ENDCASE => GOTO bogus;
+F => SELECT char FROM 'e => state ¨ Fe; ENDCASE => GOTO bogus;
+Fe => SELECT char FROM 'b => state ¨ Feb; ENDCASE => GOTO bogus;
+J => SELECT char FROM 'a => state ¨ Ja; 'u => state ¨ Ju; ENDCASE => GOTO bogus;
+Ja => SELECT char FROM 'n => state ¨ Jan; ENDCASE => GOTO bogus;
+Ju => SELECT char FROM 'l => state ¨ Jul; 'n => state ¨ Jun; ENDCASE => GOTO bogus;
+M => SELECT char FROM 'a => state ¨ Ma; ENDCASE => GOTO bogus;
+Ma => SELECT char FROM 'r => state ¨ Mar; 'y => state ¨ May; ENDCASE => GOTO bogus;
+N => SELECT char FROM 'o => state ¨ No; ENDCASE => GOTO bogus;
+No => SELECT char FROM 'v => state ¨ Nov; ENDCASE => GOTO bogus;
+O => SELECT char FROM 'c => state ¨ Oc; ENDCASE => GOTO bogus;
+Oc => SELECT char FROM 't => state ¨ Oct; ENDCASE => GOTO bogus;
+S => SELECT char FROM 'e => state ¨ Se; ENDCASE => GOTO bogus;
+Se => SELECT char FROM 'p => state ¨ Sep; ENDCASE => GOTO bogus;
+ENDCASE => GOTO bogus;
+ENDLOOP;
+SELECT state FROM
+Jan => RETURN[January];
+Feb => RETURN[February];
+Mar => RETURN[March];
+Apr => RETURN[April];
+May => RETURN[May];
+Jun => RETURN[June];
+Jul => RETURN[July];
+Aug => RETURN[August];
+Sep => RETURN[September];
+Oct => RETURN[October];
+Nov => RETURN[November];
+Dec => RETURN[December];
+ENDCASE => GOTO bogus;
+EXITS bogus => RETURN [unspecified];
+};
+ZoneInfo: TYPE ~ RECORD [zone: BasicTime.Zone, dst: BOOL];
+nullZoneInfo: ZoneInfo ~ [zone: BasicTime.unspecifiedZone, dst: FALSE];
+ParseZone: PROC [text: REF TEXT, start, stop: NAT] RETURNS [info: ZoneInfo ¨ nullZoneInfo] ~ {
+minus, dst: BOOL ¨ FALSE;
+hrs, mins: INT ¨ 0;
+SELECT stop-start FROM
+3 => {
+zoneRope: Rope.ROPE ¨ Rope.FromRefText[text, start, 3];
+SELECT TRUE FROM -- GMT needs more general parser - MGL
+Rope.Equal[zoneRope, "GMT"] => { hrs ¨ 0; dst ¨ FALSE };
+Rope.Equal[zoneRope, "BST"] => { hrs ¨ 0; dst ¨ TRUE };
+Rope.Equal[zoneRope, "PST"] => { hrs ¨ 8; dst ¨ FALSE };
+Rope.Equal[zoneRope, "MST"] => { hrs ¨ 7; dst ¨ FALSE };
+Rope.Equal[zoneRope, "CST"] => { hrs ¨ 6; dst ¨ FALSE };
+Rope.Equal[zoneRope, "EST"] => { hrs ¨ 5; dst ¨ FALSE };
+Rope.Equal[zoneRope, "PDT"] => { hrs ¨ 8; dst ¨ TRUE };
+Rope.Equal[zoneRope, "MDT"] => { hrs ¨ 7; dst ¨ TRUE };
+Rope.Equal[zoneRope, "CDT"] => { hrs ¨ 6; dst ¨ TRUE };
+Rope.Equal[zoneRope, "EDT"] => { hrs ¨ 5; dst ¨ TRUE };
+Rope.Equal[zoneRope, "JST"] => { hrs ¨ 9; minus ¨ TRUE; dst ¨ FALSE };
+ENDCASE => GOTO bogus;
+};
+5 => {
+SELECT text[start] FROM '+ => NULL; '- => minus ¨ TRUE;
+ENDCASE => GOTO bogus;
+hrs ¨ ParseDigits[text, start+1, start+3];
+mins ¨ ParseDigits[text, start+3, start+5];
+};
+ENDCASE => GOTO bogus;
+IF hrs IN[0..24) AND mins IN[0..60) THEN {
+info.zone ¨ hrs*60+mins;
+IF minus THEN info.zone ¨ -info.zone;
+info.dst ¨ dst;
+}
+ELSE GOTO bogus;
+EXITS bogus => RETURN [nullZoneInfo];
+};
+GetDateAndLineSep: PROC [in: STREAM, text: REF TEXT] RETURNS [date: DFUtilities.Date ¨ []] = {
+State: TYPE ~ {
+date1, -- awaiting beginning of date
+date2, -- saw "~", awaiting "="
+date3, -- awaiting end of line after date
+day, -- in day part of date
+month1, -- awaiting month part of date
+month2, -- in month part of date
+year1, -- awaiting year part of date
+year2, -- in year part of date
+hour1, -- awaiting hour part of date
+hour2, -- in hour part of date
+minute1, -- awaiting minute part of date
+minute2, -- in minute part of date
+second1, -- awaiting second part of date
+second2, -- in second part of date
+zone1, -- awaiting zone part of date
+zone2, -- in alphabetic zone part of date (like "PST")
+zone3 -- in numeric zone part of date (like "+0200")
+};
+state: State ¨ date1;
+dayStart, dayStop: NAT ¨ 0;
+monthStart, monthStop: NAT ¨ 0;
+yearStart, yearStop: NAT ¨ 0;
+hourStart, hourStop: NAT ¨ 0;
+minuteStart, minuteStop: NAT ¨ 0;
+secondStart, secondStop: NAT ¨ 0;
+zoneStart, zoneStop: NAT ¨ 0;
+append: BOOL ¨ FALSE;
+text.length ¨ 0;
+DO
+char: CHAR ~ in.GetChar[ ! IO.EndOfStream => EXIT];
+index: NAT ~ text.length;
+{
+SELECT state FROM
+date1 => SELECT char FROM
+Ascii.SP, Ascii.TAB => { };
+Ascii.CR, Ascii.LF => { date.format ¨ omitted; EXIT };
+'> => { date.format ¨ greaterThan; state ¨ date3 };
+'# => { date.format ¨ notEqual; state ¨ date3 };
+'~ => { state ¨ date2 };
+IN ['0..'9] => { append ¨ TRUE; dayStart ¨ index; state ¨ day };
+ENDCASE => { GOTO bogus };
+date2 => SELECT char FROM
+'= => { date.format ¨ notEqual; state ¨ date3 };
+ENDCASE => { GOTO bogus };
+date3 => SELECT char FROM
+Ascii.SP, Ascii.TAB => { };
+Ascii.CR, Ascii.LF => { EXIT };
+ENDCASE => { ERROR SyntaxError["Unrecognizable text where end-of-line was expected."] };
+day => SELECT char FROM
+IN ['0..'9] => { };
+'-, Ascii.SP => { dayStop ¨ index; state ¨ month1 };
+ENDCASE => { GOTO bogus };
+month1 => SELECT char FROM
+Ascii.SP => { };
+IN ['A..'Z] => { monthStart ¨ index; state ¨ month2 };
+ENDCASE => { GOTO bogus };
+month2 => SELECT char FROM
+IN ['a..'z] => { };
+'-, Ascii.SP => { monthStop ¨ index; state ¨ year1 };
+ENDCASE => { GOTO bogus };
+year1 => SELECT char FROM
+Ascii.SP => { };
+IN ['0..'9] => { yearStart ¨ index; state ¨ year2 };
+ENDCASE => { GOTO bogus };
+year2 => SELECT char FROM
+IN ['0..'9] => { };
+Ascii.SP, Ascii.TAB => { yearStop ¨ index; state ¨ hour1 };
+ENDCASE => { GOTO bogus };
+hour1 => SELECT char FROM
+Ascii.SP => { };
+IN ['0..'9] => { hourStart ¨ index; state ¨ hour2 };
+ENDCASE => { GOTO bogus };
+hour2 => SELECT char FROM
+IN ['0..'9] => { };
+': => { hourStop ¨ index; state ¨ minute1 };
+ENDCASE => { GOTO bogus };
+minute1 => SELECT char FROM
+IN ['0..'9] => { minuteStart ¨ index; state ¨ minute2 };
+ENDCASE => { GOTO bogus };
+minute2 => SELECT char FROM
+IN ['0..'9] => { };
+': => { minuteStop ¨ index; state ¨ second1 };
+ENDCASE => { GOTO bogus };
+second1 => SELECT char FROM
+IN ['0..'9] => { secondStart ¨ index; state ¨ second2 };
+ENDCASE => { GOTO bogus };
+second2 => SELECT char FROM
+IN ['0..'9] => { };
+Ascii.SP => { secondStop ¨ index; state ¨ zone1 };
+ENDCASE => { GOTO bogus };
+zone1 => SELECT char FROM
+Ascii.SP => { };
+IN ['A..'Z] => { zoneStart ¨ index; state ¨ zone2 };
+'+, '- => { zoneStart ¨ index; state ¨ zone3 };
+ENDCASE => { GOTO bogus };
+zone2 => SELECT char FROM
+IN ['A..'Z] => { };
+Ascii.CR, Ascii.LF => { zoneStop ¨ index; EXIT };
+Ascii.SP, Ascii.TAB => { zoneStop ¨ index; append ¨ FALSE; state ¨ date3 };
+ENDCASE => { GOTO bogus };
+zone3 => SELECT char FROM
+IN ['0..'9] => { };
+Ascii.CR, Ascii.LF => { zoneStop ¨ index; EXIT };
+Ascii.SP, Ascii.TAB => { zoneStop ¨ index; append ¨ FALSE; state ¨ date3 };
+ENDCASE => { GOTO bogus };
+ENDCASE => ERROR;
+};
+IF append THEN text ¨ RefText.InlineAppendChar[to: text, from: char];
+ENDLOOP;
+IF text.length>0 THEN {
+u: BasicTime.Unpacked ¨ [];
+day: INT ~ ParseDigits[text, dayStart, dayStop];
+month: BasicTime.MonthOfYear ~ ParseMonth[text, monthStart, monthStop];
+year: INT ~ ParseDigits[text, yearStart, yearStop];
+hour: INT ~ ParseDigits[text, hourStart, hourStop];
+minute: INT ~ ParseDigits[text, minuteStart, minuteStop];
+second: INT ~ ParseDigits[text, secondStart, secondStop];
+z: ZoneInfo ~ ParseZone[text, zoneStart, zoneStop];
+IF year IN[0..100) THEN u.year ¨ (IF year>30 THEN 1900 ELSE 2000)+year ELSE GOTO bogus;
+IF month#unspecified THEN u.month ¨ month ELSE GOTO bogus;
+IF day IN[1..BasicTime.daysPerMonth] THEN u.day ¨ day ELSE GOTO bogus;
+IF hour IN[0..BasicTime.hoursPerDay) THEN u.hour ¨ hour ELSE GOTO bogus;
+IF minute IN[0..BasicTime.minutesPerHour) THEN u.minute ¨ minute ELSE GOTO bogus;
+IF second IN[0..BasicTime.secondsPerMinute) THEN u.second ¨ second ELSE GOTO bogus;
+IF z#nullZoneInfo THEN { u.zone ¨ z.zone; u.dst ¨ IF z.dst THEN yes ELSE no };
+date.gmt ¨ BasicTime.Pack[u ! BasicTime.OutOfRange => GOTO bogus];
+date.format ¨ explicit;
+};
+EXITS bogus => ERROR SyntaxError["Illegal date specification."];
+};
+SyntaxError: PUBLIC ERROR [reason: ROPE] = CODE;
+
+WriteToStream: PUBLIC PROC [out: STREAM, proc: DFUtilities.SupplyItemProc] = {
+haveDirectory: BOOL ¨ FALSE;
+DO
+item: REF ANY = proc[];
+IF item = NIL THEN EXIT;
+WITH item SELECT FROM
+directory: REF DFUtilities.DirectoryItem => haveDirectory ¨ TRUE;
+file: REF DFUtilities.FileItem =>
+IF ~haveDirectory THEN
+ERROR SyntaxError["File item without preceding Directory item."];
+imports: REF DFUtilities.ImportsItem => haveDirectory ¨ FALSE;
+include: REF DFUtilities.IncludeItem => haveDirectory ¨ FALSE;
+ENDCASE;
+WriteItemToStream[out, item];
+ENDLOOP;
+};
+
+WriteItemToStream: PUBLIC PROC [out: STREAM, item: REF ANY] = {
+maxUsingLineLength: INT = 90;
+maxReasonableFileNameLength: INT = 45;
+WITH item SELECT FROM
+directory: REF DFUtilities.DirectoryItem => {
+IF directory.exported THEN out.PutRope["Exports "];
+IF directory.readOnly THEN out.PutRope["ReadOnly "];
+IF ~(directory.exported OR directory.readOnly) THEN out.PutRope["Directory "];
+out.PutRope[directory.path1];
+};
+file: REF DFUtilities.FileItem => {
+out.PutRope["  "];
+IF file.verifyRoot THEN out.PutChar['+];
+out.PutRope[file.name];
+THROUGH [0..MAX[maxReasonableFileNameLength-file.name.Length[], 1]) DO
+out.PutChar[Ascii.SP];
+ENDLOOP;
+DateToStream[out, file.date];
+};
+imports: REF DFUtilities.ImportsItem => {
+IF imports.exported THEN out.PutRope["Exports "];
+out.PutRope["Imports "];
+out.PutRope[imports.path1];
+out.PutRope[" Of "];
+DateToStream[out, imports.date];
+SELECT imports.form FROM
+exports => NULL;
+all => {
+out.PutChar[LineSep];
+out.PutRope["  Using All"];
+};
+list => {
+out.PutChar[LineSep];
+out.PutRope["  Using ["];
+IF imports.list ~= NIL THEN FOR i: NAT IN [0..imports.list.nEntries) DO
+entry: DFUtilities.UsingEntry = imports.list.u[i];
+IF i # 0 THEN out.PutRope[", "];
+IF entry.verifyRoot THEN out.PutChar['+];
+out.PutRope[entry.name];
+ENDLOOP;
+out.PutRope["]"];
+};
+ENDCASE;
+};
+include: REF DFUtilities.IncludeItem => {
+out.PutRope["Include "];
+out.PutRope[include.path1];
+out.PutRope[" Of "];
+DateToStream[out, include.date];
+};
+comment: REF DFUtilities.CommentItem =>
+out.PutRope[comment.text];
+whiteSpace: REF DFUtilities.WhiteSpaceItem =>
+THROUGH [0..whiteSpace.lines-1) DO out.PutChar[LineSep]; ENDLOOP;
+ENDCASE => ERROR SyntaxError["Unrecognizable item."];
+out.PutChar[LineSep];
+};
+
+SortUsingList: PUBLIC PROC [usingList: REF DFUtilities.UsingList, nearlySorted: BOOL] = {
+IF usingList = NIL THEN RETURN;
+IF nearlySorted
+THEN {
+FOR i: NAT IN [1..usingList.nEntries) DO
+item: DFUtilities.UsingEntry = usingList.u[i];
+j: NAT ¨ i;  -- 'j' can't be a loop control variable; we want its value on termination.
+WHILE Rope.Compare[item.name, usingList.u[j-1].name, FALSE] = less DO
+usingList.u[j] ¨ usingList.u[j-1];
+IF (j ¨ j.PRED) = 0 THEN EXIT;
+ENDLOOP;
+IF j ~= i THEN usingList.u[j] ¨ item;  -- test avoids unnecessary reference counting.
+ENDLOOP;
+}
+ELSE {
+SiftUp: PROC [low, high: NAT] = {
+k: NAT ¨ low;
+DO
+twoK: NAT = k*2;
+son: NAT ¨ twoK;
+IF twoK > high THEN EXIT;
+IF twoK+1 <= high AND Rope.Compare[usingList.u[twoK+1-1].name, usingList.u[twoK-1].name, FALSE] ~= less THEN son ¨ twoK+1;
+IF Rope.Compare[usingList.u[son-1].name, usingList.u[k-1].name, FALSE] = less THEN EXIT;
+Exchange[son-1, k-1];
+k ¨ son;
+ENDLOOP;
+};
+Exchange: PROC [a, b: NAT] = {
+temp: DFUtilities.UsingEntry = usingList.u[a];
+usingList.u[a] ¨ usingList.u[b];
+usingList.u[b] ¨ temp;
+};
+FOR i: NAT DECREASING IN [1..usingList.nEntries/2] DO
+SiftUp[i, usingList.nEntries];
+ENDLOOP;
+FOR i: NAT DECREASING IN [1..usingList.nEntries) DO
+Exchange[0, i];
+SiftUp[1, i];
+ENDLOOP;
+};
+};
+
+SearchUsingList: PUBLIC PROC [file: ROPE, list: REF DFUtilities.UsingList]
+RETURNS [found: BOOL ¨ FALSE, index: NAT ¨ 0] = {
+IF list = NIL
+THEN found ¨ TRUE  -- NIL list is interpreted as "everything"
+ELSE {
+low: INTEGER ¨ 0;
+high: INTEGER ¨ list.nEntries.PRED;
+UNTIL low > high DO
+probe: NAT ¨ (low + high) / 2;
+SELECT file.Compare[list.u[probe].name, FALSE] FROM
+equal => RETURN [TRUE, probe];
+less => IF probe = 0 THEN EXIT ELSE high ¨ probe.PRED;
+greater => IF probe = list.nEntries.PRED THEN EXIT ELSE low ¨ probe.SUCC;
+ENDCASE;
+ENDLOOP;
+found ¨ FALSE;
+};
+};
+
+DifferenceOfUsingLists: PUBLIC PROC [a, b: REF DFUtilities.UsingList]
+RETURNS [diff: REF DFUtilities.UsingList ¨ NIL] = {
+aI, bI: NAT ¨ 0;
+aL: NAT = a.nEntries;
+bL: NAT = b.nEntries;
+diff ¨ NEW[DFUtilities.UsingList[a.nEntries]];
+diff.nEntries ¨ 0;
+UNTIL aI = aL OR bI = bL DO
+SELECT a.u[aI].name.Compare[b.u[bI].name, FALSE] FROM
+equal => aI ¨ aI.SUCC;
+less => {
+diff.u[diff.nEntries] ¨ a.u[aI];
+diff.nEntries ¨ diff.nEntries.SUCC;
+aI ¨ aI.SUCC;
+};
+greater => bI ¨ bI.SUCC;
+ENDCASE;
+ENDLOOP;
+UNTIL aI = aL DO
+diff.u[diff.nEntries] ¨ a.u[aI];
+diff.nEntries ¨ diff.nEntries.SUCC;
+aI ¨ aI.SUCC;
+ENDLOOP;
+};
+
+DateToRope: PUBLIC PROC [date: DFUtilities.Date] RETURNS [ROPE ¨ NIL] = {
+SELECT date.format FROM
+$explicit => {
+months: ROPE = "JanFebMarAprMayJunJulAugSepOctNovDec";
+up: BasicTime.Unpacked = BasicTime.Unpack[date.gmt
+! BasicTime.OutOfRange, BasicTime.TimeParametersNotKnown => GO TO noDate];
+ConvertZone: PROC RETURNS [ROPE] = {
+dst: BOOL = up.dst = yes;
+jstZone: BasicTime.Zone = -9*BasicTime.minutesPerHour;
+SELECT up.zone FROM
+0 => RETURN [IF dst THEN "BST" ELSE "GMT"];
+NAT[5*BasicTime.minutesPerHour] => RETURN [IF dst THEN "EDT" ELSE "EST"];
+NAT[6*BasicTime.minutesPerHour] => RETURN [IF dst THEN "CDT" ELSE "CST"];
+NAT[7*BasicTime.minutesPerHour] => RETURN [IF dst THEN "MDT" ELSE "MST"];
+NAT[8*BasicTime.minutesPerHour] => RETURN [IF dst THEN "PDT" ELSE "PST"];
+jstZone => RETURN["JST"];
+ENDCASE;
+RETURN [
+IO.PutFR["%g%02d%02d",
+[character[IF up.zone < 0 THEN '- ELSE '+]],
+[cardinal[up.zone.ABS/BasicTime.minutesPerHour]],
+[cardinal[up.zone.ABS MOD BasicTime.minutesPerHour]]
+]
+]
+};
+RETURN [
+IO.PutFLR["%02d-%g-%02d %02d:%02d:%02d %g", LIST[
+[cardinal[up.day]],
+[rope[months.Substr[start: up.month.ORD*3, len: 3]]],
+[cardinal[up.year MOD 100]],
+[cardinal[up.hour]],
+[cardinal[up.minute]],
+[cardinal[up.second]],
+[rope[ConvertZone[]]]
+]]
+]
+};
+$notEqual => RETURN ["~="];
+$greaterThan => RETURN [">"];
+ENDCASE;
+EXITS
+noDate => {};
+};
+
+DateToStream: PUBLIC PROC [s: STREAM, date: DFUtilities.Date] =
+{ s.PutRope[DateToRope[date] ] };
+
+derivedList: LIST OF ROPE ¨ LIST[".bcd", ".boot", ".press", ".signals", ".mob", ".o", ".ip", ".interpress", ".c2c.c", ".dvi", ".$cheme", ".sx.c"];
+
+IsExtension: PROC [base, ext: ROPE] RETURNS [BOOL] ~ {
+bsize: INT ~ Rope.Length[base];
+esize: INT ~ Rope.Length[ext];
+i: INT ~ Rope.FindBackward[s1: base, s2: ext, case: FALSE];
+IF i<0 THEN RETURN[FALSE]; -- ext not found
+IF (i+esize)<bsize THEN RETURN[Rope.Fetch[base, i+esize]='!]; -- ext followed by version
+RETURN[TRUE]; -- ext ends filename
+};
+
+ClassifyFileExtension: PUBLIC PROC [file: ROPE] RETURNS [DFUtilities.FilterA] = {
+FOR each: LIST OF ROPE ¨ derivedList, each.rest WHILE each # NIL DO
+IF IsExtension[base: file, ext: each.first] THEN RETURN [$derived];
+ENDLOOP;
+RETURN [$source]
+};
+
+GetVersionNumber: PUBLIC PROC [r: ROPE] RETURNS [ROPE] = {
+RETURN [r.Substr[start: FindVersionNumber[r]]]
+};
+
+RemoveVersionNumber: PUBLIC PROC [r: ROPE] RETURNS [ROPE] = {
+RETURN [r.Substr[len: FindVersionNumber[r]]]
+};
+
+FindVersionNumber: PROC [r: ROPE] RETURNS [INT] = {
+len: INT ¨ Rope.Length[r];
+pos: INT ¨ len;
+WHILE (pos ¨ pos-1) >= 0 DO
+SELECT Rope.Fetch[r, pos] FROM
+'! => RETURN [pos];
+'., '>, '] => RETURN [len];
+ENDCASE;
+ENDLOOP;
+RETURN [len];
+};
+RaiseSyntaxError: PROC [prefix: ROPE, text: REF TEXT] = {
+ERROR SyntaxError[IO.PutFR["%g '%g'.", [rope[prefix]], [text[text]] ] ];
+};
+END.
+
+   é  
+DFUtilitiesImpl.mesa
+Copyright ” 1984, 1985, 1986, 1987, 1988, 1989, 1990, 1991 by Xerox Corporation.  All rights reserved.
+created by Levin
+Mike Spreitzer January 8, 1987 5:28:21 pm PST
+Russ Atkinson (RRA) January 19, 1987 1:38:57 pm PST
+Doug Wyatt, February 26, 1987 9:59:24 pm PST
+Last tweaked by Mike Spreitzer on July 20, 1988 1:01:20 pm PDT
+Last edited by: Mik Lamming - January 25, 1989 1:26:28 pm GMT
+Willie-Sue, January 25, 1989 3:54:59 pm PST
+Eduardo Pelegri-Llopart March 2, 1989 10:51:34 am PST
+Tim Diebert: May 25, 1989 1:56:50 pm PDT
+Michael Plass, December 12, 1991 11:44 am PST
+Willie-s, June 26, 1991 2:41 pm PDT
+Exported Procedures
+bufferT is used for terminals, like "Directory".  bufferN is used for non-terminals, like file names, dates, and the like.  Separate buffers are used to simplify the REF TEXT handling by clients of GetTokenAsRefText.  They are not released if ParseInner exits with an uncaught signal, but this is claimed to be OK.
+RRA sez: we should consider the imports of any imports item being exported when there is an explicit filter list.  Of course, if there is a null intersection (list = NIL), we don't have to consider it unless the form dictates it.
+enter name in list
+This case can only happen if filter.list = NIL
+form _ $exports-- 
+Main parsing loop
+blank line
+Comment line
+Remove this code when old-style comments are no longer supported.
+convert to new style
+SELECT text[start+0] FROM 'P => hrs _ 8; 'M => hrs _ 7; 'C => hrs _ 6; 'E => hrs _ 5;
+ENDCASE => GOTO bogus;
+SELECT text[start+1] FROM 'S => dst _ FALSE; 'D => dst _ TRUE;
+ENDCASE => GOTO bogus;
+SELECT text[start+2] FROM 'T => NULL;
+ENDCASE => GOTO bogus;
+When compatibility is no longer needed, replace the following NULL with
+out.PutRope["\N  Using Exports"]
+intro: ROPE = "\N  Using [";
+charsOnLine: INT _ intro.Length[].PRED;
+out.PutRope[intro];
+IF imports.list ~= NIL THEN {
+FOR i: NAT IN [0..imports.list.nEntries) DO
+The following is an approximate check; the line may get a bit longer than `maxUsingLineLength'.
+entry: DFUtilities.UsingEntry = imports.list.u[i];
+IF charsOnLine + entry.name.Length[] > maxUsingLineLength THEN {
+indent: ROPE = "\N    ";
+IF i ~= 0 THEN out.PutChar[',];
+out.PutRope[indent];
+charsOnLine _ indent.Length[].PRED;
+}
+ELSE
+IF i ~= 0 THEN {out.PutRope[", "]; charsOnLine _ charsOnLine + 2};
+IF entry.verifyRoot THEN {out.PutChar['+]; charsOnLine _ charsOnLine.SUCC};
+out.PutRope[entry.name];
+charsOnLine _ charsOnLine + entry.name.Length[];
+ENDLOOP;
+};
+out.PutChar[']];
+Insertion sort
+Heap sort
+Do a binary search for "file" in "list".
+
+
+Last edited by: Mik Lamming - January 25, 1989 1:25:04 pm GMT
+Was not creating BST for GMT + daylight saving so verify couldn't parse date
+changes to: ParseZone to emit GMT and BST as appropriate
+Eduardo Pelegri-Llopart March 2, 1989 10:51:08 am PST
+Made it indiferent to the presence of 015 or 012 in the input DF.  It rewrites the DF using \r.
+changes to: IsLineSep.
+
+ ù )Ï  ïNewlineDelimiter
+ñ(cedarcode) styleô codeöúôKöú
+œeú[ôfKöúôKô-Kô3Kô,Kô>Kô=Kô+Kô5Kô(Kô-Kô#óò öœk	ò	Kö	úûúûúûúûúòKöú
+ûúüòÆKöúûúæòœKöûúûútûúòèKöúûúZògKöúûúJûú
+òbóóKò öœnúûúûòKöûúûúò$Köûúûòóò KöûúûúûúòKöûúûúûúûúòKò Kö—bnzœz–kz°òKö–nz°¢°¢°úòKò öü	úûúûúûúûúûúò3Köûúûúûúûúò*KòóKò óKò KöúôKò öüúûúûúûúIòqKöüúûúûúòöü
+úûúòKïStartOfExpansion+ -- [char: CHAR] RETURNS [IO.CharClass] -- öúûúûúòKöúûúûúòKöúûúòKöúûúûúòKöú¶ûúûúâûúô∫Köú	ûúûúò.Köú	ûúûúò/öüúûúœc)úòHöûúûòKöúûúûúûú	ò&Köúûúûúûú
+ò&Köûúûú
+òóKòóöüúûú§)úòJöûúûòKöúûúûúûú	ò&Köúûúûúûú
+ò*Köûúûú
+òóKòóöü
+úûú§)úòGöûúûòKöú
+ûú
+òKöûúûúûúò'óKòóöüúûúûúûú	ûúûúòKKöúûúûú#ò3óö
+üúûúûúûúûúò7Köúûúûú7òGóöüúûúûúûúûúûú	ûúûúò\öûúûúûúò,öûòKöúûúûúûúò/öûúûòKöúûúûúûúòKöûúûúòóKöûúòóöûúûúòKò4KòKòöûòKöúûúûúûúò/KöûúûúûúòöûúûòKöú
+ûú	ûúò+öúûúûòKòKöúûúûúûúòKöûúòóKöúûú	ûúò*öúûúûòKöúûúûúûúòKöûúûúòóKöûúûúòóKöú0ò0KöûúòóKòKöûú
+òKòóKöûúòKòóKöú'ûúûúûúòIKöûúòKöûúûúûú
+œbúò<óöüúûúûúûúòöûúûúòKö
+ûúûú•úûúûúòMKòóöûúûúûúû
+úûúûò7KöúòKöûúòóKòóöüúûúûúûúûúûúò4Köûúûú òAKöúòóö
+üúûúûúûúûúò0Köûúûúò1Köúòóöüúûúòöûú0ûò6KöûúDòIóKöúòóöüúûúòöûúûúûúò1Köûúûú8ûúûúòTKöúòKòóKòóKöüúûúò.Köüúûúûúò1öüúûúûúûú	ûúûúûúûúûúòKöú(ûú
+ûú	ûú
+òOKöú(ûú
+ûúûúòRöüúûúûúûúò1öûúòKöúûú$ûò@Köúûú#ò<KöúòóKòóKöúûúûúòKöúûúûúòKöúûúûúòöûú	ûúûú.ûòDKöûú(ò-óöûú4ûúò<öûúûúûòKöúûúûúò@Köúûúûúò>KöûúûúAòQóöûú.ûò4Köú8ò8óKòKòóKöúûúòKöûúûúûúûú?òuöûúòöûú.ûò4öûúò!KöúòKöúòKöú!ò!KöúòKöúòKöúòóóKöûúûòKòóKòóöüúûúûúûúûúûúûúûúògö
+üúûúûúûúûúò6öûúûúûòKöúûúòKöúòKöú3ò3KöûúûúûúòóKöûú+ò1KöúòóKöúòKöûúûúûú,òIöûúûúûú-ûòBKöûú#ò(óKöú&ò&Köûúûúûú?ò^öûúòöûúûú-ûòEöûúòKöúòKöúòKöúòKöúòóóKöûúûòKöúòóKòóö
+üúûúûúûúûúòQKöúûúûúòKöúûúûúòKöúòKöú'ò'Köúûúûúò&öüúûúûúûúò(Köûúûúûúûúò2öûú
+ûúûúûúò(Köûú£ûú<ôÂKöûúûúûúûúò6KòóöûúûòKöúûú
+ûúûúûúûúò?Kö	úûúûúûúûúò,KöûúòóKöûúûúûúò'Kòóöûú.ûò4Köûú#ò(óöûú3ûò7Köúûúûò#Köûú/ò4óKöú&ò&Köú%ò%öûúûúûúò-öûú.ûò4Köú8ò8óKòKöú%ò%Kòóöûúûúûúò*Köú"ò"öûúûúûòKöúûúò.Köúûú§úûúò?öúûúò!KöúûúûúòKöúòöûòKöúûúòKöúûúòKöú"ò"öûúûòöûúûòKöúûúòòKöûúûúûúûúò-Köûúûú6ò@óKöûúòóóKöûú)ûúûú?òtKöúKòKöûúûúòKöúôöûúûúûòöúûúòKöúûúûúûúûúûúòEKöúûú ò*KöúòKòóöú ò Köú+ûô.Köú	ûúûú+òSKöú!ò!öûúûúûúûò#KöúòKöûúòóKöúòKòóKöûúòóöúòKöúòöúòKöûúûúûúò-KöûúòóKöúòóKöúûúò#KòóKöúûúòKöûúòóKòóKöûúûú:òJóKòKòóöûúòKòKöúôKòóKöúòKöûúûúûú=ò]Köûúûúûú?ò_öûúòöûúûòöûúòKöúòKöúòKöúòKöúòKòKöú
+ò
+KòóóKöûúûòKòóKòóöüúûúûúûúò@öúûúûúòCKöúòKöúòKöúûúòKöúòKöúòóKöúûúûúòKöûúûúûú#òJöûú3ûò7Köúûúûò#Köûú/ò4óKöú+ò+Köú#ò#öûúûúûòKöúûúûúòEKöúûúûúòCKöûúûú	ò'óöûú3ûò9Köú8ò8óKòKöúòKöûúûúûú=òbKöûúûúûú?òdKöûúòKòóKöúôöûòKöúûúûúûúòKöúûúûúûúò3öûúûòKöúûúûúûú§ò<Köúûú§;òHöúûúûúòKöú
+ô
+Köûúûú!ûúò=KöûòKòóöúòKòKöú!ûúò'KöúòóöúòKòöûúûúòKöúôKöú	ûú&ò3Köûúûúûú,òNKòóKöûú+ò/KöúòóöúòKöúAôAKòöûúûúòKöú	ûúûúòKöúûúûúò8KöúôöûúûòKöúûú?òIóKòóKöûúûú7òAKòóöûúòKöúûúûúòKöúòKò#öûúûúûòöúûúò'Köú$ûúûúò<óöúûúò&Köú$ûúûúò;óKöúûú'ûúòOKöúûúò#KöúûúòAöúûúò'öûú3ûò9Köûú<òAóöûúûúûòöúûúò'Köú$ûúûúò;óöúûúò&Köú$ûúûúò:óöúûúò%Köú"ûúò(óöûúò
+öúòKöú
+ûúûúò=óóóKòóKöûú4ò;óKòóóöûú	ûúûúòKòKöûúûúûúòKòóKöûúòKöûúòóKò Kò KòóKöú4ûúò:òKöú	ûúòKöûúûú&ò=Köûú
+ûúûúò#KòóKòKò óunitöüúûúûúûúûúûúûú	òMöûúûúûúûòKöúûúòKö
+ûúûú	ûúûúûúò5KöûúòóKòóöü
+úûúûúûúûúûúòWKöúûúÜòëKöúòöûúûúûúûòKöúûúòöûúûòöúûúûòKöúCòCKöúCòCKöûúûúòóKö	úûúûú%ûúûúòPKö	úûúûúûúûúò@Kö	úûúûúûúûúò@Kö	úûúûúûúûúò>Kö	úûúûúûúûúò@Kö	úûúûúûúûúò>Kö	úûúûúûúûúò@Kö	úûúûú%ûúûúòPKö	úûúûúûúûúò@Kö	úûúûú'ûúûúòSKö	úûúûúûúûúò>Kö	úûúûú'ûúûúòSKö	úûúûúûúûúò>Kö	úûúûúûúûúò@Kö	úûúûúûúûúò>Kö	úûúûúûúûúò@Kö	úûúûúûúûúò>Kö	úûúûúûúûúò@KöûúûúòóKöûúòóöûúûòKöúûú
+òKöúûúòKöúûúòKöúûúòKöúûúòKöúûúòKöúûúòKöúûú	òKöúûúòKöúûú
+òKöúûúòKöúûúòKöûúûúòóKöûú
+ûúò$KòóLöú
+ûúûúûúò:Löú@ûúòGöü	úûúûúûúûúûú$ò^KöúûúûúòKöúûúòöûúûòòKöúûú$ò7öûúûúû+ò7Köú0ûúò8Köú0ûúò7Köú0ûúò8Köú0ûúò8Köú0ûúò8Köú0ûúò8Köú0ûúò7Köú0ûúò7Köú0ûúò7Köú0ûúò7Köú2ûúûúòFKöûúûúòóöûúûú<ôUKöûúûúôóöûúûúûúûúô>Köûúûúôóöûúûúûúô%KöûúûúôóKòóòöûúûúûúûúò7KöûúûúòóKò*Kò+KòóKöûúûúòóö
+ûúûúûúûúûúò*KòKöûúûúò%KòKòóKöûúûúòKöûú
+ûúò%Kòóöüúûúûúûúûúûú"ò^öúûúòKöú§ò$Köú§òKöú§"ò)Köú§òKöú§ò&Köú§ò Köú§ò$Köú§òKöú§ò$Köú§òKöú	§ò(Köú	§ò"Köú	§ò(Köú	§ò"Köú§ò$Köú§/ò6Köú§.ò4KòóKòKöúûúòKöúûúòKöúûúòKöúûúòKöúûúò!Köúûúò!KöúûúòKöúûúûúòKòöûòKöúûúûúûúò3KöúûúòKòöûúûòöú	ûúûòKöúûúûúòKöúûúûúûúò6Köú3ò3Köú0ò0KöúòKöûúûú"ò@Köûúûú	òóöú	ûúûòKöú0ò0Köûúûú	òóöú	ûúûòKöúûúûúòKöúûúûúûúòKöûúûúFòXóöúûúûòKöûúòKöú
+ûú(ò4Köûúûú	òóöú
+ûúûòKöúûúòKöûú4ò6Köûúûú	òóöú
+ûúûòKöûúòKöú
+ûú)ò5Köûúûú	òóöú	ûúûòKöúûúòKöûú2ò4Köûúûú	òóöú	ûúûòKöûúòKöúûúûú(ò;Köûúûú	òóöú	ûúûòKöúûúòKöûú2ò4Köûúûú	òóöú	ûúûòKöûúòKöú,ò,Köûúûú	òóöúûúûòKöûú6ò8Köûúûú	òóöúûúûòKöûúòKöú.ò.Köûúûú	òóöúûúûòKöûú6ò8Köûúûú	òóöúûúûòKöûúòKöúûú*ò2Köûúûú	òóöú	ûúûòKöúûúòKöûú2ò4Köú/ò/Köûúûú	òóöú	ûúûòKöûúòKöúûúûúûúò1Köúûúûú!ûúòKKöûúûú	òóöú	ûúûòKöûúòKöúûúûúûúò1Köúûúûú!ûúòKKöûúûú	òóKöûúûúòóKòKöûúûú7òEKöûúòóöûúûúòKòKöúûú(ò0KöúGòGKöúûú*ò3Köúûú*ò3Köúûú.ò9Köúûú.ò9Köú3ò3Köûúûú	ûúûú	ûúûúûúûúòWKöûúûúûúûúò:Kö
+ûúûúûúûúûúòFKö
+ûúûúûúûúûúòHKö
+ûúûúûúûúûúòQKö
+ûúûú ûúûúûúòSKö
+ûúûúûúûúûúòNKöú6ûúòBKòKòóKöûú
+ûú,ò@Kòóö
+üúûúûú
+ûúûúò0Kò óöüúûúûúûú'òNKöúûúûúòöûòKöúûúûú
+òKöûúûúûúûúòöûúûúûòKöúûú.ûúòAöúûúò!öûúûòKöûú<òAóóKöú	ûú,ûúò>Köú	ûú,ûúò>KöûúòóKöúòKöûúòóKòóKò öüúûúûúûúûúûúò?KöúûúòKöúûúò&öûúûúûòöúûúò-Köûúûúò3Köûúûúò4KöûúûúûúòNKòKòóöúûúò#KòKöûúûúò(Kòöûúûú5ûòFKöúûúòKöûúòóKöúòKòóöú	ûúò)Köûúûúò1KöúòKöúòKöúòKöú ò öûúûòöúGôGKöú ô óKöúûúòöúòKöú•úòKöúòKòóò	Köú•úòKöúòöûúûúûúûúûúûúûòGKöú2ò2Köûúûúò Köûúûúò)KöúòKöûúòóKòKòKöúûúôKöúûúûúô'Köúôöûúûúûúôöûúûúûúûô+Köú_ô_Köú2ô2öûú8ûúô@KöúûúôKöûúûúôKöúôKöúûúô#KôóöûôKöûúûú4ôBóKöûúûú,ûúôKKöúôKöú0ô0KöûúôóKôóKôóKöûúòóKòóöú	ûúò)KöúòKöúòKöúòKöú ò Kòóöú	ûúò'Kòóöúûúò-Köûúûú•úûúòAóKöûúûú%ò5óKöú•úòKòKò óö
+üúûúûúûú&ûúòYKöûúûúûúûúòöûúòöûúòKöúôöûúûúûúûò(Köú.ò.Köúûú§JòWöûú0ûú	ûòEKöú"ò"KöûúûúûúûúòKöûúòóKöûúûú§.òUKöûúòóKòóöûúòKöú	ô	öüúûúûúò!KöúûúòöûòKöúûúòKöúûúòKöûúûúûúòKöûúûúDûú
+ûúòzKöûú>ûú	ûúûúòXKòKòKöûúòóKòóöüúûúûúòKöú.ò.Kò KòKòóö	ûúûúû
+úûúûò5KöúòKöûúòóö	ûúûúû
+úûúûò3KöúòKöúòKöûúòóKòóóKòóKò öüúûúûúûúûúûú	ûúûú	ûú	ò|Köú(ô(öûúûòKöûú	ûú§*ò=öûúòKöúûúòKöúûúûúò#öûúûòKöúûúòöûú"ûúûò3Köú	ûúûú	òKöúûúûúûúûúûúò6Köú
+ûúûúûúûúûúûúòIKöûúòóKöûúòóKöúûúòKòóóKòóKò öüúûúûúûúûúûúûúòyKöúûúòKöúûúòKöúûúòKöúûú$ò.Köúòöûú	ûú	ûòöûú$ûúûò5Köúûúòò	Köú ò Köúûúò#KöúûúòKöúòóKöúûúòKöûúòóKöûúòóöûú	ûòKöú ò Köúûúò#KöúûúòKöûúòóKòóKò öü
+úûúûúûúûúûúòIöûúûòöúòKöúûú*ò6ò2Köú<ûúûú	òJóöüúûúûúûúò$KöúûúòKöú6ò6öûú	ûòKö	úûúûúûúûúò+Kö
+ûú ûúûúûúûúòIKö
+ûú ûúûúûúûúòIKö
+ûú ûúûúûúûúòIKö
+ûú ûúûúûúûúòIKöúûúòKöûúòóöûúòöûúòKöúûúûúûúò,Köúûúò1Köúûúûúò4KòóKòóKòóöûúòöûú*ûúò1KöúòKöú$ûúò5KöúûúòKöúòKöúòKöúòKöúòKòóKòóKòóKöúûúòKöúûúòKöûúòóöûòKöúòóKòóKò öüúûúûúûúò?Köú!ò!Kò óKö	úûúûúûúûúròíKò ö
+üúûúûúûúûúò6KöúûúòKöúûúòKöúûú.ûúò;Kö	ûúûúûúûú§ò+Köûúûúûú §òXKöûúûú§ò"KòKò óö
+üúûúûúûúûúòQöûúûúûúûúûúûúûòCKöûú*ûúûúòCKöûúòóKöûú
+òKòKò óöüúûúûúûúûúûúò:Köûú(ò.KòóKò öüúûúûúûúûúûúò=Köûú&ò,KòKò óö
+üúûúûúûúûúò3KöúûúòKöúûúòöûúûòöûúûòKöúûúòKöúûúòKöûúòóKöûúòóKöûúòKòKô óö
+üúûú
+ûúûúûúò9Köûúûú4òHKòóKô KöûúòKò ô=KôLKöúœr	ú#ô8óô5Kô_Köú¶	úôóKô ó Öó    r  ßà  

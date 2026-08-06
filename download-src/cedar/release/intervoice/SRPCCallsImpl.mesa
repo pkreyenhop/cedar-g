@@ -1,0 +1,264 @@
+
+
+DIRECTORY
+Arpa USING [ Address, nullAddress ],
+ArpaUDP USING [ Port ],
+Basics USING [ Card16FromH, LowHalf, HFromCard16 ],
+CardTab USING [ Ref, Create, Fetch, Store ],
+Convert USING [ ArpaAddressFromRope ],
+IO,
+RefID USING [ ID ],
+RefTab USING [ Create, Delete, Fetch, Ref, Store ],
+Rope USING [ FromRefText, ROPE ],
+RPC USING [ Conversation, GenerateConversation ],
+RuntimeError USING [ UNCAUGHT ],
+SunPMap USING [ ipProtocolUDP, udpPort ],
+SunPMapLocal USING [ SetLocal, ipProtocolUDP ],
+SunPMapClient USING [ GetPort ],
+SunRPC USING [ Destroy, DestroyServer, Error, Handle, ReleaseReply, SendCallAndReceiveReply, Server, ServerProc, StartCall ],
+SunRPCOnUDP USING [ Create, CreateServer, GetServerPort, nullPort, SetRemote ],
+SunRPCAuth USING [ Initiate ],
+SunYPAgent USING [Error, Handle, Match, ObtainHandle, ReleaseHandle, Tokenize],
+SRPCCalls USING [ Conversation, ReportProc, SHandle, SunRPCHandleBody, TimeoutEnable ],
+VoiceUtils USING [ SunProtocol, SunAddrFromRope ];
+
+SRPCCallsImpl: CEDAR MONITOR LOCKS sHandle.LOCK USING sHandle: SRPCCalls.SHandle
+IMPORTS Basics, CardTab, Convert, IO, RefTab, Rope, RPC, RuntimeError, SunRPC, SunRPCOnUDP, SunPMapClient, SunPMapLocal, SunRPCAuth, SunYPAgent, VoiceUtils
+EXPORTS SRPCCalls ~ {
+OPEN IO;
+
+Handle: TYPE ~ SunRPC.Handle;
+ROPE: TYPE ~ Rope.ROPE;
+
+SunRPCPutArgsProc: TYPE ~ PROC [h: Handle];
+SunRPCGetResultsProc: TYPE ~ PROC [h: Handle];
+SunRPCGetErrorProc: TYPE ~ PROC [h: Handle];
+
+
+Error: PUBLIC ERROR[errCode: ATOM, explanation: ROPE] ~ CODE;
+
+
+SunRPCProgramCall: PUBLIC PROC [h: Handle, remoteProc: CARD,
+putArgs: SunRPCPutArgsProc, getResults: SunRPCGetResultsProc,
+getError: SunRPCGetErrorProc] ~ {
+sHandle: SHandle ¬ SHandleFromHandle[h];
+IF sHandle=NIL THEN Error[$BrokenDataStructures, "No semantics for conversation"];
+sHandle.errorDetected ¬ FALSE;
+DoSunRPCProgramCall[sHandle, remoteProc, putArgs, getResults, getError];
+};
+
+DoSunRPCProgramCall: ENTRY PROC [sHandle: SHandle, remoteProc: CARD,
+putArgs: SunRPCPutArgsProc, getResults: SunRPCGetResultsProc,
+getError: SunRPCGetErrorProc] ~ {
+ENABLE {
+SunRPC.Error => {
+errorDetected: BOOL ¬ sHandle.errorDetected;
+sHandle.connected ¬ FALSE;
+sHandle.errorDetected ¬ TRUE;
+SELECT code FROM
+$unreachable, $timeout, $wrongProgram, $wrongProgramVersion, $wrongProc =>
+IF sHandle.enabled AND ~errorDetected THEN {
+IF sHandle.reportProc#NIL THEN
+sHandle.reportProc[sHandle, code, "Automatic reconnect will be attempted."];
+RETRY;
+}
+ELSE Error[code, "Recovery from original error failed."];
+ENDCASE => {
+sHandle.enabled ¬ FALSE;
+Error[code, "Cannot recover automatically."];
+};
+};
+UNWIND => NULL;
+Error => NULL; -- Just in case;
+RuntimeError.UNCAUGHT => {
+sHandle.connected ¬ FALSE;
+sHandle.errorDetected ¬ TRUE;
+sHandle.enabled ¬ FALSE;
+Error[$UnknownError, NIL];
+};
+};
+h: Handle;
+IF ~sHandle.connected THEN
+IF sHandle.enabled THEN {
+ec: ATOM; ex: ROPE;
+[ec, ex] ¬ ImportInterface[sHandle];
+IF ec#NIL THEN Error[ec, ex];
+}
+ELSE Error[$disconnected, "Not connected from server"];
+h ¬ sHandle.handle;
+SunRPC.StartCall[h~h, c~SunRPCAuth.Initiate[], pgm~sHandle.rpcProgram, version~sHandle.rpcVersion, proc~remoteProc];
+putArgs[sHandle.handle];
+[] ¬ SunRPC.SendCallAndReceiveReply[h~h, timeoutMsec~sHandle.timeoutInMs, retries~sHandle.retries];
+getError[h];
+getResults[h];
+SunRPC.ReleaseReply[h];
+};
+
+
+Conversation: TYPE ~ SRPCCalls.Conversation;
+SHandle: TYPE ~ SRPCCalls.SHandle;
+SHandleBody: TYPE ~ SRPCCalls.SunRPCHandleBody;
+TimeoutEnable: TYPE ~ SRPCCalls.TimeoutEnable;
+
+ID: TYPE ~ RefID.ID;
+
+conversationToSHandleMap: RefTab.Ref ¬ RefTab.Create[];
+handleToSHandleMap: RefTab.Ref ¬ RefTab.Create[];
+
+NewRPCConversation: PUBLIC PROC [
+serverName: Rope.ROPE, rpcProgram: CARD, rpcVersion: CARD,
+clientData: REF, reportProc: SRPCCalls.ReportProc ¬ NIL, timeoutEnable: TimeoutEnable, timeoutInMs: INT, retries: INT] RETURNS [conversation: Conversation] ~ {
+sHandle: SHandle;
+conversation ¬ RPC.GenerateConversation[];
+sHandle ¬ NEW[SHandleBody ¬ [serverName: serverName, rpcProgram: rpcProgram, rpcVersion: rpcVersion, timeoutEnable: timeoutEnable, timeoutInMs: timeoutInMs, retries: retries, clientData: clientData, conversation: conversation, reportProc: reportProc, handle: SunRPCOnUDP.Create[]]];
+[]¬conversationToSHandleMap.Store[conversation, sHandle];
+[]¬handleToSHandleMap.Store[sHandle.handle, sHandle];
+-- Dummy handle until really imported
+};
+
+ReleaseConversation: PUBLIC PROC [conversation: Conversation] ~ {
+sHandle: SHandle;
+IF conversation = NIL THEN RETURN;
+sHandle ¬ GetSHandle[conversation];
+IF sHandle = NIL THEN RETURN;
+[]¬conversationToSHandleMap.Delete[conversation];
+IF sHandle.handle#NIL THEN {
+[]¬handleToSHandleMap.Delete[sHandle.handle];
+SunRPC.Destroy[sHandle.handle];
+};
+sHandle.connected ¬ FALSE;
+sHandle.conversation ¬ NIL; -- Break any
+sHandle.handle ¬ NIL; -- loops
+sHandle.clientData ¬ NIL;
+};
+
+GetSHandle: PUBLIC PROC[conversation: Conversation]
+RETURNS [sHandle: SHandle] ~ {
+RETURN[NARROW[conversationToSHandleMap.Fetch[conversation].val]];
+};
+
+SHandleFromHandle: PROC[handle: Handle]
+RETURNS [sHandle: SHandle] ~ {
+RETURN[NARROW[handleToSHandleMap.Fetch[handle].val]];
+};
+
+ImportInterface: INTERNAL PROC[sHandle: SHandle]
+RETURNS[errCode: ATOM ¬ NIL, expl: ROPE ¬ NIL] ~ {
+ENABLE {
+SunRPC.Error => {
+errCode ¬ code;
+SELECT code FROM
+$unreachable, $timeout  => NULL; ENDCASE => sHandle.enabled ¬ FALSE;
+CONTINUE;
+};
+RuntimeError.UNCAUGHT => {
+errCode ¬ $UnknownError; sHandle.enabled ¬ FALSE; CONTINUE; };
+};
+server: Rope.ROPE ¬ sHandle.serverName;
+addr: Arpa.Address ¬ Arpa.nullAddress;
+handle, oldHandle: Handle;
+sHandle.connected ¬ FALSE;
+oldHandle ¬ sHandle.handle;
+IF VoiceUtils.SunProtocol[server] THEN {
+uPort: ArpaUDP.Port;
+[addr, uPort] ¬ VoiceUtils.SunAddrFromRope[server];
+handle ¬ SunRPCOnUDP.Create[addr, uPort];
+}
+ELSE IF server#NIL THEN {
+port: CARD;
+addr ¬ SunYPNameToAddress[server];
+handle ¬ SunRPCOnUDP.Create[addr, Basics.HFromCard16[SunPMap.udpPort]];
+port ¬ SunPMapClient.GetPort[handle, SunRPCAuth.Initiate[], sHandle.rpcProgram, sHandle.rpcVersion, SunPMap.ipProtocolUDP ! SunRPC.Error => {
+errCode ¬ code;
+expl ¬ IO.PutFR1["Can't contact remote server: %g.", IO.rope[server]];}];
+IF errCode#NIL THEN RETURN;
+IF port = 0 THEN 
+RETURN [$CantConnect, IO.PutFR1["ThParty not exported on server: %g.", IO.rope[server]]];
+handle ¬
+SunRPCOnUDP.SetRemote[handle, addr, Basics.HFromCard16[Basics.LowHalf[port]]];
+};
+IF addr = Arpa.nullAddress THEN
+RETURN[$CantOpenSchema, IO.PutFR1["Unknown server: %g.", IO.rope[server]]];
+[]¬handleToSHandleMap.Store[handle, sHandle];
+sHandle.handle ¬ handle;
+IF oldHandle#NIL THEN {
+[]¬handleToSHandleMap.Delete[oldHandle];
+SunRPC.Destroy[oldHandle];
+};
+sHandle.connected ¬ TRUE;
+};
+
+ypMap: ROPE ¬ "hosts.byname";
+
+SunYPNameToAddress: PROC [name: ROPE] RETURNS [addr: Arpa.Address ¬ Arpa.nullAddress] ~ {
+ENABLE SunYPAgent.Error => CONTINUE;
+mapEntry: REF TEXT ¬ NIL;
+h: SunYPAgent.Handle ¬ SunYPAgent.ObtainHandle[];  -- use default domain
+mapEntry ¬ SunYPAgent.Match[h, ypMap, name];
+SunYPAgent.ReleaseHandle[h];
+IF mapEntry # NIL THEN {
+addrText: REF TEXT ¬ SunYPAgent.Tokenize[mapEntry][0];  -- address is at front of mapEntry
+addr ¬ Convert.ArpaAddressFromRope[Rope.FromRefText[addrText]];
+};
+};
+
+ExportSunRPCInterface: PUBLIC PROC [
+previousPort: CARD¬0, server: SunRPC.ServerProc, rpcPgm: CARD, rpcPgmVersion: CARD]
+RETURNS [uniquePort: CARD] ~ {
+ENABLE SunRPC.Error => Error[code, "export failed"];
+ok: BOOL;  -- Do something with this!!
+theServer: SunRPC.Server ¬ GetServer[previousPort];  -- in case server already running
+IF theServer#NIL THEN SunRPC.DestroyServer[theServer];  -- remove old server
+theServer ¬ SunRPCOnUDP.CreateServer[pgm~rpcPgm, serverProc~server, version~rpcPgmVersion, port: SunRPCOnUDP.nullPort ];
+uniquePort ¬ Basics.Card16FromH[SunRPCOnUDP.GetServerPort[theServer]];
+ok ¬ SunPMapLocal.SetLocal[program~rpcPgm, version~rpcPgmVersion, protocol~SunPMapLocal.ipProtocolUDP, port~uniquePort];
+[] ¬ sunServerTable.Store[key: uniquePort, val: NEW[SunRPC.Server ¬ theServer] ];
+};
+
+
+sunServerTable: CardTab.Ref ¬ CardTab.Create[];
+
+WrapOpaqueType: TYPE = REF SunRPC.Server;
+
+GetServer: PROC [port: CARD] RETURNS [SunRPC.Server] = INLINE {
+wrapper: WrapOpaqueType ¬ NARROW[CardTab.Fetch[x: sunServerTable, key: port].val];
+RETURN[IF wrapper=NIL THEN NIL ELSE wrapper­]
+};
+
+
+
+}.
+   Î  
+SRPCCallsImpl.mesa
+Copyright Ó 1990, 1992 by Xerox Corporation.  All rights reserved.
+Pier, May 24, 1990 2:38:04 pm PDT
+Swinehart, June 4, 1992 6:21 pm PDT
+Placing calls --
+
+This is where this module differs most from the Courier stub from which it is derived.  We define a SunRPCCall that looks similar to the CrRPC.Call and hides the differences in calling sequences between the two protocols.  
+
+Since SUN RPC doesn't have any error handling mechanism, remote errors are returned as explict error codes.  An error code is at the head of all returned results.  If the returned error code is NIL, then the regular procedure results follow; otherwise, the error code is followed by the error explanation.
+Don't risk reconnects, when you don't know what happened.
+The following will not be called if getError raises an Error.
+Handle Management
+
+NewRPCConversation creates a Conversation, an SHandle, and a dummy RPC Handle, but does not actually import the interface.  Instead, the interface is imported any time a call is made when the SHandle indicates that the remote server is disconnected.  In addition, whenever a call fails due to timeout or other potentially correctable problems, an attempt is made to re-bind to the remote service and retry the call before giving up.  But only one attempt is made.
+
+map entry is something like "13.0.208.72 baobab baobab.parc.xerox.com"
+A table is kept to map ports to servers, so that an old version of a server can be removed before a new one is exported.  The SunPMap package does a similar job, but it distinguishes only on the basis of program and version, so doesn't support multiple instances of an interface exported from the same machine.
+Can't NARROW or LOOPHOLE to an opaque type
+ Ê	{  •NewlineDelimiter
+–(cedarcode) style™ codešœ™Kšœ
+Ïeœ7™BK™!K™#—K˜ K˜ šÏk	˜	Kšœžœ˜$Kšœžœ
+˜Kšœžœ'˜3Kšœžœ˜,Kšœžœ˜&Kšžœ˜Kšœžœžœ˜Kšœžœ'˜3Kšœžœžœ˜!Kšžœžœ(˜1Kšœžœžœ˜ Kšœžœ˜)Kšœžœ˜/Kšœžœ˜ Kšœžœq˜}Kšœžœ>˜OKšœžœ˜Kšœžœ?˜OKšœ
+žœH˜WKšœžœ"˜2K˜ —KšÏnœžœžœžœ	žœžœ˜PKšžœžœžœd˜›šžœ˜Kšžœžœ˜—˜ Kšœžœ˜Kšžœžœžœ˜K˜ Kšœžœžœ˜+Kšœžœžœ˜.Kšœžœžœ˜,K˜ —šœ™™ J™’K˜ KšŸœžœžœ
+žœžœžœ˜=K˜ K˜ šŸœžœžœžœ˜<Kšœ=˜=Kšœ!˜!K˜(Kšžœ	žœžœ?˜RKšœžœ˜K˜HK˜K˜ —šŸœž
+œ žœ˜DKšœ=˜=Kšœ!˜!šžœ˜˜Kšœžœ˜,Kšœžœ˜Kšœžœ˜šžœž˜˜Jšžœžœžœ˜,šžœžœž˜KšœL˜L—Kšžœ˜Kšœ˜—Kšžœ5˜9—šžœ˜Kšœžœ˜Kšœ-˜-K˜—K˜——Kšžœžœ˜Kšœ	žœÏc˜šœžœ˜Kšœžœ˜Kšœžœ˜šœžœ˜Jšœ9™9—Kšœžœ˜K˜—K˜—K˜
+šžœž˜šžœžœ˜Kšœžœžœ˜K˜$Kšžœžœžœ˜Kšœ˜—Kšžœ3˜7—K˜Kšœt˜tKšœ˜K˜cKšœ˜Jšœ=™=Kšœ˜K˜Kšœ˜—K˜ ——™J™ JšœCžœŠ™ÐK˜ Kšœžœ˜,Kšœ	žœ˜"Kšœžœ˜/Kšœžœ˜.K˜ Kšžœžœ	žœ˜K˜ K˜7K˜1K˜ šŸœžœžœ˜!šœžœžœžœ˜:Kšœžœ%žœ-žœžœžœ!˜Ÿ—K˜Kšœžœ˜*Kšœ
+žœ˜šK˜9˜5Kš %˜%—K˜K˜ —šŸœžœžœ!˜AK˜Kšžœžœžœžœ˜"K˜#Kšžœžœžœžœ˜K˜1šžœžœžœ˜K˜-K˜K˜—Kšœžœ˜Kšœžœ ˜(Kšœžœ ˜Kšœžœ˜K˜K˜ —šŸ
+œžœ˜3Kšžœ˜Kšžœžœ4˜AK˜K˜ —šŸœžœ˜'Kšžœ˜Kšžœžœ(˜5K˜K˜ —šŸœžœžœ˜0Kšžœ
+žœžœžœžœÏtœ˜2šžœ˜š¡œ˜K˜šžœž˜Kšœžœžœžœ˜D—Kšžœ˜	Kšœ˜—šœžœ˜Kšœ+žœžœ˜>—K˜—Kšœžœ˜'K˜&K˜Kšœžœ˜K˜˜(K˜K˜3K˜)K˜—šžœžœžœ˜Kšœžœ˜K˜"K˜GšœŒ¡˜Kš¡œ˜Kšœžœ,žœ¡œ˜I—Kšžœ	žœžœžœ˜šžœ
+žœ˜Kšžœžœ/žœ˜Y—˜K˜N—K˜—šžœž˜Kšžœžœžœ˜K—K˜-K˜šžœžœžœ˜K˜(K˜K˜—Kšœžœ˜K˜K˜ —Kšœžœ˜K˜ šŸœžœžœžœ,˜YKšžœžœ˜$Kšœ
+žœžœžœ˜Kšœ3 ˜HK˜,Kšœ˜šžœžœžœ˜KšœF™FKšœ	žœžœ& "˜ZK˜?K˜—K˜K˜ —šŸœžœžœ˜$Kšœžœ'žœžœ˜SKšžœžœ˜Kšžœ.˜4Kšœžœ Ðct ¢˜(Kšœ8 ˜VKšžœžœžœ# ˜LK˜xK˜FK˜xK•StartOfExpansion7[x: RefTab.Ref, key: RefTab.Key, val: RefTab.Val]šœ0žœ˜QK˜K˜ —K™¶K˜ K˜/K˜ šœžœžœ˜)Kšœ*™*—K˜ –$[x: RefTab.Ref, key: RefTab.Key]š
+Ÿ	œžœžœžœÐbkœ˜?Kšœžœ2˜RKšžœžœ	žœžœžœžœ
+˜-Kšœ˜K˜ —K˜ K˜ —K˜— …—     t  0½  

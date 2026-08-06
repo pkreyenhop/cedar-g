@@ -1,0 +1,668 @@
+DIRECTORY
+Atom USING [GetPName, MakeAtom],
+Basics USING [BITAND, BITNOT, BITOR],
+BasicTime USING [GMT, nullGMT],
+DFPorter USING [DFContents, FullFileItem, LORA, ReadDFs],
+DFUtilities USING [DirectoryItem, FileItem],
+FS USING [Error, FileInfo],
+MobConnection USING [Error, LORAFromMob, ModuleID],
+MobOrder USING [BitVector, emptyBitVector, ExportItems, MobConnections, MobConnectionsRep],
+RefTab USING [Create, Fetch, Insert, Ref],
+RuntimeError USING [UNCAUGHT],
+Rope USING [Cat, Concat, Equal, Fetch, Match, ROPE, Run, Size],
+SymTab USING [Create, Fetch, Ref, Store];
+
+MobOrderImpl: CEDAR PROGRAM
+IMPORTS Atom, Basics, DFPorter, FS, MobConnection, RefTab, Rope, RuntimeError, SymTab
+EXPORTS MobOrder
+~ BEGIN OPEN MobOrder;
+
+LORA: TYPE = LIST OF REF;
+
+ROPE: TYPE = Rope.ROPE;
+
+MakeLoadList: PUBLIC PROC [dfNames: LIST OF ROPE, goals: LIST OF ROPE] RETURNS [LIST OF LIST OF ATOM] = {
+connections: LIST OF MobConnections = GetMobsViaDFs[dfNames];
+withGoals: LIST OF MobConnections = MarkGoals[connections, goals];
+sorted: LIST OF LIST OF MobConnections = TopoSortConnections[withGoals];
+namesOnly: LIST OF LIST OF ATOM = ExtractNames[sorted];
+RETURN [namesOnly]
+};
+
+DReverseAtomList: PROC [list: LIST OF ATOM] RETURNS [LIST OF ATOM] =  {
+l1, l2, l3: LIST OF ATOM ¬ NIL;
+IF list = NIL THEN RETURN[NIL];
+l3 ¬ list;
+UNTIL (l1 ¬ l3) = NIL DO
+l3 ¬ l3.rest;
+l1.rest ¬ l2;
+l2 ¬ l1;
+ENDLOOP;
+RETURN[l2];
+};
+
+MakeDependentsList: PUBLIC PROC [dfNames: LIST OF ROPE, roots: LIST OF ROPE] RETURNS [modules: LIST OF ATOM, dependentDFNames: LIST OF ROPE ¬ NIL] = {
+AddDFName: PROC [dfName: ROPE] ~ {
+FOR tail: LIST OF ROPE ¬ dependentDFNames, tail.rest UNTIL tail = NIL DO
+IF Rope.Equal[s1: dfName, s2: tail.first, case: FALSE] THEN RETURN;
+ENDLOOP;
+dependentDFNames ¬ CONS[dfName, dependentDFNames];
+};
+connections: LIST OF MobConnections = GetMobsViaDFs[dfNames];
+withGoals: LIST OF MobConnections = MarkGoals[connections, roots];
+sorted: LIST OF LIST OF MobConnections = TopoSortConnections[connections: withGoals, topDown: FALSE];
+modules ¬ DReverseAtomList[FlatExtractNames[sorted]];
+FOR tail: LIST OF LIST OF MobConnections ¬ sorted, tail.rest UNTIL tail = NIL DO
+FOR t: LIST OF MobConnections ¬ tail.first, t.rest UNTIL t = NIL DO
+AddDFName[t.first.dfName];
+ENDLOOP;
+ENDLOOP;
+};
+
+EnumerateFiles: PUBLIC PROC [action: PUBLIC PROC [dfName: ROPE, name: ROPE, fullFName: ROPE, created: BasicTime.GMT, goal: BOOL], dfs: LIST OF DFPorter.DFContents] = {
+FOR tail: LIST OF DFPorter.DFContents ¬ dfs, tail.rest UNTIL tail = NIL DO
+df: DFPorter.DFContents ~ tail.first;
+currentDir: REF DFUtilities.DirectoryItem ¬ NIL;
+FOR tail: LORA ¬ df.contents, tail.rest UNTIL tail = NIL DO
+WITH tail.first SELECT FROM
+a: REF DFPorter.FullFileItem => {
+action[df.name, a.file.name, Rope.Concat[a.directory.path1, a.file.name], IF a.file.date.format = explicit THEN a.file.date.gmt ELSE BasicTime.nullGMT, a.file.verifyRoot];
+};
+a: REF DFUtilities.DirectoryItem => {
+currentDir ¬ a;
+};
+a: REF DFUtilities.FileItem => {
+action[df.name, a.name, Rope.Concat[currentDir.path1, a.name], IF a.date.format = explicit THEN a.date.gmt ELSE BasicTime.nullGMT, a.verifyRoot];
+};
+ENDCASE => NULL;
+ENDLOOP;
+ENDLOOP;
+};
+
+BitVectorRest: PUBLIC PROC [bitVector: BitVector] RETURNS [BitVector] = {
+RETURN [IF bitVector.rest = NIL THEN emptyBitVector ELSE bitVector.rest­]
+};
+
+BitVectorRef: PUBLIC PROC [bitVector: BitVector, i: NAT] RETURNS [BOOL] = {
+WHILE i >= BITS[WORD] DO
+IF bitVector.rest = NIL THEN RETURN [FALSE];
+bitVector ¬ bitVector.rest­;
+i ¬ i - BITS[WORD];
+ENDLOOP;
+RETURN [bitVector.w0[i]]
+};
+
+BitVectorSet: PUBLIC PROC [bitVector: BitVector, i: NAT] RETURNS [BitVector] = {
+IF i < BITS[WORD] THEN {bitVector.w0[i] ¬ TRUE; RETURN [bitVector]};
+IF bitVector.rest = NIL THEN bitVector.rest ¬ NEW[BitVector ¬ [ALL[FALSE], NIL]];
+bitVector.rest­ ¬ BitVectorSet[bitVector.rest­, i-BITS[WORD]];
+RETURN [bitVector]
+};
+
+BitVectorOr: PUBLIC PROC [a, b: BitVector] RETURNS [BitVector] = {
+w0: PACKED ARRAY [0..BITS[WORD]) OF BOOL = LOOPHOLE[Basics.BITOR[LOOPHOLE[a.w0], LOOPHOLE[b.w0]]];
+RETURN [[w0, IF a.rest # NIL OR b.rest # NIL THEN NEW[BitVector ¬ BitVectorOr[BitVectorRest[a], BitVectorRest[b]]] ELSE NIL]]
+};
+
+BitVectorImplies: PUBLIC PROC [a, b: BitVector] RETURNS [BOOL] = {
+w0: PACKED ARRAY [0..BITS[WORD]) OF BOOL = LOOPHOLE[Basics.BITOR[Basics.BITNOT[LOOPHOLE[a.w0]], LOOPHOLE[b.w0]]];
+IF w0 # ALL[TRUE] THEN RETURN [FALSE];
+IF a.rest = NIL AND b.rest = NIL THEN RETURN [TRUE];
+RETURN [BitVectorImplies[BitVectorRest[a], BitVectorRest[b]]]
+};
+
+BitVectorEmptyIntersection: PUBLIC PROC [a, b: BitVector] RETURNS [BOOL] = {
+w0: PACKED ARRAY [0..BITS[WORD]) OF BOOL = LOOPHOLE[Basics.BITAND[LOOPHOLE[a.w0], LOOPHOLE[b.w0]]];
+IF w0 # ALL[FALSE] THEN RETURN [FALSE];
+IF a.rest = NIL AND b.rest = NIL THEN RETURN [TRUE];
+RETURN [BitVectorEmptyIntersection[BitVectorRest[a], BitVectorRest[b]]]
+};
+
+
+cache: SymTab.Ref ¬ SymTab.Create[case: FALSE];
+
+CachedLORAFromMob: PUBLIC PROC [fileName: ROPE] RETURNS [mob: LORA] = {
+WITH SymTab.Fetch[x: cache, key: fileName].val SELECT FROM
+lora: LORA => RETURN [lora];
+ENDCASE => NULL;
+mob ¬ MobConnection.LORAFromMob[fileName: fileName, filter: [versions: TRUE, directory: TRUE, using: FALSE, imports: TRUE, importedItems: TRUE, exports: TRUE, typeExports: FALSE, exportedItems: TRUE, modules: TRUE, configurations: FALSE]];
+[] ¬ SymTab.Store[x: cache, key: fileName, val: mob];
+};
+
+DecodeMob: PUBLIC PROC [fileName: ROPE] RETURNS [MobConnections] = {
+mob: LORA = CachedLORAFromMob[fileName: fileName];
+WITH mob.rest.first SELECT FROM
+id: REF MobConnection.ModuleID => {
+ans: MobConnections ¬ NEW[MobConnectionsRep];
+ans.kind ¬ NARROW[mob.first];
+ans.id ¬ id­;
+FOR tail: LORA ¬ Lookup[$directory, mob.rest.rest], tail.rest UNTIL tail = NIL DO
+WITH tail.first SELECT FROM
+item: LORA => {
+IF item.first = $item THEN WITH item.rest.first SELECT FROM
+atom: ATOM => {
+ans.directory ¬ CONS[[identifier: atom, version: NIL], ans.directory]
+};
+ENDCASE => NULL;
+};
+ENDCASE => NULL;
+ENDLOOP;
+FOR tail: LORA ¬ Lookup[$imports, mob.rest.rest], tail.rest UNTIL tail = NIL DO
+WITH tail.first SELECT FROM
+id: REF MobConnection.ModuleID => { ans.imports ¬ CONS[id­, ans.imports] };
+ENDCASE => NULL;
+ENDLOOP;
+FOR tail: LORA ¬ Lookup[$exports, mob.rest.rest], tail.rest UNTIL tail = NIL DO
+WITH tail.first SELECT FROM
+exportInterface: LORA => {
+IF exportInterface.first = $export THEN WITH exportInterface.rest.first SELECT FROM
+id: REF MobConnection.ModuleID => {
+exportItems: ExportItems ¬ [id­, emptyBitVector];
+IF ans.kind # $configuration THEN FOR tail: LORA ¬ exportInterface.rest.rest, tail.rest UNTIL tail = NIL DO
+WITH tail.first SELECT FROM
+item: LORA => {
+WITH item.rest.first SELECT FROM
+refINT: REF INT => {
+exportItems.items ¬ BitVectorSet[exportItems.items, refINT­]
+};
+ENDCASE => NULL;
+};
+ENDCASE => NULL;
+ENDLOOP;
+ans.exports ¬ CONS[exportItems, ans.exports]
+};
+ENDCASE => NULL;
+};
+ENDCASE => NULL;
+ENDLOOP;
+FOR tail: LORA ¬ Lookup[$modules, mob.rest.rest], tail.rest UNTIL tail = NIL DO
+WITH tail.first SELECT FROM
+id: REF MobConnection.ModuleID => { ans.modules ¬ CONS[id­, ans.modules] };
+ENDCASE => NULL;
+ENDLOOP;
+RETURN [ans]
+};
+ENDCASE => RETURN [NIL];
+};
+
+Lookup: PROC [key: REF, list: LORA] RETURNS [LORA] = {
+FOR tail: LORA ¬ list, tail.rest UNTIL tail = NIL DO
+WITH tail.first SELECT FROM
+item: LORA => IF item.first = key THEN RETURN [item.rest];
+ENDCASE => NULL;
+ENDLOOP;
+RETURN [NIL]
+};
+
+BogusMob: PUBLIC SIGNAL [msg: ROPE] = CODE;
+paranoid: BOOL ¬ TRUE; -- enables distrust of version numbers;
+GetMobsViaDFs: PUBLIC PROC [dfNames: LIST OF ROPE] RETURNS [LIST OF MobConnections] = {
+dfs: LIST OF DFPorter.DFContents = DFPorter.ReadDFs[dfNames: dfNames, followImports: FALSE];
+connections: LIST OF MobConnections;
+Inner: PROC [dfName: ROPE, name: ROPE, fullFName: ROPE, created: BasicTime.GMT, goal: BOOL] = {
+Protected: PROC = {
+SELECT TRUE FROM
+Rope.Match[pattern: "*.mob!*", object: name, case: FALSE] => {
+realName: ROPE = IF paranoid AND created # BasicTime.nullGMT THEN FS.FileInfo[name: fullFName, wantedCreatedTime: created, remoteCheck: TRUE].fullFName ELSE fullFName;
+mobConnections: MobConnections ¬ DecodeMob[realName];
+IF NOT Rope.Equal[s1: realName, s2: fullFName, case: FALSE] THEN SIGNAL IncorrectVersionNumberInDF[fullFName, realName];
+IF mobConnections # NIL THEN {
+connections ¬ CONS[mobConnections, connections];
+mobConnections.fileName ¬ realName;
+mobConnections.dfName ¬ dfName;
+};
+};
+ENDCASE => NULL;
+};
+Protected[ !
+RuntimeError.UNCAUGHT => { SIGNAL BogusMob[Rope.Cat["UNCAUGHT while trying ", fullFName, " in ", dfName]]; CONTINUE };
+MobConnection.Error => { SIGNAL BogusMob[msg]; CONTINUE };
+FS.Error => { SIGNAL BogusMob[error.explanation]; CONTINUE };
+];
+};
+EnumerateFiles[Inner, dfs];
+RETURN [connections]
+};
+
+MapIdIdentifier: PROC [c: LIST OF MobConnections] RETURNS [LIST OF ATOM] = {
+RETURN [IF c = NIL THEN NIL ELSE CONS[c.first.id.identifier, MapIdIdentifier[c.rest]]]
+};
+
+ExtractNames: PUBLIC PROC [in: LIST OF LIST OF MobConnections] RETURNS [LIST OF LIST OF ATOM] = {
+head: LIST OF LIST OF ATOM = LIST[NIL];
+last: LIST OF LIST OF ATOM ¬ head;
+FOR tail: LIST OF LIST OF MobConnections ¬ in, tail.rest UNTIL tail = NIL DO
+last ¬ last.rest ¬ LIST[MapIdIdentifier[tail.first]];
+ENDLOOP;
+RETURN [head.rest]
+};
+
+FlatExtractNames: PROC [in: LIST OF LIST OF MobConnections] RETURNS [LIST OF ATOM] = {
+head: LIST OF ATOM = LIST[NIL];
+last: LIST OF ATOM ¬ head;
+FOR tail: LIST OF LIST OF MobConnections ¬ in, tail.rest UNTIL tail = NIL DO
+last.rest ¬ MapIdIdentifier[tail.first];
+UNTIL last.rest = NIL DO last ¬ last.rest ENDLOOP;
+ENDLOOP;
+RETURN [head.rest]
+};
+
+IncorrectVersionNumberInDF: PUBLIC SIGNAL [fullFName, realName: ROPE] = CODE; 
+
+GoalNotFound: PUBLIC SIGNAL [rope: ROPE] = CODE;
+
+RopeListAppend: PROC [a, b: LIST OF ROPE] RETURNS [LIST OF ROPE] = {
+RETURN [IF a = NIL THEN b ELSE CONS[a.first, RopeListAppend[a.rest, b]]]
+};
+
+FindImportGoals: PUBLIC PROC [connections: LIST OF MobConnections, importGoals: LIST OF ATOM] RETURNS [ans: LIST OF ROPE ¬ NIL] = {
+OnList: PROC [a: ATOM] RETURNS [BOOL] = INLINE {
+FOR tail: LIST OF ATOM ¬ importGoals, tail.rest UNTIL tail = NIL DO
+IF a = tail.first THEN RETURN [TRUE]
+ENDLOOP;
+RETURN [FALSE]
+};
+FOR tail: LIST OF MobConnections ¬ connections, tail.rest UNTIL tail.rest = NIL DO
+c: MobConnections ~ tail.first;
+FOR tail: LIST OF MobConnection.ModuleID ¬ c.imports, tail.rest UNTIL tail = NIL DO
+IF OnList[tail.first.identifier] THEN {
+ans ¬ CONS[Atom.GetPName[c.id.identifier], ans];
+EXIT;
+};
+ENDLOOP;
+ENDLOOP;
+};
+
+MarkGoals: PUBLIC PROC [connections: LIST OF MobConnections, goals: LIST OF ROPE] RETURNS [LIST OF MobConnections] = {
+head: LIST OF MobConnections = LIST[NIL];
+last: LIST OF MobConnections ¬ head;
+srcHead: LIST OF MobConnections = CONS[NIL, connections];
+importGoals: LIST OF ATOM ¬ NIL;
+notGoals: LIST OF ROPE ¬ NIL;
+OnList: PROC [a: ATOM] RETURNS [BOOL] = {
+FOR tail: LIST OF ATOM ¬ importGoals, tail.rest UNTIL tail = NIL DO
+IF a = tail.first THEN RETURN [TRUE]
+ENDLOOP;
+RETURN [FALSE]
+};
+UNTIL goals = NIL DO
+SELECT TRUE FROM -- crock!! the switch detection does not really belong here.
+Rope.Equal[goals.first, "-i", FALSE] => {
+IF goals.rest # NIL THEN {
+goals ¬ goals.rest;
+importGoals ¬ CONS[Atom.MakeAtom[goals.first], importGoals];
+};
+};
+Rope.Equal[goals.first, "-x", FALSE] => {
+IF goals.rest # NIL THEN {
+goals ¬ goals.rest;
+notGoals ¬ CONS[goals.first, notGoals];
+};
+};
+ENDCASE => {
+goal: ROPE = goals.first;
+goalSize: INT = Rope.Size[goal];
+FOR prev: LIST OF MobConnections ¬ srcHead, prev.rest UNTIL prev.rest = NIL DO
+c: MobConnections ~ prev.rest.first;
+target: ROPE ~ Atom.GetPName[c.id.identifier];
+targetSize: INT = Rope.Size[target];
+IF targetSize >= goalSize THEN {
+run: INT = Rope.Run[s1: goal, s2: target, case: FALSE];
+IF run = targetSize OR run < targetSize AND Rope.Fetch[target, run] = '. THEN {
+next: LIST OF MobConnections ¬ prev.rest.rest;
+prev.rest.rest ¬ NIL;
+last ¬ last.rest ¬ prev.rest;
+prev.rest ¬ next;
+c.goal ¬ TRUE;
+EXIT;
+};
+};
+REPEAT FINISHED => {SIGNAL GoalNotFound[goal]}
+ENDLOOP;
+};
+goals ¬ goals.rest;
+ENDLOOP;
+last.rest ¬ srcHead.rest;
+IF importGoals # NIL THEN {
+FOR tail: LIST OF MobConnections ¬ head.rest, tail.rest UNTIL tail.rest = NIL DO
+c: MobConnections ~ tail.first;
+FOR tail: LIST OF MobConnection.ModuleID ¬ c.imports, tail.rest UNTIL tail = NIL DO
+IF OnList[tail.first.identifier] THEN {
+c.goal ¬ TRUE;
+EXIT;
+};
+ENDLOOP;
+ENDLOOP;
+};
+IF notGoals # NIL THEN {
+NotAGoal: PROC [name: ROPE] RETURNS [BOOL] ~{
+FOR tail: LIST OF ROPE ¬ notGoals, tail.rest UNTIL tail = NIL DO
+IF Rope.Match[pattern: tail.first, object: name, case: FALSE] THEN RETURN [TRUE];
+ENDLOOP;
+RETURN [FALSE]
+};
+FOR tail: LIST OF MobConnections ¬ head.rest, tail.rest UNTIL tail.rest = NIL DO
+c: MobConnections ~ tail.first;
+IF NotAGoal[Atom.GetPName[c.id.identifier]] THEN c.goal ¬ FALSE;
+ENDLOOP;
+};
+RETURN [head.rest]
+};
+
+MobConnectionsListLength: PUBLIC PROC [connections: LIST OF MobConnections] RETURNS [n: INT ¬ 0] = {
+FOR tail: LIST OF MobConnections ¬ connections, tail.rest UNTIL tail = NIL DO
+n ¬ n + 1;
+ENDLOOP;
+};
+
+BoundProgramNotKnown: PUBLIC SIGNAL [configuration, program: MobConnection.ModuleID] = CODE;
+
+DuplicateExports: PUBLIC SIGNAL [moduleID, interfaceID: MobConnection.ModuleID] = CODE;
+Debug: SIGNAL = CODE;
+stopper: ATOM ¬ NIL;
+TopoSortConnections: PUBLIC PROC [connections: LIST OF MobConnections, topDown: BOOL ¬ TRUE] RETURNS [LIST OF LIST OF MobConnections] = {
+Vertex: TYPE ~ REF VertexRep;
+VertexRep: TYPE ~ RECORD [
+data: MobConnections,
+satisfiedItems: BitVector,
+label: ATOM,
+onStack: BOOL,
+number: NAT,
+needs: LIST OF NAT,
+nNeedees: NAT,
+rank: INT,
+f: INT -- minimum rank branched to by desecendants
+];
+VertexSeqRep: TYPE ~ RECORD[SEQUENCE n: NAT OF Vertex];
+labelToNumber: RefTab.Ref ~ RefTab.Create[];
+identifierToNumber: RefTab.Ref ~ RefTab.Create[];
+graph: REF VertexSeqRep ~ CreateGraph[];
+CreateGraph: PROC RETURNS [REF VertexSeqRep] ~ {
+v: REF VertexSeqRep ¬ NEW[VertexSeqRep[MobConnectionsListLength[connections]]];
+n: INT ¬ 0;
+Insert: PROC [c: MobConnections] = {
+label: ATOM ~ c.id.version;
+nRef: REF NAT = NEW[NAT ¬ n];
+v[n] ¬ NEW[VertexRep ¬ [
+data: c,
+satisfiedItems: emptyBitVector,
+label: label,
+onStack: FALSE,
+number: n,
+needs: NIL,
+nNeedees: 0,
+rank: 0,
+f: LAST[INT]
+]];
+IF c.id.version = stopper OR c.id.identifier = stopper THEN SIGNAL Debug;
+[] ¬ RefTab.Insert[labelToNumber, label, nRef];
+[] ¬ RefTab.Insert[identifierToNumber, c.id.identifier, nRef];
+n ¬  n + 1;
+};
+AddEdge: PROC [from, to: NAT] = {
+v[from].needs ¬ CONS[to, v[from].needs];
+v[to].nNeedees ¬ v[to].nNeedees + 1;
+};
+FOR tail: LIST OF MobConnections ¬ connections, tail.rest UNTIL tail = NIL DO
+IF tail.first.goal THEN Insert[tail.first];
+ENDLOOP;
+FOR tail: LIST OF MobConnections ¬ connections, tail.rest UNTIL tail = NIL DO
+IF tail.first.kind = $configuration AND NOT tail.first.goal THEN Insert[tail.first];
+ENDLOOP;
+FOR tail: LIST OF MobConnections ¬ connections, tail.rest UNTIL tail = NIL DO
+IF NOT (tail.first.kind = $configuration OR tail.first.goal) THEN Insert[tail.first];
+ENDLOOP;
+IF topDown
+THEN {
+FOR i: NAT IN [0..v.n) DO
+mob: MobConnections ~ v[i].data;
+IF mob.kind = $configuration THEN {
+FOR tail: LIST OF MobConnection.ModuleID ¬ mob.modules, tail.rest UNTIL tail = NIL DO
+WITH RefTab.Fetch[labelToNumber, tail.first.version].val SELECT FROM
+refNAT: REF NAT => {
+module: MobConnections = v[refNAT­].data;
+IF mob.goal AND module.goal THEN module.goal ¬ FALSE;
+FOR tail: LIST OF ExportItems ¬ module.exports, tail.rest UNTIL tail = NIL DO
+supplier: ExportItems ~ tail.first;
+FOR tail: LIST OF ExportItems ¬ mob.exports, tail.rest UNTIL tail = NIL DO
+IF tail.first.id = supplier.id THEN {
+tail.first.items ¬ BitVectorOr[tail.first.items, supplier.items];
+EXIT;
+};
+ENDLOOP;
+ENDLOOP;
+};
+ENDCASE => {SIGNAL BoundProgramNotKnown[configuration: mob.id, program: tail.first]};
+ENDLOOP;
+};
+ENDLOOP;
+FOR i: NAT DECREASING IN [0..v.n) DO
+mob: MobConnections ~ v[i].data;
+FOR tail: LIST OF MobConnection.ModuleID ¬ mob.imports, tail.rest UNTIL tail = NIL DO
+WITH RefTab.Fetch[labelToNumber, tail.first.version].val SELECT FROM
+refNAT: REF NAT => { AddEdge[from: i, to: refNAT­] };
+ENDCASE => NULL;
+ENDLOOP;
+FOR tail: LIST OF ExportItems ¬ mob.exports, tail.rest UNTIL tail = NIL DO
+WITH RefTab.Fetch[labelToNumber, tail.first.id.version].val SELECT FROM
+refNAT: REF NAT => { AddEdge[from: refNAT­, to: i] };
+ENDCASE => NULL;
+ENDLOOP;
+ENDLOOP;
+}
+ELSE {-- NOT topDown
+FOR i: NAT DECREASING IN [0..v.n) DO
+mob: MobConnections ~ v[i].data;
+FOR tail: LIST OF MobConnection.ModuleID ¬ mob.directory, tail.rest UNTIL tail = NIL DO
+WITH RefTab.Fetch[identifierToNumber, tail.first.identifier].val SELECT FROM
+refNAT: REF NAT => { AddEdge[from: refNAT­, to: i] };
+ENDCASE => NULL;
+ENDLOOP;
+FOR tail: LIST OF MobConnection.ModuleID ¬ mob.modules, tail.rest UNTIL tail = NIL DO
+WITH RefTab.Fetch[labelToNumber, tail.first.version].val SELECT FROM
+refNAT: REF NAT => { AddEdge[from: refNAT­, to: i] };
+ENDCASE => NULL;
+ENDLOOP;
+ENDLOOP;
+};
+RETURN [v]
+};
+ShadowedByPreviousModules: PROC [u: Vertex] RETURNS [BOOL] = {
+mob: MobConnections ~ u.data;
+IF mob.goal OR mob.kind = $definitions THEN RETURN [FALSE];
+FOR tail: LIST OF ExportItems ¬ mob.exports, tail.rest UNTIL tail = NIL DO
+WITH RefTab.Fetch[labelToNumber, tail.first.id.version].val SELECT FROM
+refNAT: REF NAT => {
+j: NAT = refNAT­;
+IF graph[j].nNeedees # 0 THEN {
+IF NOT BitVectorImplies[tail.first.items, graph[j].satisfiedItems] THEN RETURN [FALSE];
+};
+};
+ENDCASE => NULL;
+ENDLOOP;
+RETURN [TRUE]
+};
+HasDuplicateExports: PROC [u: Vertex] RETURNS [duplicates: BOOL ¬ FALSE] = {
+skip: BOOL ¬ FALSE; -- set with debugger for early out.
+mob: MobConnections ~ u.data;
+IF mob.kind = $definitions THEN RETURN [FALSE];
+FOR tail: LIST OF ExportItems ¬ mob.exports, tail.rest UNTIL tail = NIL DO
+WITH RefTab.Fetch[labelToNumber, tail.first.id.version].val SELECT FROM
+refNAT: REF NAT => {
+j: NAT = refNAT­;
+IF NOT BitVectorEmptyIntersection[tail.first.items, graph[j].satisfiedItems] THEN {
+duplicates ¬ TRUE;
+SIGNAL DuplicateExports[mob.id, graph[j].data.id];
+IF skip THEN EXIT;
+};
+};
+ENDCASE => NULL;
+ENDLOOP;
+};
+RecordSatisfiedItems: PROC [u: Vertex] = {
+mob: MobConnections ~ u.data;
+FOR tail: LIST OF ExportItems ¬ mob.exports, tail.rest UNTIL tail = NIL DO
+WITH RefTab.Fetch[labelToNumber, tail.first.id.version].val SELECT FROM
+refNAT: REF NAT => {
+j: NAT = refNAT­;
+graph[j].satisfiedItems ¬ BitVectorOr[graph[j].satisfiedItems, tail.first.items];
+};
+ENDCASE => NULL;
+ENDLOOP;
+};
+stack: LIST OF Vertex ¬ NIL; -- the vertices examined but not yet output
+k: NAT ¬ 0; -- number of vertices examined so far;
+Examine: PROC [u: Vertex] ~ {
+min: INT ¬ LAST[INT];
+k ¬ k + 1;
+u.rank ¬ k;
+IF topDown AND ShadowedByPreviousModules[u] THEN RETURN;
+IF topDown AND HasDuplicateExports[u] THEN RETURN;
+stack ¬ CONS[u, stack]; u.onStack ¬ TRUE;
+FOR tail: LIST OF NAT ¬ u.needs, tail.rest UNTIL tail = NIL DO
+v: Vertex ~ graph[tail.first];
+IF v.rank = 0
+THEN {
+Examine[v];
+IF v.f < min THEN min ¬ v.f;
+}
+ELSE {
+IF v.rank < min AND v.onStack THEN min ¬ v.rank;
+};
+ENDLOOP;
+u.f ¬ min;
+IF u.f >= u.rank THEN {
+c: LIST OF MobConnections ¬ NIL;
+DO
+w: Vertex ¬ stack.first;
+stack ¬ stack.rest; w.onStack ¬ FALSE;
+IF topDown 
+THEN {
+IF w.data.kind # $definitions THEN {
+RecordSatisfiedItems[w];
+c ¬ CONS[w.data, c];
+};
+}
+ELSE {
+c ¬ CONS[w.data, c];
+};
+IF w = u THEN EXIT;
+ENDLOOP;
+Output[c];
+};
+};
+head: LIST OF LIST OF MobConnections ~ LIST[NIL];
+last: LIST OF LIST OF MobConnections ¬ head;
+Output: PROC [a: LIST OF MobConnections] = {
+IF a # NIL THEN last ¬ last.rest ¬ LIST[a];
+};
+Find: PROC [identifier: ATOM] RETURNS [ans: LIST OF INT ¬ NIL] = {
+num: INT ¬ -1;
+FOR pass: [0..1] IN [0..1] UNTIL num >= 0 DO
+FOR i: NAT IN [0..graph.n) DO
+v: Vertex ~ graph[i];
+IF v.data.id.identifier = identifier THEN {num ¬ i; EXIT};
+ENDLOOP;
+identifier ¬ Atom.MakeAtom[Atom.GetPName[identifier].Concat[".config"]];
+ENDLOOP;
+IF num >= 0 THEN {
+FOR i: NAT DECREASING IN [0..graph.n) DO
+v: Vertex ~ graph[i];
+FOR tail: LIST OF NAT ¬ v.needs, tail.rest UNTIL tail = NIL DO
+IF num = tail.first THEN {
+ans ¬ CONS[i, ans];
+EXIT;
+};
+ENDLOOP;
+ENDLOOP;
+ans ¬ CONS[num, ans];
+};
+};
+FOR i: NAT IN [0..graph.n) DO
+v: Vertex ~ graph[i];
+IF v.rank = 0 AND v.data.goal THEN Examine[v];
+ENDLOOP;
+RETURN [head.rest]
+};
+
+END.
+  š  
+MobOrderImpl.mesa
+Copyright Ó 1989, 1991 by Xerox Corporation.  All rights reserved.
+Michael Plass, September 28, 1989 9:17:51 pm PDT
+
+TRUE iff a implies b.  (ALL a=>b), (ALL ((NOT a) OR b))
+id: REF MobConnection.ModuleID => { ans.directory _ CONS[id^, ans.directory] };
+Moves the goals to the front, in the order specified in the goals list.
+<< Put all the goals first >>
+<< Then configurations so that they get used in preference to program modules >>
+<< finally everything else >>
+<<This pass fixes up the export items for configs, which Cinder seems to have botched>>
+<<Also kills goals within goals>>
+<< DECREASING so that goals end up being explored first >>
+<< DECREASING so that goals end up being explored first >>
+At this point u.rank = 0
+RecordSatisfiedItems[u];
+A new strong component has been found
+For debugging; call from breakpoint; returns list of node numbers of things that reference identifier.
+Ê"[  •NewlineDelimiter
+–(cedarcode) style™ codešœ™Kšœ
+Ïeœ7™BKšœ0™0K™ —šÏk	˜	Kšœžœ˜ Kš	œžœžœžœžœ˜%Kšœ
+žœžœ˜Kšœ	žœžœ˜9Kšœžœ˜,Kšžœžœ˜Kšœžœ ˜3Kšœ	žœM˜[Kšœžœ˜*Kšœžœžœ˜Kšœžœ$žœ˜?Kšœžœ˜)—K˜ šÏnœžœž˜Kšžœžœ3˜UKšžœ	˜šœžœžœ
+˜K˜ —š
+žœžœžœžœžœ˜K˜ —šžœžœžœ˜K˜ —šŸœžœžœžœžœžœ	žœžœžœžœžœžœžœžœžœ˜iKšœžœžœ)˜=Kšœžœžœ0˜BKš	œžœžœžœžœ1˜HKšœžœžœžœžœžœ˜7Kšžœ˜K˜K˜ —šŸœžœžœžœžœžœžœžœžœ˜GKš	œžœžœžœžœ˜Kš
+žœžœžœžœžœ˜K˜
+šžœžœž˜K˜K˜K˜Kšžœ˜—Kšžœ˜Kšœ˜K˜ —š"Ÿœžœžœžœžœžœ	žœžœžœžœžœžœžœžœžœžœžœ˜–šŸ	œžœ
+žœ˜"šžœžœžœžœžœžœž˜HK•StartOfExpansion-[s1: ROPE, s2: ROPE, case: BOOL _ TRUE]šžœ.žœžœžœ˜CKšžœ˜—Kšœžœ˜2Kšœ˜—Kšœžœžœ)˜=Kšœžœžœ0˜BKšœžœžœžœžœGžœ˜eK˜5šžœžœžœžœžœ$žœžœž˜Pšžœžœžœ%žœžœž˜CKšœ˜Kšžœ˜—Kšžœ˜—K˜K˜ —šŸœžœžœ
+žœžœ
+žœžœžœžœžœžœžœ˜§šžœžœžœ&žœžœž˜JK˜%Kšœžœžœ˜0š	žœžœžœžœž˜;šžœžœž˜šœžœ˜!KšœJžœžœžœ'˜«K˜—šœžœ˜%K˜K˜—šœžœ˜ Kšœ?žœžœžœ"˜‘K˜—Kšžœžœ˜—Kšžœ˜—Kšžœ˜—K˜—K˜ šŸœžœžœžœ˜IKš
+žœžœžœžœžœ˜IKšœ˜K˜ —šŸœžœžœžœžœžœ˜Kšžœžœžœž˜Kš
+žœžœžœžœžœ˜,K˜Kšœžœžœ˜Kšžœ˜—Kšžœ˜Kšœ˜K˜ —š
+Ÿœžœžœžœžœ˜PKšžœžœžœžœžœžœ˜DKšžœžœžœžœžœžœžœ˜QKšœ2žœžœ˜>Kšžœ˜Kšœ˜K˜ —šŸœžœžœžœ˜BKšœžœžœžœžœžœžœžœžœžœžœ	˜bKšžœžœ
+žœžœ
+žœžœžœ>žœžœ˜}Kšœ˜K˜ —š
+Ÿœžœžœžœžœ˜BK™7Kšœžœžœžœžœžœžœžœžœžœžœ	žœ	˜qKšžœžœžœžœžœžœ˜&Kšžœ
+žœžœ
+žœžœžœžœ˜4Kšžœ7˜=Kšœ˜K˜ —š
+Ÿœžœžœžœžœ˜LKšœžœžœžœžœžœžœžœžœžœžœ	˜cKšžœžœžœžœžœžœ˜'Kšžœ
+žœžœ
+žœžœžœžœ˜4KšžœA˜GKšœ˜K˜ —K˜ –&[mod: NAT _ 17, case: BOOL _ TRUE]šœ(žœ˜/K˜ —šŸœžœžœžœžœžœ˜G–[x: SymTab.Ref, key: ROPE]šžœ+žœž˜:Kšœžœžœ˜Kšžœžœ˜—KšœGžœžœ	žœžœžœžœžœžœžœžœ˜ïK˜5Kšœ˜K˜ —š
+Ÿ	œžœžœžœžœ˜DKšœžœ)˜2šžœžœž˜šœžœ˜#Kšœžœ˜-Kšœžœ˜K˜š	žœžœ0žœžœž˜Qšžœžœž˜Kšœžœ-žœ™Ošœžœ˜šžœž	œžœž˜;šœžœ˜Kšœžœžœ˜EK˜—Kšžœžœ˜—Kšœ˜—Kšžœžœ˜—Kšžœ˜—š	žœžœ.žœžœž˜Ošžœžœž˜Kšœžœ+žœ˜KKšžœžœ˜—Kšžœ˜—š	žœžœ.žœžœž˜Ošžœžœž˜šœžœ˜š	žœ!žœžœžœž˜Sšœžœ˜#K˜1šžœžœžœžœ(žœžœž˜kšžœžœž˜šœžœ˜šžœžœž˜ šœžœžœ˜K˜<K˜—Kšžœžœ˜—K˜—Kšžœžœ˜—Kšžœ˜—Kšœžœ˜,Kšœ˜—Kšžœžœ˜—Kšœ˜—Kšžœžœ˜—Kšžœ˜—š	žœžœ.žœžœž˜Ošžœžœž˜Kšœžœ+žœ˜KKšžœžœ˜—Kšžœ˜—Kšžœ˜K˜—Kšžœžœžœ˜—K˜—K˜ šŸœžœžœžœžœžœ˜6š	žœžœžœžœž˜4šžœžœž˜Kš	œžœžœžœžœ˜:Kšžœžœ˜—Kšžœ˜—Kšžœžœ˜K˜—K˜ Kš
+Ÿœžœžœžœžœ˜+Kšœ
+žœžœÏc'˜>šŸœžœžœžœžœžœžœžœžœ˜WKšœžœžœIžœ˜\Kšœžœžœ˜$šŸœžœ
+žœžœžœžœžœ˜_šŸ	œžœ˜šžœžœž˜šœ3žœ˜>K–b[name: ROPE, wantedCreatedTime: GMT _ nullGMT, remoteCheck: BOOL _ TRUE, wDir: ROPE _ NIL]šœ
+žœžœ
+žœžœžœDžœžœ˜§K˜5Kš
+žœžœ/žœžœžœ1˜xšžœžœžœ˜Kšœžœ˜0K˜#K˜K˜—K˜—Kšžœžœ˜—Kšœ˜—šœ˜KšœžœžœJžœ˜vKšœžœžœ˜:Kšžœžœžœ˜=Kšœ˜—K˜—K˜Kšžœ˜K˜K˜ —šŸœžœžœžœžœžœžœžœ˜LKšžœžœžœžœžœžœžœ1˜VKšœ˜K˜ —šŸœžœžœžœžœžœžœžœžœžœžœžœžœ˜aKšœžœžœžœžœžœžœžœ˜'Kšœžœžœžœžœžœ˜"šžœžœžœžœžœ žœžœž˜LKšœžœ˜5Kšžœ˜—Kšžœ˜K˜K˜ —šŸœžœžœžœžœžœžœžœžœžœ˜VKšœžœžœžœžœžœ˜Kšœžœžœžœ˜šžœžœžœžœžœ žœžœž˜LK˜(Kšžœžœžœžœ˜2Kšžœ˜—Kšžœ˜K˜K˜ —š
+Ÿœžœžœžœžœ˜NK˜ —š
+Ÿœžœžœžœžœ˜0K˜ —šŸœžœžœžœžœžœžœžœžœ˜DKšžœžœžœžœžœžœ%˜HKšœ˜K˜ —šŸœžœžœžœžœžœžœžœžœžœžœžœžœ˜ƒšŸœžœžœžœžœžœ˜0šžœžœžœžœžœžœž˜CKšžœžœžœžœ˜$Kšžœ˜—Kšžœžœ˜Kšœ˜—šžœžœžœ)žœžœž˜RKšœ˜šžœžœžœ/žœžœž˜Sšžœžœ˜'Kšœžœ&˜0Kšžœ˜Kšœ˜—Kšžœ˜—Kšžœ˜—Kšœ˜K˜ —šŸ	œžœžœžœžœžœžœžœžœžœžœ˜vK™GKš	œžœžœžœžœ˜)Kšœžœžœ˜$Kš	œ	žœžœžœžœ˜9Kš	œžœžœžœžœ˜ Kš	œ
+žœžœžœžœ˜š
+Ÿœžœžœžœžœ˜)šžœžœžœžœžœžœž˜CKšžœžœžœžœ˜$Kšžœ˜—Kšžœžœ˜Kšœ˜—šžœ	žœž˜šžœžœžœ <˜Mšœžœ˜)šžœžœžœ˜K˜Kšœžœ*˜<Kšœ˜—Kšœ˜—šœžœ˜)šžœžœžœ˜K˜Kšœžœ˜'Kšœ˜—Kšœ˜—šžœ˜Kšœžœ˜Kšœ
+žœ˜ šžœžœžœ%žœžœž˜NKšœ$˜$K–O[s1: ROPE, pos1: INT _ 0, s2: ROPE, pos2: INT _ 0, case: BOOL _ TRUE]šœžœ"˜.Kšœžœ˜$šžœžœ˜ Kšœžœ(žœ˜7šžœžœžœžœ˜OKšœžœžœ!˜.Kšœžœ˜K˜K˜Kšœ	žœ˜Kšžœ˜Kšœ˜—Kšœ˜—Kšžœžœžœ˜.Kšžœ˜—Kšœ˜——K˜Kšžœ˜—K˜šžœžœžœ˜šžœžœžœ'žœžœž˜PKšœ˜šžœžœžœ/žœžœž˜Sšžœžœ˜'Kšœ	žœ˜Kšžœ˜Kšœ˜—Kšžœ˜—Kšžœ˜—Kšœ˜—šžœžœžœ˜š
+Ÿœžœžœžœžœ˜-šžœžœžœžœžœžœž˜@K–6[pattern: ROPE, object: ROPE, case: BOOL _ TRUE]š
+žœ5žœžœžœžœ˜QKšžœ˜—Kšžœžœ˜Kšœ˜—šžœžœžœ'žœžœž˜PKšœ˜Kšžœ*žœ
+žœ˜@Kšžœ˜—Kšœ˜—Kšžœ˜Kšœ˜K˜ —šŸœžœžœžœžœžœžœ	˜dšžœžœžœ)žœžœž˜MK˜
+Kšžœ˜—K˜—K˜ šŸœžœžœ4žœ˜\K˜ —KšŸœžœžœ3žœ˜WKšŸœžœžœ˜Kšœ	žœžœ˜šŸœžœžœžœžœžœžœžœžœžœžœžœ˜‰Kšœžœžœ˜šœžœžœ˜K˜K˜Kšœžœ˜Kšœ	žœ˜Kšœžœ˜Kšœžœžœžœ˜Kšœ
+žœ˜Kšœžœ˜
+Kšœžœ +˜2K˜—Kšœžœžœžœžœžœ	˜7K˜,K˜1Kšœžœ˜(šŸœžœžœžœ˜0Kšœžœžœ6˜OKšœžœ˜šŸœžœ˜$Kšœžœ˜Kš	œžœžœžœžœ˜šœžœ˜K˜K˜K˜Kšœ	žœ˜K˜
+Kšœžœ˜Kšœ˜K˜Kšœžœžœ˜K˜—Kšžœžœžœžœ˜IK˜/K˜>K˜Kšœ˜—šŸœžœžœ˜!Kšœžœ˜(K˜$Kšœ˜—šžœžœžœ)žœžœž˜MK™Kšžœžœ˜+Kšžœ˜—šžœžœžœ)žœžœž˜MK™PKšžœ"žœžœžœ˜TKšžœ˜—šžœžœžœ)žœžœž˜MK™Kšžœžœ#žœžœ˜UKšžœ˜—šžœ˜
+šžœ˜šžœžœžœ
+ž˜K™WKšœ!™!K˜ šžœžœ˜#šžœžœžœ1žœžœž˜Ušžœ5žœž˜Dšœžœžœ˜K˜)Kšžœ
+žœžœžœ˜5šžœžœžœ)žœžœž˜MKšœ#˜#šžœžœžœ&žœžœž˜Jšžœžœ˜%K˜AKšžœ˜Kšœ˜—Kšžœ˜—Kšžœ˜—Kšœ˜—KšžœžœC˜U—Kšžœ˜—Kšœ˜—Kšžœ˜—šžœžœžœ
+ž˜$Kšœž
+œ-™:K˜ šžœžœžœ1žœžœž˜Ušžœ5žœž˜DKšœžœžœ&˜5Kšžœžœ˜—Kšžœ˜—šžœžœžœ&žœžœž˜Jšžœ8žœž˜GKšœžœžœ&˜5Kšžœžœ˜—Kšžœ˜—Kšžœ˜—Kšœ˜—šžœ ˜š	žœžœž
+œžœ
+ž˜$Kšœž
+œ-™:K˜ šžœžœžœ3žœžœž˜Wšžœ=žœž˜LKšœžœžœ&˜5Kšžœžœ˜—Kšžœ˜—šžœžœžœ1žœžœž˜Ušžœ5žœž˜DKšœžœžœ&˜5Kšžœžœ˜—Kšžœ˜—Kšžœ˜—Kšœ˜——Kšžœ˜
+K˜—šŸœžœžœžœ˜>Kšœ˜Kš
+žœ
+žœžœžœžœ˜;šžœžœžœ&žœžœž˜Jšžœ8žœž˜Gšœžœžœ˜Kšœžœ˜šžœžœ˜Kš
+žœžœ=žœžœžœ˜WKšœ˜—K˜—Kšžœžœ˜—Kšžœ˜—Kšžœžœ˜Kšœ˜—š
+Ÿœžœžœžœžœ˜LKšœžœžœ #˜7Kšœ˜Kšžœžœžœžœ˜/šžœžœžœ&žœžœž˜Jšžœ8žœž˜Gšœžœžœ˜Kšœžœ˜šžœžœGžœ˜SKšœžœ˜Kšžœ,˜2Kšžœžœžœ˜Kšœ˜—K˜—Kšžœžœ˜—Kšžœ˜—Kšœ˜—šŸœžœ˜*Kšœ˜šžœžœžœ&žœžœž˜Jšžœ8žœž˜Gšœžœžœ˜Kšœžœ˜K˜QK˜—Kšžœžœ˜—Kšžœ˜—Kšœ˜—Kšœžœžœ
+žœ +˜HKšœžœ &˜2šŸœžœ˜Kšœ™Kšœžœžœžœ˜K˜
+K˜Kšžœ	žœžœžœ˜8Kšžœ	žœžœžœ˜2Kšœžœžœ˜)Kšœ™šžœžœžœžœžœžœž˜>K˜šžœ˜šžœ˜K˜Kšžœžœ˜K˜—šžœ˜Kšžœžœžœ˜0K˜——Kšžœ˜—K˜
+šžœžœ˜Kšœ%™%Kšœžœžœžœ˜ šž˜K˜Kšœ žœ˜&šžœ	˜šžœ˜šžœžœ˜$K˜Kšœžœ˜K˜—K˜—šžœ˜Kšœžœ˜Kšœ˜——Kšžœžœžœ˜Kšžœ˜—K˜
+K˜—K˜—Kšœžœžœžœžœžœžœ˜1Kš	œžœžœžœžœ˜,šŸœžœžœžœ˜,Kšžœžœžœžœ˜+K˜—šŸœžœžœžœžœžœžœžœ˜BKšœf™fKšœžœ˜šžœžœžœ
+ž˜,šžœžœžœž˜K˜Kšžœ#žœžœ˜:Kšžœ˜—K˜HKšžœ˜—šžœ
+žœ˜š	žœžœž
+œžœž˜(K˜šžœžœžœžœžœžœž˜>šžœžœ˜Kšœžœ	˜Kšžœ˜Kšœ˜—Kšžœ˜—Kšžœ˜—Kšœžœ˜Kšœ˜—Kšœ˜—šžœžœžœž˜K˜Kšžœžœžœ˜.Kšžœ˜—Kšžœ˜K˜K˜ —Kšžœ˜—— …—    O<  u1  

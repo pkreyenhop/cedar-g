@@ -1,0 +1,278 @@
+
+DIRECTORY Basics, Commander, CommanderOps, Convert, FS, Imager, ImagerError, ImagerDither, ImagerDitherContext, ImagerSample, InterpressInterpreter, IO, RasterfileConverters, Real, Rope, SF, Xl, XlPredefinedAtoms, XlWMOps;
+
+XConvertersImpl: CEDAR PROGRAM
+IMPORTS Commander, CommanderOps, Convert, ImagerError, ImagerDitherContext, ImagerSample, InterpressInterpreter, IO, RasterfileConverters, Real, Rope, Xl, XlWMOps
+= BEGIN
+
+ROPE: TYPE ~ Rope.ROPE;
+Error: ERROR [explanation: ROPE] ~ RasterfileConverters.Error;
+
+Byte: TYPE ~ CARDINAL[0..255];
+Short: TYPE ~ CARDINAL[0..65535];
+
+XColorSequence: TYPE ~ ARRAY [0..255] OF MaybeXColor;
+MaybeXColor: TYPE ~ MACHINE DEPENDENT RECORD [
+rgb: Xl.RGBRec ¬ [0, 0, 0],
+used: BOOL ¬ FALSE];
+
+BColorSequence: TYPE ~ ARRAY [0..255] OF MaybeBColor;
+MaybeBColor: TYPE ~ MACHINE DEPENDENT RECORD [
+red, green, blue: Byte ¬ 0,
+used: BOOL ¬ FALSE];
+
+retainPropName: ROPE ~ "_XSETROOT_ID";
+synchDetails: Xl.Details ~ NEW [Xl.DetailsRec ¬ [synchronous: TRUE]];
+
+PreserveResource: PROC [c: Xl.Connection, w: Xl.Window] ~ {
+retainPropAtom: Xl.XAtom ~ Xl.MakeAtom[c, retainPropName];
+pm: Xl.Pixmap ~ Xl.CreatePixmap[c, w, [1, 1], 1];
+seq: REF Xl.Card32Sequence ¬ NEW[Xl.Card32Sequence[1]];
+seq[0] ¬ Xl.PixmapId[pm];
+Xl.ChangeProperty[c, w, retainPropAtom, XlPredefinedAtoms.pixmap, replace, seq];
+XlWMOps.SetCloseDownMode[c, retainPermanent];
+RETURN};
+
+FreePrevious: PROC [c: Xl.Connection, w: Xl.Window] ~ {
+retainPropAtom: Xl.XAtom ~ Xl.MakeAtom[c, retainPropName];
+prc: Xl.PropertyReturnRec ~ Xl.GetProperty[c, w, retainPropAtom, XlPredefinedAtoms.pixmap, TRUE];
+IF prc.value=NIL THEN NULL
+ELSE IF prc.type = XlPredefinedAtoms.pixmap THEN {
+seq: REF Xl.Card32Sequence ~ NARROW[prc.value];
+XlWMOps.KillClient[c, seq[0], synchDetails !Xl.XError => CONTINUE];
+Xl.FreePixmap[c, [[seq[0] ]], synchDetails !Xl.XError => CONTINUE];
+}
+ELSE Error["_XSETROOT_ID prop isn't a pixmap"];
+RETURN};
+
+XcmToXcs: PROC [c: Xl.Connection, cm: Xl.ColorMap] RETURNS [xcs: REF XColorSequence] ~ {
+xcs ¬ NEW [XColorSequence ¬ ALL[[]] ];
+FOR i: NAT IN [0 .. 255] DO
+lrgb: LIST OF Xl.RGBRec;
+lp: LIST OF CARD32 ~ LIST[i];
+lrgb ¬ Xl.QueryColors[c, cm, lp !Xl.XError => LOOP];
+IF lrgb=NIL OR lrgb.rest#NIL THEN Error["X server returned non-unit list of colors"];
+xcs[i] ¬ [lrgb.first, TRUE];
+ENDLOOP;
+RETURN};
+
+Uniquify: PROC [c: Xl.Connection, cm: Xl.ColorMap, xcs: REF XColorSequence] RETURNS [u: REF XColorSequence] ~ {
+u ¬ NEW [XColorSequence ¬ ALL[[]] ];
+FOR i: NAT IN [0..255] DO
+pixel: Xl.Pixel; usedColor: Xl.RGBRec;
+[pixel, usedColor] ¬ Xl.AllocColor[c, cm, xcs[i].rgb];
+SELECT TRUE FROM
+pixel > 255 => Error["AllocColor returned a pixel > 255"];
+NOT u[pixel].used => u[pixel] ¬ [usedColor, TRUE];
+u[pixel].rgb # usedColor => Error[IO.PutFR1["X server is making inconsistent claims about pixel %g", [cardinal[pixel]] ]];
+ENDCASE => NULL;
+ENDLOOP;
+RETURN};
+
+XcsToIme: PROC [xcs: REF XColorSequence] RETURNS [ime: ImagerDither.MapEntries] ~ {
+ime ¬ NIL;
+FOR i: NAT DECREASING IN [0..255] DO
+IF xcs[i].used THEN ime ¬ CONS[[i, S2B[xcs[i].rgb.red], S2B[xcs[i].rgb.green], S2B[xcs[i].rgb.blue]], ime];
+ENDLOOP;
+RETURN};
+
+synchronized: BOOL ¬ TRUE;
+
+XLoadIp: PROC [cmd: Commander.Handle] RETURNS [result: REF ¬ NIL, msg: ROPE ¬ NIL] --Commander.CommandProc-- ~ {
+argv: CommanderOps.ArgumentVector ~ CommanderOps.Parse[cmd];
+display, filename: ROPE ¬ NIL;
+conn: Xl.Connection;
+screen: Xl.Screen;
+rootwin: Xl.Window ¬ Xl.nullWindow;
+xcs, uxcs: REF XColorSequence;
+ime: ImagerDither.MapEntries;
+ipRect: Imager.Rectangle--in inches-- ¬ [0, 0, 0, 0];
+rSize: SF.Vec ¬ [-1, -1];
+master: InterpressInterpreter.Master ¬ NIL;
+rsm: ImagerSample.RasterSampleMap;
+context: Imager.Context;
+pm: Xl.Pixmap;
+gc: Xl.GContext;
+scanLineBytes: INT;
+ia: INT ¬ 1;
+GetArg: PROC [for: ROPE] RETURNS [ROPE] ~ {
+oia: INT ~ ia;
+IF ia >= argv.argc THEN Usage[Rope.Concat["missing arg for ", for]];
+ia ¬ ia+1;
+RETURN [argv[oia]]};
+EnsureConnection: PROC ~ {IF conn=NIL THEN {
+conn ¬ Xl.CreateConnection[display, synchronized];
+screen ¬ Xl.DefaultScreen[conn];
+rootwin ¬ screen.root;
+}};
+Usage: PROC [why: ROPE] ~ {
+cmd.err.PutRope[why];
+cmd.err.PutChar['\n];
+CommanderOps.Failed["Usage: XLoadIp [-display <display>] <filename> <x> <y> <w> <h> [in | mm] [ -ppi <ppi> | -rSize <f> <s> | -sFrac <xf> <yf> | -scale <s> ]\n"]};
+complained: BOOL ¬ FALSE;
+Log: InterpressInterpreter.LogProc ~ {
+cmd.err.PutF["Interpress message: class=%g, code=%g, explanation=%g\n", [integer[class]], [atom[ImagerError.AtomFromErrorCode[code]]], [rope[explanation]] ];
+complained ¬ TRUE;
+RETURN};
+WHILE ia < argv.argc DO
+ENABLE Convert.Error => Usage["invalid numeric argument"];
+arg: ROPE ~ argv[ia];
+ia ¬ ia+1;
+SELECT TRUE FROM
+arg.Equal["-display", FALSE] => {
+IF conn#NIL THEN Usage["-display given twice"];
+display ¬ GetArg["-display"]};
+arg.Equal["-ppi", FALSE] =>
+IF filename=NIL
+THEN Usage["filename must be given before -ppi"]
+ELSE {
+ppi: REAL ~ Convert.RealFromRope[GetArg["-ppi"]];
+rSize ¬ [s: Real.Floor[ipRect.h/ppi], f: Real.Floor[ipRect.w/ppi]];
+};
+arg.Equal["-rsize", FALSE] => {
+rSize.f ¬ Convert.CardFromRope[GetArg["-rsize"]];
+rSize.s ¬ Convert.CardFromRope[GetArg["-rsize"]]};
+arg.Equal["-sfrac", FALSE] => {
+xf: REAL ~ Convert.RealFromRope[GetArg["-sfrac"]];
+yf: REAL ~ Convert.RealFromRope[GetArg["-sfrac"]];
+IF xf<=0.0 OR xf>1.0 OR yf<=0.0 OR yf>1.0 THEN Usage["unreasonable screen fraction"];
+EnsureConnection[];
+rSize ¬ [s: Real.Round[screen.sizeInPixels.height*yf], f: Real.Round[screen.sizeInPixels.width*xf] ]};
+arg.Equal["-scale", FALSE] => {
+s: REAL ~ Convert.RealFromRope[GetArg["-scale"]];
+IF s<=0.0 OR s>1.0E6 THEN RETURN [$Failure, "unreasonable scale factor"];
+IF filename=NIL THEN Usage["filename must be given before -scale"];
+EnsureConnection[];
+rSize ¬ [
+s: Real.Round[screen.sizeInPixels.height*ipRect.h*25.4*s / screen.sizeInMillimeters.height],
+f: Real.Round[screen.sizeInPixels.width*ipRect.w*25.4*s / screen.sizeInMillimeters.width] ]};
+ENDCASE => {
+IF filename#NIL THEN Usage["two filenames"];
+IF ia+4 > argv.argc THEN Usage["filename must be followed by four numbers"];
+filename ¬ arg;
+ipRect ¬ [
+x: Convert.RealFromRope[argv[ia+0]],
+y: Convert.RealFromRope[argv[ia+1]],
+w: Convert.RealFromRope[argv[ia+2]],
+h: Convert.RealFromRope[argv[ia+3]] ];
+ia ¬ ia+4;
+SELECT TRUE FROM
+ia = argv.argc => NULL;
+argv[ia].Equal["in", FALSE] => ia ¬ ia+1;
+argv[ia].Equal["mm", FALSE] => {
+ipRect ¬ [x: ipRect.x/25.4, y: ipRect.y/25.4, w: ipRect.w/25.4, h: ipRect.h/25.4];
+ia ¬ ia+1};
+ENDCASE => NULL;
+};
+ENDLOOP;
+EnsureConnection[];
+IF filename=NIL THEN Usage["no filename given"];
+IF rSize = [-1, -1] THEN rSize ¬ [
+s: Real.Round[screen.sizeInPixels.height*ipRect.h*25.4 / screen.sizeInMillimeters.height],
+f: Real.Round[screen.sizeInPixels.width*ipRect.w*25.4 / screen.sizeInMillimeters.width] ];
+master ¬ InterpressInterpreter.Open[filename, Log];
+IF master=NIL THEN {
+IF NOT complained THEN cmd.err.PutF1["InterpressInterpreter.Open[%g] returned NIL.\n", [rope[filename]] ];
+RETURN [$Failure, NIL]};
+cmd.out.PutRope["Querying color map... "];
+xcs ¬ XcmToXcs[conn, screen.defaultColorMap];
+uxcs ¬ Uniquify[conn, screen.defaultColorMap, xcs];
+ime ¬ XcsToIme[uxcs];
+IF rSize.s<=0 OR rSize.f<=0 OR rSize.s>3D4 OR rSize.f>3D4 OR rSize.s*rSize.f>1D7 THEN Usage["unreasonable raster size"];
+cmd.out.PutF1["found %g unique colors.\nAllocating raster... ", [cardinal[ImeLen[ime]]] ];
+rsm ¬ ImagerSample.NewSampleMap[box: [min: [0, 0], max: rSize], bitsPerSample: 8];
+scanLineBytes ¬ rsm.GetBitsPerLine/8;
+IF scanLineBytes*8 # rsm.GetBitsPerLine THEN Error["RasterSampleMap's scanlines not byte aligned"];
+FreePrevious[conn, rootwin];
+context ¬ ImagerDitherContext.Create[deviceSpaceSize: rSize, scanMode: [slow: down, fast: right], surfaceUnitsPerInch: [x: rSize.f/ipRect.w, y: rSize.s/ipRect.h], pixelUnits: FALSE];
+ImagerDitherContext.SetSampleMap[context, rsm];
+ImagerDitherContext.SetDitherMap[context, ime];
+cmd.out.PutRope["dithering image... "];
+master.DoPage[1, context, Log];
+master.Close[];
+pm ¬ Xl.CreatePixmap[conn, rootwin, [width: rSize.f, height: rSize.s], 8];
+gc ¬ Xl.MakeGContext[conn, pm];
+cmd.out.PutRope["sending image... "];
+Xl.PutImage[c: conn, drawable: pm, gc: gc, size: [width: rSize.f, height: rSize.s], dest: [0, 0], base: LOOPHOLE[rsm.GetBase.word], offx: 0, offy: 0, scanLineBytes: scanLineBytes, bitsPerPixel: 8];
+Xl.ChangeWindowAttributes[conn, rootwin, [backgroundPixmap: pm]];
+Xl.ClearArea[conn, rootwin, [0, 0], [0, 0]];
+Xl.FreePixmap[conn, pm];
+PreserveResource[conn, rootwin];
+Xl.RoundTrip[conn];
+<<October 1, 1991, MJS: Don't Xl.CloseConnection because that's implemented via KillClient, which we don't want.
+Xl.CloseConnection[conn];
+>>
+cmd.out.PutRope["done.\n"];
+RETURN};
+
+CaptureXColormap: PROC [cmd: Commander.Handle] RETURNS [result: REF ¬ NIL, msg: ROPE ¬ NIL] --Commander.CommandProc-- ~ {
+argv: CommanderOps.ArgumentVector ~ CommanderOps.Parse[cmd];
+display: ROPE ¬ NIL;
+conn: Xl.Connection;
+screen: Xl.Screen;
+xcs, uxcs: REF XColorSequence;
+ime: ImagerDither.MapEntries;
+rsm: ImagerSample.RasterSampleMap ~ ImagerSample.NewSampleMap[box: [min: [0, 0], max: [0, 0]], bitsPerSample: 8];
+IF argv.argc=2 OR (argv.argc=4 AND argv[2].Equal["_"]) THEN NULL
+ELSE RETURN [$Failure, "Usage: CaptureXColormap <rasterfile colormap output> [ _ <X display>]"];
+IF argv.argc>2 THEN display ¬ argv[3];
+conn ¬ Xl.CreateConnection[display, synchronized];
+screen ¬ Xl.DefaultScreen[conn];
+xcs ¬ XcmToXcs[conn, screen.defaultColorMap];
+uxcs ¬ Uniquify[conn, screen.defaultColorMap, xcs];
+ime ¬ XcsToIme[uxcs];
+Xl.CloseConnection[conn];
+RasterfileConverters.WriteRasterfile[argv[1], rsm, ime !
+RasterfileConverters.Error => CommanderOps.Failed[explanation]
+];
+cmd.out.PutF["%g colors written to %g.\n", [integer[ImeLen[ime]]], [rope[argv[1]]] ];
+RETURN};
+
+ImeLen: PROC [ime: ImagerDither.MapEntries] RETURNS [INT] ~ {
+l: INT ¬ 0;
+FOR ime ¬ ime, ime.rest WHILE ime#NIL DO l ¬ l.SUCC ENDLOOP;
+RETURN [l]};
+
+B2S: PROC [c: Byte] RETURNS [s: Short] ~ INLINE {RETURN [c*256]};
+S2B: PROC [s: Short] RETURNS [c: Byte] ~ INLINE {RETURN [s/256]};
+
+Commander.Register["CaptureXColormap", CaptureXColormap, "<rasterfile colormap output> [ _ <X display>] --- Capture default colormap of an X display in a rasterfile"];
+Commander.Register["XLoadIp", XLoadIp, "[-display <display>] <filename> <x> <y> <w> <h> [in | mm] [ -ppi <ppi> | -rSize <f> <s> | -sFrac <xf> <yf> | -scale <s> ] --- dither Interpress file into root window's background"];
+
+END.
+    
+XConvertersImpl.mesa
+Copyright Ó 1991, 1992 by Xerox Corporation.  All rights reserved.
+Spreitze, October 1, 1991 9:29 am PDT
+Willie-s, April 3, 1992 4:43 pm PST
+Michael Plass, June 26, 1992 11:41 am PDT
+These should use the same mapping as xloadimage.
+Ê	²  •NewlineDelimiter
+–(cedarcode) style™ codešœ™Kšœ
+Ïeœ7™BK™%K™#K™)—K˜ KšÏk	œ+žœ_žœ$žœ!˜ÞK˜ šÏnœžœž˜Kšžœjžœ/˜¢—Kšœž˜K˜ Kšžœžœžœ˜KšŸœžœžœ˜>K˜ Kšœžœžœ	˜Kšœžœžœ˜!K˜ Kšœžœžœ
+žœ˜5š	œžœžœž	œžœ˜.K˜Kšœžœžœ˜—K˜ Kšœžœžœ
+žœ˜5š	œžœžœž	œžœ˜.K˜Kšœžœžœ˜—K˜ Kšœžœ˜&Kšœžœ žœ˜EK˜ šŸœžœ%˜;Kšœ:˜:Kšœ1˜1Kšœžœžœ˜7K˜KšœP˜PKšœ-˜-Kšžœ˜—K˜ šŸœžœ%˜7Kšœ:˜:Kšœ[žœ˜aKšžœžœžœž˜šžœžœ%žœ˜2Kšœžœžœ˜/Kšœ9žœ˜CKšœ9žœ˜CK˜—Kšžœ+˜/Kšžœ˜—K˜ šŸœžœ%žœžœ˜XKšœžœžœ˜&šžœžœžœž˜Kšœžœžœ˜Kš	œžœžœžœžœ˜Kšœ.žœ˜4Kš
+žœžœžœžœžœ4˜UKšœžœ˜Kšžœ˜—Kšžœ˜—K˜ š
+Ÿœžœ*žœžœžœ˜oKšœžœžœ˜$šžœžœžœ
+ž˜Kšœ&˜&K˜6šžœžœž˜Kšœ:˜:Kšžœ)žœ˜2Kšœ"žœV˜zKšžœžœ˜—Kšžœ˜—Kšžœ˜—K˜ šŸœžœžœžœ#˜SKšœžœ˜
+š	žœžœž
+œžœ
+ž˜$Kšžœžœžœžœžœžœ˜kKšžœ˜—Kšžœ˜—K˜ Kšœžœžœ˜K˜ šŸœžœžœ
+žœžœžœžœÏcœ˜pK˜<Kšœžœžœ˜K˜K˜K˜#Kšœžœ˜K˜Kšœ œ˜5Kšœžœ˜Kšœ'žœ˜+Kšœ"˜"K˜K˜Kšœ˜Kšœžœ˜Kšœžœ˜š
+Ÿœžœžœžœžœ˜+Kšœžœ˜Kšžœžœ-˜DK˜
+Kšžœ˜—š
+Ÿœžœžœžœžœ˜,K˜2K˜ K˜Kšœ˜—šŸœžœžœ˜K˜K˜Kšœ£˜£—Kšœžœžœ˜šŸœ#˜&K˜Kšœžœ˜Kšžœ˜—šžœž˜Kšžœ4˜:Kšœžœ˜K˜
+šžœžœž˜šœžœ˜!Kšžœžœžœ˜/K˜—šœžœ˜šžœ
+ž˜Kšžœ,˜0—šžœ˜Kšœžœ(˜1K˜CK˜——šœžœ˜K˜1K˜2—šœžœ˜Kšœžœ*˜2Kšœžœ*˜2Kš
+žœ	žœžœ	žœžœ'˜UK˜K˜f—šœžœ˜Kšœžœ*˜1Kšžœžœ	žœžœ)˜IKšžœ
+žœžœ/˜CK˜˜	Kšœ\˜\Kšœ]˜]——šžœ˜Kšžœ
+žœžœ˜,Kšžœžœ4˜LK˜˜
+K˜$K˜$K˜$K˜&—K˜
+šžœžœž˜Kšœžœ˜Kšœžœ˜)šœžœ˜ K˜RK˜—Kšžœžœ˜—K˜——Kšžœ˜—Kšœ˜Kšžœ
+žœžœ˜0šžœžœ
+˜"KšœZ˜ZKšœZ˜Z—K˜3šžœžœžœ˜KšžœžœžœT˜jKšžœžœ˜—K˜*K˜-K˜3K˜Kšžœžœžœžœžœžœ#˜xK˜ZK˜RK˜%Kšžœ&žœ7˜cKšœ˜Kšœ¯žœ˜¶Kšœ/˜/Kšœ/˜/K˜'K˜K˜K˜JK˜K˜%KšœhžœU˜ÅKšœA˜AK˜,Kšœ˜Kšœ ˜ Kšœ˜šœp˜pKšœ˜Kšœ˜—K˜Kšžœ˜—K˜ šŸœžœžœ
+žœžœžœžœ œ˜yK˜<Kšœ	žœžœ˜K˜K˜Kšœžœ˜K˜Kšœq˜qKš	žœžœžœžœž˜@KšžœžœU˜`Kšžœžœ˜&K˜2K˜ K˜-K˜3K˜Kšœ˜šœ8˜8Kšœ>˜>Kšœ˜—K˜UKšžœ˜—K˜ šŸœžœ žœžœ˜=Kšœžœ˜Kšžœžœžœžœžœžœ˜<Kšžœ˜—K˜ Kš
+žœžœžœžœžœ
+˜Aš
+žœžœžœžœžœ
+˜AK™0—K˜ Kšœ§˜§KšœÝ˜ÝK˜ Kšžœ˜— …—    (È  3~  

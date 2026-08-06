@@ -1,0 +1,1077 @@
+
+DIRECTORY
+Atom USING [ GetProp ],
+BasicTime USING [ Now, Period, Update ],
+Commander USING [ CommandProc, Register ],
+CommanderOps USING [ ParseToList ],
+FinchSmarts,
+IO,
+LarkFeepSunImport USING [ ImportInterface ],
+MBQueue USING [ Create, QueueClientAction ],
+NameDB USING [ Error, GetAttribute, SetAttribute ],
+Process USING [ Detach, SecondsToTicks, SetTimeout ],
+RedBlackTree USING [ EachNode, EnumerateIncreasing, Table ],
+RefID USING [ ID ],
+Rope,
+RPC USING [ EncryptionKey ],
+ThParty	USING [ Advance, Alert, Attributes, ConversationInfo, CreateConversation, DescribeParty, GetConversationFromName, GetConversationInfo, GetParty, GetNumbersForRName, GetPartyFromNumber, GetPartyInfo, LookupServiceInterface, nullIx, PartyInfo, RegisterConversation, Unvisit, UnvisitSelf, Visit ],
+Thrush USING [
+ActionReport, ConversationID, ConvEvent, Credentials, InterfaceSpec, NB, none, notReallyInConv, nullConvID, nullID, PartyID, PartyType, Reason, ROPE, SHHH, SmartsID, StateInConv ],
+ThSmarts,
+UserProfile USING [ Boolean ],
+VoiceUtils USING [ CurrentPasskey, CurrentRName, Problem, ProblemFR, Registrize, Report, ReportFR ]
+;
+
+FinchSmartsImpl: CEDAR MONITOR LOCKS FinchSmarts.lock
+IMPORTS Atom, BasicTime, Commander, CommanderOps, FinchSmarts, IO, LarkFeepSunImport, MBQueue, NameDB, -- Nice, --Process, RedBlackTree, Rope, ThParty, UserProfile, VoiceUtils
+EXPORTS FinchSmarts, ThSmarts = {
+OPEN IO;
+
+
+ConvDesc: TYPE = FinchSmarts.ConvDesc;
+ConversationID: TYPE = Thrush.ConversationID;
+nullConvID: ConversationID = Thrush.nullConvID;
+FinchInfo: TYPE = FinchSmarts.FinchInfo;
+NB: TYPE = Thrush.NB;
+none: SHHH = Thrush.none;
+nullID: RefID.ID = Thrush.nullID;
+PartyID: TYPE = Thrush.PartyID;
+ROPE: TYPE = Thrush.ROPE;
+SHHH: TYPE = Thrush.SHHH;
+SmartsID: TYPE = Thrush.SmartsID;
+StateInConv: TYPE = Thrush.StateInConv;
+nullInterfaceSpec: Thrush.InterfaceSpec = [serviceID: nullID];
+
+uniqueSuffix: CARD ¨ 0;
+
+PD: TYPE = FinchSmarts.PD;
+pd: PUBLIC REF PD ¨ NEW[PD¨[]];
+
+info: PUBLIC FinchInfo¨NIL;
+
+Report: PROC[what: ROPE] = {
+IF NOT pd.doReports THEN RETURN;
+VoiceUtils.Report[what, $Finch];
+};
+
+NConcConvs: PROC[l1, l2: LIST OF ConvDesc] RETURNS [LIST OF ConvDesc] = {
+IF l1=NIL THEN RETURN[l2];
+FOR convs: LIST OF ConvDesc ¨ l1, convs.rest WHILE convs#NIL DO
+IF convs.rest=NIL THEN { convs.rest¨l2; RETURN[l1]; };
+ENDLOOP;
+ERROR;
+};
+
+DequeueConv: PROC[l1: LIST OF ConvDesc, c: ConvDesc] RETURNS [LIST OF ConvDesc] = {
+IF l1=NIL THEN RETURN[l1]; -- No list
+IF l1.first=c THEN RETURN[l1.rest]; -- Head of list
+FOR convs: LIST OF ConvDesc ¨ l1, convs.rest WHILE convs.rest#NIL DO
+IF convs.rest.first=c THEN { convs.rest ¨ convs.rest.rest; RETURN[l1]; }; -- Internal to list
+ENDLOOP;
+RETURN[l1]; -- Not in list
+};
+
+Progress: PUBLIC ENTRY PROC[
+shh: SHHH,
+convEvent: Thrush.ConvEvent
+] = {
+ENABLE UNWIND => NULL; -- RestoreInvariant;
+IF convEvent.self.partyID = convEvent.other.partyID
+OR convEvent.other.state >= $active -- Possibly a hack, DCS February 26, 1988
+THEN [] ¨ NoteNewState[convEvent];
+};
+
+Substitution: PUBLIC ENTRY PROC[
+shh: SHHH,
+convEvent: Thrush.ConvEvent,
+oldPartyID: Thrush.PartyID,
+newPartyID: Thrush.PartyID
+] = {
+ENABLE UNWIND => NULL; -- RestoreInvariant;
+cDesc: ConvDesc = GetConv[convEvent.self.convID, FALSE];
+IF cDesc#NIL THEN cDesc.numParties ¨ 0; -- This will force the information update.
+[] ¨ NoteNewState[ convEvent ];
+};
+
+ReportAction: PUBLIC ENTRY PROC[
+shh: SHHH,
+report: Thrush.ActionReport
+] = {
+ENABLE UNWIND => NULL;
+ReportRequestState[GetConv[report.self.convID], report];
+BROADCAST info.stateChange; -- Sometimes callers wait (Ugh!)}
+};
+
+CheckIn: PUBLIC ENTRY PROC[
+shh: Thrush.SHHH,
+credentials: Thrush.Credentials,
+voicePath: BOOL,
+reason: Thrush.Reason,
+remark: ROPE,
+nextScheduledCheck: INT
+] = {
+ENABLE UNWIND => NULL;
+localRemark: ROPE¨NIL;
+connected: BOOL ¨ TRUE;
+enabled: BOOL ¨ info.enabled;
+info.nextScheduledCheck ¨ nextScheduledCheck;
+SELECT reason FROM
+$goodbye => {
+enabled ¨ connected ¨ FALSE;
+localRemark ¨ "Permanent disconnect requested by server";
+};
+$trylater => {
+localRemark ¨ "Temporary disconnect requested by server";
+connected ¨ FALSE;
+};
+$welcome, $hello => connected ¨ TRUE;
+ENDCASE;
+[]¨FinchSmarts.RecordSystemStateFromSmartsReport[
+remark: localRemark, connected: connected, enabled: enabled, voicePath: voicePath, remoteRemark: remark];
+NOTIFY info.pollCondition;
+};
+
+Poke: PUBLIC ENTRY PROC = {
+ENABLE UNWIND => NULL;
+IF info#NIL THEN NOTIFY info.pollCondition; };
+
+LimitSignalling: ENTRY PROC [cDesc: ConvDesc, signalState: StateInConv] ~ TRUSTED {
+ENABLE UNWIND => NULL;
+c: CONDITION;
+Process.SetTimeout[@c, Process.SecondsToTicks[pd.timeoutInitiating]];
+WAIT c;
+IF cDesc.situation.self.state # signalState THEN RETURN;
+[]¨Request[cDesc, $failed, $noAnswer,
+IF signalState=$notified THEN "Other party failed to respond to call."
+ELSE "We did not respond to call.  Notify LarkSupport."];
+};
+
+CallInfo: TYPE = REF CallInfoBody; -- needed because MBQueue requires a REF
+CallInfoBody: TYPE = RECORD [
+convID: Thrush.ConversationID,
+calledPartyID: Thrush.PartyID¨nullID,
+reason: Thrush.Reason¨NIL,
+comment: ROPE¨NIL
+];
+
+DisconnectCall: PUBLIC ENTRY PROC[
+convID: Thrush.ConversationID,
+reason: Thrush.Reason ¨ $terminating,
+comment: ROPE¨NIL,
+newState: StateInConv ¨ $idle] = {
+ENABLE UNWIND => NULL; -- RestoreInvariant;
+cDesc: ConvDesc; state: StateInConv;
+IF NOT(([,cDesc, state]¨FinchOn[convID]).on) THEN RETURN;
+SELECT state FROM
+$idle, $neverWas => {
+ReportConversationState[$convNotActive, NIL, "No conversation to disconnect"];
+};
+ENDCASE => []¨Request[cDesc, newState, reason, comment];
+};
+
+AnswerCall: PUBLIC ENTRY PROC[convID: Thrush.ConversationID] = {
+ENABLE UNWIND => NULL; -- RestoreInvariant;
+cDesc: ConvDesc; state: StateInConv;
+IF NOT (([,cDesc, state]¨FinchOn[convID]).on) THEN RETURN;
+SELECT state FROM $ringing, $notified => []¨Request[cDesc, $active]; ENDCASE;
+};
+
+PlaceCall: PUBLIC ENTRY PROC [
+convID: Thrush.ConversationID¨nullConvID,
+rName: ROPE, -- rName or description
+number: ROPE, -- telephone number, if present
+useNumber: BOOL¨FALSE
+] = {
+ENABLE UNWIND=>NULL; -- RestoreInvariant;
+PlaceCallInt[convID, rName, number, useNumber];
+};
+
+PlaceCallInt: INTERNAL PROC [
+convID: Thrush.ConversationID¨nullConvID,
+rName: ROPE, -- rName or description
+number: ROPE, -- telephone number, if present
+useNumber: BOOL¨FALSE,
+convAttributes: ThParty.Attributes ¨ NIL,
+partyAttributes: ThParty.Attributes ¨ NIL
+] = {
+calledPartyID: PartyID;
+nb: NB;
+reason: Thrush.Reason ¨ $notFound;
+comment: Rope.ROPE ¨ NIL;
+IF ~useNumber THEN {
+[nb, calledPartyID] ¨ThParty.GetParty[shh:info.shh, partyID:info.partyID, rName:rName];
+SELECT nb FROM
+$noSuchParty2, $noIdentSupplied => useNumber ¨ TRUE;
+$serverDown, $notEnabled, $noSuchParty => RETURN; -- Futile
+ENDCASE;
+};
+IF useNumber AND number.Length[]>0 THEN
+[nb, calledPartyID] ¨ ThParty.GetPartyFromNumber[
+shh: info.shh, partyID: info.partyID, phoneNumber: number, description: rName];
+SELECT nb FROM
+$success => reason ¨ NIL; -- reason: NIL, comment: NIL
+$noSuchParty2 => NULL; -- reason: $notFound, comment: NIL
+$narcissism => comment ¨ "Attempt to call self rejected on philosophical grounds";
+ENDCASE => { ReportConversationState[nb, NIL, NIL]; RETURN; };
+[--nb, cDesc--]¨Connect[calledPartyID, convID, reason, comment, convAttributes, partyAttributes];
+};
+
+lowPriority: ThParty.Attributes ¨ LIST[[$Priority, "300"]];
+
+Join: PUBLIC ENTRY PROC[convName: Rope.ROPE]
+RETURNS[nb: Thrush.NB¨$noSuchConv] = {
+ENABLE UNWIND => NULL;
+conversationInfo: ThParty.ConversationInfo;
+cDesc: FinchSmarts.ConvDesc;
+rName: Rope.ROPE;
+[nb, conversationInfo] ¨ ThParty.GetConversationFromName[
+shhh: info.shh, partyID: info.partyID, name: convName];
+IF nb=$success AND conversationInfo.numIdle >= conversationInfo.numParties THEN
+nb ¨ $noSuchConv;
+SELECT nb FROM
+$success => NULL;
+$noSuchConv => {
+rName ¨ NameDB.GetAttribute[
+rName: convName, attribute: $rname, key: $conversationname];
+IF rName=NIL THEN RETURN;
+nb ¨ $unknown;
+PlaceCallInt[rName: rName, number: NIL, partyAttributes: lowPriority];
+nb ¨ $success;
+RETURN;
+};
+ENDCASE => RETURN;
+cDesc ¨ GetConv[convID: conversationInfo.convID, createOK: TRUE];
+nb ¨ Request[cDesc, $active, $join, "Join conversation in progress", NIL, lowPriority];
+IF nb=$stateMismatch THEN -- Try at most twice
+nb ¨ Request[cDesc, $active, $join, "Join conversation in progress", NIL, lowPriority];
+};
+
+Feep: PUBLIC ENTRY PROC[convID: ConversationID, feepString: ROPE] = {
+ENABLE UNWIND => NULL;
+cDesc: ConvDesc;
+nb: Thrush.NB¨$success; {
+state: StateInConv;
+IF NOT(([,cDesc, state]¨FinchOn[convID]).on) OR state#$active THEN nb ¨ $convNotActive;
+IF nb=$success AND cDesc.feepInterface=NIL THEN {
+[nb, cDesc.feepInterfaceSpec] ¨ ObtainServiceInterface[NIL, "LarkFeep", cDesc];
+IF nb=$success AND cDesc.feepShhh = NIL THEN
+[cDesc.feepInterface, cDesc.feepShhh] ¨ LarkFeepSunImport.ImportInterface[
+instance: cDesc.feepInterfaceSpec.interfaceName.instance];
+};
+IF nb=$success THEN nb ¨ cDesc.feepInterface.clientStubFeep[
+interface: cDesc.feepInterface, shhh: cDesc.feepShhh,
+serviceID: cDesc.feepInterfaceSpec.serviceID,
+convID: cDesc.situation.self.convID, requestingParty: cDesc.situation.self.partyID,
+number: feepString, noisy: UserProfile.Boolean["Finch.NoisyFeep", TRUE], on: 100, off: 80
+];
+};
+IF nb # $success THEN VoiceUtils.Report["Sorry, was not able to `feep'.", $Finch]; 
+};
+
+ObtainNumbersForRName: PUBLIC PROC[rName: ROPE]
+RETURNS [fullRName: ROPE, number: ROPE, homeNumber: ROPE] = {
+[fullRName, number, homeNumber] ¨
+ThParty.GetNumbersForRName[shh: info.shh, rName: rName];
+};
+
+CurrentRName: PUBLIC PROC RETURNS [rName: ROPE] = {
+RETURN[IF info#NIL THEN info.myRName ELSE NIL];
+};
+CurrentConversations: PUBLIC PROC RETURNS [conversations: LIST OF ConvDesc] = {
+RETURN[IF info#NIL THEN info.conversations ELSE NIL];
+};
+IdentifyVisitor: PUBLIC ENTRY PROC [visitor, password: Rope.ROPE, complain: BOOL ¨ TRUE] RETURNS [nb: NB] ~ {
+ENABLE UNWIND => NULL;
+guestPartyID: PartyID;
+guestPassKey: RPC.EncryptionKey ¨ VoiceUtils.CurrentPasskey[password];
+guest: Rope.ROPE ¨ VoiceUtils.Registrize[visitor];
+IF Rope.Equal[info.myRName, guest, FALSE] THEN {
+ReleaseVisitorSelf[]; RETURN
+};
+[nb, guestPartyID] ¨ThParty.GetParty[shh:info.shh, partyID:info.partyID, rName:guest];
+IF nb=$success THEN
+nb ¨ ThParty.Visit[shh: info.shh, hostPartyID: info.partyID, guestPartyID: guestPartyID, guestPassword: guestPassKey];
+SELECT nb FROM
+$success => VoiceUtils.ReportFR["%s visiting %s -- %s calls will ring in both offices", $Finch, NIL, IO.rope[guest], IO.rope[info.myRName], IO.rope[guest]];
+$passwordNotValid => IF complain THEN VoiceUtils.ReportFR[
+"Invalid password for %s", $Finch, NIL, IO.rope[guest]];
+$visitingIllegal => Problem[
+"Visitor and/or visitee not suitable for visiting (possibly missing Lark?)"];
+$noSuchParty2 => VoiceUtils.ReportFR[
+"Couldn't identify visitor %s", $Finch, NIL, IO.rope[guest]];
+$noSuchParty => VoiceUtils.ReportFR["Couldn't identify visitee %s", $Finch, NIL, IO.rope[info.myRName]];  -- should never happen
+ENDCASE => Problem["Server communication problem", nb];
+};
+
+ReleaseVisitor: PUBLIC ENTRY PROC [visitor, password: Rope.ROPE] ~ {
+ENABLE UNWIND => NULL;
+nb: NB;
+guestPartyID: PartyID;
+guestPassword: RPC.EncryptionKey ¨ VoiceUtils.CurrentPasskey[password];
+IF visitor.Length[]=0 THEN { -- assume cancelling visiting at home via "Unvisit"
+ReleaseVisitorSelf[];  RETURN
+};
+visitor ¨ VoiceUtils.Registrize[visitor];
+IF Rope.Equal[info.myRName, visitor, FALSE] THEN {
+ReleaseVisitorSelf[]; RETURN
+};
+[nb, guestPartyID] ¨ThParty.GetParty[shh:info.shh, partyID:info.partyID, rName: visitor];
+IF nb=$noSuchParty2 THEN VoiceUtils.ReportFR[
+"Couldn't identify visitor %s", $Finch, NIL, IO.rope[visitor]];
+IF nb = $success THEN {
+hostPartyID: PartyID;
+[visitee: hostPartyID] ¨ ThParty.DescribeParty[partyID: guestPartyID, nameReq: $none];
+nb ¨ IF hostPartyID=info.partyID
+THEN ThParty.Unvisit[shh: info.shh, hostPartyID: hostPartyID,
+guestPartyID: guestPartyID, guestPassword: guestPassword]
+ELSE $noSuchVisiting;
+};
+SELECT nb FROM
+$success => VoiceUtils.ReportFR["Visiting cancelled for %s", $Finch, NIL, IO.rope[visitor]];
+$noSuchVisiting => VoiceUtils.ReportFR[
+"%s was not visiting here", $Finch, NIL, IO.rope[visitor]];
+$noSuchParty => VoiceUtils.ReportFR[
+"Couldn't identify visitor %s", $Finch, NIL, IO.rope[visitor]];
+$noSuchParty2 => VoiceUtils.ReportFR["Couldn't identify visitee %s", $Finch, NIL, IO.rope[info.myRName]];  -- should never happen
+ENDCASE => Problem["Server communication problem", nb];
+};
+
+ReleaseVisitorSelf: INTERNAL PROC ~ {
+nb: NB ¨ $noSuchVisiting;
+IF info.partyID # nullID THEN 
+nb ¨ ThParty.UnvisitSelf[shh: info.shh, guestPartyID: info.partyID];
+SELECT nb FROM
+$success => VoiceUtils.ReportFR[
+"Visiting cancelled for %s -- welcome home", $Finch, NIL, IO.rope[info.myRName]];
+$noSuchVisiting => VoiceUtils.ReportFR[
+"%s was not visiting anywhere", $Finch, NIL, IO.rope[info.myRName]];
+$noSuchParty => VoiceUtils.ReportFR["Couldn't identify visitor %s", $Finch, NIL, IO.rope[info.myRName]];  -- should never happen
+ENDCASE => Problem["Server communication problem", nb];
+};
+
+ServiceConnect: PUBLIC ENTRY PROC[
+serviceName: ROPE, 
+convID: ConversationID¨nullConvID,
+createOK: BOOL¨TRUE, addOK: BOOL¨FALSE ] RETURNS [
+nb: NB¨$success,
+cDesc: ConvDesc¨NIL ] = { ENABLE UNWIND=>NULL;
+state: StateInConv ¨ $idle;
+calledPartyID: PartyID;
+cCode: ConvCode;
+backgroundAttributes: ThParty.Attributes ¨ IF backgrounding THEN lowPriority ELSE NIL;
+IF NOT (([,cDesc, state]¨FinchOn[convID]).on) THEN RETURN[nb: $finchNotRunning];
+IF cDesc#NIL AND cDesc.situation.self.state>Thrush.notReallyInConv THEN RETURN;
+[cCode, cDesc] ¨ GetActiveConversation[serviceName,addOK];
+SELECT cCode FROM
+$ok => { nb ¨ WaitForActive[cDesc, FALSE]; RETURN; };
+$hld => {
+nb ¨ Request[cDesc, $active]; 
+IF nb=$success THEN nb ¨ WaitForActive[cDesc, FALSE];
+RETURN;
+};
+$bzy => RETURN[$convStillActive, NIL];
+$idl, $res, $addOK => IF ~createOK THEN RETURN[$noSuchConv, NIL];
+ENDCASE => ERROR;
+IF cDesc#NIL THEN { state¨ cDesc.situation.self.state; convID¨ cDesc.situation.self.convID; };
+IF serviceName = NIL THEN calledPartyID ¨ nullID
+ELSE [nb, calledPartyID] ¨ ThParty.GetParty[
+shh: info.shh, partyID: info.partyID, rName: serviceName, type: $service];
+IF nb=$success THEN [nb, cDesc] ¨ Connect[calledPartyID: calledPartyID, convID: convID,
+partyAttributes: backgroundAttributes, addOK: addOK];
+IF nb=$success AND serviceName#NIL THEN nb ¨ WaitForActive[cDesc, TRUE];
+};
+ConvCode: TYPE = { ok, addOK, res, hld, bzy, idl };
+
+GetActiveConversation: INTERNAL PROC[serviceName: ROPE¨NIL, addOK: BOOL¨FALSE]
+RETURNS[convCode: ConvCode ¨ $idl, cDesc: ConvDesc¨NIL] = {
+IF serviceName=NIL THEN RETURN; -- Can't validate
+FOR convs: LIST OF ConvDesc ¨ info.conversations, convs.rest WHILE convs#NIL DO
+possibleCDesc: ConvDesc ¨ NARROW[convs.first];
+pInfo: ThParty.PartyInfo ¨ possibleCDesc.partyInfo;
+possibleState: StateInConv ¨ possibleCDesc.situation.self.state;
+SELECT possibleState FROM
+$reserved => {convCode ¨ $res; cDesc ¨ possibleCDesc; LOOP;};
+$inactive => {
+IF convCode=$idl THEN { convCode ¨ $hld; cDesc ¨ possibleCDesc; }; LOOP;};
+$initiating, $ringback, $active => NULL;
+ENDCASE => LOOP;
+IF pInfo#NIL THEN FOR ix: NAT IN [1..pInfo.conversationInfo.numParties] DO
+IF ix#pInfo.ixSelf AND pInfo[ix].type=$service AND
+Rope.IsPrefix[serviceName, pInfo[ix].name, FALSE] THEN RETURN[$ok, possibleCDesc];
+ENDLOOP; -- There's still presumably at most one active conversation
+RETURN[
+IF addOK AND possibleCDesc.situation.self.state=$active THEN $addOK ELSE $bzy,
+possibleCDesc];
+ENDLOOP;
+};
+
+ObtainServiceInterface: PUBLIC PROC[
+serviceName: ROPE,
+interfaceName: ROPE,
+cDesc: ConvDesc¨NIL
+] RETURNS [
+nb: NB¨$success,
+interfaceSpec: Thrush.InterfaceSpec
+] = {
+partyID: Thrush.PartyID¨Thrush.nullID;
+credentials: Thrush.Credentials;
+IF cDesc#NIL THEN {
+pInfo: ThParty.PartyInfo ¨ cDesc.partyInfo;
+credentials ¨ cDesc.situation.self;
+IF pInfo#NIL THEN FOR ix: NAT IN [1..pInfo.conversationInfo.numParties] DO
+IF ix # pInfo.ixSelf AND (
+serviceName=NIL OR (
+pInfo[ix].type = $service AND pInfo[ix].state >= $active AND
+Rope.IsPrefix[serviceName, pInfo[ix].name, FALSE] )  ) THEN {
+partyID ¨ pInfo[ix].partyID;
+EXIT;
+};
+ENDLOOP;
+}
+ELSE IF serviceName = NIL THEN partyID ¨ info.partyID -- get from self!
+ELSE {  -- want interface only
+credentials ¨ [info.partyID, info.smartsID];
+[nb, partyID] ¨ThParty.GetParty[
+shh: info.shh, partyID: info.partyID, rName: serviceName, type: $service];
+IF nb#$success THEN RETURN;
+};
+IF partyID = Thrush.nullID THEN
+RETURN[nb: $noSuchParty2, interfaceSpec: nullInterfaceSpec];
+[nb, interfaceSpec] ¨
+ThParty.LookupServiceInterface[info.shh, credentials, partyID, interfaceName]; 
+};
+
+anyone: LIST OF ROPE ¨ LIST["*"];
+announcement: ThParty.Attributes ¨ LIST[[$subject, "Announcement"]];
+mediumPriority: ThParty.Attributes ¨ LIST[[$Priority, "400"]];
+Announce: ENTRY PROC [rNames: LIST OF ROPE] ~ {
+ENABLE UNWIND=>NULL; -- RestoreInvariant;
+[] ¨ AnnounceInt[rNames];
+};
+
+AnnounceInt: INTERNAL PROC [rNames: LIST OF ROPE] RETURNS [nb: NB¨$success, cDesc: ConvDesc¨NIL] ~ {
+count: INT ¨ 0;
+state: StateInConv;
+convID: ConversationID¨nullConvID;
+convEvent: Thrush.ConvEvent;
+IF ~(([,cDesc, state]¨FinchOn[convID]).on) THEN { nb ¨ $notEnabled; RETURN; };
+IF cDesc = NIL THEN [cDesc, state] ¨ GetCurrentConv[];
+SELECT state FROM
+$idle => {
+[nb, convEvent] ¨ ThParty.CreateConversation[
+shhh: info.shh,
+credentials: [partyID: info.partyID, smartsID: info.smartsID]
+];
+IF nb = $success THEN {
+pInfo: ThParty.PartyInfo;
+cDesc ¨ NoteNewState[convEvent];
+pInfo ¨ cDesc.partyInfo;
+IF pInfo=NIL OR ~pInfo[pInfo.ixSelf].voicePath THEN {
+[] ¨ Request[cDesc, $failed, $noVoicePath, "Your Etherphone is not running"];
+RETURN[$noVoicePath, cDesc];
+};
+};
+};
+$reserved, $parsing => nb ¨ Request[cDesc, $initiating];
+ENDCASE => {
+ReportConversationState[$convStillActive, NIL, "Conversation already in progress"];
+RETURN;
+};
+IF nb # $success THEN RETURN;
+cDesc.originatorRecorded ¨ TRUE;
+nb ¨ ThParty.RegisterConversation[shhh: info.shh, credentials: cDesc.situation.self, 
+name: "Announcement", convAttributes: announcement, accessList: anyone];
+VoiceUtils.Report["Notifying listeners...", $Finch];
+FOR names: LIST OF ROPE ¨ rNames, names.rest WHILE names#NIL DO
+calledPartyID: PartyID;
+partyType: Thrush.PartyType;
+IF Rope.Equal[names.first, info.myRName, FALSE] THEN LOOP;  -- Don't call self
+[nb, calledPartyID] ¨ThParty.GetParty[shh:info.shh, partyID:info.partyID, rName:names.first];
+SELECT nb FROM
+$serverDown, $notEnabled => RETURN; -- Futile
+$noSuchParty2, $noIdentSupplied, $noSuchParty => LOOP;
+ENDCASE;
+[nb: nb, type: partyType] ¨ ThParty.DescribeParty[calledPartyID, $current];
+IF partyType=$trunk THEN LOOP;
+nb¨ThParty.Alert[shhh: info.shh,
+credentials: cDesc.situation.self, calledPartyID: calledPartyID, partyAttributes: mediumPriority];
+SELECT nb FROM
+$success => count ¨ count + 1;
+$stateMismatch => {
+nb¨Request[cDesc, $failed, $error, "Conversation already in progress"];
+RETURN;
+};
+$narcissism => NULL;  -- Should never happen  ???see above???
+ENDCASE => {Problem["Server communication problem", nb];  RETURN;}
+ENDLOOP;
+nb ¨ WaitForActive[cDesc, FALSE];
+IF nb=$success AND count > 0 THEN
+VoiceUtils.ReportFR["%g parties contacted -- Please begin speaking", $Finch, NIL, IO.int[count]]
+ELSE
+VoiceUtils.Report["No listeners found", $Finch, NIL];
+};
+
+
+GetConv: INTERNAL PROC[convID: ConversationID, createOK: BOOL¨FALSE]
+RETURNS [ cDesc: ConvDesc¨NIL ] = --INLINE-- {
+cL: LIST OF ConvDesc;
+IF convID#nullConvID THEN
+FOR convs: LIST OF ConvDesc ¨ info.conversations, convs.rest WHILE convs#NIL DO
+cDesc ¨ convs.first;
+IF cDesc.situation.self.convID = convID THEN RETURN;
+ENDLOOP;
+cDesc ¨ NIL;
+IF ~createOK THEN RETURN;
+cDesc ¨ NEW[FinchSmarts.ConvDescBody¨[
+situation: [ self: [ convID: convID, smartsID: info.smartsID, partyID: info.partyID ]]]];
+cL ¨ LIST[cDesc];
+info.conversations ¨ NConcConvs[info.conversations, cL];
+};
+
+FinchOn: INTERNAL PROC[convID: ConversationID¨nullConvID] RETURNS [
+on: BOOL¨FALSE, cDesc: ConvDesc¨NIL, state: StateInConv¨$idle] = {
+IF info=NIL OR ~info.enabled THEN {
+VoiceUtils.Report["Your Finch is not running", $Finch]; RETURN; };
+on¨TRUE;
+IF convID=nullConvID THEN RETURN;
+cDesc ¨ GetConv[convID, FALSE];
+IF cDesc#NIL THEN state¨cDesc.situation.self.state;
+};
+
+NoteNewState: INTERNAL PROC[convEvent: Thrush.ConvEvent] RETURNS[cDesc: ConvDesc]= {
+cInfo: ThParty.ConversationInfo;
+pInfo: ThParty.PartyInfo;
+nb: NB;
+timeAdjustment: INT;
+prevState, currState: StateInConv;
+cDesc ¨ GetConv[convEvent.self.convID, TRUE];
+prevState ¨ cDesc.situation.self.state;
+cDesc.situation ¨ convEvent≠;
+[nb, cInfo] ¨ ThParty.GetConversationInfo[shh: info.shh, convID: convEvent.self.convID];
+currState ¨ cDesc.situation.self.state;
+SELECT TRUE FROM
+nb # $success => NULL; -- Problem["Can't obtain conversation information"];
+currState#prevState, cDesc.numParties#cInfo.numParties,
+cDesc.numActive#cInfo.numActive, cDesc.numIdle#cInfo.numIdle => {
+cDesc.subject ¨ FetchAttribute[cInfo.convAttributes, $subject].value;
+timeAdjustment ¨ BasicTime.Period[from: convEvent.time, to: BasicTime.Now[]];
+cDesc.startTime ¨ BasicTime.Update[cInfo.startTime, timeAdjustment];
+cDesc.numParties ¨ cInfo.numParties;
+cDesc.numActive ¨ cInfo.numActive;
+cDesc.numIdle ¨ cInfo.numIdle;
+[nb, pInfo] ¨
+ThParty.GetPartyInfo[shh: info.shh, credentials: cDesc.situation.self,
+nameReq: $description, allParties: TRUE];
+IF nb#$success THEN NULL -- Problem["Can't obtain conversation information", nb]
+ELSE {
+ixOriginator: NAT ¨ pInfo.ixOriginator;
+cDesc.partyInfo ¨ pInfo;
+IF ixOriginator#ThParty.nullIx AND ixOriginator # pInfo.ixSelf AND
+pInfo[ixOriginator].type=$trunk THEN
+pInfo[ixOriginator].intendedName ¨ "outside line";
+};
+};
+ENDCASE;
+SELECT currState FROM
+$idle, $neverWas => info.conversations ¨ DequeueConv[info.conversations, cDesc];
+$initiating => TRUSTED { Process.Detach[FORK LimitSignalling[cDesc, $initiating]]; };
+$notified => SELECT filtering FROM -- Needs tests for calls already in progress. 
+1 => []¨Request[cDesc, $idle, $notImportantEnough, "This is a test"];
+2 => []¨Request[cDesc, $ringing];
+3 => []¨Request[cDesc, $active, $whatever, "Hot line!"];
+ENDCASE => TRUSTED { Process.Detach[FORK LimitSignalling[cDesc, $notified]]; };
+ENDCASE; 
+IF currState#inactive AND cDesc.ultimateState<currState THEN cDesc.ultimateState ¨ currState;
+ReportConversationState[$success, cDesc, NIL];
+BROADCAST info.stateChange;
+};
+
+maxJoinTries: INT ¨ 3;
+
+Request: INTERNAL PROC[
+cDesc: ConvDesc,
+state: StateInConv,
+reason: Thrush.Reason¨NIL,
+comment: ROPE¨NIL,
+convAttributes: ThParty.Attributes¨NIL,
+partyAttributes: ThParty.Attributes¨NIL
+]
+RETURNS [nb: NB] = {
+DO
+convEvent: Thrush.ConvEvent;
+pInfo: ThParty.PartyInfo ¨ cDesc.partyInfo;
+reportToAll: BOOL = SELECT state FROM
+$idle, $failed, $active, $inactive, $ringing => TRUE, ENDCASE=>FALSE;
+IF state=$failed AND (pInfo = NIL OR ~pInfo[pInfo.ixSelf].voicePath) THEN state ¨ $idle;
+[nb, convEvent] ¨
+ThParty.Advance[shhh: info.shh, credentials: cDesc.situation.self, state: state,
+reportToAll: reportToAll, reason: reason, comment: comment, convAttributes: convAttributes, partyAttributes: partyAttributes];
+SELECT nb FROM
+$success => []¨NoteNewState[convEvent];
+$stateMismatch => {
+cDesc¨NoteNewState[convEvent];
+IF cDesc.situation.self.state = state THEN nb ¨ $success
+ELSE IF state=$idle AND cDesc.situation.self.state # $idle THEN LOOP;
+};
+ENDCASE => 
+ReportConversationState[nb, cDesc, "Telephone server action failed"];
+EXIT;
+ENDLOOP;
+};
+
+Connect: INTERNAL PROC [calledPartyID: PartyID, convID: ConversationID¨nullConvID, reason: Thrush.Reason ¨ NIL, comment: ROPE¨NIL, convAttributes: ThParty.Attributes ¨ NIL, partyAttributes: ThParty.Attributes ¨ NIL, addOK: BOOL¨FALSE]
+RETURNS [ nb: NB¨$success, cDesc: ConvDesc¨NIL ] = {
+state: StateInConv;
+newState: StateInConv = SELECT TRUE FROM
+reason#NIL => $failed,
+calledPartyID = nullID => $parsing, -- temp until can debug inactive stuff.
+ENDCASE => $initiating;
+convEvent: Thrush.ConvEvent;
+IF ~(([,cDesc, state]¨FinchOn[convID]).on) THEN { nb ¨ $notEnabled; RETURN; };
+SELECT state FROM
+$idle => {
+[nb, convEvent] ¨ ThParty.CreateConversation[
+shhh: info.shh,
+credentials: [partyID: info.partyID, smartsID: info.smartsID],
+state: newState,
+reason: reason,
+comment: comment,
+convAttributes: convAttributes,
+partyAttributes: partyAttributes
+];
+IF nb = $success THEN {
+pInfo: ThParty.PartyInfo;
+cDesc ¨ NoteNewState[convEvent];
+pInfo ¨ cDesc.partyInfo;
+IF pInfo=NIL OR ~pInfo[pInfo.ixSelf].voicePath THEN {
+[] ¨ Request[cDesc, $failed, $noVoicePath, "Your Etherphone is not running"];
+RETURN[$noVoicePath, cDesc];
+};
+};
+};
+$reserved, $parsing => nb ¨ Request[cDesc, newState, reason, comment, convAttributes, partyAttributes];
+$active => IF ~addOK THEN {
+ReportConversationState[$convStillActive, NIL, "Conversation already in progress"];
+RETURN;
+};
+ENDCASE => {
+ReportConversationState[$convStillActive, NIL, "Conversation already in progress"];
+RETURN;
+};
+IF nb # $success OR newState=$failed THEN RETURN;
+cDesc.originatorRecorded ¨ TRUE;
+IF newState # $initiating THEN RETURN;
+nb¨ThParty.Alert[shhh: info.shh,
+credentials: cDesc.situation.self, calledPartyID: calledPartyID];
+SELECT nb FROM
+$success => NULL;
+$stateMismatch => {
+nb¨Request[cDesc, $failed, $error, "Conversation already in progress"];
+RETURN;
+};
+$narcissism => {
+nb¨Request[cDesc, $failed, $notFound, "Attempt to call self rejected on philosophical grounds"];
+RETURN;
+};
+ENDCASE => Problem["Server communication problem", nb];
+};
+
+WaitForActive: INTERNAL PROC[cDesc: ConvDesc, demandNewParty: BOOL¨FALSE]
+RETURNS [nb: NB¨$success] = {
+numParties: NAT ¨ cDesc.numParties;
+FOR i: NAT IN [0..pd.waitsForConnect) DO
+SELECT cDesc.situation.self.state FROM
+$active => IF ~demandNewParty OR cDesc.numParties > numParties THEN RETURN;
+$failed => EXIT;
+ENDCASE;
+TRUSTED{Process.SetTimeout[@info.stateChange,Process.SecondsToTicks[pd.jayTimeout]];};
+WAIT info.stateChange;
+SELECT cDesc.situation.self.state FROM
+$idle, $neverWas => EXIT; -- something wrong.
+ENDCASE;
+ENDLOOP;
+nb¨Request[cDesc, $failed, $error, "Finch failed to connect to voice service."];
+IF nb=$success THEN nb¨$timedOut;
+};
+
+Problem: PUBLIC PROC[remark: ROPE¨NIL, nb: NB¨NIL] = {
+IF nb=NIL THEN VoiceUtils.Problem[remark, $Finch]
+ELSE VoiceUtils.ProblemFR["%g, reason: %g", $Finch, NIL, rope[remark], atom[nb]];
+};
+
+FetchAttribute: PUBLIC PROC[
+attributes: ThParty.Attributes, attribute: ATOM, default: ROPE¨NIL]
+RETURNS [value: ROPE, valueLoc: ThParty.Attributes¨NIL] = {
+value ¨ default;
+FOR aL: ThParty.Attributes ¨ attributes, aL.rest WHILE aL#NIL DO
+IF aL.first.type = attribute THEN RETURN[aL.first.value, aL]; ENDLOOP;
+};
+
+GetCurrentConv: INTERNAL PROC RETURNS [ cDesc: ConvDesc¨NIL, state: Thrush.StateInConv ] = --INLINE-- {
+FOR convs: LIST OF ConvDesc ¨ info.conversations, convs.rest WHILE convs#NIL DO
+ok: BOOL ¨ TRUE;
+cDesc ¨ convs.first;
+state ¨ cDesc.situation.self.state;
+SELECT state FROM
+$reserved, $parsing => { 
+pInfo: ThParty.PartyInfo ¨ cDesc.partyInfo;
+FOR ix: NAT IN [1..pInfo.conversationInfo.numParties] DO
+IF ix#pInfo.ixSelf AND pInfo[ix].type=$service THEN {
+ok ¨ FALSE;
+EXIT;
+};
+ENDLOOP;
+IF ok THEN RETURN;
+};
+ENDCASE;
+ENDLOOP;
+cDesc ¨ NIL;
+state ¨ $idle;
+};
+
+
+ReportConversationState: PUBLIC PROC [nb: NB, cDesc: ConvDesc, remark: Rope.ROPE] ~ {
+IF info=NIL THEN RETURN;
+pd.requests.QueueClientAction[ReallyReportConversationState,
+NEW[CSBody ¨ [nb, cDesc, remark]]];
+};
+
+CS: TYPE = REF CSBody;
+CSBody: TYPE = RECORD[nb: NB, cDesc: ConvDesc, remark: Rope.ROPE];
+
+ReallyReportConversationState: PROC[r: REF] = {
+cS: CS ¨ NARROW[r];
+reportProcsTable: RedBlackTree.Table ¨ NARROW[Atom.GetProp[$ReportProcs, $rpTable]];
+EachRCS: RedBlackTree.EachNode = {
+procs: FinchSmarts.ReportProcs ¨ NARROW[data];
+IF procs.reportConversationState#NIL THEN
+procs.reportConversationState[cS.nb, cS.cDesc, cS.remark];
+};
+IF reportProcsTable#NIL THEN
+EnumerateIncreasing[reportProcsTable, EachRCS];
+};
+
+
+ReportRequestState: PROC [cDesc: ConvDesc, actionReport: Thrush.ActionReport] ~ {
+pd.requests.QueueClientAction[ReallyReportRequestState,
+NEW[RSBody ¨ [cDesc, actionReport]]];
+};
+
+RS: TYPE = REF RSBody;
+RSBody: TYPE = RECORD[cDesc: ConvDesc, actionReport: Thrush.ActionReport];
+
+ReallyReportRequestState: PROC[r: REF] = {
+rS: RS ¨ NARROW[r];
+reportProcsTable: RedBlackTree.Table ¨ NARROW[Atom.GetProp[$ReportProcs, $rpTable]];
+actionRequest: REF¨NIL;
+EachRRS: RedBlackTree.EachNode = {
+procs: FinchSmarts.ReportProcs ¨ NARROW[data];
+IF procs.reportRequestState#NIL THEN
+actionRequest ¨ procs.reportRequestState[rS.cDesc, rS.actionReport, actionRequest];
+};
+IF reportProcsTable#NIL THEN
+EnumerateIncreasing[reportProcsTable, EachRRS];
+};
+
+EnumerateIncreasing: PUBLIC PROC [self: RedBlackTree.Table, procToApply: RedBlackTree.EachNode] = {
+PList: TYPE = RECORD[s: SEQUENCE m: NAT OF FinchSmarts.ReportProcs];
+pList: REF PList ¨ NEW[PList[20]];
+index: NAT ¨ 0;
+GetEm: RedBlackTree.EachNode = {
+pList[index] ¨ NARROW[data];
+index ¨ index+1;
+IF index=20 THEN ERROR;
+};
+RedBlackTree.EnumerateIncreasing[self, GetEm];
+FOR doIndex: NAT IN [0..index) DO
+IF procToApply[pList[doIndex]] THEN EXIT;
+ENDLOOP;
+};
+
+
+SetFiltering: PROC[which: INT, deferAnswer: ROPE¨ "true"]
+RETURNS [didIt: ATOM¨NIL, message: Rope.ROPE¨NIL] ¨ {
+ENABLE NameDB.Error => {didIt ¨ $Failure; message¨"Database access failure"; CONTINUE; };
+filtering ¨ which;
+NameDB.SetAttribute[VoiceUtils.CurrentRName[], $deferanswer, deferAnswer];
+};
+filtering: INT¨0;
+backgrounding: BOOL¨FALSE;
+
+FilterResetCmd: Commander.CommandProc = TRUSTED {
+[result, msg] ¨ SetFiltering[0, "false"];
+};
+
+FilterZeroCmd: Commander.CommandProc = TRUSTED {
+[result, msg] ¨ SetFiltering[0];
+};
+
+BackgroundCmd: Commander.CommandProc = TRUSTED {
+[result, msg] ¨ SetFiltering[0];
+backgrounding ¨ TRUE;
+};
+
+NoBackgroundCmd: Commander.CommandProc = TRUSTED {
+[result, msg] ¨ SetFiltering[0, "false"];
+backgrounding ¨ FALSE;
+};
+
+FilterOneCmd: Commander.CommandProc = TRUSTED {
+[result, msg] ¨ SetFiltering[1];
+};
+
+FilterTwoCmd: Commander.CommandProc = TRUSTED {
+[result, msg] ¨ SetFiltering[2];
+};
+
+FilterThreeCmd: Commander.CommandProc = TRUSTED {
+[result, msg] ¨ SetFiltering[3];
+};
+
+InitFiltering: PROC =  {
+filterMsg: ROPE;
+[message: filterMsg] ¨ SetFiltering[0];
+IF filterMsg#NIL THEN VoiceUtils.Report[filterMsg, $Finch];
+};
+
+EDLNames: LIST OF ROPE ¨ LIST["Arnon.pa", "Beach.pa", "Beretta.pa", "Bier.pa", "Crow.pa", "Diebert.pa", "Glassner.pa", "Pier.pa", "Plass.pa", "PolleZ.pa", "Shoemake.pa", "Stone.pa", "Subhana.pa", "Wyatt.pa"];
+
+AnnounceCmd: Commander.CommandProc = TRUSTED {
+list: LIST OF ROPE;
+length: INT;
+[list, length] ¨ CommanderOps.ParseToList[cmd: cmd];
+IF list=NIL THEN list ¨ EDLNames;
+Announce[list];
+};
+
+pd.requests ¨ MBQueue.Create[];
+Commander.Register["FReset", FilterResetCmd, "Don't filter calls.  This is a test."];
+Commander.Register["F0", FilterZeroCmd, "Notifies will time out.  This is a test."];
+Commander.Register["F1", FilterOneCmd, "Reject all calls.  This is a test."];
+Commander.Register["F2", FilterTwoCmd, "Accept (ringing) all calls.  This is a test."];
+Commander.Register["F3", FilterThreeCmd, "Answer all calls (hot line).  This is a test."];
+Commander.Register["Background", BackgroundCmd,
+"FinchTool will supercede background calls."];
+Commander.Register["NoBackground", NoBackgroundCmd,
+"FinchTool will not supercede background calls."];
+Commander.Register["Announce", AnnounceCmd,
+"Create a com-line like call to a set of Etherphone users."];
+}.
+
+Commander.Register["VuFinch", ViewCmd, "Program Management variables Finch"];
+
+ViewCmd: Commander.CommandProc = TRUSTED {
+};
+
+  .ñ  
+FinchSmartsImpl.mesa
+Copyright ” 1984, 1986, 1987, 1988, 1990, 1992 by Xerox Corporation.  All rights reserved.
+Last Edited by: Swinehart, June 4, 1992 9:30 pm PDT
+Doug Terry, September 5, 1986 4:17:06 pm PDT
+Polle Zellweger (PTZ) August 14, 1990 4:01:15 pm PDT
+Nice,
+Declarations
+Supervision
+
+Some party has changed state in a conversation we know about (or should).
+Two cases:
+Our party has changed state in a conversation, whether or not we're going to deal with it (at present, LarkSmarts makes all such decisions)
+Another party changed state in a conversation we know about (at present, we don't need to know that; again, LarkSmarts does all the work.)  That case is filtered out in Progress, above.
+It is our duty to obtain all relevant information about the call when the information becomes available, and to notify any Finch Clients.
+One party has replaced another (they were or are now in a poacher/poachee relationship) in this conversation, so we need to update our information about the conversation.  Same as Progress, except that we clear any indication that we know anything about the present state before noting the new state.
+If this notice indicates that our own party is the oldPartyID, we should find a way to inform our ReportConversationState clients that we are no longer involved in this conversation.  We should also pull the conv. from our active list.  This happens when the same user logs in and runs Finch somewhere else, or when our Finch bombs out in the middle of a conversation. 
+Polling loop will awaken immediately and if necessary (and not inhibited) try to reconnect.
+We have entered an unstable state, which should not be allowed to persist too long before we hang up and free our resources.  "Too long" is determined by pd.timeoutInitiating.
+If we ever decide to deal with $initiating states on our own, we may have to accommodate thaat here, too.
+Client Functions
+
+Really need better generic way to avoid duplicating work and stranding connections, here!
+
+
+cancelling visiting at home via "Visit self"
+cancelling visiting at home via "Unvisit self"
+If ThParty.Unvisit really cared about passwords (which it does not currently), we would have to keep passwords of relevant visitors, probably in the FinchInfo record.
+Need to swap the nb codes in ThPartyInitImpl
+
+Find, in this order:
+$ok) a non-idle conversation that's already established to the specified service.
+$addOK) an active conversation that does not include the specified service (addOK only)
+$res) a conversation in state $reserved
+$hld) an established converation is on hold and waiting.
+$bzy) an established conversation that doesn't satisfy the above criteria
+$idl) no active conversations exist.
+Reserved takes precedence over held, but all others take precedence over both
+We've found a sufficiently advanced conv. to disavow any others.
+Less than live calls, but more than services.
+
+If there's an existing proto-conversation, use it...
+This isn't quite good enough, because person A might log in at person B's machine and try to announce to person B.
+not an Etherphone user; can't participate in a multicast call
+Some smarts don't do this.  They probably should.
+Do something interesting  see other smarts for more confusion
+Utilities
+New conversation
+Now gather up additional information that we might not know yet:
+Who started this?
+Who the other party(s) is (are)
+This will occur during shutdown when Substitute is reporting removal from conversations.  Better to avoid complaint and use the information at hand.
+State information guaranteed correct only as of last time one of these numbers changed.
+Probably Thrush.StateInConv should order conversation states st inactive < active.
+If we've been called due to a Substitution that's kicking us out (cf Subst.), we should find a way to inform our ReportConversationState clients that we are no longer involved in this conversation.  We should also do a Dequeue as above. 
+if we're in the state we wanted, ignore stateMismatch
+Real confused about Problem (typeout only) reporting vs. client reporting.  The responsibilities are unconvincingly distributed among Smarts and client.
+If there's a reason, the connect request's only purpose is to record an error condition, audibly as well as visually.  This requires the creation of a conversation, then its immediate termination.
+Some smarts don't do this.  They probably should.
+Do something interesting  see other smarts for more confusion
+For use in Recording, and so on, where client needs to wait for setup.  demandNewParty asserts that we have invited the recording service to join us, and we need to wait until that has happened. February 26, 1988 DCS 
+Finds an existing proto-conversation (i.e., state = $reserved or $parsing) that is NOT a service conversation.
+State reports, other than system state (look in FinchRegisterImpl for that)
+Reports of all kinds are serialized and decoupled from their issuers.  Perhaps this is not entirely necessary, but it's hard to prove otherwise.  The problems are: (a) There can otherwise be deadlocks when A.entry1 calls B.p, and B.p issues a report proc that turns out to be A.entry2.  (b) Reports can be issued from many places and processes, and it appears they should be seen in the order issued, wherever they come from.  Action reports may not qualify, except that they should not proceed out of synch of the other two kinds, which do.
+
+Debugging nonsense
+
+Initial state to permit announcements.
+
+InitFiltering[];  -- to permit announcements
+Disabled October 3, 1989 4:51:16 pm PDT DCS; for further study.
+
+Obsolete stuff
+BeNice: PROC[r: REF, d: INT] = {
+IF NOT pd.doNice THEN RETURN;
+Nice.BeNice[r, d, $Finch, NIL];
+};
+
+Nice.View[pd, "Finch PD"];
+Swinehart, May 22, 1985 1:08:51 pm PDT
+Changes to GetParty.
+changes to: JayConnection
+Polle Zellweger (PTZ) July 13, 1985 5:20:26 pm PDT
+adding Text-to-Speech server
+changes to: DIRECTORY, ProseSpec, ProseSpecs, stopIntervalSpec (was stopSpec), stopProseSpec, Progress, Supervise, DisconnectCall, PlaceCall, StopSpeech, TextToSpeech, InitFinchSmarts, GetConv, ReportProses, EnqueueProses, Complain, Connect, ProseConnection
+Swinehart, August 6, 1985 5:43:08 pm PDT
+Merge PTZ prose changes
+changes to: DIRECTORY, NB, PD, stopIntervalSpec, stopProseSpec, Report, Progress, Supervise, DisconnectCall, PlaceCall, StopTune, NoiseSpec, PlaybackTune, TextToSpeech, InitFinchSmarts, GetConv, ReportProses, CompareIntID, EnqueueProses, Complain, Connect, JayConnection, ProseConnection, RepRet, FinchSmarts
+Polle Zellweger (PTZ) August 19, 1985 4:16:40 pm PDT
+Meter text in TextToSpeech so as to avoid sending large ropes all at once.  Allows speech to begin sooner and flush faster. Also flushing changes.
+changes to: FinchInfo, PD, Supervise, TextToSpeech, StopSpeech, ReportProses (comments only)
+Polle Zellweger (PTZ) September 3, 1985 6:28:29 pm PDT
+Allow registration of defaultTranslateProc.
+changes to: Supervise, defaultTranslateProc, RegisterTranslateProc, TextToSpeech, FinchSmarts
+Swinehart, September 16, 1985 10:00:59 am PDT
+If Finch has never been initialized, info is NIL -- don't let that bother you.
+changes to: GetRname, PlayNoise, FinchOn
+Polle Zellweger (PTZ) October 22, 1985 5:10:44 pm PDT
+changes to: Progress (add prose debugging reports), TextToSpeech (report connection failure), ReportProses (fix debugging reports), JayConnection (report connection failure), ProseConnection (report connection failure)
+Polle Zellweger (PTZ) October 24, 1985 4:53:21 pm PDT
+Move bluejayConnection and proseConnection from FinchInfo to ConvDesc.
+changes to: Supervise, DisconnectCall, InitFinchSmarts, Connect, JayConnection, ProseConnection
+Swinehart, October 28, 1985 12:31:20 pm PST
+Merge Above changes with other other minor changes (RefQ and the like)
+changes to: DIRECTORY, FinchSmartsImpl, Progress, Supervise, DisconnectCall, TextToSpeech, InitFinchSmarts, UninitFinchSmarts, IsConv, GetConv, IsConv (local of GetConvDesc), GetConvDesc, ReportProses, FinchOn, Connect, JayConnection, ProseConnection, PlaybackTune, ClearConvs (local of UninitFinchSmarts)
+Swinehart, December 13, 1985 2:52:25 pm PST
+Massive change to new Thrush, leaving out proses and intervals for the moment.
+changes to: ConversationHandle, FinchInfo, Progress, Supervise, DisconnectCall, AnswerCall, PlaceCall, Apprise, Complain, Connect, Problem, FinchSmarts, Progress, QdProgress
+Swinehart, December 17, 1985 10:05:46 am PST
+Major revision for new Thrush.  Removed all Prose and Bluejay stuff temporarily
+changes to: QdProgress, NoteNewState, PutFTime, Connect, Problem, Progress, Other, Supervise
+Swinehart, May 19, 1986 12:22:17 pm PDT
+Cedar 6.1
+changes to: DIRECTORY, SHHH
+Swinehart, June 1, 1986 7:48:10 pm PDT
+Add ReportAction, eliminate the MBQueueing of ThParty-provoked actions.  Others remain, but should go.
+changes to: Progress, Substitution, ReportAction
+Doug Terry, August 28, 1986 4:59:33 pm PDT
+Changed report registration; removed key distribution; removed routines for recording/playing, tunes and related operations.
+changes to: FinchIsRunning, RegisterForReports, UnRegisterForReports, ReportAction, DisconnectCall, PlaceCall, PlaybackTune, NoteNewState, Request, Connect, InitFinchSmarts, UninitFinchSmarts, ReportSystemState, ReportConversationState, ReportRequestState, DIRECTORY, FinchSmartsImpl, GetConv
+Doug Terry, August 29, 1986 12:14:14 pm PDT
+New interface procedures for FinchSmarts clients to get at voice services: VoiceConnect and LookupServiceInterface.
+changes to: ReleaseVisitor, VoiceConnect, WaitForActive, LookupServiceInterface, Problem
+Swinehart, June 8, 1987 12:03:11 pm PDT
+Remove GList by copying code.
+Swinehart, July 14, 1987 4:19:54 pm PDT
+Numerous changes to error and connection management.  ThPartyClientImpl split out.
+Swinehart, July 19, 1987 5:16:39 pm PDT
+VoiceConnect => ServiceConnect, more rigid success requirements.
+changes to: ServiceConnect, GetActiveConversation, ClearInfo, ObtainServiceInterface
+Polle Zellweger (PTZ) July 27, 1987 5:56:47 pm PDT
+a bit less rigid success requirements (find $reserved party if offhook when play/record)
+changes to: GetActiveConversation
+Polle Zellweger (PTZ) July 27, 1987 11:17:01 pm PDT
+Allow for better party reports in FinchTool (>2 parties in conversation)
+changes to: NoteNewState, us, PartyID
+Swinehart, August 30, 1987 9:23:09 pm PDT
+Continuing development of connect/disconnect behavior., PollWaiter
+Polle Zellweger (PTZ) September 15, 1987 11:36:30 am PDT
+Improved error messages for visiting functions; fix bug in NoteNewState that wasn't updating cDesc.ultimateState properly (inhibited coalescing of outside calls in FinchToolImpl).
+changes to: IdentifyVisitor, ReleaseVisitor, ReleaseVisitorSelf, NoteNewState
+Polle Zellweger (PTZ) September 15, 1987 4:28:01 pm PDT
+changes to: IdentifyVisitor, ReleaseVisitor, ReleaseVisitorSelf
+Polle Zellweger (PTZ) March 26, 1989 6:48:08 pm PST
+Add crude announcement capability.
+added: EDLNames, anyone, announcement, mediumPriority, Announce, AnnounceInt, GetCurrentConv
+Polle Zellweger (PTZ) March 29, 1989 11:18:43 pm PST
+Creature comforts, but without changing interfaces.
+changes to: InitFiltering, AnnounceCmd, initialization
+Polle Zellweger (PTZ) May 21, 1990 2:23:07 pm PDT
+Add UNWINDs to some ENTRY procs that were missing them.
+changes to: PlaceCall, PlaceCallInt, Announce, UninitFinchSmarts
+Polle Zellweger (PTZ) June 26, 1990 2:27:48 pm PDT
+Use Sun RPC for ThSmarts communication.
+changes to: InitFinchSmarts
+Polle Zellweger (PTZ) August 9, 1990 1:13:08 pm PDT
+Be a bit more flexible about state mismatch
+changes to: Request
+Polle Zellweger (PTZ) August 10, 1990 7:07:40 pm PDT
+Set up for LarkFeep via Sun RPC
+changes to: DIRECTORY, FinchSmartsImpl, Feep, Request, InitFinchSmarts
+
+Swinehart, September 8, 1990 6:53:41 pm PDT
+Redistribute some functions between FinchSmartsImpl and the new FinchRegisterImpl; adapt to new error management code.
+
+ù &S  ïNewlineDelimiter
+ñ(cedarcode) styleô öúôJöú
+œeúOôZJô3Icodeô,Köú4ô4óKò öœk	ò	KöúûúòKöú
+ûúò(Köú
+ûúò*Köúûúò#KöúòKöûúòKöúûúò,Köúûúò,Köúûú'ò3JôKöúûú(ò5Köúûú*ò<KöúûúûúòKöúòKöûúûúòKöúûú°òÆöúûúòKöúEûúIûúûúò¥óKò	KöúûúòKöúûúSòcKòKò óö—blnúûúûúûúò5Köûú8ûú&œcú=òØKöûúò!KöûúûúòKò óôKò Köú
+ûúò&öúûúò-Kò/óKöúûúò(Köûúûú
+ûúòKöúûúòKò!Köú	ûúòKöûúûú
+ûúòKöûúûú
+ûúòKöú
+ûúò!Köúûúò'Köú>ò>Kò öúûúòKò óKöûúûúûúòö	úû
+úûúûúûúòKò óKöúûúûúòKò öœnúûúûúòKöûúûúûúûúò Kò KòKò óö°
+úûú	ûúûúûúûúûúòIKöûúûúûúûúòöûúûúûúûúûúûò?Köûúûúûúûúò6KöûúòóKöûúòKöúòKò óö°úûúûúûúûúûúûúòSKö	ûúûúûúûú†
+ò%Köûúûúûú†ò3öûúûúûúûúûúûòDKöûúûú!ûú	†ò]KöûúòóKöûú†òKöúòóKò óôJô ö°úûúûúûúòKöúûúò
+KöúòKöúòKöûúûúûú†ò-JôIô
+JôãJôπJôâóöûú1ò3öûú"†)òMKöûúò"óóKòKò óö°úûúûúûúò Köúûúò
+KöúòKòKòKöúòKöûúûúûú†ò-Jô¨JôÛKöú1ûúò8Köûúûúûú†*òRKòKòKò óö°úûúûúûúò Köúûúò
+KöúòKöúòKöûúûúûúòKöú8ò8Köû	ú† úò=KöúòKò óö°úûúûúûúòKöúûúòKò KöúûúòKòKöúûúòKöúûòKòKöûúûúûúòKöúûúûúòKöúûúûúòKöú	ûúòKò-öûúûòöúòKöúûúòKò9KòóöúòKò9KöúûúòKòóKöú ûúò%Köûúòóò1KòióKöûúòKòKò óö°úûúûúûúòKöûúûúûúòKöûúûúûúûúò.Jô[Kò óö°úûúûú/ûúòSKôØKôiKöûúûúûúòKöúû	úòKöúEòEKöûúòKöûú*ûúûúò8ò%öûúûú)òFKöûú5ò9óóKòóKò óôJô Köú
+ûúûú†(òKöúûúûúòKöúòKò%KöúûúòKöú	ûúûòKòKò óö°úûúûúûúò"KöúòKò%Köú	ûúûòKò"Köûúûúûú†ò-Kò$Köûúûú'ûúûúò9öûúûòöúòKöú(ûú#òNKòóKöûú-ò8óKòKò óö°
+úûúûúûú#ò@Köûúûúûú†ò-Kò$Köûúûú'ûúûúò:Köûúûú2ûúòMKöúòKò óö°	úûúûúûúòKò)Köúûú†ò$Köúûú†ò-KöúûúûòKöúòKöûúûúûú†ò+Kò/KòKò óö°úûúûúòKò)Köúûú†ò$Köúûú†ò-KöúûúûòKöú%ûúò)Köú&ûò)KöúòKöúòKöúûúòKò"KöúûúûúòöûúûúòKòWöûúûòKöú/ûúò4Köú*ûú†	ò;KöûúòóKòóöûúûúûò'Kò1KöúOòOóöûúûòKöúûú†ò6Köúûú†"ò9KòRKöûú"ûúûúûúò>óKöúœtú	¢úUòcKöúòKò óöú"ûúò;Kò óö°úûúûúûúò,Köûúûúò&KöûúûúûúòKöú+ò+KòKöúûúòò9Köú7ò7óöûúûú9ûòOKòóöûúûòKöúûúòòòKò<óKöûúûúûúûúòKòKöú#ûú òFKòKöûúòKòóKöûúûúòóKöú;ûúòAKöúEûúòWöûúûú†ò.KöúEûúòWóKòKò óö
+°úûúûúûú%ûúòEKöûúûúûúòKöúòKöúûúœbòKòKöûúûú'ûúûúòWöûúûúûúûúò1Köú7ûúòOöûúûúûúûò,òJKò:óJö¢úY¢ô[óKòóöûúûú)ò<Köú5ò5Köú-ò-KòSKöúBûúòYKòóKö£òKöûúûú<¢úòSKöúòKò óö°úûúûúûúò/Köûúûú
+ûúûúò=ò!Köú8ò8óKòKò óö
+°úûúûúûú	ûúò3Köûúûúûúûúûúûúò/KòJô óö°úûúûúûúûúûúòOKöûúûúûúûúûúûúò5KòJô óö°úûúûúûúûúûúûúûúûúòmKöûúûúûúòKòKöúûú5òFKöúûú"ò2öûú!ûúûúò0Köú,ô,KöúûòKöúòóKòVöûúûòKòvóöûúûòKö	ú`ûúûúûúûúòúKö	úûú
+ûú9ûúûúòsKòjKöúNûúûúòcKöúLûúûú†òÄKöûú0ò7óKòKò óö°úûúûúòDKöûúûúûúòKöúûúòKöúòKöúûú5òGöûúûú†3òPKöúûòKòóKò)öûú#ûúûúò2Köú.ô.KöúûòKöúòóòYKô¶óöûúûú>ûúûúòmKö¢ú,¢ô.óöûúûúòKöúòKòVöúûúò öûú9ò=Köú9ò9óKöûúòóKòóöûúûòKöúEûúûúò\KöúLûúûúòcKöúMûúûúòdKöúMûúûú†òÅKöûú0ò7óKöúòKò óö°úûúò%KöúûúòöûúûúòKòDóöûúûòöú ò Köú5ûúûúòQóKöúPûúûúòlKöúLûúûú†òÄKöûú0ò7óKòKò óö°úûúûúûúò"KöúûúòKò"Köú
+ûúûú	ûúûúûúò2Köúûú
+òKö	úûúûúûúûúò.KòKòKòKö	ú+ûúûúûúûúòVKöûúûú'ûúòPKö
+ûúûúûúûúûúòOKò:öûúûòKöú#ûúûúò5öú	ò	KòKöûúûúûúò5KöûúòKöúòóKöúûúûúò&Kö	úûúûúûúûúòAKöûúûúòóKöûúûúûúMò^Köûúûúûúò0öûú(ò,KöúJòJóöûúûúDòWKöú5ò5óKö
+ûúûúûúûúûúòHKöúòJô óöú
+ûú%ò3Kò óö°úûúûúûúûú	ûúûúòNKöûú,ûúò;ôJôQJôWJô'Jô8JôIJô$óKö	ûúûúûúûú†ò1öûúûúûú+ûúûúûòOKöúûúò.Kò3Kò@öûúûòöú6ûúò=JôMóöúòKöûúûú.ûúòJóKöú#ûúò(KöûúûúòóJöú@ô@öûúûúûúûúûúûú(ûòJöûúûúûò2Köú+ûúûúûúòRóKöûú†;òDóöûúòKöûúûú,ûúûúòNKöúòóKöûúòóKòKò óö°úûúûúò$KöúûúòKöúûúòKöúûòKöúûúòKöúûú
+òKò#KöúòKò&Kò öûúûúòKò+Kò#öûúûúûúûúûúûú(ûòJöûúûúòöúûúûúòöúûúûò<Köú+ûúûúò=óKòKöûúòKòóóKöûúòóKòóKö	ûúûúûúûú†òGöûúûú†òKò,ò KöúJòJóKöûúûúûòKòóöûúûòKöûú6ò<óòKöúOòOóKòóKò Kö	úûúûúûúûúò!Köú#ûúòDöú%ûúò>Kô-Kô óö°úûúûú
+ûúûúûúò/Köûúûúûú†ò+KòKòKò óö°úûúûú
+ûúûúûúûúûúûúòdKöúûúòKöúòKò"KòKöûú)ûúûúòNöûúûúûú#ò6Kô4óöûúûòöú
+ò
+ò-KòKò=KòóöûúûúòKòKò Kòöûúûúûú ûúò5òMKöûúòKòóóKòóKòóKò8öûúòKöú*ûú&òSKöûúòKöúòóóKöûúûúûúòKöúûúò KòûKò4öûúûúûúûúûúûúûò?KöúòKöúòö	ûú'ûúûúûú†òNKôróKò]öûúûòKöúûú†	ò-Köú1ûúò6KöûúòóKòKöûúûúûúòKöú=ô=óò KöúbòbóöûúûòKòöúòòGJô3óKöûúòKöúòóKöúûú†'ò=öûú3ûúòBJöú@ô@óóKöûúòóKöúûúò!öûúûúûò!KöúMûúûúò`óöûòKöú0ûúò5óKòóKò óô	Kò ö°úûú#ûúûúòDKöûúûú†
+úò.Köúûúûú
+òöûúûòöûúûúûú+ûúûúûòOKòKöûú&ûúûúò4KöûúòóóKöúûúòKöûúûúûúòJöúôöúûúò&KöúYòYóKöúûúòKò8KòKò óö°úûúûú$ûúòCKöúûúûúûúòBöûúûúûúûúò#Köú8ûúòBóKöúûúòKöûúûúûúò!KöúûúòKöûúûúûú"ò3KòKò óö°úûúûúûúòTKò KòKöúûúòKöúûúòKò"Köú'ûúò-Kò'KòKòXô@JôJôóKò'öûúûúûòöúûú†4òKJôîóòyKôWKòEKòMKòDKò$Kò"KòòöúFòFKöú#ûúò)óóKöûúûúûú†7òPöûúòKöúûúò'KòöûúûúûòBöú ûò$Kò2óóKòóKòóKöûúòóöûúûòKòPKöúûúûú)òUö	úûúûú†–ct†+§òSKòEKò!Kò8Köûúûú'òOóKöûúò	óöûúûúûú!ò]KöúRôRóKöú)ûúò.JôÔKöû	úòKòKò óöúûúòKò óö°úûúûúòKòKòKöúûúòKöú	ûúûòKöú#ûúò'Köú$ûò'KòKöûúûúòöûòKòKò+öúûúûúûò%Köú0ûúûúûúòEóKö
+ûúûú
+ûúûú ûúòXòKöúPòPKöú~ò~óöûúûòKò'öúòKòöûú#ûúò8Kô5óKöûúûú$ûúûúòEKöúòóöûúòKöúEòEJôöóóKöûúòKöûúòóKòKò óö°úûúûúUûúûúûú'ûú(ûú	ûúûúòÍKöûúûúûúò4JôƒKöúòöúûò(KöúûúûúûòKöú$†'òKKòóKòKöûú)ûúûúòNöûúûòöú
+ò
+ò-KòKò>KöúòKòKòKòKò KòóöûúûúòKòKò Kòöûúûúûú ûúò5òMKöûúòKòóóKòóKòóKògöúûúûúòKöú*ûú&òSKöûúòKòóöûúòKöú*ûú&òSKöûúòKöúòóóKöûúûúûúûúò1Köúûúò Köûúûúûúò&ò KòAóöûúûòKöúûúòöúòòGJô3óKöûúòKöúòóöúòKò`KöûúòKöúòóöûú0ò7Jöú@ô@óóKòKò óö
+°úûúûú"ûúûúòIKöûúûúòJôŸKöúûúò#öûúûúûúûò(öûúûò&Kö	úûúûúûúûúòKKöúûúòKöûúòóKöûúOòVKöûúòöûúûò&Köúûú†ò-KöûúòóKöûúòóKòPKöûúûúò!KöúòKò óö°úûú	ûúûúûúûúò6öûúûúûú#ò1Köûú0ûúòQóKöúòKò óö°úûúòKöú+ûúûúûúòCKöûú	ûúûúò;Kòöûú.ûúûúûò@KöûúûúûúûúòFóKòKò óö
+°úûúûúûú †
+úògJöúnônöûúûúûú+ûúûúûòOKöúûúûúòKòKò#öûúûòöúòKò+öûúûúûú(ûò8öûúûúûúò5KöúûúòKöûúòKòóKöûúòóKöûúûúòKòóKöûúòóKöûúòóKöúûúòKòKòóKò óôKôùKò óö
+°úûúûúûú ûúòUKöûúûúûúûúòöú<ò<Köûú ò#óKòKò Köûúûúûúòö	úûúûúûú ûúòBKò óö°úûúûúò/KöúûúûúòKöú'ûú'òTö°úò"Köú!ûúò.öûúûúûò)Köú:ò:óKòóöûúûúûòKöú/ò/óKòóKò Kò óö°úûú9òQöú7ò7Köûú"ò%óKòKò Köûúûúûúòöúûúûú5òJKò óö°úûúûúò*KöúûúûúòKöú'ûú'òTKöúûúûúòö°úò"Köú!ûúò.öûúûúûò$KòSóKòóöûúûúûòKöú/ò/óKòKò óö°úûúûúCòcKöúûúûúûúûúûúòDKöúûú	ûúò"Köúûúòö°úò KöúûúòKòKöûú
+ûúûúòKòóKò.öûú
+ûúûúûò!Köûúûúûúò)KöûúòóKòKò óKò óJô óôJô ö°úûúûúûú	ò9Kö
+ûú	ûúûúûúûúò5KöûúGûúòYKòKöúJòJKòóKöúûúòöúûúûúòKò óö°úûúò1Kò)KöúòKò óö°úûúò0Kò KöúòKò óö°úûúò0Kò KöúûúòKöúòKò óö°úûúò2Kò)KöúûúòKöúòKò óö°úûúò/Kò KöúòKò óö°úûúò/Kò KöúòKò óö°úûúò1Kò KöúòKò óö°úûúòKöúûúòò'Jô&óKöûúûúûú&ò;KöúòKò óö	ú
+ûúûúûúûú≥ò–Kò óö°úûúò.KïStartOfExpansionI[cmd: Commander.Handle, starExpand: BOOL _ FALSE, switchChar: CHAR]öúûúûúûúòKöúûúòKò4Köûúûúûúò!KòKöúòKò óKòKöúUòUKöúTòTKöúMòMKöúWòWKöúZòZöú/ò/Köú.ò.óöú3ò3Köú2ò2óJô ö£–bcô,Jö£?ô?óöú+ò+Köú=ò=óóKòKô ôKò KöúMòMKò ö°úûúûúûúô JöûúûúûúûúôJöúûúôJôJô óöú!ûúò*JöúôKöúòKò óóô&KôKöúœrôóô2KôKöú–kr	¶)ú¶¥ôÅóô(KôKöúß	¶ß¶ß¶óô¥óô4Köú¶úxôíKöú¶Pô\óöú¶ ô6Köú¶úô+Köú¶Qô]óô-KôNKöú¶ô(óöú5ô5Köú¶	ú¶ú¶ú¶ú¶úô⁄óöú5ô5KöúFôFKöú¶Sô_óô+KôFKöúß	¶Åú¶gúô±óô+KôNKöú¶°ô≠óô,KôOKöú¶Pô\óô'Kô	Köúß	¶ßôóô&KôfKöú¶$ô0óô*Kô|Köú¶ıß	¶ô§óô+KöúsôsKöú¶LôXóô'Kôóô'KôRóô'Kô@Köú¶HôTóô2KôXKöú¶ô!óô3KôHKöú¶ô%óô)Köú6¶ôBóô8Kô≥Köú¶AôMóô7Köú¶3ô?óô3Kô"Köú¶Uô\óô4Kô3Köú¶*ô6óô1Kô7Köú¶4ô@óô2Kô'Köú¶ôóô3Kô+Köú¶ôóô4KôKöúß	¶1ôFóKô ô+KôvóKô ó Öó    {|  –e  

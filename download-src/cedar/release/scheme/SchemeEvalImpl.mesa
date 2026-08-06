@@ -1,0 +1,683 @@
+
+DIRECTORY Atom, IO, RefTab, Rope, Scheme, SchemePrivate, SchemeSys;
+
+SchemeEvalImpl: CEDAR MONITOR
+IMPORTS Atom, IO, RefTab, Scheme, SchemeSys
+EXPORTS Scheme, SchemePrivate
+~ BEGIN OPEN Scheme, SchemePrivate;
+
+ROPE: TYPE ~ Rope.ROPE;
+doStats: BOOL ~ FALSE;
+CopyActivation: PROC [a: Activation] RETURNS [Activation] ~ {
+new: Activation = NEW[ActivationRep ¨ a≠];
+new.s ¨ NEW[StackRep ¨ a.s≠];
+IF a.sEx # NIL THEN {
+o: SimpleVector = a.sEx;
+p: SimpleVector = NEW[SimpleVectorRep[o.length]];
+FOR i: NAT IN [0..o.length) DO
+p[i] ¨ o[i];
+ENDLOOP;
+new.sEx ¨ p;
+};
+new.shared ¨ FALSE;
+RETURN [new]
+};
+
+RetainStack: PROC [a: Activation] ~ {
+FOR p: Activation ¨ a, p.link UNTIL p = NIL OR p.shared DO
+IF p.env # NIL THEN p.env.mark ¨ 100;
+p.shared ¨ TRUE;
+ENDLOOP;
+};
+
+handlerSymbol: Symbol ~ SymbolFromRope["*system-error-handler*"];
+HandleError: PROC [a: Activation, name, culprit: Any, msg: ROPE] RETURNS [debuggerFrame: Activation] ~ {
+userEnv: Environment ~ GetUserEnvironment[]; -- I wish there was another way...
+handler: Any ~ LookupVariableValue[handlerSymbol, userEnv ! Complain => ERROR];
+debuggerFrame ¨ NEW[ActivationRep ¨ [
+link: a,
+env: NIL,
+code: NIL,
+bottom: 0,
+n: 5,	-- (handler parent-activation name culprit message)
+pc: -1,
+s: NEW[StackRep ¨ ALL[NIL]],
+sEx: NIL
+]];
+RetainStack[a];
+debuggerFrame.s[0] ¨ handler;
+debuggerFrame.s[1] ¨ a;
+debuggerFrame.s[2] ¨ name;
+debuggerFrame.s[3] ¨ culprit;
+debuggerFrame.s[4] ¨ StringFromRope[msg];
+RETURN;
+};
+
+GetArgList: PROC [a: Activation] RETURNS [Any] ~ {
+A: PROC [i: NAT] RETURNS [Any] = INLINE {
+RETURN [IF i < smallActivationSize THEN a.s[i] ELSE a.sEx[i-smallActivationSize]]
+};
+list: Any ¨ NIL;
+FOR i: NAT DECREASING IN [1..a.n) DO
+list ¨ Cons[A[i+a.bottom], list];
+ENDLOOP;
+RETURN [list]
+};
+
+CommonEnvSizes: TYPE ~ [0..20);
+Pool: TYPE ~ REF PoolRep;
+PoolRep: TYPE ~ RECORD [
+avail: Activation ¨ NIL, -- free list for activations
+envAvail: ARRAY CommonEnvSizes OF REF Environment
+];
+
+envStatLimit: NAT ~ 40;
+EnvStatEntry: TYPE ~ RECORD [alloc, reused, freed: INT ¨ 0];
+envStats: REF ARRAY [0..envStatLimit] OF EnvStatEntry ~ IF doStats THEN NEW[ARRAY [0..envStatLimit] OF EnvStatEntry] ELSE NIL;
+
+PushEnvironment: PROC [parent: Environment, names: SimpleVector, pool: Pool] RETURNS [newEnv: Environment] ~ {
+n: NAT ~ names.length;
+envCell: REF Environment ¨ NIL;
+IF n IN CommonEnvSizes AND (envCell ¨ pool.envAvail[n])≠ # NIL
+THEN {
+IF doStats THEN envStats[n].reused ¨ envStats[n].reused+1;
+newEnv ¨ envCell≠;
+envCell≠ ¨ newEnv.parent;
+IF newEnv.mark # 666 THEN ERROR;
+}
+ELSE {
+k: NAT ~ MIN[n, envStatLimit];
+IF doStats THEN envStats[k].alloc ¨ envStats[k].alloc+1;
+newEnv ¨ NEW[EnvironmentRep[n]];
+};
+newEnv.parent ¨ parent;
+newEnv.names ¨ names;
+newEnv.mark ¨ 0;
+};
+
+FreeEnv: PROC [e: Environment, pool: Pool] ~ {
+n: NAT ~ e.size;
+IF e.mark # 0 THEN ERROR;
+e.mark ¨ 666;
+IF n IN CommonEnvSizes THEN {
+envCell: REF Environment ~ pool.envAvail[n];
+IF doStats THEN envStats[n].freed ¨ envStats[n].freed+1;
+e.parent ¨ envCell≠;
+envCell≠ ¨ e;
+};
+};
+
+CleanupStorage: PROC [pool: Pool] ~ {
+WHILE pool.avail # NIL DO
+a: Activation ~ pool.avail;
+s: Stack ~ a.s;
+pool.avail ¨ a.link;
+FOR i: NAT IN [0..smallActivationSize) DO
+s[i] ¨ NIL;
+ENDLOOP;
+a.env ¨ NIL;
+a.link ¨ NIL;
+ENDLOOP;
+FOR i: NAT IN CommonEnvSizes DO
+envCell: REF Environment ~ pool.envAvail[i];
+WHILE envCell≠ # NIL DO
+env: Environment ~ envCell≠;
+envCell≠ ¨ env.parent;
+FOR j: NAT IN [0..env.size) DO env[j] ¨ NIL ENDLOOP;
+env.names ¨ NIL;
+env.parent ¨ NIL;
+ENDLOOP;
+ENDLOOP;
+};
+abortCheckInterval: CARDINAL ¨ 100;
+Run: PROC [activation: Activation] RETURNS [Any] = {
+name: Any ¨ NIL;
+Inner: PROC [a: Activation, pool: Pool] RETURNS [Any] ~ {
+abortCheckCounter: CARDINAL ¨ abortCheckInterval;
+DO
+result: Any ¨ a.s[0];
+IF abortCheckCounter # 0
+THEN { abortCheckCounter ¨ abortCheckCounter - 1 }
+ELSE {
+SchemeSys.CheckForAbort[];
+abortCheckCounter ¨ abortCheckInterval
+};
+IF a.shared THEN { a ¨ CopyActivation[a] };
+IF a.n > 0 THEN {
+s: Stack ~ a.s;
+A: PROC [i: NAT] RETURNS [Any] = INLINE {
+RETURN [IF i < smallActivationSize THEN s[i] ELSE a.sEx[i-smallActivationSize]]
+};
+WITH A[a.bottom] SELECT FROM
+fun: TidbitProcedure => {
+env: Environment ~ PushEnvironment[parent: fun.env, names: fun.code.envNames, pool: pool];
+m: NAT ~ fun.code.maxArgs; -- number of (non-rest) arguments
+n: NAT ~ a.n-1; -- number of actual arguments
+argBase: NAT ~ a.bottom+1;
+name ¨ fun.code.name;
+SELECT TRUE FROM
+((n = m) AND (argBase+m <= smallActivationSize)) => {
+FOR i: NAT IN [0..m) DO
+env[i] ¨ s[argBase+i];
+ENDLOOP;
+IF fun.code.dotted THEN env[m] ¨ NIL;
+};
+(n IN [fun.code.minArgs..m]) => {
+L: NAT = MIN[m, n]; -- number of supplied (non-rest) arguments
+FOR i: NAT IN [0..L) DO
+env[i] ¨ A[argBase+i];
+ENDLOOP;
+FOR i: NAT IN [L..m) DO
+env[i] ¨ undefined;
+ENDLOOP;
+IF fun.code.dotted THEN env[m] ¨ NIL;
+};
+(fun.code.dotted AND n >= m) => {
+rest: Any ¨ NIL;
+FOR i: NAT IN [0..m) DO
+env[i] ¨ A[argBase+i];
+ENDLOOP;
+FOR i: NAT DECREASING IN [m..n) DO
+rest ¨ Cons[A[argBase+i], rest];
+ENDLOOP;
+env[m] ¨ rest;
+};
+ENDCASE => {
+activation ¨ a;
+Complain[GetArgList[a], "Wrong number of arguments"];
+};
+IF a.pc < 0
+THEN {
+IF a.shared THEN ERROR;
+IF a.env # NIL AND a.env.mark = 0 THEN FreeEnv[a.env, pool];
+a.sEx ¨ NIL;
+}
+ELSE {
+new: Activation ¨ pool.avail; 
+IF new = NIL
+THEN {
+new ¨ NEW[ActivationRep];
+new.s ¨ NEW[StackRep];
+}
+ELSE
+pool.avail ¨ new.link;
+new.link ¨ a;
+new.fluidBindings ¨ a.fluidBindings;
+a ¨ new;
+};
+IF a.shared THEN ERROR;
+a.env ¨ env;
+a.code ¨ fun.code;
+a.pc ¨ fun.code.initialPC;
+a.sEx ¨ NIL;
+activation ¨ a.link;
+fun.code.proc[a];
+LOOP;
+};
+p: Primitive => {
+n: NAT ~ a.n-1;
+argBase: NAT = a.bottom+1;
+name ¨ p.symbol;
+activation ¨ a;
+SELECT TRUE FROM
+n <= 3 AND argBase+n <= smallActivationSize AND
+((n = p.maxArgs) OR (n IN [p.minArgs..p.maxArgs])) => {
+SELECT n FROM
+0 => result ¨ p.proc[p, undefined, undefined, undefined, NIL];
+1 => result ¨ p.proc[p, s[argBase], undefined, undefined, NIL];
+2 => result ¨ p.proc[p, s[argBase], s[argBase+1], undefined, NIL];
+3 => result ¨ p.proc[p, s[argBase], s[argBase+1], s[argBase+2], NIL];
+ENDCASE;
+};
+n IN [p.minArgs..p.maxArgs] OR (p.dotted AND n >= p.maxArgs) => {
+list: ProperList ¨ NIL;
+f: ARRAY [0..3) OF Any ¨ ALL[undefined];
+nFast: NAT ~ MIN[n, p.maxArgs, 3];
+FOR i: INT DECREASING IN [nFast..n) DO
+list ¨ Cons[A[argBase+i], list];
+ENDLOOP;
+FOR i: NAT IN [0..nFast) DO
+f[i] ¨ A[argBase+i];
+ENDLOOP;
+result ¨ p.proc[p, f[0], f[1], f[2], list];
+};
+ENDCASE => Complain[GetArgList[a], "Wrong number of arguments"];
+};
+ENDCASE => {
+name ¨ $apply;
+activation ¨ a;
+Complain[A[a.bottom], "Not a procedure"];
+};
+};
+WHILE a.pc < 0 DO
+IF a.shared
+THEN { a ¨ a.link }
+ELSE {
+IF a.env # NIL AND a.env.mark = 0 THEN FreeEnv[a.env, pool];
+a.sEx ¨ NIL;
+{old: Activation ~ a; a ¨ old.link; old.link ¨ pool.avail; pool.avail ¨ old};
+};
+IF a = NIL THEN RETURN [result]
+ENDLOOP;
+IF a.shared THEN { a ¨ CopyActivation[a] };
+IF a.bottom < smallActivationSize
+THEN a.s[a.bottom] ¨ result
+ELSE a.sEx[a.bottom-smallActivationSize] ¨ result;
+activation ¨ a.link;
+name ¨ a.code.name;
+a.code.proc[a];
+ENDLOOP;
+};
+pool: Pool ~ NEW[PoolRep];
+FOR i: NAT IN CommonEnvSizes DO pool.envAvail[i] ¨ NEW[Environment ¨ NIL] ENDLOOP;
+DO
+result: Any ¨ NIL;
+SchemeSys.CheckForAbort[];
+result ¨ Inner[activation, pool ! 
+Complain => { activation ¨ HandleError[activation, name, object, msg]; LOOP }
+];
+CleanupStorage[pool];
+RETURN [result]
+ENDLOOP;
+};
+
+Apply: PUBLIC PROC [proc: Procedure, arguments: Any] RETURNS [Any] ~ {
+activation: Activation ¨ NEW[ActivationRep ¨ [
+link: NIL,
+env: NIL,
+code: NIL,
+bottom: 0,
+n: 1 + ListLength[arguments],
+pc: -1,
+s: NEW[StackRep ¨ ALL[NIL]],
+sEx: NIL
+]];
+tail: Any ¨ arguments;
+activation.s[0] ¨ proc;
+FOR i: NAT IN [1..activation.n) DO
+activation.s[i] ¨ Car[tail];
+tail ¨ Cdr[tail];
+ENDLOOP;
+RETURN [Run[activation]]
+};
+
+Eval: PUBLIC PROC [exp: Any, env: Environment] RETURNS [Any] ~ {
+thunk: Any ~ Compile[Expand[exp, env], env];
+IF IsProcedure[thunk] THEN
+RETURN [Apply[thunk, NIL]]
+ELSE
+RETURN [unspecified];
+};
+
+compilerKey: Symbol ¨ SymbolFromRope["*system-compiler*"];
+Compile: PUBLIC PROC [form: Any, env: Environment] RETURNS [Any] ~ {
+compiler: Any ¨ LookupVariableValue[compilerKey, env ! Complain => ERROR];
+value: Any ¨ Apply[compiler, Cons[form, Cons[env, NIL]]];
+IF IsProcedure[value] THEN 
+RETURN [value]
+ELSE
+RETURN [unspecified]
+};
+
+expanderKey: Symbol ¨ SymbolFromRope["*system-syntax-expander*"];
+Expand: PUBLIC PROC [form: Any, env: Environment] RETURNS [Any] ~ {
+value: Any ¨ LookupVariableValue[expanderKey, env ! Complain => ERROR];
+form ¨ Apply[value, Cons[form, Cons[env, NIL]]];
+RETURN [form]
+};
+
+continuationTidbitCode: TidbitCode ~ NEW [TidbitCodeRep ¨ [
+name: $continuation,
+envNames: NARROW[VectorFromList[LIST[$x]]],
+dotted: FALSE,
+minArgs: 1,
+maxArgs: 1,
+proc: CallCCProcedureCode,
+globalBindings: NIL,
+literals: NIL,
+initialPC: 1,
+doc: "A Continuation",
+ext: NIL
+]];
+
+CallCCProcedureCode: PROC [a: Activation] ~ {
+SELECT a.pc FROM
+0 => {
+continuationProc: TidbitProcedure ~ NEW [TidbitProcedureRep ¨ [code: continuationTidbitCode, env: a.env]];
+a.env.mark ¨ 100;
+RetainStack[a.link];
+a.s[0] ¨ a.env[0];
+a.env[0] ¨ a.link; -- reuse the slot to save the old activation link.
+a.s[1] ¨ continuationProc;
+a.bottom ¨ 0;
+a.n ¨ 2;
+a.pc ¨ -1;
+};
+1 => {
+a.link ¨ NARROW[a.env.parent[0]];
+a.s[0] ¨ a.env[0];
+a.n ¨ 0;
+a.pc ¨ -1;
+};
+ENDCASE => ERROR;
+};
+
+ApplyProcedureCode: PROC [a: Activation] ~ {
+i: NAT ¨ 1;
+a.bottom ¨ 0;
+a.s[0] ¨ a.env[0];
+a.n ¨ 1+ListLength[a.env[1]];
+IF a.n > smallActivationSize THEN a.sEx ¨ NEW[SimpleVectorRep[a.n-smallActivationSize]];
+FOR tail: Any ¨ a.env[1], Cdr[tail] UNTIL tail = NIL DO
+IF i < smallActivationSize
+THEN a.s[i] ¨ Car[tail]
+ELSE a.sEx[i-smallActivationSize] ¨ Car[tail];
+i ¨ i + 1;
+ENDLOOP;
+a.pc ¨ -1;
+};
+
+ErrorProcedureCode: PROC [a: Activation] ~ {
+RetainStack[a.link];
+a.s[0] ¨ a.code.globalBindings[0].cdr;	-- *system-error-handler*
+a.s[1] ¨ a.link;	-- parent-activation
+a.s[2] ¨ a.env[0];	-- name
+a.s[3] ¨ a.env[1];	-- culprit
+a.s[4] ¨ a.env[2];	-- message
+a.n ¨ 5;
+a.bottom ¨ 0;
+a.pc ¨ -1;
+};
+SV1: PUBLIC PROC [a0: Any] RETURNS [SimpleVector] ~ {
+s: SimpleVector ~ NEW[SimpleVectorRep[1]];
+s[0] ¨ a0;
+RETURN [s]
+};
+
+SV2: PUBLIC PROC [a0: Any, a1: Any] RETURNS [SimpleVector] ~ {
+s: SimpleVector ~ NEW[SimpleVectorRep[2]];
+s[0] ¨ a0;
+s[1] ¨ a1;
+RETURN [s]
+};
+
+SV3: PUBLIC PROC [a0: Any, a1: Any, a2: Any] RETURNS [SimpleVector] ~ {
+s: SimpleVector ~ NEW[SimpleVectorRep[3]];
+s[0] ¨ a0;
+s[1] ¨ a1;
+s[2] ¨ a2;
+RETURN [s]
+};
+
+SV4: PUBLIC PROC [a0: Any, a1: Any, a2: Any, a3: Any] RETURNS [SimpleVector] ~ {
+s: SimpleVector ~ NEW[SimpleVectorRep[4]];
+s[0] ¨ a0;
+s[1] ¨ a1;
+s[2] ¨ a2;
+s[3] ¨ a3;
+RETURN [s]
+};
+
+SV5: PUBLIC PROC [a0: Any, a1: Any, a2: Any, a3: Any, a4: Any] RETURNS [SimpleVector] ~ {
+s: SimpleVector ~ NEW[SimpleVectorRep[5]];
+s[0] ¨ a0;
+s[1] ¨ a1;
+s[2] ¨ a2;
+s[3] ¨ a3;
+s[4] ¨ a4;
+RETURN [s]
+};
+
+SV6: PUBLIC PROC [a0: Any, a1: Any, a2: Any, a3: Any, a4: Any, a5: Any] RETURNS [SimpleVector] ~ {
+s: SimpleVector ~ NEW[SimpleVectorRep[6]];
+s[0] ¨ a0;
+s[1] ¨ a1;
+s[2] ¨ a2;
+s[3] ¨ a3;
+s[4] ¨ a4;
+s[5] ¨ a5;
+RETURN [s]
+};
+
+SV7: PUBLIC PROC [a0: Any, a1: Any, a2: Any, a3: Any, a4: Any, a5: Any, a6: Any] RETURNS [SimpleVector] ~ {
+s: SimpleVector ~ NEW[SimpleVectorRep[7]];
+s[0] ¨ a0;
+s[1] ¨ a1;
+s[2] ¨ a2;
+s[3] ¨ a3;
+s[4] ¨ a4;
+s[5] ¨ a5;
+s[6] ¨ a6;
+RETURN [s]
+};
+
+risCache: IO.STREAM ¨ NIL;
+MakeRIS: ENTRY PROC [rope: ROPE] RETURNS [IO.STREAM] ~ {
+s: IO.STREAM ¨ risCache;
+risCache ¨ NIL;
+s ¨ IO.RIS[rope: rope, oldStream: s];
+RETURN [s]
+};
+FreeRIS: ENTRY PROC [s: IO.STREAM] RETURNS [IO.STREAM ¨ NIL] ~ { risCache ¨ s };
+
+ReadRopeVector: PUBLIC PROC [rope: ROPE] RETURNS [v: SimpleVector] ~ {
+s: IO.STREAM ¨ MakeRIS[rope];
+v ¨ NARROW[Read[s]];
+s ¨ FreeRIS[s];
+};
+
+MakeTidbitCode: PUBLIC PROC [
+identifiers: Rope.ROPE, -- name, followed by 2 lists in read form: local names, then global names
+env: Environment, -- global environment
+nArgs: INTEGER, -- number of arguments, including rest; negative if dotted.
+proc: TidbitCodeProc, -- the implementation procedure
+literals: Any, -- A SimpleVector or a LIST OF REF; use SV*, above
+initialPC: INTEGER, -- the initial pc for this procedure
+doc: Rope.ROPE, -- documentation
+ext: REF ¨ NIL -- for extensions (such as debugging info)
+] RETURNS [TidbitCode] ~ {
+s: IO.STREAM ¨ MakeRIS[identifiers];
+name: Any ~ Read[s];
+envNames: SimpleVector ~ NARROW[VectorFromList[Read[s]]];
+globalBindings: PairSeq ~ GlobalsVector[env, Read[s]];
+literalsVector: SimpleVector ~
+WITH literals SELECT FROM
+sv: SimpleVector => sv,
+ENDCASE => NARROW[VectorFromList[literals]];
+n: NAT ~ MAX[nArgs, -1-nArgs];
+s ¨ FreeRIS[s];
+RETURN [NEW [TidbitCodeRep ¨ [
+name: name,
+envNames: envNames,
+dotted: (nArgs < 0),
+minArgs: n,
+maxArgs: n,
+proc: proc,
+globalBindings: globalBindings,
+literals: literalsVector,
+initialPC: initialPC,
+doc: doc,
+ext: ext
+]]]
+};
+
+GlobalsVector: PROC [env: Environment, globalNames: Any] RETURNS [PairSeq] ~ {
+p: PairSeq ~ NEW[PairSeqRep[ListLength[globalNames]]];
+FOR i: NAT IN [0..p.length) DO
+p[i] ¨ LookupCell[env: env, name: Car[globalNames]];
+globalNames ¨ Cdr[globalNames];
+ENDLOOP;
+RETURN [p]
+};
+
+SymbolFromAny: PROC [name: Any] RETURNS [Symbol] ~ {
+RETURN [WITH name SELECT FROM
+text: REF TEXT => Atom.MakeAtomFromRefText[text],
+rope: ROPE => Atom.MakeAtom[rope],
+atom: ATOM => atom,
+string: String => SymbolFromRope[RopeFromString[string]],
+ENDCASE => ERROR]
+};
+
+LookupCell: PUBLIC PROC [env: Environment, name: Any] RETURNS [result: Pair ¨ NIL] ~ {
+variable: Symbol ~ SymbolFromAny[name];
+TryLookup: PROC ~ {
+FOR e: Environment ¨ env, e.parent UNTIL e=NIL DO
+IF e.names # NIL THEN Complain[e, "not a top-level environment"];
+WITH RefTab.Fetch[NARROW[e[0]], variable].val SELECT FROM
+pair: Pair => { result ¨ pair; EXIT };
+ENDCASE => NULL;
+ENDLOOP;
+};
+TryLookup[];
+IF result = NIL THEN {
+DefineVariable[variable: variable, value: undefined, env: env];
+TryLookup[];
+};
+IF result = NIL THEN ERROR;
+};
+
+CloseProcedure: PUBLIC PROC [p: Any, env: Environment] RETURNS [TidbitProcedure] ~ {
+IF env.parent # NIL AND env.parent.mark=0 THEN ERROR;
+env.mark ¨ 100;
+RETURN [NEW[TidbitProcedureRep ¨ [code: NARROW[p], env: env]]];
+};
+
+DefineProcedure: PUBLIC PROC [name: Rope.ROPE, nArgs: NAT, envNames: LIST OF REF, dotted: BOOL, proc: TidbitCodeProc, doc: Rope.ROPE, env: Environment, lexicalEnv: Environment ¨ NIL, initialPC: INTEGER ¨ 0, globalNames: LIST OF REF ¨ NIL, literals: SimpleVector ¨ NIL, optional: NAT ¨ 0] ~ {
+code: TidbitCode ~ NEW [TidbitCodeRep ¨ [
+name: SymbolFromRope[name],
+envNames: NARROW[VectorFromList[envNames]],
+dotted: dotted,
+minArgs: nArgs-optional,
+maxArgs: nArgs,
+proc: proc,
+globalBindings: GlobalsVector[env, globalNames],
+literals: literals,
+initialPC: initialPC,
+doc: doc,
+ext: NIL
+]];
+DefineVariable[variable: code.name, value: NEW[TidbitProcedureRep ¨ [code, lexicalEnv]], env: env];
+};
+
+Init: PROC [env: Environment] ~ {
+DefineProcedure[name: "essential-apply", nArgs: 2, envNames: LIST[$procedure, $arguments], dotted: FALSE, proc: ApplyProcedureCode, doc: "Essential apply", env: env];
+DefineProcedure[name: "primitive-call/cc", nArgs: 1, envNames: LIST[$procedure], dotted: FALSE, proc: CallCCProcedureCode, doc: "Primitive version of call/cc", env: env];
+DefineProcedure[name: "error", nArgs: 3, dotted: FALSE, envNames: LIST[$name, $culprit, $message], proc: ErrorProcedureCode, doc: "(name culprit message) Enter the debugger", env: env, globalNames: LIST[SymbolFromRope["*system-error-handler*"]]];
+};
+
+RegisterInit[Init];
+
+
+END.
+  ˙  
+SchemeEvalImpl.mesa
+Copyright ” 1988, 1989, 1991 by Xerox Corporation.  All rights reserved.
+Michael Plass, August 14, 1989 12:10:37 pm PDT
+Last changed by Pavel on March 20, 1989 4:00:22 pm PST
+Evaluation Support
+This gets called if we encounter an activation that is part of a continuation.
+e.names _ NIL;
+FOR i: NAT IN [0..n) DO e[i] _ NIL ENDLOOP;
+Evaluator
+This is a tail call.  Reuse the old activation storage.
+Meta-level Primitives
+The continuation was called.
+Tidbit Support
+Initialization
+ù ó  ñ(cedarcode) styleïNewlineDelimiter
+ô codeöúôKöú
+œeú=ôHKô.Kô6Kò óKöœk	úûú1òCKò Kö–lnúûòKöûúûúò+Köûúòöúûúûúò#Kò KöûúûúûúòKöú	ûúûúòóheadôöœnúûúûúò=KôNKöúûúò*Köúûúòöûú	ûúûúòKöúòKöúûúò1öûúûúûúûòKòKöûúòóKòKöúòóKöúûúòKöûúòKöúòóKò ö†úûúò%ö	ûúûúûúûú
+ûò:Köûú	ûúûúò%KöúûúòKöûúòóKòKò óKòAö†úûú*ûúûú òhKöú-œc"òOKöúHûúòOöúûúò%KòKöúûúò	Köúûúò
+Kò
+Köú°3ò9KòKöúûúûúûúòKöúûòKòóKòKòKòKòKòKò)KöûúòKöúòKò óö†
+úûúûú
+ò2ö
+†úûúûúûú	ûúò)KöûúûúûúûúòQKöúòóKöúûúòö	ûúûúû
+úûú
+ûò$Kò!KöûúòóKöûúòKöúòKò óKöúûúòKöúûúûú	òöú	ûúûúòKöúûú°ò5Köú
+ûúûúûúò1KöúòKò óKöúûúòKöúûúûúûúò<öú
+ûúûúûúûú	ûúûúûúûúûúûúò~Kò óö†úûú8ûúònKöúûúòKöú	ûúûúòöûúûúûú!ûò>öûúòKöûú	ûú+ò:KòKòKöûúûúûúò KöúòóöûúòKöúûúûúòKöûú	ûú)ò8Köú	ûúò KöúòóóKòKòKòKöúòKò óö†úûú!ò.Köúûú
+òKöûúûúûúòKòKöú
+ûúôKö
+ûúûúûúûúûúô+öûúûúûúòKöú	ûú ò,Köûú	ûú)ò8KòKòKöúòóKöúòKò óö†úûúò%öûúûúûòKöúòKöúòKòöûúûúûúûò)KöúûúòKöûúòóKöúûúòKöú	ûúòKöûúòóöûúûúûúûòKöú	ûú ò,öûúûúûòKòKòKö
+ûúûúûúûú	ûúò4KöúûúòKöúûúòKöûúòóKöûúòóKöúòóóô	Köúûúò#ö†úûúûú
+ò4Köúûúòö†úûúûú
+ò9Köúûúò1öûòKòöûúòKöûú.ò2öûúòKöúòKò&KöúòóóKöûú
+ûúò+öûú	ûúòKòö
+†úûúûúûú	ûúò)KöûúûúûúûúòOKöúòóöûúûúûòöúòKöúZòZKöúûú°!ò<Köúûú
+°ò-Köú	ûúòKòöûúûúûòöú	ûú)ò5öûúûúûúûòKòKöûúòóKöûúûú
+ûúò%Köúòóöúûúò!Köúûúûú°*ò>öûúûúûúûòKòKöûúòóöûúûúûúûòKòKöûúòóKöûúûú
+ûúò%Köúòóöúûúò!KöúûúòöûúûúûúûòKòKöûúòóöûúûúûúûò"Kò KöûúòóKòKöúòóöûúòKòKöú5ò5Köúòóóöûú	òöûúòKô7Köûú
+ûúûúòKöûú	ûúûúûúò<KöúûúòKöúòóöûúòKòöûúûòöûúòKöúûúòKöúûúòKöúòóöûòKòóóKòKò$KòKöúòóóKöûú
+ûúûúòKòKòKòKöúûúòKòKöúòKöûúòKöúòóöúòKöúûú	òKöú	ûúòKòKòöûúûúûòö	úûú"ûúûúûúògöûúûòKöú9ûúò>Köú:ûúò?Köú=ûúòBKöú@ûúòEKöûúòóKöúòóöúûúûúûúòAKöúûúòKöúûúûúûúò(Köúûúûúò"ö	ûúûúû
+úûúûò&Kò KöûúòóöûúûúûúûòKòKöûúòóKò+KöúòóKöûú9ò@óKòóöûúòKòKòKöú)ò)KöúòóóKöúòóöûú
+ûòöûú	òKöûúòöûúòKöûú	ûúûúûúò<KöúûúòKòMKöúòóóKöûúûúûúûú	òKöûúòóKöûú
+ûúò+öûúò!KöûúòKöûú.ò2óKòKòKöúòKöûúòóKöúòóKöúûú
+òKöûúûúûúûúûúûúûúòRöûòKöúûúòKòò"KöúGûúòMKòóKöúòKöûú	òKöûúòóKöúòKò óö†úûúûú#ûú
+òFöúûúò.Köúûúò
+Köúûúò	Köúûúò
+Köú
+ò
+KöúòKöúòKöúûúûúûúòKöúûòKöúòóKòKòöûúûúûúûò"KòKòKöûúòóKöûúòKöúòKò óö†úûúûú
+ò@Köú,ò,öûúûòKöûúûúòóöûòKöûúòóKòKò óKò:ö†úûúûúûú
+òDKöúCûúòJKöú2ûúò9öûúûúòKöûúòóöûòKöûúòóKòKò óKòAö†úûúûúûú
+òCKöú@ûúòGKöú)ûúò0KöûúòKòKò óóôöú%ûúò;KöúòKöú
+ûúûúò+KöúûúòKöúòKöúòKöúòKöúûúòKöú
+ûúòKöúòKöúòKöúûòKöúòKò óö†úûúò-öûúûòòKöú$ûúCòjKòKòKòKöú°2òEKòKòKòKò
+KòóöúòKôKöú	ûúò!KòKòKò
+KöúòóKöûúûúòóKöúòKò óö†úûúò,KöúûúòKòKòKòKöûúûú	ûú+òXöûú!ûúûúûò7öûúòKöûúòKöûú*ò.óKò
+KöûúòóKò
+KöúòKò óö†úûúò,KòKöú'°ò@Köú°ò%Köú°òKöú°
+òKöú°
+òKòKòKò
+Kòóóôö†úûúûúò5Köúûúò*Kò
+Köûúò
+KöúòKò óö†úûúûúò>Köúûúò*Kò
+Kò
+Köûúò
+KöúòKò óö†úûúûúòGKöúûúò*Kò
+Kò
+Kò
+Köûúò
+KöúòKò óö†úûú&ûúòPKöúûúò*Kò
+Kò
+Kò
+Kò
+Köûúò
+KöúòKò óö†úûú/ûúòYKöúûúò*Kò
+Kò
+Kò
+Kò
+Kò
+Köûúò
+KöúòKò óö†úûú8ûúòbKöúûúò*Kò
+Kò
+Kò
+Kò
+Kò
+Kò
+Köûúò
+KöúòKò óö†úûúûúAûúòkKöúûúò*Kò
+Kò
+Kò
+Kò
+Kò
+Kò
+Kò
+Köûúò
+KöúòKò óKöú
+ûúûúûúòö†úûúûúûúûúûúûúò8KöúûúûúòKöúûúòKïStartOfExpansion)[rope: ROPE, oldStream: STREAM _ NIL]öúûúûúò%Köûúò
+Köúòóö†úûúûúûúûúûúûúûúûúòPKò óö
+†úûúûúûúûúòFKöúûúûúòKöúûú
+òKòKöúòKò óö†úûúòKöúûú°IòaKöú°ò'Köúûú°;òKKöú°ò5Köú°2òAKöúûú°$ò8Köú
+ûú°ò Köúûúûú°*ò9KöúûúòKöúûúûúò$KòKöúûúò9Köú6ò6öúòöûú
+ûúûòKöúòKöûúûúò,óóKöúûúûúòKòöûúûúòKöúòKöúòKöúòKöúòKöúòKöúòKöúòKöúòKöúòKöú	ò	KöúòKöúòóKöúòKò óö†úûú&ûúòNKöúûú&ò6öûúûúûúûòKò4KòKöûúòóKöûúò
+KöúòKò óö†úûúûúò4öûúûúûúûòKñ[rt: REF READONLY TEXT]öúûúûú#ò1Kñ[rt: REF READONLY TEXT]öúûúò"Kñ[rt: REF READONLY TEXT]öúûú	òKñ[rt: REF READONLY TEXT]öú9ò9KöûúûúòóKöúòKò óö
+†
+úûúûúûúûúòVKöú'ò'ö†	úûúòöûú ûúûúûò1Köûúûúûú,òAöûúûúûúûò9Köúûúò&KöûúûúòóKöûúòóKöúòóKöúòöûú
+ûúûúòKöú?ò?KöúòKöúòóKöûú
+ûúûúûúòKöúòKò óö†úûúûúûúòTKö
+ûúûúûúûúûúò5KòKöûúûúûúò?KòKò óö$†úûúûúûú	ûúûúûúûú
+ûú"ûú.ûúûúûúûúûúûúûúûú	ò£öúûúò)KöúòKöú
+ûúò+KöúòKöúòKöúòKöúòKöú0ò0KöúòKöúòKöú	ò	KöúûòKöúòóKöú+ûú5òcKöúòKò óóôö†úûúò!Köú=ûú"ûú>ò¶Köú?ûúûúLò™Köú1ûúûúÄûú,òˆKöúòKò óKöúòò Kò óóKöûúòó Öó    <p  U  

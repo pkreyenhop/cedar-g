@@ -1,0 +1,912 @@
+
+DIRECTORY
+BasicTime USING [GMT, nullGMT, Now, Period],
+BlackCherry,
+BlackCherryInternal,
+BlackCherrySidedoor,
+Convert USING [Error, RopeFromTimeRFC822, TimeFromRope],
+IO,
+MailBasics,
+MailBasicsFileTypes,
+MailMessage USING [ReadOneMessageX],
+MailParse USING [endOfInput, FinalizeParse, GetFieldBody, GetFieldName, InitializeParse, ParseError, ParseHandle],
+MailRetrieve USING [Accept, Failed, FailureReason, Handle, MailboxState, MBXState, NextMessage, NextServer, ServerName, ServerState, ServerType, StartMessage],
+MailUtils USING [Credentials, GetLoggedInUser, GetUserCredentials, LocalNameFromRName],
+Process USING [Detach],
+RedBlackTree,
+RefText,
+Rope,
+RuntimeError USING [BoundsFault],
+UserProfile USING [Boolean],
+VFonts USING [CharWidth, StringWidth];
+
+BlackCherryMailImpl: CEDAR MONITOR
+IMPORTS BasicTime, BlackCherry, BlackCherryInternal, Convert, IO, MailMessage, MailParse, MailRetrieve, MailUtils, Process, RedBlackTree, Rope, RuntimeError, UserProfile, VFonts
+
+EXPORTS BlackCherryInternal, BlackCherrySidedoor ~ BEGIN OPEN BlackCherry, BlackCherryInternal, BlackCherrySidedoor;
+
+ROPE: TYPE ~ Rope.ROPE;
+STREAM: TYPE ~ IO.STREAM;
+
+CantParse: SIGNAL ~ CODE;
+RetrieveState: TYPE ~ ATOM;
+blanks: ROPE ~ "                                                  "; -- lotsa blanks
+blankWidth: INT ~ VFonts.CharWidth[' ]; -- in default font
+date: ROPE ~ "Date";
+subject: ROPE ~ "Subject";
+from: ROPE ~ "From";
+sender: ROPE ~ "Sender";
+to: ROPE ~ "To";
+userRNameList: PUBLIC MailBasics.RNameList;
+simpleUserNameList: PUBLIC LIST OF ROPE;
+localRNameList: LIST OF ROPE;
+credentials: PUBLIC LIST OF MailUtils.Credentials;
+
+UpdateUser: PUBLIC ENTRY PROC[msiData: MsiData]  ~ { UpdateUserInternal[msiData] };
+
+UpdateUserInternal: INTERNAL PROC[msiData: MsiData] ~ {
+ENABLE BEGIN
+UNWIND => NULL;
+MailRetrieve.Failed => {
+Report[
+"MailRetrieve.Failed. Why: %g, text: %g\n", [atom[why]], [rope[text]] ];
+GOTO nogood;
+};
+END;
+gvMail: BOOL ~ UserProfile.Boolean["BlackCherry.gvMail", TRUE];
+xnsMail: BOOL ~ UserProfile.Boolean["BlackCherry.xnsMail", TRUE];
+CloseRetrieveHandle[];
+userRNameList ¨ NIL;
+simpleUserNameList ¨ localRNameList ¨ NIL;
+credentials ¨ MailUtils.GetUserCredentials[
+SELECT TRUE FROM ( gvMail AND xnsMail ) => NIL,
+gvMail => $gv, xnsMail => $xns, ENDCASE => $xns];
+
+MakeAndSetNewHandle[credentials, msiData];
+FOR ucL: LIST OF MailUtils.Credentials ¨ credentials, ucL.rest UNTIL ucL = NIL DO
+this: ROPE;
+userRNameList ¨ CONS[ucL.first.rName, userRNameList];
+simpleUserNameList ¨ CONS[this ¨ MailUtils.GetLoggedInUser[ucL.first.rName.ns], simpleUserNameList];
+localRNameList ¨ CONS[this ¨ MailUtils.LocalNameFromRName[[ucL.first.rName.ns, this]], localRNameList];
+ENDLOOP;
+EXITS nogood => {};
+};
+ 
+IsCurrentUser: PUBLIC PROC [ sender: ROPE ] RETURNS [ yes: BOOL ¨ TRUE ] ~ {
+FOR rnL: MailBasics.RNameList ¨ userRNameList, rnL.rest UNTIL rnL = NIL DO
+IF sender.Equal[rnL.first.name, FALSE] THEN RETURN;
+ENDLOOP;
+FOR rnL: LIST OF ROPE ¨ localRNameList, rnL.rest UNTIL rnL = NIL DO
+IF sender.Equal[rnL.first, FALSE] THEN RETURN;
+ENDLOOP;
+FOR rnL: LIST OF ROPE ¨ simpleUserNameList, rnL.rest UNTIL rnL = NIL DO
+IF sender.Equal[rnL.first, FALSE] THEN RETURN;
+ENDLOOP;
+RETURN[FALSE];
+};
+
+WriteMsgs: PUBLIC PROC [msInfo: MsgSetInfo, mailStrm: IO.STREAM]
+RETURNS [ numMsgs: INT ¨ 0, newList, newLast: MsgHandle ¨ NIL ] ~ {
+reader: IO.STREAM ~ msInfo.fileData.readStream;
+writer: IO.STREAM ~ mailStrm;
+segmentStart: INT ~ writer.GetLength[]; -- append to end of stream/log!
+writer.SetIndex[segmentStart];
+FOR msgH: MsgHandle ¨ msInfo.first, msgH.next WHILE ( msgH # NIL ) DO
+IF ( msgH.deleted ) THEN LOOP;
+BEGIN
+entryStart: INT ~ msgH.entryStart;
+entryLen: INT ~ msgH.entryLen;
+writeStart: INT ~ writer.GetLength[];
+textLen: INT ~ msgH.textLen;
+headersPos: INT ~ writeStart + ( msgH.headersPos - msgH.entryStart );
+formatPos: INT ~ headersPos + textLen;
+cell: MsgHandle ~ NEW[MsgHandleRec ¨
+[gvID: msgH.gvID, unRead: msgH.unRead, headersPos: headersPos, textLen: textLen, formatPos: formatPos, formatLen: msgH.formatLen, entryStart: writeStart, entryLen: entryLen, next: NIL] ];
+reader.SetIndex[entryStart];
+CopyBytes[to: writer, from: reader, num: entryLen];
+writer.Flush[];
+IF newLast = NIL THEN newList ¨ cell ELSE newLast.next ¨ cell;
+newLast ¨ cell;
+IF ( numMsgs ¨ numMsgs.SUCC ) MOD 10 = 0 THEN {
+IF numMsgs MOD 100 = 0 THEN Report["(%g) ", [integer[numMsgs]] ]
+ELSE Report["."];
+};
+END;
+ENDLOOP;
+writer.Flush[];
+IF ( reader # writer ) THEN reader.Flush[];
+};
+
+WriteTOC: PUBLIC PROC [ reader, writer: STREAM, numMsgs, segmentStart: INT, msgH: MsgHandle, useFromFieldInTOC: BOOL]
+RETURNS [ last: MsgHandle ¨ NIL ] ~ {
+posForEntry: INT ~ writer.GetLength[]; -- where the toc entries get written
+writer.SetIndex[posForEntry];
+writer.PutF[relTocEntriesEntryTemplate, [integer[0]], [integer[numMsgs]] ];
+FOR thisH: MsgHandle ¨ msgH, thisH.next WHILE ( thisH # NIL ) DO
+mostOfToc: ROPE;
+reader.SetIndex[thisH.headersPos];
+
+mostOfToc ¨ TOCFromStream[reader, thisH.textLen, useFromFieldInTOC].toc;
+thisH.toc ¨ Rope.Concat[" ", mostOfToc];
+writer.Flush[];
+writer.SetIndex[writer.GetLength[]];	-- set at end for sure
+thisH.charPos ¨ writer.GetIndex[];
+IF thisH.unRead THEN writer.PutRope[" ? "] ELSE writer.PutRope["   "];
+writer.PutRope[mostOfToc];
+writer.PutFL["\r%g %g %g %g\r",
+LIST[[integer[thisH.headersPos-segmentStart]], [integer[thisH.textLen]],
+[integer[IF thisH.formatPos = 0 THEN 0 ELSE thisH.formatPos-segmentStart]], [integer[thisH.formatLen]] ]];
+writer.PutF["%g %g\r", [integer[thisH.entryStart-segmentStart]], [integer[thisH.entryLen]] ];
+last ¨ thisH;
+ENDLOOP;
+{
+now: INT ~ writer.GetLength[];
+entryLen: INT ~ now-posForEntry;
+writer.SetIndex[posForEntry];
+writer.PutF[relTocEntriesEntryTemplate, [integer[entryLen]], [integer[numMsgs]] ];
+};
+writer.Flush[];
+IF ( reader # writer ) THEN reader.Flush[];
+};
+relTocPointerEntryTemplate: PUBLIC ROPE ¨ "*entry*%10g\rRelTOCPointer  %10g\r";
+relTocEntriesEntryTemplate: PUBLIC ROPE ¨ "*entry*%10g\rRelTOCEntries %5g\r";
+headerEntryTemplate: PUBLIC ROPE ¨ "*entry* %10g\r";
+createMsgTemplate: PUBLIC ROPE ¨ "CreateMsg\r%g\r%10g %10g\r";
+
+RelTOCPointerRope: ROPE = "RelTOCPointer";
+TOCPointerRope: ROPE = "TOCPointer";
+RelTOCEntriesRope: ROPE = "RelTOCEntries";
+TOCEntriesRope: ROPE = "TOCEntries";
+
+IsEntryFound: PROC [line: ROPE, start: INT] RETURNS [ok: BOOL] ~ {
+IF ( ok ¨ ( line.Find["*entry*", 0] = 0 ) ) THEN RETURN;
+BadEntryReport[line, "*entry*", start];
+};
+
+BadEntryReport: PROC[line, which: ROPE, where: INT] = {
+Report["***\n Found %g instead of %g at file pos %g - some messages may not be available\n", [rope[line]], [rope[which]], [integer[where]] ];
+};
+
+IsIdentFound: PROC [ident, which: ROPE, start: INT, failOK: BOOL ¨ FALSE]
+RETURNS [ok: BOOL] ~ {
+IF ( ok ¨ ( ident.Equal[which] ) ) THEN RETURN;
+IF NOT failOK THEN BadEntryReport[ident, which, start];
+};
+
+ReadBWFile: PUBLIC PROC [msInfo: MsgSetInfo] RETURNS [numUndel, totalMsgs: INT ¨ 0, ok: BOOL ¨ FALSE] ~ {
+fileName: ROPE ~ msInfo.fileName;
+stream: IO.STREAM ~ msInfo.fileData.readStream;	-- can only read from a readStream
+streamLen: INT ~ stream.GetLength[];
+thisRead: INT;
+BEGIN ENABLE BEGIN
+IO.EndOfStream => {
+Report["\n *** IO.EndOfStream reading mailLog, file index at %g - some messages may not be available\n", [integer[stream.GetIndex[]]] ];
+GOTO notgood;
+};
+UNWIND => {
+Report["\n *** UNWIND reading mailLog, file index at %g - some messages may not be available\n", [integer[stream.GetIndex[]]] ];
+GOTO notgood;
+};
+END;
+DO
+first: MsgHandle ¨ NIL;
+current: MsgHandle ¨ NIL;
+start: INT ~ stream.GetIndex[];
+isRelToc, isRelEntries: BOOL ¨ TRUE;
+IF ( start = streamLen ) THEN RETURN[numUndel, totalMsgs, TRUE];
+{
+entryRope: ROPE ~ stream.GetLineRope[];
+IF ( NOT IsEntryFound[entryRope, start] ) THEN RETURN;
+};
+{
+identRope: ROPE ~ stream.GetTokenRope[].token;
+startPos: INT ~ stream.GetIndex[];
+IF ( NOT IsIdentFound[identRope, RelTOCPointerRope, startPos, TRUE] ) THEN {
+IF NOT IsIdentFound[identRope, TOCPointerRope, startPos] THEN RETURN;
+isRelToc ¨ FALSE;	-- not relative tocPointer
+};
+[] ¨ stream.GetChar[];
+};
+{
+tocStart: INT ¨ stream.GetInt[]; -- int is position for TOCEntries entry
+IF isRelToc THEN tocStart ¨ tocStart + start;
+IF ( tocStart >= streamLen )  OR ( tocStart < start ) THEN {
+Report["\n *** Bad TOCEntries pointer (%g) in entry at pos %g - some messages may not be available\n",
+[integer[tocStart]], [integer[start]] ];
+RETURN;
+};
+stream.SetIndex[tocStart];
+};
+{
+entryRope: ROPE ~ stream.GetLineRope[];
+IF ( NOT IsEntryFound[entryRope, start] ) THEN RETURN;
+};
+{
+identRope: ROPE ~ stream.GetTokenRope[].token;
+startPos: INT ~ stream.GetIndex[];
+IF ( NOT IsIdentFound[identRope, RelTOCEntriesRope, startPos, TRUE] ) THEN {
+IF ( NOT IsIdentFound[identRope, TOCEntriesRope, startPos] ) THEN RETURN;
+isRelEntries ¨ FALSE;
+};
+[] ¨ stream.GetChar[];
+};
+thisRead ¨ stream.GetInt[];
+[] ¨ stream.GetChar[];
+totalMsgs ¨ totalMsgs + thisRead;
+
+FOR i: INT IN [0..thisRead) DO
+weAreHere: INT;
+this: MsgHandle ~ NEW[MsgHandleRec];
+this.charPos ¨ stream.GetIndex[];	-- where the del char goes
+this.deleted ¨ stream.GetChar[] = '*;	-- first char in loc line
+this.unRead ¨ stream.GetChar[] = '?;	-- second char in loc line
+this.toc ¨ stream.GetLineRope[];
+this.headersPos ¨ stream.GetInt[];
+this.textLen ¨ stream.GetInt[];
+this.formatPos ¨ stream.GetInt[];
+this.formatLen ¨ stream.GetInt[];
+this.entryStart ¨ stream.GetInt[];
+this.entryLen ¨ stream.GetInt[];
+[] ¨ stream.GetChar[];		-- trailing CR
+IF isRelEntries THEN {
+this.headersPos ¨ this.headersPos + start;
+IF this.formatPos # 0 THEN this.formatPos ¨ this.formatPos + start;
+this.entryStart ¨ this.entryStart + start;
+};
+weAreHere ¨ stream.GetIndex[];	-- GetMsgID will change the position
+this.gvID ¨ GetMsgID[msInfo, this];
+stream.SetIndex[weAreHere];
+IF NOT this.deleted THEN numUndel ¨ numUndel + 1;
+IF ( first = NIL )
+THEN { current ¨ first ¨ this }
+ELSE { current.next ¨ this; current ¨ current.next };
+ENDLOOP;
+IF customProcs#NIL AND customProcs.insertMsgs#NIL 
+THEN customProcs.insertMsgs[msInfo, first]
+ELSE AppendMsgs[msInfo, first, current];
+ENDLOOP;
+EXITS notgood => NULL;
+END;
+};
+
+DoCopyOrExpunge: PUBLIC PROC [msInfo: MsgSetInfo, logName: ROPE, altFileData: BCFileData, sortem: BOOL]
+RETURNS[newList, newLast: MsgHandle ¨ NIL]~ {
+msiData: MsiData ~ NARROW[msInfo.data];
+numMsgs: INT;
+msgStream, mailStrm: IO.STREAM;
+segmentStart, tocStart, endMarker: INT;
+entryLen, delta: INT;
+msgStream ¨ altFileData.readStream;
+mailStrm ¨ altFileData.writeStream;
+BEGIN ENABLE IO.EndOfStream => {
+Report["\n***IO.EndOfStream during CopyOrExpunge - quitting\n" ];
+mailStrm.Close[];
+IF msgStream # mailStrm THEN msgStream.Close[];
+GOTO exit
+};
+segmentStart ¨ mailStrm.GetLength[];
+mailStrm.SetIndex[segmentStart];
+mailStrm.PutF[relTocPointerEntryTemplate, [integer[0]], [integer[0]] ];
+msgStream.Flush[];	-- need to flush read stream when write stream changes
+entryLen ¨ mailStrm.GetIndex[] - segmentStart;
+IF sortem THEN SortByDate[msInfo, msiData.useFromFieldInTOC]; -- JKF
+[numMsgs, newList] ¨ WriteMsgs[msInfo, mailStrm];
+tocStart ¨ mailStrm.GetLength[];
+msgStream.Flush[];
+newLast ¨ WriteTOC[msgStream, mailStrm, numMsgs, segmentStart, newList, msiData.useFromFieldInTOC];
+endMarker ¨ mailStrm.GetLength[];
+delta ¨ endMarker - segmentStart;
+mailStrm.SetIndex[segmentStart];
+mailStrm.PutF[relTocPointerEntryTemplate,
+[integer[entryLen]], [integer[tocStart-segmentStart]] ];
+msgStream.Close[];
+IF mailStrm # msgStream THEN mailStrm.Close[];
+EXITS
+exit => RETURN
+END;
+Report["\n%g messages written to %g\n", [integer[numMsgs]], [rope[logName]] ];
+};
+
+DoAppendMsg: PUBLIC PROC[msInfo: MsgSetInfo, msgID, plainText, formatting: ROPE] = {
+writer: IO.STREAM ~ msInfo.fileData.writeStream;
+msiData: MsiData ~ NARROW[msInfo.data];
+posForEntry: INT ¨ writer.GetLength[];
+entryLen, posForMsg, msgTemplatePos, headersPos, textLen, formatPos, formatLen: INT;
+initialCR: BOOL ¨ FALSE;
+msgH, last: MsgHandle;
+
+writer.SetIndex[posForEntry];
+
+writer.PutF[relTocPointerEntryTemplate, [integer[0]], [integer[0]] ];
+entryLen ¨ writer.GetIndex[] - posForEntry;
+posForMsg ¨ writer.GetLength[];
+writer.PutF1[headerEntryTemplate, [integer[0]] ];
+msgTemplatePos ¨ writer.GetIndex[];
+writer.PutF[createMsgTemplate, [rope[msgID]], [integer[0]], [integer[0]] ];
+headersPos ¨ writer.GetIndex[];
+IF ( formatting # NIL ) AND ( plainText.Length[] > 0 ) THEN {
+firstChar: CHAR ~ plainText.Fetch[0];
+IF ( initialCR ¨ ( firstChar = '\r )) THEN plainText ¨ plainText.Substr[1];
+};
+textLen ¨ plainText.Length[];
+writer.PutRope[plainText];
+IF formatting # NIL THEN {
+formatPos ¨ writer.GetLength[];
+formatLen ¨ formatting.Length[];
+}
+ELSE formatPos ¨ formatLen ¨ 0;
+
+writer.PutRope[formatting];
+writer.PutChar['\r];
+IF ( NOT initialCR ) AND ( formatting # NIL ) THEN {
+textLen ¨ textLen - 1;
+headersPos ¨ headersPos + 1;
+};
+writer.SetIndex[msgTemplatePos];
+writer.PutF[createMsgTemplate, [rope[msgID]], [integer[textLen]], [integer[formatLen]] ];
+StrmFlush[writer, msiData];
+
+msgH ¨ NEW[MsgHandleRec ¨ [gvID: msgID, headersPos: headersPos, textLen: textLen, formatPos: formatPos, formatLen: formatLen] ];
+writer.SetIndex[posForMsg];
+msgH.entryStart ¨ posForMsg;
+msgH.entryLen ¨ writer.GetLength[] - posForMsg;
+writer.PutF1[headerEntryTemplate, [integer[msgH.entryLen]] ];
+msgH.unRead ¨ FALSE;
+{
+now: INT ~ writer.GetLength[];
+entryLen: INT ~ posForMsg-posForEntry;
+writer.SetIndex[posForEntry];
+writer.PutF[relTocPointerEntryTemplate, [integer[entryLen]], [integer[now - posForEntry]] ];
+last ¨ WriteTOC[msInfo.fileData.readStream, msInfo.fileData.writeStream, 1, posForEntry, msgH, msiData.useFromFieldInTOC];
+CloseAndOpen[msInfo];
+};
+IF customProcs#NIL AND customProcs.newMail#NIL 
+THEN customProcs.newMail[msInfo, msgH];
+IF customProcs#NIL AND customProcs.insertMsgs#NIL 
+THEN customProcs.insertMsgs[msInfo, msgH]
+ELSE AppendMsgs[msInfo, msgH, last];
+};
+
+AppendMsgs: PUBLIC PROC [msInfo: MsgSetInfo, first: MsgHandle, last: MsgHandle] ~ {
+SELECT TRUE FROM
+( first = NIL ) => { NULL }; -- no messages in this chunk
+( msInfo.last = NIL ) => { -- splice onto front of msInfo
+msInfo.first ¨ first;
+msInfo.last ¨ last;
+};
+ENDCASE => { -- splice onto tail of msInfo
+msInfo.last.next ¨ first;
+msInfo.last ¨ last;
+};
+};
+
+DateObj: TYPE = RECORD [
+date: BasicTime.GMT,
+mh: MsgHandle];
+
+SortByDate: PROC [msInfo: MsgSetInfo, useFromFieldInTOC: BOOL] = {
+EachNode: RedBlackTree.EachNode --PROC [data: UserData] RETURNS [stop: BOOL ¨ FALSE]-- = {
+ro: REF DateObj ¨ NARROW[data];
+mh: MsgHandle ¨ ro.mh;
+mh.next ¨ NIL;
+IF first = NIL THEN first ¨ mh ELSE last.next ¨ mh;
+last ¨ mh};
+nullMsg: MsgHandleRec = [NIL, NIL, FALSE, TRUE, 0, 0, 0, 0, 0, 0, 0, NIL, NIL, NIL, NIL];
+first: MsgHandle ¨ NIL;
+last: MsgHandle ¨ NIL;
+reader: STREAM ¨ msInfo.fileData.readStream;
+table: RedBlackTree.Table ¨ RedBlackTree.Create[GetKey, Compare];
+
+FOR msgH: MsgHandle ¨ msInfo.first, msgH.next WHILE ( msgH # NIL ) DO
+do: REF DateObj ¨ NEW[DateObj ¨ [BasicTime.nullGMT, msgH]];
+reader.SetIndex[msgH.headersPos];
+[, do.date] ¨ TOCFromStream[reader, msgH.textLen, useFromFieldInTOC];
+RedBlackTree.Insert[table, do, do ! RedBlackTree.DuplicateKey => {
+savednext: MsgHandle ¨ msgH.next;
+msgH≠ ¨ nullMsg;
+msgH.next ¨ savednext;
+CONTINUE}];
+ENDLOOP;
+RedBlackTree.EnumerateIncreasing[table, EachNode];
+msInfo.first ¨ first;
+msInfo.last ¨ last;
+RedBlackTree.DestroyTable[table];
+};
+
+GetKey: RedBlackTree.GetKey --PROC [data: UserData] RETURNS [Key]-- = {
+rr: REF DateObj ¨ NARROW[data];
+RETURN[rr]
+};
+
+Compare: RedBlackTree.Compare --PROC [k: Key, data: UserData] RETURNS [Basics.Comparison]-- = {
+lo: REF DateObj ¨ NARROW[data];
+ro: REF DateObj ¨ NARROW[k];
+period: INT ¨ BasicTime.Period[lo.date, ro.date];
+SELECT TRUE FROM
+period < 0 => RETURN[less];
+period > 0 => RETURN[greater];
+ENDCASE => RETURN[equal]
+};
+ReadAnyNewMail: PUBLIC ENTRY PROC [msInfo: MsgSetInfo] ~ {
+msiData: MsiData ~ NARROW[msInfo.data];
+rh: MailRetrieve.Handle ~ GetRetrieveHandle[].mHandle;
+posForMsgs: INT;
+numMsgs: INT; msgH: MsgHandle;
+last: MsgHandle;
+IF rh = NIL THEN RETURN;
+IF userRNameList = NIL THEN {
+UpdateUserInternal[msiData];
+IF userRNameList = NIL THEN {	-- still NIL, tell user to login
+Report["\n*****You must login - no mail retrieved\n"];
+RETURN
+};
+};
+Report["\n ~~~ Retrieving mail for %g @ %g\n", [rope[userRNameList.first.name]], [time[BasicTime.Now[]]] ];
+
+DO 		-- for each server
+reader: IO.STREAM ~ msInfo.fileData.readStream;	-- cf CloseAndOpen below
+writer: IO.STREAM ~ msInfo.fileData.writeStream;
+posForEntry: INT ¨ writer.GetLength[];
+noMore, retrieveOK: BOOL ¨ FALSE;
+writer.SetIndex[posForEntry];
+[numMsgs, msgH, posForMsgs, noMore, retrieveOK] ¨ DoOneServer[msInfo, msiData, writer];
+IF noMore THEN {
+TRUSTED { Process.Detach[FORK ForceStateOff[]] };
+RETURN;
+}
+ELSE IF NOT retrieveOK THEN {
+IF ( writer.GetLength[] > posForEntry ) THEN
+SetFileLength[msInfo, posForEntry];
+LOOP;
+};
+IF numMsgs > 0 THEN {
+now: INT ~ writer.GetLength[];
+entryLen: INT ~ posForMsgs-posForEntry;
+writer.SetIndex[posForEntry];
+writer.PutF[relTocPointerEntryTemplate, [integer[entryLen]], [integer[now - posForEntry]] ];
+};
+last ¨ WriteTOC[msInfo.fileData.readStream, msInfo.fileData.writeStream, numMsgs, posForEntry, msgH, msiData.useFromFieldInTOC];
+CloseAndOpen[msInfo];
+IF msiData.okToFlushMail THEN  -- now we can flush the server
+MailRetrieve.Accept[rh ! MailRetrieve.Failed => {
+Report["\n Messages not flushed: why=%g, msg=%g\n", [atom[FailedWhyToAtom[why]]], [rope[text]] ];
+CONTINUE }]
+ELSE Report["\n Messages not flushed - okToFlushMail is FALSE\n"];
+
+IF customProcs#NIL AND customProcs.newMail#NIL 
+THEN customProcs.newMail[msInfo, msgH];
+IF customProcs#NIL AND customProcs.insertMsgs#NIL 
+THEN customProcs.insertMsgs[msInfo, msgH]
+ELSE AppendMsgs[msInfo, msgH, last];
+ENDLOOP;
+};
+
+TOCFromStream: PROC [stream: STREAM, len: INT, useFromFieldInTOC: BOOL]
+RETURNS [toc: ROPE, mDate: BasicTime.GMT ¨ BasicTime.nullGMT] ~ {
+mPos: INT ¨ 0;
+NextChar: PROC RETURNS [ ch: CHAR ] ~ {
+IF ( mPos > len )
+THEN ch ¨ MailParse.endOfInput
+ELSE ch ¨ stream.GetChar[ ! IO.EndOfStream =>
+{ mPos ¨ len; ch ¨ MailParse.endOfInput; CONTINUE } ];
+mPos ¨ mPos.SUCC;
+};
+pH: MailParse.ParseHandle ¨ MailParse.InitializeParse[];
+mFrom, mTo, mSubject, mSender: ROPE;
+savedFrom, tocx, rDate: ROPE;
+ch: CHAR ~ stream.PeekChar[];
+IF ( ch = '\n ) OR ( ch = '\r ) THEN { [] ¨ stream.GetChar[]; mPos ¨ 1 };
+{
+ENABLE MailParse.ParseError => GOTO parseErrorExit;
+fieldName: ROPE ¨ NIL;
+wantThisField, continue: BOOL ¨ TRUE;
+DO
+fieldName ¨ MailParse.GetFieldName[pH, NextChar];
+SELECT TRUE FROM
+( fieldName = NIL ) => { EXIT };
+( fieldName.Equal[date, FALSE] ) => {
+body: ROPE ~ MailParse.GetFieldBody[pH, NextChar];
+mDate ¨ Convert.TimeFromRope[body ! Convert.Error => CONTINUE ];
+};
+( fieldName.Equal[subject, FALSE] ) => {
+mSubject ¨ MailParse.GetFieldBody[pH, NextChar];
+};
+( fieldName.Equal[sender, FALSE] ) => {
+savedFrom ¨ mSender;
+mSender ¨ MailParse.GetFieldBody[pH, NextChar];
+};
+( fieldName.Equal[to, FALSE] ) => {
+mTo ¨ MailParse.GetFieldBody[pH, NextChar];
+};
+( fieldName.Equal[from, FALSE] ) => {
+body: ROPE = MailParse.GetFieldBody[pH, NextChar];
+IF mSender = NIL THEN mSender ¨ body ELSE savedFrom ¨ body;
+};
+ENDCASE => {
+[] ¨ MailParse.GetFieldBody[pH, NextChar, TRUE];
+};
+ENDLOOP;
+MailParse.FinalizeParse[pH];
+EXITS
+parseErrorExit => { MailParse.FinalizeParse[pH]};
+};
+IF ( mDate = BasicTime.nullGMT ) THEN mDate ¨ BasicTime.Now[];
+IF ( ( useFromFieldInTOC ) AND ( savedFrom # NIL ) ) THEN mSender ¨ savedFrom;
+mFrom ¨ IF ( IsCurrentUser[mSender] ) THEN Rope.Concat["To: ", mTo] ELSE mSender;
+rDate ¨ Rope.Substr[Convert.RopeFromTimeRFC822[mDate, FALSE], 0, 9];
+tocx ¨ rDate.Cat["   ", mFrom];
+tocx ¨ SquashRopeIntoWidth[tocx, 165];
+toc ¨ tocx.Concat[mSubject];
+};
+
+DoOneServer: PROC [msInfo: MsgSetInfo, msiData: MsiData, stream: IO.STREAM]
+RETURNS [numMsgs: INT ¨ 0, msgHandle: MsgHandle, posForMsgs: INT ¨ 0, noMore: BOOL ¨ TRUE, retrieveOK: BOOL ¨ FALSE] ~ {
+ENABLE UNWIND => GOTO unwinding;
+rh: MailRetrieve.Handle ¨ GetRetrieveHandle[].mHandle;
+lastMsgHandle: MsgHandle;
+serverKnown: BOOL ¨ FALSE;
+IF userRNameList = NIL THEN {
+Report["\n*****You must login - no mail retrieved\n"];
+RETURN
+};
+stream.SetIndex[stream.GetLength[]];
+SELECT MailRetrieve.MailboxState[rh] FROM
+badName => Report["\nSome mailbox reported badName - possibly no mailBox\n"];
+badPwd => Report["\nSome mailbox reported badPwd\n"];
+cantAuth => Report["\nSome server not found\n"]; 
+ENDCASE => { NULL }; -- ok to try
+
+{ -- do one server.
+state: RetrieveState;
+serverState: MailRetrieve.ServerState; -- The state of the server.
+serverName: MailBasics.RName;
+serverType: MailRetrieve.ServerType;
+thisMsgHandle, thisLastMsgHandle: MsgHandle;
+{
+ENABLE UNWIND => {
+DO
+[noMore, serverState, serverType] ¨ MailRetrieve.NextServer[rh]; -- cycle thru servers
+IF ( NOT noMore ) THEN LOOP;
+ENDLOOP;
+};
+
+[noMore, serverState] ¨ MailRetrieve.NextServer[rh];
+IF ( noMore ) THEN RETURN; -- Last server?  Then done.
+serverKnown ¨ TRUE;
+
+serverName ¨ MailRetrieve.ServerName[rh];
+Report["%g: ", [rope[serverName.name]] ];
+SELECT serverState FROM
+unknown => { Report[" did not respond\n"] };
+empty => { Report[" empty\n"] };
+notEmpty => {
+curPos: INT ¨ stream.GetLength[];
+stream.PutF[relTocPointerEntryTemplate, [integer[0]], [integer[0]] ];
+posForMsgs ¨ stream.GetLength[];
+[numMsgs, state, msgHandle, lastMsgHandle] ¨ DrainServer[stream, rh, msiData];
+IF ( numMsgs = -1 ) THEN {
+stream.SetLength[curPos];
+StrmFlush[stream, msiData];
+Report[" no messages (%g) retrieved?\n", [integer[numMsgs]] ]
+}
+ELSE {
+Report[" %g messages\n", [integer[numMsgs]] ];
+retrieveOK ¨ TRUE;
+};
+};
+ENDCASE => { NULL };
+};
+}; -- End of servers loop, exit.
+IF ( NOT serverKnown ) THEN Report["\nNoMailboxes"];
+EXITS
+unwinding => Report["UNWIND during newMail\n" ];
+};
+
+DrainServer: PROC [stream: IO.STREAM, rh: MailRetrieve.Handle, msiData: MsiData]
+	RETURNS [num: INT, state: RetrieveState, msgH, lastMsgH: MsgHandle] ~ {
+ENABLE UNWIND => NULL;
+msgState: MsgState;
+thisMsgH: MsgHandle;
+num ¨ 0;
+DO
+[msgState, state, thisMsgH] ¨ ReadMessageItems[stream, rh, msiData];
+SELECT msgState FROM
+noMore => { EXIT };
+OK, wasDeleted => { NULL };
+readButNotFlushed => { NULL };	-- will do something different eventually
+retrieveFailed => { num ¨ -1; EXIT };
+ENDCASE => { ERROR };
+IF ( NOT ( msgState = wasDeleted ) ) THEN {
+IF ( num ¨ num.SUCC ) MOD 10 = 0 THEN Report ["! "] ELSE Report["."];
+};
+IF ( msgH = NIL )
+THEN msgH ¨ lastMsgH ¨ thisMsgH
+ELSE IF ( thisMsgH # NIL )
+THEN { lastMsgH.next ¨ thisMsgH; lastMsgH ¨ thisMsgH };
+ENDLOOP;
+};
+
+MsgState: TYPE ~ { OK, retrieveFailed, noMore, wasDeleted, readButNotFlushed };
+errorRope: ROPE ~ " ... %g error, exp: %g\n";
+
+ReadMessageItems: PROC [stream: IO.STREAM, rh: MailRetrieve.Handle, msiData: MsiData]
+RETURNS [msgState: MsgState, state: RetrieveState, msgH: MsgHandle] ~ {
+ENABLE BEGIN
+MailRetrieve.Failed => {
+state ¨ FailedWhyToAtom[why];
+Report[errorRope, [atom[state]], [rope[text]] ];
+GOTO retFailed;
+};
+IO.Error => {
+state ¨ IO.AtomFromErrorCode[ec];
+Report[errorRope, [atom[state]], [rope[msg]] ];
+GOTO retFailed;
+};
+END;
+msgExists, archived, deleted, read: BOOL;
+msgState ¨ OK;
+state ¨ $OK;
+[msgExists, archived, deleted, read] ¨ MailRetrieve.NextMessage[rh];
+SELECT TRUE FROM
+( deleted ) => { msgState ¨ wasDeleted; RETURN };
+( NOT msgExists ) => { msgState ¨ noMore; RETURN };
+( read ) => msgState ¨ readButNotFlushed;	-- more on this later
+ENDCASE => { NULL };
+{
+ok: BOOL;
+[ok, msgH] ¨ MsgToStream[rh, stream, msiData];
+IF ( NOT ok ) THEN msgState ¨ retrieveFailed;
+};
+EXITS
+retFailed => { msgState ¨ retrieveFailed };
+};
+
+FailedWhyToAtom: PROC[why: MailRetrieve.FailureReason] RETURNS[a: ATOM] ~ {
+a ¨ SELECT why FROM
+$communicationFailure => $communicationFailure,
+$noSuchServer =>	$noSuchServer,
+$connectionRejected =>	$connectionRejected,
+$badCredentials =>	$badCredentials,
+$unknownFailure =>	$unknownFailure,
+ENDCASE =>		$unknownError;
+};
+
+IdOnFileWithSender: PROC [ts: MailBasics.Timestamp, sender: MailBasics.RName]
+RETURNS [idOnFile: ROPE] ~ {
+msgNameWithSenderFormat: ROPE ~ "%g %g";
+thisSender: ROPE ¨ sender.name;
+IF ( thisSender.Fetch[0] = '" ) THEN {
+pos: INT ~ thisSender.Find["\"", 1];
+IF ( pos # -1 ) THEN thisSender ¨ Rope.Concat[thisSender.Substr[1, pos.PRED], thisSender.Substr[pos.SUCC]]; 
+};
+RETURN[IO.PutFR[msgNameWithSenderFormat, [rope[thisSender]], [rope[ts]]] ];
+};
+
+MsgToStream: PROC [rh: MailRetrieve.Handle, stream: STREAM, msiData: MsiData]
+RETURNS [ok: BOOL ¨ FALSE, msgH: MsgHandle ¨ NIL] ~ {
+entryPos: INT ~ stream.GetLength[];
+{
+ENABLE UNWIND => { stream.SetLength[entryPos] };  -- might this fail if out of space?
+msgTemplatePos: INT;
+headersPos, textLen: INT;
+formatPos, formatLen: INT ¨ 0;
+initialCR: BOOL ¨ FALSE;
+timeStamp: MailBasics.Timestamp; sender: MailBasics.RName;
+msg, plainText, formatting: ROPE;
+[timeStamp, sender, ] ¨ MailRetrieve.StartMessage[rh];
+msg ¨ IdOnFileWithSender[timeStamp, sender];
+stream.SetIndex[entryPos]; -- make sure at end
+stream.PutF1[headerEntryTemplate, [integer[0]] ];
+msgTemplatePos ¨ stream.GetIndex[];
+stream.PutF[createMsgTemplate, [rope[msg]], [integer[0]], [integer[0]] ];
+headersPos ¨ stream.GetIndex[];
+
+[plainText, formatting, textLen, , ] ¨
+MailMessage.ReadOneMessageX[rh, timeStamp, sender.name];
+IF ( textLen = -1 ) THEN {
+stream.SetLength[entryPos];
+StrmFlush[stream, msiData];
+ RETURN
+};
+IF ( formatting # NIL ) AND ( plainText.Length[] > 0 ) THEN {
+firstChar: CHAR ~ plainText.Fetch[0];
+IF ( initialCR ¨ ( firstChar = '\r )) THEN plainText ¨ plainText.Substr[1];
+};
+textLen ¨ plainText.Length[];
+stream.PutRope[plainText];
+IF formatting # NIL THEN {
+formatPos ¨ stream.GetLength[];
+formatLen ¨ formatting.Length[];
+};
+stream.PutRope[formatting];
+stream.PutChar['\r];
+
+
+IF ( NOT initialCR ) AND ( formatting # NIL ) THEN {
+textLen ¨ textLen - 1;
+headersPos ¨ headersPos + 1;
+};
+stream.SetIndex[msgTemplatePos];
+stream.PutF[createMsgTemplate, [rope[msg]], [integer[textLen]], [integer[formatLen]] ];
+StrmFlush[stream, msiData];
+
+msgH ¨ NEW[MsgHandleRec ¨ [headersPos: headersPos, textLen: textLen, formatPos: formatPos, formatLen: formatLen] ];
+stream.SetIndex[entryPos];
+msgH.entryStart ¨ entryPos;
+msgH.entryLen ¨ stream.GetLength[] - entryPos;
+stream.PutF1[headerEntryTemplate, [integer[msgH.entryLen]] ];
+ok ¨ TRUE;
+};
+};
+
+SquashRopeIntoWidth: PROC [s: ROPE, colWidth: INT] RETURNS [ROPE] ~ {
+width: INT;
+{
+ENABLE RuntimeError.BoundsFault => { GOTO doItTheHardWay };
+width ¨ VFonts.StringWidth[s];
+DO
+IF ( width <= colWidth ) THEN EXIT;
+-- truncate
+{
+guessLength: INT ¨  s.Length[] * colWidth / width;
+s ¨ Rope.Concat[s.Substr[0, MAX[0, guessLength-4]], "..."];
+width ¨ VFonts.StringWidth[s];
+};
+ENDLOOP;
+EXITS
+doItTheHardWay => { [width, s]¨ DoItTheHardWay[s, colWidth] };
+};
+{
+blankCount: INT ~ ( (colWidth - width) / blankWidth ) + 1; -- force at least one blank
+some: INT ~ MIN[blankCount, blanks.Length[]];
+white: ROPE ~ blanks.Substr[len: some];
+s ¨ s.Concat[white];
+RETURN[s]
+};
+};
+
+DoItTheHardWay: PROC [s: ROPE, colWidth: INT] RETURNS [width: INT, s1: ROPE] ~ {
+thisWidth: INTEGER;
+dots: ROPE = "...";
+nullWidth: INTEGER = VFonts.CharWidth['\000];
+width¨ VFonts.StringWidth[dots];
+FOR i: INT IN [0 .. s.Length[]) DO
+thisWidth¨ VFonts.CharWidth[s.Fetch[i]
+! RuntimeError.BoundsFault => thisWidth ¨ nullWidth];
+width ¨ width + thisWidth;
+IF ( width > colWidth ) THEN {
+width ¨ width - thisWidth;
+s1¨ Rope.Concat[s.Substr[0, MAX[0, i.PRED]], dots];
+RETURN
+};
+ENDLOOP;
+s1¨ s.Concat[dots];
+};
+
+RemoveComments: PROC [name: ROPE] RETURNS [shortName: ROPE] ~ {
+start, end: INT;
+name ¨ name.Concat[" "];
+start ¨ name.Find["<"];
+IF ( start > 0 ) THEN {
+end ¨ name.Find[">", start.SUCC];
+IF ( end > 0 ) THEN name ¨ name.Replace[start, end-start+1];
+};
+start ¨ name.Find["("];
+IF ( start > 0 ) THEN {
+end ¨ name.Find[")", start.SUCC];
+IF ( end > 0 ) THEN name ¨ name.Replace[start, end-start+1];
+};
+shortName ¨ name.Substr[len: name.Length[].PRED]
+};
+
+bufsiz: NAT ~ RefText.page;
+copyBuffer: REF TEXT ¨ NEW[TEXT[bufsiz]];
+
+StrmToStrmCopy: PROC [to, from: IO.STREAM] ~ {
+DO
+IF ( from.GetBlock[copyBuffer, 0, bufsiz] = 0 ) THEN EXIT;
+to.PutBlock[copyBuffer];
+ENDLOOP
+};
+
+CopyBytes: PROC [to, from: IO.STREAM, num: INT] ~ {
+bytes: INT ¨ num;
+WHILE ( bytes >= bufsiz ) DO
+[] ¨ from.GetBlock[copyBuffer, 0, bufsiz];
+to.PutBlock[copyBuffer];
+bytes ¨ bytes - bufsiz;
+ENDLOOP;
+IF ( bytes # 0 ) THEN {
+[] ¨ from.GetBlock[copyBuffer, 0, bytes];
+to.PutBlock[copyBuffer];
+};
+};
+
+END.
+
+
+   »  BlackCherryMailImpl.mesa
+Copyright ” 1987, 1988, 1989, 1990, 1991, 1992 by Xerox Corporation.  All rights reserved.
+adapted from BlackWalnut.mesa of 07-Jun-89 18:02:54 PDT
+Bill Jackson (bj) July 19, 1989 6:38:17 pm PDT
+Willie-Sue, April 13, 1990 10:26:04 am PDT
+Willie-s, July 20, 1993 3:44 pm PDT
+
+Types
+{ OK, communicationFailure, noSuchServer, connectionRejected, badCredentials, didNotRespond, noMailboxes, noServers, unknownFailure, unknownError };
+Fundamental constants
+Header/Attribute names
+Current User
+Transfer msgs to database
+put lots more info here by moving code out of WriteTOC - bj
+Message/Log Parsing
+tocPointerEntryTemplate: ROPE ~ "*entry*%10g\rTOCPointer %10g\r";
+tocEntriesEntryTemplate: ROPE ~ "*entry*%10g\rTOCEntries %5g\r";
+check that the file is positioned at a TOCPointer entry
+just throw away duplicate entries:
+IF  msgH.tocButton # NIL THEN TiogaButtons.DeleteButton[msgH.tocButton];
+xxx
+now we go back and genereate the toc entries
+ignore initial CR (tioga formatting nonsense)
+
+Cycle through the servers, until you find one that has mail.
+Reads mail from the next grapevine server via gvH.
+This routine reads the next message on this connection,returning MsgState = noMore when there aren't any more.
+Now read all the items in the message, terminating on the LastItem,and skipping the ones that we're not yet interested in.
+writes a createMsg entry, then copies the message from grapevine to the stream, returns ok if there were no errors; flushes the stream; catches errors and returns FALSE
+
+other fields are set later & entry is re-written
+{ endPos: INT ~ stream.GetLength[]; }; -- ASSERT end-header=text+format?
+Truncates s with "..." or expands it with blanks, so that it is about colWidth characters wide.  Not exact, uses a few heuristics here...
+At this point s is shorter than colWidth and we want to extend it with blanks
+first remove any "< . . .>" in the name
+then do the same for any ( . . . ) in the name
+Buffered Stream Copy
+Mail polling
+ù ã  ñ(cedarcode) styleïNewlineDelimiter
+ò öúôIcodeöú
+œeúOôZKöú7ô7Kô.Kô*Kô#Kô óöœk	ò	Köú
+ûúûúò,KòKöúòKòKöúûú+ò8KöûúòKöúòKöúòKöúûúò$Köú
+ûúcòrKöúûúçòüKöú
+ûúHòWKöúûú
+òKöúòKöúòKöúòKöúûúò!KöúûúòKöúûúò&Kò óöœbúûúûò"Köûú7ûúqò±Kò Köûú,ûúûú7òtKò KöûúûúûúòKöûúûúûúûúòKò Köœn	úûúûúòheadöœzôöúûúûúòKöúîôîóóö°ôKöúûú9œcòTKöúûú¢ò:óö°ôKöúûú
+òKöú	ûúòKöúûú
+òKöúûúòKöúûúòóö°ôKöúûúò+Kö	úûúûúûúûúò(KöúûúûúûúòKöúûúûúûúò2Kò ö†
+úûúûúûú6òSKò óö†úûúûúò7öûúûòKöûúûúòöúòKòKöúHòHKöûúòKòóKöûúòóKöúûú-ûúò?Köú	ûú.ûúòAKòKöúûúòKöú&ûúò*Köú,ûúûúûú
+ûúûú"ûú
+òçKò Köú*ò*öûúûúûú/ûúûúûòQKöúûúòKöúûú!ò5KöúûúKòdKöúûúRògKöûúòóKöûúòKòKöúòóö†úûúûúûúûúûúûúòLöûú5ûúûúûòJKöûúûúûúûúò3KöûúòóöûúûúûúûúûúûúûòCKöûúûúûúûúò.Köûúòóöûúûúûúûú ûúûúûòGKöûúûúûúûúò.KöûúòóKöûúûúòKòKò óóö°ôö†	úûúûú ûúûúûúûú$ûúòÑKöúûúûúò/KöúûúûúòKöúûú¢òGKöúòöûú+ûú
+ûúûòEKöûúûúûúòöûòKöúûúò"Köú
+ûúòKöúûúò%Köú	ûúòKöúûú6òEKöúûúò&öúûúƒûúò‡Kô;óKöúòKöú3ò3KöúòKöûúûúûúûúò>Kòöûúûúûúûúò/öûú	ûú	ûú%ò@KöûúòóKòóKöûúòóKöûúòóKöúòKöûúûúò+KòKò óö†úûúûúûúûú&ûúûúûúòõKöúûú¢$òKKöúòKöúKòKöûú%ûúûúûò@KöúûúòKöú"ò"Kò KòHKò(KöúòKöú%¢ò;Kò"KöûúûúûúòFKöúòKö	ú ûúNûúûúûú?ò”Kò]KòKöûúòóòKöúûúòKöú
+ûúò KöúòKöúRòRKöúòóKöúòKöûúûúò+Kòóóö°ôKöúûú$ôAKöúûúûú(òOKöúûú#ô@Köúûúûú&òMKöúûúûúò4Köúûúûú ò>Kò Kô7Kö†úûúò*Kö†úûúò$Kö†úûúò*Kö†úûúò$Kò ö†úûúûú	ûúûúûúòBKöûú*ûúûúò8Köú'ò'KòKò óö†úûúûú	ûúò7KöúçòçKòKò óö†úûúûú	ûú
+ûúûúûúûúò`Köûú!ûúûúò/Köûúûúûú%ò7KòKò óö†
+úûúûúûúûú
+ûúûúòiKöú
+ûúò!Köúûúûú¢"òRKöúûúò$Köú
+ûúòöûúûúûòöûúòKöúàòàKöûú	òKòóöûúòKöúÄòÄKöûú	òKòóKöûúòóöûòKöúûúòKöúûúòKöúûúòKöúûúûúò$Köûúûúûúûúò@öúòKöúûúò'Köûúûú"ûúûúò6KòóöúòKöúûúò.Köú
+ûúò"öûúûú6ûúûúòLKöûúûú3ûúûòEKöúûú¢ò,KòóKòKòóöúòKöú
+ûú¢'òHKöûú
+ûúò-öûúûúûúò<KöúèòèKöûúòKòóKöúòKòóöúòKöúûúò'Köûúûú"ûúûúò6KòóöúòKöúûúò.Köú
+ûúò"öûúûú6ûúûúòLKöûúûú5ûúûúòIKöúûúòKöúòóKòKòóKòKòKò!Kò öûúûúûúûòKöúûúòKöúûúò$Köú"¢ò<Köú&¢ò?Köú%¢ò?Kò Kò"KòKò!Kò!Kò"Kò Köú¢ò&öûúûúòKò*Köûúûú)òCKò*KòóKöú¢$òCKò#KöúòKöûúûúûúò1Köûúûúûúûú1òhKöûúòóöûúûúûúûúò2Köûú&ò*Köûú$ò(óKöûúòKöûúûúòKöûúòóKòKò óö†úûúûúûú#ûúûúûúòïKöúûúò'Köú	ûúòKöúûúûúòKöú#ûúò'KöúûúòKò#Kò#öûúûúûúò KöúAòAKöúòKöûúûúò/Köûúò	KòKò$Köú ò KöúGòGKöú¢6òIKò.Köûúûú0¢òDKò1Kò KöúòKòcKò!Kò!Köú ò KöúbòbKöúòKöûúûúò.öûòKöúûòóKöûúòóKöúNòNKöúòKò óö†úûúûú3ûúòTKöúû	úò0Köúûúò'Köúûúò&KöúPûúòTKöúûúûúòKòKò KöúòKò KöúEòEKò+KòKò1Kò#KöúKòKKòöûúûúûúûúò=Köúûúò%Köûú$ûú!òKKòóKòKöúòöûúûúûúòKòKò KöúòKöûúòKò óKöúòKöúòö
+ûúûúûúûúûúò4KòKòKòóKöú ò KöúYòYKöúòKò KöúûúvòÄKöúòKòKò/Kò=KöúûúòöúòKöúûúòKöú
+ûúò&KöúòKöú\ò\KòzKöúòKòóöûúûúûúûúò/Köûú#ò'óöûúûúûúûúò2Köûú%ò)Köûú ò$óKòKò óö†
+úûúûú<òSöûúûúûòKöú
+ûúûú¢ò9öúûú¢ò9KòKòKöúòóöûú¢ò*KòKòKòóóKòKò óöú	ûúûúòKöúûúòKöúòóKò ö†
+úûú)ûúòBö†ú¢,ú¢	úòZKöúûúûúòKòKöú
+ûúòKöûú	ûúûúûúò3KòóKöúûúûúûúûúûúûúûúûúòYKöúûúòKöúûúòKöúûúò,KòAKò öûú+ûú
+ûúûòEKöúûúûú&ò;Köú!ò!KòEKöú"ô"öúBòBKò!Köûúûúûú+ôHKòKòKöûúòóKöûúòóKò2KòKòKò!KòKò óö†ú¢'úòGKöúûúûúòKöûúò
+KòKò óö†ú¢=úò_KöúûúûúòKöúûúûúòKöúûú&ò1öûúûúûòKöúûúòKöúûú
+òKöûúûúòóKòóóö°ôö†úûúûúûúò:Köúûúò'Köú6ò6KöúûúòKöú	ûúòKòKöûúûúûúûúòöûúûúûúòKöúòöûúûúûú¢ ò>Kò6KöûòKòóKòóKöúkòkKò öûú¢òKöúûúûú¢òHKöúû	úò0Köúûúò&Köúûúûúò!KöúòKòWöûúûúòKöûúûúò1KöûúòKòöûúûúûúûúòKöûú&ûú$òPKöûúòKòóóKöú,ô,öûúûúòKöúûúòKöú
+ûúò'KöúòKöú\ò\KöúòóKòÄKöúòöûúûú¢ò=KöúîûúòüKöûú>òBKò óöûúûúûúûúò/Köûú#ò'óöûúûúûúûúò2Köûú%ò)Köûú ò$óKöûúòóKòKò óö†úûú
+ûúûúûúûúûúûúòâKöúûúòö†úûúûúûúò'öûúòKöûúòKöûúûú9û	úòdóKöúûúòKòóKò8Köúûúò$KöúûúòKöúûúòöûúûúûú%òIKöú-ô-óöúòKöûúûúò3KöúûúûúòKöúûúûúò%öûòKò1öûúûúûòKöúûúûúò öúûúò%Köúûú(ò2Köú5ûúò@Kòóöúûúò(Kò0Kòóöúûúò'KòKò/Kòóöúûúò#Kò+Kòóöúûúò%Köúûú(ò2Köûúûúûúûúò;KòóöûúòKöú*ûúò0KòóóKöûúòóKöúòöûòKöú1ò1óKöúòóKöûúûúò>KöûúûúûúûúòNKöúûúûúûú	òQKöú6ûú	òDKòKò&KòKòKò óö†úûú0ûúûúûúûú(ûúûúûúûúûúòƒKöûúûúûúò Kò6KöúòKöúûúûúòöûúûúûúòKò6KöûòKòóKöú$ò$öûúûò)KöúMòMKöú5ò5Köú1ò1Köûúûú¢ò!Kò óöú¢òKöúòKô Köú<ô<Köú'¢òBKöúòKöú$ò$Köú,ò,öúòöûúûúòöûòKöúA¢òVKöûúûú
+ûúûúòKöûúòóKöúòóKò Kò4Köûúûúûú¢ò6KöúûúòKò Kò)Köú)ò)öûúûòKöú,ò,Köú ò öúòKöúûúò!KöúEòEKò KòNöûúûúòKöúòKöúòKöú=ò=KöúòöûúòKöú.ò.KöúûúòKòóóKòóKöûúûúòóKöúòóKöú¢ò óKöûúûúûúò4öûòKöú0ò0óKòóKò ö†úûú
+ûúûú,òPKöúûúûú6òHKöú2ô2KöûúûúûúòKöúòKöúòKòöûòKòDöûú
+ûòKöúûúòKöûúûúòKöúûú¢)òHKöúûúò%Köûúûúòóöûúûúûúò+Kö
+ûúûúûúûúûúòEKòóöûúûúûòKöûúòöûúûúòKöûú3ò7óóKöûúòóKòKò óKöú
+ûúûú:òOKöúûúò-Kò ö†úûú	û	ú-ûú@òùKöúoôoöûúûòòKòKò0KöûúòKöúòóöûúòKöúûúò!Kò/KöûúòKòóKöûúòóKöú$ûúò)KöúûúòKòKòDöûúûúûòKöú(ûúò1Köúûú%ûúò3Köú*¢ò?KöûúûúòóöúòKöú{ô{Köúûúò	Kò.Köûúûúûúò-KòóöûòKöúûúûúò+óKòKò óö†úûú"ûúûúòKöúûúûòKöú/ò/KöúòKöú+ò+Köú#ò#Köú#ò#KöûúòóKòKò óö†úûú5ûúûúòjKöúûúò(Köúûúòöûúûúò&Köúûúò$Köûúûú3ûúûúòlKöúòóKöûúûúBòKKòKò óö†úûú#ûúûúûúûúûúòÉKô®Köú
+ûúò#òKöûúûú%¢#òUKöúûúòKöúûúòKöúûúòKöúûúûúòKöú:ò:Köúûúò!Kò6Kò,Köú¢ò.Kô Köú0ô0Kò1Kò#KöúIòIKòKò Kò_öûúûúòKöúòKöúòKöúûòKöúòóöûúûúûúûúò=Köúûúò%Köûú$ûú!òKKòóKòKöúòöûúûúûúòKòKò KöúòóKöúòKöúòKò Köú
+ûú¢!ôHKò ö
+ûúûúûúûúûúò4KòKòKòóKöú ò KöúWòWKòKò KöúûúiòsKöúòKòKò.Kò=Köúûúò
+KòóKòKò óö†úûúûúûúûúûúòEKöúâôâKöúûúòöúòKöûúûúò;KòöûòKöûúûúûúò#Kö¢òöúòKöúûú"ò2Köúûúò;KòKöúòóKöûúòóöûòKò>óKöúòóöúòKöúMôMKöúûú,¢òVKöúûúûúò-Köúûúò'KòKöûúò	KöúòóKòKò óö†úûúûúûúûúûúûúòPKöúûúòKöúûú	òKöúûúò-Kò öûúûúûúûò"Kò\KòöûúûúòKòKöúûúûú
+ò3KöûòKòóóKöûúòKòKöúòKò óö
+†úûúûúûúûúò?KöúûúòKòKöú'ô'KòöûúûúòKöúûúò!Köûúûú)ò<KöúòóKöú.ô.KòöûúûúòKöúûúò!Köûúûú)ò<KöúòóKöú+ûúò0KòKò óóö°ôKöúûúòKö	úûúûúûúûú
+ò)Kò ö†úûúû	úò.öûòKöûú.ûúûúò:KöúòKöûòóKòKò óö†	úûúû	úûúò3KöúûúòöûúûòKò*KöúòKòKöûúòóöûúûúòKò)KöúòKòóKöúòóóLö°ôKò KöûúòKò óKò ó Öó    nŒ  ñ!  

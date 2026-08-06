@@ -1,0 +1,1565 @@
+
+DIRECTORY
+Atom,
+Basics USING [CompareCard, Comparison, LongNumber, RawBytes, UnsafeBlock],
+BasicTime USING [GMT, nullGMT, Period],
+Commander USING [CommandProc, Register],
+CommanderOps USING [NextArgument],
+FileNames USING [ConvertToSlashFormat, StripVersionNumber],
+FS,
+IO,
+PFS,
+PFSNames,
+PriorityQueue,
+Process,
+Rope,
+SymTab,
+UserProfile USING [Boolean, CallWhenProfileChanges, ListOfTokens, ProfileChangedProc],
+VersionMap USING [Map, MapAndName, MapAndNameList, MapEntry, MapList, MapRep, MyStamp, nullStamp, Range, RangeList, ShortNameSeq, ShortNameSeqRep, VersionStamp],
+VersionMapExtended,
+VersionMapBackdoor USING [],
+VersionMapBuilding,
+VersionMapDefaults USING [],
+VersionMapPrivate,
+VersionMapUtils USING [SourceFileEntry, SourceFileList];
+VersionMapImpl: CEDAR MONITOR
+IMPORTS Atom, Basics, BasicTime, Commander, CommanderOps, FileNames, FS, IO, PFS, PFSNames, PriorityQueue, Process, Rope, SymTab, UserProfile
+EXPORTS VersionMap, VersionMapBackdoor, VersionMapBuilding, VersionMapDefaults, VersionMapExtended, VersionMapUtils
+= BEGIN OPEN BasicTime, VersionMap, VersionMapBuilding;
+
+ShortKey: INT = 19850206;
+LongKey: INT = 19900710;
+Comparison: TYPE = Basics.Comparison;
+ROPE: TYPE = Rope.ROPE;
+
+NullStamp: MyStamp ¬ [0, 0, 0, 0];
+
+MyStampAsHex: TYPE = PACKED ARRAY [0..hexDigitsInStamp) OF HexDigit;
+HexDigit: TYPE = [0..16);
+hexDigitsInStamp: NAT = BITS[MyStamp] / BITS[HexDigit];
+
+EntryIndex: TYPE = CARDINAL;
+NullEntryIndex: EntryIndex = LAST[CARDINAL];
+
+EntryRef: TYPE = REF EntryRep;
+EntryRep: TYPE = RECORD [next: EntryRef, name: ROPE, version: MyStamp];
+
+WhichMapList: TYPE = ATOM;
+
+MapUnderConstruction: TYPE ~ REF MapUnderConstructionPrivate;
+MapUnderConstructionPrivate: PUBLIC TYPE ~ VersionMapPrivate.MapUnderConstructionPrivate;
+
+FileEntry: TYPE = REF FileEntryRep;
+FileEntryRep: TYPE = RECORD [
+name: ROPE, created: BasicTime.GMT, myStamp: MyStamp, from: ROPE];
+
+NameSeq: TYPE = REF NameSeqRep;
+NameSeqRep: TYPE = RECORD [
+SEQUENCE len: NAT OF NameEntry];
+NameEntry: TYPE = RECORD [hasPrefix: BOOL, name: ROPE];
+
+SourceFileList: TYPE = VersionMapUtils.SourceFileList;
+SourceFileEntry: TYPE = VersionMapUtils.SourceFileEntry;
+
+DMapEntry: TYPE = PACKED ARRAY [0..7) OF CARD16;
+
+BytesInWord: TYPE ~ PACKED ARRAY [0 .. 3] OF BYTE;
+bwTest: BytesInWord ~ [1, 2, 3, 4];
+memoryLayoutLikeFileLayout: BOOL[TRUE..TRUE] ~ LOOPHOLE[bwTest, CARD32] = ((1*256+2)*256 + 3)*256 + 4;
+assumeImmutableGlobal: BOOL ¬ TRUE;
+
+root: EntryList ¬ NIL;
+EntryList: TYPE = LIST OF Entry;
+Entry: TYPE = RECORD [key: ATOM ¬ NIL, mapList: MapList ¬ NIL];
+
+versionMapDir: ROPE ~ "/Cedar/CedarVersionMap/"; -- SystemNames.CedarDir won't work
+versionMapDirPath: PFS.PATH ~ PFS.PathFromRope[versionMapDir];
+defaultSourceNameList: LIST OF ROPE ¬ LIST["CedarSource.VersionMap"];
+defaultIntermediateNameList: LIST OF ROPE ¬ LIST["CedarIntermediate.VersionMap"];
+defaultExecutableNameList: LIST OF ROPE ¬ LIST["CedarSparcExecutable.VersionMap", "CedarSparcOptExecutable.VersionMap"];
+defaultSymbolsNameList: LIST OF ROPE ¬ LIST["CedarIntermediate.VersionMap"];
+
+stats: REF Stats = NEW[Stats ¬ []];
+Stats: TYPE = RECORD [
+remoteTries: INT ¬ 0,
+localTries: INT ¬ 0,
+localWins: INT ¬ 0
+];
+VersionToName: PUBLIC PROC [list: MapList, stamp: VersionStamp]
+RETURNS [result: MapAndName] = {
+result ¬ [NIL, NIL, nullGMT];
+FOR each: MapList ¬ list, each.rest WHILE each # NIL DO
+map: Map ¬ each.first;
+nx: EntryIndex ¬ FindIndex[map, stamp];
+IF nx # NullEntryIndex THEN {
+entry: MapEntry ¬ map[nx];
+result.name ¬ IndexToFullName[map, entry.index];
+result.map ¬ map;
+result.created ¬ entry.created;
+RETURN};
+ENDLOOP;
+};
+
+VersionToAllNames: PUBLIC PROC [list: MapList, stamp: VersionStamp]
+RETURNS [result: MapAndNameList] = {
+tail: MapAndNameList ¬ NIL;
+result ¬ NIL;
+FOR each: MapList ¬ list, each.rest WHILE each # NIL DO
+map: Map ¬ each.first;
+lo,hi: EntryIndex;
+[lo,hi] ¬ FindIndexRange[map, stamp];
+FOR x: EntryIndex IN [lo..hi] DO
+entry: MapEntry ¬ map[x];
+name: ROPE ¬  IndexToFullName[map, entry.index];
+new: MapAndNameList ¬ LIST[[map, name, entry.created]];
+IF tail = NIL THEN result ¬ new ELSE tail.rest ¬ new;
+tail ¬ new;
+ENDLOOP;
+ENDLOOP;
+};
+
+ShortName: PUBLIC PROC [longName: ROPE] RETURNS [ROPE] = {
+lim: INT ¬ Rope.Length[longName];
+pos: INT ¬ lim;
+WHILE pos > 0 DO
+c: CHAR ¬ Rope.Fetch[longName, pos ¬ pos - 1];
+SELECT c FROM
+'! => lim ¬ pos;
+'], '>, '/ => {pos ¬ pos + 1; EXIT};
+ENDCASE;
+ENDLOOP;
+RETURN [Rope.Flatten[longName, pos, lim-pos]];
+};
+
+ShortNameToNames: PUBLIC PROC [list: MapList, shortName: ROPE]
+RETURNS [MapAndNameList] = {
+rangeList: RangeList ¬ ShortNameToRanges[list, shortName ¬ ShortName[shortName]];
+head,tail: MapAndNameList ¬ NIL;
+WHILE rangeList # NIL DO
+range: Range ¬ rangeList.first;
+map: Map ¬ range.map;
+rangeList ¬ rangeList.rest;
+FOR index: CARDINAL IN [range.first..range.first+range.len) DO
+mx: CARDINAL ¬ map.shortNameSeq[index];
+entry: MapEntry ¬ map[mx];
+name: ROPE ¬ IndexToFullName[map, entry.index];
+new: MapAndNameList ¬ LIST[[map, name, entry.created]];
+IF tail = NIL THEN head ¬ new ELSE tail.rest ¬ new;
+tail ¬ new;
+ENDLOOP;
+ENDLOOP;
+RETURN [head];
+};
+
+ShortNameToRanges: PUBLIC PROC [list: MapList, shortName: ROPE]
+RETURNS [RangeList] = {
+head,tail: RangeList ¬ NIL;
+shortName ¬ ShortName[shortName];
+WHILE list # NIL DO
+map: Map ¬ list.first;
+shorts: ShortNameSeq ¬ map.shortNameSeq;
+list ¬ list.rest;
+IF map # NIL THEN {
+found: BOOL;
+index: CARDINAL;
+range: Range ¬ [map: map, first: 0, len: 0];
+new: RangeList;
+[index, found] ¬ ShortNameFind[map, shortName];
+IF found
+THEN {
+x,y: CARDINAL ¬ index;
+WHILE x > 0 DO
+IF ShortNameFindPred[shortName, shorts[x-1], map] # equal THEN EXIT;
+x ¬ x - 1;
+ENDLOOP;
+WHILE y+1 < map.len DO
+IF ShortNameFindPred[shortName, shorts[y+1], map] # equal THEN EXIT;
+y ¬ y + 1;
+ENDLOOP;
+range.first ¬ x;
+range.len ¬ y+1 - x;
+}
+ELSE {
+range.first ¬ index;
+WHILE range.first < map.len DO
+SELECT ShortNameFindPred[shortName, shorts[range.first], map] FROM
+less => EXIT;
+equal => ERROR;  -- the shortNameSeq was not properly sorted!
+greater => range.first ¬ range.first + 1;
+ENDCASE;
+ENDLOOP;
+};
+new ¬ LIST [range];
+IF tail = NIL THEN head ¬ new ELSE tail.rest ¬ new;
+tail ¬ new;
+};
+ENDLOOP;
+RETURN [head];
+};
+
+GetPrefix: PUBLIC PROC [map: Map] RETURNS [ROPE] = {
+RETURN [IndexToShortName[map, 0]];
+};
+
+StampToHex: PUBLIC PROC [stamp: VersionStamp] RETURNS [ROPE] = {
+RETURN [MyStampToHex[VsToMs[stamp]]];
+};
+
+SaveMapToFile: PUBLIC PROC [map: Map, name: PFS.PATH]
+= {GeneralSaveMapToFile[map, name, FALSE]};
+
+GeneralSaveMapToFile: PUBLIC PROC [map: Map, name: PFS.PATH, long: BOOL]
+= {LimitedSave[[map, Length[map]], name, long]};
+
+LimitedSave: PUBLIC PROC [lm: LimitedMap, name: PFS.PATH, long: BOOL] = TRUSTED {
+map: Map ~ lm.map;
+st: IO.STREAM ¬ PFS.StreamOpen[name, $create];
+names: ROPE ¬ map.names;
+namesChars: INT ¬ names.Size[];
+len: NAT ¬ lm.limit;
+myVersion: INT ¬ ShortKey;
+
+IF NOT memoryLayoutLikeFileLayout THEN ERROR;
+
+st.PutF["%g %g %g\r", [integer[IF long THEN LongKey ELSE ShortKey]], [integer[len]], [integer[namesChars]] ];
+
+IF long 
+THEN IO.UnsafePutBlock[st, [LOOPHOLE[@map.entries[0]], 0, len*(BYTES[MapEntry])]]
+ELSE FOR i: INT IN [0..len) DO
+dMapEntry: DMapEntry;
+dMapEntry[0] ¬ map.entries[i].stamp.lo;
+dMapEntry[1] ¬ map.entries[i].stamp.num;
+dMapEntry[2] ¬ map.entries[i].stamp.hi;
+dMapEntry[3] ¬ LOOPHOLE[map.entries[i].created, Basics.LongNumber].lo;
+dMapEntry[4] ¬ LOOPHOLE[map.entries[i].created, Basics.LongNumber].hi;
+dMapEntry[5] ¬ LOOPHOLE[map.entries[i].index, Basics.LongNumber].lo;
+dMapEntry[6] ¬ LOOPHOLE[map.entries[i].index, Basics.LongNumber].hi;
+IO.UnsafePutBlock[st, [LOOPHOLE[@dMapEntry], 0, BYTES[DMapEntry]] ];
+ENDLOOP;
+
+IF long
+THEN IO.UnsafePutBlock[st, [LOOPHOLE[@map.shortNameSeq[0]], 0, len*(BYTES[CARD32])]]
+ELSE FOR i: INT IN [0..len) DO
+foo: Basics.LongNumber ~ [card[map.shortNameSeq[i]]];
+st.PutChar[VAL[foo.lh]];
+st.PutChar[VAL[foo.ll]];
+ENDLOOP;
+IO.PutRope[st, names];
+IO.PutRope[st, "\000\000\000"];
+IO.SetLength[st, IO.GetIndex[st]]; -- force goddamm truncation already!!!
+IO.Close[st];
+};
+
+RestoreMapFromFile: PUBLIC PROC [name: PFS.PATH, askedForUID: PFS.UniqueID, assumeImmutable: BOOL ¬ TRUE]
+RETURNS [map: Map ¬ NIL] =
+{ RETURN[VerboseRestoreMapFromFile[name, askedForUID, assumeImmutable, NIL]] };
+
+VerboseRestoreMapFromFile: PUBLIC PROC
+[name: PFS.PATH, askedForUID: PFS.UniqueID, assumeImmutable: BOOL, out: IO.STREAM]
+RETURNS [map: Map ¬ NIL] = {
+long: BOOL;
+namesChars: INT ¬ 0;
+bytes: INT ¬ 0;
+len: NAT15 ¬ 0;
+pos: INT ¬ 0;
+st: IO.STREAM ¬ NIL;
+dMapEntry: DMapEntry;
+contents: ROPE ¬ NIL;
+fullName: PFS.PATH ¬ NIL;
+actualUID: PFS.UniqueID ¬ PFS.nullUniqueID;
+Try: PROC [name: PFS.PATH, try: NAT] = {
+ENABLE PFS.Error => {
+IF out # NIL THEN out.PutF["\t**%g - %g\n", [integer[try]], [rope[error.explanation]] ];
+IF try < 3 THEN CONTINUE
+};
+[rope: contents, fullFName: fullName, uniqueID: actualUID] ¬ PFS.RopeOpen[fileName: name, wantedUniqueID: askedForUID, includeFormatting: TRUE, checkMutability: FALSE];
+};
+
+stats.remoteTries ¬ stats.remoteTries + 1;
+IF NOT memoryLayoutLikeFileLayout THEN ERROR;
+IF out = NIL THEN out _ vMapDebuggingStrm;
+
+IF out # NIL THEN out.PutF1["Opening %g using PFS\n", [rope[PFS.RopeFromPath[name]]] ];
+Try[name, 1]; -- try local first - this is the previous behavior and is used for merging version maps (needed for those other than the Cedar version maps itself)
+IF fullName = NIL THEN Try[PFSNames.ExpandName[name, versionMapDirPath], 2];
+IF fullName = NIL THEN {
+stats.localTries ¬ stats.localTries + 1;
+askedForUID ¬ PFS.nullUniqueID;
+Try[PFSNames.ExpandName[name, versionMapDirPath], 3];
+stats.localWins ¬ stats.localWins + 1;
+};
+map ¬ CheckFileCache[fullName, actualUID];
+IF map # NIL THEN {
+IF out # NIL THEN out.PutRope["\t **4 - file found in cache\n"];
+RETURN
+};
+
+st ¬ IO.RIS[contents];
+
+{
+ENABLE IO.EndOfStream, IO.Error => {
+map ¬ NIL;
+IF out # NIL THEN out.PutF1["IO Error or EndOfStream at pos %g\n", [integer[st.GetIndex[]]] ] ;
+GO TO noGot
+};
+val: INT;
+val ¬ IO.GetInt[st ! IO.Error => GO TO noGot];
+
+IF (val # ShortKey) AND (val # LongKey) THEN { IF out # NIL THEN out.PutF1[" Bad version %g\n", [integer[val]] ]; GO TO noGot};
+long ¬ val = LongKey;
+IF out # NIL THEN out.PutF["\nOpened %g (%g format)\n", [rope[PFS.RopeFromPath[name]]], [rope[IF long THEN "long" ELSE "short"]] ];
+len ¬ IO.GetInt[st ! IO.Error => GO TO noGot];
+namesChars ¬ IO.GetInt[st ! IO.Error => GO TO noGot];
+[] ¬ st.GetChar[];	-- trailing \n
+IF out # NIL THEN {
+out.PutF["len: %g, nameChars: %g\n", [integer[len]], [integer[namesChars]] ];
+out.Flush[];
+}; 
+map ¬ NEW[MapRep[len]];
+map.fileName ¬ fullName;
+map.uid ¬ actualUID;
+map.askedForUID ¬ askedForUID;
+map.assumeImmutable ¬ assumeImmutable;
+map.shortNameSeq ¬ NEW[ShortNameSeqRep[len]];
+
+TRUSTED {
+IF long
+THEN [] ¬ IO.UnsafeGetBlock[st, [LOOPHOLE[@map.entries[0]], 0, len*(BYTES[MapEntry])]]
+ELSE FOR i: INT IN [0..len) DO
+[] ¬ IO.UnsafeGetBlock[st,
+[LOOPHOLE[@dMapEntry], 0, BYTES[DMapEntry] ] ];
+map.entries[i].stamp.lo ¬ dMapEntry[0];
+map.entries[i].stamp.num ¬ dMapEntry[1];
+map.entries[i].stamp.hi ¬ dMapEntry[2];
+map.entries[i].stamp.extra ¬ 0;
+LOOPHOLE[map.entries[i].created, Basics.LongNumber].lo ¬ LOOPHOLE[dMapEntry[3]];
+LOOPHOLE[map.entries[i].created, Basics.LongNumber].hi ¬ LOOPHOLE[dMapEntry[4]];
+LOOPHOLE[map.entries[i].index, Basics.LongNumber].lo ¬ LOOPHOLE[dMapEntry[5]];
+LOOPHOLE[map.entries[i].index, Basics.LongNumber].hi ¬ LOOPHOLE[dMapEntry[6]];
+ENDLOOP;
+IF long
+THEN [] ¬ IO.UnsafeGetBlock[st, [LOOPHOLE[@map.shortNameSeq[0]], 0, len*(BYTES[CARD32])]]
+ELSE FOR i: INT IN [0..len) DO
+foo: Basics.LongNumber ¬ LOOPHOLE[0];
+foo.lh ¬ LOOPHOLE[st.GetChar[]];
+foo.ll ¬ LOOPHOLE[st.GetChar[]];
+map.shortNameSeq[i] ¬ LOOPHOLE[foo];
+ENDLOOP;
+};
+
+pos ¬ IO.GetIndex[st];
+IF out # NIL THEN out.PutF1["current index: %g\n", [integer[pos]] ];
+IF assumeImmutable
+THEN {
+map.names ¬ Rope.Substr[contents, pos, namesChars];
+}
+ELSE {
+eachChar: PROC RETURNS [c: CHAR] = TRUSTED {c ¬ IO.GetChar[st]};
+map.names ¬ Rope.FromProc[namesChars, eachChar];
+};
+EXITS noGot => {};
+};
+IO.Close[st];
+[] ¬ SymTab.Store[fileCache, PFS.RopeFromPath[map.fileName], map];  -- save in cache
+};
+
+fileCache: SymTab.Ref ~ SymTab.Create[case: FALSE];
+
+CheckFileCache:  PROC[name: PFS.PATH, uid: PFS.UniqueID] RETURNS[Map] ~ {
+key: ROPE ~ PFS.RopeFromPath[name];
+val: SymTab.Val;
+found: BOOL;
+map: Map;
+[found, val] ¬ SymTab.Fetch[fileCache, key];
+IF NOT found THEN RETURN[NIL];
+map _ NARROW[val];
+IF map.uid = uid THEN RETURN[map];
+RETURN[NIL];
+};
+
+Length: PUBLIC PROC [map: Map] RETURNS [INT] = {
+RETURN [IF map = NIL THEN 0 ELSE map.len];
+};
+
+Fetch: PUBLIC PROC [map: Map, index: CARDINAL] RETURNS [stamp: VersionStamp, name: ROPE, created: GMT] = {
+stamp ¬ MsToVs[nullStamp];
+name ¬ NIL;
+IF map # NIL AND index IN [0..map.len) THEN {
+entry: MapEntry ¬ map[index];
+stamp ¬ MsToVs[entry.stamp];
+name ¬ IndexToFullName[map, entry.index];
+created ¬ entry.created;
+};
+};
+
+FetchCreated: PUBLIC PROC [map: Map, index: CARDINAL] RETURNS [created: GMT ¬ nullGMT] = {
+IF map # NIL AND index IN [0..map.len) THEN {
+entry: MapEntry ¬ map[index];
+created ¬ entry.created;
+};
+};
+
+FetchStamp: PUBLIC PROC [map: Map, index: CARDINAL] RETURNS [stamp: VersionStamp] = {
+stamp ¬ MsToVs[nullStamp];
+IF map # NIL AND index IN [0..map.len) THEN {
+entry: MapEntry ¬ map[index];
+stamp ¬ MsToVs[entry.stamp];
+};
+};
+
+FetchName: PUBLIC PROC [map: Map, index: CARDINAL] RETURNS [name: ROPE] = {
+name ¬ NIL;
+IF map # NIL AND index IN [0..map.len) THEN {
+entry: MapEntry ¬ map[index];
+name ¬ IndexToFullName[map, entry.index];
+};
+};
+
+RangeToEntry: PUBLIC PROC [range: Range] RETURNS [name: ROPE, stamp: VersionStamp, created: GMT, next: Range] = {
+IF range.len = 0
+THEN {name ¬ NIL; next ¬ [range.map, 0, 0]; created ¬ nullGMT}
+ELSE {
+index: CARDINAL ¬ range.map.shortNameSeq[range.first];
+map: Map ¬ range.map;
+entry: MapEntry ¬ map[index];
+next ¬ [map, range.first+1, range.len-1];
+name ¬ IndexToFullName[map, entry.index];
+stamp ¬ MsToVs[entry.stamp];
+created ¬ entry.created;
+};
+};
+
+FillInShortNames: PUBLIC PROC [map: Map]
+= {FillInLimitedShortNames[[map, map.len]]};
+
+FillInLimitedShortNames: PROC [lm: LimitedMap] = {
+map: Map ~ lm.map;
+names: ROPE = map.names;
+len: CARDINAL = lm.limit;
+subLen: CARDINAL = len/32;
+pqa: REF ArrayOfQueue ¬ NEW[ArrayOfQueue ¬ ALL[NIL]];
+dstx: CARDINAL ¬ 0;
+new: ShortNameSeq ¬ NEW[ShortNameSeqRep[len]];
+map.shortNameSeq ¬ new;
+FOR i: CARDINAL IN [0..len) DO
+c: CHAR ¬ Rope.Fetch[names, GetFirstShortNameIndex[map, i]];
+pq: Cvt ¬ NIL;
+SELECT TRUE FROM
+LOOPHOLE[c-'A, CARDINAL] <= ('Z-'A) => c ¬ c + ('a-'A);
+c NOT IN GoodChars => c ¬ FIRST[GoodChars];
+ENDCASE;
+pq ¬ pqa[c];
+IF pq = NIL THEN pqa[c] ¬ pq ¬ CreatePQ[map, subLen];
+Insert[pq, i];
+ENDLOOP;
+FOR c: CHAR IN GoodChars DO
+pq: Cvt = pqa[c];
+IF pq # NIL THEN {
+FOR i: CARDINAL IN [0..pq.size) DO
+new[dstx] ¬ Remove[pq];
+dstx ¬ dstx + 1;
+ENDLOOP;
+};
+ENDLOOP;
+pqa­ ¬ ALL[NIL];  -- I deserve a good citizenship award for this!
+};
+
+LookupByExtension: PUBLIC PROC [mapList: MapList, base: ROPE, extensions: LIST OF ROPE] RETURNS [ROPE] = {
+key: ROPE ~ Rope.Concat[base, "."];
+keySize: INT ~ Rope.Size[key];
+ranges: RangeList ~ ShortNameToRanges[mapList, key];
+winningExtNum: NAT ¬ NAT.LAST;
+winningFullFName: ROPE ¬ NIL;
+FOR tail: RangeList ¬ ranges, tail.rest UNTIL tail=NIL DO
+range: Range ~ tail.first;
+mapLength: CARDINAL ~ Length[range.map];
+FOR index: CARDINAL ¬ range.first, index + 1 WHILE index < mapLength DO
+fullUName: ROPE ~ RangeToEntry[[range.map, index, 1]].name;
+entryName: ROPE ~ ShortName[fullUName];
+IF Rope.Run[s1: key, s2: entryName, case: FALSE] = keySize
+THEN {
+extNum: INT ~ FindExt[Rope.Substr[entryName, keySize], extensions];
+IF extNum < winningExtNum THEN {
+winningExtNum ¬ extNum;
+winningFullFName ¬ fullUName;
+IF extNum = 0 THEN RETURN [winningFullFName]; -- can't get better than this!
+};
+}
+ELSE EXIT;
+ENDLOOP;
+ENDLOOP;
+RETURN [winningFullFName];
+};
+
+
+FindExt: PROC [ext: ROPE, extensions: LIST OF ROPE] RETURNS [NAT] ~ {
+FOR i: NAT ¬ 0, i+1 DO
+IF extensions = NIL THEN RETURN [NAT.LAST];
+IF Rope.Match[pattern: extensions.first, object: ext, case: FALSE] THEN RETURN [i];
+extensions ¬ extensions.rest;
+ENDLOOP;
+};
+
+MyStampToHex: PROC [stamp: MyStamp] RETURNS [ROPE] = {
+index: NAT ¬ 0;
+each: PROC RETURNS [c: CHAR] = {
+x: HexDigit ¬ hex[index];
+IF x IN [0..9] THEN c ¬ 'a + hex[index];
+index ¬ index + 1;
+};
+hex: MyStampAsHex ¬ LOOPHOLE[stamp];
+RETURN [Rope.FromProc[12, each]];
+};
+
+VsToMs: PROC [vs: VersionStamp] RETURNS [MyStamp] = {
+l0: Basics.LongNumber ~ [card[vs[0]]];
+l1: Basics.LongNumber ~ [card[vs[1]]];
+RETURN [[lo: l1.hi, num: l0.lo, hi: l0.hi, extra: l1.lo]]};
+
+MsToVs: PROC [ms: MyStamp] RETURNS [VersionStamp] = {
+l0: Basics.LongNumber ~ [pair[lo: ms.num, hi: ms.hi]];
+l1: Basics.LongNumber ~ [pair[lo: ms.extra, hi: ms.lo]];
+RETURN [[l0.card, l1.card]]};
+
+IndexToShortName: PROC [map: Map, index: INT] RETURNS [ROPE] = {
+names: ROPE ¬ map.names;
+pos: INT ¬ names.SkipTo[index, "!\l\r"];
+RETURN [names.Substr[index, pos-index]];
+};
+
+IndexToMidName: PROC [map: Map, index: INT] RETURNS [ROPE] = {
+names: ROPE ¬ map.names;
+pos: INT ¬ names.SkipTo[index, "\r\l"];
+RETURN [names.Substr[index, pos-index]];
+};
+
+IndexToFullName: PROC [map: Map, index: INT] RETURNS [ROPE] = {
+names: ROPE ¬ map.names;
+pos: INT ¬ names.SkipTo[index, "\r\l"];
+name: ROPE ¬ names.Substr[index, pos-index];
+IF NOT Rope.Match["[*", name] THEN {
+prepos: INT ¬ names.SkipTo[0, "\r\l"];
+prefix: ROPE ¬ names.Substr[0, prepos];
+name ¬ prefix.Concat[name]};
+RETURN [name];
+};
+
+FindIndex: PROC [vmap: Map, t: VersionStamp] RETURNS [index: EntryIndex] = {
+mt: MyStamp ¬ VsToMs[t];
+mn: CARDINAL ¬ mt.num;
+i,k: CARDINAL ¬ 0;
+j: CARDINAL ¬ vmap.len-1;
+lo,mid: CARDINAL ¬ vmap[i].stamp.num;
+hi: CARDINAL ¬ vmap[j].stamp.num;
+probes: NAT ¬ 0;
+DO
+SELECT mn FROM
+< lo, > hi => EXIT; -- can never find it!
+= lo => k ¬ i; -- found it at the low point!
+= hi => k ¬ j; -- found it at the high point!
+ENDCASE =>
+{-- use interpolation for speed!
+dh: CARDINAL = hi-lo;
+dt: CARDINAL = mn-lo;
+--TRUSTED {k ¬ Basics.LongDiv[Basics.LongMult[j-i, dt], dh] + i};
+k ¬ (((j-i) * dt)/ dh) + i;
+mid ¬ vmap[k].stamp.num;
+probes ¬ probes + 1;
+SELECT mid FROM
+< mn => {lo ¬ vmap[i ¬ k + 1].stamp.num; LOOP};
+> mn => {hi ¬ vmap[j ¬ k - 1].stamp.num; LOOP};
+ENDCASE};
+{-- at this point, we are in a range of stamps that have equal mid-values; also, vmap[k].stamp.num = mt; a sequential search will do just fine
+km: CARDINAL ¬ k;
+m: MyStamp ¬ vmap[k].stamp;
+IF m = mt THEN GO TO found;
+WHILE km > i DO
+km ¬ km-1;
+m ¬ vmap[km].stamp;
+IF m = mt THEN {k ¬ km; GO TO found};
+IF m.num # mn THEN EXIT;
+ENDLOOP;
+WHILE k < j DO
+k ¬ k+1;
+m ¬ vmap[k].stamp;
+IF m = mt THEN GO TO found;
+IF m.num # mn THEN EXIT;
+ENDLOOP;
+EXIT; -- not found
+EXITS
+found =>  {
+RETURN [k]}};
+ENDLOOP;
+RETURN [NullEntryIndex];
+};
+
+FindIndexRange: PROC [vmap: Map, t: VersionStamp] RETURNS [lo,hi: EntryIndex] = {
+stamp: MyStamp ¬ VsToMs[t];
+lim: EntryIndex ¬ vmap.len - 1;
+hi ¬ 0;
+lo ¬ FindIndex[vmap, t];
+IF lo = NullEntryIndex THEN RETURN;
+hi ¬ lo;
+WHILE lo > 0 DO
+IF vmap[lo-1].stamp # stamp THEN EXIT;
+lo ¬ lo-1;
+ENDLOOP;
+WHILE hi < lim DO
+IF vmap[hi+1].stamp # stamp THEN EXIT;
+hi ¬ hi + 1;
+ENDLOOP;
+};
+
+GetFirstShortNameIndex: PROC [map: Map, index: CARDINAL] RETURNS [INT] = {
+len: CARDINAL = map.len;
+names: ROPE = map.names;
+pos: INT ¬ (IF index+1 >= len THEN Rope.Length[names] ELSE map[index+1].index)-1;
+DO
+c: CHAR = Rope.Fetch[names, pos ¬ pos - 1];
+SELECT c FROM
+'\l, '\r, '/, '>, '] => RETURN [pos+1];
+ENDCASE;
+ENDLOOP;
+};
+ShortNameFind: PROC [map: Map, name: ROPE]
+RETURNS [index: CARDINAL, found: BOOL ¬ TRUE] = {
+mapIndex: ShortNameSeq = map.shortNameSeq;
+lo: CARDINAL ¬ 0;
+hi: CARDINAL ¬ mapIndex.len-1;
+name ¬ Rope.Flatten[name];  -- to speed comparisons
+WHILE lo <= hi DO
+index ¬ (lo+hi)/2;
+SELECT ShortNameFindPred[name, mapIndex[index], map] FROM
+less => {
+IF lo = index THEN EXIT;
+hi ¬ index - 1;
+};
+greater => {
+IF hi = index THEN EXIT;
+lo ¬ index + 1;
+};
+equal => RETURN;
+ENDCASE => ERROR;
+ENDLOOP;
+found ¬ FALSE;
+};
+
+ShortNameFindPred: PROC [name: ROPE, index: CARDINAL, map: Map]
+RETURNS [Comparison] = {
+len: CARDINAL = map.len;
+names: ROPE = map.names;
+pos1: INT ¬ 0;
+lim1: INT = Rope.Length[name];
+pos2: INT ¬ GetFirstShortNameIndex[map, index];
+DO
+c1: CHAR ¬ IF pos1 = lim1 THEN '\r ELSE Rope.Fetch[name, pos1];
+c2: CHAR ¬ Rope.Fetch[names, pos2];
+IF LOOPHOLE[c1-'A, CARDINAL] <= ('Z-'A) THEN c1 ¬ c1 + ('a-'A);
+SELECT TRUE FROM
+c2 = '! => c2 ¬ '\r;
+LOOPHOLE[c2-'A, CARDINAL] <= ('Z-'A) => c2 ¬ c2 + ('a-'A);
+ENDCASE;
+IF c1 # c2 THEN RETURN [
+Basics.CompareCard[LOOPHOLE[c1, CARDINAL], LOOPHOLE[c2, CARDINAL]]];
+IF c1 = '\r THEN RETURN [equal];
+pos1 ¬ pos1 + 1;
+pos2 ¬ pos2 + 1;
+ENDLOOP;
+};
+
+GoodChars: TYPE = CHAR[40C..'z];
+ArrayOfQueue: TYPE = ARRAY CHAR OF Cvt;
+
+ShortNameSortPred: PROC [x1,x2: CARDINAL, map: Map] RETURNS [Comparison] = {
+len: CARDINAL = map.len;
+names: ROPE = map.names;
+pos1: INT ¬ GetFirstShortNameIndex[map, x1];
+pos2: INT ¬ GetFirstShortNameIndex[map, x2];
+DO
+c1: CHAR ¬ Rope.Fetch[names, pos1];
+c2: CHAR ¬ Rope.Fetch[names, pos2];
+IF LOOPHOLE[c1-'A, CARDINAL] <= ('Z-'A) THEN c1 ¬ c1 + ('a-'A);
+IF LOOPHOLE[c2-'A, CARDINAL] <= ('Z-'A) THEN c2 ¬ c2 + ('a-'A);
+IF c1 # c2 THEN RETURN [
+Basics.CompareCard[LOOPHOLE[c1, CARDINAL], LOOPHOLE[c2, CARDINAL]]];
+SELECT c1 FROM '!, '\r, '\l => RETURN [equal]; ENDCASE;
+pos1 ¬ pos1 + 1;
+pos2 ¬ pos2 + 1;
+ENDLOOP;
+};
+
+PQempty: PUBLIC ERROR = CODE;
+PQover: PUBLIC ERROR = CODE;
+
+--MaxSize: INT = LAST[CARDINAL];
+MaxSize: CARDINAL = LAST[CARDINAL];
+Seq: TYPE = REF SeqRep;
+SeqRep: TYPE = RECORD [elements: SEQUENCE space: CARDINAL OF CARDINAL];
+Cvt: TYPE = REF Rep;
+Rep: TYPE = RECORD [
+map: Map,
+size: CARDINAL,
+seq: Seq];
+
+CreatePQ: PROC [map: Map, size: CARD ¬ 0] RETURNS [pq: Cvt] = {
+IF size > MaxSize THEN ERROR PQover;
+IF size <= 0 THEN size ¬ 4 ELSE size ¬ size + 1;
+pq ¬ NEW[Rep ¬ [map, 0, NEW[SeqRep[size]]]];
+};
+
+Insert: PROC [pq: Cvt, item: CARDINAL] = {
+size: CARDINAL ¬ pq.size;  -- figure out new size
+a: Seq ¬ pq.seq;             -- grab the descriptor
+space: CARDINAL ¬ IF a = NIL THEN 0 ELSE a.space;
+maxCard: CARDINAL = MaxSize;  -- to aid the poor little compiler
+
+IF size = MaxSize THEN RETURN WITH ERROR PQover;
+size ¬ size + 1;
+
+IF size >= space THEN {
+seq: Seq ¬ NIL;
+IF space = 0 THEN space ¬ 1;
+SELECT space FROM
+< 2048 => space ¬ space + space;
+< maxCard-1024 => space ¬ space + 1024;
+ENDCASE => space ¬ MaxSize; 
+seq ¬ NEW[SeqRep[space]];
+FOR i: CARDINAL IN [1..size) DO
+seq[i] ¬ a[i];
+ENDLOOP;
+pq.seq ¬ a ¬ seq;
+};
+
+IF size = 1
+THEN a[1] ¬ item
+ELSE {
+son: CARDINAL ¬ size;
+dad: CARDINAL ¬ son/2;
+map: Map = pq.map;
+dadItem: CARDINAL;
+WHILE dad > 0 AND ShortNameSortPred[item, dadItem ¬ a[dad], map] = less DO
+a[son] ¬ dadItem;
+son ¬ dad;
+dad ¬ son/2;
+ENDLOOP;
+a[son] ¬ item;    -- finally insert the new item
+};
+pq.size ¬ size;  -- also update the size
+};
+
+Remove: PROC [pq: Cvt] RETURNS [CARDINAL] = {
+size: CARDINAL ¬ pq.size;    -- current size of pq
+a: Seq ¬ pq.seq;           -- desc to real stuff
+best: CARDINAL;            -- holder for best item
+item: CARDINAL;            -- holder for moving item
+IF size = 0 THEN ERROR PQempty;
+
+best ¬ a[1];           -- remember best item
+item ¬ a[size];        -- get moving item
+size ¬ size - 1;       -- new size of pq
+pq.size ¬ size;        -- also update size in pq
+IF size # 0 THEN {
+dad: CARDINAL ¬ 1;             -- current index for moving item
+maxdad: CARDINAL ¬ size / 2;   -- highest index for father item
+map: Map = pq.map;
+WHILE dad <= maxdad DO
+son: CARDINAL ¬ dad + dad;
+sonItem: CARDINAL ¬ a[son];
+IF son < size THEN {
+nson: CARDINAL ¬ son + 1;
+nsonItem: CARDINAL ¬ a[nson];
+IF ShortNameSortPred[nsonItem, sonItem, map] = less THEN {
+son ¬ nson;
+sonItem ¬ nsonItem;
+};
+};
+IF ShortNameSortPred[item, sonItem, map] = less THEN EXIT;
+a[dad] ¬ sonItem;
+dad ¬ son;
+ENDLOOP;
+a[dad] ¬ item;
+};
+
+RETURN [best];
+};
+
+
+FileNameFromVersion: PUBLIC PROC [which: ATOM, version: VersionStamp]
+RETURNS [name: ROPE ¬ NIL, created: BasicTime.GMT] = {
+mapList: MapList ¬ GetMapList[which];
+IF mapList # NIL THEN {
+mapAndName: MapAndName ¬ VersionToName[mapList, version];
+name ¬ mapAndName.name;
+created ¬ mapAndName.created;
+};
+};
+
+GetMapList: PUBLIC PROC [which: ATOM] RETURNS [list: MapList ¬ NIL] = {
+name: ROPE = Atom.GetPName[which];
+--useCachedMaps: BOOL ~ UserProfile.Boolean["VersionMap.UseCachedMaps", FALSE];
+useCachedMaps: BOOL ~ FALSE;
+Try: ENTRY PROC RETURNS [BOOL] = {
+ENABLE UNWIND => NULL;
+mapFileNameList: LIST OF ROPE ¬ NIL;
+FOR eList: EntryList ¬ root, eList.rest WHILE eList # NIL DO
+IF eList.first.key = which THEN {
+list ¬ eList.first.mapList;
+RETURN [TRUE]};
+ENDLOOP;
+SELECT which FROM
+$Source => mapFileNameList ¬ defaultSourceNameList;
+$Intermediate => mapFileNameList ¬ defaultIntermediateNameList;
+$Executable => mapFileNameList ¬ defaultExecutableNameList;
+$Symbols => mapFileNameList ¬ defaultSymbolsNameList;
+ENDCASE => RETURN [FALSE];
+FOR vL: LIST OF ROPE ¬ mapFileNameList, vL.rest UNTIL vL = NIL DO
+nl: Map ¬ VerboseRestoreMapFromFile[PFS.PathFromRope[vL.first], PFS.nullUniqueID, assumeImmutableGlobal, NIL];
+AddToMapListInternal[which, nl];
+ENDLOOP;
+RETURN [TRUE]};
+IF Try[] THEN RETURN;
+ProcessUserProfileList[
+class: which,
+key: Rope.Cat["VersionMap.", name, "Maps"],
+alwaysList: LIST[Rope.Cat["Cedar", name, ".VersionMap"]],
+useCached: useCachedMaps
+];
+[] ¬ Try[];
+RETURN};
+
+AddToMapList: PUBLIC ENTRY PROC [which: ATOM, map: Map] = {
+ENABLE UNWIND => NULL;
+AddToMapListInternal[which, map];
+};
+
+AddToMapListInternal: INTERNAL PROC[which: ATOM, map: Map] = {
+mapList: MapList ¬ LIST[map];
+IF map = NIL THEN RETURN;
+FOR eList: EntryList ¬ root, eList.rest WHILE eList # NIL DO
+IF eList.first.key = which THEN {
+mapList.rest ¬ eList.first.mapList;
+eList.first.mapList ¬ mapList;
+RETURN};
+ENDLOOP;
+root ¬ CONS[Entry[which, mapList], root];
+};
+
+SetMapList: PUBLIC ENTRY PROC [which: ATOM, list: MapList ¬ NIL] = {
+ENABLE UNWIND => NULL;
+FOR eList: EntryList ¬ root, eList.rest WHILE eList # NIL DO
+IF eList.first.key = which THEN {
+eList.first.mapList ¬ list;
+RETURN};
+ENDLOOP;
+root ¬ CONS[Entry[which, list], root];
+};
+
+ProcessUserProfile: UserProfile.ProfileChangedProc = {
+fork: BOOL ~ UserProfile.Boolean["VersionMap.Fork", FALSE];
+useCachedMaps: BOOL ~ UserProfile.Boolean["VersionMap.UseCachedMaps", FALSE];
+-- forking not yet implemented
+--IF fork THEN TRUSTED { Process.Detach[FORK DoIt[useCachedMaps]] } ELSE DoIt[useCachedMaps]; 
+DoIt[FALSE];
+};
+
+DoVersionMapsNow: PUBLIC PROC = {
+fork: BOOL ~ UserProfile.Boolean["VersionMap.Fork", FALSE];
+--IF fork THEN TRUSTED { Process.Detach[FORK DoIt[FALSE]] } ELSE DoIt[FALSE];
+-- forking not yet implemented
+DoIt[FALSE];
+};
+
+DoIt: PROC [useCached: BOOL] ~ {
+absent: LIST OF ROPE = LIST["it's missing!"];
+FOR eList: EntryList ¬ root, eList.rest WHILE eList # NIL DO
+IF eList.first.key = $Source OR eList.first.key = $Symbols THEN LOOP;
+{name: ROPE = Atom.GetPName[eList.first.key];
+key: ROPE ~ Rope.Cat["VersionMap.", name, "Maps"];
+IF UserProfile.ListOfTokens[key, absent] # absent THEN ProcessUserProfileList[
+class: eList.first.key,
+key: key,
+alwaysList: LIST[Rope.Cat["Cedar", name, ".VersionMap"]],
+useCached: useCached];
+}ENDLOOP;
+ProcessUserProfileList[
+$Symbols, "VersionMap.SymbolsMaps", defaultSymbolsNameList, useCached];
+ProcessUserProfileList[
+$Source, "VersionMap.SourceMaps", defaultSourceNameList, useCached];
+ProcessUserProfileList[
+$Intermediate, "VersionMap.IntermediateMaps", defaultIntermediateNameList, useCached];
+ProcessUserProfileList[
+$Executable, "VersionMap.ExecutableMaps", defaultExecutableNameList, useCached];
+};
+
+ProcessUserProfileList: PROC [
+class: ATOM, key: ROPE, alwaysList: LIST OF ROPE, useCached: BOOL] = {
+list: LIST OF ROPE ¬ UserProfile.ListOfTokens[key, NIL];
+aList: LIST OF ROPE ¬ alwaysList;
+FOR each: LIST OF ROPE ¬ list, each.rest WHILE each # NIL DO
+each.first ¬ FS.ExpandName[each.first ! FS.Error => CONTINUE].fullFName;
+ENDLOOP;
+FOR ll: LIST OF ROPE ¬ aList, ll.rest UNTIL ll = NIL DO
+ll.first ¬ FS.ExpandName[name: ll.first, wDir: versionMapDir ! FS.Error => CONTINUE].fullFName;
+IF ll.first # NIL THEN list ¬ RemoveRope[list, ll.first];
+ENDLOOP;
+SetMapList[class, NIL];
+FOR aa: LIST OF ROPE ¬ aList, aa.rest UNTIL aa = NIL DO
+ProcessAName[class, aa.first, useCached];
+ENDLOOP;
+WHILE list # NIL DO
+name: ROPE = list.first;
+list ¬ RemoveRope[list, name];
+ProcessAName[class, name, useCached];
+ENDLOOP;
+};
+
+ProcessAName: PROC [class: ATOM, name: ROPE, useCached: BOOL] = {
+map: Map ¬ NIL;
+prevName: ROPE ¬ NIL;
+nameCount: INT ¬ 0;
+map ¬ VerboseRestoreMapFromFile[PFS.PathFromRope[name], PFS.nullUniqueID, assumeImmutableGlobal, NIL ! PFS.Error => CONTINUE];
+IF map # NIL THEN AddToMapList[class, map];
+};
+
+RemoveRope: PROC [list: LIST OF ROPE, item: ROPE] RETURNS [LIST OF ROPE] = {
+lag: LIST OF ROPE ¬ NIL;
+FOR each: LIST OF ROPE ¬ list, each.rest WHILE each # NIL DO
+IF Rope.Equal[each.first, item, FALSE] THEN {
+IF lag = NIL THEN list ¬ each.rest ELSE lag.rest ¬ each.rest;
+LOOP;
+};
+lag ¬ each;
+ENDLOOP;
+RETURN [list];
+};
+
+FindSource: PUBLIC PROC [short: ROPE, removeDuplDates: BOOL ¬ TRUE, which: ATOM ¬ NIL] RETURNS [SourceFileList ¬ NIL] = TRUSTED {
+size: INT ¬ Rope.Length[short];
+starPos: INT ¬ short.Index[0, "*"];
+match: BOOL ¬ starPos # size;
+hasDot: BOOL ¬ short.Index[0, "."] # size;
+rangeList: VersionMap.RangeList ¬ NIL;
+head: SourceFileList ¬ NIL;
+tail: SourceFileList ¬ NIL;
+shortShort: ROPE ¬ Rope.Flatten[short, 0, starPos];
+shortShortLen: INT ¬ Rope.Length[shortShort];
+mapList: VersionMap.MapList ¬ NIL;
+IF size = 0 THEN RETURN;
+IF which = NIL THEN which ¬ $Source;
+IF mapList = NIL THEN mapList ¬ GetMapList[which];
+rangeList ¬ ShortNameToRanges[mapList, short];
+WHILE rangeList # NIL DO
+range: VersionMap.Range ¬ rangeList.first;
+map: VersionMap.Map = range.map;
+rangeList ¬ rangeList.rest;
+Process.CheckForAbort[];
+IF match
+THEN {
+entries: CARDINAL = Length[map];
+IF range.first >= entries THEN LOOP;
+range.len ¬ entries - range.first;
+WHILE range.len # 0 DO
+fullName: ROPE;
+stamp: VersionStamp;
+thisShort: ROPE;
+created: BasicTime.GMT;
+[fullName, stamp, created, range] ¬ RangeToEntry[range];
+thisShort ¬ ShortName[fullName];
+IF Rope.Run[shortShort, 0, thisShort, 0, FALSE] # shortShortLen THEN EXIT;
+IF Rope.Match[short, thisShort, FALSE] THEN {
+new: SourceFileList
+¬ LIST[[map: range.map, name: fullName, created: created, stamp: stamp]];
+IF tail = NIL THEN head ¬ new ELSE tail.rest ¬ new;
+tail ¬ new;
+};
+ENDLOOP;
+}
+ELSE {
+WHILE range.len # 0 DO
+new: SourceFileList;
+fullName: ROPE;
+stamp: VersionStamp;
+created: BasicTime.GMT;
+[fullName, stamp, created, range] ¬ RangeToEntry[range];
+new ¬ LIST[[map: range.map, name: fullName, created: created, stamp: stamp]];
+IF tail = NIL THEN head ¬ new ELSE tail.rest ¬ new;
+tail ¬ new;
+ENDLOOP;
+};
+ENDLOOP;
+RemoveDuplicates[head, removeDuplDates];
+RETURN [head];
+};
+
+RemoveDuplicates: PROC [sfl: SourceFileList, removeDuplDates: BOOL] = {
+WHILE sfl # NIL DO
+entry: SourceFileEntry ¬ sfl.first;
+thisStamp: VersionStamp ¬ entry.stamp;
+each: SourceFileList ¬ sfl.rest;
+lag: SourceFileList ¬ sfl;
+WHILE each # NIL DO
+next: SourceFileList ¬ each.rest;
+SELECT TRUE FROM
+Rope.Equal[each.first.name, entry.name, FALSE] => lag.rest ¬ next;
+removeDuplDates AND each.first.stamp = thisStamp => lag.rest ¬ next;
+ENDCASE => lag ¬ each;
+each ¬ next;
+ENDLOOP;
+sfl ¬ sfl.rest;
+ENDLOOP;
+};
+
+MaplistDesc: PUBLIC PROC [which: ATOM] RETURNS [ROPE] ~ {
+IF which=$Symbols OR which=$Source THEN RETURN ["current Cedar release"];
+RETURN Rope.Concat[Atom.GetPName[which], " version map"]
+};
+
+MapListForName: PUBLIC PROC [fileName: ROPE] RETURNS[MapList] =
+{ RETURN[GetMapList[MapAtomForName[fileName].which]] };
+
+MapAtomForName: PUBLIC PROC[fileName: ROPE] RETURNS[which, other: ATOM] = {
+woVersion: ROPE ~ FileNames.ConvertToSlashFormat[FileNames.StripVersionNumber[fileName]];
+SELECT TRUE FROM
+Rope.Match["*.mob", woVersion, FALSE] => which _ $Intermediate;
+Rope.Match["*.c2c.c", woVersion, FALSE] => which _ $Intermediate;
+Rope.Match["*/debug/*.o", woVersion, FALSE] => which _ $Executable;
+Rope.Match["*/sun4-debug/*.o", woVersion, FALSE] => which _ $Executable;
+Rope.Match["*/sun4/*.o", woVersion, FALSE] => which _ $Executable;
+Rope.Match["*/sun4-o3/*.o", woVersion, FALSE] => {
+which _ $Executable;
+other _ $opt;
+};
+Rope.Match["*/optimized/*.o", woVersion, FALSE] => {
+which _ $Executable;
+other _ $opt;
+};
+Rope.Match["*/sun4O3/*.o", woVersion, FALSE] => {
+which _ $Executable;
+other _ $opt;
+};
+Rope.Match["*.o", woVersion, FALSE] => which _ $Executable;
+ENDCASE => which _ $Source;
+};
+
+GetMapAtomList: PUBLIC PROC RETURNS[LIST OF ATOM] = {
+la: LIST OF ATOM ¬ NIL;
+FOR eList: EntryList ¬ root, eList.rest WHILE eList # NIL DO
+la ¬ CONS[eList.first.key, la];
+ENDLOOP;
+RETURN[la];
+};
+
+StartConstruction: PUBLIC PROC [size: NAT ¬ 0] RETURNS [muc: MapUnderConstruction] ~ {
+muc ¬ NEW [MapUnderConstructionPrivate ¬ [
+pq: IF size>0 THEN PriorityQueue.Predict[size, EntrySortPred] ELSE PriorityQueue.Create[EntrySortPred]
+]];
+};
+
+AddFile: PUBLIC PROC [muc: MapUnderConstruction, t: VersionMapBuilding.ConsTuple] ~ {
+entry: FileEntry ¬ NEW[FileEntryRep ¬ [
+name: t.name, created: t.created, myStamp: VsToMs[t.stamp], from: t.from]];
+PriorityQueue.Insert[muc.pq, entry];
+RETURN};
+
+FinishConstruction: PUBLIC PROC [muc: MapUnderConstruction, prefix: ROPE, PerDuplicate: PROC [a, b: VersionMapBuilding.ConsTuple]] RETURNS [map: Map] ~ {
+[[map,]] ¬ FinishLimitedConstruction[muc, prefix, PerDuplicate, FALSE];
+RETURN};
+
+FinishLimitedConstruction: PUBLIC PROC [muc: MapUnderConstruction, prefix: ROPE, PerDuplicate: PROC [a, b: VersionMapBuilding.ConsTuple], suppressDuplicates: BOOL] RETURNS [LimitedMap] ~ {
+pq: PriorityQueue.Ref ~ muc.pq;
+prefixLen: NAT = Rope.Size[prefix];
+entries: NAT = PriorityQueue.Size[pq];
+currentName: ROPE ¬ prefix ¬ Rope.Flatten[prefix];
+pos: INT ¬ prefixLen+1;
+seq: NameSeq ¬ NEW[NameSeqRep[entries]];
+entryIndex: NAT ¬ 0;
+subPos: NAT ¬ 0;
+subLim: NAT ¬ prefixLen;
+lastPos: INT ¬ 0;
+lag: FileEntry ¬ NIL;
+getChar: PROC [] RETURNS [c: CHAR] = {
+IF subPos < subLim THEN {
+c ¬ currentName.Fetch[subPos];
+subPos ¬ subPos + 1;
+RETURN;
+};
+c ¬ '\r;
+IF entryIndex < entries THEN {
+nameEntry: NameEntry ¬ seq[entryIndex];
+currentName ¬ nameEntry.name;
+subLim ¬ Rope.Length[currentName];
+IF nameEntry.hasPrefix THEN subPos ¬ prefixLen ELSE subPos ¬ 0;
+entryIndex ¬ entryIndex + 1;
+};
+};
+map: Map ¬ NEW[MapRep[entries]];
+limit: NAT ¬ entries;
+i: NAT ¬ 0;
+WHILE NOT PriorityQueue.Empty[pq] DO
+entry: FileEntry = NARROW[PriorityQueue.Remove[pq]];
+name: ROPE = entry.name;
+hasPrefix: BOOL = Rope.Run[name, 0, prefix, 0, FALSE] = prefixLen;
+IF lag=NIL OR lag.myStamp#entry.myStamp THEN pos ¬ pos
+ELSE IF suppressDuplicates AND lag.created=entry.created AND lag.name.Equal[entry.name, FALSE] THEN {limit ¬ limit.PRED; LOOP}
+ELSE PerDuplicate[
+a: [lag.name, lag.from, lag.created, MsToVs[lag.myStamp]],
+b: [entry.name, entry.from, entry.created, MsToVs[entry.myStamp]]
+];
+seq[i] ¬ [hasPrefix, name];
+map[i] ¬ [stamp: entry.myStamp, created: entry.created, index: pos];
+pos ¬ pos + Rope.Length[name] + 1;
+IF hasPrefix THEN pos ¬ pos - prefixLen;
+lag ¬ entry;
+i ¬ i.SUCC;
+ENDLOOP;
+IF i#limit THEN ERROR;
+IF limit < entries THEN map[limit] ¬ [stamp: NullStamp, created: BasicTime.nullGMT, index: pos];
+map.names ¬ Rope.FromProc[pos, getChar, 4040];
+FillInLimitedShortNames[[map, limit]];
+RETURN [[map, limit]]};
+
+ClassifyDifference: PUBLIC PROC [a, b: VersionMapBuilding.ConsTuple] RETURNS [VersionMapBuilding.DifferenceClass] ~ {
+IF a.created=b.created AND a.name.Equal[b.name, FALSE] THEN RETURN [identical];
+{aCp, bCp: FS.ComponentPositions;
+aFull, bFull, aBase, bBase: ROPE;
+[aFull, aCp, ] ¬ FS.ExpandName[a.name];
+[bFull, bCp, ] ¬ FS.ExpandName[b.name];
+aBase ¬ aFull.Substr[start: aCp.base.start, len: aCp.base.length];
+bBase ¬ bFull.Substr[start: bCp.base.start, len: bCp.base.length];
+aBase ¬ aBase.Substr[len: aBase.Index[s2: "."]];
+bBase ¬ bBase.Substr[len: bBase.Index[s2: "."]];
+IF aBase.Equal[bBase, FALSE] THEN RETURN [identicalModExtensionAndCreated];
+RETURN [veryDifferent]}};
+
+EntrySortPred: PROC [x, y, data: REF ANY] RETURNS [BOOL] --PriorityQueue.SortPred-- = {
+xe: FileEntry ~ NARROW[x];
+ye: FileEntry ~ NARROW[y];
+xx: MyStamp = xe.myStamp;
+yy: MyStamp = ye.myStamp;
+IF xx.num # yy.num THEN RETURN [xx.num < yy.num];
+IF xx.hi # yy.hi THEN RETURN [xx.hi < yy.hi];
+IF xx.lo # yy.lo THEN RETURN [xx.lo < yy.lo];
+IF xx.extra # yy.extra THEN RETURN [xx.extra < yy.extra];
+SELECT BasicTime.Period[from: xe.created, to: ye.created] FROM
+<0 => RETURN [FALSE];
+>0 => RETURN [TRUE];
+=0 => RETURN [xe.name.Compare[ye.name, FALSE] < equal]
+ENDCASE => ERROR};
+DoVersionMapsNowCommand: Commander.CommandProc = { DoVersionMapsNow[] };
+
+FindCommand: Commander.CommandProc = {
+st: IO.STREAM ¬ cmd.out;
+inStream: IO.STREAM ¬ IO.RIS[cmd.commandLine];
+which: ATOM ¬ NARROW[cmd.procData.clientData];
+slashNotation: BOOL ¬ TRUE;
+EachFile: PROC = {
+sfl: SourceFileList ¬ NIL;
+r: ROPE ¬ IO.GetTokenRope[inStream, IO.IDProc].token;
+IF Rope.Length[r] = 0 THEN RETURN;
+IF r.Equal["-maplist"] THEN {
+name: ROPE = IO.GetTokenRope[inStream, IO.IDProc].token;
+which ¬ Atom.MakeAtom[Rope.Concat[name, Atom.GetPName[which]]];
+RETURN
+};
+IF r.Equal["-b", FALSE] THEN { slashNotation ¬ FALSE; RETURN };
+IF r.Equal["-~b", FALSE] THEN { slashNotation ¬ TRUE; RETURN };
+sfl ¬ FindSource[r, FALSE, which];	-- try name as it is
+IF sfl = NIL THEN {
+IF NOT Rope.Match["*.*", r] THEN {
+r ¬ Rope.Concat[r, ".*"];
+sfl ¬ FindSource[r, FALSE, which];
+};
+IF sfl = NIL THEN {
+IO.PutF[st, "Sorry, '%g' is not in the %g.\n", [rope[r]], [rope[MaplistDesc[which]]] ];
+RETURN;
+};
+};
+IO.PutF1[st, "%g =>\n", [rope[r]] ];
+WHILE sfl # NIL DO
+IO.PutF[st, "  %g\n      %g\n",
+[rope[IF slashNotation THEN FileNames.ConvertToSlashFormat[sfl.first.name] ELSE sfl.first.name]],
+[time[sfl.first.created]]
+];
+sfl ¬ sfl.rest;
+ENDLOOP;
+};
+DO
+EachFile[
+! FS.Error => {msg ¬ error.explanation; result ¬ $Failed; EXIT};
+IO.EndOfStream => EXIT;
+];
+ENDLOOP;
+};
+
+AddToDefaultVersionMapCmd: Commander.CommandProc = {
+AddVMap[cmd.out, NIL, CommanderOps.NextArgument[cmd], NIL];
+};
+
+AddVersionMapCmd: Commander.CommandProc = {
+root: ROPE ¬ CommanderOps.NextArgument[cmd];
+baseName, wDir: ROPE;
+IF root = NIL THEN {
+cmd.out.PutRope["\n No root for VersionMap given - quitting\n"];
+RETURN;
+};
+baseName ¬ CommanderOps.NextArgument[cmd];
+IF Rope.Equal[baseName, "-base", FALSE] THEN baseName ¬ CommanderOps.NextArgument[cmd];
+wDir ¬ CommanderOps.NextArgument[cmd];
+IF Rope.Equal[root, "$Default"] THEN root ¬ NIL;
+AddVMap[cmd.out, root, wDir, baseName];
+};
+
+AddVMap: PROC[out: IO.STREAM, root, wDir, baseName: ROPE] = {
+intMapList, srcMapList, execMapList: LIST OF ROPE;
+fileList: LIST OF ROPE;
+FileNameProc: FS.NameProc = {
+SELECT TRUE FROM
+Rope.Match["*Intermediate.VersionMap*", fullFName] => intMapList ¬ CONS[fullFName, intMapList];
+Rope.Match["*Source.VersionMap*", fullFName] => srcMapList ¬ CONS[fullFName, srcMapList];
+Rope.Match["*Executable.VersionMap*", fullFName] => execMapList ¬ CONS[fullFName, execMapList];
+ENDCASE => srcMapList ¬ CONS[fullFName, srcMapList];
+RETURN[TRUE];
+};
+IF wDir # NIL THEN {
+char: CHAR ~ Rope.Fetch[wDir, Rope.Length[wDir]-1];
+IF ( char # '/ ) AND ( char # '* ) THEN wDir ¬ Rope.Concat[wDir, "/"];
+};
+FS.EnumerateForNames[Rope.Cat[wDir, IF baseName # NIL THEN baseName ELSE root, "*", ".VersionMap!H"], FileNameProc];
+IF root = NIL THEN {
+FOR each: LIST OF ROPE ¬ srcMapList, each.rest WHILE each # NIL DO 
+ProcessAName[$Source, each.first, FALSE];
+ENDLOOP;
+FOR each: LIST OF ROPE ¬ intMapList, each.rest WHILE each # NIL DO 
+ProcessAName[$Intermediate, each.first, FALSE];
+ENDLOOP;
+FOR each: LIST OF ROPE ¬ execMapList, each.rest WHILE each # NIL DO 
+ProcessAName[$Executable, each.first, FALSE];
+ENDLOOP;
+}
+ELSE {
+IF srcMapList # NIL THEN {
+class: ATOM ~ Atom.MakeAtom[Rope.Concat[root, "Source"]];
+FOR each: LIST OF ROPE ¬ srcMapList, each.rest WHILE each # NIL DO 
+ProcessAName[class, each.first, FALSE];
+ENDLOOP;
+};
+IF intMapList # NIL THEN {
+class: ATOM ~ Atom.MakeAtom[Rope.Concat[root, "Intermediate"]];
+FOR each: LIST OF ROPE ¬ intMapList, each.rest WHILE each # NIL DO 
+ProcessAName[class, each.first, FALSE];
+ENDLOOP;
+};
+IF execMapList # NIL THEN {
+class: ATOM ~ Atom.MakeAtom[Rope.Concat[root, "Executable"]];
+FOR each: LIST OF ROPE ¬ execMapList, each.rest WHILE each # NIL DO 
+ProcessAName[class, each.first, FALSE];
+ENDLOOP;
+};
+};
+};
+
+vMapDebuggingStrm: IO.STREAM ¬ NIL;
+
+VersionMapDebuggingOn: Commander.CommandProc ~ { vMapDebuggingStrm ¬ cmd.out };
+
+VersionMapDebuggingOff: Commander.CommandProc ~ { vMapDebuggingStrm ¬ NIL };
+
+Commander.Register[key: "DoVersionMapsNow", proc: DoVersionMapsNowCommand, doc: "Get new version maps (if there are any)"];
+Commander.Register[key: "AddVersionMaps", proc: AddVersionMapCmd, doc: "Usage: AddVersionMaps root { -base baseName } {wDir} - where root is the name of the map, such as MyMaps, baseName is the name of the map files if different from root"];
+Commander.Register[key: "AddToDefaultVersionMaps", proc: AddToDefaultVersionMapCmd, doc: "Usage: AddToDefaultVersionMaps {wDir}"];
+Commander.Register [
+"FindR", FindCommand,
+"FindR [-maplist name] [-b] fileName - Finds Cedar release (or name if given) source file names given the short names (.mesa extension is the default)",
+$Source];
+Commander.Register [
+"FindRBin", FindCommand,
+"FindRBin [-maplist name] [-b] fileName - Finds Cedar release binary file names given the short names.",
+$Symbols];
+Commander.Register [
+"FindRInt", FindCommand,
+"FindRInt [-maplist name] [-b] fileName - Finds Cedar release intermediate file names given the short names.",
+$Intermediate];
+Commander.Register [
+"FindREx", FindCommand,
+"FindREx [-maplist name] [-b] fileName - Finds Cedar release executable file names given the short names.",
+$Executable];
+Commander.Register [
+"FindP", FindCommand,
+"FindP [-maplist name] [-b] fileName - Finds PCedar release source file names given the short names.",
+$PSource];
+Commander.Register [
+"FindD", FindCommand,
+"FindD [-maplist name] [-b] fileName - Finds DCedar release source file names given the short names.",
+$DSource];
+Commander.Register [
+"FindDBin", FindCommand,
+"FindDBin [-maplist name] [-b] fileName - Finds Dedar release binary file names given the short names.",
+$DSymbols];
+
+Commander.Register ["VersionMapDebuggingOn", VersionMapDebuggingOn];
+Commander.Register ["VersionMapDebuggingOff", VersionMapDebuggingOff];
+UserProfile.CallWhenProfileChanges[ProcessUserProfile];
+
+END.
+
+
+   B  
+VersionMapImpl.mesa
+Copyright Ó 1984, 1985, 1986, 1987, 1988, 1989, 1990, 1992 by Xerox Corporation.  All rights reserved.
+Russ Atkinson (RRA) August 2, 1988 5:02:39 pm PDT
+Doug Wyatt, April 3, 1987 2:12:30 pm PST
+Michael Plass, March 22, 1993 9:38 am PST
+Last tweaked by Mike Spreitzer on August 17, 1990 2:15 pm PDT
+JKF October 10, 1988 3:17:13 pm PDT
+Willie-sue, January 4, 1993 4:03 pm PST
+Laurie Horton, October 29, 1990 8:10 am PST
+
+SHARES VersionMap
+Every saved version stamp file needs one of these two numbers at its start.  We got these numbers from the dates February 6, 1985 and July 10, 1990, and we suggest that future versions also use this convention for generating magic numbers.
+
+$Source => the source symbol version map list (initially from CedarSource.VersionMap)
+$Intermediate => the intermediate version map list (initially from CedarIntermediate.VersionMap)
+$Executable => the executables version map list (initially from CedarSparcExecutable.VersionMap & CedarSparcOptExecutable.VersionMap)
+other => a user-defined version map variety (initially empty)
+size of VersionMap.Mapentry as written by d-machine
+Code later in the file assumes this (and raises ERROR if its false).
+Global variables
+PUBLIC procedures
+... returns a full path name (FS format) for the given version stamp.  The list of maps is searched in order.  For convenience on a match, the containing map is also returned.  If the stamp is not found, [NIL, NIL] is returned.
+... returns all of the full path names (FS format) for the given version stamp.  The list of maps is searched in order.  For convenience on a match, the containing map is also returned.  If the stamp is not found, [NIL, NIL] is returned.
+... returns the short name for the given long name.  This simply involves stripping off the directory and version information.
+... returns all of the full path names (FS format) for the given short name.  The list of maps is searched in order.  For convenience on a match, the containing map is also returned.  If the stamp is not found, [NIL, NIL] is returned.
+... returns all of the ranges that correspond to the given short name (see the comments for Range).
+Extend the range to encompass ALL of the matching short names.
+Scan forward until we have gone beyond the short name.  This allows us to find long names using simple prefixes of short names.
+returns the creating prefix for the map
+useful little utility to turn a stamp into hex (Satterthwaite convention)
+use `\r to be compatible with dmachine generated maps
+
+IO.UnsafePutBlock[st,
+[LOOPHOLE[LONG[@myVersion]], 0, BYTES[INT]]];
+first, output the internal version number
+st.PutF["%g ", [integer[len]] ];
+st.PutF["%g\r", [integer[namesChars]] ];
+IO.UnsafePutBlock[st,
+[LOOPHOLE[LONG[@len]], 0, BYTES[NAT]]];
+first, output the # of entries
+IO.UnsafePutBlock[st,
+[LOOPHOLE[@map.entries[0]], 0, len*(BYTES[MapEntry])]];
+next, the entries themselves
+IO.UnsafePutBlock[st,
+[LOOPHOLE[@map.shortNameSeq[0]], 0, len*(BYTES[CARD16])]];
+next, the shortNameSeq
+IO.UnsafePutBlock[st,
+[LOOPHOLE[LONG[@namesChars]], 0, (BYTES[INT])]];
+next, the number of characters we are about to write (not counting the end marker)
+then the names rope
+marker at end to make Tioga happy
+restores a map from a file written by SaveMapToFile
+if assumeImmutable, then the named file is assumed to not change
+(this avoids copying the file names from the save file) 
+RRA: In case we have a problem with the remote files, yet we can open up the cache, we should try to gracefully degrade with the version maps.  Any PFS.Error here passes through to the caller.
+we are here with an open rope; let's see if we've seen this file before; if so, return its already instantiated map
+We test for the saved version at the front of the file to make sure that the remainder has the right format.
+next, read the entries themselves
+next, read the shortNameSeq
+make a rope that reads from the IO
+we assume that the file will not change
+copy the chars from the file into storage
+after all, the file could change!
+returns the # of entries in the map 
+returns the stamp and name at the given index
+index must be in [0..Length[map])
+returns the stamp at the given index
+index must be in [0..Length[map])
+returns the stamp at the given index
+index must be in [0..Length[map])
+returns the name at the given index
+index must be in [0..Length[map])
+... returns the name and stamp for the first entry in the range, also returning the next range.  If an empty range is given, the name returned will be NIL, and the range returned will be empty.
+Private procedures
+Returns the index of the matching entry in extensions, or NAT.LAST if the entry is not present
+return the name without the prefix or version
+return the name without the prefix
+return the full path name
+assert: 0 < dt < dh, i < j
+try for the quick kill first (most likely)
+otherwise, first search lower in the map
+sigh, must search higher in the map
+Scan backwards until a character before a short name is found.
+
+... finds the given short name in the index, using the given predicate, which must be consistent with the predicate used to build the index.
+In this module we take advantage of the fact that all names of entries completely contain the short names of interest, and that all names of entries are bound by CRs ('\n).  The given name is already presumed to be short.
+Scan through the two names comparing characters (case ignored).
+Routines to fill in the shortNameSeq
+In this module we take advantage of the fact that all names of entries completely contain the short names of interest, and that all names of entries are bound by CRs ('\n).
+Scan through the two names comparing characters (case ignored).
+Special clone of PriorityQueue intended for shuffling indexes.
+create a priority queue object, initially empty
+insert a new item into the queue
+overflow check - unfortunately, we can't get more than LAST[CARDINAL] words!    
+Must first check for room in array.  If there is not enough room, then allocate new storage, copy, and free the old storage.
+Insert item by shuffling items down until invariant holds (assuming that a[son] will hold item).
+item is better than a[dad], so shuffle a[dad] down
+remove the "best" item in the queue
+Remove top item from the array and prepare to move bottom item
+Restore the invariant by moving the item down
+(better items move up)
+must find better of the two sons
+Return the saved best item
+Test routines
+
+TestFindIndexFailed: ERROR = CODE;
+SingleTestFindIndex: PROC [map: Map, i: NAT] RETURNS [index: INT _ 0] = {
+lo,hi: EntryIndex;
+entry: MapEntry _ map[i];
+[lo,hi] _ FindIndexRange[map, MsToVs[map[i].stamp]];
+IF i NOT IN [lo..hi] THEN ERROR TestFindIndexFailed;
+};
+
+TestFindIndex: PROC [map: Map] RETURNS [allProbes: INT, len: NAT] = {
+allProbes _ 0;
+len _ map.len;
+FOR i: NAT IN [0..len) DO
+[] _ SingleTestFindIndex[map, i];
+ENDLOOP;
+};
+
+Stuff formerly in VersionMapDefaultsImpl
+... returns a name corresponding to the given version stamp in the indicated map list (does not check for multiple names, since that is the responsibility of the version map creator).
+... gets the requested version map list.  Map lists are defined either by user profile entries, or by someone making explicit calls on AddToMapList or SetMapList.
+... adds a new map to the lookup list.  Use this proc for adding personal version maps.
+There is no mapList under this key, so add it
+.. sets the current version map for source files.  Since there can be a race between GetMapList and SetMapList, this operation should not be casually used!
+There is no mapList under this key, so add it
+Try to make the name canonical in form
+VersionMapUtils items
+This routine removes entries with duplicate names an (if removeDuplDates = TRUE) also removes entries with duplicate dates.
+canonical form
+Version Map Building
+Warn the caller that there are duplicate versions
+Commands
+[cmd: Handle] RETURNS [result: REF _ NIL, msg: ROPE _ NIL]
+Handle = REF [in, out, err: STREAM, commandLine,command: ROPE, propertyList: List.AList]
+preserving the old behavior, with the addition of finding name as given without extention
+this could be done more cleverly
+root=NIL in here means add to default verison maps
+can't use !* in names since they might be in an -ux:/ directory
+Init
+Ê;   –(cedarcode) style•NewlineDelimiter
+™ headšœ™Icodešœ
+Ïeœ[™fL™1L™(L™)L™=L™#L™'L™+L™ —˜ šÏk	˜	Lšœ˜Lšœžœ>˜JLšœ
+žœžœ˜'Lšœ
+žœ˜(Lšœžœ˜"Lšœ
+žœ,˜;Lšžœ˜Lšžœ˜Lšžœ˜L˜	L˜Lšœ˜Lšœ˜L˜LšœžœE˜VLšœžœ‘˜¡Lšœ˜Lšœžœ˜L˜Lšœžœ˜L˜Lšœžœ#˜8——šÏnœžœž˜Lšžœ>žœžœžœ=˜Lšžœl˜sLšžœ™Lšœžœžœ+˜7L˜ Lšœ
+žœ˜šœ	žœ˜Lšœï™ïL™ —Lšœžœ˜%Lšžœžœžœ˜L˜ LšŸ	œ˜"L˜ š	œžœžœžœžœ
+˜DLšœ
+žœ˜Lšœžœžœžœ˜7—L˜ Lšœžœžœ˜Lšœžœžœ˜,L˜ Lšœ
+žœžœ
+˜Lšœ
+žœžœžœ˜GL˜ šœžœžœ˜L™UL™`L™…L™=—L˜ Lšœžœžœ˜=Lšœžœžœ1˜YL˜ Lšœžœžœ˜#šœžœžœ˜Lšœžœžœžœ˜B—L˜ Lšœ	žœžœ˜šœžœžœ˜Lšžœžœžœ˜ —Lš	œžœžœžœžœ˜7L˜ Lšœžœ"˜6šœžœ#˜8L˜ —šœžœžœžœžœžœ˜0L™3—L˜ Lšœžœžœžœ
+žœžœ˜2L˜#šœžœžœžœžœ	žœ ˜fL™D——™šœžœžœ˜#L˜ —šœžœ˜Lšœžœžœžœ˜ Lšœžœžœžœžœžœ˜?—L˜ LšœžœÏc"˜SLšœžœžœžœ˜>Lš	œžœžœžœžœ˜ELš	œžœžœžœžœ!˜QLš	œžœžœžœžœJ˜xLš	œžœžœžœžœ!˜LL˜ Lšœžœ	žœ˜#šœžœžœ˜Lšœžœ˜Lšœžœ˜Lšœžœ˜L˜——™šŸœžœžœ&žœ˜`Lšœžœ­žœžœ™ãLšœ
+žœžœ˜šžœ!žœžœž˜7L˜L˜'šžœžœ˜L˜L˜0L˜L˜Lšžœ˜—Lšžœ˜—L˜L˜ —šŸœžœžœ&žœ˜hLšœ(žœ­žœžœ™íLšœžœ˜Lšœ	žœ˜šžœ!žœžœž˜7L˜L˜L˜%šžœžœ
+ž˜ L˜Lšœžœ&˜0Lšœžœ˜7Lšžœžœžœžœ˜5L˜Lšžœ˜—Lšžœ˜—L˜L˜ —šŸ	œžœžœžœžœžœ˜:Lšœ~™~Lšœžœ˜!Lšœžœ˜šžœ	ž˜Lšœžœ'˜.šžœž˜L˜Lšœžœ˜$Lšžœ˜—Lšžœ˜—Lšžœ(˜.L˜L˜ —š
+Ÿœžœžœžœžœ˜[Lšœ(žœªžœžœ™êL˜QLšœžœ˜ šžœžœž˜L˜L˜L˜šžœžœžœ&ž˜>Lšœžœ˜'L˜Lšœžœ%˜/Lšœžœ˜7Lšžœžœžœžœ˜3L˜Lšžœ˜—Lšžœ˜—Lšžœ˜Lšœ˜L˜ —š
+Ÿœžœžœžœžœ˜WLšœc™cLšœžœ˜L˜!šžœžœž˜L˜L˜(L˜šžœžœžœ˜Lšœžœ˜Lšœžœ˜L˜,L˜L˜/šžœ˜šžœ˜Lšœžœ™>Lšœžœ	˜šžœž˜Lšžœ8žœžœ˜DL˜
+Lšžœ˜—šžœž˜Lšžœ8žœžœ˜DL˜
+Lšžœ˜—L˜L˜L˜—šžœ˜Lšœ™L˜šžœž˜šžœ8ž˜BLšœžœ˜Lšœ	žœ ,˜=L˜)Lšžœ˜—Lšžœ˜—L˜——Lšœžœ	˜Lšžœžœžœžœ˜3L˜L˜—Lšžœ˜—Lšžœ˜L˜L˜ —š
+Ÿ	œžœžœžœžœ˜4Lšœ'™'Lšžœ˜"L˜L˜ —š
+Ÿ
+œžœžœžœžœ˜@LšœI™ILšžœ˜%Lšœ˜L˜ —š
+Ÿœžœžœžœžœ˜5Lšœ#žœ˜+—L˜ šŸœžœžœžœžœžœ˜HLšœ0˜0—L˜ šŸœžœžœžœžœžœžœ˜QL˜Lšœžœžœžœ˜.Lšœžœ˜Lšœžœ˜Lšœžœ˜Lšœžœ˜L˜ Lšžœžœžœžœ˜-L˜ L™5Lšœžœžœ	žœ5˜mL™ šžœ™Lš	œžœžœžœžœ™-Lšœ)™)—L˜ Lšœ ™ Lšœ(™(šžœ™Lš	œžœžœžœžœ™'Lšœ™—šžœ™Lšœžœžœ™7Lšœ™—šžœ˜Lšžœžœžœžœ˜Qš	žœžœžœžœ
+ž˜Lšœ˜L˜'L˜(L˜'Lšœžœ/˜FLšœžœ/˜FLšœžœ-˜DLšœžœ-˜DLšžœžœžœ˜DLšžœ˜——L˜ šžœ™Lšœžœ žœžœ™:Lšœ™—šžœ˜Lš
+žœžœžœ žœžœ˜Tš	žœžœžœžœ
+ž˜L˜5Lšœžœ
+˜Lšœžœ
+˜Lšžœ˜——šžœ™Lš	œžœžœžœžœ™0LšœR™R—šžœ˜Lšœ™—šžœ˜Lšœ!™!—Lšžœžœ &˜ILšžœ˜L˜—L˜ šŸœžœžœžœžœžœžœžœ˜iLšžœžœ˜Lšœžœ?žœ˜OL˜ —šŸœžœžœžœžœžœžœžœžœ˜yLšžœžœœ˜Lšœ3™3Lšœ@™@Lšœ8™8Lšœžœ˜Lšœžœ˜Lšœžœ˜Lšœžœ˜Lšœžœ˜Lšœžœžœžœ˜Lšœ˜Lšœ
+žœžœ˜Lšœ
+žœžœžœ˜Lšœžœžœ˜+š
+Ÿœžœžœžœžœ˜(šžœžœ˜LšžœžœžœG˜XLšžœ	žœž˜L˜—Lšœ=žœœ2žœžœ˜¨Lšœ˜—L˜ L˜*Lšžœžœžœžœ˜-Lšžœžœžœ˜*L˜ Lšžœžœžœ+žœ˜WLšœ “˜¡Lšžœžœžœ6˜Lšžœžœžœ˜Lšžœ‘žœ)™ÀL˜(Lšœžœ˜L˜5L˜&Lšœ˜—™sL˜*šžœžœžœ˜Lšžœžœžœ/˜@Lšž˜Lšœ˜——L˜ Lšœžœžœ˜L˜ ˜šžœžœžœ˜$Lšœžœ˜
+LšžœžœžœN˜_Lšžœžœ˜Lšœ˜—Lšœžœ˜	Lš	œžœžœ
+žœžœ˜.L˜ šžœžœžœžœžœžœ2žœžœ˜Lšœl™l—L˜Lšžœžœžœ-žœžœžœžœ˜ƒLš	œžœžœ
+žœžœ˜.Lš	œžœžœ
+žœžœ˜5Lšœ ˜!šžœžœžœ˜LšœM˜MLšœ˜Lšœ˜—Lšœžœ˜L˜L˜L˜L˜&Lšœžœ˜-L˜ šžœ˜	šžœ˜Lšžœžœžœžœ˜Vš	žœžœžœžœ
+ž˜Lšœžœžœžœ˜JL˜'L˜(L˜'L˜Lšžœ1žœ˜PLšžœ1žœ˜PLšžœ/žœ˜NLšžœ/žœ˜NLšžœ˜—Lšœ!™!—šžœ˜Lš
+žœžœžœ žœžœ˜Yš	žœžœžœžœ
+ž˜Lšœžœ˜%Lšœ	žœ˜ Lšœ	žœ˜ Lšœžœ˜$Lšžœ˜—Lšœ™—Lšœ˜L˜ —Lšœžœ˜Lšžœžœžœ3˜Dšžœ˜šžœ˜Lšœ ž™"Lšœ'™'L˜3L˜—šžœ˜Lšœ
+žœžœžœžœžœ˜@Lšœ)™)Lšœ!™!L˜0Lšœ˜——Lšžœ˜L˜—Lšžœ˜Lšœžœ$ ˜TL˜L˜ —šœ,žœ˜3L˜ —šŸœžœžœžœžœžœ	˜ILšœžœžœ˜#L˜Lšœžœ˜L˜	L˜,Lš
+žœžœžœžœžœ˜Lšœžœ˜Lšžœžœžœ˜"Lšžœžœ˜L˜L˜ —š
+Ÿœžœžœžœžœ˜0Lšœ$™$Lš
+žœžœžœžœžœ
+˜*L˜L˜ —šŸœžœžœžœžœžœžœ˜jLšœ-™-Lšœ!™!L˜Lšœžœ˜š
+žœžœžœžœžœ˜-L˜L˜L˜)L˜L˜—L˜L˜ —šŸœžœžœžœžœžœ˜Zšœ$™$Lšœ!™!—š
+žœžœžœžœžœ˜-L˜L˜Lšœ˜—L˜L˜ —š
+Ÿ
+œžœžœžœžœ˜ULšœ$™$Lšœ!™!L˜š
+žœžœžœžœžœ˜-L˜L˜Lšœ˜—L˜L˜ —šŸ	œžœžœžœžœžœ˜KLšœ#™#Lšœ!™!Lšœžœ˜š
+žœžœžœžœžœ˜-L˜L˜)L˜—L˜L˜ —šŸœžœžœžœžœ žœ˜qLšœÁ™Ášžœ˜Lšžœ	žœ.˜>šžœ˜Lšœžœ'˜6L˜L˜L˜)L˜)L˜L˜L˜——Lšœ˜L˜ —šŸœžœžœ˜(Lšœ,˜,—L˜ šŸœžœ˜2L˜Lšœžœ˜Lšœžœ˜Lšœžœ
+˜Lš	œžœžœžœžœ˜5Lšœžœ˜Lšœžœ˜.L˜šžœžœžœ
+ž˜Lšœžœ5˜<Lšœ
+žœ˜šžœžœž˜Lšžœžœ ˜7Lšœžœžœžœ˜+Lšžœ˜—L˜Lšžœžœžœ%˜5Lšœ˜Lšžœ˜—šžœžœžœž˜L˜šžœžœžœ˜šžœžœžœž˜"L˜L˜Lšžœ˜—L˜—Lšžœ˜—Lšœžœžœ /˜AL˜L˜ —šŸœžœžœžœžœžœžœžœžœ˜jLšœžœ˜#Lšœ	žœ˜Lšœ4˜4Lšœžœžœžœ˜Lšœžœžœ˜šžœ%žœžœž˜9Lšœ˜Lšœžœ˜(š	žœžœžœžœ	ž˜GLšœžœ,˜;Lšœžœ˜'•StartOfExpansionO[s1: ROPE, pos1: INT _ 0, s2: ROPE, pos2: INT _ 0, case: BOOL _ TRUE]šžœ(žœ˜:šžœ˜Lšœžœ8˜Cšžœžœ˜ L˜L˜Lšžœžœžœ ˜LLšœ˜—Lšœ˜—Lšžœžœ˜
+—Lšžœ˜—Lšžœ˜—Lšžœ˜Lšœ˜L˜ ——™L˜ šŸœžœžœžœžœžœžœžœ˜ELšœ:žœžœ™^šžœžœ
+ž˜Lšžœžœžœžœžœžœ˜+L–-[s1: ROPE, s2: ROPE, case: BOOL _ TRUE]šžœ:žœžœžœ˜SL˜Lšžœ˜—Lšœ˜L˜ —šŸœžœžœžœ˜6Lšœžœ˜šœžœžœžœ˜ L˜Lšžœžœžœ˜(L˜L˜—Lšœžœ˜$Lšžœ˜!L˜L˜ —šŸœžœžœ˜5L˜&L˜&Lšžœ5˜;L˜ —šŸœžœžœ˜5L˜6L˜8Lšžœ˜—L˜ š
+Ÿœžœžœžœžœ˜@Lšœ-™-Lšœžœ˜Lšœžœ ˜(Lšžœ"˜(L˜L˜ —š
+Ÿœžœžœžœžœ˜>Lšœ"™"Lšœžœ˜Lšœžœ˜'Lšžœ"˜(L˜L˜ —š
+Ÿœžœžœžœžœ˜?Lšœ™Lšœžœ˜Lšœžœ˜'Lšœžœ"˜,šžœžœžœ˜$Lšœžœ˜&Lšœžœ˜'L˜—Lšžœ˜L˜L˜ —šŸ	œžœžœ˜LL˜Lšœžœ
+˜Lšœžœ˜Lšœžœ˜Lšœžœ˜%Lšœžœ˜!Lšœžœ˜šž˜šžœž˜Lšœžœ ˜)Lšœ ˜,Lšœ ˜-šžœ˜
+šœ ˜ Lšœžœ	˜Lšœžœ	˜Lšœ™Lšž	œ8˜AL˜L˜L˜šžœž˜Lšœ)žœ˜/šœ)žœ˜/Lšžœ˜	—————šœ ˜ŽLšœžœ˜L˜Lšœ*™*Lšžœžœžœžœ˜Lšœ(™(šžœž˜L˜
+L˜Lšžœžœ
+žœžœ˜%Lšžœžœžœ˜Lšžœ˜—Lšœ#™#šžœž˜L˜L˜Lšžœžœžœžœ˜Lšžœžœžœ˜Lšžœ˜—Lšžœ ˜—šž˜˜Lšžœ˜——Lšžœ˜—Lšžœ˜L˜L˜ —šŸœžœžœ˜QL˜L˜L˜L˜Lšžœžœžœ˜#L˜šžœž˜Lšžœžœžœ˜&L˜
+Lšžœ˜—šžœ
+ž˜Lšžœžœžœ˜&L˜Lšžœ˜—L˜L˜ —š
+Ÿœžœžœžœžœ˜JLšœžœ˜Lšœžœ˜Lš	œžœžœžœžœ˜Qšž˜Lšœ>™>Lšœžœ$˜+šžœž˜Lšœžœ	˜'Lšžœ˜—Lšžœ˜—L˜L™ —šŸœžœžœžœ	žœ	žœžœ˜\LšœŒ™ŒLšœ*˜*Lšœžœ˜Lšœžœ˜Lšœ ˜3šžœ
+ž˜L˜šžœ/ž˜9šœ	˜	Lšžœžœžœ˜L˜L˜—˜Lšžœžœžœ˜L˜L˜—Lšœ	žœ˜Lšžœžœ˜—Lšžœ˜—Lšœžœ˜L˜L˜ —š
+Ÿœžœžœ	žœžœ˜XL™ÝLšœžœ˜Lšœžœ˜Lšœžœ˜Lšœžœ˜Lšœžœ&˜/šž˜Lšœ?™?Lš	œžœžœžœžœ˜?Lšœžœ˜#Lšžœžœžœžœ˜?šžœžœž˜L˜Lšžœžœ"˜:Lšžœ˜—šžœ	žœžœ˜Lš	œžœžœžœžœ˜D—Lšžœ
+žœžœ	˜ L˜L˜Lšžœ˜—L˜L˜ ——šœ$™$Lšœžœžœ
+˜ Lš	œžœžœžœžœ˜'L˜ šŸœžœ	žœžœ˜LL™¬Lšœžœ˜Lšœžœ˜Lšœžœ#˜,Lšœžœ#˜,šž˜Lšœ?™?Lšœžœ˜#Lšœžœ˜#Lšžœžœžœžœ˜?Lšžœžœžœžœ˜?šžœ	žœžœ˜Lš	œžœžœžœžœ˜D—Lšžœžœžœ
+žœ˜7L˜L˜Lšžœ˜—L˜——šœ>™>L˜ Lšœ	žœžœžœ˜Lšœžœžœžœ˜L˜ Lšœžœžœžœ˜ Lšœ	žœžœžœ˜#Lšœžœžœ˜Lšœžœžœžœžœžœžœ˜GLšœžœžœ˜šœžœžœ˜Lšœ	˜	Lšœžœ˜L˜
+—L˜ šŸœžœžœžœ˜?Lšœ/™/Lšžœžœžœ˜$Lšžœžœ
+žœ˜0Lšœžœžœ˜,L˜L˜ —šŸœžœžœ˜*Lšœ ™ Lšœžœ ˜1Lšœ ˜3Lšœžœžœžœžœžœ	˜1Lšœ	žœ "˜@L˜ LšœP™PLš
+žœžœžœžœžœ˜0L˜L˜ Lšœ|™|šžœžœ˜Lšœžœ˜Lšžœžœ˜šžœž˜L˜ L˜'Lšžœ˜—Lšœžœ˜šžœžœžœž˜L˜Lšžœ˜—L˜L˜L˜ —šžœ	˜Lšžœ˜šžœ˜Lšœ`™`Lšœžœ˜Lšœžœ	˜L˜Lšœ	žœ˜šžœ	žœ7ž˜JLšœ2™2L˜L˜
+L˜Lšžœ˜—Lšœ ˜0L˜——Lšœ ˜(L˜L˜ —šŸœžœžœžœ˜-Lšœ#™#Lšœžœ ˜2Lšœ ˜0Lšœžœ ˜2Lšœžœ ˜4Lšžœ
+žœžœ	˜L˜ Lšœ>™>Lšœ ˜,Lšœ ˜)Lšœ ˜(Lšœ ˜0šžœ
+žœ˜Lšœ-™-Lšœ™Lšœžœ  ˜?Lšœžœ  ˜?L˜šžœž˜Lšœžœ˜Lšœ	žœ
+˜šžœžœ˜Lšœ ™ Lšœžœ˜Lšœ
+žœ˜šžœ2žœ˜:L˜L˜L˜—L˜—Lšžœ.žœžœ˜:L˜L˜
+Lšžœ˜—L˜L˜L˜ —Lšœ™Lšžœ˜˜L˜ ———šœ™L™ Lšœžœžœ™"š
+Ÿœžœžœžœ	žœ	™IL™L™Lšœ4™4Lš
+žœžœžœ
+žœžœ™4L™L™ —š
+Ÿœžœžœžœžœ™EL™L™šžœžœžœ
+ž™L™!Lšžœ™—L™L™ ——šœ(™(L˜ šŸœžœžœ	žœžœžœžœžœ˜|Lšœ·™·L˜%šžœžœžœ˜L˜9L˜L˜L˜—Lšœ˜L˜ —šŸ
+œžœžœ	žœžœžœ˜GLšœ‡ŸœŸ
+œ™¢Lšœžœ˜"Lšœžœ3žœ˜OLšœžœžœ˜š
+Ÿœžœžœžœžœ˜"Lšžœžœžœ˜Lš	œžœžœžœžœ˜$šžœ%žœ	žœž˜<šžœžœ˜!L˜Lšžœžœ˜—Lšžœ˜—šžœž˜L˜3L˜?L˜;L˜5Lšžœžœžœ˜—šžœžœžœžœžœžœž˜ALšœ$žœžœ&žœ˜nL˜ Lšžœ˜—Lšžœžœ˜—Lšžœžœžœ˜šœ˜Lšœ˜Lšœ+˜+Lšœžœ)˜9Lšœ˜Lšœ˜—L˜Lšžœ˜L˜ —š
+Ÿœžœžœžœ	žœ˜;Lšžœžœžœ˜L˜!L˜L˜ —šŸœžœžœžœ˜>LšœW™WLšœžœ˜Lšžœžœžœžœ˜šžœ%žœ	žœž˜<šžœžœ˜!L˜#L˜Lšžœ˜—Lšžœ˜—Lšœ-™-Lšœžœ˜)L˜L˜ —šŸ
+œžœžœžœ	žœžœ˜DLšœ›™›Lšžœžœžœ˜šžœ%žœ	žœž˜<šžœžœ˜!L˜Lšžœ˜—Lšžœ˜—Lšœ-™-Lšœžœ˜&L˜L˜ —šŸœ$˜6Lšœžœ*žœ˜;Lšœžœ3žœ˜MLšžœ˜Lš
+žœžœžœžœžœ˜^Lšœžœ˜L˜L˜ —šŸœžœžœ˜!Lšœžœ*žœ˜;Lšžœžœžœžœžœžœžœ˜ML˜Lšœžœ˜L˜L˜ —šŸœžœžœ˜ Lš	œžœžœžœžœ˜-šžœ%žœ	žœž˜<Lšžœžœžœžœ˜ELšœžœ"˜-Lšœžœ)˜2šžœ0žœ˜NLšœ˜Lšœ	˜	Lšœžœ)˜9Lšœ˜—Lšœžœ˜	—Lšœ_˜_Lšœ\˜\Lšœn˜nLšœh˜hL˜L˜ —šŸœžœ
+žœžœžœžœžœžœ˜eLš	œžœžœžœ!žœ˜8Lšœžœžœžœ˜!šžœžœžœžœžœžœž˜<šœžœžœ
+žœ˜HLšœ&™&—Lšžœ˜—šžœžœžœžœžœžœž˜7Lšœžœ2žœ
+žœ˜_Lšžœžœžœ#˜9Lšžœ˜—Lšœžœ˜šžœžœžœžœžœžœž˜7Lšœ)˜)Lšžœ˜—šžœžœž˜Lšœžœ˜L˜Lšœ%˜%Lšžœ˜—L˜L˜ —š
+Ÿœžœ	žœžœžœ˜ALšœžœ˜Lšœ
+žœžœ˜Lšœžœ˜Lšœ žœžœ&žœžœ
+žœ˜~Lšžœžœžœ˜+L˜L˜ —šŸ
+œžœžœžœžœžœžœžœžœžœ˜LLš	œžœžœžœžœ˜šžœžœžœžœžœžœž˜<šžœžœžœ˜-Lšžœžœžœžœ˜=Lšžœ˜L˜—L˜Lšžœ˜—Lšžœ˜L˜L˜ ——™šŸ
+œžœžœ	žœžœžœ	žœžœžœžœžœ˜Lšœžœ˜Lšœ	žœ˜#Lšœžœ˜Lšœžœ˜*Lšœ"žœ˜&Lšœžœ˜Lšœžœ˜Lšœžœ#˜3Lšœžœ˜-Lšœžœ˜"Lšžœ
+žœžœ˜Lšžœ	žœžœ˜$Lšžœžœžœ˜2L˜.šžœžœž˜L˜*Lšœ ˜ L˜L˜šžœ˜šžœ˜Lšœ	žœ˜ Lšžœžœžœ˜$L˜"šžœž˜Lšœ
+žœ˜Lšœ˜Lšœžœ˜Lšœžœ˜L˜8L˜ Lšžœ'žœžœžœ˜Jšžœžœžœ˜-šœ˜LšœžœC˜I—Lšžœžœžœžœ˜3L˜L˜—Lšžœ˜—L˜—šžœ˜šžœž˜Lšœ˜Lšœ
+žœ˜Lšœ˜Lšœžœ˜L˜8LšœžœC˜MLšžœžœžœžœ˜3L˜Lšž˜—L˜——Lšžœ˜—Lšœ(˜(Lšžœ˜L˜L˜ —šŸœžœ(žœ˜GLšœKžœ,™{šžœžœž˜L˜#L˜&L˜ L˜šžœžœž˜L˜!šžœžœž˜Lšœ(žœ˜BLšœžœ1˜DLšžœ˜—L˜Lšžœ˜—L˜Lšžœ˜—L˜L˜ —šŸœžœžœ	žœžœžœ˜9Lšžœžœžœžœ˜ILšžœ2˜8Lšœ˜L˜ —š
+Ÿœžœžœžœžœ˜?Lšœžœ/˜7L˜ —šŸœžœžœžœžœžœ˜KL™LšœžœJ˜Yšžœžœž˜Lšœžœ˜?Lšœ!žœ˜ALšœ%žœ˜CLšœ*žœ˜HLšœ$žœ˜Bšœ'žœ˜2Lšœ˜Lšœ˜L˜—šœ)žœ˜4Lšœ˜Lšœ˜L˜—šœ&žœ˜1Lšœ˜Lšœ˜L˜—Lšœžœ˜;Lšžœ˜—L˜L˜ —šŸœžœžœžœžœžœžœ˜5Lš	œžœžœžœžœ˜šžœ%žœ	žœž˜<Lšœžœ˜Lšžœ˜—Lšžœ˜L˜L˜ ——šŸ™š
+Ÿœžœžœžœžœ ˜Všœžœ!˜*Lšœžœžœ,žœ$˜fL˜—L˜—L˜ šŸœžœžœA˜Ušœžœ˜'LšœK˜K—Lšœ$˜$Lšžœ˜—L˜ šŸœžœžœ%žœŸœžœ'žœ˜™Lšœ@žœ˜GLšžœ˜—L˜ šŸœžœžœ%žœŸœžœ;žœžœ˜¼Lšœ˜Lšœžœ˜#Lšœ	žœ˜&Lšœžœ!˜2Lšœžœ˜Lšœžœ˜(Lšœžœ˜Lšœžœ˜Lšœžœ˜Lšœ	žœ˜Lšœžœ˜šœ	žœžœžœ˜&šžœžœ˜L˜L˜Lšžœ˜L˜—L˜šžœžœ˜L˜'L˜L˜"Lšžœžœžœ˜?L˜Lšœ˜—L˜—Lšœžœ˜ Lšœžœ˜Lšœžœ˜šžœžœž˜$Lšœžœ˜4Lšœžœ˜Lšœžœ žœ˜BLšžœžœžœžœ
+˜6Lšžœžœžœžœžœžœžœžœ˜~šžœ˜Lšœ1™1L˜:L˜AL˜—L˜L˜DL˜"Lšžœžœ˜(L˜Lšœžœ˜Lšžœ˜—Lšžœ	žœžœ˜LšžœžœI˜`L˜.Lšœ&˜&Lšžœ˜L˜ —šŸœžœžœ&žœ)˜uLš
+žœžœžœžœžœ˜OLšœžœ˜!Lšœžœ˜!Lšœžœ˜'Lšœžœ˜'L˜BL˜BL˜0L˜0Lšžœžœžœžœ#˜KLšžœ˜L˜ —šŸœžœžœžœžœžœ œ˜WLšœžœ˜Lšœžœ˜Lšœ˜Lšœ˜Lšžœžœžœ˜1Lšžœžœžœ˜-Lšžœžœžœ˜-Lšžœžœžœ˜9šžœ4ž˜>Lšœžœžœ˜Lšœžœžœ˜Lšœžœžœ
+˜6Lšžœžœ˜———™šŸœ1˜HL˜ —šŸœ˜&šœžœ
+žœžœžœžœ™:Lšœ	žœžœžœ™X—Lšœžœžœ˜Lš	œ
+žœžœžœžœ˜.Lšœžœžœ˜.Lšœžœžœ˜šŸœžœ˜Lšœžœ˜Lšœžœžœžœ˜5Lšžœžœžœ˜"šžœžœ˜Lšœžœžœžœ˜8L˜?Lšž˜Lšœ˜—Lš
+žœžœžœžœžœ˜?Lš
+žœžœžœžœžœ˜?Lšœžœ
+ ˜7L™Yšžœžœžœ˜šžœžœžœ˜"L˜Lšœžœ	˜"L˜—L™ šžœžœžœ˜LšžœU˜WLšžœ˜Lšœ˜—L˜—Lšžœ"˜$šžœžœž˜šžœ˜Lšœžœžœ0žœ˜aLšœ˜Lšœ˜—L˜Lšžœ˜—L˜—šž˜˜	šœžœ6žœ˜@Lšžœžœ˜—L˜—Lšžœ˜—L˜L˜ —šŸœ˜4Lšœžœ"žœ˜;L˜L˜ —šŸœ˜+Lšœžœ"˜,Lšœžœ˜šžœžœžœ˜L˜@Lšžœ˜L˜—L˜*Lšžœžœžœ+˜WL˜&Lšžœžœžœ˜0L˜'L˜L˜ —š
+Ÿœžœžœžœžœ˜=L™2Lšœ%žœžœžœ˜2Lšœ
+žœžœžœ˜šŸœžœ˜L™?šžœžœž˜LšœCžœ˜_Lšœ=žœ˜YLšœBžœ˜_Lšžœžœ˜4—Lšžœžœ˜L˜—šžœžœžœ˜Lšœžœ)˜3Lšžœžœžœ˜FL˜—Lš
+žœ"žœžœžœ
+žœ,˜tšžœžœžœ˜šžœžœžœžœžœžœžœ˜CLšœ"žœ˜)Lšžœ˜—šžœžœžœžœžœžœžœ˜CLšœ(žœ˜/Lšžœ˜—šžœžœžœžœžœžœžœ˜DLšœ&žœ˜-Lšžœ˜—L˜šžœ˜šžœžœžœ˜Lšœžœ.˜9šžœžœžœžœžœžœžœ˜CLšœ žœ˜'Lšžœ˜—L˜—šžœžœžœ˜Lšœžœ4˜?šžœžœžœžœžœžœžœ˜CLšœ žœ˜'Lšžœ˜—L˜—šžœžœžœ˜Lšœžœ2˜=šžœžœžœžœžœžœžœ˜DLšœ žœ˜'Lšžœ˜—L˜—L˜——L˜L˜ —šœžœžœžœ˜#L˜ —šŸœ:˜OL˜ —šŸœ0žœ˜LL˜ —Lšœ{˜{L˜ñL˜‚šœ˜L˜L˜˜L˜	—šœ˜L˜L˜hL˜
+—šœ˜L˜L˜nL˜—šœ˜L˜L˜kL˜—šœ˜L˜L˜fL˜
+—šœ˜L˜L˜fL˜
+—šœ˜L˜L˜hL˜L˜ —LšœD˜DLšœF˜F—™Lšœ7˜7L˜ —šžœ˜L˜ L˜ —— …—    ¥–   ø 

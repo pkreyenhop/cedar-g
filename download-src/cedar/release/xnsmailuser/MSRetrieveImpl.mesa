@@ -1,0 +1,679 @@
+
+DIRECTORY
+AuthenticationP14V2 USING [CallProblem, Problem],
+CHEntriesP0V0 USING [mailboxes],
+CrRPC USING [BulkDataSink, CreateClientHandle, DestroyClientHandle, Error, ErrorReason, Handle],
+EnvelopeFormatP1517V1,
+InbasketP18V2 USING [AccessError, AccessProblem, AuthenticationError, BodyPartSequence, BodyPartSequenceObject, ChangeMessageStatus, Delete, InbasketInUse, IndexError, IndexProblem, Logoff, Logon, MailPoll, nullIndex, OtherError, OtherProblem, Range, RetrieveBodyParts, RetrieveEnvelopes, Session, SessionError, SessionProblem, ServiceError, ServiceProblem, State, Status],
+IO,
+MailBasicsItemTypes USING [interpress, nsTextFile, otherNSFile, postscript, vpDocument, vpFolder],
+MailTransportP17V5 USING [Envelope],
+MSBasics USING [BodyPartInfo, CHName, Envelope, lastBodyPart],
+MSRetrieve,
+MSUtils,
+Process,
+Rope,
+UserProfile USING [Boolean],
+XNS USING [Address],
+XNSAuth USING [AuthenticationError, CallError, Conversation, Credentials, GetCredentials, GetIdentityDetails,GetNextVerifier, Identity, Initiate, MakeIdentity, SetRecipientHostNumber, Terminate, Verifier],
+XNSCH USING [Conversation, Error, InitiateConversation, Item, LookupAddressFromRope, LookupItemProperty, TerminateConversation],
+XNSCHItemOps USING [Error, NameListFromItem],
+XNSCHName USING [Name, RopeFromName];
+
+MSRetrieveImpl: CEDAR MONITOR
+IMPORTS CrRPC, InbasketP18V2, IO, MSUtils, Process, Rope, UserProfile, XNSAuth, XNSCH, XNSCHItemOps, XNSCHName
+EXPORTS MSRetrieve
+~ BEGIN 
+
+OPEN 
+Authentication: AuthenticationP14V2,
+CHEntries: CHEntriesP0V0,
+EnvelopeFormat: EnvelopeFormatP1517V1,
+Inbasket: InbasketP18V2,
+MailTransport: MailTransportP17V5;
+
+STREAM: TYPE ~ IO.STREAM;
+ROPE: TYPE ~ Rope.ROPE;
+LORA: TYPE ~ LIST OF REF ANY;
+dbMsg: BOOL ¬ FALSE;
+SetDBMsg: PROC [new: BOOL] RETURNS [old: BOOL] ~ {
+old ¬ dbMsg; dbMsg ¬ new;
+};
+
+DBMsg: PROC [r: ROPE] ~ {
+};
+
+Handle: TYPE ~ MSRetrieve.Handle;  -- should always be of type MSHandle
+
+MSHandle: TYPE ~ REF MSHandleObject;
+MSHandleObject: TYPE ~ RECORD [
+identity: XNSAuth.Identity ¬ NIL,
+mailboxes: MBoxList ¬ NIL,
+state: MSRetrieve.MboxState ¬ unknown,
+service: XNSCHName.Name,
+serviceAddr: REF XNS.Address ¬ NIL,
+sessionEstablished: BOOLEAN ¬ FALSE,
+session: Inbasket.Session,
+unreadMailboxes: MBoxList ¬ NIL,
+msg: CARD32 ¬ Inbasket.nullIndex,  -- current message
+msgList: LIST OF Inbasket.Range ¬ NIL,  -- list of messages we've read
+msgWithAttachmentsList: LIST OF Inbasket.Range ¬ NIL,
+envelope: MSBasics.Envelope,
+tocIndex: CARD32 ¬ LAST[CARD32],
+msgsThisServer: INT ¬ 0,
+pollingInterval: CARDINAL ¬ minPollingInterval,
+reportProc: MSRetrieve.ChangeReportProc ¬ NIL, -- write-once
+closed: BOOLEAN ¬ FALSE
+];
+
+minPollingInterval: CARDINAL ~ 30; -- seconds
+
+RPCData: TYPE ~ RECORD [
+conv: XNSAuth.Conversation ¬ NIL,
+rpcH: CrRPC.Handle ¬ NIL
+];
+
+MBoxList: TYPE ~ LIST OF XNSCHName.Name;
+maxMsgsPerSession: INT ¬ 120;		-- xns mail servers seem to drop connnections when the mailbox has lots of messages;  we "claim" the mailbox is empty after this many messages have been retrieved
+SetMaxMsgsPerSession: PROC [new: INT] RETURNS [old: INT] -- DEBUG --
+~ { old ¬ maxMsgsPerSession; maxMsgsPerSession ¬ new; };
+
+GetUser: PROC [msH: MSHandle] RETURNS [user: XNSCHName.Name] ~ -- INLINE -- { user ¬ XNSAuth.GetIdentityDetails[msH.identity].name };
+
+GetCreds: PROC [rpcD: RPCData] RETURNS [creds: XNSAuth.Credentials] ~ -- INLINE -- { creds ¬ XNSAuth.GetCredentials[rpcD.conv] };
+
+GetVerf: PROC [rpcD: RPCData] RETURNS [verf: XNSAuth.Verifier] ~ -- INLINE -- { verf ¬ XNSAuth.GetNextVerifier[rpcD.conv] };
+
+RefAddressFromName: PROC [name: XNSCHName.Name] RETURNS [refAddress: REF XNS.Address] ~ {
+refAddress ¬ NEW[XNS.Address ¬ XNSCH.LookupAddressFromRope[XNSCHName.RopeFromName[name]].address];
+};
+
+PutRPCData: PROC [rpcD: RPCData] ~ {
+IF rpcD.rpcH # NIL THEN CrRPC.DestroyClientHandle[rpcD.rpcH];
+IF rpcD.conv # NIL THEN XNSAuth.Terminate[rpcD.conv];
+};
+
+GetRPCData: PROC [myID: XNSAuth.Identity, service: XNSCHName.Name, optionalAddr: REF XNS.Address] RETURNS [rpcD: RPCData ¬ [NIL, NIL]] ~ {
+ENABLE UNWIND => PutRPCData[rpcD];
+refAddr: REF XNS.Address;
+IF optionalAddr = NIL
+THEN refAddr ¬ RefAddressFromName[service]
+ELSE refAddr ¬ NEW[XNS.Address ¬ optionalAddr­];
+rpcD.rpcH ¬ CrRPC.CreateClientHandle[$CMUX, refAddr];
+rpcD.conv ¬ XNSAuth.Initiate[myID, service];
+XNSAuth.SetRecipientHostNumber[rpcD.conv, refAddr.host];
+};
+
+EstablishSession: PROC [msH: MSHandle] ~ {
+rpcD: RPCData ¬ [NIL, NIL];
+DoLogon: PROC ~ {
+ENABLE UNWIND => PutRPCData[rpcD];
+DBMsg[IO.PutFR1["Logon %g\n", IO.rope[XNSCHName.RopeFromName[msH.service]]]];
+rpcD ¬ GetRPCData[msH.identity, msH.service, msH.serviceAddr];
+msH.session ¬ Inbasket.Logon[rpcD.rpcH, GetUser[msH], GetCreds[rpcD], GetVerf[rpcD]].session;
+msH.sessionEstablished ¬ TRUE;
+PutRPCData[rpcD];
+};
+IF msH.sessionEstablished THEN {
+DBMsg[IO.PutFR1["Continue session %g\n", IO.rope[XNSCHName.RopeFromName[msH.service]]]];
+RETURN;
+};
+CallEnabled[DoLogon];
+};
+
+ReleaseSession: PROC [msH: MSHandle] ~ {
+rpcD: RPCData ¬ [NIL, NIL];
+DoLogoff: PROC ~ {
+ENABLE UNWIND => PutRPCData[rpcD];
+DBMsg[IO.PutFR1["Logoff %g\n", IO.rope[XNSCHName.RopeFromName[msH.service]]]];
+rpcD ¬ GetRPCData[msH.identity, msH.service, msH.serviceAddr];
+Inbasket.Logoff[rpcD.rpcH, msH.session];
+msH.sessionEstablished ¬ FALSE;
+PutRPCData[rpcD];
+};
+IF msH.sessionEstablished THEN CallEnabled[DoLogoff ! Failed => CONTINUE];
+};
+Create: PUBLIC PROC [pollingInterval: CARDINAL, reportChanges: MSRetrieve.ChangeReportProc ¬ NIL] RETURNS [Handle] ~ {
+msH: MSHandle ¬ NEW[MSHandleObject];
+msH.reportProc ¬ reportChanges;
+msH.pollingInterval ¬ MAX[pollingInterval, minPollingInterval];
+IF reportChanges # NIL THEN TRUSTED {
+Process.Detach[ FORK PollMboxStatus[msH] ];
+};
+RETURN[msH];
+};
+Close: PUBLIC PROC [handle: Handle] RETURNS [] ~ {
+msH: MSHandle ¬ NARROW[handle];
+ReleaseSession[msH];
+msH.closed ¬ TRUE;
+};
+NewUser: PUBLIC PROC [handle: Handle, user: MSBasics.CHName, password: ROPE] RETURNS [] ~ {
+msH: MSHandle ¬ NARROW[handle];
+DoNewUser: ENTRY PROC ~ {
+ENABLE UNWIND => NULL;
+msH.identity ¬ NIL;
+msH.mailboxes ¬ NIL;
+msH.state ¬ cantAuth;
+msH.identity ¬ XNSAuth.MakeIdentity[user, password, simple];
+msH.state ¬ badName;
+msH.mailboxes ¬ GetMailboxes[user];
+IF msH.mailboxes # NIL THEN msH.state ¬ userOK;
+DBMsg[IO.PutFR1["NewUser state %g\n", IO.card[ORD[msH.state]]]];
+};
+ReleaseSession[msH];
+CallEnabled[DoNewUser];
+};
+MailboxStateInner: PROC [handle: Handle]
+RETURNS [oldState, newState: MSRetrieve.MboxState ¬ unknown] ~ {
+msH: MSHandle ¬ NARROW[handle];
+down, empty, msgs: BOOLEAN ¬ FALSE;
+computedState: MSRetrieve.MboxState;
+identity: XNSAuth.Identity;
+mailboxes: MBoxList;
+GetHandleInfo: ENTRY PROC ~ {
+ENABLE UNWIND => NULL;
+identity ¬ msH.identity;
+mailboxes ¬ msH.mailboxes;
+oldState ¬ msH.state;
+};
+SetNewState: ENTRY PROC ~ {
+ENABLE UNWIND => NULL;
+IF msH.state >= userOK AND computedState >= userOK THEN msH.state ¬ computedState;
+newState ¬ msH.state;
+};
+DBMsg["MailboxState\n"];
+GetHandleInfo[];
+IF oldState < userOK THEN {
+DBMsg[IO.PutFR1["MailboxState %g\n", IO.card[ORD[msH.state]]]];
+RETURN [oldState, oldState];
+};
+IF identity = NIL THEN ERROR; -- can't happen
+FOR mbox: MBoxList ¬ mailboxes, mbox.rest WHILE mbox#NIL AND NOT msgs DO
+SELECT GetServerState[identity, mbox.first, NIL] FROM
+unknown => down ¬ TRUE;
+empty => empty ¬ TRUE;
+notEmpty => msgs ¬ TRUE;
+ENDCASE;
+ENDLOOP;
+computedState ¬ SELECT TRUE FROM
+msgs => notEmpty,
+empty AND down => someEmpty,
+down => allDown,
+empty => allEmpty,
+ENDCASE => unknown;  -- No mailboxes? 
+DBMsg[IO.PutFR1["MailboxState %g\n", IO.card[ORD[msH.state]]]];
+SetNewState[];
+};
+MailboxState: PUBLIC PROC [handle: Handle] RETURNS [state: MSRetrieve.MboxState] ~ { RETURN [MailboxStateInner[handle].newState] };
+GetServerState: PROC [myID: XNSAuth.Identity, server: XNSCHName.Name, serverAddr: REF XNS.Address] RETURNS [state: MSRetrieve.ServerState ¬ unknown] ~ {
+rpcD: RPCData ¬ [NIL, NIL];
+DoGetServerState: PROC ~ {
+ENABLE UNWIND => PutRPCData[rpcD];
+msgCount: Inbasket.State;
+rpcD ¬ GetRPCData[myID, server, serverAddr];
+msgCount ¬ Inbasket.MailPoll[rpcD.rpcH, XNSAuth.GetIdentityDetails[myID].name, GetCreds[rpcD], GetVerf[rpcD]];
+state ¬ IF msgCount.total # 0 THEN notEmpty ELSE empty;
+PutRPCData[rpcD];
+};
+CallEnabled[DoGetServerState ! Failed => CONTINUE];
+};
+
+NextServer: PUBLIC PROC [handle: Handle] RETURNS [noMore: BOOLEAN, state: MSRetrieve.ServerState] ~ {
+msH: MSHandle ¬ NARROW[handle];
+DBMsg["NextServer\n"];
+ReleaseSession[msH];  -- probably won't use it for awhile
+msH.unreadMailboxes ¬ IF msH.unreadMailboxes = NIL THEN msH.mailboxes ELSE msH.unreadMailboxes.rest;
+IF msH.unreadMailboxes = NIL
+THEN {
+msH.serviceAddr ¬ NIL;
+msH.service ¬ [NIL, NIL, NIL];
+DBMsg["NextServer noMore, unknown\n"];
+RETURN [noMore: TRUE, state: unknown];
+}
+ELSE {
+msH.serviceAddr ¬ RefAddressFromName[msH.unreadMailboxes.first];
+msH.service ¬ msH.unreadMailboxes.first;
+};
+msH.msg ¬ Inbasket.nullIndex;
+msH.msgsThisServer ¬ 0;
+
+noMore ¬ FALSE;
+state ¬ GetServerState[msH.identity, msH.service, msH.serviceAddr];
+DBMsg[IO.PutFR1["NextServer %g\n", IO.rope[XNSCHName.RopeFromName[msH.service]]]];
+};
+ServerName: PUBLIC PROC [handle: Handle] RETURNS [MSBasics.CHName] ~ {
+msH: MSHandle ¬ NARROW[handle];
+RETURN[ msH.service ];
+};
+AddMsgToList: PROC [thisMsg: CARD32, oldList: LIST OF Inbasket.Range] RETURNS [newList: LIST OF Inbasket.Range] ~ {
+SELECT TRUE FROM
+((oldList = NIL) OR (thisMsg > oldList.first.high+1)) =>
+newList ¬ CONS[[low~thisMsg, high~thisMsg], oldList];
+(thisMsg = oldList.first.high+1) =>
+newList ¬ CONS[[low~oldList.first.low, high~thisMsg], oldList.rest];
+thisMsg >= oldList.first.low =>
+newList ¬ oldList;
+ENDCASE =>
+newList ¬ CONS[oldList.first, AddMsgToList[thisMsg, oldList.rest]];
+};
+
+NextMessage: PUBLIC PROC [handle: Handle]
+RETURNS [msgExists, previouslyRead: BOOL ¬ FALSE] ~ {
+msH: MSHandle ¬ NARROW[handle];
+rpcD: RPCData ¬ [NIL, NIL];
+DoNextMessage: PROC ~ {
+ENABLE UNWIND => { msH.msgList ¬ NIL; PutRPCData[rpcD] };
+msgEnvelope: MailTransport.Envelope;
+msgStatus: Inbasket.Status;
+thisMsg: CARD32;
+EstablishSession[msH];
+rpcD ¬ GetRPCData[msH.identity, msH.service, msH.serviceAddr];
+[msgEnvelope, msgStatus, thisMsg] ¬ Inbasket.RetrieveEnvelopes[rpcD.rpcH, msH.msg, next, msH.session];
+msgExists ¬ thisMsg#Inbasket.nullIndex;
+previouslyRead ¬ msgStatus.messageStatus.existenceOfMessage=known;
+
+IF msgExists THEN {
+msH.envelope ¬ MSUtils.ParseEnvelope[msgEnvelope];
+IF HasAttachments[msH.envelope] THEN msH.msgWithAttachmentsList ¬ AddMsgToList[thisMsg, msH.msgWithAttachmentsList]
+ELSE msH.msgList ¬ AddMsgToList[thisMsg, msH.msgList];
+msH.msg ¬ thisMsg;
+msH.tocIndex ¬ LAST[CARD32];
+msH.msgsThisServer ¬ msH.msgsThisServer + 1;
+};
+PutRPCData[rpcD];
+}; 
+
+IF ( msH.msgsThisServer = maxMsgsPerSession ) THEN RETURN[FALSE, FALSE];
+CallEnabled[DoNextMessage];
+};
+GetMessageEnvelope: PUBLIC PROC [handle: Handle] RETURNS [envelope: MSBasics.Envelope] ~ {
+msH: MSHandle ¬ NARROW[handle];
+envelope ¬ msH.envelope;
+};
+NextBodyPart: PUBLIC PROC [handle: Handle] RETURNS [pb: MSBasics.BodyPartInfo] ~ {
+msH: MSHandle ¬ NARROW[handle];
+msH.tocIndex ¬ msH.tocIndex + 1;
+IF msH.tocIndex >= msH.envelope.toc.length THEN RETURN[[MSBasics.lastBodyPart, 0]];
+pb ¬ msH.envelope.toc[msH.tocIndex];
+};
+GetBodyPart: PUBLIC PROC [handle: Handle] RETURNS [s: STREAM] ~ {
+s ¬ IO.RIS[GetBodyPartAsRope[handle]];
+};
+GetBodyPartAsRope: PUBLIC PROC [handle: Handle] RETURNS [r: ROPE] ~ {
+ReadBodyPart: MSRetrieve.GetBodyPartCallback = {
+text: Rope.Text ¬ Rope.NewText[MIN[maxText, bytesRemaining]];
+pos: NAT ¬ 0;
+bytesRead: NAT ¬ 0;
+WHILE NOT IO.EndOf[s] DO
+IF checkAbort[] THEN RETURN[TRUE];
+TRUSTED {bytesRead ¬ IO.GetBlock[s, LOOPHOLE[text], pos, text.max]};
+pos ¬ pos + bytesRead;
+IF pos >= text.max THEN {
+contents ¬ Rope.Concat[contents, text];
+bytesRemaining ¬ bytesRemaining - pos;
+IF bytesRemaining > 0 THEN text ¬ Rope.NewText[MIN[maxText, bytesRemaining]];
+pos ¬ 0;
+};
+IF bytesRead = 0 AND NOT IO.EndOf[s] THEN Process.PauseMsec[200];
+ENDLOOP;
+RETURN[FALSE];
+};
+msH: MSHandle ¬ NARROW[handle];
+bodyPartSize: INT ¬ msH.envelope.toc[msH.tocIndex].sizeInBytes;
+maxText: INT ¬ 2048;
+bytesRemaining: INT ¬ bodyPartSize;
+contents: ROPE ¬ NIL;
+GetBodyPartViaCallback[handle, ReadBodyPart];
+IF bytesRemaining # 0 THEN ERROR Failed[$BrainDamagedServer, IO.PutFR["It said the item was %g bytes but it delivered %g bytes.", [integer[bodyPartSize]], [integer[contents.Length[]]] ] ];
+r ¬ contents;
+};
+GetBodyPartViaCallback: PUBLIC PROC [handle: Handle, proc: MSRetrieve.GetBodyPartCallback] ~ {
+msH: MSHandle ¬ NARROW[handle];
+rpcD: RPCData ¬ [NIL, NIL];
+ReadBulkData: CrRPC.BulkDataSink = {
+userCheckAbort: PROC RETURNS [BOOL] ~ { RETURN[checkAbort[h]] };
+RETURN[proc[s, userCheckAbort]];
+};
+DoGetBodyPartViaCallback: PROC ~ {
+bodyPartSize: INT ¬ msH.envelope.toc[msH.tocIndex].sizeInBytes;
+IF bodyPartSize > 0 THEN {
+ENABLE UNWIND => PutRPCData[rpcD];
+bodyParts: Inbasket.BodyPartSequence ¬ NEW[Inbasket.BodyPartSequenceObject[1]];
+bodyParts[0] ¬ msH.tocIndex;
+EstablishSession[msH];
+rpcD ¬ GetRPCData[msH.identity, msH.service, msH.serviceAddr];
+Inbasket.RetrieveBodyParts[rpcD.rpcH, msH.msg, bodyParts, ReadBulkData, msH.session];
+PutRPCData[rpcD];
+};
+};
+CallEnabled[DoGetBodyPartViaCallback];
+};
+MarkMessage: PUBLIC PROC [handle: Handle] ~ {
+msH: MSHandle ¬ NARROW[handle];
+rpcD: RPCData ¬ [NIL, NIL];
+DoMarkMessage: PROC ~ {
+ENABLE UNWIND => PutRPCData[rpcD];
+range: Inbasket.Range ¬ [low: msH.msg, high: msH.msg];
+EstablishSession[msH];
+rpcD ¬ GetRPCData[msH.identity, msH.service, msH.serviceAddr];
+Inbasket.ChangeMessageStatus[rpcD.rpcH, range, FALSE, 0, msH.session];
+PutRPCData[rpcD];
+};
+CallEnabled[DoMarkMessage];
+};
+
+DeleteMessage: PUBLIC PROC [handle: Handle] ~ {
+msH: MSHandle ¬ NARROW[handle];
+rpcD: RPCData ¬ [NIL, NIL];
+DoDeleteMessage: PROC ~ {
+ENABLE UNWIND => PutRPCData[rpcD];
+range: Inbasket.Range ¬ [low: msH.msg, high: msH.msg];
+IF msH.msg = Inbasket.nullIndex THEN RETURN;
+EstablishSession[msH];
+rpcD ¬ GetRPCData[msH.identity, msH.service, msH.serviceAddr];
+Inbasket.Delete[rpcD.rpcH, range, msH.session];
+IF msH.msgList # NIL AND msH.msgList.first.high = msH.msg
+THEN {
+IF msH.msgList.first.low = msH.msg
+THEN msH.msgList ¬ msH.msgList.rest
+ELSE msH.msgList.first.high ¬ msH.msgList.first.high - 1;
+}
+ELSE ERROR Failed[$Delete, IO.PutFR["msH.msgList.first.high: %g, msH.msg: %g", [integer[msH.msgList.first.high]], [integer[msH.msg]] ] ];  -- something's inconsistent
+PutRPCData[rpcD];
+};
+CallEnabled[DoDeleteMessage];
+};
+
+Accept: PUBLIC PROC [handle: Handle] ~ {
+msH: MSHandle ¬ NARROW[handle];
+rpcD: RPCData ¬ [NIL, NIL];
+DeleteMessages: PROC [msgList: LIST OF Inbasket.Range] ~ {
+IF msgList = NIL THEN RETURN;
+DeleteMessages[msgList.rest];
+Inbasket.Delete[rpcD.rpcH, msgList.first, msH.session];
+};
+DoAccept: PROC ~ {
+ENABLE UNWIND => PutRPCData[rpcD];
+EstablishSession[msH];
+rpcD ¬ GetRPCData[msH.identity, msH.service, msH.serviceAddr];
+DeleteMessages[msH.msgList];
+msH.msgList ¬ NIL;
+IF UserProfile.Boolean["XNSMail.FlushMsgsWithAttachments", FALSE] THEN {
+DeleteMessages[msH.msgWithAttachmentsList];
+msH.msgWithAttachmentsList ¬ NIL;
+};
+msH.msg ¬ Inbasket.nullIndex;
+PutRPCData[rpcD];
+};
+IF ( msH.msgList # NIL ) OR ( msH.msgWithAttachmentsList # NIL ) THEN CallEnabled[DoAccept];
+};
+
+HasAttachments: PROC[envelop: MSBasics.Envelope] RETURNS[yes: BOOL ¬ FALSE] = {
+FOR i: CARD32 IN [0..envelop.toc.length) DO
+SELECT envelop.toc[i].type FROM
+MailBasicsItemTypes.vpFolder,
+MailBasicsItemTypes.vpDocument,
+MailBasicsItemTypes.otherNSFile,
+MailBasicsItemTypes.interpress,
+MailBasicsItemTypes.postscript => RETURN[TRUE];
+MailBasicsItemTypes.nsTextFile =>
+IF UserProfile.Boolean["XNSMail.nsTextFileAsFile", FALSE] THEN RETURN[TRUE];
+ENDCASE;
+ENDLOOP;
+RETURN;
+};
+
+Failed: PUBLIC ERROR [why: MSRetrieve.FailureReason, text: ROPE] = CODE;
+
+CallEnabled: PROC [proc: PROC] ~ {
+ENABLE {
+CrRPC.Error => ReportRPCError[errorReason, text];
+XNSAuth.AuthenticationError => ReportAuthenticationError[problem];
+XNSAuth.CallError => ReportAuthCallError[problem];
+Inbasket.AccessError => ReportAccessError[problem];
+Inbasket.AuthenticationError => ReportAuthenticationError[problem];
+Inbasket.InbasketInUse => ReportInbasketInUse[user];
+Inbasket.IndexError => ReportIndexError[problem];
+Inbasket.OtherError => ReportOtherError[problem];
+Inbasket.ServiceError => ReportServiceError[problem];
+Inbasket.SessionError => ReportSessionError[problem];
+};
+proc[];
+};
+
+ReportRPCError: PROC [errorReason: CrRPC.ErrorReason, text: ROPE] = {
+ERROR Failed[$RPC, text];
+};
+
+ReportAuthCallError: PROC [problem: Authentication.CallProblem] = {
+SELECT problem FROM
+tooBusy => ERROR Failed[$Authentication, "server is too busy to service this request"];
+accessRightsInsufficient => ERROR Failed[$Authentication, "operation prevented by access controls"];
+keysUnavailable => ERROR Failed[$Authentication, "the server that holds the required keys was inaccessible"];
+strongKeyDoesNotExist => ERROR Failed[$Authentication, "a strong key critical to this operation has not been registered"];
+simpleKeyDoesNotExist => ERROR Failed[$Authentication, "a simple key critical to this operation has not been registered"];
+strongKeyAlreadyRegistered => ERROR Failed[$Authentication, "cannot create a strong key for an entity which already has one"];
+simpleKeyAlreadyRegistered => ERROR Failed[$Authentication, "cannot create a simple key for an entity which already has one"];
+domainForNewKeyUnavailable => ERROR Failed[$Authentication, "cannot create a new key because the domain to hold it is inaccessible"];
+domainForNewKeyUnknown => ERROR Failed[$Authentication, "cannot create a new key because the domain to hold it is unknown"];
+badKey => ERROR Failed[$Authentication, "bad key passed to CreateStrongKey or ChangeStrongKey"];
+badName => ERROR Failed[$Authentication, "bad name passed to CreateStrongKey or ChangeStrongKey"];
+databaseFull => ERROR Failed[$Authentication, "no more data can be added to the Authentication database"];
+other => ERROR Failed[$Authentication, "some unknown Authentication call problem"];
+ENDCASE => ERROR;
+};
+
+ReportAuthenticationError: PROC [problem: Authentication.Problem] = {
+SELECT problem FROM
+credentialsInvalid => ERROR Failed[$Authentication, "credentials unacceptable"];
+verifierInvalid => ERROR Failed[$Authentication, "verifier unacceptable"];
+verifierExpired => ERROR Failed[$Authentication, "the verifier was too old"];
+verifierReused => ERROR Failed[$Authentication, "the verifier has been used before"];
+credentialsExpired => ERROR Failed[$Authentication, "the credentials have expired"];
+inappropriateCredentials => ERROR Failed[$Authentication, "passed strong, wanted simple, or vice versa"];
+ENDCASE => ERROR;
+};
+
+ReportAccessError: PROC [problem: Inbasket.AccessProblem] = {
+SELECT problem FROM
+accessRightsInsufficient => ERROR Failed[$Authentication, "the user doesn't have access"];
+accessRightsIndeterminate => ERROR Failed[$Authentication, "cannot determine whether the user has access"];
+noSuchInbasket => ERROR Failed[$Protocol, "no inbasket for this recipient"];
+inbasketIndeterminate => ERROR Failed[$Protocol, "cannot resolve potential alias"];
+wrongService => ERROR Failed[$Protocol, "mailbox does not reside on this service"];
+ENDCASE => ERROR;
+};
+
+ReportSessionError: PROC [problem: Inbasket.SessionProblem] = {
+SELECT problem FROM
+tokenInvalid => ERROR Failed[$Protocol, "the Inbasket.Session is invalid"];
+ENDCASE => ERROR;
+};
+
+ReportServiceError: PROC [problem: Inbasket.ServiceProblem] = {
+SELECT problem FROM
+cannotAuthenticate => ERROR Failed[$Service, "generally, an Authentication.CallProblem on the server"];
+serviceFull => ERROR Failed[$Service, "no more operations of that type can be accepted"];
+serviceUnavailable => ERROR Failed[$Service, "operations of that type are currently disabled"];
+ENDCASE => ERROR;
+};
+
+ReportOtherError: PROC [problem: Inbasket.OtherProblem] = {
+SELECT problem FROM
+cantExpedite => ERROR Failed[$Protocol, "the operation cannot be expedited"];
+malformedMessage => ERROR Failed[$Protocol, "the message bodyparts or other portions are malformed"];
+invalidOperation => ERROR Failed[$Protocol, "the sequence of operations is invalid"];
+ENDCASE => ERROR Failed[$Protocol, "unknown inbasket error"];
+};
+
+ReportIndexError: PROC [problem: Inbasket.IndexProblem] = {
+SELECT problem FROM
+invalidIndex => ERROR Failed[$Protocol, "the index doesn't name an existing message"];
+invalidBodyPartIndex => ERROR Failed[$Protocol, "the index doesn't name an existing body part"];
+ENDCASE => ERROR;
+};
+
+ReportInbasketInUse: PROC [user: XNSCHName.Name] = {
+ERROR Failed[$Service, Rope.Concat["inbasket is currently in use by ", XNSCHName.RopeFromName[user]]];
+};
+
+PollMboxStatus: PROC [msH: MSHandle] RETURNS [] ~ {
+prevState, state: MSRetrieve.MboxState;
+WHILE NOT msH.closed DO
+[prevState, state] ¬ MailboxStateInner[msH];
+IF msH.reportProc = NIL THEN ERROR; -- can't happen 
+msH.reportProc[state, msH];	-- always report the state
+
+Process.PauseMsec[1000*msH.pollingInterval];
+ENDLOOP;
+};
+GetMailboxes: PROC [name: XNSCHName.Name] RETURNS [mailboxes: MBoxList] = {
+item: XNSCH.Item;
+c: XNSCH.Conversation;
+alreadyRetried: BOOL ¬ FALSE;
+DBMsg[IO.PutFR1["GetMailboxes %g\n", IO.rope[XNSCHName.RopeFromName[name]]]];
+DO
+c ¬ XNSCH.InitiateConversation[];
+item ¬ XNSCH.LookupItemProperty[c, name, CHEntries.mailboxes
+! XNSCH.Error => CONTINUE ].item;
+IF item # NIL THEN EXIT;
+XNSCH.TerminateConversation[c];
+IF alreadyRetried THEN RETURN[NIL];
+alreadyRetried ¬ TRUE;
+ENDLOOP;
+mailboxes ¬ XNSCHItemOps.NameListFromItem[item, 2
+! XNSCHItemOps.Error => CONTINUE].names;
+XNSCH.TerminateConversation[c];
+FOR each: MBoxList ¬ mailboxes, each.rest WHILE each # NIL DO
+DBMsg[IO.PutFR1["GetMailboxes found %g\n", IO.rope[XNSCHName.RopeFromName[each.first]]]];
+ENDLOOP;
+};
+
+END. 
+   ”  MSRetrieveImpl.mesa
+Copyright Ó 1987, 1989, 1990, 1991 by Xerox Corporation.  All rights reserved.
+Doug Terry, November 29, 1988 8:38:05 pm PST
+Wes Irish, December 22, 1988 2:57:28 pm PST
+Willie-sue, December 10, 1991 7:58 pm PST
+Willie-Sue Orr,  January 18, 1990 1:43:21 pm PST
+Tim Diebert: November 16, 1989 9:34:06 am PST
+Demers, December 14, 1989 1:00:08 pm PST
+
+Operations for retrieval of electronic mail messages from XNS mail servers.
+
+This is a MONITOR because the client and the polling process run concurrently...it's the responsibility of the client not to have more than one outstanding call per handle.
+
+Debugging Junk
+StringFromRope: PROC [zero: CARD32, r: ROPE] RETURNS [CARD32] ~ TRUSTED MACHINE CODE { "XR_CharStarFromRope" };
+ConsoleMsg: PROC [m: CARD32] ~ TRUSTED MACHINE CODE { "XR_ConsoleMsg" };
+msg: CARD32 ;
+IF NOT dbMsg THEN RETURN;
+msg _ StringFromRope[0, r];
+ConsoleMsg[msg];
+Handles and sessions
+MSHandles are not tied directly to sessions with a MS server since MSHandles are potentially long-lived (hours or days) whereas sessions should be fairly short to avoid tying up resources on the server.  Sessions are automatically established when needed and automatically released when further activity in the near future is unlikely (e.g. when NextServer returns noMore=TRUE). 
+User identity, protected by the monitor lock ...
+State of current processing
+Handle state
+! May raise any error that might be raised during address lookup ...
+There must be a better way to do this!
+N.B. the following could just use optionalAddr without copying it, I think ... ajd
+Exported procedures
+Must be called before any other entries in this interface.  Can be called many times.  "pollingInterval" is the interval in seconds to wait between successive inbox checks and "reportChanges" (if provided) is called  whenever the state of the user's authentication or mailboxes changes;  "reportChanges" will not be called if the state changes to "unknown" or "userOK".
+
+Releases resources used by this handle.  Further use of this handle is illegal.
+Handle is garbage collected; nothing actually prevents the client from holding on to the handle and continuing to use it.
+
+Provides new user name and password, and starts authentication and mailbox checking.
+
+Returns the current mailbox state.  No ERRORs.
+down, empty, and msgs are set TRUE if they are TRUE for some server
+
+
+No ERRORs, returns unknown on failure.
+Returns information about the next server in the mailbox site list of the user, and that server becomes the "current server".  If there is no such server, noMore=TRUE, in which case the next call to "NextServer" will start a new sequence of mail retrieval.  If the state is "unknown", attempting to access the mailbox is inadvisable, as the server is probably down.  If the state is "empty", there may in fact be mail, as the state is only a hint obtained by polling. 
+ERRORs: Failed.
+The order of the following two assignments is important because RefAddressFromName may raise an error ...
+
+Provides the name of the current server.  For MTP registries, this will be equivalent to the registry name.
+
+Returns information about the next message in the mailbox, and that message becomes the "current message".  If there is no such message, msgExists=FALSE.  If previouslyRead=TRUE then the message is not new, i.e. it has been marked as being read.
+ERRORs: Failure.
+
+Retrieves the message's postmark, msgID, sender, etc.
+
+Skips the remainder of any previous item, then delivers the header of the next item.
+
+Provides an IO stream for reading the current item.
+
+Provides the current item as a ROPE.
+PROC [s: STREAM, checkAbort: PROC RETURNS [BOOL]] RETURNS [abort: BOOL]
+IF debugStrm # NIL THEN
+debugStrm.PutF["bytesRead: %g, text.max: %g\n", [integer[bytesRead]], [integer[text.max]] ];
+
+Provides the current item via a Callback.
+[h: CrRPC.Handle, s: STREAM, checkAbort: CrRPC.BulkDataCheckAbortProc] RETURNS [abort: BOOL]
+
+Marks current message as being read.
+Deletes current message.
+Flush the mailbox entirely (and irrecoverably).
+Note that we are intentionally deleting the oldest range first, the most recent last; just in case the mail server cares...
+Errors
+All errors raised by underlying protocols (Inbasket, Authentication, Clearinghouse) are turned into "Failed".
+May be signalled by any of the procedures that handle messages.
+Errors that can be raised by the Courier RPC runtime:
+
+Errors that can be raised by Authentication:
+
+Errors that can be raised by the Inbasket protocol:
+
+Status change reports
+Should do something about this in case a mail server wedges ... ajd
+
+
+IF (state # prevState) AND (state > userOK) THEN {
+IF msH.reportProc = NIL THEN ERROR; -- can't happen 
+msH.reportProc[state, msH];
+};
+Mailboxes
+ ÊS  •NewlineDelimiter
+–(cedarcode) style˜ code•MarkoutsideHeaderšÏb™Kšœ
+ÏeœC™NK™,K™+K™)K™0K™-K™(K™ KšœK™KK™ —šÏk	˜	KšœŸœ˜1KšœŸœ˜ KšœŸœU˜`Kšœ˜KšœŸœâ˜õKšŸœ˜KšœŸœI˜bKšœŸœ˜$Kšœ	Ÿœ0˜>Kšœ˜Kšœ˜Kšœ˜Kšœ˜KšœŸœ˜KšŸœŸœ˜KšœŸœÀ˜ÍKšŸœŸœu˜€KšœŸœ˜-Kšœ
+Ÿœ˜%—K˜ KšÐblœŸœŸ˜KšŸœg˜nKšŸœ˜šœŸ˜K˜ K™¬K™ šŸœ˜KšÏnœ˜$Kš¡	œ˜Kš¡œ˜&Kš¡œ˜Kš¡œ˜"—K˜ KšŸœŸœŸœŸœ˜KšŸœŸœŸœ˜KšŸœŸœŸœŸœŸœŸœ˜—head™KšœŸœŸœ˜š
+¡œŸœŸœŸœŸœ˜2K˜K˜K˜ —š¡œŸœŸœ˜Kš¡œŸœŸœŸœŸœŸœŸœŸœŸœ™oKš¡
+œŸœŸœŸœŸœŸœ™HKšœŸœ™KšŸœŸœŸœŸœ™Kšœ™Kšœ™K˜——™Kšœû™ûK˜ KšœŸœÏc$˜GK˜ Kšœ
+ŸœŸœ˜$šœŸœŸœ˜™0KšœŸœ˜!KšœŸœ˜K˜&—™Kšœ˜KšœŸœŸœŸœ˜#KšœŸœŸœ˜$Kšœ˜KšœŸœ˜ KšœŸœ¢˜5Kšœ	ŸœŸœŸœ¢˜FKšœŸœŸœŸœ˜5Kšœ˜Kšœ
+ŸœŸœŸœ˜ KšœŸœ˜—™KšœŸœ˜/Kšœ*Ÿœ¢˜<KšœŸœŸ˜—Kšœ˜K˜ —šœŸœ¢
+˜-K˜ —šœ	ŸœŸœ˜KšœŸœ˜!KšœŸ˜K˜K˜ —Kšœ
+ŸœŸœŸœ˜(KšœŸœ	¢¢˜Áš¡œŸœŸœŸœŸœ¢˜DK˜8—K˜ š¡œŸœŸœ¢œ:˜…K˜ —š¡œŸœŸœ ¢œ/˜K˜ —š¡œŸœŸœ¢œ/˜|K˜ —š
+¡œŸœŸœŸœŸœ˜YK™DK™&KšœŸœŸœŸœ>˜bK˜—š¡
+œŸœ˜$KšŸœŸœŸœ&˜=KšŸœŸœŸœ˜5K˜K˜ —š¡
+œŸœAŸœŸœ
+ŸœŸœŸœ˜ŠKšŸœŸœ˜"Kšœ	ŸœŸœ	˜KšœR™RšŸœŸ˜KšŸœ&˜*KšŸœŸœŸœ˜0—K˜5K˜,Kšœ8˜8K˜K˜ —š¡œŸœ˜*KšœŸœŸœ˜š¡œŸœ˜KšŸœŸœ˜"KšœŸœŸœ-˜MK˜>K˜]KšœŸœ˜Kšœ˜K˜—šŸœŸœ˜ KšœŸœ!Ÿœ-˜XKšŸœ˜K˜—K˜K˜K˜ —š¡œŸœ˜(KšœŸœŸœ˜š¡œŸœ˜KšŸœŸœ˜"KšœŸœŸœ-˜NK˜>Kšœ(˜(KšœŸœ˜Kšœ˜K˜—KšŸœŸœ"Ÿœ˜JK˜——™š¡œŸœŸœŸœ/ŸœŸœ˜vKšœñ™ñKšœŸœ˜$K˜KšœŸœ&˜?šŸœŸœŸœŸœ˜%KšœŸœ˜+K˜—KšŸœ˜K˜K™ —š¡œŸœŸœŸœ˜2KšœO™OKšœŸœ	˜Kšœ˜KšœŸœ˜K™yK˜K™ —š
+¡œŸœŸœ3ŸœŸœ˜[KšœT™TKšœŸœ	˜š¡	œŸ
+œ˜KšŸœŸœŸœ˜KšœŸœ˜KšœŸœ˜K˜K˜<K˜K˜#KšŸœŸœŸœ˜/KšœŸœŸœŸœ˜@K˜—K˜Kšœ˜K˜K™ —š¡œŸœŸœ9˜iKšœ.™.KšœŸœ	˜KšœŸœŸœ˜#Kšœ$˜$Kšœ˜Kšœ˜š¡œŸœŸœ˜KšŸœŸœŸœ˜K˜K˜K˜K˜—š¡œŸœŸœ˜KšŸœŸœŸœ˜KšŸœŸœŸœ˜RK˜K˜—K˜K˜šŸœŸœ˜KšœŸœŸœŸœ˜?KšŸœ˜K˜—Kš	ŸœŸœŸœŸœ¢˜-šŸœ'ŸœŸœŸ˜HKšœC™CšŸœ&ŸœŸ˜5KšœŸœ˜KšœŸœ˜KšœŸœ˜KšŸœ˜—KšŸœ˜—šœŸœŸœŸ˜ Kšœ˜KšœŸœ˜Kšœ˜Kšœ˜KšŸœ¢˜&—KšœŸœŸœŸœ˜?Kšœ˜K˜K™ —š
+¡œŸœŸœŸœ#Ÿœ(˜ƒK™ —š
+¡œŸœ>ŸœŸœ
+Ÿœ.˜˜K™&KšœŸœŸœ˜š¡œŸœ˜KšŸœŸœ˜"Kšœ˜K˜,K˜nKšœŸœŸœ
+Ÿœ˜7Kšœ˜K˜—Kšœ)Ÿœ˜3K˜K˜ —š
+¡
+œŸœŸœŸœ
+Ÿœ$˜eKšœÔ™ÔK™KšœŸœ	˜K˜Kšœ¢#˜9Kš	œŸœŸœŸœŸœ˜dšŸœŸ˜šŸœ˜KšœŸœ˜KšœŸœŸœŸœ˜K˜&KšŸœ
+Ÿœ˜&K˜—šŸœ˜Kšœi™iK˜@K˜(K˜——K˜K˜K˜ Kšœ	Ÿœ˜K˜CKšœŸœŸœ-˜RK˜K™ —š¡
+œŸœŸœŸœ˜FKšœk™kKšœŸœ	˜KšŸœ˜K˜K™ —š¡œŸœŸœŸœŸœŸœŸœŸœ˜sšŸœŸœŸ˜šœŸœŸœ%˜8Kšœ
+Ÿœ'˜5—šœ#˜#Kšœ
+Ÿœ6˜D—šœ˜K˜—šŸœ˜
+Kšœ
+Ÿœ5˜C——K˜K˜ —š¡œŸœŸœŸœŸœŸœ˜_Kšœ“ŸœŸœD™õK™KšœŸœ	˜KšœŸœŸœ˜š¡œŸœ˜KšŸœŸœŸœ˜9Kšœ$˜$Kšœ˜Kšœ	Ÿœ˜Kšœ˜K˜>K˜fK˜'K˜BK˜ šŸœŸœ˜K˜2šŸœŸœO˜sKšŸœ2˜6—K˜KšœŸœŸœ˜K˜,K˜—Kšœ˜KšŸœ¢˜K˜ —Kš
+Ÿœ,ŸœŸœŸœŸœ˜HKšœ˜K˜K™ —š¡œŸœŸœŸœ"˜ZKšœ5™5KšœŸœ	˜K˜K˜K™ —š¡œŸœŸœŸœ ˜RKšœT™TKšœŸœ	˜K˜ KšŸœ)ŸœŸœ˜SK˜$K˜K™ —š
+¡œŸœŸœŸœŸœ˜AKšœŸœ%™3KšœŸœŸœ˜&K˜K™ —š
+¡œŸœŸœŸœŸœ˜EKšœ$™$•StartOfExpansion` -- [h: CrRPC.Handle, s: STREAM, checkAbort: CrRPC.BulkDataCheckAbortProc] RETURNS [abort: BOOL]š¡œ$˜0KšŸœŸœŸœŸœŸœŸœ	Ÿœ™GKšœŸœ˜=KšœŸœ˜KšœŸœ˜šŸœŸœŸœ
+Ÿ˜KšŸœŸœŸœŸœ˜"KšŸœŸœŸœ˜DK˜šŸœŸœŸ™Kšœ\™\—šŸœŸœ˜K˜'K˜&KšŸœŸœŸœ˜MK˜K˜—Kš
+ŸœŸœŸœŸœ
+Ÿœ˜AKšŸœ˜—KšŸœŸœ˜Kšœ˜—KšœŸœ	˜KšœŸœ.˜?Kšœ	Ÿœ˜KšœŸœ˜#Kšœ
+ŸœŸœ˜Kšœ-˜-KšŸœŸœŸœŸœ}˜¼K˜K˜K™ —š¡œŸœŸœ;˜^Kšœ)™)KšœŸœ	˜KšœŸœŸœ˜–` -- [h: CrRPC.Handle, s: STREAM, checkAbort: CrRPC.BulkDataCheckAbortProc] RETURNS [abort: BOOL]š¡œ˜$KšœŸœ,Ÿœ	Ÿœ™\Kš	œŸœŸœŸœŸœ˜@KšŸœ˜ Kšœ˜—š¡œŸœ˜"KšœŸœ.˜?šŸœŸœ˜KšŸœŸœ˜"Kšœ'Ÿœ%˜OK˜Kšœ˜K˜>KšœU˜UK˜K˜—K˜—Kšœ&˜&K˜K™ —š¡œŸœŸœ˜-K™$KšœŸœ	˜KšœŸœŸœ˜š¡œŸœ˜KšŸœŸœ˜"K˜6K˜K˜>Kšœ/Ÿœ˜FKšœ˜K˜—Kšœ˜K˜K˜ —š¡œŸœŸœ˜/K™KšœŸœ	˜KšœŸœŸœ˜š¡œŸœ˜KšŸœŸœ˜"K˜6KšŸœŸœŸœ˜,K˜K˜>Kšœ/˜/šŸœŸœŸœ!˜9šŸœ˜šŸœ ˜"KšŸœ˜#KšŸœ5˜9—K˜—KšŸœŸœŸœn¢˜¦—Kšœ˜K˜—Kšœ˜K˜K˜ —š¡œŸœŸœ˜(Kšœ/™/KšœŸœ	˜KšœŸœŸœ˜šÐbnœŸœŸœŸœ˜:K™{KšŸœŸœŸœŸœ˜Kšœ˜Kšœ7˜7Kšœ˜—š¡œŸœ˜KšŸœŸœ˜"K˜K˜>Kšœ˜KšœŸœ˜šŸœ9ŸœŸœ˜HK˜+KšœŸœ˜!K˜—K˜Kšœ˜K˜—Kš
+ŸœŸœŸœ ŸœŸœ˜\K˜K˜ —š
+¡œŸœŸœŸœŸœ˜OšŸœŸœŸœŸ˜+šŸœŸ˜Kšœ¡ŸœŸœ˜®Kšœ"Ÿœ1ŸœŸœŸœŸœ˜nKšŸœ˜—KšŸœ˜—KšŸœ˜K˜——™K™mK˜ š
+¡œŸœŸœ'ŸœŸœ˜HKšœ?™?K˜ —š¡œŸœŸœ˜"šŸœ˜Kšœ/Ït˜1Kšœ@¤˜BKšœ0¤˜2Kšœ1¤˜3KšœA¤˜CKšœ2¤˜4Kšœ1˜1Kšœ/¤˜1Kšœ3¤˜5Kšœ5˜5K˜—K˜K˜K˜ —K™5K™ š¡œŸœ(Ÿœ˜EKšŸœ˜K˜K˜ —K™,K™ š¡œŸœ*˜CšŸœ	Ÿ˜KšœŸœG˜WKšœŸœC˜dKšœŸœU˜mKšœŸœ\˜zKšœŸœ\˜zKšœŸœ[˜~KšœŸœ[˜~KšœŸœb˜…KšœŸœ]˜|Kšœ
+ŸœQ˜`KšœŸœR˜bKšœŸœU˜jKšœ	ŸœE˜SKšŸœŸœ˜—Kšœ˜K˜ —š¡œŸœ&˜EšŸœ	Ÿ˜KšœŸœ5˜PKšœŸœ2˜JKšœŸœ5˜MKšœŸœ>˜UKšœŸœ9˜TKšœŸœH˜iKšŸœŸœ˜—Kšœ˜K˜ —K™3K™ š¡œŸœ&˜=šŸœ	Ÿ˜KšœŸœ9˜ZKšœŸœI˜kKšœŸœ5˜LKšœŸœ5˜SKšœŸœ>˜SKšŸœŸœ˜—Kšœ˜—K˜ š¡œŸœ'˜?šŸœ	Ÿ˜KšœŸœ6˜KKšŸœŸœ˜—šœ˜K˜ ——š¡œŸœ'˜?šŸœ	Ÿ˜KšœŸœL˜gKšœŸœE˜YKšœŸœD˜_KšŸœŸœ˜—šœ˜K˜ ——š¡œŸœ%˜;šŸœ	Ÿ˜KšœŸœ8˜MKšœŸœL˜eKšœŸœ<˜UKšŸœŸœ-˜=—Kšœ˜K˜ —š¡œŸœ%˜;šŸœ	Ÿ˜KšœŸœA˜VKšœŸœC˜`KšŸœŸœ˜—Kšœ˜K˜ —š¡œŸœ˜4KšŸœa˜fKšœ˜K˜ ——™™CK™ —š¡œŸœŸœ˜3Kšœ'˜'šŸœŸœŸ˜K˜,Kš	ŸœŸœŸœŸœ¢˜4Kšœ¢˜6K™ šŸœŸœŸœ™2Kš	ŸœŸœŸœŸœ¢™4Kšœ™K™—K˜ Kšœ,˜,KšŸœ˜—K˜——™	š£œŸœŸœ˜KKšœŸœ˜KšœŸœ˜KšœŸœŸœ˜KšœŸœŸœ&˜MšŸ˜KšœŸœ˜!KšœŸœ3Ÿœ
+Ÿœ˜^KšŸœŸœŸœŸœ˜KšŸœ˜KšŸœŸœŸœŸœ˜#KšœŸœ˜KšŸœ˜—KšœJŸœ˜ZKšŸœ˜šŸœ'ŸœŸœŸ˜=KšœŸœ#Ÿœ,˜YKšŸœ˜—Kšœ˜K˜ ——KšŸœ˜— …—    Tô  €Û  

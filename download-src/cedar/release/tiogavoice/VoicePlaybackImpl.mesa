@@ -1,0 +1,536 @@
+DIRECTORY
+BasicTime USING [GetClockPulses, MicrosecondsToPulses, Pulses, PulsesToMicroseconds ],
+MessageWindow USING [Append, Blink ],
+Process USING [Detach, MsecToTicks, Priority, priorityRealTime, SetPriority, SetTimeout, Ticks ],
+Rope USING [Length, ROPE ],
+TiogaOps USING [CancelSelection, CommandProc, FirstChild, GetRope, GetSelection, SelectionGrain, SelectPoint, SetSelection, ViewerDoc ],
+TiogaOpsDefs USING [Location, Ref, SelectionGrain ],
+TiogaVoicePrivate USING [ AgeAllViewers, BadRope, ButtonParams, PlayBackRequestState, PlaySelection, ReColorViewer, RecordingInProgress, SelectionsAfterRedraw, SetTiogaViewerParams, SetVoiceLooks, SetVoiceViewerEditStatus, SoundList, soundRopeCharLength, soundRopeCharsPerSecond, thrushHandle, VoiceViewerInfo ],
+ViewerClasses USING [MouseButton, Viewer ],
+ViewerOps USING [FetchProp ],
+VoiceRope USING [Length, NB, NewRequestID, nullRequestID, PauseNB, PlayNB, RequestID, ResumeNB, VoiceRope, VoiceRopeInterval ]
+;
+
+VoicePlaybackImpl: CEDAR MONITOR
+IMPORTS BasicTime, MessageWindow, Process, Rope, TiogaOps, TiogaVoicePrivate, ViewerOps, VoiceRope EXPORTS TiogaVoicePrivate = {
+PlayBackRequestList: TYPE = LIST OF PlayBackRequest;
+
+playBackState: RECORD [
+running: BOOLEAN ¨ FALSE, -- is there currently a forked instance of PlayBackProcess ?
+queue: PlayBackRequestList ¨ NIL,
+nextTime: BasicTime.Pulses,  -- time to wake up playBackProcess next
+abort: BOOLEAN ¨ FALSE -- set when a 'stop voice playback' button is hit - playBackProcess will destroy itself next time it wakes up
+];
+
+abortCleared: CONDITION; -- signalled by PlayBackProcess when it has acted on an abort 
+
+PlayBackRequest: TYPE = REF PlayBackRequestRec;
+PlayBackRequestRec: TYPE = RECORD[
+requestID: VoiceRope.RequestID ¨ VoiceRope.nullRequestID,
+state: TiogaVoicePrivate.PlayBackRequestState ¨ waiting,
+expectFinishedReport: BOOLEAN ¨ TRUE, -- if FALSE, then this entry was edited after it was queued, so go on to the next entry automatically.  See RedrawViewer.
+display: BOOLEAN ¨ TRUE, -- if not set then there is no displaying to be done
+viewer: ViewerClasses.Viewer ¨ NIL,
+node: TiogaOpsDefs.Ref, -- the text node is assumed to contain of rope of characters in the
+start: INT ¨ 0, -- range [start..end]: this is not checked by PlayBackProcess
+pauseStart: BasicTime.Pulses ¨ 0,
+end: INT ¨ 0, -- except that if display=FALSE then viewer, node are unused and these
+currentPos: INT ¨ -1, -- integers are used only for counting
+startTime: BasicTime.Pulses ¨ 0, -- when playback was started
+timeRemnant: INT ¨ 0 -- (end-start+1) represents the duration of the rope section in 'whole characters' rounded down: this is the rounding error in voice samples (OBSOLETE)
+];
+
+ 
+cuePriority: Process.Priority = Process.priorityRealTime;
+aVeryLongTime: BasicTime.Pulses = BasicTime.MicrosecondsToPulses[300000000];
+oneSoundCharTime: BasicTime.Pulses = BasicTime.MicrosecondsToPulses[1000000/TiogaVoicePrivate.soundRopeCharsPerSecond];
+waitForReportTime: BasicTime.Pulses = BasicTime.MicrosecondsToPulses[100000000];  -- 100 sec
+
+PlayBackProcess: PROC = {
+moreToDo: BOOLEAN;
+nextWakeUp: BasicTime.Pulses;
+
+Process.SetPriority[cuePriority]; 
+[moreToDo, nextWakeUp] ¨ PlayBackNext[];
+
+WHILE moreToDo DO
+now: BasicTime.Pulses ¨ BasicTime.GetClockPulses[];
+IF nextWakeUp - now < aVeryLongTime THEN { -- so as to cope properly with wrap-around
+timeout: Process.Ticks ¨ Process.MsecToTicks[BasicTime.PulsesToMicroseconds[ nextWakeUp-now]/1000];
+TRUSTED { Process.SetTimeout[@playBackCue, timeout]; };
+Wait[];
+};
+[moreToDo, nextWakeUp] ¨ PlayBackNext[];
+ENDLOOP;
+};
+
+playBackCue: CONDITION;
+
+Wait: ENTRY PROC [] RETURNS [] ~ {
+WAIT playBackCue;
+};
+
+PlayBackNext: ENTRY PROC RETURNS [moreToDo: BOOLEAN ¨ TRUE, nextWakeUp: BasicTime.Pulses] = {
+currRequest: PlayBackRequest ¨ playBackState.queue.first;
+
+IF playBackState.abort THEN {
+RemoveCue[currRequest];
+playBackState.queue ¨ NIL;
+playBackState.running ¨ FALSE;
+playBackState.abort ¨ FALSE;
+TiogaVoicePrivate.SetVoiceViewerEditStatus[currRequest.viewer];
+BROADCAST abortCleared;
+RETURN [moreToDo: FALSE, nextWakeUp: 0] -- the latter only to satisfy the compiler
+};
+
+WHILE currRequest.state = done OR 
+(NOT currRequest.expectFinishedReport AND currRequest.currentPos>currRequest.end) DO
+prevRequest: PlayBackRequest;
+RemoveCue[currRequest];
+TiogaVoicePrivate.SetVoiceViewerEditStatus[currRequest.viewer];
+playBackState.queue ¨ playBackState.queue.rest;
+IF playBackState.queue = NIL THEN {
+playBackState.running ¨ FALSE;
+RETURN[moreToDo: FALSE, nextWakeUp: 0];
+};
+prevRequest ¨ currRequest;
+currRequest ¨ playBackState.queue.first;
+IF NOT prevRequest.expectFinishedReport THEN
+IF currRequest.start > currRequest.end THEN currRequest.state ¨ done
+ELSE {currRequest.startTime ¨ BasicTime.GetClockPulses[]; currRequest.state ¨ busy};
+ENDLOOP;
+
+IF currRequest.state = busy AND (currRequest.display OR NOT currRequest.expectFinishedReport) THEN {
+currRequest.currentPos ¨ currRequest.currentPos + 1;
+IF currRequest.display THEN {
+IF currRequest.currentPos-2 >= currRequest.start THEN
+TiogaVoicePrivate.SetVoiceLooks[currRequest.node, currRequest.currentPos-2, 1, ""];
+IF currRequest.currentPos <= currRequest.end THEN
+TiogaVoicePrivate.SetVoiceLooks[currRequest.node, currRequest.currentPos, 1, "w"];
+};
+playBackState.nextTime ¨ currRequest.startTime +
+(currRequest.currentPos-currRequest.start+1)*oneSoundCharTime;
+}
+ELSE playBackState.nextTime ¨ BasicTime.GetClockPulses[] + waitForReportTime;
+RETURN[moreToDo: TRUE, nextWakeUp: playBackState.nextTime]
+}; 
+
+RemoveCue: INTERNAL PROC [request: PlayBackRequest] ~ {
+IF NOT request.display THEN RETURN;
+IF request.start <= request.currentPos AND request.currentPos-1 <= request.end THEN
+TiogaVoicePrivate.SetVoiceLooks[request.node, request.currentPos-1, 2, ""];
+};
+
+QueuePlayBackCue: ENTRY PROC [request: PlayBackRequest] = {
+WHILE playBackState.running AND playBackState.abort DO WAIT abortCleared ENDLOOP;
+IF playBackState.running 
+THEN AppendRequest[request]
+ELSE {
+playBackState.queue ¨ CONS[request, NIL];
+playBackState.nextTime ¨ BasicTime.GetClockPulses[];
+playBackState.running ¨ TRUE;
+TRUSTED {Process.Detach[FORK PlayBackProcess[]]};
+};
+};
+
+AppendRequest: INTERNAL PROC [request: PlayBackRequest] = {
+hangOffPoint: LIST OF PlayBackRequest ¨ playBackState.queue;
+oneElementList: LIST OF PlayBackRequest ¨ CONS[request, NIL];
+WHILE hangOffPoint.rest # NIL DO hangOffPoint ¨ hangOffPoint.rest ENDLOOP;
+hangOffPoint.rest ¨ oneElementList
+};
+
+AbortCues: INTERNAL PROC = {
+IF playBackState.running THEN {playBackState.abort ¨ TRUE; BROADCAST playBackCue}
+};
+PlayBackMenuProc: PUBLIC TiogaOps.CommandProc = {
+buttonParams: TiogaVoicePrivate.ButtonParams ¨ NARROW[ViewerOps.FetchProp[viewer, $ButtonParams]];
+mouseButton: ViewerClasses.MouseButton ¨ IF buttonParams#NIL THEN buttonParams.mouseButton ELSE $red;
+IF TiogaVoicePrivate.RecordingInProgress[] THEN {
+MessageWindow.Append["Stop recording before trying to play back", TRUE];
+MessageWindow.Blink[];
+RETURN
+}; 
+
+IF mouseButton = blue THEN  -- i.e. right
+PlayWholeSlab[NARROW[viewer, ViewerClasses.Viewer]]
+ELSE {
+v: ViewerClasses.Viewer;
+start, end: TiogaOpsDefs.Location;
+[viewer: v, start: start, end: end] ¨ TiogaOps.GetSelection[];
+
+IF v = NIL THEN  -- no selection
+PlayWholeSlab[NARROW[viewer, ViewerClasses.Viewer]]
+ELSE IF ViewerOps.FetchProp[v, $voiceViewerInfo] # NIL THEN {
+IF start.node # end.node THEN ERROR; -- voice viewers only have one display node !!!!
+TiogaOps.SelectPoint[v, start]; -- leave caret at left of playback selection
+PlaySlabSection[v, start.node, start.where, end.where];
+}
+ELSE TiogaVoicePrivate.PlaySelection[];
+};
+};
+
+PlaySlabSection: PUBLIC PROC [viewer: ViewerClasses.Viewer, node: TiogaOpsDefs.Ref, from, to: INT] = {
+nb: VoiceRope.NB;
+viewerInfo: TiogaVoicePrivate.VoiceViewerInfo ¨ NARROW[ViewerOps.FetchProp[viewer, $voiceViewerInfo], TiogaVoicePrivate.VoiceViewerInfo];
+newRequest: PlayBackRequest;
+IF viewerInfo = NIL THEN RETURN; -- somebody's buggering around with the selection
+IF node # TiogaOps.FirstChild[TiogaOps.ViewerDoc[viewer]] THEN ERROR;
+newRequest ¨ NEW[PlayBackRequestRec ¨ [requestID: VoiceRope.NewRequestID[], viewer: viewer, node: node, start: from, end: to, currentPos: from-1]];
+
+QueuePlayBackCue[newRequest];
+[nb: nb] ¨ VoiceRope.PlayNB[handle: TiogaVoicePrivate.thrushHandle,
+voiceRope: NEW [VoiceRope.VoiceRopeInterval ¨ [viewerInfo.ropeInterval.ropeID, from*TiogaVoicePrivate.soundRopeCharLength,
+(to-from)*TiogaVoicePrivate.soundRopeCharLength]],
+requestID: newRequest.requestID, clientData: $TiogaVoice];
+IF nb # $success THEN SetPlayBackState[newRequest.requestID, done];
+};
+
+PlayWholeSlab: PUBLIC PROC [viewer: ViewerClasses.Viewer] = {
+viewerInfo: TiogaVoicePrivate.VoiceViewerInfo ¨ NARROW[ViewerOps.FetchProp[viewer, $voiceViewerInfo], TiogaVoicePrivate.VoiceViewerInfo];
+IF viewerInfo = NIL THEN
+MessageWindow.Append["Not a voice window or no selection", TRUE]
+ELSE {
+nb: VoiceRope.NB;
+node: TiogaOpsDefs.Ref ¨ TiogaOps.FirstChild[TiogaOps.ViewerDoc[viewer]];
+nodeLength: INT ¨ TiogaOps.GetRope[node].Length;
+newRequest: PlayBackRequest ¨ NEW[PlayBackRequestRec ¨ [requestID: VoiceRope.NewRequestID[], viewer: viewer, node: node, end: nodeLength-1, timeRemnant: viewerInfo.remnant]]; 
+
+QueuePlayBackCue[newRequest];
+[nb: nb] ¨ VoiceRope.PlayNB[handle: TiogaVoicePrivate.thrushHandle,
+voiceRope: NEW [VoiceRope.VoiceRopeInterval ¨ viewerInfo.ropeInterval],
+requestID: newRequest.requestID, clientData: $TiogaVoice];
+IF nb # $success THEN SetPlayBackState[newRequest.requestID, done];
+}
+};
+
+PlayRopeWithoutCue: PUBLIC PROC [voiceID: Rope.ROPE] RETURNS [badRope: TiogaVoicePrivate.BadRope]= {
+nb: VoiceRope.NB;
+fullRope: VoiceRope.VoiceRope ¨ NEW [VoiceRope.VoiceRopeInterval  ¨ [voiceID, 0, 0]];
+newRequest: PlayBackRequest;
+fullRope.length ¨ VoiceRope.Length[handle: TiogaVoicePrivate.thrushHandle, vr: fullRope];
+badRope ¨ SELECT fullRope.length FROM
+= -1 => doesNotExist,
+= 0 => zeroLength,
+ENDCASE => okay;
+IF badRope < okay THEN RETURN;
+
+newRequest ¨ NEW [PlayBackRequestRec ¨ [requestID: VoiceRope.NewRequestID[], display: FALSE, end: fullRope.length/TiogaVoicePrivate.soundRopeCharLength, timeRemnant: fullRope.length MOD TiogaVoicePrivate.soundRopeCharLength]];
+QueuePlayBackCue[newRequest];
+[nb: nb] ¨ VoiceRope.PlayNB[handle: TiogaVoicePrivate.thrushHandle, voiceRope: fullRope,
+requestID: newRequest.requestID, clientData: $TiogaVoice];
+IF nb # $success THEN SetPlayBackState[newRequest.requestID, done];
+};
+
+PlayBackInProgress: PUBLIC PROC RETURNS [BOOLEAN] = { RETURN [playBackState.running AND ~playBackState.abort] }; -- only a hint: a new playback request may be queued up and waiting for the abort to clear before becoming the new playBackState.queue 
+
+PauseProc: PUBLIC TiogaOps.CommandProc = {
+buttonParams: TiogaVoicePrivate.ButtonParams ¨ NARROW[ViewerOps.FetchProp[viewer, $ButtonParams]];
+mouseButton: ViewerClasses.MouseButton ¨ IF buttonParams#NIL THEN buttonParams.mouseButton ELSE $red;
+SELECT mouseButton FROM
+$red => [] ¨ VoiceRope.PauseNB[TiogaVoicePrivate.thrushHandle];
+$yellow => [] ¨ VoiceRope.ResumeNB[TiogaVoicePrivate.thrushHandle];
+ENDCASE;
+};
+
+CancelPlayBack: PUBLIC ENTRY PROC = { AbortCues[] };
+
+GetCurrentPlayBackPos: PUBLIC PROC RETURNS [display: BOOLEAN¨FALSE, viewer: ViewerClasses.Viewer¨NIL, currentPos: INT¨-1] = {
+IF playBackState.queue#NIL THEN {
+currRequest: PlayBackRequest ¨ playBackState.queue.first;
+IF currRequest.state=busy THEN 
+RETURN[currRequest.display, currRequest.viewer, currRequest.currentPos];
+};
+};
+
+SetPlayBackState: PUBLIC ENTRY PROC [reqID: VoiceRope.RequestID, newState: TiogaVoicePrivate.PlayBackRequestState] = {
+FOR playQ: PlayBackRequestList ¨ playBackState.queue, playQ.rest WHILE playQ#NIL DO
+IF playQ.first.requestID = reqID THEN {
+playQ.first.state ¨ newState;  -- worry about busyi after donei ?
+IF newState=busy THEN playQ.first.startTime ¨ BasicTime.GetClockPulses[];
+IF newState = paused THEN playQ.first.pauseStart ¨ BasicTime.GetClockPulses[];
+IF newState = resumed THEN {
+playQ.first.startTime ¨ playQ.first.startTime + BasicTime.GetClockPulses[] - 
+	playQ.first.pauseStart;
+playQ.first.state ¨ busy;
+newState ¨ busy;
+}; 
+
+IF playQ#playBackState.queue THEN 
+FOR pQ: PlayBackRequestList ¨ playBackState.queue, pQ.rest WHILE pQ#playQ DO
+pQ.first.state ¨ done; -- must have missed the report
+ENDLOOP;
+BROADCAST playBackCue;
+RETURN;
+};
+ENDLOOP;
+};
+
+RemoveViewerReferences: PUBLIC ENTRY PROC [viewer: ViewerClasses.Viewer] RETURNS [okay: BOOLEAN ¨ TRUE] = {
+IF playBackState.queue = NIL THEN RETURN;
+IF playBackState.queue.first.display AND playBackState.queue.first.viewer = viewer THEN RETURN [FALSE];
+FOR l: LIST OF PlayBackRequest ¨ playBackState.queue.rest, l.rest WHILE l # NIL DO
+IF l.first.viewer = viewer THEN l.first.display ¨ FALSE
+ENDLOOP
+};
+
+RedrawViewer: PUBLIC ENTRY PROC [viewer: ViewerClasses.Viewer, newContents: Rope.ROPE, unchangedHead, deleteChars, insertChars: INT, timeRemnant: INT, age: BOOLEAN, selectionsAfterRedraw: TiogaVoicePrivate.SelectionsAfterRedraw] RETURNS [newNode: TiogaOpsDefs.Ref] = {
+
+pViewer, sViewer: ViewerClasses.Viewer;
+pStart, pEnd, sStart, sEnd: TiogaOpsDefs.Location;
+pLevel, sLevel: TiogaOpsDefs.SelectionGrain;
+pCaretBefore, sCaretBefore, pPendingDelete, sPendingDelete: BOOLEAN;
+
+[viewer: pViewer, start: pStart, end: pEnd, level: pLevel, caretBefore: pCaretBefore, pendingDelete: pPendingDelete] ¨ TiogaOps.GetSelection[primary];
+[viewer: sViewer, start: sStart, end: sEnd, level: sLevel, caretBefore: sCaretBefore, pendingDelete: sPendingDelete] ¨ TiogaOps.GetSelection[secondary];
+
+newNode ¨ TiogaVoicePrivate.SetTiogaViewerParams[viewer, newContents];
+
+SELECT selectionsAfterRedraw FROM
+unAltered =>  -- if the selected character have been edited then we'll try to keep the selection on the same bits of voice
+{  lastCharInNode: INT ¨ (TiogaOps.GetRope[newNode]).Length - 1;
+IF pViewer = viewer THEN
+{  IF pStart.node # pEnd.node THEN TiogaOps.CancelSelection[primary]
+ELSE
+{  pStart.node ¨ pEnd.node ¨ newNode;
+IF pStart.where >= unchangedHead THEN pStart.where ¨ pStart.where - deleteChars + insertChars;
+IF pEnd.where >= unchangedHead THEN pEnd.where ¨ pEnd.where - deleteChars + insertChars;
+IF pStart.where > lastCharInNode THEN pStart.where ¨ lastCharInNode;
+IF pEnd.where > lastCharInNode THEN pEnd.where ¨ lastCharInNode;
+TiogaOps.SetSelection[viewer: pViewer, start: pStart, end: pEnd, level: pLevel, caretBefore: pCaretBefore, pendingDelete: pPendingDelete, which: primary]
+}
+};
+IF sViewer = viewer THEN
+{  IF sStart.node # sEnd.node THEN TiogaOps.CancelSelection[secondary]
+ELSE
+{  sStart.node ¨ sEnd.node ¨ newNode;
+IF sStart.where >= unchangedHead THEN sStart.where ¨ sStart.where - deleteChars + insertChars;
+IF sEnd.where >= unchangedHead THEN sEnd.where ¨ sEnd.where - deleteChars + insertChars;
+IF sStart.where > lastCharInNode THEN sStart.where ¨ lastCharInNode;
+IF sEnd.where > lastCharInNode THEN sEnd.where ¨ lastCharInNode;
+TiogaOps.SetSelection[viewer: sViewer, start: sStart, end: sEnd, level: sLevel, caretBefore: sCaretBefore, pendingDelete: sPendingDelete, which: secondary]
+}
+}
+};
+deSelected =>
+{  IF pViewer = viewer THEN TiogaOps.CancelSelection[primary];
+IF sViewer = viewer THEN TiogaOps.CancelSelection[secondary]
+};
+primaryOnInsert =>
+{  nodeLength: INT ¨ (TiogaOps.GetRope[newNode]).Length;
+IF sViewer = viewer THEN TiogaOps.CancelSelection[secondary];
+IF nodeLength = 0 THEN TiogaOps.CancelSelection[primary] -- in case the viewer is empty 
+ELSE
+{  pViewer ¨ viewer;
+pStart.node ¨ pEnd.node ¨ newNode;
+IF insertChars = 0 
+THEN -- leave a point selection
+{  pStart.where ¨ pEnd.where ¨ (IF unchangedHead > nodeLength THEN nodeLength ELSE unchangedHead);
+pLevel ¨ point
+}
+ELSE
+{  pStart.where ¨ unchangedHead;
+pEnd.where ¨ unchangedHead + insertChars -1;
+pLevel ¨ char
+};
+pCaretBefore ¨ pPendingDelete ¨ FALSE;
+TiogaOps.SetSelection[viewer: pViewer, start: pStart, end: pEnd, level: pLevel, caretBefore: pCaretBefore, pendingDelete: pPendingDelete, which: primary]
+}
+}; 
+ENDCASE => ERROR;
+IF age AND insertChars # 0 THEN TiogaVoicePrivate.AgeAllViewers[viewer] ELSE TiogaVoicePrivate.ReColorViewer[viewer];
+IF playBackState.queue # NIL THEN FOR p: LIST OF PlayBackRequest ¨ playBackState.queue, p.rest WHILE p.rest # NIL DO
+currRequest: PlayBackRequest ¨ p.rest.first;
+IF currRequest.display AND currRequest.viewer = viewer THEN
+{  currRequest.node ¨ newNode; -- I've just changed it under your feet!! [okay - monitored]
+IF currRequest.end >= unchangedHead -- if not, unaffected by the edit
+THEN 
+{  newRequests: LIST OF PlayBackRequest ¨ p.rest.rest;
+
+IF currRequest.end >= unchangedHead + deleteChars THEN -- non-empty third part
+{  start: INT ¨ MAX[ unchangedHead + deleteChars, currRequest.start ] 
++ (insertChars - deleteChars);
+end: INT ¨ currRequest.end + (insertChars - deleteChars);
+newRequests ¨ CONS[ NEW[ PlayBackRequestRec ¨ [requestID: currRequest.requestID, state: waiting, expectFinishedReport: TRUE, display: TRUE, viewer: viewer, node: newNode, start: start, end: end, currentPos: start-1, timeRemnant: timeRemnant]], newRequests]
+};
+
+IF currRequest.start < unchangedHead + deleteChars THEN -- non-empty second part [since request cannot lie entirely in first part - see two IFs back]
+{  start: INT ¨ MAX[unchangedHead, currRequest.start]; 
+end: INT ¨ MIN [unchangedHead + deleteChars - 1, currRequest.end];
+newRequests ¨ CONS[ NEW[ PlayBackRequestRec ¨ [requestID: currRequest.requestID, state: waiting, expectFinishedReport: FALSE, display: FALSE, start: start, end: end, currentPos: start-1, timeRemnant: 0]], newRequests]
+};
+
+IF currRequest.start < unchangedHead THEN -- non-empty first part
+{  start: INT ¨ currRequest.start;
+end: INT ¨ MIN [unchangedHead - 1, currRequest.end];
+newRequests ¨ CONS[ NEW[ PlayBackRequestRec ¨ [requestID: currRequest.requestID, state: waiting, expectFinishedReport: FALSE, display: TRUE, viewer: viewer, node: newNode, start: start, end: end, currentPos: start-1, timeRemnant: 0]], newRequests]
+};
+
+p.rest ¨ newRequests
+}
+}
+ENDLOOP;
+
+
+IF playBackState.queue # NIL THEN {
+currRequest: PlayBackRequest ¨ playBackState.queue.first;
+currentPosFound: BOOLEAN ¨ FALSE;
+IF currRequest.display AND currRequest.viewer = viewer THEN {
+newRequests: LIST OF PlayBackRequest ¨ playBackState.queue.rest;
+currRequest.node ¨ newNode;
+IF currRequest.end >= unchangedHead THEN {
+IF currRequest.end >= unchangedHead + deleteChars THEN {
+start: INT ¨ MAX[ unchangedHead + deleteChars, currRequest.start ] 
++ (insertChars - deleteChars);
+end: INT ¨ currRequest.end + (insertChars - deleteChars);
+currentPos: INT ¨ MAX [ start-1, currRequest.currentPos + (insertChars - deleteChars) ]; 
+newRequests ¨ CONS[ NEW[ PlayBackRequestRec ¨ [requestID: currRequest.requestID, state: waiting, expectFinishedReport: TRUE, display: TRUE, viewer: viewer, node: newNode, start: start, end: end, currentPos: currentPos, timeRemnant: timeRemnant]], newRequests];
+IF currentPos # start-1 THEN
+currentPosFound ¨ TRUE;
+};
+
+IF (~currentPosFound) AND currRequest.start < unchangedHead + deleteChars THEN {
+start: INT ¨ MAX[unchangedHead, currRequest.start]; 
+end: INT ¨ MIN [unchangedHead + deleteChars - 1, currRequest.end];
+currentPos: INT ¨ MAX [ start-1, currRequest.currentPos]; -- no need to put in a MIN clause since otherwise currentPosFound=TRUE and we'd never have got here
+newRequests ¨ CONS[ NEW[ PlayBackRequestRec ¨ [requestID: currRequest.requestID, state: waiting, expectFinishedReport: FALSE, display: FALSE, viewer: viewer, node: newNode, start: start, end: end, currentPos: currentPos, timeRemnant: 0]], newRequests];
+IF currentPos # start-1 THEN
+currentPosFound ¨ TRUE;
+};
+
+IF (~currentPosFound) AND currRequest.start < unchangedHead THEN {
+start: INT ¨ currRequest.start;
+end: INT ¨ MIN [unchangedHead - 1, currRequest.end];
+currentPos: INT ¨ currRequest.currentPos;
+newRequests ¨ CONS[ NEW[ PlayBackRequestRec ¨ [requestID: currRequest.requestID, state: currRequest.state, expectFinishedReport: FALSE, display: TRUE, viewer: viewer, node: newNode, start: start, end: end, currentPos: currentPos, timeRemnant: 0]], newRequests]
+};
+newRequests.first.state ¨ currRequest.state;
+newRequests.first.startTime ¨ currRequest.startTime;
+playBackState.queue ¨ newRequests;
+currRequest ¨ playBackState.queue.first;
+};
+
+IF currRequest.display AND currRequest.currentPos>=currRequest.start THEN {
+start: INT ¨ MAX[currRequest.start, currRequest.currentPos-1];
+len: INT ¨ MIN[currRequest.end, currRequest.currentPos] - start;
+TiogaVoicePrivate.SetVoiceLooks[node: currRequest.node, start: start, len: len, looks: "w"];
+}
+}
+}
+};
+
+}.
+
+   :  
+VoicePlaybackImpl.mesa
+Copyright ” 1987, 1992 by Xerox Corporation.  All rights reserved.
+Ades, September 24, 1986 5:11:21 pm PDT
+Swinehart, April 10, 1987 9:38:59 am PDT
+Polle Zellweger (PTZ) September 13, 1988 1:21:46 pm PDT
+
+
+Routines replay sounds, plus all the guff to move a cue along a slab display
+see TiogaVoicePrivate.mesa for the raison d'etre of this module
+
+when placed in the playback queue, a request should have currentPos=start-1
+requests with end<start should not be queued!!!
+ 
+when a PlayBackRequest is on the head of playBackState.queue and display=TRUE then the characters currentPos and currentPos-1 in the node currentlyhave looks w instead of v, provided in each case that  start<=characterPosition<=end 
+the BasicTime ClockPulses wrap around every hour [roughly]. Since we use the clock to time intervals of 250ms, five minutes is indeed aVeryLongTime for the purposes of spotting wrap-around
+try to keep this process up to time: however there is compensation for delay in each wake-up by looking at a real time clock; see below
+
+The playBackQueue contains two different kinds of requests: 
+normal requests are queued by some kind of playback initiation; they have an associated VoiceRope.Play and therefore will have $started and $finished reports. expectFinishedReport=TRUE.
+edited requests are created by RedrawViewer in response to user edits in front of the playback cue after a playback request; they must be started and finished more manually. expectFinishedReport=FALSE.
+request arose from editing after playback queued - need to start the next piece
+endcase: currRequest.timeRemnant*(1000/Jukebox.bytesPerMS) handled by $finished report
+either not started, not displaying, or done displaying: wait for a report to get going again
+restores any w looks to v looks, using the invariant "currentPos-1 & currentPos are the only chars that can have w looks (although they may not)"
+no need to worry about node boundaries; TextEdit.ChangeLooks prunes as needed
+
+The public procedures
+
+PROC [viewer: Viewer _ NIL] RETURNS [recordAtom: BOOL _ TRUE, quit: BOOL _ FALSE]; viewer prop $ButtonParams = TiogaVoicePrivate.ButtonParams
+General playback proc for all viewers: on a right click or if there is no primary selection, if the viewer is a voice viewer then play the whole of it otherwise do nothing; in other cases play all the voice represented in/by [for text/voice viewers] the current selection.
+
+
+PROC [viewer: Viewer _ NIL] RETURNS [recordAtom: BOOL _ TRUE, quit: BOOL _ FALSE]; viewer prop $ButtonParams = TiogaVoicePrivate.ButtonParams
+Respond to playback progress reports from Finch/Thrush.
+called in order to redraw an edited voice viewer, which may or may not be in the queue of viewers in which cues are appearing or are about to appear: newContents is the result of the edit as is timeRemnant, and the three INT arguments refer to the display prior to the edit
+all voice viewers will be 'aged' by this call [see TiogaVoicePrivate for details] unless age=FALSE OR insertChars = 0
+because the contents of the viewer are to be completely reset, any selections therein will be upset: how selections are to be affected must always be specified explicitly
+these preserve the selection info for reasoning after the redraw
+now attend to resetting selections:
+
+
+process any instances of this viewer on the queue [not including the one at the head]
+if this PlayBackRequest is part of something that has been edited, we need to split it into up to three sections: the first section is the unedited head of the slab, to be displayed. The second is the spliced out section, which is not to be displayed [but appears to keep the timing correct]. The third is the tail of the slab which is to be displayed: its position in the slab has in general moved. We will assemble these components in reverse order, simply because that's what CONS allows. newRequests was initialised to point to the list of entries beyond the element we are about to replace
+
+**** this and the following section need changing so that the remnant goes in the last of the split parts, as opposed to the third part if it exists
+link the new structure into the queue in place of the old one
+now we have to go through all that guff again for the head of the queue, except that there is an additional complication: the head of the queue, if being played back, must have the playback looks put back into it. Also the head of the queue must be whichever of the three sections discussed above is currently being played back. Alas we must also remove any character looks corresponding to the cue before this redraw occurred
+If not, unaffected by the edit [but still will need to put back the playback looks].
+One advantage of going backward through these is that it's easy to stop when we find the one currently being played back.
+link the new structure into the queue in place of the old head
+now redraw the playback cue: beware - the head of the queue might now be a ~display entry
+Swinehart, April 10, 1987 9:38:29 am PDT
+Merged VoicePlayImpl and VoiceRecordImpl, from Ades. Fixed some nested ML problems resulting from merging two MONITORs.
+changes to: AddVoiceProc, DictationMachine, AbortCues, CancelPlayBack
+Polle Zellweger (PTZ) May 14, 1987 5:03:48 pm PDT
+Trying to avoid intermittent viewer lockups. 
+changes to: DIRECTORY, ChangeVoiceInputFocus, PlayBackNext, PlayBackMenuProc, RedrawViewer, IncrementRecordTimer, DoIt (local of SetPlayLooks), PlayBackNext, SetPlayLooks (new procedure)
+Polle Zellweger (PTZ) May 15, 1987 7:04:36 pm PDT
+Avoid using the Tioga primary selection to change looks when animating the gray square for voice play feedback; also when adding indication of new voice.  Intended as a general improvement and trying to avoid intermittent viewer lockups.
+changes to: DIRECTORY, VoiceRecordPlayImpl, IncrementRecordTimer, NewRecordingMarker, DoIt (local of NewRecordingMarker), StopRecording, SetPlayLooks, DoIt (local of SetPlayLooks), PlayBackNext, RedrawViewer
+Polle Zellweger (PTZ) May 22, 1987 4:51:43 pm PDT
+Split back into VoicePlaybackImpl and VoiceRecordImpl: too many monitor lock difficulties to fix quickly.
+Polle Zellweger (PTZ) May 27, 1987 11:24:52 am PDT
+changes to: DIRECTORY, RedrawViewer(SetStyle was necessary after all - now done w/o selections)
+Polle Zellweger (PTZ) May 28, 1987 4:32:22 pm PDT
+New procedure to allow Marking the current playback spot directly.
+changes to: GetCurrentPlayBackPos
+Polle Zellweger (PTZ) June 8, 1987 6:45:18 pm PDT
+Moved SetPlayLooks to VoiceViewersImpl.SetVoiceLooks; use new VoiceViewersImpl.SetTiogaViewerParams.
+changes to: PlayBackNext, RedrawViewer
+Polle Zellweger (PTZ) June 19, 1987 12:11:12 pm PDT
+parameter change for SetVoiceLooks
+changes to: PlayBackNext, RedrawViewer
+Polle Zellweger (PTZ) July 20, 1987 5:12:15 pm PDT
+Add Finch/Thrush error handling (disappearing conversations, etc) + voicerope monitoring.  Extensive changes to playback cue stuff; now done by following reports from Finch/Thrush rather than open-loop.
+changes to: DIRECTORY, PlayBackRequestList, playBackState, abortCleared, PlayBackRequestRec, QueuePlayBackCue, AppendRequest, PlaySlabSection, PlayWholeSlab, PlayRopeWithoutCue, PlayBackProcess, PlayBackInProgress, GetCurrentPlayBackPos, SetPlayBackState, RemoveViewerReferences, RedrawViewer
+Polle Zellweger (PTZ) July 27, 1987 1:43:58 pm PDT
+changes to: PlaySlabSection, PlayWholeSlab, PlayRopeWithoutCue
+Polle Zellweger (PTZ) January 22, 1988 4:51:14 pm PST
+user message improvements
+changes to: DIRECTORY, PlayRopeWithoutCue
+Polle Zellweger (PTZ) September 8, 1988 11:11:40 pm PDT
+Keep nextTime from growing when a succession of requests are queued without voice viewers & cues; signal playBackCue immediately when an abort is received.
+changes to: PlayBackNext, AbortCues
+Polle Zellweger (PTZ) September 13, 1988 1:21:56 pm PDT
+Changes to allow clients to alter button behaviors via Tioga registry (for WalnutTiogaVoice).
+changes to: DIRECTORY, PlayBackMenuProc, PauseProc
+
+ù P  ïNewlineDelimiter
+ñ(cedarcode) styleô öúôIcodeöú
+œeú7ôBJô'Kô(Kô7Kô óöœk	ò	Köú
+ûúGòVKöúûúò%KöúûúTòaKöúûú
+ûúòKöú	ûúzòàKöúûú"ò4Köúûú°ò∏Köúûúò+Köú
+ûúòKöú
+ûú
+ûúcò~KòKò óö–lnúûúûò Köûú\ûúòÄóJô JôLKöú?ô?Kô Köúûúûúûúò4Kò öúûúòKöú	ûúûúœc<òVKöúûúò!Köú†'òDKöúûúûú†mòÑKöúòKò óöúû	ú†>òWKò óKöúûúûúò/öúûúûúò"Kò9Kò8Köúûúûú†yòüKöú	ûúûú†4òMKöúûúò#Köú†Cò[Köúûú†=òMKò!Köúûú†FòTKöúûú†&ò<Köú!†ò=Köúûú†çú†úò¨KòKò KöúKôKKöú/ô/KöúôKöúËôËKöúòóKöú9ò9öúLòLKöúºôºóKöúwòwKöúR†
+ò\Kò öœnúûúòKöú
+ûúòKöúòKò Köú"ò"KôàKò(Kò öûú
+ûòKò3öûú"ûú†*òUKòcKöûú0ò7KòKòóKò(KöûòóKòóKò Köúû	úòKò ö°úû
+úûúò"KöûúòKòóKò ö°úûúûúûúûúûú#ò]ô<KöúπôπKöúIœbú{ô…óKò9Kò öûúûúòKöúòKöúûúòKöúûúòKöúûúòKöú?ò?Köû	úòKöûúûú†*òRKòóKò ö
+ûúûúúûú"ûú&ûòwKöúòKöúòKöú?ò?Kò/öûúûúûúò#KöúûúòKöûúûúò'KöúòóKòKò(öûúûú"ûò,KöúOôOKöûú$ûúòDKöûúPòTóKöûúòKò óöûúûúûú!ûúòdKò4öûúûúòöûú/ûò5KöúSòSóöûú+ûò1KöúRòRKòóóKòoKöúVôVKòóöûúIòMKô\óKöûúûú%ò:KöúòKò óö°	úûúò7KöúëôëKöûúûò#öûú%ûú#ûòSöúKòKKôMóóKòKò óö°úûúûúò;Kö
+ûúûúûúûúûúòQKöûúòKöûúòöûúòKöúûú
+ûúò)Kò4KöúûúòKöûúûúò1KòóKòKò óö°úûúûúò;Köúûúûú'ò<Kö	úûúûúûú
+ûúò=Köûúûúûú"ûúòJKò"KòKò óö°	úûúûúòKöûúûúûúû	úòQKöúòóKô Kôö°úûúò1Köûúûúûúûúûúûúûú=ôçKôêKöú/ûú-òbKö	ú)ûúûúûúûúòeöûú)ûúò1KöúBûúòHKòKöûòKöúòóKò öûúû†ò)Köúûúò3óöûúòKöúòKöú"ò"Kò>óò öûúûúûú†ò Köúûúò3óöûúûú,û	úò=Köûúûúûú†0òUKöú †,òLKöú7ò7KöúòóKöûú#ò'KòóKòKò óö°úûúûúBûúòfKöúûúòKöú0ûúSòâKöúòKö	ûúûúûúûú†1òRKöûú8ûúûúòEKô KöúûúÉòìKò KöúòòCKöúûúüò≠Köú:ò:óKöûúûú.òCKòKò óö°úûúûú#ò=Köú0ûúSòâöûúûúûòKöú;ûúò@óöûúòKöúûúòKòIKöúûú!ò0KöúûúéòØKò KöúòòCKöúûú9òGKöú:ò:óKöûúûú.òCKòóKòKò óö
+°úûúûúûúûú(òdKöúûúòKöú ûú2òUKöúòKô KòYöú
+ûúûò%KöúòKöúòKöûú	òóKöûúûúûúòKò KöúûúFûú[ûú)ò‚KöúòòXKöú:ò:óKöûúûú.òCKòKò óö°úûúûúûúûúûúûú†áò¯Kò óö°	úûúò*Köûúûúûúûúûúûúûú=ôçKöú/ûú-òbKö	ú)ûúûúûúûúòeöûúûòKò?KòCKöûúòóKòKò óö°úûúû
+úò4Kò óö°úûúûúûúûúûúûúûúò}öûúûúûúò!Kò9öûúûúòKöûúBòHóKòóKòKò óö°úûúûúûúSòvKô7öûú>ûúûòSöûúûúûúò'Köú†–cd†£†òAKöûúûú4òIKòNKòÆKòKò öûúûúò"öûú8ûúûòLKöú†ò5KöûúòóóKöû	úòKöûúòKòóKöûúòóKòKò óö°úûúûúûú ûúûúûúòkKöûúûúûúûúò)Kö
+ûú#ûú+ûúûúûúògöûúûúûú4ûúûúûòRKöûúûúûò7óKöûòKöúòKò óö°úûúûúûú2ûú+ûúûúûúBûú òåKöúëôëKôuKô™Kò Kô@Köú'ò'Kò2Köú,ò,Köú<ûúòDKò KòñKòòKò Köúœtú*òFKò Kô#Köûúûò!öú†lòzöúûú*ò@Köûúûòöúûúûú"òDKöûòò%Köûúûú9ò^Köûúûú5òXKöûúûúòDKöûúûúò@KöúôòôóKòóKòKöûúûòöúûúûú$òFKöûòò%Köûúûú9ò^Köûúûú5òXKöûúûúòDKöûúûúò@KöúõòõóKòóKòóKòóòöúûúûú#ò>Köûúûú$ò<óKòóòöúûú&ò8Köûúûú%ò=Köûúûú#†òXKöûòòKò"KöûúòKöûú†òöú ûúûúûúòbKòóKöúòKöûòò Kò,KòóKòKöú ûúò&KöúôòôóKòóKöúòóKöûúûúòKô Köûúûúûú)ûú)òuKô KôUöûúûúûúûúûúûú/ûú
+ûúûòtKò,Köûúûúûò;öú†<ò[Köûú"†!òEKöûúòöúûúûúò6Köú“ô“Kô KôîKò Köûú0ûú†òNöú
+ûúûúRòeKöúûú1ò9Kö	úûúûú`ûúûúvòÄóKòKò Köûú1ûú†]òïöú
+ûúûú$ò7Köúûúûú4òBKö	úûúûú`ûúûúMòŸóKòKò Köûú#ûú†òAöú
+ûúò"Köúûúûú&ò4Kö	úûúûú`ûúûúlò˜óKòKò Kô=KòóKòóKòóKöûúòKò Kô™Kò öûúûúûúò#Kò9Köúûúûúò!öûúûúûúò=Köúûúûú,ò@Kòöûú"ûúò*KöúTôTKöúyôyöûú0ûúò8KöúûúûúRòbKöúûú1ò9KöúûúûúDòYKö	úûúûú`ûúûúzòÑöûúûòKöúûúòóKòóKò öûúûú1ûúòPKöúûúûú$ò4Köúûúûú4òBKöúûúûú%†còùKö	úûúûú`ûúûúpò¸öûúûòKöúûúòóKòóKò öûúûú#ûúòBKöúûúòKöúûúûú&ò4Köúûúò)Kö	úûúûújûúûúoòÑKòóKò,Kò4Kô>Kò"Kò(KòóKò KôYöûúûú+ûúòKKöúûúûú.ò>Köúûúûú2ò@Köú\ò\KòóKòóKòóKòKò óKòKò ô(KôwKöúœr9ôEóô1Kô-Köú•jú•úô∫óô1KôÌKöú•Nú•#ú•ôœóô1Kôióô2Köú•ú<ô_óô1KôBKöú•ô!óô1KôdKöú•ô&óô3Kô"Köú•ô&óô2Kô Köú•òô§óô2Köú•2ô>óô5KôKöú•ô)óô7KôõKöú•ô#óô7Kô]Köú•&ô2óKô ó Öó    PF  Å–  

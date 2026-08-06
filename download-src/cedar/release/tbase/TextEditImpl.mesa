@@ -1,0 +1,901 @@
+DIRECTORY
+Ascii USING [Lower, Upper],
+CardTab USING [Ref, Create, Update, UpdateAction],
+Char USING [XCHAR, CharSet, Make],
+EditNotify USING [Change, Notify],
+IO USING [STREAM, ROS, RopeFromROS, PutByte, PutRope],
+NodeAddrs USING [MapTextAddrs, MoveTextAddr, PinTextAddr, PutTextAddr, Replace, UnpinAll],
+NodeProps,
+Prop USING [PropList, Get, Put],
+Rope USING [ActionType, Fetch, FromChars, Map, Replace, ROPE, Size, SkipTo, Substr],
+Rosary USING [CatSegments, Fetch, FetchRun, FromItem, FromRuns, MapRuns, ROSARY, Run, RunActionType, Size],
+TextEdit,
+TextEditBogus,
+TextEditExtras,
+TextLooks USING [ModifyLooks, Runs],
+Tioga USING [Node, NodeRep, Looks, noLooks],
+UndoEvent USING [Note, Event, EventRep, SubEvent];
+
+TextEditImpl: CEDAR MONITOR
+IMPORTS Ascii, CardTab, Char, EditNotify, IO, NodeAddrs, NodeProps, Prop, Rope, Rosary, TextLooks, UndoEvent
+EXPORTS TextEdit, TextEditBogus, TextEditExtras, Tioga
+= BEGIN
+
+ROPE: TYPE = Rope.ROPE;
+ROSARY: TYPE = Rosary.ROSARY;
+XCHAR: TYPE ~ Char.XCHAR;
+CharSet: TYPE ~ Char.CharSet;
+Node: TYPE = Tioga.Node;
+Looks: TYPE = Tioga.Looks;
+noLooks: Looks = Tioga.noLooks;
+Runs: TYPE = TextLooks.Runs;
+Event: TYPE = UndoEvent.Event;
+EventRep: PUBLIC TYPE = UndoEvent.EventRep;
+Change: TYPE = EditNotify.Change;
+MaxLen: INT = LAST[INT];
+CapChange: TYPE ~ TextEdit.CapChange;
+DestSpanProc: TYPE ~ TextEdit.DestSpanProc;
+OneSpanProc: TYPE ~ TextEdit.OneSpanProc;
+MapPropsAction: TYPE ~ TextEdit.MapPropsAction;
+ModifyPropsAction: TYPE ~ TextEdit.ModifyPropsAction;
+scratch1, scratch2, scratch3: REF Change.ChangingText ¬ NIL;
+
+Alloc: ENTRY PROC RETURNS [scratch: REF Change.ChangingText] = {
+ENABLE UNWIND => NULL;
+scratch ¬ scratch3; IF scratch#NIL THEN {scratch3¬NIL; RETURN};
+scratch ¬ scratch2; IF scratch#NIL THEN {scratch2¬NIL; RETURN};
+scratch ¬ scratch1; IF scratch#NIL THEN {scratch1¬NIL; RETURN};
+scratch ¬ NEW[Change.ChangingText];
+};
+Free: PROC [scratch: REF Change.ChangingText] = {
+IF scratch3 = scratch OR scratch2 = scratch OR scratch1 = scratch THEN ERROR;
+SELECT TRUE FROM
+(scratch3 = NIL) => scratch3 ¬ scratch;
+(scratch2 = NIL) => scratch2 ¬ scratch;
+(scratch1 = NIL) => scratch1 ¬ scratch;
+ENDCASE => NULL;
+};
+maxSearchDepth: NAT ¬ 20;
+AlreadySaved: PUBLIC PROC [text: Node, event: Event] RETURNS [BOOL] = {
+k: NAT ¬ maxSearchDepth;
+IF event = NIL THEN RETURN [TRUE];
+FOR l: UndoEvent.SubEvent ¬ event.subevents, l.next UNTIL l=NIL DO
+WITH l.undoRef SELECT FROM
+x: REF Change.ChangingText => IF x.text = text THEN RETURN[TRUE];
+ENDCASE;
+IF (k ¬ k-1) = 0 THEN EXIT;
+ENDLOOP;
+RETURN [FALSE];
+};
+
+DoWithNotify: PROC [action: PROC, event: Event, 
+root: Node, text: Node, start: INT, newlen: INT, oldlen: INT] = {
+note: BOOL ~ event#NIL AND NOT AlreadySaved[text, event];
+notify: REF Change.ChangingText = IF note THEN NEW[Change.ChangingText] ELSE Alloc[];
+notify­ ¬ [ChangingText[
+text: text, start: start, newlen: newlen, oldlen: oldlen, 
+oldRope: text.rope, oldRuns: text.runs,
+oldCharSets: text.charSets, oldCharProps: text.charProps
+]];
+EditNotify.Notify[notify, before];
+action[];
+EditNotify.Notify[notify, after];
+IF note THEN UndoEvent.Note[event, UndoChangeText, notify] ELSE Free[notify];
+};
+
+UndoChangeText: PROC [undoRef: REF, currentEvent: Event] = {
+WITH undoRef SELECT FROM
+x: REF Change.ChangingText => {
+[] ¬ ReplaceByContents[root: NIL, 
+dest: x.text, destStart: 0, destLen: InlineSize[x.text], 
+sourceRope: x.oldRope, sourceRuns: x.oldRuns, 
+sourceCharSets: x.oldCharSets, sourceCharProps: x.oldCharProps, 
+sourceStart: 0, sourceLen: Rope.Size[x.oldRope], event: currentEvent];
+};
+ENDCASE => ERROR;
+};
+
+nilRosary: ROSARY ~ Rosary.FromItem[NIL, INT.LAST];
+
+RosaryReplace: PROC [dest: ROSARY, destSize, destStart, destLen: INT, 
+source: ROSARY, sourceStart, sourceLen: INT] RETURNS [ROSARY] ~ {
+IF dest=NIL AND source=NIL THEN RETURN[NIL]
+ELSE {
+destRosary: ROSARY ~ IF dest=NIL THEN nilRosary ELSE dest;
+sourceRosary: ROSARY ~ IF source=NIL THEN nilRosary ELSE source;
+destEnd: INT ~ destStart+destLen;
+result: ROSARY ~ Rosary.CatSegments[
+[destRosary, 0, destStart],
+[sourceRosary, sourceStart, sourceLen],
+[destRosary, destEnd, destSize-destEnd]
+];
+notNil: Rosary.RunActionType ~ { RETURN[item#NIL] };
+RETURN[IF Rosary.MapRuns[[result], notNil] THEN result ELSE NIL];
+};
+};
+
+RosaryFromItem: PROC [item: REF, repeat: INT] RETURNS [ROSARY] ~ {
+RETURN[IF item=NIL THEN NIL ELSE Rosary.FromItem[item, repeat]];
+};
+
+
+ReplaceByContents: PUBLIC PROC [root: Node, dest: Node, destStart, destLen: INT, 
+sourceRope: ROPE, sourceRuns, sourceCharSets, sourceCharProps: ROSARY, 
+sourceStart, sourceLen: INT, event: Event] RETURNS [resultStart, resultLen: INT] = {
+destSize: INT ~ InlineSize[dest];
+sourceSize: INT ~ Rope.Size[sourceRope];
+changeAction: PROC ~ {
+dest.rope ¬ Rope.Replace[base: dest.rope, start: destStart, len: destLen, 
+with: Rope.Substr[sourceRope, sourceStart, sourceLen]];
+dest.runs ¬ RosaryReplace[dest: dest.runs, 
+destSize: destSize, destStart: destStart, destLen: destLen, 
+source: sourceRuns, sourceStart: sourceStart, sourceLen: sourceLen];
+dest.charSets ¬ RosaryReplace[dest: dest.charSets, 
+destSize: destSize, destStart: destStart, destLen: destLen, 
+source: sourceCharSets, sourceStart: sourceStart, sourceLen: sourceLen];
+dest.charProps ¬ RosaryReplace[dest: dest.charProps, 
+destSize: destSize, destStart: destStart, destLen: destLen, 
+source: sourceCharProps, sourceStart: sourceStart, sourceLen: sourceLen];
+NodeAddrs.Replace[dest, destStart, destLen, sourceLen];
+};
+sourceStart ¬ MIN[MAX[0, sourceStart], sourceSize];
+sourceLen ¬ MIN[MAX[0, sourceLen], sourceSize-sourceStart];
+destStart ¬ MIN[MAX[0, destStart], destSize];
+destLen ¬ MIN[MAX[0, destLen], destSize-destStart];
+IF destLen#0 OR sourceLen#0 THEN DoWithNotify[action: changeAction, event: event, 
+root: root, text: dest, start: destStart, newlen: sourceLen, oldlen: destLen];
+RETURN [destStart, sourceLen];
+};
+
+ReplaceText: PUBLIC PROC [destRoot: Node, sourceRoot: Node, 
+dest: Node, destStart: INT, destLen: INT, 
+source: Node, sourceStart: INT, sourceLen: INT, 
+event: Event] RETURNS [resultStart, resultLen: INT] = {
+IF dest=NIL THEN RETURN [0, 0]
+ELSE IF source=NIL THEN RETURN ReplaceByContents[
+root: destRoot, dest: dest, destStart: destStart, destLen: destLen, 
+sourceRope: NIL, sourceRuns: NIL, sourceCharSets: NIL, sourceCharProps: NIL, 
+sourceStart: 0, sourceLen: 0, event: event]
+ELSE RETURN ReplaceByContents[
+root: destRoot, dest: dest, destStart: destStart, destLen: destLen, 
+sourceRope: source.rope, sourceRuns: source.runs, 
+sourceCharSets: source.charSets, sourceCharProps: source.charProps, 
+sourceStart: sourceStart, sourceLen: sourceLen, event: event];
+};
+
+DeleteText: PUBLIC OneSpanProc = {
+[] ¬ ReplaceText[destRoot: root, sourceRoot: NIL, 
+dest: text, destStart: start, destLen: len, 
+source: NIL, sourceStart: 0, sourceLen: 0, 
+event: event]
+};
+
+CopyText: PUBLIC DestSpanProc = { -- copy the specified text
+RETURN ReplaceText[destRoot: destRoot, sourceRoot: sourceRoot, 
+dest: dest, destStart: destLoc, destLen: 0, 
+source: source, sourceStart: start, sourceLen: len, 
+event: event];
+};
+
+MoveText: PUBLIC PROC [destRoot, sourceRoot: Node, dest: Node, destLoc: INT ¬ 0, source: Node, start: INT ¬ 0, len: INT ¬ MaxLen, event: Event ¬ NIL] RETURNS [resultStart, resultLen: INT] = {
+MoveAddrs: PROC [addr: REF, location: INT] RETURNS [quit: BOOL] = {
+IF location NOT IN [start..start+len) THEN RETURN [FALSE];
+IF dest=source
+THEN { -- pin addr at new location
+new: INT ¬ destLoc+location-start;
+IF destLoc > start THEN new ¬ new-len; -- moving toward end of node
+NodeAddrs.PutTextAddr[dest, addr, new];
+NodeAddrs.PinTextAddr[dest, addr] -- so it won't be changed by Replace --
+}
+ELSE NodeAddrs.MoveTextAddr[ -- move the addr to the new node
+from: source, to: dest, addr: addr, location: destLoc+location-start];
+RETURN [FALSE];
+};
+sourceSize: INT ~ InlineSize[source];
+destSize: INT ~ IF dest=source THEN sourceSize ELSE InlineSize[dest];
+start ¬ MIN[MAX[0, start], sourceSize];
+len ¬ MIN[MAX[0, len], sourceSize-start];
+destLoc ¬ MIN[MAX[0, destLoc], destSize];
+IF source=dest AND destLoc IN [start..start+len] THEN RETURN [start, len];
+IF len=0 THEN RETURN [destLoc, 0];
+[] ¬ NodeAddrs.MapTextAddrs[source, MoveAddrs];
+[resultStart, resultLen] ¬ CopyText[destRoot, sourceRoot, dest, destLoc, source, start, len, event];
+IF dest=source THEN { -- need to adjust locations
+IF destLoc > start
+THEN resultStart ¬ destLoc-len -- moving toward end of node
+ELSE start ¬ start+len; -- moving toward start of node
+};
+DeleteText[sourceRoot, source, start, len, event];
+IF dest=source THEN NodeAddrs.UnpinAll[source];
+};
+
+MoveTextOnto: PUBLIC PROC [destRoot, sourceRoot: Node, dest: Node, destStart: INT ¬ 0, destLen: INT ¬ MaxLen, source: Node, sourceStart: INT ¬ 0, sourceLen: INT ¬ MaxLen, event: Event ¬ NIL] RETURNS [resultStart, resultLen: INT] = {
+sourceSize, destSize, start, len, end, destEnd: INT ¬ 0;
+start ¬ sourceStart; len ¬ sourceLen;
+sourceSize ¬ Size[source];
+start ¬ MIN[MAX[0, start], sourceSize];
+len ¬ MIN[MAX[0, len], sourceSize-start];
+end ¬ start+len;
+destSize ¬ IF dest=source THEN sourceSize ELSE Size[dest];
+destStart ¬ MIN[MAX[0, destStart], destSize];
+destLen ¬ MIN[MAX[0, destLen], destSize-destStart];
+destEnd ¬ destStart+destLen;
+IF source=dest THEN { -- check for overlapping or adjacent
+IF start IN [destStart..destEnd) THEN {
+IF end < destEnd THEN [] ¬ DeleteText[sourceRoot, source, end, destEnd-end, event];
+IF start > destStart THEN [] ¬ DeleteText[sourceRoot, source, destStart, start-destStart, event];
+RETURN [destStart, len];
+};
+IF end IN (destStart..destEnd) THEN {
+[] ¬ DeleteText[sourceRoot, source, end, destEnd-end, event];
+RETURN [start, len];
+};
+IF start <= destStart AND end >= destEnd THEN RETURN [start, len];
+IF end=destStart THEN {
+[] ¬ DeleteText[sourceRoot, source, destStart, destLen, event];
+RETURN [start, len];
+};
+IF start=destEnd THEN {
+[] ¬ DeleteText[sourceRoot, source, destStart, destLen, event];
+RETURN [destStart, len];
+};
+};
+[] ¬ DeleteText[destRoot, dest, destStart, destLen, event];
+IF source=dest AND start > destStart THEN start ¬ start-destLen;
+RETURN MoveText[destRoot, sourceRoot, dest, destStart, source, start, len, event];
+};
+TransposeText: PUBLIC PROC [alphaRoot, betaRoot: Node, alpha: Node, alphaStart: INT ¬ 0, alphaLen: INT ¬ MaxLen, beta: Node, betaStart: INT ¬ 0, betaLen: INT ¬ MaxLen, event: Event ¬ NIL] RETURNS [alphaResultStart, alphaResultLen, betaResultStart, betaResultLen: INT] = {
+SwitchResults: PROC = INLINE --gfi saver-- {
+start, len: INT;
+start ¬ betaResultStart; len ¬ betaResultLen;
+betaResultStart ¬ alphaResultStart; betaResultLen ¬ alphaResultLen;
+alphaResultStart ¬ start; alphaResultLen ¬ len
+};
+alphaSize, betaSize: INT;
+switched: BOOL ¬ FALSE;
+alphaSize ¬ InlineSize[alpha];
+alphaStart ¬ MIN[MAX[0, alphaStart], alphaSize];
+alphaResultLen ¬ alphaLen ¬ MIN[MAX[0, alphaLen], alphaSize-alphaStart];
+betaSize ¬ IF beta=alpha THEN alphaSize ELSE InlineSize[beta];
+betaStart ¬ MIN[MAX[0, betaStart], betaSize];
+betaResultLen ¬ betaLen ¬ MIN[MAX[0, betaLen], betaSize-betaStart];
+IF alpha=beta THEN {
+alphaEnd: INT;
+IF alphaStart > betaStart THEN { -- switch them
+start: INT ¬ alphaStart;
+len: INT ¬ alphaLen;
+root: Node ¬ alphaRoot;
+alphaStart ¬ betaStart; betaStart ¬ start;
+alphaResultLen ¬ alphaLen ¬ betaLen;
+alphaRoot ¬ betaRoot; betaRoot ¬ root;
+betaResultLen ¬ betaLen ¬ len;
+switched ¬ TRUE;
+};
+alphaEnd ¬ alphaStart+alphaLen;
+IF alphaEnd = betaStart THEN { -- turn into a move instead
+[] ¬ MoveText[alphaRoot, betaRoot, alpha, alphaStart, alpha, betaStart, betaLen, event];
+betaResultStart ¬ alphaStart;
+alphaResultStart ¬ alphaStart+betaLen;
+IF switched THEN SwitchResults[];
+RETURN;
+};
+IF alphaEnd > betaStart THEN { -- overlapping
+overlap, alphaHeadLen, betaTailLen: INT;
+alphaHeadLen ¬ betaStart-alphaStart;
+betaTailLen ¬ betaStart+betaLen-alphaEnd;
+IF alphaHeadLen < 0 OR betaTailLen < 0 THEN
+RETURN [alphaStart, alphaLen, betaStart, betaLen];
+overlap ¬ alphaEnd-betaStart;
+[alphaResultStart, alphaResultLen, betaResultStart, betaResultLen] ¬
+TransposeText[alphaRoot, betaRoot, alpha, alphaStart, alphaHeadLen, 
+alpha, alphaEnd, betaTailLen, event];
+betaResultLen ¬ betaResultLen+overlap;
+alphaResultStart ¬ alphaResultStart-overlap;
+alphaResultLen ¬ alphaResultLen+overlap;
+IF switched THEN SwitchResults[];
+RETURN;
+};
+};
+[alphaResultStart, alphaResultLen] ¬ MoveText[ -- move alpha after beta
+destRoot: betaRoot, sourceRoot: alphaRoot, 
+dest: beta, destLoc: betaStart+betaLen, 
+source: alpha, start: alphaStart, len: alphaLen, event: event]; 
+IF alpha=beta THEN betaStart ¬ betaStart-alphaLen ELSE alphaResultStart ¬ alphaResultStart-betaLen;
+[betaResultStart, betaResultLen] ¬ MoveText[ -- move beta to old alpha location
+destRoot: alphaRoot, sourceRoot: betaRoot, 
+dest: alpha, destLoc: alphaStart, 
+source: beta, start: betaStart, len: betaLen, event: event];
+IF switched THEN SwitchResults;
+};
+
+
+looksTab: CardTab.Ref ~ CardTab.Create[];
+
+ItemFromLooks: PUBLIC PROC [looks: Looks] RETURNS [item: REF ¬ NIL] ~ {
+action: CardTab.UpdateAction ~ {
+IF found THEN { item ¬ val; RETURN[none] }
+ELSE { item ¬ NEW[Looks ¬ looks]; RETURN[store, item] }
+};
+IF looks#noLooks THEN CardTab.Update[looksTab, LOOPHOLE[looks], action];
+};
+
+LooksFromItem: PUBLIC PROC [item: REF] RETURNS [Looks] ~ {
+WITH item SELECT FROM
+item: REF Looks => RETURN[item­];
+ENDCASE => RETURN[noLooks];
+};
+
+charSetTab: CardTab.Ref ~ CardTab.Create[];
+
+ItemFromCharSet: PUBLIC PROC [charSet: CharSet] RETURNS [item: REF ¬ NIL] ~ {
+action: CardTab.UpdateAction ~ {
+IF found THEN { item ¬ val; RETURN[none] }
+ELSE { item ¬ NEW[CharSet ¬ charSet]; RETURN[store, item] }
+};
+IF charSet#0 THEN CardTab.Update[charSetTab, charSet, action];
+};
+
+CharSetFromItem: PUBLIC PROC [item: REF] RETURNS [CharSet] ~ {
+WITH item SELECT FROM
+item: REF CharSet => RETURN[item­];
+ENDCASE => RETURN[0];
+};
+
+ItemFromPropList: PUBLIC PROC [propList: PropList] RETURNS [REF] ~ {
+RETURN[propList];
+};
+
+PropListFromItem: PUBLIC PROC [item: REF] RETURNS [PropList] ~ {
+WITH item SELECT FROM
+item: PropList => RETURN[item];
+ENDCASE => RETURN[NIL];
+};
+
+ReplaceByRope: PUBLIC PROC [root: Node, dest: Node, start, len: INT, 
+rope: ROPE, looks: Looks, charSet: CharSet, charProps: PropList, 
+event: Event] RETURNS [resultStart, resultLen: INT ¬ 0] = {
+IF dest#NIL THEN {
+sourceLen: INT ~ Rope.Size[rope];
+RETURN ReplaceByContents[root: root, 
+dest: dest, destStart: start, destLen: len, sourceRope: rope, 
+sourceRuns: RosaryFromItem[ItemFromLooks[looks], sourceLen], 
+sourceCharSets: RosaryFromItem[ItemFromCharSet[charSet], sourceLen], 
+sourceCharProps: RosaryFromItem[ItemFromPropList[charProps], sourceLen], 
+sourceStart: 0, sourceLen: sourceLen, event: event];
+};
+};
+
+ChangeLooks: PUBLIC PROC [root: Node, text: Node, remove, add: Looks, 
+start: INT ¬ 0, len: INT ¬ MaxLen, event: Event ¬ NIL] = {
+IF text#NIL THEN {
+destSize: INT ~ InlineSize[text];
+destStart: INT ~ MIN[MAX[0, start], destSize];
+destLen: INT ~ MIN[MAX[0, len], destSize-destStart];
+destRosary: ROSARY ~ IF text.runs=NIL THEN nilRosary ELSE text.runs;
+willChange: Rosary.RunActionType ~ {
+old: Looks ~ LooksFromItem[item];
+new: Looks ~ TextLooks.ModifyLooks[old: old, remove: remove, add: add];
+RETURN[new#old];
+};
+IF Rosary.MapRuns[[destRosary, destStart, destLen], willChange] THEN {
+p: PROC [q: PROC [item: REF, repeat: INT]] ~ {
+modify: Rosary.RunActionType ~ {
+old: Looks ~ LooksFromItem[item];
+new: Looks ~ TextLooks.ModifyLooks[old: old, remove: remove, add: add];
+q[ItemFromLooks[new], repeat];
+};
+[] ¬ Rosary.MapRuns[[destRosary, destStart, destLen], modify];
+};
+sourceRosary: ROSARY ~ Rosary.FromRuns[p];
+changeAction: PROC ~ {
+text.runs ¬ RosaryReplace[dest: text.runs, destSize: destSize, destStart: destStart, destLen: destLen, source: sourceRosary, sourceStart: 0, sourceLen: destLen];
+};
+IF Rosary.Size[sourceRosary]#destLen THEN ERROR;
+DoWithNotify[action: changeAction, event: event, 
+root: root, text: text, start: destStart, newlen: destLen, oldlen: destLen];
+};
+};
+};
+
+
+PropList: TYPE ~ Prop.PropList;
+GetPropFromList: PUBLIC PROC [propList: PropList, key: ATOM] RETURNS [value: REF] ~ {
+RETURN[Prop.Get[propList, key]];
+};
+
+PutPropOnList: PUBLIC PROC [propList: PropList, key: ATOM, value: REF] RETURNS [PropList] ~ {
+RETURN[Prop.Put[propList, key, value]];
+};
+
+GetCharPropList: PUBLIC PROC [node: Node, index: INT] RETURNS [PropList ¬ NIL] ~ {
+IF node.charProps=NIL
+THEN { [] ¬ Basics.BoundsCheck[index, InlineSize[node]]; RETURN[NIL] }
+ELSE RETURN[PropListFromItem[Rosary.Fetch[node.charProps, index]]];
+};
+
+PutCharPropList: PUBLIC PROC [node: Node, index: INT, propList: PropList, 
+nChars: INT, event: Event, root: Node] ~ {
+destSize: INT ~ InlineSize[node];
+destStart: INT ~ MIN[MAX[0, index], destSize];
+destLen: INT ~ MIN[MAX[0, nChars], destSize-destStart];
+changeAction: PROC ~ {
+source: ROSARY ~ RosaryFromItem[ItemFromPropList[propList], destLen];
+node.charProps ¬ RosaryReplace[dest: node.charProps, 
+destSize: destSize, destStart: destStart, destLen: destLen, 
+source: source, sourceStart: 0, sourceLen: destLen];
+};
+IF destLen#0 THEN DoWithNotify[action: changeAction, event: event, 
+root: root, text: node, start: destStart, newlen: destLen, oldlen: destLen];
+};
+
+GetCharProp: PUBLIC PROC [node: Node, index: INT, name: ATOM] RETURNS [value: REF] ~ {
+RETURN [Prop.Get[GetCharPropList[node, index], name]];
+};
+
+PutCharProp: PUBLIC PROC [node: Node, index: INT, name: ATOM, value: REF, 
+nChars: INT, event: Event, root: Node] ~ {
+destSize: INT ~ InlineSize[node];
+destStart: INT ~ MIN[MAX[0, index], destSize];
+destLen: INT ~ MIN[MAX[0, nChars], destSize-destStart];
+destRosary: ROSARY ~ IF node.charProps=NIL THEN nilRosary ELSE node.charProps;
+p: PROC [q: PROC [item: REF, repeat: INT]] ~ {
+putProp: Rosary.RunActionType ~ {
+old: PropList ~ PropListFromItem[item];
+new: PropList ~ Prop.Put[old, name, value];
+q[new, repeat];
+};
+[] ¬ Rosary.MapRuns[[destRosary, destStart, destLen], putProp];
+};
+sourceRosary: ROSARY ~ Rosary.FromRuns[p];
+changeAction: PROC ~ {
+node.charProps ¬ RosaryReplace[dest: node.charProps, 
+destSize: destSize, destStart: destStart, destLen: destLen, 
+source: sourceRosary, sourceStart: 0, sourceLen: destLen];
+};
+IF Rosary.Size[sourceRosary]#destLen THEN ERROR;
+IF destLen#0 THEN DoWithNotify[action: changeAction, event: event, 
+root: root, text: node, start: destStart, newlen: destLen, oldlen: destLen];
+};
+
+MapCharProps: PUBLIC PROC [node: Node, index: INT, action: MapPropsAction] RETURNS [quit: BOOL] ~ {
+FOR list: PropList ¬ GetCharPropList[node, index], list.rest UNTIL list=NIL DO
+IF action[NARROW[list.first.key], list.first.val].quit THEN RETURN[TRUE];
+ENDLOOP;
+RETURN[FALSE];
+};
+
+ModifyCharProps: PUBLIC PROC [node: Node, name: ATOM, index: INT, nChars: INT, action: ModifyPropsAction, event: Event, root: Node] RETURNS [quit: BOOL ¬ FALSE] ~ {
+destSize: INT ~ InlineSize[node];
+destStart: INT ~ MIN[MAX[0, index], destSize];
+destLen: INT ~ MIN[MAX[0, nChars], destSize-destStart];
+r: ROSARY ~ IF node.charProps=NIL THEN nilRosary ELSE node.charProps;
+prefixSize: INT ¬ INT.LAST;
+i: INT ¬ index;
+p: PROC[q: PROC[REF, INT]] ~ {
+runAction: Rosary.RunActionType ~ {
+oldList: PropList ~ PropListFromItem[item];
+oldValue: REF ~ Prop.Get[oldList, name];
+stop: BOOL ¬ FALSE; newValue: REF ¬ NIL;
+[stop, newValue] ¬ action[oldValue, i, repeat];
+IF newValue # oldValue AND prefixSize = INT.LAST THEN prefixSize ¬ i;
+IF prefixSize # INT.LAST THEN {
+newList: PropList ~ IF newValue = oldValue THEN oldList 
+ELSE Prop.Put[oldList, name, newValue];
+q[newList, repeat];
+};
+i ¬ i + repeat;
+IF stop THEN RETURN [TRUE];
+};
+quit ¬ Rosary.MapRuns[[r, destStart, destLen], runAction];
+};
+s: ROSARY ~ Rosary.FromRuns[p]; -- sets prefixSize, i, and quit as side effect
+IF prefixSize # INT.LAST THEN {
+t: ROSARY ~ Rosary.CatSegments[[r, 0, prefixSize], [s], [r, i, destSize-i]];
+len: INT ~ Rosary.Size[s];
+changeAction: PROC ~ { node.charProps ¬ t };
+IF prefixSize + len # i THEN ERROR;
+DoWithNotify[action: changeAction, event: event, 
+root: root, text: node, start: prefixSize, newlen: len, oldlen: len];
+};
+};
+
+GetProp: PUBLIC PROC [node: Node, name: ATOM] RETURNS [value: REF] = {
+RETURN [IF node=NIL THEN NIL ELSE NodeProps.GetProp[node, name]];
+};
+
+PutProp: PUBLIC PROC [node: Node, name: ATOM, value: REF, event: Event ¬ NIL] = {
+IF node#NIL THEN {
+oldval: REF ~ NodeProps.GetProp[node, name];
+IF value#oldval THEN {
+notify: REF Change ~ NEW[Change.ChangingProp ¬ [ChangingProp[
+node: node, name: name, newval: value, oldval: oldval]]];
+EditNotify.Notify[notify, before];
+NodeProps.PutProp[node, name, value];  
+EditNotify.Notify[notify, after];
+IF event#NIL THEN UndoEvent.Note[event, UndoPutProp, notify];
+};
+};
+};
+
+UndoPutProp: PROC [undoRef: REF Change, currentEvent: Event] = {
+WITH undoRef SELECT FROM
+x: REF Change.ChangingProp => {
+PutProp[node: x.node, name: x.name, value: x.oldval, event: currentEvent];
+};
+ENDCASE => ERROR;
+};
+
+GetFormat: PUBLIC PROC [node: Node] RETURNS [ATOM] = {
+RETURN [IF node=NIL THEN NIL ELSE node.format];
+};
+
+PutFormat: PUBLIC PROC [node: Node, format: ATOM, event: Event] = {
+PutProp[node, NodeProps.nameFormat, NodeProps.ValueFromAtom[format], event];
+};
+
+GetComment: PUBLIC PROC [node: Node] RETURNS [BOOL] = {
+RETURN [IF node=NIL THEN FALSE ELSE node.comment];
+};
+
+PutComment: PUBLIC PROC [node: Node, comment: BOOL, event: Event] = {
+PutProp[node, NodeProps.nameComment, NodeProps.ValueFromBool[comment], event];
+};
+
+ChangeStyle: PUBLIC PROC [node: Node, name: ROPE, event: Event ¬ NIL] = {
+value: REF ~ IF Rope.Size[name]=0 THEN NIL 
+ELSE Rope.Replace[base: "\"\" style", start: 1, len: 0, with: name];
+PutProp[node, NodeProps.namePrefix, value, event];
+};
+
+FetchChar: PUBLIC PROC [text: Node, index: INT] RETURNS [XCHAR] = {
+charSets: ROSARY ~ text.charSets;
+RETURN[Char.Make[
+set: IF charSets=NIL THEN 0 ELSE CharSetFromItem[Rosary.Fetch[charSets, index]],
+code: ORD[Rope.Fetch[text.rope, index]]
+]];
+};
+
+FetchLooks: PUBLIC PROC [text: Node, index: INT] RETURNS [Looks] = {
+IF text.runs=NIL THEN RETURN[noLooks]; -- should check for index in bounds?
+RETURN[LooksFromItem[Rosary.Fetch[text.runs, index]]];
+};
+
+InlineSize: PROC [node: Node] RETURNS [INT] = INLINE {
+RETURN [Rope.Size[node.rope]]
+};
+
+Size: PUBLIC PROC [text: Node] RETURNS [INT] = {
+RETURN [IF text=NIL THEN 0 ELSE InlineSize[text]]
+};
+
+GetRope: PUBLIC PROC [node: Node] RETURNS [ROPE] ~ {
+RETURN [IF node=NIL THEN NIL ELSE node.rope];
+};
+
+HasCharSets: PUBLIC PROC [node: Node, start: INT, len: INT] RETURNS [BOOL] ~ {
+nonZeroCharSet: Rosary.RunActionType ~ { RETURN[CharSetFromItem[item]#0] };
+RETURN[node#NIL AND node.charSets#NIL AND 
+Rosary.MapRuns[[node.charSets, start, len], nonZeroCharSet]];
+};
+
+GetString: PUBLIC PROC [node: Node, start: INT, len: INT] RETURNS [ROPE] ~ {
+IF node=NIL THEN RETURN[NIL];
+IF HasCharSets[node, start, len]
+THEN {
+stream: IO.STREAM ~ IO.ROS[];
+set: CharSet ¬ 0;
+count: INT ¬ 0;
+putRun: Rosary.RunActionType ~ {
+newSet: CharSet ~ CharSetFromItem[item]; -- must fit in a byte!
+IF newSet#set THEN { IO.PutByte[stream, 255]; IO.PutByte[stream, set ¬ newSet] };
+IO.PutRope[stream, node.rope, start+count, repeat];
+count ¬ count+repeat;
+};
+[] ¬ Rosary.MapRuns[[node.charSets, start, len], putRun];
+RETURN[IO.RopeFromROS[stream]];
+}
+ELSE RETURN [Rope.Substr[node.rope, start, len]];
+};
+
+FromRope: PUBLIC PROC [rope: ROPE] RETURNS [Node] = {
+RETURN[NEW[Tioga.NodeRep ¬ [rope: rope]]];
+};
+
+DocFromNode: PUBLIC PROC [child: Node] RETURNS [Node] = {
+newline: ROPE ¬ "\n";
+root: Node ~ NEW[Tioga.NodeRep ¬ [child: child, comment: TRUE]];
+child.parent ¬ root;
+IF child#NIL THEN {
+rope: ROPE ~ child.rope;
+index: INT ~ Rope.SkipTo[s: rope, pos: 0, skip: "\r\l"];
+IF index < Rope.Size[rope] THEN newline ¬ Rope.Substr[rope, index, 1];
+};
+PutNewlineDelimiter[root, newline];
+RETURN[root];
+};
+
+nameNewlineDelimiter: ATOM ~ $NewlineDelimiter;
+
+GetNewlineDelimiter: PUBLIC PROC [root: Node] RETURNS [ROPE] ~ {
+WITH GetProp[root, nameNewlineDelimiter] SELECT FROM
+rope: ROPE => RETURN [rope];
+ENDCASE => RETURN ["\r"];
+};
+
+PutNewlineDelimiter: PUBLIC PROC [root: Node, val: ROPE, event: Event ¬ NIL] ~ {
+PutProp[root, nameNewlineDelimiter, val, event];
+};
+
+ModifyCharsAction: TYPE ~ TextEdit.ModifyCharsAction;
+
+ModifyChars: PUBLIC PROC [root: Node, dest: Node, start: INT, len: INT, 
+action: ModifyCharsAction, event: Event] ~ {
+IF dest#NIL THEN {
+destSize: INT ~ InlineSize[dest];
+destStart: INT ~ MIN[MAX[0, start], destSize];
+destLen: INT ~ MIN[MAX[0, len], destSize-destStart];
+IF destLen>0 THEN {
+charSets: ROSARY ~ IF dest.charSets=NIL THEN nilRosary ELSE dest.charSets;
+p: PROC [q: PROC [CHAR]] ~ {
+index, charSetEndIndex: INT ¬ destStart;
+set: CharSet ¬ 0;
+ropeMapAction: PROC [c: CHAR] RETURNS [quit: BOOL ¬ FALSE] ~ {
+IF NOT index<charSetEndIndex THEN {
+run: Rosary.Run ~ Rosary.FetchRun[charSets, index];
+set ¬ CharSetFromItem[run.item];
+charSetEndIndex ¬ index+run.repeat;
+};
+q[action[set, c]]; -- store the modified char into the new rope
+index ¬ index+1;
+};
+[] ¬ Rope.Map[dest.rope, destStart, destLen, ropeMapAction];
+};
+newRope: ROPE ~ Rope.FromChars[p];
+changeAction: PROC ~ {
+dest.rope ¬ Rope.Replace[base: dest.rope, start: destStart, len: destLen, with: newRope];
+};
+IF Rope.Size[newRope]#destLen THEN ERROR;
+DoWithNotify[action: changeAction, event: event, 
+root: root, text: dest, start: destStart, newlen: destLen, oldlen: destLen];
+};
+};
+};
+
+CharPredicate: TYPE ~ REF CharPredicateRep;
+CharPredicateRep: TYPE ~ PACKED ARRAY CHAR OF BOOL;
+
+MakeCharPredicate: PROC [p: PROC [CHAR] RETURNS [BOOL]] RETURNS [CharPredicate] ~ {
+a: CharPredicate ~ NEW[CharPredicateRep ¬ ALL[FALSE]];
+FOR c: CHAR IN CHAR DO a[c] ¬ p[c] ENDLOOP;
+RETURN[a];
+};
+
+IsAlphaNumeric: PROC [c: CHAR] RETURNS [BOOL] ~ {
+RETURN[c IN['A..'Z] OR c IN['a..'z] OR c IN['0..'9] OR c='\' OR c='_]
+};
+
+isAlphaNumeric: CharPredicate ~ MakeCharPredicate[IsAlphaNumeric];
+
+ChangeCaps: PUBLIC PROC [root: Node, dest: Node, start: INT, len: INT, 
+how: CapChange, event: Event] ~ {
+Upper: PROC [set: CharSet, char: CHAR] RETURNS [CHAR] ~ INLINE {
+RETURN[IF set=0 THEN Ascii.Upper[char] ELSE char];
+};
+Lower: PROC [set: CharSet, char: CHAR] RETURNS [CHAR] ~ INLINE {
+RETURN[IF set=0 THEN Ascii.Lower[char] ELSE char];
+};
+SELECT how FROM
+firstCap => {
+first: BOOL ¬ TRUE;
+firstCapAction: ModifyCharsAction ~ {
+IF first THEN { first ¬ FALSE; RETURN[Upper[set, char]] }
+ELSE RETURN[Lower[set, char]];
+};
+ModifyChars[root, dest, start, len, firstCapAction, event];
+};
+allCaps => {
+allCapsAction: ModifyCharsAction ~ { RETURN[Upper[set, char]] };
+ModifyChars[root, dest, start, len, allCapsAction, event];
+};
+allLower => {
+allLowerAction: ModifyCharsAction ~ { RETURN[Lower[set, char]] };
+ModifyChars[root, dest, start, len, allLowerAction, event];
+};
+initCaps => {
+init: BOOL ¬ TRUE;
+initCapsAction: ModifyCharsAction ~ {
+first: BOOL ~ init;
+init ¬ NOT(set=0 AND isAlphaNumeric[char]);
+RETURN[IF first THEN Upper[set, char] ELSE char];
+};
+ModifyChars[root, dest, start, len, initCapsAction, event];
+};
+ENDCASE => ERROR;
+};
+
+END.
+     
+TextEditImpl.mesa
+Copyright Ó 1985, 1986, 1987, 1989, 1990, 1991, 1992 by Xerox Corporation.  All rights reserved.
+written by Bill Paxton, March 1981
+last edit by Bill Paxton, December 28, 1982 11:43 am
+Last Edited by: Maxwell, January 5, 1983 3:31 pm
+Michael Plass, April 6, 1989 2:38:04 pm PDT
+Christian Jacobi, May 2, 1989 6:03:06 pm PDT
+Willie-s, February 13, 1991 6:46 pm PST
+Doug Wyatt, June 19, 1992 3:56 pm PDT
+
+Cache of notify records
+
+
+Text Editing Support
+
+-- returns TRUE if there is already a ChangingText record for given node in the event 
+Don't keep searching too long; give up and make a new event instead. - mfp
+BumpCount[text];
+must replace all of text since only save first change per event
+Text Editing Operations
+RosaryReplaceWithItem: PROC [dest: ROSARY, destSize, destStart, destLen: INT, 
+sourceItem: REF, sourceLen: INT] RETURNS [ROSARY] ~ {
+IF dest=NIL AND sourceItem=NIL THEN RETURN[NIL]
+ELSE {
+destRosary: ROSARY ~ IF dest=NIL THEN nilRosary ELSE dest;
+sourceRosary: ROSARY ~ IF sourceItem=NIL THEN nilRosary ELSE Rosary.FromItem[sourceItem, sourceLen];
+destEnd: INT ~ destStart+destLen;
+result: ROSARY ~ Rosary.CatSegments[
+[destRosary, 0, destStart],
+[sourceRosary, 0, sourceLen],
+[destRosary, destEnd, destSize-destEnd]
+];
+notNil: Rosary.RunActionType ~ { RETURN[sourceItem#NIL] };
+RETURN[IF Rosary.MapRuns[[result], notNil] THEN result ELSE NIL];
+};
+};
+
+-- replace the dest text by a copy of the source text
+-- names that are in the replaced text move to destStart
+-- names that are after the replaced text are adjusted
+
+ReplaceByRope: PUBLIC PROC [root: Node, dest: Node, start, len: INT, 
+rope: ROPE, looks: Looks, charSet: CharSet, charProps: PropList, 
+event: Event] RETURNS [resultStart, resultLen: INT ¬ 0] = {
+IF dest#NIL THEN {
+destSize: INT ~ InlineSize[dest];
+destStart: INT ~ MIN[MAX[0, start], destSize];
+destLen: INT ~ MIN[MAX[0, len], destSize-destStart];
+sourceLen: INT ~ Rope.Size[rope];
+changeAction: PROC = {
+dest.rope ¬ Rope.Replace[base: dest.rope, start: destStart, len: destLen, with: rope];
+dest.runs _ RosaryReplaceWithItem[dest: dest.runs, 
+destSize: destSize, destStart: destStart, destLen: destLen, 
+sourceItem: ItemFromLooks[looks], sourceLen: sourceLen];
+dest.charSets _ RosaryReplaceWithItem[dest: dest.charSets, 
+destSize: destSize, destStart: destStart, destLen: destLen, 
+sourceItem: ItemFromCharSet[charSet], sourceLen: sourceLen];
+dest.charProps _ RosaryReplaceWithItem[dest: dest.charProps, 
+destSize: destSize, destStart: destStart, destLen: destLen, 
+sourceItem: charProps, sourceLen: sourceLen];
+NodeAddrs.Replace[dest, destStart, destLen, sourceLen];
+};
+IF destLen#0 OR sourceLen#0 THEN DoWithNotify[action: changeAction, event: event, 
+root: root, text: dest, start: destStart, newlen: sourceLen, oldlen: destLen];
+RETURN [destStart, sourceLen];
+};
+};
+
+Operation to add or delete looks
+Character Properties
+Note: Character properties are implemented using a ROSARY (an immutable sequence of REFs; see Rosary.mesa), appearing in the CharProps property of the node.  The values in this rosary are of type Prop.PropList; these property lists are immutable.  The values on the property lists are externalized and internalized using the procedures registered with NodeProps, but no warrantee is expressed or implied for props that are not immutable.
+
+Node properties
+Fetch info operations
+MapCharsAction: TYPE ~ PROC [c: XCHAR] RETURNS [quit: BOOL ¬ FALSE];
+
+MapChars: PROC [text: Node, start, len: INT, action: MapCharsAction] 
+RETURNS [BOOL] ~ {
+charSets: ROSARY ~ text.charSets;
+set: CharSet _ 0;
+index: INT _ start;
+end: INT _ IF charSets=NIL THEN INT.LAST ELSE 0;
+ropeAction: Rope.ActionType ~ {
+IF NOT index<end THEN {
+run: Rosary.Run ~ Rosary.FetchRun[charSets, index];
+set _ CharSetFromItem[run.item];
+end _ index+run.repeat;
+};
+quit _ action[Char.Make[set, ORD[c]]];
+index _ index+1;
+};
+RETURN[Rope.Map[text.rope, start, len, ropeAction]];
+};
+
+Operations to create a text node
+Newline Delimiter
+Caps and Lowercase
+ Ê"Ã  •NewlineDelimiter
+–(cedarcode) style™ codešœ™Kšœ
+ÏeœU™`KšÏy"™"Kšž4™4Kšž0™0K™+K™,K™'K™%K™ —šÏk	˜	KšœŸœ˜KšœŸœ%˜2KšœŸœŸœ˜"KšœŸœ˜"KšŸœŸœŸœŸœ!˜6Kšœ
+ŸœK˜ZKšœ
+˜
+KšœŸœ˜ KšœŸœ.Ÿœ˜TKšœŸœ=Ÿœ˜kKšœ	˜	Kšœ˜K˜Kšœ
+Ÿœ˜$KšœŸœ!˜,Kšœ
+Ÿœ#˜2—K˜ KšÏnœŸœŸ˜KšŸœ#Ÿœ@˜lKšŸœ/˜6šœŸ˜K˜ KšŸœŸœŸœ˜KšŸœŸœ
+Ÿœ˜KšŸœŸœŸœ˜Kšœ	Ÿœ˜KšœŸœ˜KšœŸœ˜Kšœ˜KšœŸœ˜KšœŸœ˜Kšœ
+ŸœŸœ˜+KšœŸœ˜!KšœŸœŸœŸœ˜KšœŸœ˜%KšœŸœ˜+KšœŸœ˜)KšœŸœ˜/KšœŸœ˜5—headšœ™KšœŸœŸœ˜<K˜ š
+ œŸœŸœŸœŸœ˜@KšŸœŸœŸœ˜KšœŸœ	ŸœŸœŸœŸœ˜?KšœŸœ	ŸœŸœŸœŸœ˜?KšœŸœ	ŸœŸœŸœŸœ˜?Kšœ
+Ÿœ˜#Kšœ˜K™ —š œŸœŸœ˜1Kš
+ŸœŸœŸœŸœŸœ˜MšŸœŸœŸ˜KšœŸœ˜'KšœŸœ˜'KšœŸœ˜'KšŸœŸœ˜—Kšœ˜K™ ——šœ™šœŸœ˜K™ —š
+ œŸœŸœŸœŸœ˜GKšœV™VKšœŸœ˜Kš
+Ÿœ	ŸœŸœŸœŸœ˜"šŸœ1ŸœŸœŸ˜BšŸœŸœŸ˜KšœŸœŸœŸœŸœŸœ˜AKšŸœ˜—šŸœŸœŸœ˜K™J—KšŸœ˜—KšŸœŸœ˜Kšœ˜K˜ —š œŸœ
+Ÿœ0Ÿœ
+Ÿœ
+Ÿœ˜rKš	œŸœ	ŸœŸœŸœ˜9KšœŸœŸœŸœŸœŸœ	˜Ušœ˜Kšœ:˜:Kšœ'˜'Kšœ8˜8Kšœ˜—K˜"Kšœ	˜	Kšž™K˜!KšŸœŸœ.Ÿœ˜MKšœ˜K˜ —š œŸœŸœ˜<šŸœ	ŸœŸ˜šœŸœ˜Kšœ?™?KšœŸœó˜“Kšœ˜—KšŸœŸœ˜—Kšœ˜K˜ ——šœ™š	œŸœŸœŸœŸœ˜3K˜ —š œŸœŸœ ŸœŸœŸœŸœŸœ˜ˆKšŸœŸœŸœŸœŸœŸœŸœ˜+šŸœ˜KšœŸœŸœŸœŸœŸœ˜:KšœŸœŸœŸœŸœŸœ˜@Kšœ	Ÿœ˜!šœŸœ˜$Kšœ˜Kšœ'˜'Kšœ'˜'Kšœ˜—Kšœ!ŸœŸœ˜4Kš
+ŸœŸœ"ŸœŸœŸœ˜AK˜—K˜K˜ —š œŸœŸœ
+ŸœŸœŸœ˜BKšŸœŸœŸœŸœŸœŸœ ˜@K˜K˜ —š œŸœŸœ ŸœŸœŸœŸœŸœ™„KšŸœŸœŸœŸœŸœŸœŸœ™/šŸœ™KšœŸœŸœŸœŸœŸœ™:KšœŸœŸœŸœŸœŸœ(™dKšœ	Ÿœ™!šœŸœ™$Kšœ™Kšœ™Kšœ'™'Kšœ™—Kšœ!ŸœŸœ™:Kš
+ŸœŸœ"ŸœŸœŸœ™AK™—K™K™ —K˜ š œŸœŸœ.ŸœŸœ/ŸœŸœŸœŸœ˜îKšœ
+Ÿœ˜!KšœŸœ˜(šœŸœ˜Kšœ‚˜‚K˜­K˜¹K˜¼K˜7Kšœ˜—KšœŸœŸœ˜3KšœŸœŸœ(˜;KšœŸœŸœ˜-Kšœ
+ŸœŸœ"˜3KšŸœŸœŸœ˜¡KšŸœ˜Kšœ˜K˜ —š œŸœŸœ<ŸœŸœŸœŸœŸœŸœ˜ÐKšœ5™5Kšœ8™8Kšœ6™6KšŸœŸœŸœŸœ˜KšŸœŸœŸœŸœŸœeŸœŸœŸœŸœ.˜ðKšŸœŸœ˜š˜K˜ ——š 
+œŸœ˜"Kšœ-Ÿœ8Ÿœ.˜™Kšœ˜K˜ —š œŸœÏc˜<KšŸœª˜°˜K˜ ——š œŸœŸœ3ŸœŸœŸœŸœŸœŸœ˜¿š 	œŸœŸœŸœŸœŸœ˜CKšŸœ
+ŸœŸœŸœŸœŸœ˜:šŸœ˜šŸœ¡˜"KšœŸœ˜"KšŸœŸœ¡˜CKšœ'˜'Kšœ"¡'˜IKšœ˜—šŸœ¡ ˜=KšœF˜F——KšŸœŸœ˜Kšœ˜—KšœŸœ˜%Kš	œ
+ŸœŸœŸœŸœ˜EKšœŸœŸœ˜'KšœŸœŸœ˜)Kšœ
+ŸœŸœ˜)Kš
+ŸœŸœ	ŸœŸœŸœ˜JKšŸœŸœŸœ˜"Kšœ/˜/Kšœd˜dšŸœŸœ¡˜1šŸœ˜KšŸœ¡˜;KšŸœ¡˜6—Kšœ˜—Kšœ2˜2KšŸœŸœ˜/Kšœ˜K˜ —š œŸœŸœ5ŸœŸœ&ŸœŸœŸœŸœŸœ˜èKšœ0Ÿœ˜8K˜%K˜KšœŸœŸœ˜'KšœŸœŸœ˜)K˜KšœŸœŸœŸœ˜:KšœŸœŸœ˜-Kšœ
+ŸœŸœ"˜3K˜šŸœŸœ¡$˜:šŸœŸœŸœ˜'KšŸœŸœ>˜SKšŸœŸœH˜aKšŸœ˜Kšœ˜—šŸœŸœŸœ˜%K˜=KšŸœ˜Kšœ˜—KšŸœŸœŸœŸœ˜BšŸœŸœ˜K˜?KšŸœ˜Kšœ˜—šŸœŸœ˜K˜?KšŸœ˜Kšœ˜—Kšœ˜—K˜;KšŸœŸœŸœ˜@KšŸœL˜RK˜K™ —š œŸœŸœ6ŸœŸœ"ŸœŸœŸœŸœDŸœ˜š œŸœŸœ¡œ˜,KšœŸœ˜K˜-K˜CK˜.K˜—KšœŸœ˜Kšœ
+ŸœŸœ˜K˜KšœŸœŸœ˜0KšœŸœŸœ%˜HKšœŸœŸœŸœ˜>KšœŸœŸœ˜-KšœŸœŸœ"˜CšŸœŸœ˜Kšœ
+Ÿœ˜šŸœŸœ¡˜/KšœŸœ˜KšœŸœ˜Kšœ˜K˜*K˜$K˜&K˜KšœŸœ˜Kšœ˜—K˜šŸœŸœ¡˜:K˜XK˜K˜&KšŸœ
+Ÿœ˜!KšŸœ˜Kšœ˜—šŸœŸœ¡˜-Kšœ$Ÿœ˜(K˜$K˜)šŸœŸœŸ˜+KšŸœ,˜2—K˜˜D˜DK˜%——K˜&K˜,K˜(KšŸœ
+Ÿœ˜!KšŸœ˜Kšœ˜—Kšœ˜—šœ/¡˜GK˜+K˜(K˜@—KšŸœŸœŸœ-˜cšœ-¡"˜OK˜+K˜"K˜<—KšŸœ
+Ÿœ˜Kšœ˜K˜ —K˜ šœ)˜)K˜ —š œŸœŸœŸœŸœŸœ˜G˜ KšŸœŸœŸœ˜*KšŸœ
+ŸœŸœ˜7K˜—KšŸœŸœŸœ˜HK˜K˜ —š
+ œŸœŸœŸœŸœ˜:šŸœŸœŸ˜KšœŸœ
+Ÿœ˜!KšŸœŸœ
+˜—K˜K˜ —šœ+˜+K˜ —š œŸœŸœŸœŸœŸœ˜M˜ KšŸœŸœŸœ˜*KšŸœ
+ŸœŸœ˜;K˜—KšŸœŸœ-˜>K˜K˜ —š
+ œŸœŸœŸœŸœ˜>šŸœŸœŸ˜KšœŸœŸœ˜#KšŸœŸœ˜—K˜K˜ —š
+ œŸœŸœŸœŸœ˜DKšŸœ˜K˜K˜ —š
+ œŸœŸœŸœŸœ˜@šŸœŸœŸ˜KšœŸœ˜KšŸœŸœŸœ˜—K˜K˜ —š œŸœŸœ&Ÿœ	ŸœFŸœŸœ	˜ÃšŸœŸœŸœ˜KšœŸœ˜!KšŸœá˜çK˜—Kšœ˜K˜ —š œŸœŸœ&Ÿœ	ŸœFŸœŸœ	™ÃšŸœŸœŸœ™Kšœ
+Ÿœ™!KšœŸœŸœŸœ™.Kšœ	ŸœŸœŸœ™4KšœŸœ™!šœŸœ™KšœV™VKšœ©™©Kšœµ™µKšœ¨™¨K™7Kšœ™—KšŸœŸœŸœ™¡KšŸœ™K™—Kšœ™K™ ——šœ ™ š œŸœŸœ6ŸœŸœŸœ˜šŸœŸœŸœ˜Kšœ
+Ÿœ˜!KšœŸœŸœŸœ˜.Kšœ	ŸœŸœŸœ˜4KšœŸœŸœŸœŸœŸœ˜Dšœ$˜$Kšœ!˜!KšœG˜GKšŸœ
+˜Kšœ˜—šŸœ>Ÿœ˜Fš	œŸœŸœŸœ
+Ÿœ˜.šœ ˜ Kšœ!˜!KšœG˜GK˜Kšœ˜—K˜>K˜—KšœŸœ˜*šœŸœ˜K˜¡K˜—KšŸœ#ŸœŸœ˜0Kšœ~˜~K˜—K˜—K˜K˜ ——šœ™šœ3Ÿœü™µK˜ —Kšœ
+Ÿœ˜K™ š œŸœŸœŸœŸœ	Ÿœ˜UKšŸœ˜ K˜K˜ —š œŸœŸœŸœ	ŸœŸœ˜]KšŸœ!˜'K˜—K˜ š œŸœŸœŸœŸœŸœ˜RšŸœŸ˜KšŸœ5ŸœŸœ˜FKšŸœŸœ8˜C—Kšœ˜K˜ —š
+ œŸœŸœŸœŸœ˜uKšœ
+Ÿœ˜!KšœŸœŸœŸœ˜.Kšœ	ŸœŸœŸœ!˜7šœŸœ˜KšœŸœ7˜EK˜§K˜—KšŸœŸœ˜Kšœ˜K˜ —š œŸœŸœŸœŸœŸœ	Ÿœ˜VKšŸœ0˜6Kšœ˜K˜ —š œŸœŸœŸœŸœ	ŸœŸœ˜uKšœ
+Ÿœ˜!KšœŸœŸœŸœ˜.Kšœ	ŸœŸœŸœ!˜7KšœŸœŸœŸœŸœŸœ˜Nš	œŸœŸœŸœ
+Ÿœ˜.šœ!˜!Kšœ'˜'Kšœ+˜+Kšœ˜Kšœ˜—K˜?Kšœ˜—KšœŸœ˜*šœŸœ˜K˜­K˜—KšŸœ#ŸœŸœ˜0KšŸœŸœ˜Kšœ˜K˜ —š œŸœŸœŸœŸœŸœ˜cšŸœ:ŸœŸœŸ˜NKš
+ŸœŸœ'ŸœŸœŸœ˜IKšŸœ˜—KšŸœŸœ˜Kšœ˜K˜ —š œŸœŸœŸœ	Ÿœ
+Ÿœ7ŸœŸœŸœ˜¤Kšœ
+Ÿœ˜!KšœŸœŸœŸœ˜.Kšœ	ŸœŸœŸœ!˜7KšœŸœŸœŸœŸœŸœ˜EKšœŸœŸœŸœ˜KšœŸœ	˜š	œŸœŸœŸœŸœ˜šœ#˜#Kšœ+˜+Kšœ
+Ÿœ˜(Kš	œŸœŸœŸœŸœ˜(Kšœ/˜/Kš
+ŸœŸœŸœŸœŸœ˜EšŸœŸœŸœŸœ˜KšœŸœŸœ
+Ÿœ#˜`Kšœ˜Kšœ˜—Kšœ˜KšŸœŸœŸœŸœ˜Kšœ˜—Kšœ:˜:Kšœ˜—KšœŸœ¡.˜NšŸœŸœŸœŸœ˜KšœŸœC˜LKšœŸœ˜KšœŸœ˜,KšŸœŸœŸœ˜#Kšœw˜wKšœ˜—Kšœ˜K˜ ——™š œŸœŸœŸœŸœ	Ÿœ˜FKšŸœŸœŸœŸœŸœŸœ ˜AKšœ˜K˜ —š œŸœŸœŸœ	ŸœŸœ˜QšŸœŸœŸœ˜KšœŸœ!˜,šŸœŸœ˜šœŸœ
+Ÿœ%˜=Kšœ9˜9—K˜"Kšœ'˜'K˜!KšŸœŸœŸœ,˜=K˜—K˜—Kšœ˜K˜ —š œŸœŸœ!˜@šŸœ	ŸœŸ˜šœŸœ˜KšœJ˜JKšœ˜—KšŸœŸœ˜—Kšœ˜K˜ —š
+ 	œŸœŸœŸœŸœ˜6KšŸœŸœŸœŸœŸœŸœ˜/Kšœ˜K˜ —š 	œŸœŸœŸœ˜CKšœL˜LKšœ˜K˜ —š
+ 
+œŸœŸœŸœŸœ˜7KšŸœŸœŸœŸœŸœŸœ˜2Kšœ˜K˜ —š 
+œŸœŸœŸœ˜EKšœN˜NKšœ˜K˜ —š
+ œŸœŸœŸœŸœ˜IKšœŸœŸœŸœŸœŸœ@˜pK˜2K˜K˜ ——šœ™š 	œŸœŸœŸœŸœŸœ˜CKšœ
+Ÿœ˜!šŸœ˜Kš	œŸœ
+ŸœŸœŸœ0˜PKšœŸœ˜'Kšœ˜—Kšœ˜K˜ —šœŸœŸœŸœŸœŸœŸœ™DK™ —š
+ œŸœŸœŸœŸœ™XKšœ
+Ÿœ™!K™KšœŸœ	™KšœŸœŸœ
+ŸœŸœŸœŸœŸœ™0šœ™šŸœŸœŸœ™K™3Kšœ ™ K™K™—KšœŸœ™&K™Kšœ™—KšŸœ.™4Kšœ™K™ —š
+ 
+œŸœŸœŸœŸœ˜DKš	ŸœŸœŸœŸœ¡$˜KKšŸœ0˜6Kšœ˜K˜ —š
+ 
+œŸœŸœŸœŸœ˜6KšŸœ˜Kšœ˜K˜ —š
+ œŸœŸœŸœŸœ˜0Kš
+ŸœŸœŸœŸœŸœ˜1Kšœ˜K˜ —š
+ œŸœŸœŸœŸœ˜4KšŸœŸœŸœŸœŸœŸœ˜-Kšœ˜K˜ —š œŸœŸœŸœŸœŸœŸœ˜NKšœ)Ÿœ˜KKš
+ŸœŸœŸœŸœŸœ?˜hK˜K˜ —š 	œŸœŸœŸœŸœŸœŸœ˜LKš
+ŸœŸœŸœŸœŸœ˜šŸœ˜ šŸœ˜Kš	œŸœŸœŸœŸœ˜K˜KšœŸœ˜˜ Kšœ)¡˜?KšŸœŸœŸœŸœ!˜QKšŸœ1˜3K˜K˜—K˜9KšŸœŸœ˜K˜—KšŸœŸœ&˜1—Kšœ˜K˜ ——šœ ™ š
+ œŸœŸœŸœŸœ˜5KšŸœŸœ ˜*K˜K˜ —š œŸœŸœŸœ˜9Kšœ	Ÿœ˜KšœŸœ)Ÿœ˜@Kšœ˜šŸœŸœŸœ˜KšœŸœ˜K•StartOfExpansion)[s: ROPE, pos: INT _ 0, skip: ROPE]šœŸœ.˜8K–9[base: ROPE, start: INT _ 0, len: INT _ 2147483647]šŸœŸœ'˜FKšœ˜—K–3[n: TextNode.Ref, name: ATOM, value: REF ANY]šœ#˜#KšŸœ˜Kšœ˜K˜ ——™šœŸœ˜/K˜ —š
+ œŸœŸœŸœŸœ˜@šŸœ%ŸœŸ˜4KšœŸœŸœ˜KšŸœŸœ˜—K˜K˜ —š
+ œŸœŸœŸœŸœ˜PKšœ0˜0K˜K˜ ——šœ™šœŸœ˜5K˜ —š
+ œŸœŸœ!ŸœŸœ/˜ušŸœŸœŸœ˜Kšœ
+Ÿœ˜!KšœŸœŸœŸœ˜.Kšœ	ŸœŸœŸœ˜4šŸœŸœ˜Kšœ
+ŸœŸœŸœŸœŸœ˜JšœŸœŸœŸœ˜KšœŸœ˜(K˜šœŸœŸœŸœŸœŸœ˜>šŸœŸœŸœ˜#Kšœ3˜3K˜ K˜#K˜—Kšœ¡,˜?K˜Kšœ˜—K˜<K˜—Kšœ	Ÿœ˜"šœŸœ˜K˜YK˜—KšŸœŸœŸœ˜)Kšœ~˜~K˜—K˜—K˜K˜ —KšœŸœŸœ˜+šœŸœŸœŸœŸœŸœŸœ˜3K˜ —š œŸœŸœŸœŸœŸœŸœ˜SKšœŸœŸœŸœ˜6KšŸœŸœŸœŸœŸœŸœ˜+KšŸœ˜
+K˜K˜ —š
+ œŸœŸœŸœŸœ˜1KšŸœŸœ	ŸœŸœ	ŸœŸœ	ŸœŸœ˜EK˜K˜ —šœB˜BK˜ —š
+ 
+œŸœŸœ!ŸœŸœ$˜iš œŸœŸœŸœŸœŸœ˜@KšŸœŸœŸœŸœ˜2K˜—š œŸœŸœŸœŸœŸœ˜@KšŸœŸœŸœŸœ˜2K˜—šŸœŸ˜šœ˜KšœŸœŸœ˜˜%KšŸœŸœŸœŸœ˜9KšŸœŸœ˜K˜—K˜;Kšœ˜—šœ˜Kšœ%Ÿœ˜@K˜:Kšœ˜—šœ˜Kšœ&Ÿœ˜AK˜;Kšœ˜—˜KšœŸœŸœ˜˜%KšœŸœ˜KšœŸœŸœ˜+KšŸœŸœŸœŸœ˜1K˜—K˜;Kšœ˜—KšŸœŸœ˜—K˜K˜ ——KšŸœ˜— …—    ib  ›Å  

@@ -1,0 +1,807 @@
+
+DIRECTORY
+Basics,
+FinalizeOps,
+IO USING [Close, STREAM],
+List,
+PFS,
+PFSBackdoor,
+PFSExtras,
+PFSPrivate,
+PFSCanonicalNames,
+PFSCFSNames,
+PFSClass,
+PFSPrefixMap,
+PFSNames,
+PreDebug,
+Process,
+ProcessProps,
+Rope USING [Cat, EqualSubstrs, IsEmpty, Fetch, Find, Length, ROPE],
+UnixTypes USING [FD];
+
+
+PFSImpl: CEDAR MONITOR
+IMPORTS FinalizeOps, IO, List, PFS, PFSBackdoor, PFSCanonicalNames, PFSCFSNames, PFSClass, PFSNames, PFSPrefixMap, PFSPrivate, PreDebug, Process, ProcessProps, Rope
+EXPORTS PFS, PFSExtras, PFSBackdoor
+~ BEGIN OPEN PFS;
+
+ROPE: TYPE ~ Rope.ROPE;
+STREAM: TYPE ~ IO.STREAM;
+PATH: TYPE ~ PFSNames.PATH;
+OpenFileObject: PUBLIC TYPE = PFSClass.OpenFileObject;
+
+Error: PUBLIC ERROR [error: PFS.ErrorDesc] ~ CODE;
+
+AtomFromErrorGroup: PUBLIC PROC[eg: ErrorGroup] RETURNS[ATOM] ~ {
+SELECT eg FROM
+ok => RETURN[$ok];
+bug => RETURN[$bug];
+environment => RETURN[$environment];
+client => RETURN[$client];
+user => RETURN[$user];
+ENDCASE => RETURN[$NIL];
+};
+
+ErrorGroupFromAtom: PUBLIC PROC[at: ATOM] RETURNS[ErrorGroup] ~ {
+SELECT at FROM
+$ok => RETURN[ok];
+$bug => RETURN[bug];
+$environment => RETURN[environment];
+$client => RETURN[client];
+$user => RETURN[user];
+ENDCASE => RETURN[ErrorGroup.LAST];
+};
+RopeFromPath: PUBLIC PROC [path: PATH, format: NameFormat ¨ slashes] RETURNS [rope: ROPE] ~ {
+IF path=NIL THEN RETURN[NIL];
+rope ¨ IF format = slashes THEN PFSCanonicalNames.UnparseName[path] ELSE PFSCFSNames.UnparseName[path];
+};
+PathFromRope: PUBLIC PROC [rope: ROPE] RETURNS [path: PATH] ~ {
+IF rope.IsEmpty[] THEN RETURN[NIL]
+ELSE {
+c0: CHAR ¨ rope.Fetch[0];
+SELECT c0 FROM
+'[ => RETURN[PFSCFSNames.ParseName[rope]];
+'/ => RETURN[PFSCanonicalNames.ParseName[rope]];
+ENDCASE => IF rope.Find["/"] > 0 THEN RETURN[PFSCanonicalNames.ParseName[rope]] ELSE RETURN[PFSCFSNames.ParseName[rope]];
+};
+};
+wDirKey: ATOM ~ $WorkingDirectory; -- val: [wDir: ROPE]
+
+DoInWDir: PUBLIC PROC [ wDir: PATH, inner: PROC ] ~ {
+wDirRope: ROPE ~ RopeFromPath[wDir];
+propList: List.AList ~ List.PutAssoc[key: wDirKey, val: wDirRope, aList: NIL];
+ProcessProps.AddPropList[propList: propList, inner: inner];
+};
+
+GetWDir: PUBLIC PROC RETURNS [ wDir: PATH ] ~ {
+wDirRope: ROPE ~ GetWorkingDirectoryRope[];
+wDir ¨ PathFromRope[wDirRope];
+};
+
+AbsoluteName: PUBLIC PROC [short: PATH, wDir: PATH ¨ NIL] RETURNS [absolute: PATH] ~ {
+SELECT TRUE FROM
+PFSNames.IsAbsolute[short] => absolute ¨ short;
+wDir#NIL => absolute ¨ wDir.Cat[short];
+ENDCASE => absolute ¨ PFSNames.Cat[GetWDir[], short];
+absolute ¨ ResolveRelativeComponents[absolute];
+};
+
+
+
+ResolveRelativeComponents: PROC [path: PATH] RETURNS [PATH] ~ {
+anyRelative: BOOL ¨ FALSE;
+FOR i: CARD IN [0..PFSNames.ComponentCount[path]) DO
+comp: PFSNames.Component ~ path.Fetch[i];
+IF Rope.EqualSubstrs[comp.name.base, comp.name.start, comp.name.len, "."] OR Rope.EqualSubstrs[comp.name.base, comp.name.start, comp.name.len, ".."] THEN {
+anyRelative ¨ TRUE; EXIT;
+};
+ENDLOOP;
+IF anyRelative THEN {
+comps: LIST OF PFSNames.Component ¨ NIL;
+FOR i: CARD IN [0..PFSNames.ComponentCount[path]) DO
+comp: PFSNames.Component ~ path.Fetch[i];
+SELECT TRUE FROM
+Rope.EqualSubstrs[comp.name.base, comp.name.start, comp.name.len, "."] => NULL;
+Rope.EqualSubstrs[comp.name.base, comp.name.start, comp.name.len, ".."] => {
+comps ¨ IF comps=NIL THEN NIL ELSE comps.rest;
+};
+ENDCASE => comps ¨ CONS[comp, comps];
+ENDLOOP;
+RETURN[ PFSNames.ConstructName[components~comps, absolute~path.IsAbsolute[], directory~path.IsADirectory[], reverse~TRUE] ];
+}
+ELSE RETURN[ path ];
+};
+
+GetWorkingDirectoryRope: PROC RETURNS [ wDirRope: ROPE ] ~ {
+propList: List.AList ~ ProcessProps.GetPropList[];
+WITH List.Assoc[key: wDirKey, aList: propList] SELECT FROM
+rope: ROPE => { wDirRope ¨ rope };
+ENDCASE;
+IF ( wDirRope.IsEmpty[] ) THEN wDirRope ¨ PFSPrivate.GetDefaultWDirRope[];
+};
+
+FileInfo: PUBLIC PROC [
+name: PATH, 
+wantedUniqueID: UniqueID ¨ nullUniqueID 
+] RETURNS [
+fullFName, attachedTo: PATH, 
+uniqueID: UniqueID,
+bytes: INT, 
+mutability: Mutability,
+fileType: FileType
+] ~
+{
+fs: PFSClass.FSHandle;
+nameOnFS: PATH;
+replacedPrefix: PATH;
+suppliedPrefixLen: INT;
+success: BOOL ¨ TRUE;
+version: PFSNames.Version;
+absoluteName: PATH ~ AbsoluteName[name];
+[fs, nameOnFS, replacedPrefix, suppliedPrefixLen] ¨ ServerAndHints[absoluteName];
+[version, attachedTo, bytes, uniqueID, mutability, fileType] ¨ fs.procs.fileInfo[fs, nameOnFS, wantedUniqueID ];
+fullFName ¨ PFSNames.SetVersionNumber[absoluteName, version];
+NoteEvent[$fileInfo, fullFName];
+};
+EnumerateForInfo: PUBLIC PROC [pattern: PATH, proc: InfoProc, lbound: PATH, hbound: PATH] ~
+{
+fs: PFSClass.FSHandle;
+patternOnFS: PATH;
+replacedPrefix: PATH;
+suppliedPrefixLen: INT;
+NameTranslator: InfoProc ~ {
+IF lbound # NIL AND PFSNames.Compare[fullFName, lbound]=less THEN RETURN [TRUE];
+IF hbound # NIL AND PFSNames.Compare[fullFName, hbound]=greater THEN RETURN [FALSE];
+RETURN [ 
+proc[ 
+BackTranslate[fullFName, replacedPrefix, suppliedPrefixLen],
+attachedTo, uniqueID, bytes, mutability, fileType] 
+];
+};
+IF lbound # NIL THEN lbound ¨ DoServer[AbsoluteName[lbound]].nameOnFS;
+IF hbound # NIL THEN hbound ¨ DoServer[AbsoluteName[hbound]].nameOnFS;
+[fs, patternOnFS, replacedPrefix, suppliedPrefixLen] ¨ ServerAndHints[AbsoluteName[pattern]];
+fs.procs.enumerateForInfo[fs, patternOnFS, NameTranslator, lbound, hbound];
+};
+
+EnumerateForNames: PUBLIC PROC [pattern: PATH, proc: NameProc, lbound: PATH, hbound: PATH] ~
+{
+fs: PFSClass.FSHandle;
+patternOnFS: PATH;
+replacedPrefix: PATH;
+suppliedPrefixLen: INT;
+NameTranslator: NameProc ~ {
+IF lbound # NIL AND PFSNames.Compare[name, lbound]=less THEN RETURN [TRUE];
+IF hbound # NIL AND PFSNames.Compare[name, hbound]=greater THEN RETURN [FALSE];
+RETURN [ 
+proc[BackTranslate[name, replacedPrefix, suppliedPrefixLen]]
+];
+};
+IF lbound # NIL THEN lbound ¨ DoServer[AbsoluteName[lbound]].nameOnFS;
+IF hbound # NIL THEN hbound ¨ DoServer[AbsoluteName[hbound]].nameOnFS;
+[fs, patternOnFS, replacedPrefix, suppliedPrefixLen] ¨ ServerAndHints[AbsoluteName[pattern]];
+fs.procs.enumerateForNames[fs, patternOnFS, NameTranslator, lbound, hbound];
+};
+
+BackTranslate: PROC [name, newPrefix: PATH, replacePrefixLen: CARD] RETURNS [PATH] ~ {
+RETURN [ 
+PFSNames.Cat[newPrefix, PFSNames.SubName[name, replacePrefixLen]]
+]; 
+};
+
+FileLookup: PUBLIC PROC [name: PATH, tryExtensions: LIST OF ROPE] RETURNS [fullPath: PATH ¨ NIL ] ~
+{
+fs: PFSClass.FSHandle;
+nameOnFS: PATH;
+replacedPrefix: PATH;
+suppliedPrefixLen: INT;
+[fs, nameOnFS, replacedPrefix, suppliedPrefixLen] ¨ ServerAndHints[AbsoluteName[name]];
+fullPath ¨ fs.procs.lookupName[fs, nameOnFS ! PFS.Error => CONTINUE ];
+IF fullPath = NIL THEN {
+FOR extList: LIST OF ROPE ¨ tryExtensions, extList.rest WHILE extList# NIL DO
+ext: ROPE ¨ extList.first;
+IF( fullPath ¨ fs.procs.lookupName[fs, AddExt[nameOnFS, ext] 
+! PFS.Error => CONTINUE]) # NIL 
+THEN EXIT;
+ENDLOOP; 
+};
+IF fullPath # NIL THEN 
+fullPath ¨ BackTranslate[fullPath, replacedPrefix, suppliedPrefixLen]; 
+};
+
+FileSearch: PUBLIC PROC [name: PATH, searchRules: LIST OF -- Directory -- PATH] RETURNS [fullPath: PATH] ~
+{
+IF  name.IsAbsolute[] THEN RETURN[FileLookup[name, NIL]];
+FOR dirList: LIST OF PATH ¨ searchRules, dirList.rest WHILE dirList # NIL DO
+dir: PATH ¨ dirList.first;
+IF (fullPath ¨ FileLookup[PFSNames.Cat[dir, name], NIL]) # NIL THEN RETURN;
+ENDLOOP;
+RETURN[NIL];
+};
+
+
+Open: PUBLIC PROC [name: PATH, 
+access: AccessOptions ¨ read,
+wantedUniqueID: UniqueID ¨ nullUniqueID, 
+checkFileType: BOOL ¨ FALSE, fileType: FileType ¨ tUnspecified,
+createOptions: CreateOptions ¨ defaultCreateOptions
+] RETURNS [OpenFile] ~
+{
+fs: PFSClass.FSHandle;
+nameOnFS: PATH;
+openFile: OpenFile;
+absoluteName: PATH ¨ AbsoluteName[name];
+[fs, nameOnFS] ¨ DoServer[absoluteName];
+openFile ¨ fs.procs.open[fs, nameOnFS, wantedUniqueID, access, checkFileType, fileType, createOptions -- ! PFS.Error => IF access=read AND backingName#NIL THEN CONTINUE -- ];
+IF openFile#NIL THEN {
+openFile.fullFName ¨ PFSNames.SetVersionNumber[absoluteName, openFile.fullFName.ShortName[].version]; 
+openFile.access ¨ access;
+IF access # create THEN NoteEvent[$readOpen, openFile.fullFName];
+[] ¨ FinalizeOps.EnableFinalization[openFile, fq];
+RETURN [openFile];
+};
+RETURN [openFile];
+};
+Retrieve: PUBLIC PROCEDURE [name: PATH, 
+wantedUniqueID: UniqueID ¨ nullUniqueID, 
+proc: RetrieveConfirmProc, 
+checkFileType: BOOL ¨ FALSE, fileType: FileType ¨ tUnspecified
+] ~
+{
+fs: PFSClass.FSHandle;
+nameOnFS: PATH;
+absolute: PATH ~ AbsoluteName[name];
+[fs, nameOnFS] ¨ DoServer[absolute];
+NoteEvent[$startRetrieving, absolute];
+fs.procs.retrieve[fs, nameOnFS, wantedUniqueID, proc, checkFileType, fileType];
+NoteEvent[$endRetrieving, absolute];
+};
+Store: PUBLIC PROCEDURE [name: PATH, 
+wantedUniqueID: UniqueID, 
+str: IO.STREAM,
+proc: StoreConfirmProc,
+createOptions: CreateOptions ¨ defaultCreateOptions
+] ~
+{
+fs: PFSClass.FSHandle;
+nameOnFS: PATH;
+absolute: PATH ~ AbsoluteName[name];
+[fs, nameOnFS] ¨ DoServer[absolute];
+NoteEvent[$startStoring, absolute];
+fs.procs.store[fs, nameOnFS, wantedUniqueID, str, proc, createOptions];
+NoteEvent[$endStoring, absolute];
+};
+GetClass: PUBLIC PROC [file: OpenFile] RETURNS [ATOM] ~ 
+{
+RETURN[$PFS];
+};
+
+GetName: PUBLIC PROC [file: OpenFile] RETURNS [fullFName, attachedTo: PATH] ~ 
+{
+RETURN[file.fullFName, file.attachedTo];
+};
+
+GetInfo: PUBLIC PROC [file: OpenFile] RETURNS [
+fullFName, attachedTo: PATH, 
+uniqueID: UniqueID, 
+bytes: INT, 
+mutability: Mutability,
+fileType: FileType
+] ~
+{
+RETURN file.fs.procs.getInfo[file.fs, file];
+};
+
+SetAttributes: PUBLIC PROC [file: OpenFile, attributes: CreateOptions] ~
+{
+file.fs.procs.setAttributes[file.fs, file, attributes];
+};
+
+SetByteCountAndUniqueID: PUBLIC PROC [
+file: OpenFile, 
+bytes: INT ¨ -1, 
+uniqueID: UniqueID ¨ nullUniqueID
+] ~
+{
+file.fs.procs.setByteCountAndUniqueID[file.fs, file, bytes, uniqueID];
+};
+
+Read: PUBLIC UNSAFE PROC [file: OpenFile, filePosition, nBytes: CARD, to: POINTER TO Basics.RawBytes, toStart: CARD ¨ 0] RETURNS [bytesRead: INT] ~
+UNCHECKED {
+RETURN [ file.fs.procs.read[file.fs, file, filePosition, nBytes, to, toStart] ];
+};
+
+Write: PUBLIC PROC [file: OpenFile, filePosition, nBytes: CARD, from: POINTER TO Basics.RawBytes, fromStart: CARD ¨ 0] RETURNS [bytesWritten: INT] ~ {
+TRUSTED {RETURN [ file.fs.procs.write[file.fs, file, filePosition, nBytes, from, fromStart] ]};
+};
+
+Close: PUBLIC PROC [file: OpenFile] ~
+{
+NewClose[file, FALSE];
+};
+
+NewClose: PUBLIC PROC [file: OpenFile, abort: BOOL _ FALSE] ~
+{
+file.state ¨ closed;
+file.fs.procs.close[file.fs, file, abort];
+IF file.access # read THEN NoteEvent[$writeClose, file.fullFName];
+};
+Attach: PUBLIC PROC [attachment, attachedFile: PATH, 
+keep: CARDINAL ¨ 0, -- no keep processing
+wantedUniqueID: UniqueID ¨ nullUniqueID, 
+remoteCheck: BOOL ¨ TRUE 
+] 
+RETURNS [toFName: PATH] ~
+{
+fs: PFSClass.FSHandle;
+attachmentOnFS: PATH;
+absoluteTo: PATH ~ AbsoluteName[attachment];
+[fs, attachmentOnFS] ¨ DoServer[absoluteTo];
+IF fs.procs.attach=NIL THEN ProduceError[notImplemented, "Attachments not implemented in this view", fs];
+NoteEvent[$startCopying, absoluteTo];
+toFName ¨ fs.procs.attach[fs, attachmentOnFS, attachedFile, keep, wantedUniqueID, remoteCheck];
+NoteEvent[$endCopying, absoluteTo];
+};
+
+Delete: PUBLIC PROC [name: PATH, 
+wantedUniqueID: UniqueID ¨ nullUniqueID,
+confirmProc: NameConfirmProc 
+] ~
+{
+fs: PFSClass.FSHandle;
+nameOnFS: PATH;
+replacedPrefix: PATH;
+suppliedPrefixLen: INT;
+NameTranslator: NameConfirmProc ~ {
+RETURN [ 
+confirmProc[BackTranslate[fullName, replacedPrefix, suppliedPrefixLen], uniqueID]
+];
+};
+absolute: PATH ~ AbsoluteName[name];
+[fs, nameOnFS, replacedPrefix, suppliedPrefixLen] ¨ ServerAndHints[absolute];
+NoteEvent[$startDeleting, absolute];
+fs.procs.delete[fs, nameOnFS, wantedUniqueID, IF confirmProc#NIL THEN NameTranslator ELSE NIL];
+NoteEvent[$endDeleting, absolute];
+};
+
+Rename: PUBLIC PROC [from, to: PATH, 
+wantedUniqueID: UniqueID ¨ nullUniqueID,
+createOptions: CreateOptions ¨ defaultCreateOptions,
+confirmProc: NameConfirmProc 
+] ~
+{
+fromFS, toFS: PFSClass.FSHandle;
+fromNameOnFS, toNameOnFS: PATH;
+replacedPrefix: PATH;
+suppliedPrefixLen: INT;
+NameTranslator: NameConfirmProc ~ {
+RETURN [ 
+confirmProc[BackTranslate[fullName, replacedPrefix, suppliedPrefixLen], uniqueID]
+];
+};
+done: BOOL ¨ FALSE;
+absoluteTo: PATH ~ AbsoluteName[to];
+[fromFS, fromNameOnFS] ¨ DoServer[AbsoluteName[from]];
+[toFS, toNameOnFS, replacedPrefix, suppliedPrefixLen] ¨ ServerAndHints[absoluteTo];
+NoteEvent[$startRenaming, absoluteTo];
+IF fromFS=toFS THEN {
+done ¨ fromFS.procs.rename[fromFS, fromNameOnFS, wantedUniqueID, toNameOnFS, createOptions, IF confirmProc#NIL THEN NameTranslator ELSE NIL];
+};
+IF NOT done THEN {
+ProduceError[notImplemented, "File rename requiring copying is not yet implemented"]
+};
+NoteEvent[$endRenaming, absoluteTo];
+};
+
+
+Copy: PUBLIC PROC [from, to: PATH, 
+wantedUniqueID: UniqueID ¨ nullUniqueID,
+createOptions: CreateOptions ¨ defaultCreateOptions,
+confirmProc: NameConfirmProc 
+] ~
+{
+fromFS, toFS: PFSClass.FSHandle;
+fromNameOnFS, toNameOnFS: PATH;
+replacedPrefix: PATH;
+suppliedPrefixLen: INT;
+CopyNameTranslator: NameConfirmProc ~ {
+RETURN [ 
+IF confirmProc#NIL THEN confirmProc[BackTranslate[fullName, replacedPrefix, suppliedPrefixLen], uniqueID] ELSE TRUE
+];
+};
+StoreNameTranslator: StoreConfirmProc ~ {
+RETURN [ 
+IF confirmProc#NIL THEN confirmProc[BackTranslate[fullName, replacedPrefix, suppliedPrefixLen], wantedUniqueID] ELSE TRUE
+];
+};
+done: BOOL ¨ FALSE;
+toStream, fromStream: IO.STREAM;
+absoluteTo: PATH ~ AbsoluteName[to];
+[fromFS, fromNameOnFS] ¨ DoServer[AbsoluteName[from]];
+[toFS, toNameOnFS, replacedPrefix, suppliedPrefixLen] ¨ ServerAndHints[absoluteTo];
+NoteEvent[$startCopying, absoluteTo];
+IF fromFS=toFS THEN {
+done ¨ fromFS.procs.copy[fromFS, fromNameOnFS, wantedUniqueID, toNameOnFS, createOptions, IF confirmProc#NIL THEN CopyNameTranslator ELSE NIL];
+};
+IF NOT done THEN {
+ENABLE UNWIND => {
+IF toStream # NIL THEN IO.Close[toStream ! PFS.Error => CONTINUE];
+IF fromStream # NIL THEN IO.Close[fromStream ! PFS.Error => CONTINUE];
+};
+fromStream ¨ PFS.StreamOpen[fileName~from, accessOptions~read, wantedUniqueID~wantedUniqueID, streamOptions~[includeFormatting: TRUE, closeFSOpenFileOnClose: TRUE]];
+IF wantedUniqueID=nullUniqueID THEN wantedUniqueID ¨ GetInfo[OpenFileFromStream[fromStream]].uniqueID;
+toFS.procs.store[toFS, toNameOnFS, wantedUniqueID, fromStream, StoreNameTranslator, createOptions];
+IO.Close[fromStream];
+};
+NoteEvent[$endCopying, absoluteTo];
+};
+
+SetClientProperty: PUBLIC PROC [file: OpenFile, propertyName: ROPE, propertyValue: ROPE] ~
+{
+file.fs.procs.setClientProperty[file.fs, file, propertyName, propertyValue];
+};
+GetClientProperty: PUBLIC PROC [file: OpenFile, propertyName: ROPE] RETURNS [propertyValue: ROPE] ~
+{
+RETURN[file.fs.procs.getClientProperty[file.fs, file, propertyName]];
+};
+
+EnumerateClientProperties: PUBLIC PROC [file: OpenFile, proc: PropProc] ~
+{
+file.fs.procs.enumerateClientProperties[file.fs, file, proc];
+};
+PFSNameToUnixName: PUBLIC PROC [ file: PATH ] RETURNS [ ROPE ] ~ {
+fs: PFSClass.FSHandle;
+patternOnFS: PATH;
+proc: PFSClass.PFSNameToUnixNameProc;
+[fs, patternOnFS] ¨ ServerAndHints[AbsoluteName[file]];
+IF (proc ¨ fs.procs.pfsNameToUnixName) # NIL 
+THEN RETURN[proc[fs, patternOnFS]] 
+ELSE {
+ENABLE PFS.Error => GOTO GiveUp;
+attachedFile: PATH ~ fs.procs.fileInfo[fs, patternOnFS, nullUniqueID].attachedTo;
+IF attachedFile#NIL THEN RETURN[PFSNameToUnixName[attachedFile]];
+EXITS
+GiveUp => NULL;
+};
+RETURN[NIL]
+};
+
+CaseSensitive: PUBLIC PROC [ file: PATH ] RETURNS [ BOOL ] ~ {
+fs: PFSClass.FSHandle;
+patternOnFS: PATH;
+proc: PFSClass.CaseSensitiveProc;
+[fs, patternOnFS] ¨ ServerAndHints[AbsoluteName[file]];
+IF (proc ¨ fs.procs.caseSensitive) # NIL 
+THEN RETURN[proc[fs, patternOnFS]] 
+ELSE {
+message: ROPE ~ Rope.Cat["Class for ", RopeFromPath[file], " doesn't implement case-sensitivity determination."];
+ProduceError[notImplemented, message];
+RETURN[FALSE]; -- not reached
+};
+};
+codeAtoms: ARRAY PFSBackdoor.ErrorCode OF ATOM ¨ ALL[$unknown];
+
+codeGroups: ARRAY PFSBackdoor.ErrorCode OF PFS.ErrorGroup ¨ ALL[bug];
+
+ProduceError: PUBLIC PROC [code: PFSBackdoor.ErrorCode, explanation: Rope.ROPE, info: REF ¨ NIL] ~ {
+codeAtom: ATOM ~ codeAtoms[code];
+codeGroup: ErrorGroup ~ codeGroups[code];
+ERROR Error[[codeGroup, codeAtom, explanation, info]];
+};
+
+ExplainPFSError: PreDebug.Explainer = {
+msg ¨ "PFS Error";
+IF args=NIL THEN RETURN;
+PreDebug.Raise[signalOrError, args ! PFS.Error => {
+info: ROPE ¨ NIL;
+IF ~Rope.IsEmpty[error.explanation] THEN msg ¨ Rope.Cat[msg, ": ", error.explanation];
+WITH error.info SELECT FROM
+r: ROPE => info ¨ r;
+p: PATH => info ¨ RopeFromPath[p ! Error => CONTINUE];
+ENDCASE => {};
+IF ~Rope.IsEmpty[info] THEN msg ¨ Rope.Cat[msg, ": ", info];
+CONTINUE
+}];
+};
+
+lastEvent: REF PFSBackdoor.Event ¨ NIL;
+newEvent: CONDITION;
+NoteEvent: ENTRY PROC [op: PFSBackdoor.Op, fName: PFSNames.PATH] ~ {
+IF lastEvent = NIL THEN RETURN; -- never activated
+lastEvent.chain ¨ NEW[PFSBackdoor.Event ¨ [op, fName, NIL]];
+lastEvent ¨ lastEvent.chain;
+BROADCAST newEvent;
+};
+
+NextEvent: PUBLIC ENTRY PROC [prev: REF READONLY PFSBackdoor.Event] RETURNS [REF READONLY PFSBackdoor.Event] ~ {
+ENABLE UNWIND => NULL; -- may abort during wait
+IF prev = NIL THEN {
+IF lastEvent = NIL THEN lastEvent ¨ NEW[PFSBackdoor.Event];
+prev ¨ lastEvent;
+};
+UNTIL prev.chain # NIL DO
+WAIT newEvent;
+ENDLOOP;
+RETURN [prev.chain];
+};
+AtomFromErrorCode: PUBLIC PROC [code: PFSBackdoor.ErrorCode] RETURNS [ATOM] ~
+{ RETURN[codeAtoms[code]] };
+
+ErrorCodeFromAtom: PUBLIC PROC [atom: ATOM] RETURNS [PFSBackdoor.ErrorCode] ~ {
+RETURN[ SELECT atom FROM
+$ok => ok,
+$inconsistent => inconsistent,
+$resourceLimitExceeded => resourceLimitExceeded,
+$ioError => ioError,
+$volumeFull => volumeFull,
+$noMoreVersions => noMoreVersions,
+$serverInaccessible => serverInaccessible,
+$connectionRejected => connectionRejected,
+$connectionTimedOut => connectionTimedOut,
+$badCredentials => badCredentials,
+$accessDenied => accessDenied,
+$quotaExceeded => quotaExceeded,
+$invalidPropertyStorage => invalidPropertyStorage,
+$outOfPropertySpace => outOfPropertySpace,
+$positionNotInFile => positionNotInFile,
+$invalidOpenFile => invalidOpenFile,
+$notImplemented => notImplemented,
+$fileTypeMismatch => fileTypeMismatch,
+$unknownClass => unknownClass,
+$unknownFile => unknownFile,
+$unknownUniqueID => unknownUniqueID,
+$illegalName => illegalName,
+$patternNotAllowed => patternNotAllowed,
+$versionSpecified => versionSpecified,
+$cantUpdateTiogaFile => cantUpdateTiogaFile,
+$invalidNameSyntax => invalidNameSyntax,
+ENDCASE => LOOPHOLE[BYTE.LAST/2]
+];
+};
+FDFromOpenFile: PROC [file: OpenFile] RETURNS [UnixTypes.FD] ~ {
+WITH file.data SELECT FROM
+ux: REF PFSBackdoor.UXData => {
+ux.fdIndex ¨ PFSBackdoor.unreliableIndex;
+RETURN[ux.fd];
+};
+vux: REF PFSBackdoor.VUXData => {
+vux.fdIndex ¨ PFSBackdoor.unreliableIndex;
+RETURN[vux.fd];
+};
+ENDCASE;
+PFSBackdoor.ProduceError[notImplemented, "FDFromOpenFile not implemented for this file"];
+RETURN[error];
+};
+FDFromOpenStream: PUBLIC PROC [self: IO.STREAM] RETURNS [UnixTypes.FD] ~ {
+RETURN[FDFromOpenFile[PFS.OpenFileFromStream[self]]];
+};
+DoServer: PROC [name: PATH] RETURNS [fs: PFSClass.FSHandle, nameOnFS: PATH] ~ {
+translation: PFSPrefixMap.PrefixTableEntry ¨ PFSPrefixMap.TranslateAndGetHints[name];
+IF NOT translation.translation.IsAbsolute[] THEN {
+ProduceError[invalidNameSyntax, Rope.Cat["The prefix map produced a relative translation for ", RopeFromPath[name], " and an absolute translation is required."], translation.translation]
+};
+fs ¨ PFSClass.GetFS[translation.fsName ! 
+PFSClass.Error => ProduceError[unknownFile, Rope.Cat["The file server for ", RopeFromPath[name], " is unknown or unavailable."], NIL]];
+nameOnFS ¨ translation.nameOnFS;
+};
+
+ServerAndHints: PROC [name: PATH] RETURNS [fs: PFSClass.FSHandle, nameOnFS: PATH, replacedPrefix: PATH, suppliedPrefixLen: INT] ~ {
+translation: PFSPrefixMap.PrefixTableEntry ¨ PFSPrefixMap.TranslateAndGetHints[name];
+IF NOT translation.translation.IsAbsolute[] THEN {
+ProduceError[invalidNameSyntax, Rope.Cat["The prefix map produced a relative translation for ", RopeFromPath[name], " and an absolute translation is required."], translation.translation]
+};
+fs ¨ PFSClass.GetFS[translation.fsName ! 
+PFSClass.Error => ProduceError[unknownFile, Rope.Cat["The file server for ", RopeFromPath[name], " is unknown or unavailable."], NIL]];
+nameOnFS ¨ translation.nameOnFS;
+replacedPrefix ¨ translation.replacedPrefix;
+suppliedPrefixLen ¨ translation.suppliedPrefixLen;
+};
+
+AddExt: PROC [name: PATH, ext: ROPE] RETURNS [newName: PATH] ~ {
+newBase: ROPE ~ Rope.Cat[PFSNames.ComponentRope[name.ShortName[]], ".", ext];
+newName ¨ PFSNames.ReplaceShortName[
+name, 
+[name~[newBase, 0, newBase.Length[]], version~[none, 0]] 
+];
+};
+
+fq: FinalizeOps.CallQueue ~ FinalizeOps.CreateCallQueue[Finalizer];
+openFilesFinalized: CARD ¨ 0;
+OpenFilesFinalized: PROC [] RETURNS [CARD] ~ {
+RETURN[openFilesFinalized];
+};
+closedFilesFinalized: CARD ¨ 0;
+ClosedFilesFinalized: PROC [] RETURNS [CARD] ~ {
+RETURN[closedFilesFinalized];
+};
+
+Finalizer: FinalizeOps.FinalizeProc ~ {
+openFile: REF OpenFileObject ¨ NARROW[object];
+IF openFile # NIL THEN {
+IF openFile.state # closed THEN {
+NewClose[file~openFile, abort~TRUE ! PFS.Error => CONTINUE];
+openFilesFinalized ¨ openFilesFinalized + 1;
+}
+ELSE closedFilesFinalized ¨ closedFilesFinalized + 1;
+};
+};
+
+InitErrorArrays: PROC ~ {
+codeGroups[ok] ¨ ok;
+FOR i: PFSBackdoor.ErrorCode IN [resourceLimitExceeded..invalidPropertyStorage] DO
+codeGroups[i] ¨ environment;
+ENDLOOP;
+FOR i: PFSBackdoor.ErrorCode IN [outOfPropertySpace..fileTypeMismatch] DO
+codeGroups[i] ¨ client;
+ENDLOOP;
+FOR i: PFSBackdoor.ErrorCode IN [unknownClass..invalidNameSyntax] DO
+codeGroups[i] ¨ user;
+ENDLOOP;
+codeAtoms[ok] ¨ $ok;
+codeAtoms[inconsistent] ¨ $inconsistent;
+codeAtoms[resourceLimitExceeded] ¨ $resourceLimitExceeded;
+codeAtoms[ioError] ¨ $ioError;
+codeAtoms[volumeFull] ¨ $volumeFull;
+codeAtoms[noMoreVersions] ¨ $noMoreVersions;
+codeAtoms[serverInaccessible] ¨ $serverInaccessible;
+codeAtoms[connectionRejected] ¨ $connectionRejected;
+codeAtoms[connectionTimedOut] ¨ $connectionTimedOut;
+codeAtoms[badCredentials] ¨ $badCredentials;
+codeAtoms[accessDenied] ¨ $accessDenied;
+codeAtoms[quotaExceeded] ¨ $quotaExceeded;
+codeAtoms[invalidPropertyStorage] ¨ $invalidPropertyStorage;
+codeAtoms[outOfPropertySpace] ¨ $outOfPropertySpace;
+codeAtoms[positionNotInFile] ¨ $positionNotInFile;
+codeAtoms[invalidOpenFile] ¨ $invalidOpenFile;
+codeAtoms[notImplemented] ¨ $notImplemented;
+codeAtoms[fileTypeMismatch] ¨ $fileTypeMismatch;
+codeAtoms[unknownClass] ¨ $unknownClass;
+codeAtoms[unknownFile] ¨ $unknownFile;
+codeAtoms[unknownUniqueID] ¨ $unknownUniqueID;
+codeAtoms[illegalName] ¨ $illegalName;
+codeAtoms[patternNotAllowed] ¨ $patternNotAllowed;
+codeAtoms[versionSpecified] ¨ $versionSpecified;
+codeAtoms[cantUpdateTiogaFile] ¨ $cantUpdateTiogaFile;
+codeAtoms[invalidNameSyntax] ¨ $invalidNameSyntax;
+};
+
+InitErrorArrays[];
+
+TRUSTED {
+Process.EnableAborts[@newEvent];
+};
+PreDebug.RegisterErrorExplainer[PFS.Error, ExplainPFSError];
+END.
+
+
+     
+PFSImpl.mesa
+Copyright ” 1989, 1990, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Carl Hauser, July 26, 1989 10:25:31 am PDT
+Chauser, March 20, 1992 2:06 pm PST
+Christian Jacobi, July 24, 1992 2:51 pm PDT
+Willie-s, September 1, 1992 1:24 pm PDT
+Michael Plass, January 29, 1992 10:27 am PST
+Doug Wyatt, April 7, 1992 1:39 pm PDT
+
+Copied Types and Constants
+Exported to PFS
+File Names
+This is a quick hack implementation.  Let's do it right someday.
+
+Working Directory
+backing: PATH _ NIL;
+BackingName: PROC [short: PATH] RETURNS [absolute: PATH] ~ {
+SELECT TRUE FROM
+backing=NIL => RETURN[NIL];
+PFSNames.IsAbsolute[short] => RETURN[NIL];
+ENDCASE => absolute _ PFSNames.Cat[backing, short];
+absolute _ ResolveRelativeComponents[absolute];
+};
+
+SetBacking: PROC [ backingRope: ROPE ] ~ {
+backing _ PathFromRope[backingRope];
+};
+gets the $WorkingDirectory property from the process property list;
+if empty, uses the default working directory
+
+File Information
+
+Enumeration
+Opening Files
+backingName: PATH _ BackingName[name];
+[fs, nameOnFS] _ DoServer[backingName];
+openFile _ fs.procs.open[fs, nameOnFS, wantedUniqueID, access, checkFileType, fileType, createOptions];
+openFile.fullFName _ PFSNames.SetVersionNumber[backingName, openFile.fullFName.ShortName[].version]; 
+[] _ FinalizeOps.EnableFinalization[openFile, fq];
+Store and Retrieve
+Operations On Open Files
+exported to PFSExtras; eventually PFS.Close should have this signature
+General File Manipulations
+
+
+
+
+Exported to PFSExtras
+try for an attachment
+Exported to PFSBackdoor
+Events
+
+Error Codes
+FD from file/stream
+This does not lock the OpenFile's data - the client had better beware of concurrent access, anyway!
+
+
+Private Procedures
+codeGroups array is initalized to bug
+codeGroups[inconsistent] ¨ bug;
+codeAtoms array is initialized to $unknown
+ ù Î  ñ(cedarcode) styleïNewlineDelimiter
+ô öúôIcodeöú
+œeúCôNKô*Kô#Kô+Kô'Kô,Kô%Jô óKò öœk	ò	KòKòKöûúûú	ûúòKòKöúòKöúòKò
+KòKöúòKòKò	KòKöú	ò	Köú	ò	KòKòKöúûú3ûúòCKöú
+ûúûúòóKò Kò Kö–lnúûòKöûúûúûúÇò§Köûúò#öúûúûúûúòKò óheadôKöûúûúûúòKöûúûúûúûúòKöûúûúûúòóôöúûúûúò6Kò óöœnúûúûúò2Kò óö
+†úûúûúûúûúòAöûúûòKöúûúòKöúûúòKöúûúò$Köú
+ûú
+òKöúûúòKöûúûúòóKòKò óö†úûúûúûúûúúòAöûúûòKöúûúòKöúûúòKöúûúò$Köúûú	òKöú	ûúòKöûúûúûúò#óKòóóô
+Kô@ö
+†úûúûú ûúûúò]Kö
+ûúûúûúûúûúòKöúûúûú%ûúògKöúòKô óö
+†úûúûúûúûúò?Köûúûúûúûúò"öûúòKöúûúòöûúûòKöúûúò*Köúûú$ò0Köûúûúûúûú$ûúûúòyóKòóKöúòóóôKöú	ûúœcò7Kò code2ö†úûú	ûú	ûúò5Möú
+ûúò$MöúIûúòNMöú;ò;MöúòMò óö†úûúûú	ûúò/Möú
+ûúò+KöúòKöúòKò óö†úûúûú	ûúûúûúûúûúòVöûúûúûòKöú/ò/Köúûúò'Köûú.ò5óKöú/ò/KöúòKò óKöú	ûúûúôKò ö
+†úûú	ûúûúûúô<öûúûúûôKöúûúûúûúôKöúûúûúô*Köûú,ô3óKöú/ô/KôKô óö†
+úûúûúô*Köú$ô$KöúôKò óö
+†úûúûúûúûúò?Köúûúûúòöûúûúûú$ûò4Köú)ò)öûúHûúIûúòõKöúûúûúòKöúòóKöûúòóöûúûúòKöúûúûúûúò(öûúûúûú$ûò4Köú)ò)öûúûúûòKöúJûúòOöúLòLKöúûúûúûúûúûúò.KöúòóKöûúûúò%óKöûúòóKöûúnûúò|KöúòóKöûúûú	òKòKò óö†úûúûúûúò<KôCKô,Köú2ò2öûú+ûúûò:Köúûúò"KöûúòóKöûúûú,òJKöúòKò óLô óöúôKö†úûú	ûú.ûúûúûú1ò«òKòKöú
+ûúòKöúûúòKöúûúòKöú	ûúûúòKòKöúûúò(KòQKòpKò=Kò KòKô óóôKö
+†úûúûúûú
+ûúò[öúòKòKöúûúòKöúûúòKöúûúòö†úòKöûú
+ûúûú*ûúûúûúòPKöûú
+ûúûú-ûúûúûúòTöûúò	öúòKöú<ò<Köú3ò3óKöúòóKöúòóKöûú
+ûúûú2òFKöûú
+ûúûú2òFKöú]ò]KöúKòKKöúòKò óKö
+†úûúûúûú
+ûúò\öúòKòKöúûúòKöúûúòKöúûúòö†úòKöûú
+ûúûú%ûúûúûúòKKöûú
+ûúûú(ûúûúûúòOöûúò	Köú<ò<KöúòóKöúòóKöûú
+ûúûú2òFKöûú
+ûúûú2òFKöú]ò]KöúLòLKöúòKò óö†úûúûúûúûúûúòVöûúò	KöúAòAKöúòóKòKò óKö†
+úûúûúûúûúûúûúûúûúûúòcöúòKòKöú
+ûúòKöúûúòKöúûúòKöúWòWKöú.ûú
+ûúòFöûúûúûúòöûú
+ûúûúûúûú
+ûúûòMKöúûúòKöûú>ûú
+ûúûúò^Köûúûúò
+Köûúò	óKòóöûúûúûúòKöúGòGóKöúòKò óKö†
+úûúûúûúûúûú°úûúûúûúòjöúòKöûúûúûúûúò9öûú
+ûúûúûúûúûúûòLKöúûúòKö
+ûú1ûúûúûúûúòKKöûúòóKöûúûúòKöúòKò óKò óöúôKö†úûúûúûúZûúûú[ûúòÚöúòKòKöú
+ûúòKöúòKöúûúò(Köúûúô&Köú(ò(Köúf°EúòÆöûú
+ûúûúòKöúfòfKòKöûúûú*òAKò2KöûúòKöúòóKöú'ô'KöúgôgKöúeôeKô2KöûúòKöúòóóôMö
+†úûúûúXûúûú'ò±öúòKòKöú
+ûúòKöú
+ûúò$Kò$Kò&KòOKò$KòóMö
+†úûúûú#ûúûúQò†öúòKòKöú
+ûúòKöú
+ûúò$Kò$Kò#KòGKò!KòóóöúôKö†úûúûúûúò8öúòKöûúòKöúòKò óKö†úûúûúûúòNöúòKöûú"ò(KöúòKò óKö
+†úûúûúûúûú1òûöúòKöûú&ò,KöúòKò óKö†úûú.òHöúòKöú7ò7KöúòKò óKö†úûúûú-òoöúòKöúFòFKöúòKò óKö†úûúûúûú(ûúûúûúûúûúûúòìöû	úòKöûúJòPKöúòKò óö†úûú(ûúûúûúûúûúûúûúòñKöûúûúPò_KöúòKò óKö†úûúò%öúòJöúûúòKòKò óKö
+†úûúûúûúûúò=KôFöúòKöúòKò*Köûúûú(òBKòóóöúôKö†úûúûú	ûú°ú7ûúûúûúûúò¿öúòKòKöúûúòKöúûúò,Kò,KöûúûúûúNòiKò%Kò_Kò#KöúòKô Kô óKò Kö†úûúûúMòlòKòKöú
+ûúòKöúûúòKöúûúòö†úò#öûúò	KöúQòQKöúòóKöúòóKöú
+ûúò$KòMKò$Köú.ûúûúûúûúûúò_Kò"KòKô óKò Kö†úûúûúûúÇò•öúòKöú ò KöúûúòKöúûúòKöúûúòö†úò#öûúò	KöúQòQKöúòóKöúòóKöúûúûúòKöúûúò$Köú6ò6KòSKò&öûúûúòKöú\ûúûúûúûúûúòçKòóöûúûúûúòKöúTòTKöúòóKò$KòKò Kò óKö†úûúûúûúÇò£öúòKöú ò KöúûúòKöúûúòKöúûúòö†úò'öûúò	Kö	ûúûúûúSûúûòsKöúòóKöúòóö†úò)öûúò	Kö	ûúûúûúYûúûòyKöúòóKöúòóKöúûúûúòKöúûúûúò Köúûúò$Kò6KòSKò%öûúûúòKöúZûúûúûúûúûúòèKòóöûúûúûúòöûúûúòKöûúûúûúûúûú
+ûúòBKöûúûúûúûúûú
+ûúòFKöúòóKöúûúpûúûúò•KöûúûúCòfKöúcòcKöûúòKöúòóKò#KòKò óKö†úûú ûúûúòZöúòKöúLòLKöúòKô óKö
+†úûú ûúûúûúòcöúòKöûú?òEKöúòKò óKö†úûú#òIöúòKöú=ò=Köúòóóôö
+†úûú	ûúûúûúòBKòKöúûúòKò%Köú7ò7Köûú'ûúò-Köûúûúò#öûúòKôKöûúûú
+ûúò Köúûú?òQKöûúûúûúûú"òAöûòKöú
+ûúòóKöúòóKöûúûúòKöúòKò óö†úûúûú	ûúûúûúò>KòKöúûúòKöú!ò!Köú7ò7Köûú#ûúò)Köûúûúò#öûúòKöú	ûúdòqKöú&ò&Köûúûú°òKöúòóKöúòóóôKö	úûúûúûúûúò?Kò Kö	úûúûúûúûúòEKò ö†úûúûú1ûúûúûúòdKöú
+ûúò!Köú)ò)Köûú1ò6KòóKò ö†úò'KöúòKöûúûúûúûúòöú%ûúò3KöúûúûúòKöûú"ûú.òVöûúûúûòKöúûúòKöúûú%ûúò6KöûúòóKöûúûú!ò<KöûòKòóKòóKò óôKöúûúûúò'Köú
+û	úòö†	úûúûú&ûúòDKö	ûúûúûúûú°ò2Köúûú!ûúò<KòKöû	ú
+òKöúòKò óö†	úûúûúûúûúûúûúûúûúòpKöûúûúûú°ò/öûúûúûúòKöûúûúûúûúò;KòKòóöûúûúûòKöûú
+òKöûúòóKöûúòKòKô óóôö
+†úûúûúûúûúòMKöúûúòKò óö
+†úûúûúûúûúòOöûúûúûòKöú
+ò
+KöúòKöú0ò0KöúòKöúòKöú"ò"Köú*ò*Köú*ò*Köú*ò*Köú"ò"KöúòKöú ò Köú2ò2Köú*ò*Köú(ò(Köú$ò$Köú"ò"Köú&ò&KöúòKöúòKöú$ò$KöúòKöú(ò(Köú&ò&Köú,ò,Köú(ò(Köûúûúûúûúò KòóKòóóôö†úûúûúûúò@KôcöûúûúûòöúûúòKöú)ò)KöûúòKòóöúûúò!Köú*ò*Köûú	òKòóKöûúòóKòYKöûúòKòKô óö†úûúûúûúûúûúûúòJJöûúûúò5KòKô óóôö
+†úûúûúûú#ûúòOKöúUòUöûúûú&ûúò2Köú∫ò∫KöúòóKöú´ûúò±Köú ò KòKò óö†úûúûúûú#ûúûúûúòÉKöúUòUöûúûú&ûúò2Köú∫ò∫KöúòóKöú´ûúò±Köú ò Köú,ò,Köú2ò2KòKò óö†úûúûúûúûúûúò@KöúMòMKöúhòhKòóKò KòCöúûúòö†úûúûúûúò.KöûúòKòóóöúûúòö†úûúûúûúò0KöûúòKòóóKò ö†	úò'Köú
+ûúûú	ò.öûúûúûúòöûúûúò!Köúûúûú
+ûúò<Kò,KöúòóKöûú1ò5KòóKòKò óö†úûúòKöú%ô%KöúòKöúôöûúûú1ûòRKöúòKöûúòóöûúûú(ûòIKöúòKöûúòóöûúûú#ûòDKöúòKöûúòóKöú*ô*KöúòKöú(ò(Köú:ò:KöúòKöú$ò$Köú,ò,Köú4ò4Köú4ò4Köú4ò4Köú,ò,Köú(ò(Köú*ò*Köú<ò<Köú4ò4Köú2ò2Köú.ò.Köú,ò,Köú0ò0Köú(ò(Köú&ò&Köú.ò.Köú&ò&Köú2ò2Köú0ò0Köú6ò6Köú2ò2KòóKò KòKò öûúò	Köú ò KöúòóKöú ûúò<óKöûúòKò Kò ó Öó    Y“  {›  

@@ -1,0 +1,704 @@
+DIRECTORY
+AmpersandContext USING[MakeNodeFromNode],
+Atom USING [GetPName],
+CCTypes USING[BreakObject, CCError, CCErrorCase, Conforms, DoObject, Operator, GetTypeClass, IsIndirectType, sia],
+CedarCode,
+CedarNumericTypes USING[NumericDescriptor],
+CirioBackstop,
+CirioTypes USING[CompilerContext, NodeBody, Type, TypedCode],
+CirioSyntacticOperations USING[ParseTree],
+Convert USING[RopeFromInt],
+IO,
+Records USING[ConstructRecordNode],
+RefTab,
+Rope,
+StructuredStreams;
+
+CedarCodeImpl: CEDAR PROGRAM
+IMPORTS AmpersandContext, Atom, CCTypes, CirioBackstop, Convert, IO, Records, RefTab, Rope, StructuredStreams
+EXPORTS CedarCode, CirioTypes
+SHARES CirioTypes
+= BEGIN OPEN SS:StructuredStreams;
+
+ROPE: TYPE ~ Rope.ROPE;
+CC: TYPE = CirioTypes.CompilerContext;
+Type: TYPE = CirioTypes.Type;
+TypedCode: TYPE = CirioTypes.TypedCode;
+NumericDescriptor: TYPE = CedarNumericTypes.NumericDescriptor;
+OperationsBody: TYPE = CedarCode.OperationsBody;
+
+CCE: ERROR[case: CCTypes.CCErrorCase, msg: ROPE ¬ NIL] ¬ CCTypes.CCError;
+
+Code: TYPE = REF CodeBody;
+CodeBody: PUBLIC TYPE = RECORD[
+first, last: REF InstructionCell];
+
+InstructionCell: TYPE = RECORD[
+instruction: Instruction,
+next: REF InstructionCell,
+alternateNext: REF InstructionCell ¬ NIL,
+visitedOn: INT,
+number: INT];
+
+
+Instruction: TYPE = REF InstructionBody;
+InstructionBody: TYPE = RECORD[
+SELECT case: * FROM
+null =>  [],
+pop => [n: INT],
+test => [popCond: BOOL],
+loadGlobalFrame => [name: ROPE, nToSkip: INT],
+loadAMNode => [node: Node],
+loadNameScope => [],
+getNameContext => [scopeIndex: CARDINAL],
+loadContentsOfAMNode => [node: Node],
+makeAMNode => [sourceType: Type],
+coerce => [sourceType, targetType: Type],
+binaryOp => [op: CCTypes.Operator, left, right: Type],
+unaryOp => [op: CCTypes.Operator, type: Type],
+buildRecord => [nFields: INT, rcdType: Type],
+storeUnpopped => [indirectType: Type, valType: Type],
+loadThroughIndirect => [indirectType: Type],
+extractField => [id: ROPE, type: Type],
+selectField => [id: ROPE, indirectType: Type],
+apply => [operatorType: Type, operandType: Type],
+index => [indirectOperatorType: Type, operandType: Type],
+selectNestedBlock => [set: INT, depth: INT, indirectType: Type],
+ENDCASE];
+
+
+
+ConcatCode: PUBLIC PROC[c1, c2: Code] RETURNS[Code] ~ {
+IF c1 = NIL OR c1.first = NIL THEN RETURN[c2];
+IF c2 = NIL OR c2.first = NIL THEN RETURN[c1];
+c1.last.next ¬ c2.first;
+c1.last ¬ c2.last;
+RETURN[c1]};
+
+CopyCode: PUBLIC PROC [old: Code] RETURNS [new: Code] ~ {
+instMap: RefTab.Ref ~ RefTab.Create[];
+CopyInst: PROC [i: REF InstructionCell] RETURNS [j: REF InstructionCell] ~ {
+IF i=NIL THEN RETURN [NIL];
+j ¬ NARROW[instMap.Fetch[i].val];
+IF j#NIL THEN RETURN;
+j ¬ NEW [InstructionCell ¬ [i.instruction, NIL, NIL, i.visitedOn, i.number]];
+IF NOT instMap.Insert[i, j] THEN CCE[cirioError, "concurrent code copy"];
+j.next ¬ CopyInst[i.next];
+j.alternateNext ¬ CopyInst[i.alternateNext];
+RETURN};
+new ¬ NEW [CodeBody ¬ [NIL, CopyInst[old.last] ]];
+new.first ¬ CopyInst[old.first];
+RETURN};
+
+CodeToDoPoppedCond: PUBLIC PROC[test, trueCase, falseCase: Code] RETURNS[Code]
+= {RETURN CodeToCond[test, trueCase, falseCase, TRUE]};
+
+CodeToDoUnpopedCond: PUBLIC PROC[test, trueCase, falseCase: Code] RETURNS[Code]
+= {RETURN CodeToCond[test, trueCase, falseCase, FALSE]};
+
+CodeToCond: PROC[test, trueCase, falseCase: Code, popCond: BOOL] RETURNS[Code] ~ {
+fullTest: Code ¬ ConcatCode[test, OneInstCode[NEW[InstructionBody¬[test[popCond]]]]];
+null: Code ¬ NullCode[];
+IF trueCase = NIL OR falseCase = NIL THEN CCE[cirioError];
+fullTest.last.next ¬ trueCase.first;
+fullTest.last.alternateNext ¬ falseCase.first;
+trueCase.last.next ¬ null.first;
+falseCase.last.next ¬ null.first;
+fullTest.last ¬ null.last;
+RETURN[fullTest];
+};
+
+CodeToPop: PUBLIC PROC[nPops: INT] RETURNS[Code] =
+{RETURN[OneInstCode[NEW[InstructionBody¬[pop[nPops]]]]]};
+
+NullCode: PUBLIC PROC RETURNS[Code] =
+{RETURN[OneInstCode[NEW[InstructionBody¬[null[]]]]]};
+
+OneInstCode: PROC[inst: Instruction] RETURNS[Code] =
+BEGIN
+cell: REF InstructionCell ¬ NEW[InstructionCell¬[inst, NIL, NIL, 0, 0]];
+RETURN[NEW[CodeBody ¬ [cell, cell]]];
+END;
+
+
+CodeToLoadGlobalFrame: PUBLIC PROC [name: ROPE, nToSkip: INT] RETURNS [Code]
+~ {RETURN OneInstCode[NEW[InstructionBody¬[loadGlobalFrame[name, nToSkip]] ]]};
+
+CodeToLoadNameScope: PUBLIC PROC RETURNS[Code] =
+{RETURN[OneInstCode[NEW[InstructionBody¬[loadNameScope[]]]]]};
+
+CodeToGetNameContext: PUBLIC PROC[scopeIndex: CARDINAL] RETURNS[Code] =
+{RETURN[OneInstCode[NEW[InstructionBody¬[getNameContext[scopeIndex]]]]]};
+
+CodeToLoadContentsOfAMNode: PUBLIC PROC[node: Node] RETURNS[Code] =
+{RETURN[OneInstCode[NEW[InstructionBody¬[loadContentsOfAMNode[node]]]]]};
+
+CodeToLoadAMNode: PUBLIC PROC[node: Node] RETURNS[Code] =
+{RETURN[OneInstCode[NEW[InstructionBody¬[loadAMNode[node]]]]]};
+
+CodeToMakeAMNode: PUBLIC PROC[sourceType: Type] RETURNS[Code] =
+{RETURN[OneInstCode[NEW[InstructionBody¬[makeAMNode[sourceType]]]]]};
+
+CodeToCoerce: PUBLIC PROC[sourceType, targetType: Type] RETURNS[Code] =
+{RETURN[OneInstCode[NEW[InstructionBody¬[coerce[sourceType, targetType]]]]]};
+
+CodeToDoBinaryOp: PUBLIC PROC[op: CCTypes.Operator, left, right: Type] RETURNS[Code] =
+{RETURN[OneInstCode[NEW[InstructionBody¬[binaryOp[op, left, right]]]]]};
+
+CodeToDoUnaryOp: PUBLIC PROC[op: CCTypes.Operator, type: Type] RETURNS[Code] =
+{RETURN[OneInstCode[NEW[InstructionBody¬[unaryOp[op, type]]]]]};
+
+CodeToBuildRecord: PUBLIC PROC[nFields: INT, rcdType: Type] RETURNS[Code] =
+{RETURN[OneInstCode[NEW[InstructionBody¬[buildRecord[nFields, rcdType]]]]]};
+
+CodeToStoreUnpopped: PUBLIC PROC[indirectType: Type, sourceType: Type] RETURNS[Code] =
+{RETURN[OneInstCode[NEW[InstructionBody¬[storeUnpopped[indirectType, sourceType]]]]]};
+
+CodeToLoadThroughIndirect: PUBLIC PROC[indirectType: Type] RETURNS[Code] =
+{RETURN[OneInstCode[NEW[InstructionBody¬[loadThroughIndirect[indirectType]]]]]};
+
+CodeToExtractField: PUBLIC PROC[id: ROPE, type: Type] RETURNS[Code] =
+{RETURN[OneInstCode[NEW[InstructionBody¬[extractField[id, type]]]]]};
+
+CodeToSelectField: PUBLIC PROC[id: ROPE, indirectType: Type] RETURNS[Code] =
+{RETURN[OneInstCode[NEW[InstructionBody¬[selectField[id, indirectType]]]]]};
+
+CodeToDoApply: PUBLIC PROC[operatorType: Type, operandType: Type] RETURNS[Code] =
+{RETURN[OneInstCode[NEW[InstructionBody¬[apply[operatorType, operandType]]]]]};
+
+CodeToDoIndex: PUBLIC PROC[indirectOperatorType: Type, operandType: Type] RETURNS[Code] =
+{RETURN[OneInstCode[NEW[InstructionBody¬[index[indirectOperatorType, operandType]]]]]};
+
+CodeToSelectNestedBlock: PUBLIC PROC[set:INT, depth: INT, indirectType: Type] RETURNS[Code] =
+{RETURN[OneInstCode[NEW[InstructionBody¬[selectNestedBlock[set, depth, indirectType]]]]]};
+
+
+
+
+Node: TYPE = REF NodeBody;
+NodeBody: TYPE = CirioTypes.NodeBody;
+
+CreateNode: PROC[data: REF ANY] RETURNS[Node] =
+{RETURN[NEW[NodeBody¬[NIL, NIL, data]]]};
+
+SetNodeOps: PROC[node: Node, ops: REF OperationsBody] =
+{IF node.ops # NIL THEN CCE[cirioError]; node.ops ¬ ops};
+
+SetNodeType: PROC[node: Node, type: Type] =
+{IF node.type # NIL THEN CCE[cirioError]; node.type ¬ type};
+
+CreateCedarNode: PUBLIC PROC[ops: REF OperationsBody, type: Type, data: REF ANY] RETURNS[Node] =
+BEGIN
+node: Node ¬ CreateNode[data];
+IF type = NIL THEN CCE[cirioError];
+SetNodeOps[node, ops];
+SetNodeType[node, type];
+RETURN[node];
+END;
+
+GetTypeOfNode: PUBLIC PROC[node: Node] RETURNS[Type] =
+{RETURN[node.type]};
+
+GetCurrentTypeOfNode: PUBLIC PROC[node: Node, cc: CC] RETURNS[Type] =
+BEGIN
+IF node.ops.getCurrentType = NIL THEN RETURN[node.type]
+ELSE RETURN[node.ops.getCurrentType[node, cc]];
+END;
+
+GetDataFromNode: PUBLIC PROC[node: Node] RETURNS[REF ANY] =
+{RETURN[node.data]};
+
+
+Coerce: PUBLIC PROC[sourceType, targetType: Type, node: Node, cc: CC] RETURNS[Node] =
+BEGIN
+IF NOT CCTypes.Conforms[GetTypeOfNode[node], sourceType, cc] THEN
+BEGIN
+IF node.ops.coerce = NIL THEN CCE[cirioError];
+RETURN[node.ops.coerce[sourceType, targetType, node, cc]];
+END;
+IF NOT CCTypes.Conforms[sourceType, targetType, cc] THEN
+BEGIN
+IF node.ops.coerce = NIL THEN CCE[cirioError];
+RETURN[node.ops.coerce[sourceType, targetType, node, cc]];
+END;
+RETURN[node];
+END;
+
+AdvanceNameScope: PUBLIC PROC[node: Node, cc: CC] RETURNS[Node] =
+BEGIN
+IF node.ops.advanceNameScope = NIL THEN CCE[cirioError];
+RETURN[node.ops.advanceNameScope[node, cc]];
+END;
+
+ExamineParseTree: PUBLIC PROC[node: Node, cc: CC] RETURNS[CirioSyntacticOperations.ParseTree] =
+BEGIN
+IF node.ops.examineParseTree = NIL THEN CCE[cirioError];
+RETURN[node.ops.examineParseTree[node, cc]];
+END;
+
+ApplyBinaryOp: PUBLIC PROC[op: CCTypes.Operator, leftType, rightType: Type, leftNode, rightNode: Node, cc: CC] RETURNS[Node] =
+BEGIN
+IF leftNode.ops.binaryOp = NIL THEN CCE[cirioError];
+RETURN[leftNode.ops.binaryOp[op, leftType, rightType, leftNode, rightNode, cc]];
+END;
+
+ApplyUnaryOp: PUBLIC PROC[op: CCTypes.Operator, type: Type, node: Node, cc: CC] RETURNS[Node] =
+BEGIN
+IF node.ops.unaryOp = NIL THEN CCE[cirioError];
+RETURN[node.ops.unaryOp[op, type, node, cc]];
+END;
+
+StoreThroughIndirectNode: PUBLIC PROC[valType: Type, valNode: Node, indirectType: Type, indirectNode: Node, cc: CC] =
+BEGIN
+IF indirectNode.ops.store = NIL THEN CCE[cirioError];
+indirectNode.ops.store[valType, valNode, indirectType, indirectNode, cc];
+END;
+
+LoadThroughIndirectNode: PUBLIC PROC[indirectType: Type, indirectNode: Node, cc: CC] RETURNS[Node] =
+BEGIN
+IF indirectNode.ops.load = NIL THEN CCE[cirioError];
+RETURN[indirectNode.ops.load[indirectType, indirectNode, cc]];
+END;
+
+ForceNodeIn: PUBLIC PROC[type: Type, node: Node, cc: CC] RETURNS[Node] =
+BEGIN
+IF node.ops.forceIn = NIL THEN RETURN[node]
+ELSE RETURN[node.ops.forceIn[type, node, cc]];
+END;
+
+ExtractFieldFromNode: PUBLIC PROC[id: ROPE, type: Type, node: Node, cc: CC] RETURNS[Node] =
+BEGIN
+IF node.ops.extractField = NIL THEN CCE[cirioError];
+RETURN[node.ops.extractField[id, type, node, cc]];
+END;
+
+SelectFieldFromNode: PUBLIC PROC[id: ROPE, indirectType: Type, indirectNode: Node, cc: CC] RETURNS[Node] =
+BEGIN
+IF indirectNode.ops.selectField = NIL THEN CCE[cirioError];
+RETURN[indirectNode.ops.selectField[id, indirectType, indirectNode, cc]];
+END;
+
+
+NodeAsIndex: PUBLIC PROC[type: Type, node: Node, cc: CC] RETURNS[CARD] =
+{RETURN[IF node.ops.asIndex # NIL THEN node.ops.asIndex[type, node, cc] ELSE CCE[cirioError]]};
+
+ShowNode: PUBLIC PROC[to: IO.STREAM, node: Node, depth, width: INT, cc: CC] = {
+IF node.ops.show # NIL THEN {
+InnerShow: PROC RETURNS [ROPE] ~ {
+node.ops.show[to, node, depth, width, cc];
+RETURN[NIL]};
+msg: ROPE ~ CirioBackstop.Protect[
+InnerShow,
+NIL--"to" is structured, and so shouldn't receive random reports--];
+IF msg#NIL THEN to.PutF1["--%g--", [rope[msg]] ]}
+ELSE to.PutRope["node?"];
+RETURN};
+
+ShowNodeBracketed: PUBLIC PROC[to: IO.STREAM, node: Node, depth, width: INT, cc: CC] = {
+InnerShow: PROC ~ {ShowNode[to, node, depth, width, cc]};
+CCTypes.DoObject[to, InnerShow];
+RETURN};
+
+BreakShowNode: PUBLIC PROC[to: IO.STREAM, node: Node, depth, width: INT, cc: CC, sep: ROPE ¬ NIL] = {
+InnerShow: PROC ~ {ShowNode[to, node, depth, width, cc]};
+CCTypes.BreakObject[to, InnerShow, sep];
+RETURN};
+
+GetNodeRepresentation: PUBLIC PROC[node: Node, cc: CC] RETURNS[REF ANY] =
+{RETURN[IF node.ops.getNodeRepresentation # NIL THEN node.ops.getNodeRepresentation[node, cc] ELSE CCE[cirioError]]};
+
+ShowOp: PROC[op: CCTypes.Operator] RETURNS[ROPE] =
+BEGIN
+RETURN[Atom.GetPName[op]]
+END;
+
+Interpret: PUBLIC PROC[code: Code, cc: CC, debug: IO.STREAM ¬ NIL] RETURNS[Node] = { -- only good for expressions for now
+stack: LIST OF Node ¬ NIL;
+current: REF InstructionCell ¬ code.first; -- assumes code # NIL
+savedCurrent: REF InstructionCell;
+depth: INT ¬ 2; -- nominal for now
+width: INT ¬ 35; -- nominal for now
+
+PopStack: PROC RETURNS[Node] =
+BEGIN
+top: Node ¬ stack.first;
+stack ¬ stack.rest;
+RETURN[top];
+END;
+
+PushStack: PROC[node: Node] =
+{stack ¬ CONS[node, stack]};
+
+ShowTop: PROC = {
+typeClass: ROPE ¬ NIL;
+IF stack # NIL THEN {
+type: Type ¬ GetTypeOfNode[stack.first];
+typeClass ¬ Atom.GetPName[CCTypes.GetTypeClass[type]];
+IF CCTypes.IsIndirectType[type] THEN typeClass ¬ Rope.Concat["^", typeClass]};
+ShowNode[debug, stack.first, depth, width, cc];
+debug.PutF1["   (%g)", [rope[typeClass]] ]};
+
+ShowTop2: PROC = {
+ShowNode[debug, stack.rest.first, depth, width, cc];
+SS.Bp[debug, lookLeft, CCTypes.sia, " "];
+ShowNode[debug, stack.first, depth, width, cc];
+RETURN};
+
+WHILE current # NIL DO
+
+savedCurrent ¬ current;
+
+IF debug # NIL THEN {
+debug.PutRope[ShowInstruction[current.instruction, stack]];
+SS.Bp[debug, lookLeft, 0, " "];
+WITH current.instruction SELECT FROM
+inst: REF makeAMNode InstructionBody => ShowTop[];
+inst: REF binaryOp InstructionBody =>  ShowTop2[];
+inst: REF unaryOp InstructionBody => ShowTop[];
+ENDCASE => NULL};
+
+WITH current.instruction SELECT FROM
+inst: REF null InstructionBody =>
+{current ¬ current.next};
+inst: REF pop InstructionBody =>
+BEGIN
+FOR I: INT IN [0..inst.n) DO
+[] ¬ PopStack[];
+ENDLOOP;
+current ¬ current.next;
+END;
+inst: REF test InstructionBody =>
+BEGIN
+top: Node ¬ IF inst.popCond THEN PopStack[] ELSE stack.first;
+IF top.ops.examineBoolean = NIL THEN CCE[cirioError, "an alleged boolean doesn't know how to reveal itself"];
+IF top.ops.examineBoolean[top, cc]
+THEN current ¬ current.next
+ELSE current ¬ current.alternateNext;
+END;
+inst: REF loadGlobalFrame InstructionBody =>
+BEGIN
+IF cc.moduleScope=NIL THEN ERROR CCE[unimplemented, "This compiler context doesn't know how to load a global frame"];
+PushStack[cc.moduleScope.GetModule[cc.moduleScope, inst.name, inst.nToSkip]];
+current ¬ current.next;
+END;
+inst: REF loadAMNode InstructionBody =>
+BEGIN
+PushStack[AmpersandContext.MakeNodeFromNode[inst.node, cc]];
+current ¬ current.next;
+END;
+inst: REF loadNameScope InstructionBody =>
+BEGIN
+PushStack[cc.nameScope]; -- this should come from an interpreter context?
+current ¬ current.next;
+END;
+inst: REF getNameContext InstructionBody =>
+BEGIN
+top: Node ¬ PopStack[];
+IF top.ops.getNameContext = NIL THEN CCE[cirioError, "top of stack doesn't know how to getNameContext"];
+PushStack[top.ops.getNameContext[inst.scopeIndex, top, cc]];
+current ¬ current.next;
+END;
+inst: REF loadContentsOfAMNode InstructionBody =>
+BEGIN
+PushStack[inst.node];
+current ¬ current.next;
+END;
+inst: REF makeAMNode InstructionBody =>
+BEGIN
+top: Node ¬ PopStack[];
+forcedIn: Node ¬ ForceNodeIn[inst.sourceType, top, cc];
+enclosingNode: Node ¬ SELECT TRUE FROM
+forcedIn.ops.makeAMNode = NIL => AmpersandContext.MakeNodeFromNode[forcedIn, cc],
+ENDCASE => forcedIn.ops.makeAMNode[inst.sourceType, forcedIn, cc];
+PushStack[enclosingNode];
+current ¬ current.next;
+END;
+inst: REF coerce InstructionBody =>
+BEGIN
+top: Node ¬ PopStack[];
+PushStack[Coerce[inst.sourceType, inst.targetType, top, cc]];
+current ¬ current.next;
+END;
+inst: REF binaryOp InstructionBody =>
+BEGIN
+right: Node ¬ PopStack[];
+left: Node ¬ PopStack[];
+IF left.ops.binaryOp = NIL THEN CCE[cirioError, "2nd top of stack doesn't support binary operations"];
+PushStack[left.ops.binaryOp[inst.op, inst.left, inst.right, left, right, cc]];
+current ¬ current.next;
+END;
+inst: REF unaryOp InstructionBody =>
+BEGIN
+top: Node ¬ PopStack[];
+IF top.ops.unaryOp = NIL THEN CCE[cirioError, "top of stack doesn't support unary operations"];
+PushStack[top.ops.unaryOp[inst.op, inst.type, top, cc]];
+current ¬ current.next;
+END;
+inst: REF buildRecord InstructionBody =>
+BEGIN
+fields: LIST OF Node ¬ NIL;
+
+FOR I: INT IN [0..inst.nFields) DO
+fieldVal: Node ¬ PopStack[];
+fields ¬ CONS[fieldVal, fields];
+ENDLOOP;
+PushStack[Records.ConstructRecordNode[inst.rcdType, fields, cc]];
+current ¬ current.next;
+END;
+inst: REF storeUnpopped InstructionBody =>
+BEGIN
+val: Node ¬ PopStack[];
+indirect: Node ¬ PopStack[];
+IF indirect.ops.store = NIL THEN CCE[cirioError, "top of stack doesn't support store"];
+indirect.ops.store[inst.valType, val, inst.indirectType, indirect, cc];
+PushStack[val];
+current ¬ current.next;
+END;
+inst: REF loadThroughIndirect InstructionBody =>
+BEGIN
+indirect: Node ¬ PopStack[];
+IF indirect.ops.load = NIL THEN CCE[cirioError, "top of stack doesn't support load"];
+PushStack[indirect.ops.load[inst.indirectType, indirect, cc]];
+current ¬ current.next;
+END;
+inst: REF extractField InstructionBody =>
+BEGIN
+record: Node ¬ PopStack[];
+IF record.ops.extractField = NIL THEN CCE[cirioError, "top of stack doesn't support extractField"];
+PushStack[record.ops.extractField[inst.id, inst.type, record, cc]];
+current ¬ current.next;
+END;
+inst: REF selectField InstructionBody =>
+BEGIN
+indirect: Node ¬ PopStack[];
+IF indirect.ops.selectField = NIL THEN CCE[cirioError, "top of stack doesn't support selectField"];
+PushStack[indirect.ops.selectField[inst.id, inst.indirectType, indirect, cc]];
+current ¬ current.next;
+END;
+inst: REF apply InstructionBody =>
+BEGIN
+operand: Node ¬ PopStack[];
+operator: Node ¬ PopStack[];
+IF operator.ops.apply = NIL THEN CCE[cirioError, "2nd top of stack doesn't support apply"];
+PushStack[operator.ops.apply[inst.operatorType, inst.operandType, operator, operand, cc]];
+current ¬ current.next;
+END;
+inst: REF index InstructionBody =>
+BEGIN
+operand: Node ¬ PopStack[];
+indirectOperator: Node ¬ PopStack[];
+IF indirectOperator.ops.index = NIL THEN CCE[cirioError, "2nd top of stack doesn't support index"];
+PushStack[indirectOperator.ops.index[inst.indirectOperatorType, inst.operandType, indirectOperator, operand, cc]];
+current ¬ current.next;
+END;
+inst: REF selectNestedBlock InstructionBody =>
+BEGIN
+indirect: Node ¬ PopStack[];
+IF indirect.ops.selectNestedBlock = NIL THEN CCE[cirioError, "2nd top of stack doesn't support selectNestedBlock"];
+PushStack[indirect.ops.selectNestedBlock[inst.set, inst.depth, inst.indirectType, indirect, cc]];   -- The first argument is to select between enumerated types block and variable blocks.  Zero selects variable blocks
+current ¬ current.next;
+END;
+ENDCASE => CCE[cirioError]; -- shouldn't happen
+
+IF debug # NIL THEN {
+SS.Bp[debug, always, 0];
+debug.PutRope["producing"];
+SS.Bp[debug, lookLeft, CCTypes.sia, " "];
+ShowTop[];
+SS.Bp[debug, always, 0];
+SS.Bp[debug, always, 0]};
+ENDLOOP;
+
+IF stack.rest # NIL THEN CCE[cirioError]; -- shouldn't happen
+RETURN[stack.first];
+};
+
+
+
+
+ShowCode: PUBLIC PROC[code: Code] RETURNS[ROPE] =
+BEGIN
+cellNumb: INT ¬ 0;
+rope: ROPE ¬ NIL;
+NumberACell: PROC[cell: REF InstructionCell] =
+{cell.number ¬ cellNumb; cellNumb ¬ cellNumb+1};
+VisitACell: PROC[cell: REF InstructionCell] =
+{rope ¬ Rope.Cat[rope, "\N", ShowACell[cell]]}; 
+WalkCode[code, NumberACell];
+WalkCode[code, VisitACell];
+RETURN[rope];
+END;
+
+ShowACell: PROC[cell: REF InstructionCell] RETURNS[ROPE] =
+BEGIN
+rope: ROPE ¬ Rope.Cat[Convert.RopeFromInt[cell.number], ": ",
+ShowInstruction[cell.instruction]];
+IF cell.alternateNext # NIL THEN
+rope ¬ rope.Cat[rope, " (=> ", Convert.RopeFromInt[cell.alternateNext.number], ")"];
+RETURN[rope];
+END;
+
+ShowInstruction: PROC[instruction: Instruction, stack: LIST OF Node ¬ NIL] RETURNS[ROPE] =
+BEGIN
+typeClass: ROPE ¬ NIL;
+IF stack # NIL THEN 
+BEGIN
+type: Type ¬ GetTypeOfNode[stack.first];
+typeClass ¬ Atom.GetPName[CCTypes.GetTypeClass[type]];
+IF CCTypes.IsIndirectType[type] THEN typeClass ¬ Rope.Concat["^", typeClass];
+END;
+BEGIN
+result1: ROPE ¬ WITH instruction SELECT FROM
+inst: REF null InstructionBody => "null",
+inst: REF pop InstructionBody => 
+Rope.Concat["pop ", Convert.RopeFromInt[inst.n]],
+inst: REF test InstructionBody => IF inst.popCond THEN "unPoppedCond" ELSE "poppedCond",
+inst: REF loadGlobalFrame InstructionBody => IO.PutFR["loadGlobalFrame %g %g", [rope[inst.name]], [integer[inst.nToSkip]] ],
+inst: REF loadAMNode InstructionBody => "loadAMNode",
+inst: REF loadNameScope InstructionBody => "loadNameScope",
+inst: REF getNameContext InstructionBody => "getNameContext",
+inst: REF loadContentsOfAMNode InstructionBody => "loadContentsOfAMNode",
+inst: REF makeAMNode InstructionBody => "makeAMNode",
+inst: REF coerce InstructionBody => "coerce",
+inst: REF binaryOp InstructionBody =>
+Rope.Concat["binaryOp ", ShowOp[inst.op]],
+inst: REF unaryOp InstructionBody =>
+Rope.Concat["unaryOp ", ShowOp[inst.op]],
+inst: REF buildRecord InstructionBody => "buildRecord",
+inst: REF storeUnpopped InstructionBody => "storeUnpopped",
+inst: REF loadThroughIndirect InstructionBody => "loadThroughIndirect",
+inst: REF extractField InstructionBody =>
+Rope.Concat["extractField ", inst.id],
+inst: REF selectField InstructionBody =>
+Rope.Concat["selectField ", inst.id],
+inst: REF apply InstructionBody => "apply",
+inst: REF index InstructionBody => "index",
+inst: REF selectNestedBlock InstructionBody =>
+Rope.Concat["selectNestedBlock ", Convert.RopeFromInt[inst.depth]],
+ENDCASE => CCE[cirioError];
+RETURN[Rope.Cat[result1, "   (", typeClass, ")"]];
+END;
+
+END;
+
+walkPass: INT ¬ 0; -- global so that we can walk sharing code fragments
+
+WalkCode: PROC[code: Code, for: PROC[cell: REF InstructionCell]] =
+BEGIN
+walkPass ¬ walkPass+1;
+IF walkPass = 0 THEN walkPass ¬ 1;
+SubWalk[code, code.first, for];
+END;
+
+SubWalk: PROC[code: Code, cell: REF InstructionCell, for: PROC[cell: REF InstructionCell]] =
+BEGIN
+visitCell: REF InstructionCell ¬ cell;
+WHILE TRUE DO
+IF NOT visitCell.visitedOn = walkPass THEN
+BEGIN
+visitCell.visitedOn ¬ walkPass;
+for[visitCell];
+END;
+IF visitCell.alternateNext # NIL THEN EXIT;
+IF code.last = visitCell THEN EXIT;
+visitCell ¬ visitCell.next;
+ENDLOOP;
+
+IF code.last # visitCell THEN
+BEGIN
+SubWalk[code, visitCell.next, for];
+SubWalk[code, visitCell.alternateNext, for];
+END;
+
+END;
+
+
+END..
+  ä  
+CedarCodeImpl.mesa
+Copyright Ó 1990, 1992 by Xerox Corporation.  All rights reserved.
+Sturgis: September 13, 1989 11:46:26 am PDT
+Last changed by Theimer on August 25, 1989 7:41:46 pm PDT
+Hopcroft July 26, 1989 12:07:06 pm PDT
+Last tweaked by Mike Spreitzer on January 10, 1992 9:30 am PST
+Willie-s, May 20, 1992 12:30 pm PDT
+
+following stuff is for WalkCode and ShowCode
+Here are the exported routines that create code
+Uses side effects.  c1 might be damaged.  c2 might share with result.
+Uses side effects.  all args might be damaged.
+Here is the interpreter
+for the moment, the details of nodes will be kept here, although in the near future they will have to migrate out to various files depending on target world and target langauge
+
+Nodes have data and Cedar operations.  The Cedar operations correspond to the instructions above.
+does not call the object routine unless Conforms[GetTypeOfNode[node], sourceType] # yes or Conforms[sourceType, targetType] # yes;
+{RETURN[SELECT op FROM
+$plus => "plus",
+$minus => "minus",
+$div => "div",
+$mult => "mult",
+$mod => "mod",
+$le => "le",
+$lt => "lt",
+$eq => "eq",
+$ne => "ne",
+$gt => "gt",
+$ge => "ge",
+$and => "and",
+$or => "or",
+$not => "not",
+$max => "max",
+$min => "min",
+$size => "size",
+$bits => "bits",
+$bytes => "bytes",
+$units => "units",
+$words => "words",
+$first => "first",
+$last => "last",
+$uparrow => "uparrow",
+ENDCASE => CCE[cirioError]]};
+printing code
+we have to compute result1 outside the return clause, due to brain damaged mimosa
+ÊW  –(cedarcode) style•NewlineDelimiter
+™ codešœ™Kšœ
+Ïeœ7™BKšœ+™+K™9K™&K™>K™#K™ —šÏk	˜	Kšœžœ˜)Kšœžœ˜Kšœžœe˜rK˜
+Kšœžœ˜+K˜Kšœžœ-˜=Kšœžœ˜*Kšœžœ˜Kšžœ˜Kšœžœ˜#K˜Kšœ˜K˜—K˜ šÏnœžœž˜Kšžœ:žœ*˜mKšžœ˜Kšžœ˜—Kšœžœžœžœ˜"K˜ Kšžœžœžœ˜Kšžœžœ˜&Kšœžœ˜Kšœžœ˜'Kšœžœ'˜>Kšœžœ˜0K˜ Kšžœžœ!žœžœ˜IK˜ Kšœžœžœ
+˜šœ
+žœžœžœ˜Kšœžœ˜"—K˜ šœžœžœ˜K˜Kšœžœ˜Kšœžœžœ˜)Kšœ,™,Kšœžœ˜Kšœžœ˜K˜ K˜ —Kšœžœžœ˜(šœžœžœ˜šžœ	ž˜K˜Kšœžœ˜Kšœžœ˜Kšœžœžœ˜.K˜K˜Kšœžœ˜)K˜%K˜!K˜)K˜6K˜.Kšœžœ˜-K˜5K˜,Kšœžœ˜'Kšœžœ˜.K˜1K˜9Kšœžœ	žœ˜@Kšžœ˜	—K˜ —K˜ šœ/™/˜ KšœE™E—šŸ
+œžœžœžœ
+˜7Kšžœžœžœžœžœžœ˜.Kšžœžœžœžœžœžœ˜.K˜K˜Kšžœ˜—K˜ šŸœžœžœžœ˜9K˜&š
+Ÿœžœžœžœžœ˜LKš
+žœžœžœžœžœ˜Kšœžœ˜!Kšžœžœžœžœ˜Kšœžœ$žœžœ˜MKšžœžœžœžœ%˜IK˜K˜,Kšžœ˜—Kšœžœžœ˜2K˜ Kšžœ˜—˜ Kšœ.™.—šŸœžœžœ"žœ˜NKšœžœ'žœ˜7—K˜ šŸœžœžœ"žœ˜OKšœžœ'žœ˜8—K˜ šŸ
+œžœ+žœžœ
+˜RKšœ.žœ$˜UK˜Kšžœžœžœžœžœžœ˜:K˜$K˜.K˜ K˜!K˜Kšžœ˜Kšœ˜—K˜ š
+Ÿ	œžœžœžœžœ˜2Kšœžœžœ"˜9K˜ —šŸœžœžœžœ˜%Kšœžœžœ˜5—K˜ šŸœžœžœ˜4Kšž˜Kš	œžœžœžœžœ	˜HKšžœžœ˜%Kšžœ˜K˜ —K˜ šŸœžœžœžœžœžœ˜LKšœžœžœ6˜O—K˜ šŸœžœžœžœ˜0Kšœžœžœ'˜>—K˜ š
+Ÿœžœžœžœžœ˜GKšœžœžœ2˜I—K˜ šŸœžœžœžœ˜CKšœžœžœ2˜I—K˜ šŸœžœžœžœ˜9Kšœžœžœ(˜?K˜ —šŸœžœžœžœ˜?Kšœžœžœ.˜E—K˜ šŸœžœžœžœ˜GKšœžœžœ6˜MK˜ —šŸœžœžœ*žœ˜VKšœžœžœ1˜HK˜ —šŸœžœžœ#žœ˜NKšœžœžœ)˜@—K˜ š
+Ÿœžœžœ
+žœžœ˜KKšœžœžœ5˜L—K˜ šŸœžœžœ'žœ˜VKšœžœžœ?˜V—K˜ šŸœžœžœžœ˜JKšœžœžœ9˜P—K˜ š
+Ÿœžœžœžœžœ˜EKšœžœžœ.˜E—K˜ š
+Ÿœžœžœžœžœ˜LKšœžœžœ5˜L—K˜ šŸœžœžœ(žœ˜QKšœžœžœ8˜O—K˜ šŸœžœžœ0žœ˜YKšœžœžœ@˜W—K˜ šŸœžœžœžœ	žœžœ˜]KšœžœžœC˜Z—K˜ —K˜ K˜ šœ™Kšœ°™°K™ Kšœa™aK˜ Kšœžœžœ
+˜Kšœ
+žœ˜%K˜ š
+Ÿ
+œžœžœžœžœ˜/Kš	œžœžœžœžœ˜)—K˜ šŸ
+œžœžœ˜7Kš	œžœžœžœžœ˜9—K˜ šŸœžœ˜+Kš	œžœžœžœžœ ˜<—K˜ šŸœžœžœžœ#žœžœžœ˜`Kšž˜K˜Kšžœžœžœžœ˜#K˜K˜Kšžœ˜Kšžœ˜—K˜ šŸœžœžœžœ˜6Kšœžœ˜—K˜ š
+Ÿœžœžœžœžœ˜EKšž˜šžœžœžœžœ˜7Kšžœžœ$˜/—Kšžœ˜—K˜ šŸœžœžœžœžœžœ˜;šœžœ˜K˜ —K˜ Kšœ‚™‚—š
+Ÿœžœžœ/žœžœ˜UKšž˜šžœžœ7ž˜AKšž˜Kšžœžœžœžœ˜.Kšžœ4˜:Kšžœ˜—šžœžœ.ž˜8Kšž˜Kšžœžœžœžœ˜.Kšžœ4˜:Kšžœ˜—Kšžœ˜Kšžœ˜—K˜ š
+Ÿœžœžœžœžœ˜AKšž˜Kšžœžœžœžœ˜8Kšžœ&˜,Kšžœ˜—K˜ š
+Ÿœžœžœžœžœ&˜_Kšž˜Kšžœžœžœžœ˜8Kšžœ&˜,Kšžœ˜—K˜ š
+ŸœžœžœQžœžœ˜~Kšž˜Kšžœžœžœžœ˜4KšžœJ˜PKšžœ˜—K˜ š
+Ÿœžœžœ3žœžœ˜_Kšž˜Kšžœžœžœžœ˜/Kšžœ'˜-Kšžœ˜—K˜ šŸœžœžœKžœ˜uKšž˜Kšžœžœžœžœ˜5K˜IKšžœ˜—K˜ š
+Ÿœžœžœ-žœžœ˜dKšž˜Kšžœžœžœžœ˜4Kšžœ8˜>Kšžœ˜—K˜ š
+Ÿœžœžœžœžœ˜HKšž˜šžœžœžœžœ˜+Kšžœžœ#˜.—Kšžœ˜—K˜ šŸœžœžœžœžœžœ˜[Kšž˜Kšžœžœžœžœ˜4Kšžœ,˜2Kšžœ˜—K˜ šŸœžœžœžœ.žœžœ˜jKšž˜Kšžœ žœžœžœ˜;KšžœC˜IKšžœ˜—K˜ K˜ šŸœžœžœžœžœžœ˜HKšœžœžœžœžœ"žœžœ˜_—K˜ šŸœžœžœžœžœžœžœ˜Ošžœžœžœ˜šŸ	œžœžœžœ˜"Kšœ*˜*Kšžœžœ˜—šœžœ˜"Kšœ
+˜
+KšžÏc?œ˜D—Kšžœžœžœ"˜1—Kšžœ˜Kšžœ˜—K˜ šŸœžœžœžœžœžœžœ˜XKšŸ	œžœ*˜9Kšœ ˜ Kšžœ˜—K˜ šŸœžœžœžœžœžœžœžœžœ˜eKšŸ	œžœ*˜9Kšœ(˜(Kšžœ˜—K˜ šŸœžœžœžœžœžœžœ˜IKšœžœžœ"žœžœ*žœžœ˜u—K˜ šŸœžœžœžœ˜2šž˜Kšžœ˜Kšžœ˜—šœžœžœž™K™K™K™K™K™K™K™K™K™K™K™K™K™K™K™K™K™K™K™K™K™K™K™K™Kšžœžœ™——K˜ šŸ	œžœžœžœ	žœžœžœžœ $˜yKšœžœžœžœ˜Kšœ	žœ ˜@Kšœžœ˜"Kšœžœ ˜"Kšœžœ ˜#K˜ šŸœžœžœ˜Kšž˜K˜K˜Kšžœ˜Kšžœ˜—K˜ šŸ	œžœ˜Kšœ	žœ˜—K˜ šŸœžœ˜Kšœžœžœ˜šžœ	žœžœ˜K˜(K˜6Kšžœžœ*˜N—Kšœ/˜/K˜,—K˜ šŸœžœ˜Kšœ4˜4Kšžœ'˜)Kšœ/˜/Kšžœ˜—K˜ šžœžœž˜K˜ K˜K˜ šžœ	žœžœ˜K˜;Kšžœ˜šžœžœž˜$Kšœžœ)˜2Kšœžœ)˜2Kšœžœ&˜/Kšžœžœ˜——K˜ šžœžœž˜$šœžœ˜!K˜—šœžœ˜ Kšž˜š	žœŸœžœžœž˜K˜Kšžœ˜—K˜Kšžœ˜—šœžœ˜!Kšž˜Kšœžœžœžœ˜=KšžœžœžœžœE˜mšžœ ˜"Kšžœ˜Kšžœ!˜%—Kšžœ˜—šœžœ#˜,Kšž˜Kš
+žœžœžœžœžœQ˜uK˜MK˜Kšžœ˜—šœžœ˜'Kšž˜K˜<K˜Kšžœ˜—šœžœ!˜*Kšž˜Kšœ 0˜IK˜Kšžœ˜—šœžœ"˜+Kšž˜K˜Kšžœžœžœžœ@˜hKšœ<˜<K˜Kšžœ˜—šœžœ(˜1Kšž˜K˜K˜Kšžœ˜—šœžœ˜'Kšž˜K˜K˜7šœžœžœž˜&Kšœžœ4˜QKšžœ;˜B—K˜K˜Kšžœ˜—šœžœ˜#Kšž˜K˜K˜=K˜Kšžœ˜—šœžœ˜%Kšž˜K˜K˜KšžœžœžœžœC˜fK˜NK˜Kšžœ˜—šœžœ˜$Kšž˜K˜Kšžœžœžœžœ>˜_K˜8K˜Kšžœ˜—šœžœ˜(Kšž˜Kšœžœžœžœ˜K˜ š	žœŸœžœžœž˜"K˜Kšœ	žœ˜ Kšžœ˜—K˜AK˜Kšžœ˜—šœžœ!˜*Kšž˜K˜K˜Kšžœžœžœžœ3˜WK˜GK˜K˜Kšžœ˜—šœžœ'˜0Kšž˜K˜Kšžœžœžœžœ2˜UK˜>K˜Kšžœ˜—šœžœ ˜)Kšž˜K˜Kšžœžœžœžœ:˜cK˜CK˜Kšžœ˜—šœžœ˜(Kšž˜K˜Kšžœžœžœžœ9˜cK˜NK˜Kšžœ˜—šœžœ˜"Kšž˜K˜K˜Kšžœžœžœžœ7˜[K˜ZK˜Kšžœ˜—šœžœ˜"Kšž˜K˜K˜$Kšžœžœžœžœ7˜cK˜rK˜Kšžœ˜—šœžœ%˜.Kšž˜K˜Kšžœ"žœžœžœC˜sKšœd t˜ØK˜Kšžœ˜—Kšžœžœ ˜/—K˜ šžœ	žœžœ˜Kšžœ˜K˜Kšžœ'˜)Kšœ
+˜
+Kšžœ˜Kšžœ˜—Kšžœ˜K˜ —Kš	žœžœžœžœ ˜=Kšžœ˜Kšœ˜——K˜ K˜ K˜ šœ™K˜ š
+Ÿœžœžœžœžœ˜1Kšž˜Kšœ
+žœ˜Kšœžœžœ˜šŸœžœžœ˜.K˜0—šŸ
+œžœžœ˜-K˜0—K˜K˜Kšžœ˜Kšžœ˜—K˜ š
+Ÿ	œžœžœžœžœ˜:Kšž˜šœžœ3˜=K˜#—šžœžœž˜ K˜T—Kšžœ˜Kšžœ˜—K˜ šŸœžœ"žœžœžœžœžœ˜ZKšž˜Kšœžœžœ˜šžœ	žœžœ˜Kšž˜K˜(K˜6Kšžœžœ)˜MKšžœ˜—™QKšž˜šœ	žœžœžœž˜,Kšœžœ ˜)šœžœ˜!K˜1—Kš	œžœžœžœžœ˜XKšœžœ$žœM˜|Kšœžœ,˜5Kšœžœ2˜;Kšœžœ4˜=Kšœžœ@˜IKšœžœ,˜5Kšœžœ$˜-šœžœ˜%K˜*—šœžœ˜$K˜)—Kšœžœ.˜7Kšœžœ2˜;Kšœžœ>˜Gšœžœ ˜)K˜&—šœžœ˜(K˜%—Kšœžœ"˜+Kšœžœ"˜+šœžœ%˜.K˜C—Kšžœžœ˜—Kšžœ,˜2Kšžœ˜—K˜ Kšžœ˜—K˜ Kšœ
+žœ 4˜GK˜ šŸœžœžœžœ˜BKšž˜K˜Kšžœžœ˜"K˜Kšžœ˜—K˜ š
+Ÿœžœžœžœžœ˜\Kšž˜Kšœžœ˜&šžœžœž˜šžœžœ ž˜*Kšž˜K˜K˜Kšžœ˜—Kšžœžœžœžœ˜+Kšžœžœžœ˜#K˜Kšžœ˜—K˜ šžœž˜Kšž˜K˜#K˜,Kšžœ˜—K˜ Kšžœ˜—K˜ K˜ —Kšžœ˜— …—    S„  s¿  

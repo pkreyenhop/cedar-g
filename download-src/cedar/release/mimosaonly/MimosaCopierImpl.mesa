@@ -1,0 +1,1388 @@
+
+DIRECTORY
+Alloc USING [AddNotify, DropNotify, Handle, Notifier, Top, Units],
+Basics USING [LowHalf],
+ConvertUnsafe USING [SubString],
+LiteralOps USING [CopyLiteral, CopyStringLiteral, FindHeapString],
+Literals USING [LTIndex, STIndex, STNull],
+MimData USING [interface],
+MimosaCopier USING [FindMdEntry, FreeSymbolTable, GetSymbolTable],
+MimZones USING [permZone],
+SourceMap USING [Down, nullLoc],
+SymbolOps USING [CtxEntries, CtxLevel, DecodeBti, DecodeCard, DecodeType, EncodeBti, EncodeCard, EncodeType, EnterExtension, EnterString, FindMdi, FindString, FirstCtxSe, FromBti, FromType, LinkBti, MakeCtxSe, MakeNonCtxSe, MakeSeChain, NewCtx, NextSe, own, ParentBti, RCType, ReferentType, ResetCtxList, SearchContext, SeiForValue, SetSeLink, SubStringForName, ToBti, ToType, TypeForm, TypeRoot, UnderType, XferMode],
+Symbols USING [Base, BodyRecord, bodyType, BTIndex, BTNull, CBTIndex, CBTNull, Closure, CSEIndex, CSENull, CTXIndex, CTXNull, CTXRecord, ctxType, ExtensionType, FirstStandardCtx, HTIndex, HTNull, IncludedCTXIndex, IncludedCTXNull, ISEFirst, ISEIndex, ISENull, LastStandardCtx, lZ, MDFirst, MDIndex, MDNull, MDRecord, mdType, Name, OwnMdi, RecordSEIndex, RecordSENull, SEIndex, SENull, SERecord, seType, Type, typeANY, typeTYPE],
+SymbolSegment USING [ExtFirst, ExtIndex, ExtRecord],
+SymbolTable USING [],
+SymbolTablePrivate USING [SymbolTableBaseRep],
+SymLiteralOps USING [EnterAtom, EnterText, EnterType],
+Tree USING [Base, Index, Link, Map, NodeName, Null, nullIndex, Scan, treeType],
+TreeOps USING [CopyTree, FreeNode, FromLoc, GetHash, GetNode, GetStr, GetTag, OpName, PopTree, PushNode, PushTree, ScanList, SetAttrs, SetInfo];
+MimosaCopierImpl: PROGRAM
+IMPORTS Alloc, Basics, LiteralOps, MimData, MimosaCopier, MimZones, SourceMap, SymbolOps, SymLiteralOps, TreeOps
+EXPORTS MimosaCopier, SymbolTable = { 
+OPEN Symbols;
+
+STB: TYPE = REF SymbolTableBaseRep;
+SymbolTableBaseRep: PUBLIC TYPE = SymbolTablePrivate.SymbolTableBaseRep;
+
+
+table: Alloc.Handle ¬ NIL;
+
+seb: Symbols.Base ¬ NIL;		-- se table
+ctxb: Symbols.Base ¬ NIL;	-- context table
+mdb: Symbols.Base ¬ NIL;	-- module directory base
+bb: Symbols.Base ¬ NIL;		-- body table
+tb: Tree.Base ¬ NIL;		-- tree table
+
+CopierNotify: Alloc.Notifier = {
+seb ¬ base[seType];
+ctxb ¬ base[ctxType];
+mdb ¬ base[mdType];
+bb ¬ base[bodyType];
+tb ¬ base[Tree.treeType];
+IF iBase # NIL AND iBase = SymbolOps.own THEN INotify[];
+};
+
+
+iBase: STB ¬ NIL;
+
+iHtb: Symbols.Base ¬ NIL;
+iSeb: Symbols.Base ¬ NIL;
+iCtxb: Symbols.Base ¬ NIL;
+
+INotify: PROC = {
+iHtb ¬ iBase.htb;
+iSeb ¬ iBase.seb;
+iCtxb ¬ iBase.ctxb;
+};
+
+MemoCacheSize: CARDINAL = 509;  -- prime < 512
+SearchCache: TYPE = ARRAY [0..MemoCacheSize) OF RECORD [
+hti: HTIndex,
+ctx: CTXIndex];
+
+memoCache: REF SearchCache = MimZones.permZone.NEW[SearchCache];
+
+parentRecordType: RecordSEIndex ¬ RecordSENull;
+
+useCaches: BOOL ¬ TRUE;
+
+
+CopierInit: PUBLIC PROC
+[ownTable: Alloc.Handle, symbolCachePages: CARDINAL, useMemo: BOOL] = {
+iBase ¬ NIL;
+table ¬ ownTable;
+table.AddNotify[CopierNotify];
+ResetCaches[];
+useCaches ¬ useMemo;
+currentBody ¬ BTNull;
+parentRecordType ¬ RecordSENull;
+};
+
+ResetCaches: PROC = INLINE {
+memoCache­ ¬ ALL[ [hti: HTNull, ctx: CTXNull] ];
+typeCache­ ¬ ALL[ [mdi: MDNull, iSei: SENull, sei: SENull] ];
+};
+
+CopierReset: PUBLIC PROC = {
+ResetIncludeContexts[];
+table.DropNotify[CopierNotify];
+table ¬ NIL;
+};
+
+
+SEToken: PUBLIC TYPE = RECORD [ISEIndex];
+nullSEToken: PUBLIC SEToken ¬ [ISENull];
+
+CtxValue: PUBLIC PROC
+[ctx: CTXIndex, value: CARD] RETURNS [t: SEToken ¬ nullSEToken] = {
+mdi: MDIndex;
+iCtx: CTXIndex;
+[mdi, iCtx] ¬ InverseMapCtx[ctx];
+IF OpenIncludedTable[mdi] THEN {
+t ¬ [SymbolOps.SeiForValue[iBase, SymbolOps.EncodeCard[value], iCtx]];
+CloseIncludedTable[];
+};
+};
+
+CtxFirst: PUBLIC PROC [ctx: CTXIndex] RETURNS [t: SEToken ¬ nullSEToken] = {
+mdi: MDIndex;
+iCtx: CTXIndex;
+[mdi, iCtx] ¬ InverseMapCtx[ctx];
+IF OpenIncludedTable[mdi] THEN {
+t ¬ [SymbolOps.FirstCtxSe[iBase, iCtx]];
+CloseIncludedTable[];
+};
+};
+
+CtxNext: PUBLIC PROC
+[ctx: CTXIndex, t: SEToken] RETURNS [next: SEToken ¬ nullSEToken] = {
+mdi: MDIndex;
+iCtx: CTXIndex;
+[mdi, iCtx] ¬ InverseMapCtx[ctx];
+IF t # nullSEToken AND OpenIncludedTable[mdi] THEN {
+next ¬ [SymbolOps.NextSe[iBase, t]];
+CloseIncludedTable[];
+}
+};
+
+TokenHash: PUBLIC PROC [ctx: CTXIndex, t: SEToken] RETURNS [hti: HTIndex ¬ HTNull] = {
+mdi: MDIndex = InverseMapCtx[ctx].mdi;
+IF t # nullSEToken AND OpenIncludedTable[mdi] THEN {
+hti ¬ MapHti[iBase.seb[t].hash];
+CloseIncludedTable[];
+};
+};
+
+TokenValue: PUBLIC PROC [ctx: CTXIndex, t: SEToken] RETURNS [v: CARD ¬ 0] = {
+mdi: MDIndex = InverseMapCtx[ctx].mdi;
+IF t # nullSEToken AND OpenIncludedTable[mdi] THEN {
+v ¬ SymbolOps.DecodeCard[iBase.seb[t].idValue];
+CloseIncludedTable[];
+};
+};
+
+TokenSymbol: PUBLIC PROC
+[ctx: CTXIndex, t: SEToken] RETURNS [sei: ISEIndex ¬ ISENull] = {
+mdi: MDIndex = InverseMapCtx[ctx].mdi;
+SELECT TRUE FROM
+(mdi = OwnMdi) => sei ¬ t;
+OpenIncludedTable[mdi] => {
+sei ¬ LOOPHOLE[CopyIncludedSymbol[t, mdi]];
+CloseIncludedTable[];
+};
+ENDCASE;
+};
+
+
+SubString: TYPE = ConvertUnsafe.SubString;
+
+SearchFileCtx: PUBLIC PROC [hti: HTIndex, ctx: IncludedCTXIndex]
+RETURNS [found: BOOL ¬ FALSE, sei: ISEIndex ¬ ISENull] = {
+mdi: MDIndex = ctxb[ctx].module;
+s: SubString = SymbolOps.SubStringForName[SymbolOps.own, hti];
+junk: CARDINAL = Basics.LowHalf[hti-HTNull]+Basics.LowHalf[ctx-IncludedCTXNull];
+hash: [0..MemoCacheSize) = junk MOD MemoCacheSize;
+IF useCaches AND memoCache[hash].hti = hti AND memoCache[hash].ctx = ctx THEN
+RETURN [FALSE, ISENull];
+IF OpenIncludedTable[mdi] THEN {
+iHti: HTIndex ¬ SymbolOps.FindString[iBase, s];
+IF iHti # HTNull AND (iHtb[iHti].anyPublic OR iHtb[iHti].anyInternal) THEN {
+iSei: ISEIndex ¬ SymbolOps.SearchContext[iBase, iHti, ctxb[ctx].map];
+IF (found ¬ iSei # SENull) THEN sei ¬ CopyCtxSe[iSei, hti, ctx, mdi];
+};
+CloseIncludedTable[];
+};
+IF ~found AND useCaches THEN memoCache[hash] ¬ [hti: hti, ctx: ctx];
+};
+
+Delink: PUBLIC PROC [sei: ISEIndex] = {
+ctx: CTXIndex = seb[sei].idCtx;	-- assumed not reset
+prev: ISEIndex ¬ ctxb[ctx].seList;
+DO
+next: ISEIndex ¬ SymbolOps.NextSe[SymbolOps.own, prev];
+SELECT next FROM
+sei => EXIT;
+ctxb[ctx].seList, ISENull => ERROR;
+ENDCASE => prev ¬ next;
+ENDLOOP;
+IF SymbolOps.NextSe[SymbolOps.own, sei] = sei
+THEN ctxb[ctx].seList ¬ ISENull
+ELSE {
+IF sei = ctxb[ctx].seList THEN ctxb[ctx].seList ¬ prev;
+SymbolOps.SetSeLink[prev, SymbolOps.NextSe[SymbolOps.own, sei]];
+};
+SymbolOps.SetSeLink[sei, ISENull];
+};
+
+CopySymbol: PUBLIC PROC [mdi: MDIndex, iSei: SEIndex, depth: Closure]
+RETURNS [sei: SEIndex ¬ SENull] = {
+SELECT TRUE FROM
+(mdi = OwnMdi) => sei ¬ iSei;
+OpenIncludedTable[mdi] => {
+sei ¬ CopyIncludedSymbol[iSei, mdi];
+WITH s: seb[sei] SELECT FROM
+id => {
+CompleteType[s.idType, mdi, depth];
+IF s.idType = typeTYPE THEN
+CompleteType[SymbolOps.DecodeType[s.idInfo], mdi, depth];
+};
+ENDCASE => CompleteType[sei, mdi, depth];
+CloseIncludedTable[];
+};
+ENDCASE;
+};
+
+
+CompleteContext: PUBLIC PROC
+[ctx: IncludedCTXIndex, depth: Closure¬unit, parent: SEIndex ¬ SENull] = {
+IF ctxb[ctx].copied < depth AND OpenIncludedTable[ctxb[ctx].module] THEN {
+oldParent: RecordSEIndex ¬ parentRecordType;
+csei: CSEIndex = SymbolOps.UnderType[SymbolOps.own, parent];
+WITH seb[csei] SELECT FROM
+record => parentRecordType ¬ LOOPHOLE[parent];
+ENDCASE;
+FillContext[ctx, depth];
+parentRecordType ¬ oldParent;
+CloseIncludedTable[];
+};
+};
+
+AugmentContext: PUBLIC PROC [ctx: IncludedCTXIndex, mdi: MDIndex] = {
+mdRoot: MDIndex;
+target: CTXIndex;
+[mdRoot, target] ¬ InverseMapCtx[ctx];
+IF ~ctxb[ctx].reset AND OpenIncludedTable[mdi] THEN {
+newMdi: MDIndex = SymbolOps.FindMdi[iBase, mdb[mdRoot].stamp];
+IF newMdi # MDNull THEN
+FOR iCtx: IncludedCTXIndex ¬ iBase.mdb[newMdi].ctx,
+iBase.ctxb[iCtx].chain UNTIL iCtx = CTXNull DO
+IF iBase.ctxb[iCtx].map = target THEN {
+CopyCtxEntries[ctx, iCtx, mdi, unit];
+IF ~iBase.ctxb[iCtx].complete THEN ctxb[ctx].complete ¬ FALSE;
+IF ctxb[ctx].complete THEN ResetCtx[ctx];
+EXIT;
+};
+ENDLOOP;
+CloseIncludedTable[]}
+};
+
+FillContext: PROC [ctx: IncludedCTXIndex, depth: Closure] = {
+mdi: MDIndex = ctxb[ctx].module;
+CopyCtxEntries[ctx, ctxb[ctx].map, mdi, depth];
+ResetCtx[ctx];
+};
+
+CopyContext: PROC [ctx, iCtx: CTXIndex, mdi: MDIndex, depth: Closure] = {
+WITH ctxb[ctx] SELECT FROM
+included => {
+tCtx: IncludedCTXIndex = LOOPHOLE[ctx];
+IF ctxb[tCtx].copied < depth AND (~ctxb[tCtx].closed OR depth > unit) THEN {
+ctxb[tCtx].closed ¬ TRUE;
+CopyCtxEntries[tCtx, iCtx, mdi, depth];
+ResetCtx[tCtx];
+};
+};
+ENDCASE;
+};
+
+CopyCtxEntries: PROC
+[ctx: IncludedCTXIndex, iCtx: CTXIndex, mdi: MDIndex, depth: Closure] = {
+IF ctxb[ctx].copied < depth THEN {
+pSei: ISEIndex ¬ ISENull;
+ctxb[ctx].copied ¬ depth;
+FOR iSei: ISEIndex ¬ SymbolOps.FirstCtxSe[iBase, iCtx], SymbolOps.NextSe[iBase, iSei]
+UNTIL iSei = SENull DO
+hti: HTIndex = MapHti[iSeb[iSei].hash];
+sei: ISEIndex ¬ IF hti = HTNull AND ctxb[ctx].reset
+THEN SymbolOps.FirstCtxSe[SymbolOps.own, ctx]
+ELSE SymbolOps.SearchContext[SymbolOps.own, hti, ctx];
+IF ~ctxb[ctx].reset THEN {
+IF sei = SENull THEN sei ¬ CopyCtxSe[iSei, hti, ctx, mdi];
+IF pSei # SENull AND SymbolOps.NextSe[SymbolOps.own, pSei] # sei THEN {
+Delink[sei];
+SymbolOps.SetSeLink[sei, SymbolOps.NextSe[SymbolOps.own, pSei]];
+SymbolOps.SetSeLink[pSei, sei];
+};
+ctxb[ctx].seList ¬ pSei ¬ sei;
+};
+IF depth > unit AND sei # SENull THEN {
+subType: CSEIndex = SymbolOps.UnderType[SymbolOps.own, 
+IF seb[sei].idType = typeTYPE THEN sei ELSE seb[sei].idType];
+IF (depth = rc AND SymbolOps.RCType[SymbolOps.own, subType] # none)
+OR depth > rc THEN
+IF seb[sei].idType = typeTYPE
+THEN CompleteVariant[sei, mdi, depth]
+ELSE CompleteType[subType, mdi, depth];
+};
+ENDLOOP;
+ctxb[ctx].complete ¬ TRUE;
+};
+};
+
+
+CompleteType: PROC [sei: SEIndex, mdi: MDIndex, depth: Closure] = {
+type: CSEIndex = SymbolOps.UnderType[SymbolOps.own, sei];
+WITH t: seb[type] SELECT FROM
+enumerated => IF depth > rc THEN CompleteEnumeration[type, mdi, depth];
+record => CompleteRecord[type, mdi, TRUE, depth];
+ref => IF depth > rc THEN CompleteType[t.refType, mdi, depth];
+array => {
+CompleteType[t.indexType, mdi, depth];
+CompleteType[t.componentType, mdi, depth];
+};
+arraydesc => IF depth > rc THEN CompleteType[t.describedType, mdi, depth];
+transfer, definition => {};  -- *** temporary ***
+union => CompleteUnion[type, mdi, depth];
+sequence => {
+CompleteType[seb[t.tagSei].idType, mdi, depth];
+CompleteType[t.componentType, mdi, depth];
+IF t.parentType = RecordSENull THEN {
+t.parentType ¬ parentRecordType;
+IF parentRecordType = RecordSENull THEN ERROR;
+};
+};
+relative => {
+CompleteType[t.baseType, mdi, depth];
+CompleteType[t.offsetType, mdi, depth];
+};
+subrange => CompleteType[t.rangeType, mdi, depth];
+ENDCASE;
+};
+
+CompleteEnumeration: PROC [sei: CSEIndex, mdi: MDIndex, depth: Closure] = {
+WITH type: seb[sei] SELECT FROM
+enumerated =>
+WITH c: ctxb[type.valueCtx] SELECT FROM
+included =>
+IF c.copied < depth THEN
+IF c.module = mdi
+THEN FillContext[LOOPHOLE[type.valueCtx], depth]
+ELSE {
+CloseIncludedTable[];
+CompleteContext[LOOPHOLE[type.valueCtx], depth];
+[] ¬ OpenIncludedTable[mdi];
+};
+ENDCASE;
+ENDCASE;
+};
+
+CompleteRecord: PROC
+[sei: CSEIndex, mdi: MDIndex, doLink: BOOL, depth: Closure ¬ unit] = {
+WITH type: seb[sei] SELECT FROM
+record => {
+oldParent: RecordSEIndex ¬ parentRecordType;
+rSei: RecordSEIndex = LOOPHOLE[sei];
+parentRecordType ¬ rSei;
+WITH type SELECT FROM
+linked =>
+IF doLink THEN
+CompleteRecord[
+SymbolOps.UnderType[SymbolOps.own, linkType],
+mdi, TRUE, depth];
+ENDCASE;
+WITH c: ctxb[type.fieldCtx] SELECT FROM
+included => {
+IF c.copied < depth THEN
+IF c.module = mdi
+THEN FillContext[LOOPHOLE[type.fieldCtx], depth]
+ELSE {
+CloseIncludedTable[];
+CompleteContext[LOOPHOLE[type.fieldCtx], depth];
+[] ¬ OpenIncludedTable[mdi];
+};
+};
+ENDCASE;
+parentRecordType ¬ oldParent;
+};
+ENDCASE;
+};
+
+CompleteUnion: PROC [sei: CSEIndex, mdi: MDIndex, depth: Closure] = {
+WITH type: seb[sei] SELECT FROM
+union => {
+CompleteType[seb[type.tagSei].idType, mdi, depth];
+WITH c: ctxb[type.caseCtx] SELECT FROM
+included =>
+IF c.copied < depth THEN
+IF c.module = mdi
+THEN FillContext[LOOPHOLE[type.caseCtx], depth]
+ELSE {
+CloseIncludedTable[];
+CompleteContext[LOOPHOLE[type.caseCtx], depth];
+[] ¬ OpenIncludedTable[mdi];
+};
+ENDCASE;
+};
+ENDCASE;
+};
+
+CompleteVariant: PROC [sei: ISEIndex, mdi: MDIndex, depth: Closure] = {
+type: CSEIndex = SymbolOps.UnderType[SymbolOps.own, sei];
+WITH seb[type] SELECT FROM
+record => CompleteRecord[type, mdi, FALSE, depth];
+ENDCASE;
+};
+
+
+CopyUnion: PUBLIC PROC [rSei: RecordSEIndex, depth: Closure ¬ none] = {
+ctx: CTXIndex = seb[rSei].fieldCtx;
+WITH c: ctxb[ctx] SELECT FROM
+included => {
+oldParent: RecordSEIndex ¬ parentRecordType;
+parentRecordType ¬ rSei;
+IF ~c.reset AND OpenIncludedTable[c.module] THEN {
+FillUnionPart[LOOPHOLE[ctx], depth];
+CloseIncludedTable[];
+};
+parentRecordType ¬ oldParent;
+};
+ENDCASE;
+};
+
+FillUnionPart: PROC [ctx: IncludedCTXIndex, depth: Closure ¬ none] = {
+iRoot: ISEIndex = iCtxb[ctxb[ctx].map].seList;
+iSei: ISEIndex ¬ iRoot;
+DO
+IF iSei = SENull THEN EXIT;
+SELECT SymbolOps.TypeForm[iBase, iSeb[iSei].idType] FROM
+union, sequence => {
+IF iSeb[iSei].hash # HTNull
+THEN [] ¬ CopyIncludedSymbol[iSei, ctxb[ctx].module]
+ELSE FillContext[LOOPHOLE[ctx], MAX[unit, depth]];
+EXIT;
+};
+ENDCASE;
+IF (iSei ¬ SymbolOps.NextSe[iBase, iSei]) = iRoot THEN EXIT;
+ENDLOOP;
+};
+
+FillUnion: PROC [sei: CSEIndex, mdi: MDIndex] = {
+WITH type: seb[sei] SELECT FROM
+record => {
+rSei: RecordSEIndex = LOOPHOLE[sei];
+WITH c: ctxb[type.fieldCtx] SELECT FROM
+included =>
+IF ~c.reset THEN
+IF c.module = mdi
+THEN FillUnionPart[LOOPHOLE[type.fieldCtx]]
+ELSE {
+CloseIncludedTable[];
+CopyUnion[rSei];
+[] ¬ OpenIncludedTable[mdi];
+};
+ENDCASE;
+};
+ENDCASE;
+};
+
+
+MapHti: PROC [iHti: HTIndex] RETURNS [hti: HTIndex] = {
+s: SubString;
+IF iHti = HTNull
+THEN hti ¬ HTNull
+ELSE {
+s ¬ SymbolOps.SubStringForName[iBase, iHti];
+hti ¬ SymbolOps.EnterString[s ! TableRelocated => {s.base ¬ iBase.ssb}];
+};
+};
+
+MissingHti: ERROR = CODE;
+
+InverseMapHti: PROC [hti: HTIndex] RETURNS [iHti: HTIndex ¬ HTNull] = {
+IF hti # HTNull THEN {
+s: SubString ¬ SymbolOps.SubStringForName[SymbolOps.own, hti];
+iHti ¬ SymbolOps.FindString[iBase, s];
+IF iHti = HTNull THEN ERROR MissingHti;
+};
+};
+
+FindExternalCtx: PUBLIC PROC [mdi: MDIndex, iCtx: CTXIndex]
+RETURNS [ctx: IncludedCTXIndex ¬ IncludedCTXNull] = {
+IF mdi # MDNull AND OpenIncludedTable[mdi] THEN {
+ctx ¬ MapCtx[mdi, iCtx];
+CloseIncludedTable[];
+};
+};
+
+MapCtx: PROC [mdi: MDIndex, iCtx: CTXIndex] RETURNS [IncludedCTXIndex] = {
+ctx, last: IncludedCTXIndex;
+target: CTXIndex ¬ CTXNull;
+mdRoot: MDIndex ¬ mdi;
+IF iCtx # CTXNull THEN
+WITH iCtxb[iCtx] SELECT FROM
+included => [mdRoot, target] ¬ IncludedTargets[LOOPHOLE[iCtx]];
+imported => {
+IF iBase.mdb[iCtxb[includeLink].module].defaultImport # iCtx THEN
+ERROR;	-- need a signal to raise
+[mdRoot, target] ¬ IncludedTargets[includeLink];
+};
+ENDCASE => {mdRoot ¬ mdi; target ¬ iCtx};
+last ¬ IncludedCTXNull;
+FOR ctx ¬ mdb[mdRoot].ctx, ctxb[ctx].chain UNTIL ctx = CTXNull DO
+IF ctxb[ctx].map = target AND target # CTXNull THEN RETURN [ctx];
+last ¬ ctx;
+ENDLOOP;
+ctx ¬ table.Units[ctxType, CTXRecord.included.SIZE];
+ctxb[ctx] ¬ CTXRecord[
+level: IF iCtx = CTXNull THEN lZ ELSE iCtxb[iCtx].level,
+seList: ISENull,
+varUpdated: iCtx # CTXNull AND iCtxb[iCtx].varUpdated,
+extension: included[
+chain: IncludedCTXNull,
+module: mdRoot,
+map: target,
+restricted: FALSE,
+complete: FALSE,
+closed: FALSE,
+reset: FALSE]];
+IF last = IncludedCTXNull THEN mdb[mdRoot].ctx ¬ ctx ELSE ctxb[last].chain ¬ ctx;
+RETURN [ctx];
+};
+
+InverseMapCtx: PROC [ctx: CTXIndex] RETURNS [mdi: MDIndex, iCtx: CTXIndex] = {
+WITH ctxb[ctx] SELECT FROM
+included => {mdi ¬ module; iCtx ¬ map};
+imported => [mdi, iCtx] ¬ InverseMapCtx[includeLink];
+ENDCASE => {mdi ¬ OwnMdi; iCtx ¬ ctx};
+};
+
+IncludedTargets: PROC [iCtx: IncludedCTXIndex]
+RETURNS [mdi: MDIndex, ctx: CTXIndex] = {
+oldMdi: MDIndex = iCtxb[iCtx].module;
+s: SubString ¬ SymbolOps.SubStringForName[iBase, iBase.mdb[oldMdi].fileId];
+id: Name = MapHti[iBase.mdb[oldMdi].moduleId];
+mdi ¬ MimosaCopier.FindMdEntry[
+formalId: id,
+typeId: id,
+version: iBase.mdb[oldMdi].stamp,
+file: MapHti[iBase.mdb[oldMdi].fileId]];
+ctx ¬ iCtxb[iCtx].map;
+};
+
+UnknownModule: PUBLIC SIGNAL [HTIndex] = CODE;
+
+FillModule: PUBLIC PROC [sei: ISEIndex, typeId: HTIndex, mdi: MDIndex] = {
+IF mdi = MDNull OR ~OpenIncludedTable[mdi]
+THEN DummyCtxSe[sei]
+ELSE {
+{
+iHti: HTIndex ¬ InverseMapHti[typeId ! MissingHti => {GO TO failed}];
+iSei: ISEIndex ¬ SymbolOps.SearchContext[iBase, iHti, iBase.stHandle.directoryCtx];
+IF iSei = ISENull OR ~iSeb[iSei].public THEN GO TO failed;
+CopyCtxSeInfo[sei, iSei, mdi];
+seb[sei].public ¬ FALSE;
+EXITS
+failed => {SIGNAL UnknownModule[seb[sei].hash]; DummyCtxSe[sei]};
+};
+CloseIncludedTable[];
+};
+};
+
+DummyCtxSe: PROC [sei: ISEIndex] = {
+seb[sei].idType ¬ typeANY;
+seb[sei].idInfo ¬ seb[sei].idValue ¬ SymbolOps.EncodeCard[0];
+seb[sei].extended ¬ seb[sei].public ¬ seb[sei].linkSpace ¬ FALSE;
+seb[sei].immutable ¬ seb[sei].constant ¬ TRUE;
+seb[sei].mark3 ¬ seb[sei].mark4 ¬ TRUE;
+};
+
+
+TypeCacheSize: CARDINAL = 83;		-- prime < 256/3
+TypeCacheIndex: TYPE = [0..TypeCacheSize);
+TypeCache: TYPE = ARRAY TypeCacheIndex OF RECORD [
+mdi: MDIndex,
+iSei: SEIndex,	-- mdi & iSei are search keys
+sei: SEIndex];	-- the result
+
+typeCache: REF TypeCache = MimZones.permZone.NEW[TypeCache];
+
+TypeHash: PROC [mdi: MDIndex, iSei: SEIndex] RETURNS [TypeCacheIndex] = INLINE {
+RETURN [((mdi-OwnMdi)*(iSei-SENull)) MOD TypeCacheSize];
+};
+
+CacheType: PROC [mdi: MDIndex, iSei, sei: SEIndex] = {
+IF useCaches THEN typeCache[TypeHash[mdi, iSei]] ¬ [mdi: mdi, iSei: iSei, sei: sei];
+};
+
+
+CopyIncludedSymbol: PROC [iSei: SEIndex, mdi: MDIndex] RETURNS [SEIndex] = {
+sei: SEIndex ¬ SENull;
+IF iSei = SENull THEN RETURN [sei];
+WITH iSe: iSeb[iSei] SELECT FROM
+id => {
+hti: HTIndex = MapHti[iSe.hash];
+iiSei: ISEIndex = LOOPHOLE[iSei, ISEIndex];
+IF iSe.idCtx IN [FirstStandardCtx .. LastStandardCtx]
+THEN {
+sei ¬ SymbolOps.SearchContext[SymbolOps.own, hti, iSe.idCtx];
+IF sei = SENull THEN ERROR;
+}
+ELSE {
+ctx: IncludedCTXIndex = MapCtx[mdi, iSe.idCtx];
+tSei: ISEIndex = SymbolOps.SearchContext[SymbolOps.own, hti, ctx];
+IF hti = HTNull THEN {
+IF ctxb[ctx].seList # SENull THEN RETURN [ctxb[ctx].seList];
+sei ¬ CopyCtxSe[iiSei, hti, ctx, mdi];
+RETURN [sei];
+};
+sei ¬ tSei;
+IF sei # SENull
+THEN seb[tSei].idCtx ¬ ctx
+ELSE {
+iMdi: MDIndex ¬ ctxb[ctx].module;
+IF iMdi = mdi 
+OR (
+iBase.stHandle.extended AND
+(~iSe.extended OR iBase.stHandle.definitionsFile) AND
+~mdb[iMdi].shared)
+THEN
+sei ¬ CopyCtxSe[iiSei, hti, ctx, mdi]
+ELSE {
+CloseIncludedTable[];
+IF OpenIncludedTable[iMdi]
+THEN iSei ¬ SymbolOps.SearchContext[
+iBase, InverseMapHti[hti], ctxb[ctx].map]
+ELSE [] ¬ OpenIncludedTable[iMdi ¬ mdi];
+sei ¬ CopyCtxSe[LOOPHOLE[iSei, ISEIndex], hti, ctx, iMdi];
+CloseIncludedTable[];
+[] ¬ OpenIncludedTable[mdi];
+};
+};
+};
+};
+cons =>
+WITH iType: iSe SELECT FROM
+mode => sei ¬ typeTYPE;
+basic => sei ¬ MapBasicType[iType.code];
+ENDCASE => {
+i: TypeCacheIndex = TypeHash[mdi, iSei];
+IF useCaches
+AND typeCache[i].iSei = iSei
+AND typeCache[i].mdi = mdi
+THEN sei ¬ typeCache[i].sei
+ELSE sei ¬ CopyNonCtxSe[LOOPHOLE[iSei, CSEIndex], mdi];
+};
+ENDCASE;
+RETURN [sei];
+};
+
+CopyCtxSe: PROC [iSei: ISEIndex, hti: HTIndex, ctx: CTXIndex, mdi: MDIndex]
+RETURNS [sei: ISEIndex] = {
+sei ¬ SymbolOps.MakeCtxSe[hti, ctx];
+CopyCtxSeInfo[sei, iSei, mdi];
+};
+
+CopyCtxSeInfo: PROC [sei, iSei: ISEIndex, mdi: MDIndex] = {
+IF sei = ISENull OR iSei = ISENull THEN RETURN;
+IF iSeb[iSei].idCtx = CTXNull THEN seb[sei].idCtx ¬ CTXNull;
+seb[sei].extended ¬ iSeb[iSei].extended;
+seb[sei].public ¬ iSeb[iSei].public;
+seb[sei].immutable ¬ iSeb[iSei].immutable;
+seb[sei].constant ¬ iSeb[iSei].constant;
+seb[sei].linkSpace ¬ iSeb[iSei].linkSpace;
+seb[sei].idType ¬ CopyIncludedSymbol[iSeb[iSei].idType, mdi];
+IF iSeb[iSei].idType = typeTYPE
+THEN
+seb[sei].idInfo ¬ SymbolOps.EncodeType[
+CopyIncludedSymbol[SymbolOps.DecodeType[iSeb[iSei].idInfo], mdi]]
+ELSE
+IF iSeb[iSei].constant AND
+(SELECT SymbolOps.XferMode[iBase, iSeb[iSei].idType] FROM
+proc, program=> TRUE,
+ENDCASE => FALSE)
+THEN seb[sei].idInfo ¬ SymbolOps.EncodeBti[
+CopyIncludedBody[SymbolOps.DecodeBti[iSeb[iSei].idInfo], sei, mdi]]
+ELSE seb[sei].idInfo ¬ iSeb[iSei].idInfo;
+IF iSeb[iSei].idType = typeTYPE
+AND SymbolOps.CtxLevel[iBase, iSeb[iSei].idCtx] # lZ 
+AND ~iBase.stHandle.extended
+THEN seb[sei].idValue ¬ SymbolOps.EncodeCard[iSei - ISEFirst]
+ELSE seb[sei].idValue ¬ iSeb[iSei].idValue;
+seb[sei].mark3 ¬ seb[sei].mark4 ¬ TRUE;
+IF seb[sei].extended
+THEN CopyExtension[sei, iSei, mdi]
+ELSE IF seb[sei].linkSpace THEN seb[sei].idInfo ¬ SymbolOps.EncodeCard[0];
+};
+
+currentBody: BTIndex;
+
+FindExtension: PROC [base: STB, sei: ISEIndex]
+RETURNS [type: ExtensionType, tree: Tree.Link] = {
+OPEN SymbolSegment;
+extLimit: ExtIndex = LOOPHOLE[base.extLimit];	-- type may lie
+FOR exti: ExtIndex ¬ ExtFirst, exti + ExtRecord.SIZE UNTIL exti = extLimit DO
+IF base.extb[exti].sei = sei THEN RETURN [base.extb[exti].type, base.extb[exti].tree];
+ENDLOOP;
+RETURN [$none, Tree.Null];
+};
+
+CopyExtension: PROC [sei, iSei: ISEIndex, mdi: MDIndex] = {
+iType: ExtensionType;
+iTree: Tree.Link;
+saveCurrentBody: BTIndex = currentBody;
+currentBody ¬ BTNull;
+[iType, iTree] ¬ FindExtension[iBase, iSei];
+WITH iTree SELECT TreeOps.GetTag[iTree] FROM
+subtree => IF iBase.tb[index].name = body THEN
+currentBody ¬ SymbolOps.DecodeBti[seb[sei].idInfo];
+ENDCASE;
+SymbolOps.EnterExtension[sei, iType, InputExtension[iTree, mdi]];
+currentBody ¬ saveCurrentBody;
+};
+
+InputExtension: PROC [t: Tree.Link, mdi: MDIndex] RETURNS [Tree.Link] = {
+InputTree: Tree.Map = {
+WITH link: t SELECT TreeOps.GetTag[t] FROM
+hash =>
+v ¬ [hash[index: MapHti[link.index]]];
+symbol =>
+v ¬ [symbol[index: LOOPHOLE[CopyIncludedSymbol[link.index, mdi]]]];
+literal =>
+v ¬ [literal[LiteralOps.CopyLiteral[[baseP: @iBase.ltb, index: link.index]]]];
+string => {
+v ¬ t;
+IF link.index # Literals.STNull THEN
+v ¬ [string[LiteralOps.CopyStringLiteral[@iBase.stb, link.index]]];
+};
+subtree => {
+iNode: Tree.Index = link.index;
+v ¬ SELECT iBase.tb[iNode].name FROM
+block, ditem => InputBlock[iNode],
+IN [forseq .. downthru] => InputBlock[iNode],
+openx =>
+TreeOps.CopyTree[[baseP: @iBase.tb, link: iBase.tb[iNode].son[1]], InputTree],
+ENDCASE => TreeOps.CopyTree[[baseP: @iBase.tb, link: link], InputTree];
+WITH v SELECT TreeOps.GetTag[v] FROM
+subtree => {
+node: Tree.Index = index;
+name: Tree.NodeName = tb[node].name;
+SELECT name FROM
+body => tb[node].info ¬ SymbolOps.FromBti[currentBody];
+block, ditem => ExitBlock[node];
+safen => {
+v ¬ tb[node].son[1];
+tb[node].son[1] ¬ Tree.Null;
+TreeOps.FreeNode[node];
+};
+IN [basicTC..discrimTC], IN [apply..typecode],
+textlit, exlist, lengthen, shorten, ord, val, proccheck => {
+type: Symbols.SEIndex = CopyIncludedSymbol[SymbolOps.ToType[iBase.tb[iNode].info], mdi];
+ut: Symbols.CSEIndex = SymbolOps.UnderType[SymbolOps.own, type];
+tb[node].info ¬ SymbolOps.FromType[type];
+SELECT name FROM
+construct, exlist => CompleteRecord[ut, mdi, TRUE];
+dollar => {
+WITH tb[node].son[1] SELECT TreeOps.GetTag[tb[node].son[1]] FROM
+subtree => {
+sei: CSEIndex = SymbolOps.UnderType[SymbolOps.own, SymbolOps.ToType[tb[index].info]];
+WITH type: seb[sei] SELECT FROM
+record =>
+IF type.argument THEN
+WITH tb[node].son[2] SELECT TreeOps.GetTag[tb[node].son[2]] FROM
+symbol => index ¬ SymbolOps.SearchContext[
+SymbolOps.own, seb[index].hash, type.fieldCtx];
+ENDCASE => ERROR;
+ENDCASE;
+};
+ENDCASE;
+};
+union => {
+son1: Tree.Link ¬ tb[node].son[1];
+WITH s: son1 SELECT TreeOps.GetTag[son1] FROM
+symbol => {
+sType: Symbols.CSEIndex = SymbolOps.UnderType[SymbolOps.own, s.index];
+CompleteRecord[sType, mdi, FALSE];
+};
+ENDCASE => ERROR;
+};
+apply => FillUnion[ut, mdi];
+bindx => FillBinding[node, mdi];
+atom => IF NOT MimData.interface THEN {
+name: Symbols.Name = TreeOps.GetHash[tb[index].son[1]];
+referentType: Symbols.Type = SymbolOps.ReferentType[SymbolOps.own, type];
+SymLiteralOps.EnterType[type: referentType, used: TRUE];
+SymLiteralOps.EnterAtom[name];
+};
+textlit => IF NOT MimData.interface THEN {
+referentType: Symbols.Type = SymbolOps.TypeRoot[
+SymbolOps.own,
+SymbolOps.ReferentType[SymbolOps.own, type]];
+sti: Literals.STIndex = LiteralOps.FindHeapString[
+TreeOps.GetStr[tb[index].son[1]],
+referentType];
+tb[index].son[1] ¬ [string[sti]];
+SymLiteralOps.EnterType[type: referentType, used: TRUE];
+SymLiteralOps.EnterText[sti, type];
+};
+ENDCASE;
+};
+IN [forseq..downthru] => NULL;
+do => {
+son1: Tree.Link = tb[node].son[1];
+IF TreeOps.OpName[son1] IN [forseq..downthru] THEN
+ExitBlock[TreeOps.GetNode[son1]];
+GO TO nullSource;
+};
+bind => FillBinding[node, mdi];
+catch => {
+TreeOps.ScanList[tb[node].son[1], UpdateType];
+GO TO nullSource;
+};
+IN [assign..join], decl, typedecl => GO TO nullSource;
+ENDCASE;
+EXITS nullSource =>
+tb[index].info ¬ TreeOps.FromLoc[SourceMap.nullLoc];
+};
+ENDCASE;
+};
+ENDCASE => ERROR;
+};
+
+UpdateType: Tree.Scan = {
+WITH t SELECT TreeOps.GetTag[t] FROM
+subtree =>
+tb[index].info ¬ SymbolOps.FromType[CopyIncludedSymbol[SymbolOps.ToType[tb[index].info], mdi]];
+ENDCASE;
+};
+
+FillBinding: PROC [node: Tree.Index, mdi: MDIndex] = {
+WITH tb[node].son[1] SELECT TreeOps.GetTag[tb[node].son[1]] FROM
+subtree => {
+subNode: Tree.Index = index;
+rType: CSEIndex = 
+WITH tb[subNode].son[2] SELECT TreeOps.GetTag[tb[subNode].son[2]] FROM
+symbol => SymbolOps.UnderType[SymbolOps.own, seb[index].idType],
+subtree => SymbolOps.UnderType[SymbolOps.own, SymbolOps.ToType[tb[index].info]],
+ENDCASE => ERROR;
+CompleteRecord[rType, mdi, FALSE]};
+ENDCASE => ERROR;
+};
+
+InputBlock: PROC [iNode: Tree.Index] RETURNS [v: Tree.Link] = {
+iBti: BTIndex = SymbolOps.ToBti[iBase.tb[iNode].info];
+n: CARDINAL = iBase.tb[iNode].nSons;
+bti: BTIndex ¬ BTNull;
+IF iBti # BTNull THEN {
+ctx: IncludedCTXIndex = MapCtx[mdi, iBase.bb[iBti].localCtx];
+bti ¬ table.Units[bodyType, BodyRecord.Other.SIZE];
+bb[bti] ¬ BodyRecord[
+link: ,
+firstSon: BTNull,
+type: LOOPHOLE[CopyIncludedSymbol[iBase.bb[iBti].type, mdi]],
+localCtx: ctx,
+level: iBase.bb[iBti].level,
+class: iBase.bb[iBti].class,
+sourceIndex: SourceMap.nullLoc.Down[],
+info: ,
+extension: Other[relOffset: ]];
+SymbolOps.LinkBti[bti: bti, parent: currentBody];
+currentBody ¬ bti;
+};
+FOR i: CARDINAL IN [1 .. n] DO
+TreeOps.PushTree[InputTree[iBase.tb[iNode].son[i]]];
+ENDLOOP;
+TreeOps.PushNode[iBase.tb[iNode].name, n];
+TreeOps.SetAttrs[iBase.tb[iNode].attr1, iBase.tb[iNode].attr2, iBase.tb[iNode].attr3];
+TreeOps.SetInfo[SymbolOps.FromBti[bti]];
+v ¬ TreeOps.PopTree[];
+IF bti # BTNull THEN
+bb[bti].info ¬ [cases: Internal[bodyTree: TreeOps.GetNode[v], thread: Tree.nullIndex, frameSize: 0]];
+};
+
+ExitBlock: PROC [node: Tree.Index] = INLINE {
+IF SymbolOps.ToBti[tb[node].info] # BTNull THEN
+currentBody ¬ SymbolOps.ParentBti[SymbolOps.own, SymbolOps.ToBti[tb[node].info]];
+};
+
+RETURN [InputTree[t]];
+};
+
+CopyExternalBody: PUBLIC PROC [mdi: MDIndex, iBti: CBTIndex]
+RETURNS [bti: CBTIndex ¬ CBTNull] = {
+IF iBti # CBTNull AND mdi # MDNull AND OpenIncludedTable[mdi] THEN {
+iSei: ISEIndex = iBase.bb[iBti].id;
+IF iSei # ISENull
+THEN {
+sei: ISEIndex ¬ LOOPHOLE[CopyIncludedSymbol[iSei, mdi]]; 
+bti ¬ SymbolOps.DecodeBti[seb[sei].idInfo];
+}
+ELSE bti ¬ CopyIncludedBody[iBti, ISENull, mdi];
+CloseIncludedTable[];
+};
+};
+
+CopyIncludedBody: PROC [iBti: CBTIndex, sei: ISEIndex, mdi: MDIndex]
+RETURNS [bti: CBTIndex ¬ CBTNull] = {
+IF iBti # BTNull THEN {
+iCtx: CTXIndex ¬ iBase.bb[iBti].localCtx;
+bti ¬ table.Units[bodyType, BodyRecord.Callable.SIZE];
+bb[bti] ¬ iBase.bb[iBti];
+bb[bti].link ¬ [which: parent, index: BTNull];
+bb[bti].firstSon ¬ BTNull;
+bb[bti].id ¬ sei;
+IF iCtx = CTXNull
+THEN {
+bb[bti].localCtx ¬ CTXNull;
+bb[bti].type ¬ RecordSENull;
+}
+ELSE {
+bb[bti].localCtx ¬ MapCtx[mdi, iCtx];
+bb[bti].type ¬ LOOPHOLE[CopyIncludedSymbol[iBase.bb[iBti].type, mdi]];
+};
+IF iBase.bb[iBti].inline
+THEN {
+bb[bti].ioType ¬ CopyBodyType[iBase.bb[iBti].ioType, mdi];
+WITH body: bb[bti].info SELECT FROM
+Internal => body.thread ¬ body.bodyTree ¬ Tree.nullIndex;
+ENDCASE;
+}
+ELSE
+bb[bti].ioType ¬ IF sei = ISENull OR seb[seb[sei].idType].seTag = id
+THEN CopyBodyType[iBase.bb[iBti].ioType, mdi]
+ELSE SymbolOps.UnderType[SymbolOps.own, seb[sei].idType];
+};
+};
+
+MapBasicType: PROC [code: CARDINAL] RETURNS [CSEIndex] = {
+FOR sei: ISEIndex ¬ SymbolOps.FirstCtxSe[SymbolOps.own, FirstStandardCtx], SymbolOps.NextSe[SymbolOps.own, sei]
+UNTIL sei = ISENull DO
+IF seb[sei].idType = typeTYPE THEN {
+tSei: CSEIndex = SymbolOps.UnderType[SymbolOps.own, sei];
+WITH t: seb[tSei] SELECT FROM
+basic => IF t.code = code THEN RETURN [tSei];
+ENDCASE;
+};
+ENDLOOP;
+ERROR;
+};
+
+CopyNonCtxSe: PROC [iSei: CSEIndex, mdi: MDIndex] RETURNS [sei: CSEIndex] = {
+tSei1, tSei2: SEIndex;
+WITH iType: iSeb[iSei] SELECT FROM
+signed => {
+sei ¬ SymbolOps.MakeNonCtxSe[SERecord.cons.signed.SIZE];
+seb[sei].typeInfo ¬ signed[length: iType.length];
+CacheType[mdi, iSei, sei];
+};
+unsigned => {
+sei ¬ SymbolOps.MakeNonCtxSe[SERecord.cons.unsigned.SIZE];
+seb[sei].typeInfo ¬ unsigned[length: iType.length];
+CacheType[mdi, iSei, sei];
+};
+real => {
+sei ¬ SymbolOps.MakeNonCtxSe[SERecord.cons.real.SIZE];
+seb[sei].typeInfo ¬ real[length: iType.length];
+CacheType[mdi, iSei, sei];
+};
+enumerated => {
+tCtx: CTXIndex;
+sei ¬ SymbolOps.MakeNonCtxSe[SERecord.cons.enumerated.SIZE];
+tCtx ¬ IF iType.valueCtx IN [FirstStandardCtx .. LastStandardCtx]
+THEN iType.valueCtx
+ELSE CopyIncludedValues[~iType.painted, iType.valueCtx, mdi, sei];
+seb[sei].typeInfo ¬ enumerated[
+ordered: iType.ordered,
+machineDep: iType.machineDep,
+painted: iType.painted,
+sparse: iType.sparse,
+valueCtx: tCtx,
+empty: iType.empty,
+range: iType.range];
+CacheType[mdi, iSei, sei];
+};
+record => {
+tCtx: CTXIndex = IF iType.fieldCtx IN [FirstStandardCtx .. LastStandardCtx]
+THEN iType.fieldCtx
+ELSE MapCtx[mdi, iType.fieldCtx];
+oldParent: RecordSEIndex ¬ parentRecordType;
+WITH iType SELECT FROM
+notLinked => {
+sei ¬ SymbolOps.MakeNonCtxSe[SERecord.cons.record.notLinked.SIZE];
+CacheType[mdi, iSei, sei];
+seb[sei].typeInfo ¬ record[
+machineDep: iType.machineDep,
+bitOrder: iType.bitOrder,
+grain: iType.grain,
+spare: iType.spare,
+list: iType.list,
+painted: iType.painted,
+argument: iType.argument,
+packed: iType.packed,
+hints: iType.hints,
+fieldCtx: tCtx,
+length: iType.length,
+monitored: iType.monitored,
+linkPart: notLinked[]];
+};
+linked => {
+sei ¬ SymbolOps.MakeNonCtxSe[SERecord.cons.record.linked.SIZE];
+CacheType[mdi, iSei, sei];
+tSei1 ¬ CopyIncludedSymbol[linkType, mdi];
+seb[sei].typeInfo ¬ record[
+machineDep: iType.machineDep,
+bitOrder: iType.bitOrder,
+grain: iType.grain,
+spare: iType.spare,
+list: iType.list,
+painted: iType.painted,
+argument: iType.argument,
+packed: iType.packed,
+hints: iType.hints,
+fieldCtx: tCtx,
+length: iType.length,
+monitored: iType.monitored,
+linkPart: linked[linkType: tSei1]];
+};
+ENDCASE;
+parentRecordType ¬ LOOPHOLE[sei];
+IF ~iType.painted OR (iType.hints.refField AND iType.hints.unifield) THEN
+CopyContext[tCtx, iType.fieldCtx, mdi, unit];
+parentRecordType ¬ oldParent;
+};
+ref => {
+sei ¬ SymbolOps.MakeNonCtxSe[SERecord.cons.ref.SIZE];
+CacheType[mdi, iSei, sei];
+tSei1 ¬ CopyIncludedSymbol[iType.refType, mdi];
+seb[sei].typeInfo ¬ ref[
+refType: tSei1,
+counted: iType.counted,
+var: iType.var,
+readOnly: iType.readOnly,
+ordered: iType.ordered,
+list: iType.list,
+basing: iType.basing,
+length: iType.length];
+};
+array => {
+sei ¬ SymbolOps.MakeNonCtxSe[SERecord.cons.array.SIZE];
+CacheType[mdi, iSei, sei];
+tSei1 ¬ CopyIncludedSymbol[iType.indexType, mdi];
+tSei2 ¬ CopyIncludedSymbol[iType.componentType, mdi];
+seb[sei].typeInfo ¬ array[
+packed: iType.packed,
+bitOrder: iType.bitOrder,
+indexType: tSei1,
+componentType: tSei2];
+};
+arraydesc => {
+sei ¬ SymbolOps.MakeNonCtxSe[SERecord.cons.arraydesc.SIZE];
+CacheType[mdi, iSei, sei];
+tSei1 ¬ CopyIncludedSymbol[iType.describedType, mdi];
+seb[sei].typeInfo ¬ arraydesc[
+describedType: tSei1,
+var: iType.var,
+readOnly: iType.readOnly,
+bitOrder: iType.bitOrder,
+length: iType.length];
+};
+transfer => {
+argSei1, argSei2: CSEIndex;
+sei ¬ SymbolOps.MakeNonCtxSe[SERecord.cons.transfer.SIZE];
+argSei1 ¬ CopyArgs[iType.typeIn, mdi, FALSE];
+argSei2 ¬ CopyArgs[iType.typeOut, mdi, FALSE];
+seb[sei].typeInfo ¬ transfer[
+typeIn: argSei1,
+typeOut: argSei2,
+mode: iType.mode,
+safe: iType.safe,
+length: iType.length];
+};
+definition => {
+sei ¬ SymbolOps.MakeNonCtxSe[SERecord.cons.definition.SIZE];
+seb[sei].typeInfo ¬ definition[
+defCtx: MapCtx[mdi, iType.defCtx],
+named: iType.named,
+slots: iType.slots];
+};
+union => {
+tag: ISEIndex;
+tCtx: CTXIndex;
+sei ¬ SymbolOps.MakeNonCtxSe[SERecord.cons.union.SIZE];
+CacheType[mdi, iSei, sei];
+tCtx ¬ MapCtx[mdi, iType.caseCtx];
+tag ¬ CopyCtxSe[iType.tagSei, MapHti[iSeb[iType.tagSei].hash], CTXNull, mdi];
+seb[sei].typeInfo ¬ union[
+caseCtx: tCtx,
+tagSei: tag,
+hints: iType.hints,
+overlaid: iType.overlaid,
+controlled: iType.controlled,
+machineDep: iType.machineDep,
+bitOrder: iType.bitOrder,
+grain: iType.grain
+];
+};
+sequence => {
+tag: ISEIndex;
+sei ¬ SymbolOps.MakeNonCtxSe[SERecord.cons.sequence.SIZE];
+CacheType[mdi, iSei, sei];
+tSei1 ¬ CopyIncludedSymbol[iType.componentType, mdi];
+tag ¬ CopyCtxSe[iType.tagSei, MapHti[iSeb[iType.tagSei].hash], CTXNull, mdi];
+seb[sei].typeInfo ¬ sequence[
+parentType: parentRecordType,
+tagSei: tag,
+componentType: tSei1,
+packed: iType.packed,
+controlled: iType.controlled,
+machineDep: iType.machineDep,
+bitOrder: iType.bitOrder,
+grain: iType.grain
+];
+};
+relative => {
+tSei3: SEIndex;
+sei ¬ SymbolOps.MakeNonCtxSe[SERecord.cons.relative.SIZE];
+CacheType[mdi, iSei, sei];
+tSei1 ¬ CopyIncludedSymbol[iType.baseType, mdi];
+tSei2 ¬ CopyIncludedSymbol[iType.offsetType, mdi];
+tSei3 ¬ IF iType.resultType = iType.offsetType
+THEN tSei2
+ELSE CopyIncludedSymbol[iType.resultType, mdi];
+seb[sei].typeInfo ¬ relative[
+baseType: tSei1,
+offsetType: tSei2,
+resultType: tSei3];
+};
+subrange => {
+sei ¬ SymbolOps.MakeNonCtxSe[SERecord.cons.subrange.SIZE];
+tSei1 ¬ CopyIncludedSymbol[iType.rangeType, mdi];
+seb[sei].typeInfo ¬ subrange[
+rangeType: tSei1,
+origin: iType.origin,
+range: iType.range,
+filled: iType.filled,
+biased: iType.biased,
+empty: iType.empty];
+CacheType[mdi, iSei, sei];
+};
+opaque => {
+sei ¬ SymbolOps.MakeNonCtxSe[SERecord.cons.opaque.SIZE];
+CacheType[mdi, iSei, sei];
+tSei1 ¬ CopyIncludedSymbol[iType.id, mdi];
+seb[sei].typeInfo ¬ opaque[
+id: LOOPHOLE[tSei1],
+length: iType.length,
+lengthKnown: iType.lengthKnown];
+};
+zone => {
+sei ¬ SymbolOps.MakeNonCtxSe[SERecord.cons.zone.SIZE];
+seb[sei].typeInfo ¬ zone[
+counted: iType.counted,
+mds: iType.mds,
+length: iType.length];
+CacheType[mdi, iSei, sei];
+};
+any => {
+sei ¬ SymbolOps.MakeNonCtxSe[SERecord.cons.any.SIZE];
+seb[sei].typeInfo ¬ any[];
+CacheType[mdi, iSei, sei];
+};
+ENDCASE => ERROR;
+seb[sei].align ¬ iSeb[iSei].align;
+seb[sei].mark3 ¬ seb[sei].mark4 ¬ TRUE;
+};
+
+CopyBodyType: PROC [iSei: CSEIndex, mdi: MDIndex] RETURNS [sei: CSEIndex] = {
+argSei1, argSei2: CSEIndex;
+WITH iType: iSeb[iSei] SELECT FROM
+transfer => {
+sei ¬ SymbolOps.MakeNonCtxSe[SERecord.cons.transfer.SIZE];
+argSei1 ¬ CopyArgs[iType.typeIn, mdi, TRUE];
+argSei2 ¬ CopyArgs[iType.typeOut, mdi, TRUE];
+seb[sei].typeInfo ¬ transfer[
+mode: iType.mode, safe: iType.safe,
+typeIn: argSei1, typeOut: argSei2];
+};
+ENDCASE => ERROR;
+seb[sei].mark3 ¬ seb[sei].mark4 ¬ TRUE;
+};
+
+CopyArgs: PROC [iargSei: CSEIndex, mdi: MDIndex, mapped: BOOL]
+RETURNS [argSei: CSEIndex ¬ CSENull] = {
+IF iargSei # CSENull THEN 
+WITH t: iSeb[iargSei] SELECT FROM
+record => {
+iCtx: CTXIndex = t.fieldCtx;
+ctx: CTXIndex;
+argSei ¬ SymbolOps.MakeNonCtxSe[SERecord.cons.record.notLinked.SIZE];
+IF ~mapped
+THEN ctx ¬ SymbolOps.NewCtx[SymbolOps.CtxLevel[iBase, iCtx]]
+ELSE {
+tCtx: IncludedCTXIndex = MapCtx[mdi, iCtx];
+ctxb[tCtx].complete ¬ TRUE;
+ResetCtx[tCtx];
+ctx ¬ tCtx;
+};
+IF ctxb[ctx].seList = ISENull THEN {
+seChain: ISEIndex ¬ SymbolOps.MakeSeChain[ctx,
+SymbolOps.CtxEntries[iBase, iCtx], FALSE];
+sei, iSei: ISEIndex;
+ctxb[ctx].seList ¬ seChain;
+FOR iSei ¬ iCtxb[iCtx].seList, SymbolOps.NextSe[iBase, iSei]
+UNTIL iSei = ISENull DO
+sei ¬ seChain;
+seChain ¬ SymbolOps.NextSe[SymbolOps.own, seChain];
+seb[sei].hash ¬ MapHti[iSeb[iSei].hash];
+CopyCtxSeInfo[sei, iSei, mdi];
+ENDLOOP;
+};
+seb[argSei] ¬ SERecord[
+mark3: TRUE, mark4: TRUE,
+body: cons[
+align: t.align,
+typeInfo: record[
+machineDep: FALSE, list: FALSE, spare: FALSE,
+painted: FALSE, argument: TRUE, packed: FALSE,
+grain: t.grain,
+bitOrder: t.bitOrder,
+hints: t.hints,
+fieldCtx: ctx,
+length: t.length,
+monitored: FALSE,
+linkPart: notLinked[]]]];
+IF useCaches THEN {
+i: TypeCacheIndex = TypeHash[mdi, iargSei];
+typeCache[i] ¬ [mdi: mdi, iSei: iargSei, sei: argSei];
+};
+};
+ENDCASE => argSei ¬ CopyNonCtxSe[iargSei, mdi];
+};
+
+CopyIncludedValues: PROC [full: BOOL, iCtx: CTXIndex, mdi: MDIndex, type: SEIndex]
+RETURNS [ctx: IncludedCTXIndex] = {
+iSei, sei, seChain: ISEIndex;
+ctx ¬ MapCtx[mdi, iCtx];
+iSei ¬ iCtxb[iCtx].seList;
+IF full OR (iSei # SENull AND iSeb[iSeb[iSei].idType].seTag # id) THEN {
+seChain ¬ SymbolOps.MakeSeChain[ctx, SymbolOps.CtxEntries[iBase, iCtx], FALSE];
+ctxb[ctx].seList ¬ seChain;
+ctxb[ctx].closed ¬ ctxb[ctx].reset ¬ TRUE;
+UNTIL iSei = SENull DO
+sei ¬ seChain;
+seChain ¬ SymbolOps.NextSe[SymbolOps.own, seChain];
+seb[sei].hash ¬ MapHti[iSeb[iSei].hash];
+seb[sei].extended ¬ seb[sei].linkSpace ¬ FALSE;
+seb[sei].immutable ¬ seb[sei].constant ¬ TRUE;
+seb[sei].public ¬ iSeb[iSei].public;
+seb[sei].idType ¬ type;  seb[sei].idInfo ¬ SymbolOps.EncodeCard[0];
+seb[sei].idValue ¬ iSeb[iSei].idValue;
+seb[sei].mark3 ¬ seb[sei].mark4 ¬ TRUE;
+iSei ¬ SymbolOps.NextSe[iBase, iSei];
+ENDLOOP;
+ctxb[ctx].copied ¬ full;
+ctxb[ctx].complete ¬ TRUE;
+};
+};
+
+
+ResetCtx: PROC [ctx: IncludedCTXIndex] = {
+IF ~ctxb[ctx].reset THEN {
+SymbolOps.ResetCtxList[ctx];
+ctxb[ctx].closed ¬ ctxb[ctx].reset ¬ TRUE;
+};
+};
+
+ResetIncludeContexts: PROC = {
+limit: MDIndex = table.Top[mdType];
+FOR mdi: MDIndex ¬ MDFirst, mdi + MDRecord.SIZE UNTIL mdi = limit DO
+FOR ctx: IncludedCTXIndex ¬ mdb[mdi].ctx, ctxb[ctx].chain UNTIL ctx = CTXNull DO
+ctxb[ctx].copied ¬ none;	-- clear bits (**** until bootstrap ****)
+ResetCtx[ctx];
+ENDLOOP;
+ENDLOOP;
+ResetCaches[];
+};
+
+Outer: PUBLIC PROC [mdi: MDIndex, inner: PROC [STB]] = {
+IF mdi # MDNull AND OpenIncludedTable[mdi] THEN {
+inner[iBase ! UNWIND => {CloseIncludedTable[]}];
+CloseIncludedTable[];
+};
+};
+
+TableRelocated: PUBLIC SIGNAL = CODE;
+
+OpenIncludedTable: PROC [mdi: MDIndex] RETURNS [success: BOOL] = {
+base: STB =
+IF mdi = OwnMdi THEN SymbolOps.own ELSE MimosaCopier.GetSymbolTable[mdi];
+IF success ¬ (base # NIL) THEN {
+iBase ¬ base;
+IF mdi # OwnMdi THEN iBase.notifier ¬ IRelocNotify;
+INotify[];
+};
+};
+
+IRelocNotify: PROC [base: STB] = {
+IF base = iBase THEN {INotify[]; SIGNAL TableRelocated};
+};
+
+CloseIncludedTable: PROC = {
+IF iBase # SymbolOps.own THEN {
+iBase.notifier ¬ NIL;
+MimosaCopier.FreeSymbolTable[iBase];
+};
+iBase ¬ NIL;
+};
+
+}.
+
+   @  
+MimosaCopierImpl.mesa
+(formerly just "SymbolCopier.mesa")
+Copyright Ó 1985, 1986, 1987, 1988, 1989, 1991 by Xerox Corporation.  All rights reserved.
+Satterthwaite, June 18, 1986 12:19:38 pm PDT
+Russ Atkinson (RRA) November 20, 1989 7:51:39 pm PST
+Willie-s, September 24, 1991 2:20 pm PDT
+tables defining the current symbol table
+called whenever the main symbol table is repacked
+table bases for the current include module
+called whenever iBase switches or tables moved
+initialization/finalization
+see ResetIncludeContexts
+manipulation of symbol tokens (without copying)
+copying across table boundaries
+If in the memoCache, then not found in a previous search of the context
+context completion
+recursive type completion
+N.B.  still incomplete if depth > rc
+variant copying
+mappings
+allow failure exit
+caching of (cons) types
+copying symbols
+A null hash?  How does this happen?
+We assume that the first entry is OK.
+A last ditch attempt to copy the info!
+needed for transition only (pass 4 now places safens)
+Keep this consistent with Pass3Xb.Exp (atom case)
+Need the root of the referent type to go into the literal table.  This type is known to be opaque (referent of ATOM).
+Always enter the referent type for a REF literal
+Keep this consistent with Pass3Xb.StringRef
+Need the root of the referent type to go into the literal table.  This allows REF literals to be REFs to variant records (as in Rope.ROPE).
+Alter the tree to reflect the new sti.
+Always enter the referent type for a REF literal
+RRA: some day fix this to not lose the source file information!
+do not use cache (in case of importing)
+included module accounting
+Russ Atkinson (RRA) July 31, 1987 6:38:19 pm PDT
+Changed to accomodate bitOrder & grain fields in records
+Russ Atkinson (RRA) January 14, 1988 4:03:25 pm PST
+added support for maintaining the parentType field in sequences
+Ê&Z  –(cedarcode) style•NewlineDelimiter
+™ headšœ™Icodešœ#™#Lšœ
+ÏeœO™ZLšÏy,™,L™4L™(—˜ šÏk	˜	LšœŸœ7˜BLšœŸœ˜LšœŸœ˜ LšœŸœ2˜BLšœ	Ÿœ˜*LšœŸœ˜LšœŸœ0˜BLšœ	Ÿœ˜Lšœ
+Ÿœ˜ Lšœ
+Ÿœ“˜¢LšœŸœŸ˜¬LšœŸœ!˜4LšœŸœ˜LšœŸœ˜.LšœŸœ#˜6LšœŸœE˜OLšœŸœƒ˜——šÏnœŸ˜LšŸœi˜pLšŸœ˜&LšŸœ	˜L˜ LšŸœŸœŸœ˜#LšœŸœŸœ)˜HL˜ —™(L˜ LšœŸœ˜L˜ LšœŸœÏc˜%LšœŸœ¡˜*LšœŸœ¡˜1LšœŸœ¡˜&LšœŸœ¡˜#L˜ š œ˜ L™1L˜L˜L˜L˜L˜LšŸœ	ŸœŸœŸœ˜8L˜L˜ ——™*L˜ LšœŸœŸœ˜L˜ LšœŸœ˜LšœŸœ˜LšœŸœ˜L˜ š œŸœ˜L™.L˜L˜L˜L˜L˜ —LšœŸœ	¡˜.š	œŸœŸœŸœŸœ˜8L˜L˜L˜ —LšœŸœ!Ÿœ˜@L˜ Lšœ/˜/L˜ LšœŸœŸœ˜L˜ —™L˜ š
+ 
+œŸœŸœ+ŸœŸœ˜_LšœŸœ˜L˜L˜Lšœ˜Lšœ˜L˜Lšœ ˜ L˜L˜ —š œŸœŸœ˜L™LšœŸœ ˜0LšœŸœ-˜=L˜L˜ —š œŸœŸœ˜L˜L˜LšœŸœ˜L˜L˜ ——™/L˜ Lšœ	ŸœŸœŸœ˜)LšœŸœ˜(L˜ š
+ œŸœŸœŸœŸœ˜YL˜L˜L˜!šŸœŸœ˜ LšœF˜FLšœ˜Lšœ˜—L˜L˜ —š œŸœŸœŸœ˜LL˜L˜L˜!šŸœŸœ˜ Lšœ(˜(Lšœ˜Lšœ˜—L˜L˜ —š œŸœŸœŸœ"˜ZL˜L˜L˜!šŸœŸœŸœ˜4Lšœ$˜$Lšœ˜Lšœ˜—L˜L˜ —š 	œŸœŸœŸœ˜VL˜&šŸœŸœŸœ˜4Lšœ ˜ Lšœ˜Lšœ˜—L˜L˜ —š
+ 
+œŸœŸœŸœŸœ	˜ML˜&šŸœŸœŸœ˜4Lšœ/˜/Lšœ˜Lšœ˜—L˜L˜ —š œŸœŸœŸœ˜ZL˜&šŸœŸœŸ˜L˜˜LšœŸœ˜+Lšœ˜Lšœ˜—LšŸœ˜—L˜L˜ ——™L˜ LšœŸœ˜*L˜ š œŸœŸœ'Ÿœ	ŸœŸœ˜{L˜ L˜>LšœŸœB˜PLšœ Ÿœ˜2šŸœŸœŸœŸ˜MLšœG™GLšŸœŸœ˜—šŸœŸœ˜ Lšœ/˜/šŸœŸœŸœŸœ˜LLšœE˜ELšŸœŸœ&˜EL˜—L˜L˜—LšŸœŸœŸœ(˜DL˜L˜ —š œŸœŸœ˜'Lšœ ¡˜4L˜"šŸ˜L˜7šŸœŸ˜LšœŸœ˜LšœŸœ˜#LšŸœ˜—LšŸœ˜—šŸœ+˜-LšŸœ˜šŸœ˜LšŸœŸœ˜7L˜@L˜——L˜"L˜L˜ —š 
+œŸœŸœ/Ÿœ˜išŸœŸœŸ˜L˜˜L˜$šŸœŸœŸ˜˜L˜#šŸœŸ˜L˜9—L˜—LšŸœ"˜)L˜—L˜—LšŸœ˜—L˜L˜ ——™L˜ š œŸœŸœJ˜gšŸœŸœ%Ÿœ˜JLšœ,˜,Lšœ<˜<šŸœŸœŸ˜LšœŸœ	˜.LšŸœ˜—Lšœ˜Lšœ˜L˜L˜—˜L˜ ——š œŸœŸœ*˜EL˜L˜L˜&šŸœŸœŸœ˜5Lšœ>˜>šŸœŸ˜šŸœ0˜3šœŸœŸ˜.šŸœŸœ˜'L˜%LšŸœŸœŸœ˜>LšŸœŸœ˜)LšŸœ˜—Lšœ˜—LšŸœ˜——L˜—L˜L˜ —š œŸœ,˜=L˜ L˜/L˜L˜L˜ —š œŸœ8˜IšŸœŸœŸ˜˜LšœŸœ˜'šŸœŸœŸœŸœ˜LLšœŸœ˜L˜'L˜L˜—L˜—LšŸœ˜—˜L˜ ——š œŸœI˜^šŸœŸœ˜"L˜L˜šŸœSŸœŸ˜lL˜'šœŸœŸœ˜3LšŸœ)˜-LšŸœ2˜6—šŸœŸœ˜LšŸœŸœ&˜:šŸœŸœ-Ÿœ˜GL˜L˜@L˜L˜—L˜L˜—šŸœŸœŸœ˜'Lšœ8ŸœŸœŸœ˜ušŸœŸœ2ŸœŸ˜VšŸœ˜LšŸœ!˜%LšŸœ#˜'——L˜—LšŸœ˜—LšœŸ˜L˜—L˜L˜ ——™L˜ š œŸœ1˜CL™$L˜9šŸœŸœŸ˜LšœŸœŸœ'˜GLšœ$Ÿœ	˜1LšœŸœŸœ%˜>˜
+L˜&L˜*L˜—LšœŸœŸœ+˜JLšœ¡˜1L˜)˜L˜/L˜*šŸœŸœ˜%Lšœ ˜ LšŸœ!ŸœŸœ˜.L˜—L˜—˜L˜%L˜'L˜—L˜2LšŸœ˜—˜L˜ ——š œŸœ2˜KšŸœŸœŸ˜˜šŸœŸœŸ˜'˜šŸœŸ˜šŸœ˜LšŸœŸœ˜0šŸœ˜L˜LšœŸœ˜0L˜L˜————LšŸœ˜——LšŸœ˜—˜L˜ ——š œŸœ&Ÿœ˜[šŸœŸœŸ˜˜Lšœ,˜,LšœŸœ˜$Lšœ˜šŸœŸœŸ˜˜	šŸœŸ˜LšœCŸœ	˜P——LšŸœ˜—šŸœŸœŸ˜'˜šŸœŸ˜šŸœ˜LšŸœŸœ˜0šŸœ˜L˜LšœŸœ˜0L˜L˜———L˜—LšŸœ˜—Lšœ˜L˜—LšŸœ˜—˜L˜ ——š œŸœ2˜EšŸœŸœŸ˜˜
+L˜2šŸœŸœŸ˜&˜šŸœŸ˜šŸœ˜LšŸœŸœ˜/šŸœ˜L˜LšœŸœ˜/L˜L˜————LšŸœ˜—L˜—LšŸœ˜—˜L˜ ——š œŸœ2˜GL˜9šŸœŸœŸ˜Lšœ$Ÿœ	˜2LšŸœ˜—L˜L˜ ——™L˜ š 	œŸœŸœ1˜GLšœ#˜#šŸœŸœŸ˜˜Lšœ,˜,Lšœ˜šŸœ
+ŸœŸœ˜2LšœŸœ˜$L˜L˜—Lšœ˜L˜—LšŸœ˜—L˜L˜ —š œŸœ3˜FL˜.L˜šŸ˜LšŸœŸœŸœ˜šŸœ.Ÿ˜8˜šŸœ˜LšŸœ0˜4LšŸœŸœŸœ˜2—LšŸ˜L˜—LšŸœ˜—LšŸœ0ŸœŸœ˜<LšŸœ˜—˜L˜ ——š 	œŸœ"˜1šŸœŸœŸ˜˜LšœŸœ˜$šŸœŸœŸ˜'˜šŸœ
+Ÿ˜šŸœ˜LšŸœŸœ˜+šŸœ˜L˜Lšœ˜L˜L˜————LšŸœ˜—L˜—LšŸœ˜—L˜L˜ ——™L˜ š œŸœŸœ˜7L˜šŸœ˜LšŸœ˜šŸœ˜Lšœ,˜,L˜HL˜——L˜L˜ —Lš 
+œŸœŸœ˜L˜ š œŸœŸœ˜GšŸœŸœ˜L˜>Lšœ&˜&LšŸœŸœŸœ˜'L˜—L˜L˜ —š œŸœŸœ Ÿœ.˜qšŸœŸœŸœ˜1Lšœ˜Lšœ˜Lšœ˜—L˜L˜ —š œŸœ Ÿœ˜JL˜L˜L˜šŸœŸ˜šŸœŸœŸ˜Lšœ/Ÿœ˜?˜šŸœ;Ÿ˜ALšŸœ¡˜ —L˜0L˜—LšŸœ"˜)——L˜šŸœ(ŸœŸ˜ALšŸœŸœŸœŸœ˜AL˜LšŸœ˜—Lšœ.Ÿœ˜4˜LšœŸœŸœŸœ˜8Lšœ˜LšœŸœ˜6˜L˜L˜L˜LšœŸœ˜Lšœ
+Ÿœ˜LšœŸœ˜LšœŸœ˜——LšŸœŸœŸœ˜QLšŸœ˜L˜L˜ —š œŸœŸœ#˜NšŸœŸœŸ˜L˜'L˜5LšŸœ˜&—L˜L˜ —š œŸœŸœ"˜XL˜%LšœK˜KLšœ.˜.šœ˜Lšœ˜Lšœ˜L˜!L˜(—L˜L˜L˜ —Lš œŸœŸœŸœ˜.L˜ š 
+œŸœŸœ3˜JšŸœŸœ˜*LšŸœ˜šŸœ˜˜L™Lšœ6ŸœŸœ
+˜ELšœS˜SLš
+ŸœŸœŸœŸœŸœ˜:Lšœ˜LšœŸœ˜šŸ˜LšœŸœ0˜A—L˜—L˜L˜——˜L˜ ——š 
+œŸœ˜$L˜L˜=Lšœ;Ÿœ˜ALšœ)Ÿœ˜.Lšœ"Ÿœ˜'L˜L˜ ——™L˜ LšœŸœ¡˜/LšœŸœ˜*š	œŸœŸœŸœŸœ˜2L˜Lšœ¡˜,Lšœ¡˜L˜ —LšœŸœŸœ˜<L˜ š œŸœŸœŸœ˜PLšŸœŸœ˜8L˜L˜ —š 	œŸœ'˜6LšŸœŸœC˜TL˜L˜ ——™L˜ š œŸœŸœ˜LLšœ˜LšŸœŸœŸœ˜#šŸœŸœŸ˜ ˜L˜ LšœŸœ˜+šŸœŸœ&˜5šŸœ˜L˜=LšŸœŸœŸ˜L˜—šŸœ˜L˜/L˜BšŸœŸœ˜L™#šŸœŸœŸœ˜<L™%—šœ&˜&L™&—LšŸœ˜L˜—L˜šŸœ˜LšŸœ˜šŸœ˜L˜!šŸœ˜šŸœ˜LšœŸ˜LšœŸœ!Ÿ˜5L˜—šŸ˜Lšœ%˜%—šŸœ˜L˜šŸœ˜LšŸœJ˜NLšŸœ$˜(—LšœŸœ"˜:L˜L˜L˜——L˜——L˜——L˜—˜šŸœŸœŸ˜L˜L˜(šŸœ˜L˜(šŸœŸœŸœ˜DLšŸœ˜LšŸœŸœ˜7—L˜———LšŸœ˜—LšŸœ˜L˜L˜ —š 	œŸœ=Ÿœ˜gL˜$L˜L˜L˜ —š œŸœ(˜;LšŸœŸœŸœŸœ˜/LšŸœŸœ˜<Lšœ(˜(Lšœ$˜$Lšœ*˜*Lšœ(˜(Lšœ*˜*Lšœ=˜=šŸœ˜šŸ˜Lšœi˜i—šŸ˜šŸœŸ˜šœŸœ.Ÿ˜9LšœŸœ˜LšŸœŸœ˜—LšŸœk˜oLšŸœ%˜)———šŸœŸœ3Ÿœ˜rLšŸœ9˜=LšŸœ'˜+—Lšœ"Ÿœ˜'šŸœ˜LšŸœ˜"LšŸœŸœŸœ+˜J—L˜L˜ —L˜L˜ š œŸœŸœŸœ+˜aLšŸœ˜LšœŸœ¡˜=šŸœ-ŸœŸœŸ˜MLšŸœŸœŸœ.˜VLšŸœ˜—LšŸœ˜L˜L˜ —š œŸœ(˜;L˜L˜L˜'L˜L˜,šŸœŸœŸ˜,šœŸœŸ˜.Lšœ3˜3—LšŸœ˜—L˜AL˜L˜L˜ —š œŸœŸœ˜Iš 	œ˜šŸœ	ŸœŸ˜*˜L˜&—šœ	˜	LšœŸœ(˜C—˜
+LšœN˜N—˜Lšœ˜šŸœŸ˜$LšœC˜C—L˜—˜L˜šœŸœŸ˜$L˜"LšŸœ+˜-˜L˜N—LšŸœ@˜G—šŸœŸœŸ˜$˜L˜Lšœ$˜$šŸœŸ˜L˜7L˜ šœ
+˜
+Lšœ5™5L˜L˜L˜L˜—šŸœŸœP˜kL˜XLšœ@˜@L˜)šŸœŸ˜Lšœ-Ÿœ˜3˜šŸœŸœ!Ÿ˜@˜L˜UšŸœŸœŸ˜˜	šŸœŸ˜šŸœŸœ!Ÿ˜@L˜ZLšŸœŸœ˜———LšŸœ˜—Lšœ˜—LšŸœ˜—L˜—˜
+Lšœ"˜"šŸœ	ŸœŸ˜-šœ˜LšœF˜FLšœŸœ˜"Lšœ˜—LšŸœŸœ˜—L˜—Lšœ˜L˜ šœŸœŸœŸœ˜'Lšœ1™1Lšœ7˜7šœI˜ILšœoŸœ™u—šœ2Ÿœ˜8Lšœ%Ÿœ™0—Lšœ˜L˜—šœŸœŸœŸœ˜*Lšœ+™+šœm˜mLšœNŸœ4Ÿœ™‹—Lšœc˜cšœ!˜!L™&—šœ2Ÿœ˜8Lšœ%Ÿœ™0—Lšœ#˜#L˜—LšŸœ˜—Lšœ˜—LšŸœŸœ˜˜Lšœ"˜"šŸœŸœŸ˜2Lšœ!˜!—LšŸœŸœ˜L˜—L˜˜
+L˜.LšŸœŸœ˜L˜—LšŸœ#ŸœŸœ˜6LšŸœ˜—šŸœ˜˜4LšŸœ<™?——Lšœ˜—LšŸœ˜—Lšœ˜—LšŸœŸœ˜—L˜L˜ —š 
+œ˜šŸœŸœŸ˜$˜
+L˜_—LšŸ˜—˜L˜ ——š œŸœ%˜6šŸœŸœ!Ÿ˜@˜L˜˜šŸœŸœ#Ÿ˜FL˜@L˜PLšŸœŸœ˜——LšœŸœ˜#—LšŸœŸœ˜—˜L˜ ——š 
+œŸœŸœ˜?L˜6LšœŸœ˜$L˜šŸœŸœ˜L˜=Lšœ-Ÿœ˜3˜Lšœ˜L˜LšœŸœ/˜=L˜L˜L˜L˜&L˜L˜—L˜1L˜L˜—šŸœŸœŸœ
+Ÿ˜Lšœ4˜4LšŸœ˜—L˜*L˜VL˜(Lšœ˜šŸœŸ˜Lšœe˜e—L˜L˜ —š 	œŸœŸœ˜-šŸœ)Ÿ˜/LšœQ˜Q—L˜L˜ —LšŸœ˜L˜L˜ —š œŸœŸœ Ÿœ˜bšŸœŸœŸœŸœ˜DL˜#šŸœ˜šŸœ˜LšœŸœ!˜9L˜+L˜—LšŸœ,˜0—L˜L˜—L˜L˜ —š œŸœ/Ÿœ˜jšŸœŸœ˜L˜)Lšœ0Ÿœ˜6L˜L˜.L˜L˜šŸœ˜šŸœ˜L˜L˜L˜—šŸœ˜L˜%LšœŸœ/˜FL˜——šŸœ˜šŸœ˜L˜:šŸœŸœŸ˜#L˜9LšŸœ˜—L˜—šŸ˜šœŸœŸœ ˜DLšŸœ)˜-LšŸœ5˜9———L˜—L˜L˜ —š œŸœŸœŸœ˜:šŸœmŸœŸ˜†šŸœŸœ˜$L˜9šŸœŸœŸ˜Lšœ	ŸœŸœŸœ˜-LšŸœ˜—L˜—LšŸœ˜—LšŸœ˜L˜L˜ —š œŸœ Ÿœ˜ML˜šŸœŸœŸ˜"˜Lšœ2Ÿœ˜8L˜1L˜L˜—˜Lšœ4Ÿœ˜:L˜3L˜L˜—˜	Lšœ0Ÿœ˜6L˜/L˜L˜—˜L˜Lšœ6Ÿœ˜<šœŸœŸœ&˜ALšŸœ˜LšŸœ>˜B—˜L˜L˜L˜L˜L˜L˜L˜—L˜L˜—˜šœŸœŸœ&˜KLšŸœ˜LšŸœ˜!—Lšœ,˜,šŸœŸœŸ˜˜Lšœ<Ÿœ˜BL˜˜L˜L˜L˜L˜L˜L˜L˜L˜L˜L˜L˜L˜L˜—L˜—˜Lšœ9Ÿœ˜?L˜L˜*˜L˜L˜L˜L˜L˜L˜L˜L˜L˜L˜L˜L˜L˜#—L˜—LšŸœ˜—LšœŸœ˜!šŸœŸœŸœŸ˜IL˜-—Lšœ˜L˜—˜Lšœ/Ÿœ˜5L˜L˜/˜L˜L˜L˜L˜L˜L˜L˜L˜—L˜—˜
+Lšœ1Ÿœ˜7L˜L˜1L˜5˜L˜L˜L˜L˜—L˜—˜Lšœ5Ÿœ˜;L˜L˜5˜L˜L˜L˜L˜L˜—L˜—˜L™'L˜Lšœ4Ÿœ˜:Lšœ&Ÿœ˜-Lšœ'Ÿœ˜.˜L˜L˜L˜L˜L˜—L˜—˜Lšœ6Ÿœ˜<˜L˜"L˜Lšœ˜—L˜—˜
+L˜L˜Lšœ1Ÿœ˜7L˜L˜"L˜M˜L˜L˜L˜L˜L˜L˜L–2 in tabStopsšœ˜L–2 in tabStopsšœ˜L˜—L˜—˜L˜Lšœ4Ÿœ˜:L˜L˜5L˜M˜Lšœ˜L˜L˜L˜L˜L˜L–2 in tabStopsšœ˜L–2 in tabStopsšœ˜L˜—L˜—˜L˜Lšœ4Ÿœ˜:L˜L˜0L˜2šœŸœ$˜.LšŸœ˜
+LšŸœ+˜/—˜L˜L˜L˜—L˜—˜Lšœ4Ÿœ˜:L˜1˜L˜L˜L˜L˜L˜L˜—L˜L˜—˜Lšœ2Ÿœ˜8L˜L˜*˜LšœŸœ˜L˜L˜ —L˜—˜	Lšœ0Ÿœ˜6˜L˜L˜L˜—L˜L˜—˜Lšœ/Ÿœ˜5L˜L˜L˜—LšŸœŸœ˜—Lšœ"˜"Lšœ"Ÿœ˜'L˜L˜ —š œŸœ Ÿœ˜ML˜šŸœŸœŸ˜"˜Lšœ4Ÿœ˜:Lšœ&Ÿœ˜,Lšœ'Ÿœ˜-˜L˜#L˜#—L˜—LšŸœŸœ˜—Lšœ"Ÿœ˜'L˜L˜ —š œŸœ+ŸœŸœ!˜gšŸœŸœ˜šŸœŸœŸ˜!˜L˜L˜Lšœ?Ÿœ˜EšŸœ˜
+LšŸœ8˜<šŸœ˜L˜+LšœŸœ˜L˜L˜L˜——šŸœŸœ˜$LšœRŸœ˜YL˜L˜šŸœ:ŸœŸ˜TL˜L˜3L˜(L˜LšŸœ˜—L˜—˜LšœŸœ	Ÿœ˜˜L˜˜LšœŸœŸœ	Ÿœ˜-Lšœ	ŸœŸœ
+Ÿœ˜.L˜L˜L˜L˜L˜LšœŸœ˜L˜———šŸœŸœ˜L˜+L˜6L˜—L˜—LšŸœ(˜/——L˜L˜ —š œŸœŸœ/Ÿœ˜vL˜L˜L˜šŸœŸœŸœ%Ÿœ˜HLšœHŸœ˜OL˜Lšœ%Ÿœ˜*šŸœŸ˜L˜L˜3L˜(Lšœ)Ÿœ˜/Lšœ)Ÿœ˜.L˜$L˜CL˜&Lšœ"Ÿœ˜'Lšœ%˜%LšŸœ˜—L˜LšœŸœ˜L˜—L˜L˜ ——™L˜ š œŸœ˜*šŸœŸœ˜L˜Lšœ%Ÿœ˜*L˜—L˜L˜ —š œŸœ˜L˜#šŸœ(ŸœŸœŸ˜DšŸœ7ŸœŸ˜PLšœ¡)˜BL˜LšŸœ˜—LšŸœ˜—L˜L˜L˜ —š
+ œŸœŸœŸœŸœ˜8šŸœŸœŸœ˜1LšœŸœ˜0L˜L˜—˜L˜ ——Lš œŸœŸœŸœ˜%L˜ š œŸœŸœŸœ˜BLš	œŸœŸœŸœŸœ"˜UšŸœŸœŸœ˜ L˜LšŸœŸœ˜3L˜
+L˜—L˜L˜ —š œŸœŸœ˜"LšŸœŸœŸœ˜8L˜L˜ —š œŸœ˜šŸœŸœ˜LšœŸœ˜Lšœ$˜$L˜—LšœŸœ˜L˜L˜ ——L˜L˜ ™0L™8—™3L™?—— …—    ––  Ä0  

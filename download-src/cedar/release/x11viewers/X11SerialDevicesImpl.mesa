@@ -1,0 +1,320 @@
+DIRECTORY
+Basics, InputDevice, InputDeviceTypes, Process, RelativeTimes, UnixSysCalls, UnixTypes, UserInput, ViewersWorld, ViewersWorldInstance, ViewersWorldRefType, ViewersWorldTypes;
+
+X11SerialDevicesImpl: CEDAR MONITOR
+IMPORTS Basics, Process, UnixSysCalls, ViewersWorld, ViewersWorldInstance
+EXPORTS InputDevice, ViewersWorldRefType  ~ BEGIN 
+
+OPEN InputDevice;
+
+Event: TYPE = InputDeviceTypes.Event;
+EventBuffer: TYPE = InputDeviceTypes.EventBuffer;
+EventBufferRep: TYPE = InputDeviceTypes.EventBufferRep;
+HandleRep: TYPE = InputDeviceTypes.HandleRep;
+Milliseconds: TYPE ~ INT;
+ViewersWorldObj: PUBLIC TYPE = ViewersWorldTypes.ViewersWorldObj;
+DeltaTime: TYPE = RelativeTimes.DeltaTime;
+
+h: Handle; -- the one global InputDevice.Handle in the world
+registerCV: CONDITION; -- and a cv to wait on until h is non-NIL
+
+Reopen: PUBLIC PROC = {
+eventBuffer: EventBuffer;
+IF h=NIL THEN OpenHandle[] -- first registration ever in this world
+ELSE Close[]; -- must abort all existing reader process, then reopen
+FOR i: NAT IN [0..h.nDevices) DO
+IF (eventBuffer ¨ h.inputs[i])#NIL THEN Register[deviceName: eventBuffer.deviceName, bufferLength: eventBuffer.length, open: eventBuffer.open, eventReader: eventBuffer.read, eventDispatch: eventBuffer.dispatch, close: eventBuffer.close, clientData: eventBuffer.clientData];
+ENDLOOP;
+};
+
+OpenHandle: SAFE PROC = TRUSTED {
+h ¨ NEW[HandleRep];
+Process.SetTimeout[@h.inputAvailable, Process.MsecToTicks[1000]];
+Process.EnableAborts[@h.inputAvailable];
+};
+
+Close: PUBLIC ENTRY  SAFE PROC [] = {
+eventBuffer: EventBuffer;
+IF h=NIL THEN RETURN;
+FOR i: NAT IN [0..h.nDevices) DO
+IF (eventBuffer ¨ h.inputs[i])#NIL THEN {
+CloseDeviceInternal[eventBuffer];
+};
+ENDLOOP;
+};
+
+CloseDeviceInternal:  INTERNAL PROC [b: EventBuffer] = {
+inputProcess: SAFE PROCESS ¨ NIL;
+IF b.active THEN { -- don't close it if its already closed
+b.active ¨ FALSE;
+IF (inputProcess ¨ GrabInputProcess[b]) # NIL THEN TRUSTED {
+Process.Abort[inputProcess];
+JOIN inputProcess;
+IF b.close#NIL THEN b.close[b.clientData]; -- call device specific close proc
+};
+};
+};
+
+GrabInputProcess: <<ENTRY>> PROC [b: EventBuffer] RETURNS [SAFE PROCESS] = {
+ENABLE UNWIND => NULL;
+IF b # NIL THEN {
+inputProcess: SAFE PROCESS = b.inputProcess;
+b.inputProcess ¨ NIL;
+RETURN [inputProcess]
+};
+RETURN [NIL]
+};
+
+Register: PUBLIC ENTRY SAFE PROC [deviceName: ATOM, bufferLength: NAT ¨ 20, open: OpenProc, eventReader: EventReaderProc, eventDispatch: EventDispatchProc ¨ NIL, close: CloseProc, clientData: REF] =  TRUSTED {
+ENABLE UNWIND => NULL;
+eventBuffer: EventBuffer;
+notifyRegister: BOOL _ FALSE;
+IF h=NIL THEN {-- first registration ever in this world
+OpenHandle[]; 
+notifyRegister _ TRUE;
+};
+FOR i: INT IN [0..InputDeviceTypes.maxDevices) DO
+IF h.inputs[i] = NIL THEN { -- i points to next empty array entry
+eventBuffer ¨ h.inputs[i] ¨ NEW[EventBufferRep[bufferLength]];
+IF i=h.nDevices THEN h.nDevices ¨ h.nDevices + 1;  -- should check for overflowing maxDevices
+EXIT;
+};
+IF h.inputs[i].deviceName=deviceName THEN { -- i points to existing array entry
+eventBuffer ¨ h.inputs[i];
+CloseDeviceInternal[eventBuffer]; -- close existing reader process
+EXIT;
+};
+ENDLOOP;
+
+IF eventBuffer=NIL THEN ERROR; -- sanity check
+eventBuffer.active ¨ TRUE;
+eventBuffer.open ¨ open;
+eventBuffer.deviceName ¨ deviceName;
+eventBuffer.read ¨ eventReader;
+eventBuffer.dispatch ¨ eventDispatch;
+eventBuffer.close ¨ close;
+eventBuffer.clientData ¨ clientData;
+eventBuffer.start ¨ eventBuffer.end ¨ 0;
+IF open#NIL THEN eventBuffer.clientData ¨ open[clientData]; -- call the device specific open proc
+Process.EnableAborts[@eventBuffer.inputWanted];
+eventBuffer.inputProcess ¨ FORK InputProcess[eventBuffer, eventReader];
+IF notifyRegister THEN NOTIFY registerCV;
+};
+
+UnRegister: PUBLIC ENTRY PROC [deviceName: ATOM] = {
+eventBuffer: EventBuffer;
+IF h=NIL THEN RETURN;
+FOR i: NAT IN [0..h.nDevices) DO
+IF (eventBuffer ¨ h.inputs[i])#NIL AND eventBuffer.deviceName=deviceName THEN {
+CloseDeviceInternal[eventBuffer];
+h.inputs[i] ¨ NIL; -- devices that are UnRegistered will be forgotten
+};
+ENDLOOP;
+};
+
+GetClientData: PUBLIC ENTRY PROC [deviceName: ATOM] RETURNS [REF] = {
+eventBuffer: EventBuffer;
+FOR i: NAT IN [0..h.nDevices) DO
+IF (eventBuffer ¨ h.inputs[i])#NIL AND eventBuffer.deviceName=deviceName THEN RETURN[eventBuffer.clientData];
+ENDLOOP;
+RETURN[NIL];
+};
+
+InputProcess: SAFE PROC [b: EventBuffer, eventReader: EventReaderProc] = TRUSTED {
+ENABLE ABORTED => CONTINUE;
+Process.SetPriority[Process.priorityRealTime];
+WHILE b.active DO
+NewEvents[b, eventReader[b, CheckBufferSpace[b], b.clientData]];
+ENDLOOP;
+};
+
+CheckBufferSpace: ENTRY PROC [b: EventBuffer] RETURNS [NAT] = TRUSTED {
+ENABLE UNWIND => NULL;
+WHILE b.active DO
+n: NAT = (b.end-b.start);
+IF n = 0 THEN {b.start ¨ b.end ¨ 0; RETURN [b.length]};
+IF b.start > n OR ((b.start > 0) AND INT[b.length-b.end] < INT[2]) THEN {
+Basics.MoveWords[dst: LOOPHOLE[@(b[0])], src: LOOPHOLE[@(b[b.start])], count: n*WORDS[Event]];
+b.start ¨ 0;
+b.end ¨ n;
+};
+IF b.end < b.length THEN RETURN [b.length-b.end];
+WAIT b.inputWanted;
+ENDLOOP;
+b.start ¨ b.end ¨ 0;
+RETURN [0];
+};
+
+NewEvents: ENTRY PROC [b: EventBuffer, n: INT] = {
+ENABLE UNWIND => NULL;
+b.end ¨ b.end + n;
+BROADCAST h.inputAvailable;
+};
+
+InOrder: PROC [t1, t2: UnixTypes.TimeVal] RETURNS [BOOL] = {
+RETURN [t1.sec < t2.sec OR (t1.sec = t2.sec) AND (t1.usec <= t2.usec)]
+};
+
+activeReader: PROC [timeout: Milliseconds ¨ LAST[Milliseconds]] RETURNS [e: Event, deviceName: ATOM, dispatch: EventDispatchProc ¨ NIL] ¨ ThreadRead;
+
+Read: SAFE PROC [timeout: Milliseconds ¨ LAST[Milliseconds]] RETURNS [e: Event, deviceName: ATOM, dispatch: EventDispatchProc ¨ NIL] = {
+[e, deviceName, dispatch] ¨ activeReader[timeout];
+};
+
+More: PUBLIC ENTRY SAFE PROC [deviceName: ATOM] RETURNS [BOOL] = {
+ENABLE UNWIND => NULL;
+FOR i: NAT IN [0..h.nDevices) DO
+b: EventBuffer ~ h.inputs[i];
+IF b=NIL THEN LOOP; -- can have NIL EventBuffers due to UnRegistered devices
+IF (deviceName=NIL OR b.deviceName=deviceName) THEN
+IF b.start < b.end AND b[b.start].time = h.lastDeliveredTime THEN RETURN [TRUE];
+ENDLOOP;
+RETURN [FALSE];
+};
+
+TimeoutEvent: PROC RETURNS [Event, ATOM] = TRUSTED {
+now: UnixTypes.TimeVal;
+tz: UnixTypes.TimeZone;
+[] ¨ UnixSysCalls.GetTimeOfDay[@now, @tz];
+RETURN [[id: timeoutID, pairType: none, pair: 0, value: 0, time: now], $Timeout];
+};
+
+ThreadRead: ENTRY PROC [timeout: Milliseconds ¨ LAST[Milliseconds]] RETURNS [e: Event, deviceName: ATOM, dispatch: EventDispatchProc ¨ NIL] = {
+ENABLE UNWIND => NULL;
+GetEvent: INTERNAL PROC RETURNS [BOOL] = {
+best: EventBuffer ¨ NIL;
+anyActive: BOOL ¨ FALSE;
+FOR i: NAT IN [0..h.nDevices) DO
+b: EventBuffer ~ h.inputs[i];
+IF b=NIL THEN LOOP;
+anyActive ¨ anyActive OR b.active;
+IF b.active AND b.start < b.end THEN {
+IF best = NIL OR InOrder[b[b.start].time, e.time] THEN {
+best ¨ b;
+e ¨ b[b.start];
+deviceName ¨ b.deviceName;
+dispatch ¨ b.dispatch;
+};
+};
+ENDLOOP;
+IF NOT anyActive THEN {
+e ¨ [id: timeoutID, pairType: none, pair: 0, value: 0, time: h.lastDeliveredTime];
+deviceName ¨ $Closed;
+RETURN [TRUE];
+};
+IF best = NIL THEN RETURN [FALSE];
+best.start ¨ best.start + 1;
+IF best.start = best.end THEN NOTIFY best.inputWanted;
+RETURN [TRUE]
+};
+IF NOT GetEvent[] THEN {
+IF timeout = 0
+THEN [e, deviceName] ¨ TimeoutEvent[]
+ELSE TRUSTED {
+IF timeout = LAST[Milliseconds]
+THEN Process.DisableTimeout[@h.inputAvailable]
+ELSE Process.SetTimeout[@h.inputAvailable, Process.MsecToTicks[timeout]];
+DO
+WAIT h.inputAvailable;
+IF GetEvent[] THEN EXIT;
+IF timeout # LAST[Milliseconds] THEN {
+[e, deviceName] ¨ TimeoutEvent[];
+EXIT;
+};
+ENDLOOP;
+};
+};
+h.lastDeliveredTime ¨ e.time;
+};
+
+ProcessInput: PUBLIC SAFE PROC [viewersWorld: ViewersWorldRefType.Ref, goAway: GoAwayProc, updateMouse: UpdatePointerProc, updatePen: UpdatePointerProc] = {
+BEGIN ENABLE ABORTED => CONTINUE;
+DoProcessInput[viewersWorld, goAway, updateMouse, updatePen];
+END;
+Close[];
+};
+
+DoProcessInput: SAFE PROC [viewersWorld: ViewersWorldRefType.Ref, goAway: GoAwayProc, updateMouse: UpdatePointerProc, updatePen: UpdatePointerProc] = {
+deltaTime: RelativeTimes.DeltaTime = 0; -- should really be computed from XTkTIPSourceImpl.GetDeltaTime, but that routine isn't public and I don't know how to get ahold of the XTkTIPSourceImpl.Handle (Bier, September 30, 1993)
+e: Event;
+deviceName: ATOM;
+dispatch: EventDispatchProc ¨ NIL;
+userInput: UserInput.Handle ~ ViewersWorld.GetInputHandle[viewersWorld];
+
+Process.SetPriority[Process.priorityClient3];
+DO
+[e, deviceName, dispatch] ¨ Read[50];
+IF deviceName=$Closed THEN EXIT; -- no active devices
+IF dispatch#NIL THEN {
+dispatch[e, deviceName, deltaTime, GetClientData[deviceName]];
+}
+ELSE NULL;
+ENDLOOP;
+SetHToNIL[];
+StartSerialDevices[];
+};
+
+
+SetHToNIL: ENTRY PROC =  {
+h ¨NIL;
+};
+
+WaitForRegistration: ENTRY PROC =  {
+vw: REF ViewersWorldObj ¨ ViewersWorldInstance.GetWorld[];
+WAIT registerCV;
+Process.Detach[FORK ProcessInput[vw, NIL, NIL, NIL]];
+};
+
+StartSerialDevices: PROC =  {
+Process.Detach[FORK WaitForRegistration[]];
+};
+
+StartSerialDevices[];
+
+END.
+
+
+
+  ﬁ  
+X11SerialDevicesImpl.mesa
+Copyright ” 1992 by Xerox Corporation.  All rights reserved.
+Kenneth A. Pier, October 28, 1992 2:57 pm PST
+
+This module is used in to run serial devices in the X11ViewersWorld.  Mouse and keyboard are not processed here but come from a separate stream of X events.  Only serial devices such as the FastTrap trackball should use this mechanism.
+Bier, September 30, 1993 10:52 am PDT
+
+export to ViewersWorldRefType
+BROADCAST h.inputAvailable; -- so we don't wait for a timeout on this
+search for existing registration.  If found, reregister.  If not, make a new entry.
+Returns number of available slots (after maybe shifting data up)
+This has been closed.
+deviceName=NIL means search every device buffer.
+IF b=NIL THEN RETURN [FALSE]; -- this seems wrong. KAP.
+This handle has been closed!
+Processes input events from devices that are not yet handled by the X input extension, such as the FastTRAP trackball.
+The next higher priority than priorityForeground (which equals priorityClient2)
+GetClientData can be optimized out by passing around clientDatas in this module
+ELSE IF e.id=timeoutID THEN UserInputInsertActions.InsertTimeIsPassing[userInput, deltaTime]
+have to wait for the first device to Register itself
+ù ±  ïNewlineDelimiter
+ô codeôKô<Kô-Kô KôÎKô%Kô óöœk	ò	JòÆKò óöœnúùúùò#JöùúBòIJöùú%ùúò2Kò KöùúòKò Köúùúò%Köúùú ò1Köúùú#ò7Köúùúò-Köúùúùúòöúùúùú%òAKôóKöúùúò*Kò Köúœc1ò<Köúù	úü)ò@óKò öûúùúòKöúòöùúùúùúü(òCKöùú
+ü6òDóöùúùúùúùò KöùúùúùúÍòëKöùúòóKòKò óöû
+úùúùúùúò!KöúùúòKòAKò(KöúòKò óöûúùú—bklùúò%KöúòKöùúùúùúùúòöùúùúùúùò öùúùúùúò)Kò!KòóKöùúòóKöúòKò óöûúùúò8Köúùúùúùúò!öùú
+ùúü'ò:Köúùúòöùú(ùúùúùúò<KïStartOfExpansion	[PROCESS]öúòKöùúòKöùú	ùúùúü"òMKöúòóKöúòóKöúòóKò öûúù	úùúùúùúùúòLKöùúùúùúòöùúùúùúòKöúùúùúò,KöúùúòKöù	úü)ôEKöùúòKöúòóKöùúùúòKöúòóKò öûúùú†úùúùúùúùúXùú ùúùúò—KöùúùúùúòKöúòKöúùúùúòöùúùúùúü(ò7KòKöúùúòKòJôSóöùúùúùú"ùò1öùúùúùúü%òAKöúùúò>Köùúùúü*ò]KöùúòKòóöùú#ùúü#òOKòKöú"ü òBKöùúòKòóKöùúòóKò Kö	ùúùúùúùúüò.KöúùúòKòKò$KòKò%KòKò$Kò(Köùúùúùú,ü%òaKöú/ò/Köúùú(òGKöùúùúùúò)KöúòKò óö	û
+úùú†ùúùúò4KöúòKöùúùúùúùúòöùúùúùúùò öùúùúùú#ùúòOKò!Köúùúü2òEKòóKöùúòóKöúòóKò öûúùúù
+úùúùúùúòEKöúòöùúùúùúùò Kö
+ùúùúùú#ùúùúòmKöùúòóKöùúùúòKöúòKò óöûúùúùú2ùúòRKöùúùúùúòKöú.ò.öùú
+ùòKöú@ò@KöùúòóKöúòKò óöûúùúùúùúùúùúòGKô@Köùúùúùúòöùú
+ùòKöúùúòKöùúùúùúò7öùúùúùúùúùúùúòIKöúùúùúùú	ò^KòKò
+KöúòóKöùúùúùúò1KöùúòKöùúòóKôKòKöùúòKöúòKò óöû	úùúùúùúò2KöùúùúùúòKòKöù	úòKöúòKò óöûúùúùúùúò<KöùúùúùúòFKöúòKò óöúùúùúùúùú ùúòïKò óöûúùúùúùúùúùú ùúòàKò2KöúòKò óöûúùúùúùúùúùúùúùúòBKô0Köùúùúùúòöùúùúùúùò KòKö
+ùúùúùúùúùúô7Kö	ùúùúùúùúü8òLöùúùúùúùò3Kö
+ùúùú'ùúùúùúòPóKöùúòóKöùúùúòKöúòKò óö
+ûúùúùú	ùúùúò4KòKòKò*KöùúKòQKöúòKò óöû
+úùúùúùúùúùú ùúòèKöùúùúùúòö
+ûúùúùúùúùúò*KöúùúòKöúùúùúòöùúùúùúùò KöúòKöùúùúùúùúòKöúùú
+ò"öùú
+ùúùúò&öùúùúùú"ùúò8Kò	KòKòKòKöúòóKöúòóKöùúòóöùúùúùúòKôKòRKòKöùúùúòKöúòóKö
+ùúùúùúùúùúò"KòKöùúùúùúò6KöùúùúòKöúòóöùúùúùúòöùúòKöùú!ò%öùúùúòöùúùúòKöùú*ò.KöùúEòIóöùòKöùúòKöùúùúùúòöùúùúùúò&Kò!KöùúòKöúòóKöùúòóKöúòóóKöúòóKòKöúòóKò öûúùúùúùú~òúöùúùúùúùúò!Köú=ò=KöùúòóKöœbòKòKò óï	CharProps%Postfix0.83333 1 0.7 textColorÅ	 ö–lnúùúùú~òóôvKöú#°úúü∫ò‚Köú	ò	KöúùúòKöúùúò"KöúHòHKò Kò-KôOöùòKöú°úò%Köùúùúùúüò5öùú
+ùúùúòö°úú&ò>KôOóKöúòóKöùúùúùúAô\Köùúùúò
+KöùúòóóJòKòKòóò Jò óöû	úùúùúòJöúùúòJòJò óöûúù
+úò$öúùú3ò:Kô4óKöùúòKö	úùúùúùúùúò5KòJò óöûúùúòKöúùúò+KòJò óòJò óJöùúòJò Kò Jò ó Öó    #  4´  

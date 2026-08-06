@@ -1,0 +1,633 @@
+
+DIRECTORY
+Ascii USING [BS, ControlQ, ControlW, DEL, ESC],
+Atom USING [GetPName],
+EditedStream USING [AddStreamProcs, DeliverWhenProc, IsACR, SetEcho],
+IO USING [CharsAvail, CR, CreateStream, CreateStreamProcs, EndOf, EndOfStream, EraseChar, Error, GetChar, PutChar, Reset, RopeFromROS, ROS, Rubout, STREAM, StreamProcs],
+IOClasses USING [CreateDribbleOutputStream],
+IOTiogaPrivate USING [AddOps, CharSet, Looks, MapPropsAction, Ops, OpsRep, PropList],
+IOUtils USING [CopyPFProcs, PFCodeProc, PFProcs, SetPFCodeProc, SetPFProcs, StoreData, StoreProc],
+MessageWindow USING [Append, Clear],
+PFS USING [PathFromRope, StreamOpen],
+RefText USING [Append, InlineAppendChar],
+Rope USING [Fetch, Find, FromChar, Length, Map, Replace, ROPE],
+TiogaOps USING [GetRope, GetTextKey, LastLocWithin, Location, PutTextKey, Ref, ViewerDoc],
+TypeScript,
+ViewerClasses USING [Viewer],
+ViewerEvents USING [EventProc, RegisterEventProc],
+ViewerIO USING [],
+ViewerOps USING [AddProp, FetchProp];
+
+ViewerIOImpl: CEDAR PROGRAM
+IMPORTS Atom, EditedStream, IO, IOClasses, IOTiogaPrivate, IOUtils, MessageWindow, PFS, RefText, Rope, TiogaOps, TypeScript, ViewerEvents, ViewerOps
+EXPORTS ViewerIO
+= BEGIN
+
+STREAM: TYPE = IO.STREAM;
+ROPE: TYPE = Rope.ROPE;
+
+CharSet: TYPE ~ IOTiogaPrivate.CharSet;
+Looks: TYPE ~ IOTiogaPrivate.Looks;
+PropList: TYPE ~ IOTiogaPrivate.PropList;
+MapPropsAction: TYPE ~ IOTiogaPrivate.MapPropsAction;
+
+Viewer: TYPE = ViewerClasses.Viewer;
+StreamProcs: TYPE = IO.StreamProcs;
+DeliverWhenProc: TYPE = EditedStream.DeliverWhenProc;
+TypeOfGetDeliverWhen: TYPE = PROC [self: STREAM] RETURNS [proc: DeliverWhenProc, context: REF ANY];
+TypeOfSetDeliverWhen: TYPE = PROC [self: STREAM, proc: DeliverWhenProc, context: REF ANY];
+TypeOfAppendBufferChars: TYPE = PROC [stream: STREAM, chars: ROPE];
+TypeOfUnAppendBufferChars: TYPE = PROC [stream: STREAM, nChars: NAT];
+TypeOfSetMode: TYPE = PROC [stream: STREAM, stuff: ROPE, pendingDelete: BOOL,
+echoAsterisks: BOOL];
+ViewerStreamData: TYPE = REF ViewerStreamDataRecord;
+ViewerStreamDataRecord: TYPE = RECORD [
+viewer: Viewer,
+echoStream: STREAM ¬ NIL
+];
+ViewerInStreamProcs: REF StreamProcs;
+ViewerOutStreamProcs: REF StreamProcs;
+ViewerOutPFProcs: IOUtils.PFProcs;
+CreateViewerStreams: PUBLIC PROC [
+name: ROPE, viewer: Viewer ¬ NIL, backingFile: ROPE ¬ NIL, editedStream: BOOL ¬ TRUE, iconic: BOOL ¬ FALSE]
+RETURNS [in: STREAM, out: STREAM] = {
+streams: LIST OF STREAM;
+IF viewer = NIL THEN viewer ¬ TypeScript.Create[info: [name: name, iconic: iconic]]
+ELSE IF NOT TypeScript.IsATypeScript[viewer] THEN ERROR IO.Error[$Failure, NIL];
+in ¬ IO.CreateStream[
+streamProcs: ViewerInStreamProcs,
+streamData: NEW[ViewerStreamDataRecord ¬ [viewer: viewer]]];
+IOUtils.StoreData[in, $Name, name];
+out ¬ IO.CreateStream[
+streamProcs: ViewerOutStreamProcs,
+streamData: NEW[ViewerStreamDataRecord ¬ [viewer: viewer]]];
+IOUtils.StoreData[out, $Name, name];
+[] ¬ IOUtils.SetPFProcs[out, ViewerOutPFProcs];
+IF backingFile # NIL THEN out ¬ IOClasses.CreateDribbleOutputStream[
+output1: out,
+output2: PFS.StreamOpen[fileName: PFS.PathFromRope[backingFile], accessOptions: $create]];
+streams ¬ NARROW[ViewerOps.FetchProp[viewer: viewer, prop: $Streams]];
+streams ¬ CONS[in, CONS[out, streams]];
+ViewerOps.AddProp[viewer: viewer, prop: $Streams, val: streams];
+IF editedStream THEN
+in ¬ CreateEditedViewerStream[in: in, echoTo: out, deliverWhen: EditedStream.IsACR]
+ELSE EditedStream.SetEcho[self: in, echoTo: out];
+};
+GetViewerFromStream: PUBLIC PROC [stream: STREAM] RETURNS [Viewer] = {
+WHILE stream # NIL DO
+WITH stream.streamData SELECT FROM
+data: ViewerStreamData => RETURN[data.viewer];
+ENDCASE => stream ¬ stream.backingStream;
+ENDLOOP;
+RETURN [NIL];
+};
+WasAStreamViewerDestroyed: ViewerEvents.EventProc = {
+streams: LIST OF STREAM = NARROW[ViewerOps.FetchProp[viewer, $Streams]];
+v: Viewer ¬ viewer;
+IF streams = NIL THEN RETURN;
+WHILE (v ¬ v.link) # NIL AND (v # viewer) DO -- split viewer
+IF NOT v.destroyed THEN {
+FOR l: LIST OF STREAM ¬ streams, l.rest UNTIL l = NIL DO
+data: ViewerStreamData = NARROW[l.first.streamData];
+data.viewer ¬ v;
+ENDLOOP;
+ViewerOps.AddProp[v, $Streams, streams]; 
+RETURN;
+};
+ENDLOOP; 
+};
+ViewerGetChar: PROC [self: STREAM] RETURNS [char: CHAR] =  {
+data: ViewerStreamData = NARROW[self.streamData];
+IF data.viewer.destroyed THEN ERROR IO.Error[$StreamClosed, self];
+char ¬ TypeScript.GetChar[data.viewer ! TypeScript.Destroyed =>
+IF data.viewer.destroyed THEN ERROR IO.Error[$StreamClosed, self] ELSE RETRY];
+IF data.echoStream # NIL THEN data.echoStream.PutChar[char];
+};
+ViewerEndOf: PROC [self: STREAM] RETURNS [BOOL] = CHECKED {
+data: ViewerStreamData = NARROW[self.streamData];
+IF data.viewer.destroyed THEN ERROR IO.Error[$StreamClosed, self];
+RETURN[FALSE];
+};
+ViewerCharsAvail: PROC [self: STREAM, wait: BOOL] RETURNS [INT] = {
+data: ViewerStreamData = NARROW[self.streamData];
+viewer: Viewer ¬ data.viewer;
+IF viewer = NIL OR viewer.destroyed THEN ERROR IO.Error[$StreamClosed, self];
+IF wait
+THEN {
+TypeScript.WaitUntilCharsAvail[viewer ! TypeScript.Destroyed =>
+IF viewer.destroyed THEN ERROR IO.Error[StreamClosed, self] ELSE RETRY];
+RETURN[1]
+}
+ELSE RETURN[IF TypeScript.CharsAvailable[viewer] THEN 1 ELSE 0];
+};
+ViewerSetEcho: PROC [self: STREAM, echoTo: STREAM] = {
+data: ViewerStreamData = NARROW[self.streamData];
+IF data.viewer.destroyed THEN ERROR IO.Error[$StreamClosed, self];
+data.echoStream ¬ echoTo;
+};
+ViewerGetEcho: PROC [self: STREAM] RETURNS [oldEcho: STREAM] = {
+data: ViewerStreamData = NARROW[self.streamData];
+IF data.viewer.destroyed THEN ERROR IO.Error[$StreamClosed, self];
+RETURN [data.echoStream];
+};
+ViewerPutChar: PROC[self: STREAM, char: CHAR] = {
+data: ViewerStreamData = NARROW[self.streamData];
+IF data.viewer.destroyed THEN ERROR IO.Error[$StreamClosed, self];
+TypeScript.PutChar[data.viewer, char ! TypeScript.Destroyed =>
+IF data.viewer.destroyed THEN ERROR IO.Error[$StreamClosed, self] ELSE RETRY];
+};
+
+ViewerFlush: PROC[self: STREAM] = {
+data: ViewerStreamData = NARROW[self.streamData];
+IF data.viewer.destroyed THEN ERROR IO.Error[$StreamClosed, self];
+TypeScript.Flush[data.viewer];
+};
+
+ViewerEraseChar: PROC[self: STREAM, char: CHAR] = {
+data: ViewerStreamData = NARROW[self.streamData];
+WHILE data.viewer.destroyed DO
+IF data.viewer.link # NIL THEN data.viewer ¬ data.viewer.link
+ELSE ERROR IO.Error[$StreamClosed, self];
+ENDLOOP;
+TypeScript.BackSpace[data.viewer];
+};
+
+ViewerReset: PROC [self: STREAM] = {
+ENABLE TypeScript.Destroyed => GO TO bye;
+data: ViewerStreamData = NARROW[self.streamData];
+viewer: Viewer = data.viewer;
+IF viewer = NIL OR viewer.destroyed THEN RETURN;
+TypeScript.ChangeLooks[viewer, '  ];
+TypeScript.SetCharSet[viewer, 0];
+TypeScript.SetCharProps[viewer, NIL];
+DO
+IF NOT TypeScript.CharsAvailable[viewer] THEN GO TO bye;
+[] ¬ TypeScript.GetChar[viewer];
+ENDLOOP;
+EXITS bye => {};
+};
+
+ViewerSetLooks: IOUtils.PFCodeProc = {
+viewer: Viewer = GetViewerFromStream[stream];
+looks: ROPE ¬ NIL;
+IF viewer = NIL THEN ERROR IO.Error[$NotImplementedForThisStream, stream];
+TRUSTED { WITH v: val SELECT FROM
+null => NULL;
+atom => looks ¬ Atom.GetPName[v.value];
+rope => looks ¬ v.value;
+character => looks ¬ Rope.FromChar[v.value];
+ENDCASE => ERROR IO.Error[$NotImplementedForThisStream, stream] };
+FOR i: INT IN [0..Rope.Length[looks]) DO
+TypeScript.ChangeLooks[viewer, Rope.Fetch[looks, i]];
+ENDLOOP;
+};
+
+
+viewerIOTiogaOps: IOTiogaPrivate.Ops ~ NEW[IOTiogaPrivate.OpsRep ¬ [
+SetCharSet: ViewerSetCharSet,
+GetCharSet: ViewerGetCharSet,
+ChangeLooks: ViewerChangeLooks,
+GetLooks: ViewerGetLooks,
+SetCharProps: ViewerSetCharProps,
+GetCharProps: ViewerGetCharProps,
+SetNodeProp: ViewerSetNodeProp,
+GetNodeProp: ViewerGetNodeProp,
+MapNodeProps: ViewerMapNodeProps,
+SetLevel: ViewerSetLevel,
+GetLevel: ViewerGetLevel,
+Break: ViewerBreak
+]];
+
+ViewerSetCharSet: PROC [self: STREAM, charSet: CharSet] ~ {
+ts: TypeScript.TS ~ GetViewerFromStream[self];
+TypeScript.SetCharSet[ts, charSet];
+};
+
+ViewerGetCharSet: PROC [self: STREAM] RETURNS [CharSet] ~ {
+ts: TypeScript.TS ~ GetViewerFromStream[self];
+RETURN[TypeScript.GetCharSet[ts]];
+};
+
+ViewerChangeLooks: PROC [self: STREAM, remove, add: Looks] ~ {
+ts: TypeScript.TS ~ GetViewerFromStream[self];
+TypeScript.ModifyLooks[ts: ts, remove: remove, add: add];
+};
+
+ViewerGetLooks: PROC [self: STREAM] RETURNS [Looks] ~ {
+ts: TypeScript.TS ~ GetViewerFromStream[self];
+RETURN[TypeScript.GetLooks[ts]];
+};
+
+ViewerSetCharProps: PROC [self: STREAM, propList: PropList] ~ {
+ts: TypeScript.TS ~ GetViewerFromStream[self];
+TypeScript.SetCharProps[ts, propList];
+};
+
+ViewerGetCharProps: PROC [self: STREAM] RETURNS [PropList] ~ {
+ts: TypeScript.TS ~ GetViewerFromStream[self];
+RETURN[TypeScript.GetCharProps[ts]];
+};
+
+ViewerSetNodeProp: PROC [self: STREAM, name: ATOM, value: REF] ~ {
+};
+
+ViewerGetNodeProp: PROC [self: STREAM, name: ATOM] RETURNS [value: REF] ~ {
+RETURN[NIL]
+};
+
+ViewerMapNodeProps: PROC [self: STREAM, action: MapPropsAction] RETURNS [BOOL] ~ {
+RETURN[FALSE];
+};
+
+ViewerSetLevel: PROC [self: STREAM, level: CARDINAL] ~ {
+};
+
+ViewerGetLevel: PROC [self: STREAM] RETURNS [level: CARDINAL] ~ {
+RETURN[0];
+};
+
+ViewerBreak: PROC [self: STREAM] ~ {
+};
+
+
+Location: TYPE = TiogaOps.Location;
+EditedViewerStreamData: TYPE = REF EditedViewerStreamRecord;
+EditedViewerStreamRecord: TYPE = RECORD[
+ready: REF TEXT,
+readyPos: INT ¬ 0, -- ready[readyPos .. ready.length) are the already-activated characters
+buffer: REF TEXT,
+echoStream: STREAM,
+deliverWhen: DeliverWhenProc,
+context: REF ANY,
+bufferIsConsistent: BOOL ¬ FALSE,
+viewer: Viewer,
+node: TiogaOps.Ref
+];
+EditedViewerStreamProcs: REF StreamProcs;
+CreateEditedViewerStream: PROC [
+in: STREAM, echoTo: STREAM, deliverWhen: DeliverWhenProc, context: REF ANY ¬ NIL]
+RETURNS [STREAM] = {
+data: EditedViewerStreamData;
+data ¬ NEW[EditedViewerStreamRecord ¬ [ 
+buffer: NEW[TEXT[256]],
+ready: NEW[TEXT[256]],
+readyPos: 0,
+echoStream: echoTo,
+deliverWhen: deliverWhen, context: context,
+viewer: NARROW[in.streamData, ViewerStreamData].viewer,
+node: NIL]];
+RETURN [IO.CreateStream[
+streamProcs: EditedViewerStreamProcs, streamData: data, backingStream: in]]
+};
+GetBuffer: PUBLIC PROC [editedViewerStream: STREAM] RETURNS [REF TEXT] = {
+data: EditedViewerStreamData = NARROW[editedViewerStream.streamData];
+GetCurrentBuffer1[data];
+RETURN [data.buffer];
+};
+TypeChars: PUBLIC PROC [editedViewerStream: STREAM, chars: ROPE] = {
+data: EditedViewerStreamData = NARROW[editedViewerStream.streamData];
+TypeScript.TypeIn[data.viewer, chars];
+};
+GetCurrentBuffer: PROC [data: EditedViewerStreamData] = INLINE {
+IF data.bufferIsConsistent THEN RETURN ELSE GetCurrentBuffer1[data];
+};
+GetCurrentBuffer1: PROC [data: EditedViewerStreamData] = {
+r: ROPE;  loc: Location;
+data.buffer.length ¬ 0;
+data.bufferIsConsistent ¬ TRUE;
+IF data.node = NIL THEN RETURN;
+TypeScript.Flush[data.viewer];
+r ¬ TiogaOps.GetRope[data.node];
+loc ¬ TiogaOps.GetTextKey[node: data.node, key: data];
+IF loc.node # data.node THEN ERROR;
+{
+Put: PROC [c: CHAR] RETURNS [quit: BOOL] = {
+data.buffer ¬ RefText.InlineAppendChar[data.buffer, c];
+RETURN [quit: FALSE]
+};
+[] ¬ Rope.Map[base: r, start: loc.where + 1, len: INT.LAST, action: Put];
+};
+};
+EditedViewerStreamAppendBufferChars: PROC [stream: STREAM, chars: ROPE] = {
+data: EditedViewerStreamData = NARROW[stream.streamData];
+Append1: PROC [c: CHAR] RETURNS [quit: BOOL] = {
+AppendBufferChar[data, c]; RETURN [quit: FALSE] };
+GetCurrentBuffer1[data];
+[] ¬ chars.Map[action: Append1];
+};
+AppendBufferChar: PROC [data: EditedViewerStreamData, char: CHAR] = INLINE {
+loc: Location;
+data.buffer ¬ RefText.InlineAppendChar[data.buffer, char];
+IF data.node = NIL THEN {
+TypeScript.Flush[data.viewer];
+loc ¬ TiogaOps.LastLocWithin[TiogaOps.ViewerDoc[data.viewer]];
+IF loc.where = 0 THEN data.echoStream.PutChar[' ] ELSE loc.where ¬ loc.where - 1;
+};
+data.echoStream.PutChar[char];
+IF data.node = NIL THEN {
+TypeScript.Flush[data.viewer];
+TiogaOps.PutTextKey[node: loc.node, where: loc.where, key: data];
+data.node ¬ loc.node;
+};
+};
+EditedViewerStreamUnAppendBufferChars: PROC [stream: STREAM, nChars: NAT] = {
+data: EditedViewerStreamData = NARROW[stream.streamData];
+GetCurrentBuffer1[data];
+FOR i: NAT IN [0 .. MIN[nChars, data.buffer.length]) DO
+UnAppendBufferChar[data]
+ENDLOOP;
+};
+UnAppendBufferChar: PROC [data: EditedViewerStreamData] = INLINE {
+char: CHAR = data.buffer[data.buffer.length - 1];
+data.echoStream.EraseChar[char];
+data.buffer.length ¬ data.buffer.length - 1;
+IF data.buffer.length = 0 THEN data.node ¬ NIL;
+};
+EditedViewerStreamSetMode: PROC [stream: STREAM, stuff: ROPE, pendingDelete: BOOL, echoAsterisks: BOOL]  = {
+data: EditedViewerStreamData = NARROW[stream.streamData];
+data.buffer.length ¬ 0;
+data.readyPos ¬ data.ready.length;
+EditedViewerStreamAppendBufferChars[stream, stuff];
+};
+EditedViewerStreamGetDeliverWhen: PROC [self: STREAM] RETURNS [proc: DeliverWhenProc, context: REF ANY] = {
+data: EditedViewerStreamData = NARROW[self.streamData];
+RETURN [data.deliverWhen, data.context];
+};
+EditedViewerStreamSetDeliverWhen: PROC [self: STREAM, proc: DeliverWhenProc, context: REF ANY] = {
+data: EditedViewerStreamData = NARROW[self.streamData];
+data.deliverWhen ¬ proc;  data.context ¬ context;
+};
+EditedViewerStreamGetChar: PROC [self: STREAM] RETURNS [char: CHAR] = {
+data: EditedViewerStreamData = NARROW[self.streamData];
+BackChar: PROC = {
+IF data.buffer.length > 0 THEN {
+UnAppendBufferChar[data];
+}
+};
+BackWord: PROC = {
+alphaSeen: BOOL ¬ FALSE;
+UNTIL data.buffer.length = 0 DO
+SELECT data.buffer[data.buffer.length - 1] FROM
+IN ['A..'Z], IN ['a..'z], IN ['0..'9] => alphaSeen ¬ TRUE;
+ENDCASE => IF alphaSeen THEN EXIT;
+UnAppendBufferChar[data];
+ENDLOOP;
+};
+BackLine: PROC = {
+UNTIL data.buffer.length = 0 DO
+IF data.buffer[data.buffer.length - 1] = IO.CR THEN EXIT;
+UnAppendBufferChar[data];
+ENDLOOP;
+};
+DO
+IF data.readyPos < data.ready.length THEN {
+char ¬ data.ready[data.readyPos];
+data.readyPos ¬ data.readyPos + 1;
+RETURN [char];
+};
+{
+appendChar, activate: BOOL;
+char ¬ self.backingStream.GetChar[ ! IO.EndOfStream =>
+IF data.buffer.length = 0 THEN REJECT ELSE GOTO activateBuffer];
+[appendChar: appendChar, activate: activate] ¬
+data.deliverWhen[char, NIL --data.buffer--, self, data.context];
+IF appendChar THEN {
+SELECT char FROM
+Ascii.DEL => { ENABLE UNWIND => data.buffer.length ¬ 0;
+ERROR IO.Rubout[self];
+};
+Ascii.BS => { GetCurrentBuffer1[data]; BackChar[] };
+Ascii.ControlW => { GetCurrentBuffer1[data]; BackWord[] };
+Ascii.ControlQ => { GetCurrentBuffer1[data]; BackLine[] };
+Ascii.ESC => {
+GetCurrentBuffer1[data];
+IF data.buffer.length = 0 THEN {
+IF ( data.ready.length # 0 ) THEN	-- [0..-1) below gives BoundFault
+FOR i: NAT IN [0..data.ready.length-1) DO
+AppendBufferChar[data, data.ready[i]];
+ENDLOOP
+}
+};
+ENDCASE => {
+IF data.buffer.length = 0 THEN GetCurrentBuffer1[data];
+AppendBufferChar[data, char];
+}
+};
+IF activate THEN GOTO activateBuffer;
+EXITS activateBuffer => {
+GetCurrentBuffer1[data];
+data.ready.length ¬ 0;
+data.ready ¬ RefText.Append[data.ready, data.buffer];
+data.readyPos ¬ 0;
+data.buffer.length ¬ 0;
+data.node ¬ NIL;
+}
+}
+ENDLOOP;
+};
+EditedViewerStreamEndOf: PROC [self: STREAM] RETURNS [BOOL] = {
+data: EditedViewerStreamData = NARROW[self.streamData];
+RETURN[data.readyPos = data.ready.length AND self.backingStream.EndOf[]]; 
+};
+EditedViewerStreamCharsAvail: PROC [self: STREAM, wait: BOOL] RETURNS [INT] = {
+data: EditedViewerStreamData = NARROW[self.streamData];
+IF data.readyPos < data.ready.length THEN RETURN [data.ready.length-data.readyPos];
+RETURN[self.backingStream.CharsAvail[wait]];
+};
+EditedViewerStreamBackup: PROC [self: STREAM, char: CHAR] = {
+data: EditedViewerStreamData = NARROW[self.streamData];
+IF data.readyPos = 0 OR data.ready[data.readyPos - 1] # char THEN
+ERROR IO.Error[$IllegalBackup, self];
+data.readyPos ¬ data.readyPos - 1;
+};
+EditedViewerStreamSetEcho: PROC [self: STREAM, echoTo: STREAM] = {
+data: EditedViewerStreamData = NARROW[self.streamData];
+IF echoTo = NIL THEN RETURN;  -- ignore request to turn off echoing
+IF data.echoStream # echoTo THEN ERROR IO.Error[$Failure, self];
+};
+EditedViewerStreamGetEcho: PROC [self: STREAM] RETURNS [STREAM] = {
+data: EditedViewerStreamData = NARROW[self.streamData];
+RETURN [data.echoStream];
+};
+EditedViewerStreamReset: PROC [self: STREAM] = {
+data: EditedViewerStreamData = NARROW[self.streamData];
+data.node ¬ NIL;
+data.buffer.length ¬ 0;
+data.ready.length ¬ 0;
+data.readyPos ¬ 0;
+self.backingStream.Reset[];
+data.echoStream.Reset[];
+};
+MessageWindowStreamProcs: REF StreamProcs;
+
+CreateMessageWindowStream: PUBLIC PROC [] RETURNS [STREAM] = { 
+RETURN[IO.CreateStream[
+streamProcs: MessageWindowStreamProcs, backingStream: IO.ROS[], streamData: NIL]];
+};
+
+MessageWindowStreamFlush: PROC[self: STREAM] = {
+r: ROPE ¬ self.backingStream.RopeFromROS[close: FALSE];
+i: INT ¬ 0;
+self.backingStream.Reset[];
+WHILE (i ¬ Rope.Find[s1: r, s2: "\n", pos1: i]) # -1 DO
+r ¬ Rope.Replace[base: r, start: i, len: 1, with: " "];
+ENDLOOP;
+MessageWindow.Append[message: r, clearFirst: TRUE]
+};
+
+MessageWindowStreamReset: PROC[self: STREAM] = {
+self.backingStream.Reset[];
+MessageWindow.Clear[]
+};
+[] ¬ ViewerEvents.RegisterEventProc [
+proc: WasAStreamViewerDestroyed, filter: $Typescript, event: $destroy];
+ViewerInStreamProcs ¬ EditedStream.AddStreamProcs[to: IO.CreateStreamProcs[
+variety: $input, class: $ViewersInput,
+getChar: ViewerGetChar, 
+endOf: ViewerEndOf,
+charsAvail: ViewerCharsAvail,
+reset: ViewerReset],
+setEcho: ViewerSetEcho,
+getEcho: ViewerGetEcho];
+ViewerOutStreamProcs ¬ IO.CreateStreamProcs[
+variety: $output, class: $ViewersOutput,
+putChar: ViewerPutChar,
+flush: ViewerFlush,
+eraseChar: ViewerEraseChar,
+reset: ViewerReset];
+IOTiogaPrivate.AddOps[ViewerOutStreamProcs, viewerIOTiogaOps];
+ViewerOutPFProcs ¬ IOUtils.CopyPFProcs[NIL];
+[] ¬ IOUtils.SetPFCodeProc[ViewerOutPFProcs, 'l, ViewerSetLooks];
+EditedViewerStreamProcs ¬ EditedStream.AddStreamProcs[to: IO.CreateStreamProcs[
+variety: $input, class: $EditedViewer,
+getChar: EditedViewerStreamGetChar,
+endOf: EditedViewerStreamEndOf,
+charsAvail: EditedViewerStreamCharsAvail,
+backup: EditedViewerStreamBackup,
+reset: EditedViewerStreamReset],
+setEcho: EditedViewerStreamSetEcho,
+getEcho: EditedViewerStreamGetEcho];
+IOUtils.StoreProc[EditedViewerStreamProcs,
+$GetDeliverWhen, NEW[TypeOfGetDeliverWhen ¬ EditedViewerStreamGetDeliverWhen]];
+IOUtils.StoreProc[EditedViewerStreamProcs,
+$SetDeliverWhen, NEW[TypeOfSetDeliverWhen ¬ EditedViewerStreamSetDeliverWhen]];
+IOUtils.StoreProc[EditedViewerStreamProcs,
+$AppendBufferChars, NEW[TypeOfAppendBufferChars ¬ EditedViewerStreamAppendBufferChars]];
+IOUtils.StoreProc[EditedViewerStreamProcs,
+$UnAppendBufferChars, NEW[TypeOfUnAppendBufferChars ¬ EditedViewerStreamUnAppendBufferChars]];
+IOUtils.StoreProc[EditedViewerStreamProcs,
+$SetMode, NEW[TypeOfSetMode ¬ EditedViewerStreamSetMode]];
+MessageWindowStreamProcs ¬ IO.CreateStreamProcs[
+variety: $output, class: $MessageWindow,
+flush: MessageWindowStreamFlush,
+reset: MessageWindowStreamReset
+];
+
+END.
+  J  
+ViewerIOImpl.mesa
+Copyright Ó 1984, 1985, 1986, 1987, 1989, 1990, 1991 by Xerox Corporation.  All rights reserved.
+MBrown on January 13, 1984 1:42 pm
+Russ Atkinson, November 5, 1984 8:56:31 pm PST
+Michael Plass, September 24, 1991 5:16 pm PDT
+Pier, January 16, 1989 4:20:33 pm PST
+Willie-sue Orr, February 14, 1991 11:28 am PST
+Doug Wyatt, November 6, 1991 2:54 pm PST
+
+-- CreateViewerStreams should not raise IO.Error[$Failure], should not raise FS.Error?
+-- Should Destroy of a viewer cause implicit Close?
+-- WasAStreamViewerDestroyed seems to require monitor protection in its access to the stream.
+-- Why is Close not implemented for Viewer streams?
+-- What if node goes away in AppendBufferChar?
+-- Edited stream backup does not allow backup past ready chars, should it?
+-- SetEcho with stream in the backed-up state should be some sort of error?
+-- Why is there air?
+Viewer Input and Output Streams (Typescript)
+Types
+This type is used for both input and output stream; the echoStream field is ignored for output streams.  A ViewerStreamDataRecord is not shared between multiple streams.
+Creation
+make all streams attached to the viewer about to be destroyed attached to this undestroyed child 
+Input procs
+If a split viewer is destroyed while a process is inside of a call to TypeScript.GetChar on that viewer, TypeScript.Destroyed is raised in that process.  Before TypeScript.Destroyed is raised, data.viewer on any stream for this viewer will have been replaced by one of the other viewers (viewers calls WasAStreamViewerDestroyed below); hence the RETRY will call TypeScript.GetChar on another viewer.  The same logic is used in ViewerCharsAvail and ViewerPutChar.
+Output procs
+Note, we cannot use TypeScript.Flush, since it tosses all of our nice state on the floor.
+Put the looks back into their ground state.
+Edited Viewer Input Stream (Editable Typescript)
+in is a Viewer input stream and EditedStream.GetEcho[in] = NIL.
+echoTo is a Viewer output stream for the same viewer as in, or is a dribble stream.
+Called from EditedViewerStreamAppendBufferChars, EditedViewerStreamUnAppendBufferChars, EditedViewerStreamGetChar
+Makes data.buffer consistent with current state of the underlying viewer
+This is the only proc that tests the state of data.bufferIsConsistent
+-- RefText.AppendRope[to: data.buffer, from: r, start: loc.where + 1];
+Assumes data.buffer is consistent
+What if node goes away?
+What if node goes away?
+Assumes data.buffer is consistent
+erases last character, if any, in buffer
+erases last "word" (consecutive run of letters and numbers), if any, in buffer
+erases buffer back to (not including) previous CR, if any
+GetCurrentBuffer[data];
+looks wrong ... why can't you backup past ready chars?
+Can't change echo stream, because "truth" about buffered characters is stored in Tioga document behind echo stream.
+Message Window Stream 
+Module Initialization
+ÊC  –(cedarcode) style•NewlineDelimiter
+™ codešœ™Kšœ
+ÏeœU™`KšÏy
+Ðcy™"K™.K™-K™%K™.K™(K™ KšÏcV™VKš 3™3Kš ]™]Kš 3™3Kš .™.Kš J™JKš K™KK™—K˜ šÏk	˜	Kš	œ¡œ¡œ¡œ¡œ˜/Kšœ¡œ˜Kšœ¡œ3˜EKš
+¡œ¡œ¡œo¡œ
+¡œ˜©Kšœ
+¡œ˜,Kšœ¡œA˜UKšœ¡œU˜bKšœ¡œ˜$Kš¡œ¡œ˜%Kšœ¡œ˜)Kšœ¡œ/¡œ˜?Kšœ	¡œL˜ZKšœ˜Kšœ¡œ
+˜Kšœ¡œ ˜2Kšœ	¡œ˜Kšœ
+¡œ˜%—K˜ KšÏnœ¡œ¡˜Kš¡œ¡œ5¡œ>˜”Kš¡œ	˜šœ¡˜K˜ Kš¡œ¡œ¡œ¡œ˜Kš¡œ¡œ¡œ˜K˜ Kšœ	¡œ˜'Kšœ¡œ˜#Kšœ
+¡œ˜)Kšœ¡œ!˜5K˜ Kšœ¡œ˜$Kšœ¡œ¡œ˜#Kšœ¡œ ˜5Kš¢œ¡œ¡œ¡œ¡œ"¡œ¡œ˜cKš¢œ¡œ¡œ¡œ"¡œ¡œ˜ZKš
+¢œ¡œ¡œ
+¡œ	¡œ˜CKš
+¢œ¡œ¡œ
+¡œ
+¡œ˜Eš¢œ¡œ¡œ
+¡œ	¡œ¡œ˜MKšœ¡œ˜——™,šœ™šœ¡œ¡œ˜4Kšœ©™©—šœ¡œ¡œ˜'K˜Kšœ¡œ¡˜K˜—Kšœ¡œ˜%Kšœ¡œ˜&Kšœ"˜"—™š¢œ¡œ¡œ˜"Kšœ¡œ¡œ¡œ¡œ¡œ¡œ
+¡œ¡œ˜kKš¡œ¡œ¡œ˜%Kšœ	¡œ¡œ¡œ˜Kš¡œ
+¡œ¡œ?˜SKš¡œ¡œ¡œ"¡œ¡œ¡œ¡œ˜Pšœ¡œ˜Kšœ!˜!Kšœ¡œ-˜<—Kšœ#˜#šœ¡œ˜Kšœ"˜"Kšœ¡œ-˜<—Kšœ$˜$Kšœ/˜/š¡œ¡œ¡œ+˜DKšœ˜Kšœ	¡œ¡œ5˜Z—Kšœ
+¡œ6˜FKšœ
+¡œ¡œ˜'Kšœ@˜@š¡œ¡˜KšœS˜S—Kš¡œ-˜1K˜—š
+¢œ¡œ¡œ
+¡œ¡œ˜Fš¡œ
+¡œ¡˜š¡œ¡œ¡˜"Kšœ¡œ˜.Kš¡œ"˜)—Kš¡œ˜—Kš¡œ¡œ˜K˜—šÏbœ˜5Kš	œ	¡œ¡œ¡œ¡œ(˜HK˜Kš¡œ¡œ¡œ¡œ˜š	¡œ¡œ¡œ¡œ ˜<š¡œ¡œ¡œ˜Kšœa™aš¡œ¡œ¡œ¡œ¡œ¡œ¡˜8Kšœ¡œ˜4K˜Kš¡œ˜—Kšœ)˜)Kš¡œ˜K˜—Kš¡œ˜	—K˜——™š
+¢œ¡œ¡œ¡œ¡œ˜<Kšœ¡œ˜1Kš¡œ¡œ¡œ¡œ˜Bšœ?˜?š¡œ¡œ¡œ¡œ¡œ¡œ˜NKšœÚ¡œo™Î——Kš¡œ¡œ¡œ˜<Kšœ˜—š¢œ¡œ¡œ¡œ¡œ¡œ˜;Kšœ¡œ˜1Kš¡œ¡œ¡œ¡œ˜BKš¡œ¡œ˜Kšœ˜—š¢œ¡œ¡œ¡œ¡œ¡œ˜CKšœ¡œ˜1Kšœ˜Kš¡œ
+¡œ¡œ¡œ¡œ¡œ˜Mš¡œ˜š¡œ˜šœ?˜?Kš¡œ¡œ¡œ¡œ¡œ¡œ˜H—Kš¡œ˜	Kšœ˜—Kš
+¡œ¡œ¡œ#¡œ¡œ˜@—Kšœ˜—š¢œ¡œ¡œ
+¡œ˜6Kšœ¡œ˜1Kš¡œ¡œ¡œ¡œ˜BKšœ˜Kšœ˜—š
+¢œ¡œ¡œ¡œ¡œ˜@Kšœ¡œ˜1Kš¡œ¡œ¡œ¡œ˜BKš¡œ˜Kšœ˜——™š¢œ¡œ¡œ¡œ˜1Kšœ¡œ˜1Kš¡œ¡œ¡œ¡œ˜Bšœ>˜>Kš¡œ¡œ¡œ¡œ¡œ¡œ˜N—Kšœ˜K˜ —š¢œ¡œ¡œ˜#Kšœ¡œ˜1Kš¡œ¡œ¡œ¡œ˜BK˜Kšœ˜K˜ —š¢œ¡œ¡œ¡œ˜3Kšœ¡œ˜1š¡œ¡˜Kš¡œ¡œ¡œ˜=Kš¡œ¡œ¡œ˜)Kš¡œ˜—K˜"Kšœ˜K˜ —š¢œ¡œ¡œ˜$KšœY™YKš¡œ¡œ¡œ˜)Kšœ¡œ˜1K˜Kš
+¡œ
+¡œ¡œ¡œ¡œ˜0Kšœ$˜$Kšœ!˜!šœ ¡œ˜%Kšœ+™+—š¡˜Kš
+¡œ¡œ#¡œ¡œ¡œ˜8Kšœ ˜ Kš¡œ˜—Kš¡œ˜Kšœ˜K˜ —š£œ˜&K˜-Kšœ¡œ¡œ˜Kš
+¡œ
+¡œ¡œ¡œ¡œ-˜Jš¡œ¡œ¡œ¡˜!Kšœ¡œ˜K˜'K˜K˜,Kš¡œ¡œ¡œ/˜B—š¡œ¡œ¡œ¡˜(Kšœ5˜5Kš¡œ˜—K˜K˜ —K˜ šœ'¡œ˜DKš¢
+œ˜Kš¢
+œ˜Kš¢œ˜Kš¢œ˜Kš¢œ˜!Kš¢œ˜!Kš¢œ˜Kš¢œ˜Kš¢œ˜!Kš¢œ˜Kš¢œ˜Kš¢œ˜Kšœ˜K˜ —š¢œ¡œ¡œ˜;Kšœ¡œ˜.Kšœ#˜#K˜K˜ —š¢œ¡œ¡œ¡œ˜;Kšœ¡œ˜.Kš¡œ˜"K˜K˜ —š¢œ¡œ¡œ˜>Kšœ¡œ˜.Kšœ9˜9K˜K˜ —š¢œ¡œ¡œ¡œ˜7Kšœ¡œ˜.Kš¡œ˜ K˜K˜ —š¢œ¡œ¡œ˜?Kšœ¡œ˜.Kšœ&˜&K˜K˜ —š¢œ¡œ¡œ¡œ˜>Kšœ¡œ˜.Kš¡œ˜$K˜K˜ —š
+¢œ¡œ¡œ¡œ	¡œ˜BK˜K˜ —š¢œ¡œ¡œ¡œ¡œ	¡œ˜KKš¡œ¡œ˜K˜K˜ —š
+¢œ¡œ¡œ¡œ¡œ˜RKš¡œ¡œ˜K˜K˜ —š¢œ¡œ¡œ	¡œ˜8K˜K˜ —š
+¢œ¡œ¡œ¡œ	¡œ˜AKš¡œ˜
+K˜K˜ —š¢œ¡œ¡œ˜$K˜K˜ —K˜ ——™0Kšœ
+¡œ˜#Kšœ¡œ¡œ˜<šœ¡œ¡œ˜(Kšœ¡œ¡œ˜Kšœ
+¡œ G˜ZKšœ¡œ¡œ˜Kšœ¡œ˜K˜Kšœ	¡œ¡œ˜Kšœ¡œ¡œ˜!Kšœ˜Kšœ˜K˜—Kšœ¡œ˜)š¢œ¡œ˜ Kšœ¡œ
+¡œ)¡œ¡œ¡œ˜QKš¡œ¡œ˜Kšœ;¡œ™?KšœS™SKšœ˜šœ¡œ˜(Kšœ¡œ¡œ˜Kšœ¡œ¡œ˜Kšœ˜Kšœ˜Kšœ+˜+Kšœ¡œ)˜7Kšœ¡œ˜—š¡œ¡œ˜KšœK˜K—Kšœ˜—š¢	œ¡œ¡œ¡œ¡œ¡œ¡œ˜JKšœ¡œ ˜EKšœ˜Kš¡œ˜Kšœ˜—š
+¢	œ¡œ¡œ¡œ	¡œ˜DKšœ¡œ ˜EKšœ&˜&Kšœ˜—š¢œ¡œ"¡œ˜@Kšœq™qKšœH™HKšœE™EKš¡œ¡œ¡œ¡œ˜DKšœ˜—š¢œ¡œ#˜:Kšœ¡œ˜Kšœ˜Kšœ¡œ˜Kš¡œ¡œ¡œ¡œ˜Kšœ˜Kšœ ˜ Kšœ6˜6Kš¡œ¡œ¡œ˜#šœ˜KšœF™Fš
+¢œ¡œ¡œ¡œ¡œ˜,Kšœ7˜7Kš¡œ¡œ˜Kšœ˜—Kšœ2¡œ¡œ˜IKšœ˜—K˜—š¢#œ¡œ
+¡œ	¡œ˜KKšœ¡œ˜9š
+¢œ¡œ¡œ¡œ¡œ˜0Kšœ¡œ¡œ˜2—Kšœ˜Kšœ ˜ K˜—š¢œ¡œ&¡œ¡œ˜LKšœ!™!K˜K˜:š¡œ¡œ¡œ˜Kšœ˜šœ>˜>Kšœ™—Kš¡œ¡œ¡œ˜QKšœ˜—Kšœ˜š¡œ¡œ¡œ˜Kšœ˜šœA˜AKšœ™—Kšœ˜K˜—Kšœ˜—š¢%œ¡œ
+¡œ
+¡œ˜MKšœ¡œ˜9Kšœ˜š	¡œ¡œ¡œ¡œ¡˜7Kšœ˜Kš¡œ˜—K˜—š¢œ¡œ"¡œ˜BKšœ!™!Kšœ¡œ'˜1Kšœ ˜ K˜,Kš¡œ¡œ¡œ˜/Kšœ˜—š¢œ¡œ
+¡œ	¡œ¡œ¡œ˜lKšœ¡œ˜9K˜Kšœ"˜"Kšœ3˜3K˜—š¢ œ¡œ¡œ¡œ"¡œ¡œ˜kKšœ¡œ˜7Kš¡œ"˜(K˜—š
+¢ œ¡œ¡œ"¡œ¡œ˜bKšœ¡œ˜7Kšœ1˜1K˜—š
+¢œ¡œ¡œ¡œ¡œ˜GKšœ¡œ˜7š¢œ¡œ˜Kšœ(™(š¡œ¡œ˜ K˜Kšœ˜—Kšœ˜—š¢œ¡œ˜KšœN™NKšœ¡œ¡œ˜š¡œ¡˜š¡œ%¡˜/Kš¡œ¡œ¡œ¡œ˜:Kš¡œ¡œ¡œ¡œ˜"—K˜Kš¡œ˜—Kšœ˜—š¢œ¡œ˜Kšœ/¡œ™9š¡œ¡˜Kš
+¡œ'¡œ¡œ¡œ¡œ˜9K˜Kš¡œ˜—Kšœ˜—š¡˜š¡œ#¡œ˜+Kšœ!˜!K˜"Kš¡œ˜Kšœ˜—˜Kšœ¡œ˜šœ%¡œ˜6Kš
+¡œ¡œ¡œ¡œ¡œ˜@—Kšœ™šœ.˜.Kšœ¡œ œ˜@—š¡œ¡œ˜š¡œ¡˜šœ¡œ¡œ¡œ˜7Kš¡œ¡œ˜K˜—Kšœ¡œ,˜4Kšœ:˜:Kšœ:˜:šœ¡œ˜Kšœ˜š¡œ¡œ˜ š¡œ¡œ !˜Cš¡œ¡œ¡œ¡˜)K˜&Kš¡˜——K˜—K˜—š¡œ˜Kš¡œ¡œ˜7Kšœ˜K˜——K˜—Kš¡œ
+¡œ¡œ˜%š¡œ˜Kšœ˜Kšœ˜K˜5Kšœ˜K˜Kšœ¡œ˜K˜—K˜—Kš¡œ˜—Kšœ˜—š
+¢œ¡œ¡œ¡œ¡œ˜?Kšœ¡œ˜7Kš¡œ#¡œ˜JKšœ˜—š¢œ¡œ¡œ¡œ¡œ¡œ˜OKšœ¡œ˜7Kš¡œ#¡œ¡œ#˜SKš¡œ&˜,Kšœ˜—š¢œ¡œ¡œ¡œ˜=Kšœ6™6Kšœ¡œ˜7š¡œ¡œ&¡˜AKš¡œ¡œ˜%—Kšœ"˜"Kšœ˜—š¢œ¡œ¡œ
+¡œ˜BKšœ¡œ˜7Kš	¡œ
+¡œ¡œ¡œ %˜Cš¡œ¡œ¡œ¡œ˜@Kšœs™s—Kšœ˜—š
+¢œ¡œ¡œ¡œ¡œ˜CKšœ¡œ˜7Kš¡œ˜Kšœ˜—š¢œ¡œ¡œ˜0Kšœ¡œ˜7Kšœ¡œ˜K˜K˜K˜K˜Kšœ˜Kšœ˜——™šœ¡œ˜*K˜ —š
+¢œ¡œ¡œ¡œ¡œ˜?š¡œ¡œ˜Kšœ6¡œ¡œ¡œ˜R—Kšœ˜—K˜ š¢œ¡œ¡œ˜0Kšœ¡œ)¡œ˜7Kšœ¡œ˜Kšœ˜š¡œ0¡˜7Kšœ7˜7Kš¡œ˜—Kšœ-¡œ˜2Kšœ˜—K˜ š¢œ¡œ¡œ˜0Kšœ˜Kšœ˜Kšœ˜——™˜%K˜G—šœ6¡œ˜KKšœ&˜&K˜K˜K˜Kšœ˜Kšœ˜Kšœ˜—šœ¡œ˜,Kšœ(˜(K˜K˜Kšœ˜Kšœ˜—Kšœ>˜>Kšœ'¡œ˜,KšœA˜Ašœ:¡œ˜OK˜&K˜#K˜K˜)K˜!K˜ Kšœ#˜#Kšœ$˜$šœ*˜*Kšœ¡œ;˜O—šœ*˜*Kšœ¡œ;˜O—šœ*˜*Kšœ¡œA˜X—šœ*˜*Kšœ¡œE˜^—šœ*˜*Kšœ
+¡œ-˜:——šœ¡œ˜0Kšœ(˜(K˜ K˜K˜——K˜ Kš¡œ˜— …—    Iø  m…  

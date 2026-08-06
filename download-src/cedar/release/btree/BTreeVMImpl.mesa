@@ -1,0 +1,313 @@
+
+DIRECTORY
+Basics,
+BTree USING [PageNumber, PagePtr, PageSize, PageStorage, ReferencePage, ReferenceType, ReleasePage, statePage, UpdateState],
+BTreeVM,
+FinalizeOps,
+IO,
+Rope,
+VM USING [AddressForPageNumber, Free, Interval, PageNumber, PageNumberForAddress, PagesForBytes, SimpleAllocate];
+
+BTreeVMImpl: CEDAR MONITOR
+LOCKS h USING h: BTreeVM.Ref
+IMPORTS FinalizeOps, IO, VM
+EXPORTS BTreeVM
+= {
+Impl: TYPE ~ REF VMObjectRepImpl;
+VMObjectRepImpl: PUBLIC TYPE =  RECORD [
+readBacking: IO.STREAM,	-- the backing stream for reads
+writeBacking: IO.STREAM, -- the backing stream for writes
+pageLength: INT,	-- in bytes
+offset: CARD,	-- in bytes
+rover: CacheIndex,
+cache: REF Cache,
+stats:  BTreeVM.Stats,
+hashTable: PACKED SEQUENCE count: CARDINAL OF CacheIndex
+]; 
+CacheIndex: TYPE = [0 .. LAST[BTreeVM.CacheSize]];
+noIndex: CacheIndex = LAST[CacheIndex];
+Cache: TYPE = RECORD [PACKED SEQUENCE count: CacheIndex OF CacheEntry];
+CacheEntry: TYPE = RECORD [
+pNum: BTree.PageNumber,
+start: INT,
+ptr: BTree.PagePtr,
+referenceCount: INT,
+hash: CacheIndex,
+empty, recentlyUsed, dirty: BOOLEAN
+]; 
+useFinalization: BOOL ¨ TRUE;
+ROPE: TYPE = Rope.ROPE;
+Error: PUBLIC ERROR [ec: ErrorCode, explanation: ROPE ¨ NIL];
+ErrorCode: TYPE = ATOM;
+Open: PUBLIC PROC [readBacking, writeBacking: IO.STREAM, pageSize: BTree.PageSize,
+cacheSize: BTreeVM.CacheSize, offset: CARD] RETURNS [h: BTreeVM.Ref] = {
+
+impl: Impl ¨ NEW[VMObjectRepImpl [2*cacheSize+1]];
+impl.readBacking ¨ readBacking;
+impl.writeBacking ¨ writeBacking;
+impl.offset ¨ offset;
+impl.pageLength ¨ pageSize * BYTES[WORD];
+impl.rover ¨ 0;
+impl.cache ¨ NEW[Cache[cacheSize]];
+impl.stats ¨ NEW[BTreeVM.Statistics ¨ [hits: 0, misses: 0, reads: 0, writes: 0, cumChainLength: 0,
+cumReadWriteTime: 0]];
+FOR c: CARD IN [0..impl.count) DO
+impl.hashTable[c] ¨ noIndex;
+ENDLOOP;
+
+FOR i: CacheIndex IN [0 .. cacheSize) DO
+impl.cache[i].pNum ¨ 0;
+impl.cache[i].start ¨ 0;
+impl.cache[i].ptr ¨ NIL;
+impl.cache[i].referenceCount ¨ 0;
+impl.cache[i].hash ¨ noIndex;
+impl.cache[i].empty ¨ TRUE;
+impl.cache[i].recentlyUsed ¨ FALSE;
+impl.cache[i].dirty ¨ FALSE;
+ENDLOOP;
+
+h ¨ NEW [BTreeVM.VMObjectRep ¨ [impl: impl]];
+IF useFinalization THEN [] ¨ FinalizeOps.EnableFinalization[h, finalizationQueue];
+
+RETURN [h];
+};
+ReferencePage: PUBLIC BTree.ReferencePage = {
+InnerReference: ENTRY PROCEDURE [h: BTreeVM.Ref] = {
+ENABLE UNWIND => NULL;
+
+hash: CARDINAL;
+i: CacheIndex;
+impl: Impl ¨ h.impl;
+hash ¨  HashIndex[impl, number];
+
+FOR i ¨ impl.hashTable[hash], impl.cache[i].hash UNTIL i = noIndex DO
+impl.stats.cumChainLength ¨ impl.stats.cumChainLength+1;
+
+IF impl.cache[i].pNum = number THEN { impl.stats.hits ¨ impl.stats.hits+1; EXIT };
+REPEAT FINISHED => { -- not found --
+impl.stats.misses ¨ impl.stats.misses+1;
+i ¨ GetEmptyCacheEntry[impl];
+impl.cache[i].pNum ¨ number;
+impl.cache[i].start ¨ impl.offset+impl.cache[i].pNum*impl.pageLength;
+impl.cache[i].empty ¨ FALSE;
+IF type # new THEN LoadCachePage[impl, i ! UNWIND => impl.cache[i].empty ¨ TRUE;];
+impl.cache[i].hash ¨ impl.hashTable[hash];
+impl.hashTable[hash] ¨ i;
+};
+ENDLOOP;
+impl.cache[i].recentlyUsed ¨ TRUE;
+impl.cache[i].referenceCount ¨ impl.cache[i].referenceCount + 1;
+IF type # read THEN impl.cache[i].dirty ¨ TRUE;
+IF type = new THEN ExtendFile[impl, number];
+ptr ¨ impl.cache[i].ptr;
+};
+InnerReference[NARROW[storage]];
+};
+ReleasePage: PUBLIC BTree.ReleasePage = {
+InnerRelease: ENTRY PROCEDURE [h: BTreeVM.Ref] = {
+ENABLE UNWIND => NULL;
+
+i: CacheIndex;
+impl: Impl ¨ h.impl;
+
+FOR i ¨ impl.hashTable[HashIndex[impl, number]], impl.cache[i].hash UNTIL i = noIndex DO
+IF impl.cache[i].pNum = number THEN EXIT;
+REPEAT FINISHED => ERROR Bug[pageNotInUse];
+ENDLOOP;
+IF impl.cache[i].referenceCount = 0 THEN ERROR Bug[pageNotInUse] 
+ELSE impl.cache[i].referenceCount ¨ impl.cache[i].referenceCount - 1;
+IF update # unchanged THEN {
+IF number = BTree.statePage
+THEN {
+IF update = startOfUpdate
+THEN StoreCachePage[impl, i] -- only this page is dirty, so just write it
+ELSE WriteDirtyPagesWithStatePageLast[impl]; -- many pages possibly dirty
+}
+ELSE StoreCachePage[impl, i];
+};
+};
+InnerRelease[NARROW[storage]];
+};
+GetStats: PUBLIC ENTRY PROC [ h: BTreeVM.Ref] RETURNS [stats: BTreeVM.Stats] = {
+impl: Impl ¨ h.impl;  -- get the representation
+
+RETURN[impl.stats]
+};
+FlushCache: PUBLIC ENTRY PROC [h: BTreeVM.Ref] = {
+impl: Impl ¨ h.impl;  -- get the representation
+
+WriteDirtyPagesWithStatePageLast[impl];
+FOR i: CacheIndex IN [0 .. impl.cache.count) DO
+impl.cache[i].empty ¨ TRUE;
+ENDLOOP;
+FOR c: CARDINAL IN [0..impl.count) DO
+impl.hashTable[c] ¨ noIndex;
+ENDLOOP;
+};
+FreeBuffers: PUBLIC ENTRY PROC [ h: BTreeVM.Ref ] = {
+ENABLE UNWIND => NULL;
+impl: Impl ¨ h.impl;  -- get the representation
+FOR i: CacheIndex IN [0 .. impl.cache.count) DO
+IF impl.cache[i].ptr # NIL THEN {ReleaseSpace[impl, impl.cache[i].ptr]; impl.cache[i].ptr ¨ NIL};
+impl.cache[i].empty ¨ TRUE;
+ENDLOOP;
+FOR c: CARDINAL IN [0..impl.count) DO
+impl.hashTable[c] ¨ noIndex;
+ENDLOOP;
+};
+HashIndex: INTERNAL PROC [x: Impl, pNum: BTree.PageNumber] 
+RETURNS [CARDINAL] = INLINE {
+RETURN [pNum MOD x.count];
+};
+WriteDirtyPagesWithStatePageLast: INTERNAL PROC [x: Impl] = {
+statePageIndex: CacheIndex ¨ noIndex;
+FOR i: CacheIndex IN [0 .. x.cache.count) DO
+IF NOT x.cache[i].empty AND x.cache[i].dirty THEN {
+IF x.cache[i].pNum = BTree.statePage
+THEN statePageIndex ¨ i
+ELSE StoreCachePage[x, i];
+};
+ENDLOOP;
+IF statePageIndex # noIndex THEN StoreCachePage[x, statePageIndex];
+};
+GetEmptyCacheEntry: INTERNAL PROC [x: Impl] RETURNS [i: CacheIndex] =  {
+FOR cntr: CARDINAL IN [0..2*x.cache.count) DO
+i ¨ (x.rover + cntr) MOD x.cache.count;
+SELECT TRUE FROM
+x.cache[i].empty => {
+IF x.cache[i].ptr = NIL THEN x.cache[i].ptr ¨ GetSpace[x];
+x.cache[i].recentlyUsed ¨ FALSE;
+x.cache[i].dirty ¨ FALSE;
+x.cache[i].referenceCount ¨ 0;
+EXIT;
+};
+x.cache[i].referenceCount = 0 => {
+IF x.cache[i].recentlyUsed
+THEN x.cache[i].recentlyUsed ¨ FALSE
+ELSE {
+IF x.cache[i].dirty THEN
+IF x.cache[i].pNum = BTree.statePage
+THEN LOOP -- never force out the statePage
+ELSE StoreCachePage[x, i];
+EXIT;
+};
+};
+ENDCASE;
+REPEAT FINISHED => ERROR Bug[noAvailableCacheEntries];
+ENDLOOP;
+IF NOT x.cache[i].empty THEN {
+hx: CARDINAL = HashIndex[x, x.cache[i].pNum];
+IF x.hashTable[hx] = i
+THEN x.hashTable[hx] ¨ x.cache[i].hash
+ELSE FOR j: CacheIndex ¨ x.hashTable[hx], x.cache[j].hash UNTIL j = noIndex DO
+IF x.cache[j].hash = i THEN {x.cache[j].hash ¨ x.cache[i].hash; EXIT};
+REPEAT FINISHED => ERROR Bug[cacheEntryNotInHashTable];
+ENDLOOP;
+x.cache[i].empty ¨ TRUE;
+};
+x.rover ¨ (i+1) MOD x.cache.count;
+};
+ExtendFile: INTERNAL PROC [x: Impl, n: BTree.PageNumber] = {
+desiredBytes: INT ¨ x.offset + ((n+1) * x.pageLength);
+currentBytes: INT ¨ IO.GetLength[x.writeBacking];
+IF currentBytes < desiredBytes THEN TRUSTED {
+localBytes: NAT = 256;
+packed: PACKED ARRAY [0..localBytes) OF BYTE ¨ ALL[0];
+basePtr: POINTER TO Basics.RawBytes = LOOPHOLE[@packed];
+desiredBytes ¨ desiredBytes + 8*x.pageLength;
+IO.SetIndex[x.writeBacking, currentBytes];
+WHILE desiredBytes > currentBytes DO
+delta: INT ¨ MIN[desiredBytes-currentBytes, localBytes];
+IO.UnsafePutBlock[x.writeBacking, [base: basePtr, startIndex: 0, count: delta]];
+currentBytes ¨ currentBytes + delta;
+ENDLOOP;
+IO.Flush[x.writeBacking];
+};
+};
+LoadCachePage: INTERNAL PROC [x: Impl, i: CacheIndex] = {
+IO.Flush[x.readBacking];  -- synchronize with write stream
+TRUSTED {
+basePtr: POINTER TO Basics.RawBytes = LOOPHOLE[x.cache[i].ptr];
+IO.SetIndex[x.readBacking, x.cache[i].start];
+[] ¨ IO.UnsafeGetBlock[x.readBacking, [base: basePtr, startIndex: 0, count: x.pageLength] 
+];
+};
+x.stats.reads ¨ x.stats.reads+1;
+};
+StoreCachePage: INTERNAL PROC [x: Impl, i: CacheIndex] =  {
+TRUSTED {
+basePtr: POINTER TO Basics.RawBytes = LOOPHOLE[x.cache[i].ptr];
+IO.SetIndex[x.writeBacking, x.cache[i].start];
+IO.UnsafePutBlock[x.writeBacking, [base: basePtr, startIndex: 0, count: x.pageLength]];
+IO.Flush[x.writeBacking];
+};
+x.stats.writes ¨ x.stats.writes+1;
+x.cache[i].dirty ¨ FALSE;
+};
+GetSpace: INTERNAL PROC [x: Impl] RETURNS [BTree.PagePtr] = TRUSTED {
+count: VM.PageNumber = VM.PagesForBytes[x.pageLength];
+interval: VM.Interval = VM.SimpleAllocate[count];
+RETURN [VM.AddressForPageNumber[interval.page]];
+};
+ReleaseSpace: --INTERNAL-- PROC [x: Impl, ptr: BTree.PagePtr] = TRUSTED {
+count: VM.PageNumber = VM.PagesForBytes[x.pageLength];
+VM.Free[[page: VM.PageNumberForAddress[ptr], count: count]];
+};
+Bug: ERROR [type: BugType] = CODE;
+BugType: TYPE = {cacheEntryNotInHashTable, noAvailableCacheEntries, pageNotInUse};
+Finalizer: FinalizeOps.FinalizeProc = {
+IF useFinalization THEN {
+h: BTreeVM.Ref ¨ NARROW[object];
+FreeBuffers[h];
+};
+};
+finalizationQueue: FinalizeOps.CallQueue;
+IF useFinalization THEN {
+finalizationQueue ¨ FinalizeOps.CreateCallQueue[Finalizer];
+};
+}.
+
+  ¨  
+BTreeVMImpl.mesa
+Copyright ” 1985, 1986, 1988, 1992 by Xerox Corporation.  All rights reserved.
+Cache to support the BTree package
+Created by M. D. Schroeder
+Schroeder, June 10, 1983 3:04 pm
+Taft, November 30, 1983 10:03 am
+Levin, August 9, 1983 10:28 am
+Russ Atkinson (RRA) May 11, 1988 11:07:14 pm PDT
+Bob Hagmann September 11, 1989 1:26:46 pm PDT
+Brian Oki, February 6, 1990 10:50:27 am PST
+Willie-s, April 13, 1992 2:26 pm PDT
+Christian Jacobi, July 24, 1992 7:28 pm PDT
+Types and constants
+Public operations
+--Initialize the fields of VM Object
+--Now initialize the cache entries
+PROC [storage: PageStorage, number: PageNumber, type: ReferenceType]
+ RETURNS [ptr: PagePtr]
+PROC [storage: PageStorage, number: PageNumber, update: UpdateState]
+is the statePage; can be either startOfUpdate or endOfUpdate
+is not the statePage; must be endOfUpdate; only page i is dirty
+Private procedures
+The cache entry that is returned is empty; it has a valid space and a useCount of zero.  It may be assocaited with a page by setting pNum.
+empty entry
+not currently being used
+not even recently used
+Initialization and finalization
+Bob Hagmann September 30, 1985 3:26:46 pm PDT
+added UNWIND to NULL in ReferencePage and ReleasePage.  It is necessary to release the monitor lock in ReferencePage during a salvage when trying to overcome hardware errors in the FS BTree.
+Bob Hagmann September 11, 1989 12:51:44 pm PDT
+replaced SafeStorage with PFinalize.
+
+ ù <  ïNewlineDelimiter
+ñ(cedarcode) styleô codeöúôKöú
+œeúCôNKöú"ô"KöúôKöœy ô Köû ô KöûôJô0Kô-Kô+Kô$Kô+óKò öœk	ò	KòKöúüúqò|KöúòKòKöüúòKòKöüúüúiòqKò óöœnúüúüòKöüúüúòKöüúüúüòKöüúòKöúòóheadôIcode2öúüúüúò!öúüúüúüúò(Möúüúüúœcò7Möúüúüú° ò9Möúüú°òMöúüú°òMöúòMöúüúòMöúòMö	úüúüúüúüúò8MöúòóMöúüú	üúò2Möúüúò'MöúüúüúüúüúüúòGöúüúüúòMöúòMöúüúòMöúòMöúüúòMöúòMöúüò#MöúòóMöúüúüúòMöüúüúüúòMö
+†úüúüúüúüúò=Icode0öúüúüúòóôö†úüúüúüúüúBüúüúòõMò Mô$Möúüú"ò2MòMò!MòMöúüúüúò)MòMöúüúò#Möúüúiòyöüúüúüúüò!KòKöüúò	óKô"öüúüúüò(MòKòKöúüúòKò!KòKöúüúòKöúüúò#KöúüúòMöüúòóMò Möúüú&ò-Möüúüú;òRMò KöüúòMöúòóö†úüúò-MöüúBüúô\ö†úüúü	úò4MöüúüúüúòMò MöúüúòMöúòMòMöúüúüúò Mò öüú.üúüòEMò8Mò Möüúüú(üúòRöüúüú°ò$Mò(MòMòMòEMöúüúòMöüúüúüúüúòRMò*MòMöúòóMöüúòóMöúüúò"Mò@Möüúüúüúò/Möüúüúò,MòMöúòóMöúüúò Möúòóö†úüúò)Möüú@ôDö†úüúü	úò2MöüúüúüúòMò MöúòMòMò öüúAüúüòXMöüúüúüúò)Möüúüúüúò+Möüúòóöüú"üúüúòAMöüúAòEóöüúüúòöüúòöüúòMöú<ô<öüúòMöüú°,òIMöüú)°òIóMöúòóöüúòMöú?ô?óóMöúòóMöúòóMöúüúòMöúòóö
+†úüúüúüúüúòPMöú°ò/Mò MöüúòMöúòóö†
+úüúüúüúò2Möú°ò/Mò Möú'ò'öüúüúüò/MöúüúòMöüúòóöüúüúüúüò%MòMöüúòóMöúòóö†úüúüúüúò5MöüúüúüúòMöú°ò/öüúüúüò/Möüúüúüú=üúòaMöúüúòMöüúòóöüúüúüúüò%MòMöüúòóMöúòóóôö†	úüúüú$üúüúüúòYMöüúüú
+òMöúòóö† úüúüúò=Mò%öüúüúüò,öüúüúüúüúò3öüú"ò$MöüúòMöüúòóMöúòóMöüúòóMöüúüú#òCMöúòóö†úüúüúüúòHMöú)°ú°Fú°ôäöüúüúüúüò-Möúüúò'öüúüúüòöúòMöúôMöüúüúò:Möúüúò MöúüúòMòMöüúòMöúòóöú °úò"MöúôöüúòMöüúüò$öüúòMöúôöüúüòöüú"ò$Möüúüú° ò*MöüúòóóMöüúòMöúòóóMöúòóMöüúòóMöüúüúüúò6MöüúòóöüúüúüúòMöúüú!ò-öüúòMöüú"ò&öüúüú2üúüòNMöüúüú%üúòFMöüúüúüúò7MöüúòóóMöúüúòMöúòóMöúüúò"Möúòóö†
+úüúüú#ò<Möúüú%ò6Möúüúüúò1öüúüúüúò-MöúüúòMöúüúüúüúüúüúò6Möú	üúüúüú
+ò8Mò-Möüú(ò*öüúüò$Möúüúüú(ò8MöüúNòPMò$MöüúòóMöüúòMöúòóMöúòóö†úüúüúò9Möüú° ò:öüúò	Möú	üúüúüúò?Möüú+ò-öúüúSòZMöúòóMöúòóMò Möúòóö†úüúüúò;öüúò	Möú	üúüúüúò?Möüú,ò.MöüúUòWMöüúòMöúòóMò"MöúüúòMöúòóö
+†úüúüúüúüúòEMöúüúüúò6Möú
+üúüúò1Möüúüú&ò0Möúòóö†ú°úüú!üúòIMöúüúüúò6Möüúüú+ò<MöúòóMöúüúüúò"Köú	üúEòRóôö†	úò'öüúüúòMöúüú	ò MòMòóMöúòóMò)öüúüúòMò;MòóMöúòMò óô-Köúœrú¢ú2¢úJôæóô.Kô$óKô ó Öó    "(  4  

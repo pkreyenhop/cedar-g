@@ -1,0 +1,913 @@
+
+DIRECTORY
+Alloc USING [Base, Notifier],
+Basics USING [BITRSHIFT],
+IntCodeDefs USING [ArithClass, ArithPrecision, BlockNode, IndexedLocation, Location, LocationRep, Node, NodeList, NodeRep, nullVariableId, Var, WordConstNode],
+IntCodeUtils USING [NodeListTail, WordToCard],
+MimCode USING [BitAddress, BitCount, CodeList, curctxlvl, firstMappedAddress, RegisterNotifier, StoreOptions, VLoc, xtracting, xtractNode, xtractsei, z],
+MimP5 USING [All, Clarify, Construct, Exp, Normalize, RowCons, VariantConstruct],
+MimP5S USING [Category],
+MimP5Stuff USING [Vulnerable],
+MimP5U USING [AdjustLoc, AlignmentFromType, ApplyOp, ArithClassForType, Assign, AssignRC, BinaryArithOp, BitsForOperand, BitsForType, BoundsCheck, ConvertOpNode, Deref, Extend, FnField, IsZero, MakeBlock, MakeConstCard, MakeNodeList, MakeTemp, MakeVar, MaybeBlock, MesaOpNode, MoreCode, NewCodeList, NextVar, OperandType, ProcessSafens, RecField, RecOrFnProc, Simplify, TakeField, TakeFieldVar, ZeroExtend],
+SymbolOps USING [BitsPerElement, Cardinality, CtxLevel, DecodeInt, FirstCtxSe, NextSe, own],
+Symbols USING [Alignment, Base, CBTIndex, ContextLevel, CSEIndex, CTXIndex, ctxType, ISEIndex, ISENull, lG, RecordSEIndex, SEIndex, seType, Type, typeANY],
+Target: TYPE MachineParms USING [bitsPerAU, bitsPerByte, bitsPerLongWord, bitsPerRef, bitsPerStringBound, bitsPerWord, logBitsPerWord],
+Tree USING [Base, Index, Link, NodeName, NodePtr, Null, treeType],
+TreeOps USING [GetNode, GetSe, GetTag, NthSon, OpName, ReverseUpdateList, ScanList, UpdateList];
+MimStore: PROGRAM
+IMPORTS Basics, IntCodeUtils, MimCode, MimP5, MimP5Stuff, MimP5U, SymbolOps, TreeOps
+EXPORTS MimP5S = {
+OPEN IntCodeDefs, MimCode, Target;
+
+
+Category: TYPE = MimP5S.Category;
+CBTIndex: TYPE = Symbols.CBTIndex;
+CTXIndex: TYPE = Symbols.CTXIndex;
+ISEIndex: TYPE = Symbols.ISEIndex;
+ISENull: ISEIndex = Symbols.ISENull;
+RecordSEIndex: TYPE = Symbols.RecordSEIndex;
+Type: TYPE = Symbols.Type;
+
+firstMappedBit: CARD = MimCode.firstMappedAddress*Target.bitsPerAU;
+firstMappedWord: CARD = firstMappedBit / Target.bitsPerWord;
+
+Assign: PUBLIC PROC [node: Tree.Index] RETURNS [l: Node] = {
+l ¬ ComAssign[
+t1: tb[node].son[1],
+t2: tb[node].son[2],
+options: [expr: FALSE, init: tb[node].attr1, counted: tb[node].attr2]];
+};
+
+AssignExp: PUBLIC PROC [node: Tree.Index] RETURNS [l: Node] = {
+l ¬ ComAssign[
+t1: tb[node].son[1],
+t2: tb[node].son[2],
+options: [expr: TRUE, init: tb[node].attr1, counted: tb[node].attr2]];
+RETURN
+};
+
+EvalToTemp: PUBLIC PROC [cl: CodeList, t: Tree.Link] RETURNS [Tree.Link] = {
+IF NOT WillEvalToConst[t, TRUE] THEN {
+nb: INT = MimP5U.BitsForOperand[t];
+type: Symbols.Type = MimP5U.OperandType[t];
+tempSei: ISEIndex = MimP5U.MakeTemp[cl, nb, NIL, type].sei;
+temp: Tree.Link = [symbol[tempSei]];
+tempVar: Var = NARROW[MimP5.Exp[temp]];
+MimP5U.MoreCode[cl, ComAssign[temp, t, [init: TRUE]]];
+seb[tempSei].immutable ¬ TRUE;
+tempVar.flags[constant] ¬ TRUE;
+t ¬ temp;
+};
+RETURN [t];
+};
+
+Temporize: PUBLIC PROC
+[cl: CodeList, n: Node, type: Type ¬ Symbols.typeANY] RETURNS [Var] = {
+nb: INT = n.bits;
+tempSei: ISEIndex = MimP5U.MakeTemp[cl, nb].sei;
+temp: Tree.Link = [symbol[tempSei]];
+tempVar: Var = NARROW[MimP5.Exp[temp]];
+IF tempVar.bits # nb THEN n ¬ EnsureLength[n, type, type, tempVar.bits];
+MimP5U.MoreCode[cl, MimP5U.Assign[tempVar, n]];
+seb[tempSei].immutable ¬ TRUE;
+tempVar.flags[constant] ¬ TRUE;
+RETURN [tempVar];
+};
+
+ComAssign: PUBLIC PROC [t1, t2: Tree.Link, options: StoreOptions] RETURNS [ret: Node] = {
+fullBits: INT = MimP5U.BitsForOperand[t1];
+nbits: INT ¬ fullBits;
+dstType: Symbols.SEIndex = MimP5U.OperandType[t1];
+srcType: Symbols.SEIndex = MimP5U.OperandType[t2];
+padded: BOOL ¬ FALSE;
+lx: Node ¬ NIL;
+tail: NodeList ¬ NIL;
+lv: Var ¬ NIL;
+rv: Node ¬ NIL;
+simpleTest: BOOL ¬ FALSE;
+tryHarder: BOOL ¬ FALSE;
+opName: Tree.NodeName;
+srcTree: Tree.Link ¬ Tree.Null;
+
+DO
+opName ¬ TreeOps.OpName[t2];
+SELECT opName FROM
+pad => {
+IF MimP5U.BitsForOperand[t2] <= bitsPerWord THEN EXIT;
+t2 ¬ TreeOps.NthSon[t2, 1];
+padded ¬ TRUE;
+nbits ¬ MimP5U.BitsForOperand[t2];
+};
+cast, safen => t2 ¬ TreeOps.NthSon[t2, 1];
+ENDCASE => EXIT;
+ENDLOOP;
+
+srcTree ¬ t2;
+DO
+WITH e: srcTree SELECT TreeOps.GetTag[srcTree] FROM
+subtree => IF tb[e.index].name = assignx THEN {srcTree ¬ tb[e.index].son[2]; LOOP};
+ENDCASE;
+EXIT;
+ENDLOOP;
+IF srcTree # t2 THEN {
+recurseAssign: PROC [dst: Tree.Link] = {
+WITH e: dst SELECT TreeOps.GetTag[dst] FROM
+subtree => {
+tp: Tree.NodePtr = @tb[e.index];
+IF tp.name = assignx THEN {
+node: Tree.Index = e.index;
+nopt: StoreOptions ¬ options;
+son1: Tree.Link = tp.son[1];
+nopt.expr ¬ FALSE;
+nopt.init ¬ tp.attr1;
+nopt.counted ¬ tp.attr2;
+recurseAssign[tp.son[2]];  -- don't use tp after this!
+MimP5U.MoreCode[cl, ComAssign[son1, srcTree, nopt]];
+};
+};
+ENDCASE;
+};
+cl: CodeList ¬ MimP5U.NewCodeList[];
+srcTree ¬ EvalToTemp[cl, srcTree];
+recurseAssign[t2];
+ret ¬ MimP5U.MaybeBlock[cl, ComAssign[t1, srcTree, options]];
+RETURN;
+};
+
+SELECT TRUE FROM
+GlobalLocation[t1] AND options.init => {
+options.skipZeros ¬ simpleTest ¬ TRUE;
+};
+SimpleLocation[t1] AND opName = callx => {
+srcTree ¬ Tree.Null; -- for breakpoints
+};
+MimP5Stuff.Vulnerable[t1, t2, TRUE] => {
+cl: CodeList ¬ MimP5U.NewCodeList[];
+inner: PROC [t: Tree.Link] RETURNS [Tree.Link] = {
+WITH e: t SELECT TreeOps.GetTag[t] FROM
+subtree =>
+SELECT tb[e.index].name FROM
+list => RETURN [TreeOps.UpdateList[t, inner]];
+construct, union, rowcons => {
+tb[e.index].son[2] ¬ inner[tb[e.index].son[2]];
+RETURN [t];
+};
+pad, cast, all => {
+tb[e.index].son[1] ¬ inner[tb[e.index].son[1]];
+RETURN [t];
+};
+safen => {
+tb[e.index].son[1] ¬ inner[tb[e.index].son[1]];
+RETURN [t];
+};
+ENDCASE;
+ENDCASE;
+IF MimP5Stuff.Vulnerable[t1, t, TRUE] THEN
+t ¬ EvalToTemp[cl, t];
+RETURN [t];
+};
+temp: Tree.Link ¬ inner[t2];
+nopt: StoreOptions ¬ options;
+nopt.expr ¬ FALSE;
+MimP5U.MoreCode[cl, ComAssign[t1, temp, nopt]];
+IF options.expr
+THEN ret ¬ MimP5U.MaybeBlock[cl, MimP5.Exp[temp]]
+ELSE ret ¬ MimP5U.MakeBlock[cl, 0];
+RETURN;
+};
+ENDCASE;
+
+{
+SELECT opName FROM
+construct => {
+IF nbits > bitsPerWord AND AddressableDest[t1] THEN {
+ret ¬ MimP5.Construct[t1, TreeOps.GetNode[t2], options];
+GO TO outgoing;
+};
+rv ¬ MimP5.Construct[Tree.Null, TreeOps.GetNode[t2], []];
+};
+union => {
+ret ¬ MimP5.VariantConstruct[t1, t2, options];
+GO TO outgoing;
+};
+rowcons => {
+IF nbits > bitsPerWord AND AddressableDest[t1] THEN {
+ret ¬ MimP5.RowCons[t1, TreeOps.GetNode[t2], options];
+GO TO outgoing;
+};
+rv ¬ MimP5.RowCons[Tree.Null, TreeOps.GetNode[t2], []];
+};
+all => {
+ret ¬ MimP5.All[t1, TreeOps.GetNode[t2], options];
+GO TO outgoing;
+};
+ENDCASE =>
+rv ¬ MimP5.Exp[t2];
+WITH e: t1 SELECT TreeOps.GetTag[t1] FROM
+symbol => seb[e.index].idDecl ¬ 0;
+ENDCASE;
+lx ¬ MimP5.Exp[t1];
+{
+x: Node ¬ lx;
+DO
+WITH x SELECT FROM
+block: BlockNode => {
+tail ¬ IntCodeUtils.NodeListTail[block.nodes];
+x ¬ tail.first;
+};
+var: Var => {lv ¬ var; EXIT};
+ENDCASE => ERROR;
+ENDLOOP;
+};
+IF options.skipZeros AND MimP5U.IsZero[rv] THEN {
+IF simpleTest THEN {
+IF options.expr THEN ret ¬ rv ELSE ret ¬ NIL;
+RETURN [ret];
+};
+};
+IF padded THEN {
+IF lv # NIL THEN {
+bits: INT = lv.bits;
+SELECT bits FROM
+<= nbits => {};
+<= bitsPerWord => lv ¬ MimP5U.TakeFieldVar[lv, bits-nbits, nbits];
+ENDCASE => lv ¬ MimP5U.TakeFieldVar[lv, 0, nbits];
+};
+IF rv # NIL THEN {
+bits: INT = rv.bits;
+SELECT bits FROM
+<= nbits => {};
+<= bitsPerWord => rv ¬ MimP5U.TakeField[rv, bits-nbits, nbits];
+ENDCASE => rv ¬ MimP5U.TakeField[rv, 0, nbits];
+};
+};
+IF lv # NIL AND rv # NIL THEN {
+lbits: INT = lv.bits;
+rbits: INT = rv.bits;
+SELECT lbits FROM
+< rbits => {
+start: INT = IF rbits <= bitsPerWord THEN rbits-lbits ELSE 0;
+IF options.expr THEN {
+cl: CodeList = MimP5U.NewCodeList[];
+temp: Var = Temporize[cl, rv, srcType];
+rv ¬ EnsureLength[temp, dstType, srcType, lbits];
+MimP5U.MoreCode[cl,
+IF options.counted
+THEN MimP5U.AssignRC[lv, rv, dstType, options.init]
+ELSE MimP5U.Assign[lv, rv]];
+ret ¬ MimP5U.MaybeBlock[cl, temp];
+IF tail # NIL THEN {tail.first ¬ ret; lx.bits ¬ ret.bits; ret ¬ lx}; 
+RETURN [ret];
+};
+rv ¬ MimP5U.TakeField[rv, start, lbits];
+nbits ¬ lbits;
+};
+> rbits => {
+rv ¬ ExtendValue[rv, dstType, srcType, lbits];
+nbits ¬ lbits;
+};
+ENDCASE;
+};
+SELECT TRUE FROM
+options.expr => {
+cl: CodeList ¬ MimP5U.NewCodeList[];
+res: Node ¬ NIL;
+{
+rCat: Category = GetCategory[rv];
+lCat: Category = GetCategory[lv];
+IF rCat < local THEN GO TO useRHS;
+IF lCat # other THEN
+IF rCat < lCat THEN GO TO useRHS ELSE GO TO useLHS;
+res ¬ Temporize[cl, rv, srcType];
+rv ¬ res;
+IF lv.bits # rv.bits THEN
+rv ¬ EnsureLength[rv, dstType, srcType, lv.bits];
+EXITS
+useRHS => res ¬ rv;
+useLHS => res ¬ lv;
+};
+IF options.counted
+THEN ret ¬ MimP5U.AssignRC[lv, rv, dstType, options.init]
+ELSE ret ¬ MimP5U.Assign[lv, rv];
+MimP5U.MoreCode[cl, ret];
+ret ¬ MimP5U.MaybeBlock[cl, res];
+nbits ¬ ret.bits;
+};
+options.counted =>
+ret ¬ MimP5U.AssignRC[lv, rv, dstType, options.init];
+ENDCASE =>
+ret ¬ MimP5U.Assign[lv, rv];
+IF tail # NIL THEN {
+tail.first ¬ ret;
+ret ¬ lx;
+IF NOT options.expr THEN ret.bits ¬ 0;
+};
+EXITS outgoing => {};
+};
+};
+
+ManySafens: PROC [t: Tree.Link, nbits: CARDINAL] RETURNS [BOOL] = {
+nFields, nSafens: NAT ¬ 0;
+noAll: BOOL ¬ TRUE;
+CountSafens: PROC [t: Tree.Link] = {
+SELECT TreeOps.OpName[t] FROM
+rowcons, construct, union => TreeOps.ScanList[TreeOps.NthSon[t, 2], CountSafens];
+all => { noAll ¬ FALSE; CountSafens[TreeOps.NthSon[t, 1]] };
+cast, pad => CountSafens[TreeOps.NthSon[t, 1]];
+safen => { nSafens ¬ nSafens+1; nFields ¬ nFields+1 };
+ENDCASE => nFields ¬ nFields+1;
+};
+CountSafens[t];
+RETURN [IF nbits<16*bitsPerWord
+THEN (nSafens >= 2)
+ELSE (noAll AND 2*nSafens > nFields)]
+};
+
+Extract: PUBLIC PROC [node: Tree.Index] RETURNS [Node] = {
+cl: CodeList ¬ MimP5U.NewCodeList[];
+[] ¬ ExtractToCl[cl, node];
+RETURN [MimP5U.MakeBlock[cl]];
+};
+
+ExtractToCl: PROC [cl: CodeList, node: Tree.Index] RETURNS [Node] = {
+t1: Tree.Link = tb[node].son[1];
+tsei: RecordSEIndex = LOOPHOLE[MimP5U.OperandType[t1]];
+t2: Tree.Link = tb[node].son[2];
+vType: Type = MimP5U.OperandType[t2];
+sn: Node ¬ MimP5.Exp[t2];
+IF NOT SimpleLocation[t2] THEN
+sn ¬ MimP5U.MakeTemp[cl, sn.bits, sn, vType].var;
+ExtractFrom[cl, t1, tsei, sn];
+RETURN [sn];
+};
+
+ExtractExp: PUBLIC PROC [node: Tree.Index] RETURNS [Node] = {
+cl: CodeList ¬ MimP5U.NewCodeList[];
+sn: Node = ExtractToCl[cl, node];
+RETURN [MimP5U.MaybeBlock[cl, sn]];
+};
+
+ExtractFrom: PROC [cl: CodeList, t1: Tree.Link, tsei: RecordSEIndex, sourceNode: Node] = {
+saveExtractState: RECORD [xtracting: BOOL, xtractNode: Node, xtractsei: Symbols.ISEIndex] =
+[MimCode.xtracting, MimCode.xtractNode, MimCode.xtractsei];
+fa: MimP5U.RecOrFnProc = IF seb[tsei].argument THEN MimP5U.FnField ELSE MimP5U.RecField;
+startsei: ISEIndex = SymbolOps.FirstCtxSe[SymbolOps.own, seb[tsei].fieldCtx];
+sei: ISEIndex ¬ startsei;
+isei: ISEIndex ¬ startsei;
+node: Tree.Index = TreeOps.GetNode[t1];
+totalBits: INT;
+SExtract: PROC [node: Tree.Index] = {
+t1: Tree.Link = tb[node].son[1];
+tsei: RecordSEIndex = LOOPHOLE[MimP5U.OperandType[t1]];
+ExtractFrom[cl, t1, tsei, MimP5.Exp[tb[node].son[2]]];
+};
+ExtractItem: PROC [t: Tree.Link] RETURNS [v: Tree.Link] = {
+posn: BitAddress;
+size: INT;
+v ¬ t;
+[posn, size] ¬ fa[sei];
+IF t # Tree.Null THEN {
+subNode: Tree.Index = TreeOps.GetNode[t];
+vl: VLoc ¬ [disp: posn, size: size];
+IF fa # MimP5U.FnField AND totalBits <= bitsPerWord THEN
+vl ¬ MimP5U.AdjustLoc[vl: vl, rSei: tsei, fSei: sei, tBits: totalBits];
+MimCode.xtractNode ¬ MimP5U.TakeField[sourceNode, vl.disp, vl.size];
+MimCode.xtractsei ¬ sei;
+SELECT tb[subNode].name FROM
+assign => MimP5U.MoreCode[cl, Assign[subNode]];
+extract => SExtract[subNode];
+ENDCASE => ERROR;
+};
+{
+ssei: ISEIndex ¬ startsei;
+psei: ISEIndex ¬ MimP5U.NextVar[ssei];
+rsei: ISEIndex ¬ psei;
+UNTIL psei = sei DO
+rsei ¬ psei;
+psei ¬ MimP5U.NextVar[SymbolOps.NextSe[SymbolOps.own, psei]];
+ENDLOOP;
+sei ¬ rsei;
+};
+};
+xlist: Tree.Link ¬ tb[node].son[1];
+UNTIL (isei ¬ SymbolOps.NextSe[SymbolOps.own, sei]) = ISENull DO
+isei ¬ MimP5U.NextVar[isei];
+IF isei = ISENull THEN EXIT;
+sei ¬ isei;
+ENDLOOP;
+totalBits ¬ sourceNode.bits;
+MimCode.xtracting ¬ TRUE;
+tb[node].son[1] ¬ TreeOps.ReverseUpdateList[xlist, ExtractItem];
+[MimCode.xtracting, MimCode.xtractNode, MimCode.xtractsei] ¬ saveExtractState;
+};
+
+EnsureLength: PROC [rv: Node, dstType, srcType: Type, bits: INT] RETURNS [Node] = {
+rbits: INT = rv.bits;
+SELECT rbits FROM
+> bits => {
+start: INT ¬ IF rbits <= bitsPerWord THEN rbits-bits ELSE 0;
+rv ¬ MimP5U.TakeField[rv, start, bits];
+};
+< bits => {
+rv ¬ ExtendValue[rv, dstType, srcType, bits];
+};
+ENDCASE;
+RETURN [rv];
+};
+
+GlobalLocation: PROC [t: Tree.Link] RETURNS [BOOL] = {
+DO
+WITH e: t SELECT TreeOps.GetTag[t] FROM
+symbol => {
+sei: ISEIndex ¬ e.index;
+ctx: CTXIndex ¬ seb[sei].idCtx;
+level: Symbols.ContextLevel ¬ SymbolOps.CtxLevel[SymbolOps.own, ctx];
+SELECT level FROM
+Symbols.lG => RETURN [TRUE];
+ENDCASE => RETURN [FALSE];
+};
+subtree => {
+tp: Tree.NodePtr = @tb[e.index];
+SELECT tp.name FROM
+dollar, cast => {t ¬ tp.son[1]; LOOP};
+ENDCASE;
+};
+ENDCASE;
+RETURN [FALSE];
+ENDLOOP;
+};
+
+SimpleLocation: PROC [t: Tree.Link] RETURNS [BOOL] = {
+DO
+WITH t SELECT TreeOps.GetTag[t] FROM
+symbol => {
+sei: ISEIndex ¬ index;
+ctx: CTXIndex ¬ seb[sei].idCtx;
+level: Symbols.ContextLevel ¬ SymbolOps.CtxLevel[SymbolOps.own, ctx];
+SELECT level FROM
+Symbols.lG, MimCode.curctxlvl => RETURN [TRUE];
+ENDCASE => RETURN [FALSE];
+};
+subtree => {
+tp: Tree.NodePtr = @tb[index];
+SELECT tp.name FROM
+dot, uparrow, dollar, cast => {t ¬ tp.son[1]; LOOP};
+ENDCASE;
+};
+ENDCASE;
+RETURN [FALSE];
+ENDLOOP;
+};
+
+AddressableDest: PROC [t: Tree.Link] RETURNS [BOOL] = {
+offset: CARD ¬ 0;
+DO
+WITH t SELECT TreeOps.GetTag[t] FROM
+symbol => {
+sei: ISEIndex = index;
+ctx: CTXIndex = seb[sei].idCtx;
+level: Symbols.ContextLevel = SymbolOps.CtxLevel[SymbolOps.own, ctx];
+IF level < Symbols.lG THEN RETURN [FALSE];
+offset ¬ offset + MimP5U.RecField[sei].offset;
+};
+subtree => {
+tp: Tree.NodePtr = @tb[index];
+SELECT tp.name FROM
+uparrow, reloc => {};
+index => {
+arrayType: Symbols.CSEIndex = MimP5U.OperandType[tp.son[1]];
+WITH a: seb[arrayType] SELECT FROM
+array => {
+grain: CARD = SymbolOps.BitsPerElement[SymbolOps.own, a.componentType, a.packed];
+IF grain < bitsPerWord THEN RETURN [FALSE];
+};
+ENDCASE => ERROR;
+};
+dindex => {
+arrayDType: Symbols.CSEIndex = MimP5.Normalize[MimP5U.OperandType[tp.son[1]]];
+arrayType: Symbols.CSEIndex =
+WITH seb[arrayDType] SELECT FROM
+arraydesc => MimP5.Clarify[describedType],
+ENDCASE => ERROR;
+WITH a: seb[arrayType] SELECT FROM
+array => {
+grain: CARD = SymbolOps.BitsPerElement[SymbolOps.own, a.componentType, a.packed];
+IF grain < bitsPerWord THEN RETURN [FALSE];
+};
+ENDCASE => ERROR;
+};
+seqindex => {
+seqType: Symbols.CSEIndex = MimP5U.OperandType[tp.son[1]];
+WITH ss: seb[seqType] SELECT FROM
+sequence => {
+grain: CARD = SymbolOps.BitsPerElement[SymbolOps.own, ss.componentType, ss.packed];
+IF grain < bitsPerWord THEN RETURN [FALSE];
+};
+ENDCASE => RETURN [FALSE];
+};
+dot => {
+sei: ISEIndex = TreeOps.GetSe[tp.son[2]];
+offset ¬ offset + MimP5U.RecField[sei].offset;
+};
+dollar => {
+sei: ISEIndex = TreeOps.GetSe[tp.son[2]];
+offset ¬ offset + MimP5U.RecField[sei].offset;
+t ¬ tp.son[1];
+LOOP;
+};
+cast => {t ¬ tp.son[1]; LOOP};
+ENDCASE => RETURN [FALSE];
+};
+ENDCASE => RETURN [FALSE];
+IF offset MOD bitsPerWord = 0 THEN RETURN [TRUE];
+RETURN [FALSE];
+ENDLOOP;
+};
+
+GetCategory: PUBLIC SAFE PROC [n: Node] RETURNS [Category] = CHECKED {
+DO
+WITH n SELECT FROM
+const: REF NodeRep.const => RETURN [constant];
+nv: Var => WITH nv.location SELECT FROM
+nvLoc: REF LocationRep.localVar =>
+IF nv.flags[constant] THEN RETURN [constLocal] ELSE RETURN [local];
+nvGlob: REF LocationRep.globalVar =>
+IF nv.flags[constant] THEN RETURN [constGlobal] ELSE RETURN [global];
+nvField: REF LocationRep.field => n ¬ nvField.base;
+ENDCASE => EXIT;
+ENDCASE => EXIT;
+ENDLOOP;
+RETURN [other];
+};
+
+WillEvalToConst: PUBLIC PROC [t: Tree.Link, noLocals: BOOL] RETURNS [BOOL] = {
+tt: Tree.Link ¬ t;
+DO
+WITH e: tt SELECT TreeOps.GetTag[tt] FROM
+subtree => {
+tp: Tree.NodePtr = @tb[e.index];
+start: NAT ¬ 1;
+stop: NAT ¬ tp.nSons;
+SELECT tp.name FROM
+construct, rowcons => start ¬ 2;
+all, union, cast, pad, list, lengthen, shorten => {};
+mwconst => RETURN [TRUE];
+ENDCASE => RETURN [FALSE];
+IF start = stop THEN {tt ¬ tp.son[start]; LOOP};
+FOR i: NAT IN [start..stop] DO
+IF NOT WillEvalToConst[tp.son[i], noLocals] THEN RETURN [FALSE];
+ENDLOOP;
+RETURN [TRUE];
+};
+symbol => {
+IF seb[e.index].immutable THEN {
+IF noLocals THEN {
+ctx: CTXIndex ¬ seb[e.index].idCtx;
+IF ctxb[ctx].level > Symbols.lG THEN RETURN [FALSE];
+IF seb[e.index].idDecl # 2 THEN RETURN [FALSE];
+};
+RETURN [TRUE];
+};
+RETURN [FALSE];
+};
+literal => RETURN [TRUE];
+string => RETURN [TRUE];
+ENDCASE;
+ENDLOOP;
+};
+
+
+Index: PUBLIC PROC [node: Tree.Index] RETURNS [Node] = {
+arrayType: Symbols.CSEIndex = MimP5U.OperandType[tb[node].son[1]];
+grain: BitCount ¬ 0;
+tBits: BitCount ¬ 0;
+packed: BOOL;
+indexRange: INT;
+ind: IndexedLocation;
+cl: CodeList ¬ MimP5U.NewCodeList[];
+an: Node ¬ MimP5.Exp[MimP5U.ProcessSafens[cl, tb[node].son[1]]];
+index: Node = MimP5.Exp[MimP5U.ProcessSafens[cl, tb[node].son[2]]];
+WITH a: seb[arrayType] SELECT FROM
+array => {
+grain ¬ SymbolOps.BitsPerElement[SymbolOps.own, a.componentType, a.packed];
+packed ¬ grain < bitsPerWord;
+indexRange ¬ SymbolOps.Cardinality[SymbolOps.own, a.indexType];
+tBits ¬ indexRange*grain;
+WITH index SELECT FROM
+wc2: WordConstNode => {};
+ENDCASE => GO TO bailOut;
+WITH an SELECT FROM
+const: WordConstNode => {
+unsignedClass: IntCodeDefs.ArithClass = [unsigned, FALSE, Target.bitsPerLongWord];
+wc: Node = MimP5U.MakeConstCard[IntCodeUtils.WordToCard[const.word]];
+shift: Node = MimP5U.BinaryArithOp[
+sub, unsignedClass,
+MimP5U.MakeConstCard[tBits-grain],
+MimP5U.BinaryArithOp[
+mul, unsignedClass,
+MimP5U.MakeConstCard[grain],
+index]];
+power: Node = MimP5U.BinaryArithOp[pow, unsignedClass,
+MimP5U.MakeConstCard[2], shift];
+mod: Node = MimP5U.BinaryArithOp[mod, unsignedClass, const, power];
+RETURN [MimP5U.TakeField[mod, mod.bits-grain, grain]];
+};
+ENDCASE;
+EXITS bailOut => {};
+};
+ENDCASE => ERROR;
+IF packed AND tBits IN (0..bitsPerWord) AND tBits < an.bits THEN 
+an ¬ MimP5U.TakeField[an, an.bits-tBits, tBits];
+ind ¬ z.NEW[LocationRep.indexed ¬ [indexed[base: an, index: index]]];
+RETURN [MimP5U.MaybeBlock[cl,
+MimP5U.MakeVar[bits: grain, id: nullVariableId, loc: ind]]];
+};
+
+DIndex: PUBLIC PROC [node: Tree.Index] RETURNS [Node] = {
+arrayDType: Symbols.CSEIndex = MimP5.Normalize[MimP5U.OperandType[tb[node].son[1]]];
+arrayType: Symbols.CSEIndex =
+WITH seb[arrayDType] SELECT FROM
+arraydesc => MimP5.Clarify[describedType],
+ENDCASE => ERROR;
+align: Symbols.Alignment ¬ MimP5U.AlignmentFromType[arrayType];
+grain: BitCount ¬ 0;
+nilck: BOOL = tb[node].attr1;
+bndck: BOOL = tb[node].attr3;
+cl: CodeList ¬ MimP5U.NewCodeList[];
+desc: Node ¬ MimP5.Exp[MimP5U.ProcessSafens[cl, tb[node].son[1]]];
+base: Node ¬ NIL;
+index: Node ¬ MimP5.Exp[MimP5U.ProcessSafens[cl, tb[node].son[2]]];
+
+WITH a: seb[arrayType] SELECT FROM
+array =>
+grain ¬ SymbolOps.BitsPerElement[SymbolOps.own, a.componentType, a.packed];
+ENDCASE => ERROR;
+
+IF bndck THEN desc ¬ MimP5U.Simplify[cl, desc];
+
+base ¬ MimP5U.TakeField[desc, 0, bitsPerRef];
+
+IF nilck THEN {
+aBits: CARD = MimP5U.BitsForType[arrayType];
+IF aBits >= firstMappedBit THEN
+base ¬ MimP5U.ApplyOp[
+oper: MimP5U.MesaOpNode[nilck],
+args: MimP5U.MakeNodeList[base],
+bits: bitsPerRef];
+};
+
+IF bndck THEN {
+bound: Node = MimP5U.TakeField[desc, bitsPerRef, bitsPerWord];
+index ¬ MimP5U.BoundsCheck[index, bound];
+};
+
+{
+ind: Location = z.NEW[LocationRep.indexed ¬ [indexed[
+base: MimP5U.Deref[base, 0, align], index: index]]];
+RETURN [MimP5U.MaybeBlock[cl,
+MimP5U.MakeVar[bits: grain, id: nullVariableId, loc: ind]]];
+};
+};
+
+WordOffset: PROC [sei: ISEIndex] RETURNS [INT] = {
+val: INT = SymbolOps.DecodeInt[seb[sei].idValue];
+RETURN [Basics.BITRSHIFT[val, Target.logBitsPerWord]];
+};
+
+SeqIndex: PUBLIC PROC [node: Tree.Index] RETURNS [Node] = {
+t1: Tree.Link ¬ tb[node].son[1];
+seqType: Symbols.CSEIndex = MimP5U.OperandType[t1];
+isString: BOOL ¬ FALSE;
+grain: BitCount;
+bndck: BOOL = tb[node].attr3;
+index, elements, tag: Node;
+ind: Location;
+cl: CodeList ¬ MimP5U.NewCodeList[];
+
+tb[node].son[1] ¬ t1 ¬ MimP5U.ProcessSafens[cl, t1];
+
+WITH ss: seb[seqType] SELECT FROM
+array => {
+isString ¬ TRUE;
+grain ¬ Target.bitsPerByte;
+};
+sequence => {
+grain ¬ SymbolOps.BitsPerElement[SymbolOps.own, ss.componentType, ss.packed];
+IF bndck THEN {
+tt: Tree.Link ¬ t1;
+wordOffset: CARD = WordOffset[ss.tagSei];
+DO
+SELECT TreeOps.OpName[tt] FROM
+dollar => {tt ¬ TreeOps.NthSon[tt, 1]; LOOP};
+dot, uparrow =>
+IF wordOffset < firstMappedWord THEN
+tb[TreeOps.GetNode[tt]].attr1 ¬ FALSE;
+ENDCASE;
+EXIT;
+ENDLOOP;
+};
+};
+ENDCASE => ERROR;
+
+elements ¬ MimP5.Exp[t1];
+IF isString
+THEN {
+tag ¬ MimP5U.TakeField[elements, -bitsPerStringBound, bitsPerStringBound];
+}
+ELSE {
+tag ¬ elements;
+elements ¬ MimP5U.TakeField[tag, tag.bits, 0];
+};
+
+index ¬ MimP5.Exp[tb[node].son[2]];
+IF bndck THEN {
+addr: Node ¬ NIL;
+offset: INT ¬ 0;
+index ¬ MimP5U.Simplify[cl, index];
+WITH tag SELECT FROM
+eVar: Var => WITH eVar.location SELECT FROM
+field: REF LocationRep.field => WITH field.base SELECT FROM
+fVar: Var => WITH fVar.location SELECT FROM
+deref: REF LocationRep.deref => {offset ¬ field.start; addr ¬ deref.addr};
+ENDCASE;
+ENDCASE;
+deref: REF LocationRep.deref => addr ¬ deref.addr;
+ENDCASE;
+ENDCASE;
+IF addr # NIL THEN {
+IF GetCategory[addr] <= local THEN GO TO takeBoundsCheck;
+addr ¬ Temporize[cl, addr];
+tag ¬ MimP5U.Deref[addr, tag.bits, MimP5U.AlignmentFromType[seqType]];
+IF offset # 0 THEN
+tag ¬ MimP5U.TakeField[tag, offset, tag.bits];
+elements ¬ MimP5U.TakeField[tag, tag.bits, 0];
+GO TO takeBoundsCheck;
+};
+tag ¬ MimP5U.Simplify[cl, tag];
+elements ¬ MimP5U.TakeField[tag, tag.bits, 0];
+GO TO takeBoundsCheck;
+EXITS takeBoundsCheck =>
+index ¬ MimP5U.BoundsCheck[index, tag];
+};
+ind ¬ z.NEW[LocationRep.indexed ¬ [indexed[base: elements, index: index]]];
+RETURN [MimP5U.MaybeBlock[cl,
+MimP5U.MakeVar[bits: grain, id: nullVariableId, loc: ind]]];
+};
+
+ExtendValue: PUBLIC PROC [node: Node, dstType, srcType: Symbols.Type, bits: INT]
+RETURNS [Node] = {
+nBits: INT = node.bits;
+srcAc: ArithClass ¬ MimP5U.ArithClassForType[srcType];
+IF bits > Target.bitsPerWord*2 THEN RETURN [MimP5U.ZeroExtend[node, bits]];
+IF srcAc.kind # lastExtension AND bits <= IntCodeDefs.ArithPrecision.LAST
+THEN {
+dstAc: ArithClass ¬ MimP5U.ArithClassForType[dstType];
+IF dstAc.precision # bits THEN dstAc.precision ¬ bits;
+IF dstAc.kind = lastExtension THEN dstAc.kind ¬ srcAc.kind;
+SELECT INT[srcAc.precision] FROM
+< nBits => srcAc.precision ¬ nBits;
+> nBits => {
+srcAc.precision ¬ nBits;
+IF srcAc.kind = signed THEN srcAc.kind ¬ unsigned;
+IF dstAc.kind = signed THEN dstAc.kind ¬ unsigned;
+};
+ENDCASE;
+IF srcAc # dstAc THEN
+node ¬ MimP5U.ApplyOp[
+MimP5U.ConvertOpNode[from: srcAc, to: dstAc],
+MimP5U.MakeNodeList[node],
+bits];
+}
+ELSE
+IF nBits < bits THEN node ¬ MimP5U.Extend[node, bits, srcType];
+RETURN [node];
+};
+
+tb: Tree.Base ¬ NIL;		-- tree base (local copy)
+seb: Symbols.Base ¬ NIL;		-- semantic entry base (local copy)
+ctxb: Symbols.Base ¬ NIL;	-- context entry base (local copy)
+
+StoreNotify: PUBLIC Alloc.Notifier = {
+seb ¬ base[Symbols.seType];
+ctxb ¬ base[Symbols.ctxType];
+tb ¬ base[Tree.treeType];
+};
+
+MimCode.RegisterNotifier[StoreNotify];
+
+}. 
+
+     
+MimStore.mesa
+Copyright Ó 1985, 1986, 1987, 1988, 1989, 1990, 1991 by Xerox Corporation.  All rights reserved.
+Sweet, May 31, 1986 5:17:06 pm PDT
+Satterthwaite, October 10, 1985 2:11:49 pm PDT
+Russ Atkinson (RRA) April 12, 1990 12:26:34 pm PDT
+Willie-s, September 24, 1991 4:52 pm PDT
+imported definitions
+
+procedures
+
+generates code for assignment statement
+generates code for assignment expression
+This routine evaluates the expression given by t into a temporary, with any side effects generating code into cl, and returns a link for the temporary.  Of course, we try not to use a temporary if the result will not need one.
+can support counted assignments
+until we get to something interesting
+This is an assignment of an assignment expression
+Note: we assume that all global variables are initially zero!
+In this case we perform no pre-evaluation of the LHS, so it is OK even if the RHS can affect the LHS address.
+This evaluation needs a temporary to ensure that the RHS is fully evaluated before the LHS.  We try to make up temporaries sparingly: only those parts that induce vulnerability should be put into temporaries.
+This is where we need a temporary
+Pretend this identifier is defined
+Find the tail of the possibly complex destination.
+If not a block and not a var we can't do anything
+Provided that we are not avoiding side effects we can eliminate the zero assign
+Don't forget to return the proper zero
+If the LHS is a different size than the RHS then we adopt a procrustean solution.
+We have to take a field of the value for the destination, but the full length is still available in a temporary.
+The full RHS value is available in a temp after we chop it down to fit into the LHS, since this is an assignment expression.  This case is relatively rare, so it doesn't have to be beautiful.
+There was a complex expression as the LHS (sigh)
+At this point we don't have to retain the value so just take the field.
+The destination is larger, so extend the value.
+In this block we try to determine the right place to get the resulting value from.  We try for the simpler of the lhs or rhs, but if rhs is non-constant and there may be side effects in lhs or neither is sufficiently simple, we go to use a temporary.
+There was a complex expression as the LHS (sigh)
+Find the previous sei (start at beginning, run up to just before this one)
+We have to take a field of the value for the destination.
+The destination is larger, so extend the value.  If arithmetic or address extension, then use the conversion operators.
+Returns TRUE if the given tree names an addressable destination.
+See MimDriver.CollectConstants
+formerly in Address
+
+operations
+generates code for array indexing
+Both array and index are constant, so we can have a constant result.
+generates code for indexing from an array descriptor
+To avoid excessive evaluation of the descriptor, make sure that it is someplace "simple" when we have to perform an extra access to get the bound.
+Generate a NIL check unless we can show that the described array can't be so large as to get beyond the first mapped bit.
+We can (probably) use the bounds check to avoid the NIL check
+(see MimExpr.DotOrUparrow)
+The symbol table entry for the sequence part points to the tag (if any).  If there is no tag (i.e., a COMPUTED sequence), it still points ahead of the sequence part.  If one adds the size of this node to its location, one gets a node pointing to the beginning of the sequence part.
+This case is taken when we do bounds checking.  If the sequence base is not simple enough we have to evaluate it into a temporary to keep it from changing while we check the bounds and then index the sequence.
+Simplify the index expression so we get rid of any potential side-effects before trying to evaluate the sequence.
+The base of the sequence address should be evaluated once, rather than twice, provided that it makes some sense to do so.  If we succeed here, then we don't have to further simplify, because we have only evaluated the elements and the bounds once!
+For now we only trust local variables to not change over the bounds check operation.  Perhaps even this is too trusting.  Global variables can change due to multi-process code.  Local variables should only change
+Force the address into a temporary, since we will need it twice.
+The sequence elemtns are assumed to start right after the sequence length
+At this point we don't have an especially simple sequence based on an address, and we have to do a bounds check, so we have to simplify the tag (and elements) expressions to make the extra evaluation have no side effects.
+Extends the given value according to the assumed source and destination types.  If they are not arithmetic, then assume the given # of bits.
+If someone is playing fast and loose with LOOPHOLE or UNSPECIFIED we try to preserve the class of the source (because we can't think of anything more reasonable to do).
+If we are extending a field that can't have the sign bit on, force it to be unsigned
+In the non-arithmetic case we extend without looking at the destination
+bases & notifier
+
+called by allocator whenever table area is repacked
+Êá  –(cedarcode) style•NewlineDelimiter
+™ head™Icodešœ
+ÏeœU™`LšÏy"™"Lšž.™.L™2L™(L˜ šÏk	˜	LšœŸœ˜LšœŸœŸ	œ˜LšœŸœŽ˜ŸLšœŸœ˜.LšœŸœŒ˜™LšœŸœF˜QLšœŸœ˜LšœŸœ˜LšœŸœ‹˜—Lšœ
+ŸœM˜\LšœŸœŽ˜›LšœŸœŸœh˜‡LšœŸœ8˜BLšœŸœS˜`——šÏnœŸ˜LšŸœM˜TLšŸœ˜LšŸœ˜"L˜ L˜ —™L™ Lšœ
+Ÿœ˜!Lšœ
+Ÿœ˜"Lšœ
+Ÿœ˜"Lšœ
+Ÿœ˜"L˜$LšœŸœ˜,LšœŸœ˜L˜ LšœŸœ/˜CLšœŸœ'˜<L˜ —™
+L™ š œŸœŸœŸœ˜<L™'˜L˜L˜LšœŸœ2˜G—L˜L˜ —š 	œŸœŸœŸœ˜?L™(˜L˜L˜LšœŸœ2˜F—LšŸ˜L˜L˜ —š 
+œŸœŸœŸœ˜LL™âšŸœŸœŸœŸœ˜&LšœŸœ˜#L˜+Lšœ,Ÿœ˜;Lšœ$˜$LšœŸœ˜'Lšœ.Ÿœ˜6LšœŸœ˜LšœŸœ˜L˜	L˜—LšŸœ˜L˜L˜ —š 	œŸœ7Ÿœ
+˜^LšœŸœ
+˜Lšœ0˜0Lšœ$˜$LšœŸœ˜'LšŸœŸœ/˜HLšœ/˜/LšœŸœ˜LšœŸœ˜LšŸœ˜L˜L˜ —š 	œŸœŸœ,Ÿœ˜YL™Lšœ
+Ÿœ˜*LšœŸœ˜L˜2L˜2LšœŸœŸœ˜LšœŸœ˜LšœŸœ˜Lšœ
+Ÿœ˜LšœŸœ˜LšœŸœŸœ˜LšœŸœŸœ˜Lšœ˜L˜L˜ šŸ˜L™%Lšœ˜šŸœŸ˜˜LšŸœ*ŸœŸœ˜6L˜Lšœ	Ÿœ˜L˜"L˜—L˜*LšŸœŸœ˜—LšŸœ˜—L˜ L˜šŸ˜šŸœŸœŸ˜3LšœŸœŸœ Ÿœ˜SLšŸœ˜—LšŸœ˜LšŸœ˜—šŸœŸœ˜L™1šœŸœ˜(šŸœŸœŸ˜+šœ˜L˜ šŸœŸœ˜Lšœ˜Lšœ˜Lšœ˜LšœŸœ˜Lšœ˜Lšœ˜LšœÏc˜6Lšœ4˜4L˜—L˜—LšŸœ˜—L˜—Lšœ$˜$Lšœ"˜"Lšœ˜Lšœ=˜=LšŸœ˜L˜L˜ —šŸœŸœŸ˜šœŸœ˜(šœ!Ÿœ˜&L™=—L˜—šœŸœ˜*Lš	œ1ŸœŸœŸœŸœ	™mLšœ¡˜'L˜—šœŸœ˜(Lšœ5ŸœŸœv™ÐL˜$šœŸœŸœ˜2šŸœŸœŸ˜'˜
+šŸœŸ˜LšœŸœ ˜.šœ˜Lšœ/˜/LšŸœ˜L˜—šœ˜Lšœ/˜/LšŸœ˜L˜—šœ
+˜
+Lšœ/˜/LšŸœ˜L˜—LšŸœ˜——LšŸœ˜—šŸœŸœŸ˜*L™!Lšœ˜—LšŸœ˜L˜—Lšœ˜Lšœ˜LšœŸœ˜Lšœ/˜/šŸœ˜LšŸœ-˜1LšŸœ˜#—LšŸœ˜L˜—LšŸœ˜L˜ —˜šŸœŸ˜˜šŸœŸœŸœ˜5L˜8LšŸœŸœ
+˜L˜—L˜9L˜—˜
+L˜.LšŸœŸœ
+˜L˜—˜šŸœŸœŸœ˜5L˜6LšŸœŸœ
+˜L˜—L˜7L˜—˜L˜2LšŸœŸœ
+˜L˜—šŸœ˜
+L˜——šŸœŸœŸ˜)šœ"˜"L™"—LšŸœ˜—Lšœ˜˜L™2L˜šŸ˜šŸœŸœŸ˜šœ˜Lšœ.˜.L˜L˜—LšœŸœ˜šŸœŸœ˜L™1——LšŸœ˜—L˜—šŸœŸœŸœ˜1L™OšŸœŸœ˜šŸœŸœ
+ŸœŸœ˜-L™&—LšŸœ˜L˜—L˜—šŸœŸœ˜šŸœŸœŸœ˜LšœŸœ˜šŸœŸ˜Lšœ˜LšœB˜BLšŸœ+˜2—Lšœ˜—šŸœŸœŸœ˜LšœŸœ˜šŸœŸ˜Lšœ˜Lšœ?˜?LšŸœ(˜/—L˜—L˜—š
+ŸœŸœŸœŸœŸœ˜L™QLšœŸœ˜LšœŸœ˜šŸœŸ˜˜L™pLš	œŸœŸœŸœŸœ˜=šŸœŸœ˜L™¿L˜$Lšœ'˜'Lšœ1˜1šœ˜šŸœ˜LšŸœ/˜3LšŸœ˜——Lšœ"˜"šŸœŸœŸœ3˜ELšœ&Ÿœ™0—LšŸœ˜L˜—L™GL˜(L˜L˜—˜L™/L˜.L˜L˜—LšŸœ˜—L˜—šŸœŸœŸ˜šœ˜L˜$LšœŸœ˜˜L™úLšœ!˜!Lšœ!˜!LšŸœŸœŸœŸœ˜"šŸœŸ˜LšŸœŸœŸœŸœŸœŸœŸœ˜3—Lšœ!˜!Lšœ	˜	šŸœŸ˜Lšœ1˜1—šŸ˜Lšœ˜Lšœ˜—L˜—šŸœ˜LšŸœ5˜9LšŸœ˜!—Lšœ˜Lšœ!˜!Lšœ˜L˜—šœ˜Lšœ5˜5—šŸœ˜
+Lšœ˜——šŸœŸœŸœ˜Lšœ&Ÿœ™0L˜L˜	LšŸœŸœŸœ˜&Lšœ˜—LšŸœ˜L˜—L˜L˜ —š
+ 
+œŸœŸœŸœŸœ˜CLšœŸœ˜LšœŸœŸœ˜š œŸœ˜$šŸœŸ˜L˜QLšœŸœ&˜<L˜/L˜6LšŸœ˜—L˜—L˜šŸœŸœ˜LšŸœ˜LšŸœŸœ˜%—L˜L˜ —š œŸœŸœŸœ˜:L˜$L˜LšŸœ˜L˜L˜ —š œŸœ"Ÿœ˜EL˜ LšœŸœ˜7L˜ Lšœ%˜%Lšœ˜šŸœŸœŸ˜Lšœ1˜1—L˜LšŸœ˜L˜L˜ —š 
+œŸœŸœŸœ˜=L˜$L˜!LšŸœ˜#L˜L˜ —š œŸœI˜ZLšœŸœŸœn˜—LšœŸœŸœŸœ˜XL˜ML˜L˜L˜'LšœŸœ˜š œŸœ˜%L˜ LšœŸœ˜7L˜6L˜—š œŸœŸœ˜;L˜LšœŸœ˜
+L˜L˜šŸœŸœ˜L˜)L˜$šŸœŸœŸ˜8L˜G—L˜DL˜šŸœŸ˜L˜/L˜LšŸœŸœ˜—L˜—˜L™JLšœ˜L˜&Lšœ˜šŸœŸ˜Lšœ˜Lšœ=˜=LšŸœ˜—Lšœ˜L˜—L˜—L˜#šŸœ9Ÿ˜@L˜LšŸœŸœŸœ˜L˜LšŸœ˜—L˜LšœŸœ˜L˜@L˜NL˜L˜ —š œŸœ*ŸœŸœ˜SLšœŸœ˜šŸœŸ˜šœ˜L™9Lš	œŸœŸœŸœŸœ˜<Lšœ'˜'L˜—šœ˜L™wLšœ-˜-L˜—LšŸœ˜—LšŸœ˜L˜L˜ —š œŸœŸœŸœ˜6šŸ˜šŸœŸœŸ˜'šœ˜L˜L˜L˜EšŸœŸ˜LšœŸœŸœ˜LšŸœŸœŸœ˜—Lšœ˜—˜L˜ šŸœ	Ÿ˜Lšœ Ÿœ˜&LšŸœ˜—L˜—LšŸœ˜—LšŸœŸœ˜LšŸœ˜—L˜L˜ —š œŸœŸœŸœ˜6šŸ˜šŸœŸœŸ˜$šœ˜L˜L˜L˜EšŸœŸ˜Lšœ!ŸœŸœ˜/LšŸœŸœŸœ˜—L˜—˜L˜šŸœ	Ÿ˜Lšœ.Ÿœ˜4LšŸœ˜—L˜—LšŸœ˜—LšŸœŸœ˜LšŸœ˜—L˜L˜ —š œŸœŸœŸœ˜7LšœŸœ4™@LšœŸœ˜šŸ˜šŸœŸœŸ˜$šœ˜L˜L˜L˜ELšŸœŸœŸœŸœ˜*Lšœ.˜.L˜—˜L˜šŸœ	Ÿ˜Lšœ˜šœ
+˜
+L˜<šŸœŸœŸ˜"˜
+LšœŸœF˜QLšŸœŸœŸœŸœ˜+L˜—LšŸœŸœ˜—L˜—šœ˜L˜N˜šŸœŸœŸ˜ L˜*LšŸœŸœ˜——šŸœŸœŸ˜"˜
+LšœŸœF˜QLšŸœŸœŸœŸœ˜+L˜—LšŸœŸœ˜—L˜—šœ˜L˜:šŸœŸœŸ˜!˜LšœŸœH˜SLšŸœŸœŸœŸœ˜+L˜—LšŸœŸœŸœ˜—L˜—˜L˜)Lšœ.˜.L˜—˜L˜)Lšœ.˜.Lšœ˜LšŸœ˜L˜—LšœŸœ˜LšŸœŸœŸœ˜—L˜—LšŸœŸœŸœ˜—Lš
+ŸœŸœŸœŸœŸœ˜1LšŸœŸœ˜LšŸœ˜—L˜L˜ —š œŸœŸœŸœŸœŸœ˜FšŸ˜šŸœŸœŸ˜LšœŸœŸœ˜.šœŸœŸœŸ˜'šœŸœ˜"Lš
+ŸœŸœŸœŸœŸœ	˜C—šœŸœ˜$Lš
+ŸœŸœŸœŸœŸœ
+˜E—Lšœ	Ÿœ'˜3LšŸœŸœ˜—LšŸœŸœ˜—LšŸœ˜—LšŸœ	˜L˜L˜ —š
+ œŸœŸœŸœŸœ˜NL˜šŸ˜šŸœŸœŸ˜)šœ˜L˜ LšœŸœ˜LšœŸœ˜šŸœ	Ÿ˜Lšœ ˜ Lšœ5˜5LšœŸœŸœ˜LšŸœŸœŸœ˜—LšŸœŸœŸœ˜0šŸœŸœŸœŸ˜Lš
+ŸœŸœ&ŸœŸœŸœ˜@LšŸœ˜—LšŸœŸœ˜Lšœ˜—šœ˜šŸœŸœ˜ šŸœ
+Ÿœ˜Lšœ#˜#LšŸœŸœŸœŸœ˜4šŸœŸœŸœŸœ˜/L™—L˜—LšŸœŸœ˜L˜—LšŸœŸœ˜L˜—LšœŸœŸœ˜Lšœ
+ŸœŸœ˜LšŸœ˜—LšŸœ˜—L˜L˜ ——™L™ ™
+L˜ š œŸœŸœŸœ˜8L™!L˜BL˜L˜LšœŸœ˜LšœŸœ˜L˜L˜$L˜@LšœC˜CšŸœŸœŸ˜"˜
+L˜KL˜L˜?Lšœ˜šŸœŸœŸ˜Lšœ˜LšŸœŸœŸœ	˜—šŸœŸœŸ˜šœ˜L™DLšœ3Ÿœ˜RLšœE˜Ešœ#˜#Lšœ˜Lšœ"˜"šœ˜Lšœ˜Lšœ˜Lšœ˜——LšœW˜WLšœC˜CLšŸœ0˜6L˜—LšŸœ˜—LšŸœ˜L˜—LšŸœŸœ˜—š
+ŸœŸœŸœŸœŸœ˜AL˜0—LšœŸœ:˜ELšŸœT˜ZL˜L˜ —š
+ œŸœŸœŸœ	¡œ˜9L™4L˜T˜šŸœŸœŸ˜ L˜*LšŸœŸœ˜——Lšœ?˜?L˜LšœŸœ˜LšœŸœ˜L˜$LšœB˜BLšœŸœ˜LšœC˜CL˜ šŸœŸœŸ˜"˜L˜K—LšŸœŸœ˜L˜ —šŸœŸœ!˜/L™’—L˜ L˜-L˜ šŸœŸœ˜LšœŸœk™yLšœŸœ!˜,šŸœŸ˜L˜j—L˜—L˜ šŸœŸœ˜L˜>L˜)L˜L˜ —šœ˜LšœŸœU˜jLšŸœT˜ZL˜—L˜L˜ —š 
+œŸœŸœŸœ˜2LšœŸœ)˜1LšŸœ	Ÿ	œ˜6L˜L˜ —š œŸœŸœŸœ˜;L˜ L˜3Lšœ
+ŸœŸœ˜L˜LšœŸœ˜L˜L˜L˜$L˜ L˜4L˜ šŸœŸœŸ˜!˜
+LšœŸœ˜L˜L˜—˜L˜MšŸœŸœ˜šœ4Ÿœ™=Lšœ™—Lšœ˜LšœŸœ˜)šŸ˜šŸœŸ˜Lšœ'Ÿœ˜-˜šŸœŸ˜$Lšœ Ÿœ˜&——LšŸœ˜—LšŸœ˜LšŸœ˜—Lšœ˜—L˜—LšŸœŸœ˜—L˜ L˜šŸœ	˜šŸœ˜L˜JL˜—šŸœ˜LšœfŸœ«™™L˜L˜.L˜L˜ ——L˜#šŸœŸœ˜L™ÑLšœŸœ˜LšœŸœ˜šœ#˜#L™q—šŸœŸœŸ˜šœŸœŸœŸ˜+šœŸœŸœŸœŸ˜;šœŸœŸœŸ˜+LšœŸœ@˜JLšŸœ˜—LšŸœ˜—LšœŸœ(˜2LšŸœ˜—LšŸœ˜—šŸœŸœŸœ˜L™÷šŸœŸœŸœŸœ˜9L™Ô—šœ˜L™@—LšœF˜FšŸœŸ˜Lšœ.˜.—˜.L™I—LšŸœŸœ˜L˜—L™ÝLšœ˜L˜.LšŸœŸœ˜šŸœ˜Lšœ'˜'—L˜—LšœŸœ@˜KLšŸœT˜ZL˜L˜ —š
+ œŸœŸœ4ŸœŸœ˜cL™ŒLšœŸœ˜Lšœ6˜6LšŸœŸœŸœ!˜KšŸœŸœ$Ÿ˜IšŸœ˜L˜6LšŸœŸœ˜6šŸœŸœ˜;Lšœ*ŸœŸœg™¨—šŸœŸœŸ˜ Lšœ#˜#šœ˜L™TLšœ˜LšŸœŸœ˜2LšŸœŸœ˜2Lšœ˜—LšŸœ˜—šŸœŸ˜L˜f—L˜—šŸ˜L™GLšŸœŸœ+˜?——LšŸœ˜L˜L˜ ———™L™ LšœŸœ¡˜/LšœŸœ¡$˜=LšœŸœ¡"˜<L˜ š œŸœ˜&L™3L˜Lšœ˜L˜L˜—L˜ ˜&L˜ ——˜L˜ —— …—    Z€  Šu  

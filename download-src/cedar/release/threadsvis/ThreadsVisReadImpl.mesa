@@ -1,0 +1,328 @@
+
+DIRECTORY List, CardTab, Convert, Rope, RefText, Atom, IO, PFS, CommanderOps, ThreadsVisPrivate, SimpleFeedback, SymTab;
+
+ThreadsVisReadImpl: CEDAR PROGRAM
+IMPORTS List, CardTab, Rope, CommanderOps, Convert, RefText, Atom, IO, PFS, SimpleFeedback, ThreadsVisPrivate,  SymTab
+EXPORTS ThreadsVisPrivate
+~ BEGIN
+
+ROPE: TYPE ~ Rope.ROPE;
+
+StripQuotes: PUBLIC PROC [text: REF TEXT] ~ {
+i, j: NAT ¨ 0;
+UNTIL i = text.length DO
+SELECT text[i] FROM
+'" => { i ¨ i + 1 };
+'\\ => { i ¨ i + 1; IF i = text.length THEN ERROR; text[j] ¨ text[i]; i ¨ i+1; j ¨ j+1 };
+ENDCASE => { text[j] ¨ text[i]; i ¨ i + 1; j ¨ j + 1 };
+ENDLOOP;
+text.length ¨ j;
+};
+
+Canon: PUBLIC PROC [rope: ROPE] RETURNS [ROPE] ~ {
+RETURN [Atom.GetPName[Atom.MakeAtom[rope]]];
+};
+
+ReadAny: PUBLIC PROC [stream: IO.STREAM] RETURNS [threadFacts: ThreadsVisPrivate.ThreadFacts, commentText: ROPE _ NIL] ~ {
+buffer: REF TEXT ¨ NEW[TEXT[80]];
+firstRecord: BOOL;  -- the first decimal after a paren is the uniqueID
+tokenKind: IO.TokenKind;
+charsSkipped: INT;
+error: IO.TokenError;
+stack: LIST OF LIST OF REF ¨ NIL;
+head: LIST OF REF ¨ LIST[NIL];
+last: LIST OF REF ¨ head;
+threadlist: LIST OF ThreadsVisPrivate.Thread _ NIL;
+thread: ThreadsVisPrivate.Thread _ NEW[ThreadsVisPrivate.ThreadRep];
+thread.idList _ CardTab.Create[];
+thread.nameTable _ SymTab.Create[];
+threadFacts _ NEW[ThreadsVisPrivate.ThreadFactsRep];
+DO
+v: REF ¨ NIL;
+[tokenKind, buffer, charsSkipped, error] ¨ IO.GetCedarToken[stream: stream, buffer: buffer, flushComments: FALSE];
+SELECT tokenKind FROM
+tokenSINGLE => {
+SELECT buffer[0] FROM
+'; => {
+IF commentText = NIL THEN commentText _ IO.GetLineRope[stream]
+ELSE commentText _ Rope.Cat[commentText, "\n", IO.GetLineRope[stream]];
+LOOP
+};
+'( => {
+head.first ¨ last;
+stack ¨ CONS[head, stack];
+last ¨ head ¨ LIST[NIL];
+firstRecord _ TRUE;
+LOOP;
+};
+') => {
+v ¨ head.rest;
+head ¨ stack.first;
+stack ¨ stack.rest;
+last ¨ NARROW[head.first];
+head.first ¨ NIL;
+IF stack # NIL AND stack.rest = NIL THEN {
+thread.tree _ v;
+threadlist _ CONS[thread, threadlist];
+thread _ NEW[ThreadsVisPrivate.ThreadRep];
+thread.name _ NIL;
+thread.idList _ CardTab.Create[];
+thread.nameTable _ SymTab.Create[];
+};
+};
+ENDCASE => GOTO ParseFailed;
+};
+tokenDECIMAL => {
+c: CARD ¨ Convert.CardFromRope[RefText.TrustTextAsRope[buffer]];
+v ¨ NEW[CARD ¨ c];
+IF firstRecord THEN {
+firstRecord _ FALSE;
+IF CardTab.Store[NARROW[thread.idList], c, NIL] THEN {
+} ELSE {
+SimpleFeedback.Append[$ThreadsVis, oneLiner, $Complaint, "duplicate thread ID"];
+};
+};
+};
+tokenID => {
+v ¨ Atom.MakeAtomFromRefText[buffer];
+};
+tokenROPE => {
+a: ATOM;
+r: ROPE;
+StripQuotes[buffer];
+a _ Atom.MakeAtomFromRefText[buffer];
+r _ Rope.FromRefText[buffer];
+v ¨ Atom.GetPName[a];
+IF thread.name = NIL THEN thread.name _ r;
+[] _ SymTab.Insert[NARROW[thread.nameTable], r, NIL];
+};
+ENDCASE => GOTO ParseFailed;
+IF stack = NIL THEN {
+threadFacts.tlist _ threadlist;
+threadFacts.tree _ v;
+RETURN [threadFacts, commentText];
+};
+last ¨ last.rest ¨ LIST[v];
+ENDLOOP;
+EXITS ParseFailed => CommanderOps.Failed[IO.PutFR1["Parse error near %g", [integer[IO.GetIndex[stream]]]]];
+};
+
+ST: TYPE ~ LIST OF REF;
+
+STName: PUBLIC PROC [st: ST] RETURNS [ROPE] ~ {
+RETURN [IF st.first = $Merged THEN "*" ELSE NARROW[st.rest.first]];
+};
+STChildren: PUBLIC PROC [st: ST] RETURNS [LIST OF REF] ~ {
+RETURN [IF st.first = $Merged THEN st.rest ELSE st.rest.rest.rest.rest];
+};
+
+
+ReadTreeFromFile: PUBLIC PROC [fileName: ROPE, throwAwayUnix: BOOL] RETURNS [threadFacts: ThreadsVisPrivate.ThreadFacts, eventFacts: ThreadsVisPrivate.EventFacts, commentText: ROPE ] ~ {
+ENABLE PFS.Error => { CommanderOps.Failed[error.explanation] };
+stream: IO.STREAM ~ PFS.StreamOpen[PFS.PathFromRope[fileName]];
+spyTree: ST;
+thread: ThreadsVisPrivate.Thread;
+threadlist: LIST OF ThreadsVisPrivate.Thread;
+line: ROPE;
+[threadFacts: threadFacts, commentText: commentText] ¨ ReadAny[stream];
+threadFacts.stackList _ InvertThreadTree[threadFacts.tree];
+threadFacts.stackTable _ BuildStackTable[threadFacts.stackList];
+DO
+line _ IO.GetLineRope[stream ! IO.EndOfStream => EXIT];
+IF Rope.Equal[Rope.Substr[line, 0, 1], ";"] THEN {
+IF commentText = NIL THEN commentText _ line
+ELSE commentText _ Rope.Cat[commentText, "\n", line];
+};
+IF Rope.Equal[Rope.Substr[line, 0, 9], ";;; Event"]  THEN EXIT;
+ENDLOOP;
+[eventFacts, commentText] _ ReadEvents[stream, commentText, throwAwayUnix];
+IO.Close[stream];
+eventFacts.nameTable _ BuildThreadsLists[threadFacts, eventFacts];
+RETURN [threadFacts, eventFacts, commentText]
+};
+
+ReadEvents: PROC [stream: IO.STREAM, inCommentText: ROPE, throwAwayUnix: BOOL] RETURNS [efacts: ThreadsVisPrivate.EventFacts, commentText: ROPE] ~ {
+event: ThreadsVisPrivate.Event;
+line: ROPE;
+streamRope: IO.STREAM;
+buffer: REF TEXT ¨ NEW[TEXT[80]];
+commentText _ inCommentText;
+efacts _ NEW[ThreadsVisPrivate.EventFactsRep];
+efacts.elist _ NIL;
+efacts.min _ LAST[CARD];
+efacts.eventTable _ CardTab.Create[];
+efacts.max _ 0;
+DO
+line _ IO.GetLineRope[stream ! IO.EndOfStream => EXIT];
+IF Rope.Equal[Rope.Substr[line, 0, 1], ";"] THEN {
+IF commentText = NIL THEN commentText _ line
+ELSE commentText _ Rope.Cat[commentText, "\n", line];
+LOOP;
+};
+streamRope _ IO.RIS[line];
+event _ NEW[ThreadsVisPrivate.EventRep];
+event.id _ IO.GetCard[streamRope ! IO.EndOfStream => GOTO Done];
+event.type _ MyGetAtom[streamRope, buffer];
+event.time _ IO.GetCard[streamRope];
+event.node _ IO.GetCard[streamRope];
+event.wakeTime _ IO.GetCard[streamRope];
+event.wakeEvent _ IO.GetCard[streamRope];
+event.drawn _ FALSE;
+event.xstartpos _ event.xendpos _ event.ypos _ 0;
+IF throwAwayUnix AND Atom.GetPName[event.type].Length[] > 1 THEN LOOP; -- hack to throw away unix kernel events that aren't understood
+efacts.elist _ CONS[event, efacts.elist];
+IF efacts.min > event.time AND event.time # 0 THEN efacts.min _ event.time;
+IF efacts.max < event.time THEN efacts.max _ event.time;
+IF efacts.min > event.wakeTime AND event.wakeTime # 0 THEN efacts.min _ event.wakeTime;
+IF efacts.max < event.wakeTime AND event.wakeTime # 0 THEN efacts.max _ event.wakeTime;
+[] _ CardTab.Store[NARROW[efacts.eventTable], event.id, event];
+ENDLOOP;
+EXITS Done => RETURN;
+};
+
+buffer: REF TEXT ¨ NEW[TEXT[80]];
+
+MyGetAtom: PROC [s: IO.STREAM, buffer: REF TEXT] RETURNS [a: ATOM] ~ {
+[] _ IO.GetToken[s, IO.IDProc, buffer];
+a _ Atom.MakeAtomFromRefText[buffer];
+};
+
+
+BuildStackTable: PROC [t: LIST OF REF ANY] RETURNS [idTable: CardTab.Ref] ~ {
+DoItem: PROC [s: REF ANY, r: LIST OF REF ANY] ~ {
+stackItem: ThreadsVisPrivate.StackEntry _ NARROW[s];
+[] _ CardTab.Store[idTable, stackItem.id, r];
+};
+DoStack: PROC  [s: REF ANY, r: LIST OF REF ANY] ~ {
+myStack: LIST OF REF ANY _ NARROW[s];
+List.Map[myStack, DoItem];
+};
+idTable _ CardTab.Create[];
+List.Map[t, DoStack];
+RETURN [idTable];
+};
+
+InvertThreadTree: PROC [t: REF] RETURNS [result: LIST OF REF ANY] ~ {
+workHead, workTail, tmpResult, currentWork, extraWork: LIST OF REF ANY;
+stack: ThreadsVisPrivate.StackEntry;
+workHead _ LIST[NEW[ThreadsVisPrivate.WorkItemRep _ [NARROW[t, LIST OF REF ANY], NIL]]];
+workTail _ workHead;
+result _ NIL;
+UNTIL workHead = NIL DO
+workItem: ThreadsVisPrivate.WorkItem _ NARROW[workHead.first];
+tmpResult _ workItem.doneAlready;
+currentWork _ workItem.toDo;
+UNTIL currentWork = NIL DO
+stack _ NEW[ThreadsVisPrivate.StackEntryRep];
+stack.name _ ThreadsVisPrivate.STName[currentWork];
+stack.id _ NARROW[currentWork.first, REF CARD]^;
+tmpResult _ CONS[stack, tmpResult];
+IF ThreadsVisPrivate.STChildren[currentWork] # NIL THEN extraWork _ currentWork.rest.rest.rest.rest.rest ELSE extraWork _ NIL;
+UNTIL extraWork = NIL DO
+workTail _ workTail.rest _ LIST[NEW[ThreadsVisPrivate.WorkItemRep _ [NARROW[extraWork.first, LIST OF REF ANY], tmpResult]]];
+extraWork _ extraWork.rest;
+ENDLOOP;
+IF ThreadsVisPrivate.STChildren[currentWork] # NIL THEN currentWork _ NARROW[ThreadsVisPrivate.STChildren[currentWork].first] ELSE currentWork _ NIL;
+ENDLOOP;
+result _ CONS[tmpResult, result];
+workHead _ workHead.rest;
+ENDLOOP;
+};
+
+
+BuildThreadsLists: PROC [tfacts: ThreadsVisPrivate.ThreadFacts, efacts: ThreadsVisPrivate.EventFacts] RETURNS [nameTable: REF] ~ {
+tlist: LIST OF ThreadsVisPrivate.Thread _ tfacts.tlist;
+elist: LIST OF ThreadsVisPrivate.Event _ efacts.elist;
+done: BOOL;
+t: ThreadsVisPrivate.Thread;
+e: ThreadsVisPrivate.Event;
+origTlist: LIST OF ThreadsVisPrivate.Thread = tlist;
+nameTable _ SymTab.Create[];
+WHILE tlist # NIL DO
+t _ tlist.first;
+t.elist _ NIL;
+tlist _ tlist.rest;
+ENDLOOP;
+WHILE elist # NIL DO
+e _ elist.first;
+done _ FALSE;
+tlist _ origTlist;
+WHILE tlist # NIL DO
+t _ tlist.first;
+IF CardTab.Fetch[NARROW[t.idList], e.node].found THEN {
+myval: CardTab.Val;
+myfound: BOOL;
+[val: myval, found: myfound] _ CardTab.Fetch[NARROW[tfacts.stackTable], e.node];
+t.elist _ CONS[e, t.elist];
+done _ TRUE;
+EXIT;
+};
+tlist _ tlist.rest;
+ENDLOOP;
+IF NOT done THEN {
+SimpleFeedback.Append[$ThreadsVis, oneLiner, $Feedback, IO.PutFR1["event %g references no thread.", IO.card[e.id]]];
+};
+elist _ elist.rest;
+ENDLOOP;
+};
+
+PrintThreadEvents: PROC [tlist: LIST OF ThreadsVisPrivate.Thread] = {
+t: ThreadsVisPrivate.Thread;
+t _ tlist.first;
+WHILE tlist.rest # NIL DO
+t _ tlist.first;
+SimpleFeedback.Append[$ThreadsVis, oneLiner, $Feedback, IO.PutFR1["size %g.", IO.card[CardTab.GetSize[NARROW[t.idList]]]]];
+tlist _ tlist.rest;
+ENDLOOP;
+};
+
+PrintThreadInfo: PROC [tlist: LIST OF ThreadsVisPrivate.Thread] = {
+t: ThreadsVisPrivate.Thread;
+t _ tlist.first;
+WHILE tlist.rest # NIL DO
+t _ tlist.first;
+SimpleFeedback.Append[$ThreadsVis, oneLiner, $Feedback, IO.PutFR1["Tree size %g.", IO.card[List.Length[NARROW[t.tree]]]]];
+tlist _ tlist.rest;
+ENDLOOP;
+};
+
+
+
+END.
+
+  0  
+ThreadsVisReadImpl.mesa
+Copyright ”1992 by Xerox Corporation.  All rights reserved.
+Weiser, March 13, 1993 9:36 am PST
+Does not handle multi-character escaped things.
+leaving a new thread, record the info
+SimpleFeedback.Append[$ThreadsVis, oneLiner, $Feedback, "new stack"];
+SimpleFeedback.Append[$ThreadsVis, oneLiner, $Complaint, IO.PutFR1["list1 size %g.", IO.card[CardTab.GetSize[NARROW[thread.idList]]]]];
+SimpleFeedback.Append[$ThreadsVis, oneLiner, $Complaint, IO.PutFR1["list2 size %g.", IO.card[CardTab.GetSize[NARROW[thread.idList]]]]];
+PrintThreadEvents[threadlist];
+PrintThreadInfo[threadlist];
+SimpleFeedback.Append[$ThreadsVis, oneLiner, $Complaint, IO.PutFR1["Storing %g in cardtab", IO.card[c]]];
+We canonicalize these, because we expect lots of repeats.
+Read events now
+Link events with threads
+step through to the bottom of each stack
+follow one stack all the way
+if we see extra children, add them to the list of further stacks to follow
+event order was reversed on reading, then reversed again here.  Thus t.elist is in correct order for all t.
+ù ‰  ïNewlineDelimiter
+ô codeôKöú
+œeú0ô;Kô"óKò Köœk	ú.ûúûú:òxKò Köœnúûúûò!Köûú<ûúûú,òvKöûúòöúûòKò KöûúûúûúòKò óöüúûúûúûúò-Jô/Köúûúòöûúûòöûú	ûòKòKöúûúûúûú(òYKöûú0ò7óKöûúòóKòKöúòKò óö
+üúûúûúûúûúò2Köûú&ò,KöúòKò óöüúûúûú
+ûúûúûú;ûúûúòzKö	úûúûúûúûúò!Köúûúœc2òFKöúûúòKöúûúòKöúûúòKöúûúûúûúûúûúûúò!KöúûúûúûúûúûúòKöúûúûúûúòKöúûúûúûúò3Köú#ûúòDKò!Kò#Köúûú#ò4öûòKöúûúûúòKöú+ûú>ûúòröûúûòöúòöûúûòòöûúûúûúûúò>Köûú+ûúòGóKöûòKòóöúòKöúòKöúûúòKöúûúûúòKöúûúòKöûúòKöúòóöúòKöúòKöúòKöúòKöúûúòKöúûúòö
+ûú	ûúûúûúûúò*Kô%KôEKöú9ûúûúûúôáKòKöúûúò&Köú	ûúò*KöúûúòKò!Kò#Köú9ûúûúûúôáKôKôKòóKöúòóKöûúûúòóKöúòóöúòKöúûú9ò@KöúûúûúòöûúûúòKöúûúòöûúûúûúûúò6Köú9ûú!ûúôiKöúûúòKòPKòóKòóKòóöúòKöú%ò%KöúòóöúòKöúûúòKöúûúòKöúòKò%KòKô9KòKöûúûúûúò*Köúûúûúò5KöúòóKöûúûúòóöûú	ûúûúûòKòKòKöûúò"KòóKöúûúòKöûúòóKöûú$ûú(ûúòkKöúòKò óö
+ûúûúûúûúûúòKò óö
+üúûúûúûúûúò/Kö
+ûúûúûúûúûúòCKöúòóöü
+úûúûúûúûúûúûúò:Köûúûúûú	ûúòHKöúòóò Kò óöüúûúûúûúûúûúeûúò∫Köûúûú5ò?Kö	úûúûúûúûúò?Köú	ûúòKò!Köúûúûúò-KöúûúòKòGKò;Kò@öûòKöúûúûúûúò7öûú)ûúò2öûúûúûúò,Köûú1ò5óKòóKöûú3ûúûúò?KöûúòóKôKòKKöûúòKôKòBKöûú'ò-öúòKò óóöü
+úûú
+ûúûúûúûúûú5ûúòîKòKöúûúòKöúûúûúòKö	úûúûúûúûúò!KòKöú	ûú"ò.KöúûúòKöúûúûúòKò%KòöûòKöúûúûúûúò7öûú)ûúò2öûúûúûúò,Köûú1ò5óKöûúòKòóKöúûúûúòKöúûúò(Köúûúûúûúò@Kò+Köúûúò$Köúûúò$Köúûúò(Köúûúò)KöúûúòKò1Kö	ûúûú(ûúûú†?òÜKöúûúò)KöûúûúûúòKKöûúûúò8KöûúûúûúòWKöûúûúûúòWKöúûú&ò?KöûúòóKöûúûòKòKò óö	úûúûúûúûúò!Kò óöü	úûúûúûú
+ûúûúûúûúòFKöúûúûúò'Kò%Kòò Kò óóöüúûúûúûúûúûúûúòMöüúûúûúûúûúûúûúûúò1Köú*ûúò4Kò-Kòóöüúûúûúûúûúûúûúûúò3Köú	ûúûúûúûúûúò%KòKòóKòKòKöûúòKòKò óöüúûúûúûú
+ûúûúûúûúòEKö	ú7ûúûúûúûúòGKò$Köúûúûú"ûúûúûúûúûúûúòXKòKöú	ûúòKô(öûúû	òKöú'ûúò>Kò!KòKôöûúûúûòKöúûú"ò-Kò3Köúûúûúûúò0Köúûúò#Kö
+ûú-ûúûú2ûúûúò~KôJöûú	û	òKöúûú"ûúûúûúûúûúò|KòKöûúòóKöûú-ûúûúûú2ûúûúòïKöûúòóKöú	ûúò!KòKöûúòóKòKò óKò öüúûúOûúûúòÇKöúûúûú)ò7Köúûúûú(ò6KöúûúòKòKòKöúûúûú"ò4Kòöûú	ûúûòKòKöú
+ûúòKòKöûúòóöûú	ûúûòKòKöúûúòKòöûú	ûúûòKòöûúûúûúò7KòKöú	ûúòKöú-ûúòPKöú
+ûúòKöúûúòKöûúòKòóKòKöûúòóöûúûúûúòKöú8ûú*ûúòtKòóKòKöûúòóKôkKòKò óöüúûú	ûúûúòEKòKòöûúûúûòKòKöú8ûúûúûúò{KòKöûúòóKòKò óöüúûú	ûúûúòCKòKòöûúûúûòKòKöú8ûúûúûúòzKòKöûúòóKòKò óKò Kò KöûúòJò ó Öó    %j  6~  

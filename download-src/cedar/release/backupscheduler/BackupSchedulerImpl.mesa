@@ -1,0 +1,891 @@
+DIRECTORY
+Basics, BasicTime, Commander, CommanderOps, Convert, Rope, RedBlackTree, PFS, PFSNames, PriorityQueue, Process, Real, SymTab, IO, UnixSpawnTCP;
+
+
+BackupSchedulerImpl: CEDAR MONITOR
+IMPORTS Basics, BasicTime, Commander, CommanderOps, Convert, Rope, RedBlackTree, Real, PFS, PFSNames, PriorityQueue, Process, SymTab, IO, UnixSpawnTCP
+~ BEGIN
+
+ROPE: TYPE ~ Rope.ROPE;
+STREAM: TYPE ~ IO.STREAM;
+GMT: TYPE ~ BasicTime.GMT;
+nullGMT: GMT ~ BasicTime.nullGMT;
+PQ: TYPE ~ PriorityQueue.Ref;
+Tree: TYPE ~ RedBlackTree.Table;
+
+Day: TYPE ~ {Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday};
+Days: ARRAY Day OF ROPE ~ ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+
+NextDay: PROC [d: Day] RETURNS [Day] ~ {
+RETURN [IF d=Sunday THEN Monday ELSE d.SUCC]
+};
+PrevDay: PROC [d: Day] RETURNS [Day] ~ {
+RETURN [IF d=Monday THEN Sunday ELSE d.PRED]
+};
+
+Config: TYPE ~ REF ConfigRep;
+ConfigRep: TYPE ~ RECORD [
+dumpServers: DumpServers,
+defaultClients: DumpClients,
+dumpClientHosts: SymTab.Ref,
+dumpClients: DumpClients,
+tapeChangeSchedule: TapeChangeSchedules,
+nServers: INT ¨ 0
+];
+
+
+DumpServers: TYPE ~ LIST OF DumpServer;
+DumpClients: TYPE ~ Tree;
+TapeChangeSchedules: TYPE ~ LIST OF TapeChangeSchedule;
+
+VirtualTapeDriveName: TYPE ~ ROPE;
+
+DumpServer: TYPE ~ REF DumpServerRep;
+DumpServerRep: TYPE ~ RECORD [
+name: VirtualTapeDriveName,  -- e.g. SSL-A
+index: CARD,
+size: INTEGER, -- in megabytes
+host: ROPE, -- e.g. sapphire
+device: ROPE, -- e.g. /dev/rsmt0
+comments: ROPE
+];
+
+DumpKind: TYPE ~ {none, incrOnly, normal, fullOnly};
+DumpClient: TYPE ~ REF DumpClientRep;
+DumpClientRep: TYPE ~ RECORD [
+host: ROPE,
+fileSystem: ROPE, -- e.g. /dev/rxd0a or "default"
+hasLocalTape: BOOL ¨ FALSE,
+localTapeIndex: INTEGER ¨ 0,
+size: INTEGER ¨ 0, -- in megabytes
+used: INTEGER ¨ 0, -- in megabytes
+dumpKind: DumpKind ¨ none,
+priority: CARD ¨ CARD.LAST, -- small numbers are higher priority
+volatility: REAL ¨ 0.0 , -- fraction of file system expected to change on working days
+comment: ROPE ¨ NIL,
+didLocally: BOOL ¨ FALSE
+];
+
+GetClientKey: RedBlackTree.GetKey ~ { RETURN[data] };
+CompareClientNames: RedBlackTree.Compare ~ {
+n1: DumpClient ¨ NARROW[k];
+n2: DumpClient ¨ NARROW[data];
+RETURN[Rope.Compare[Rope.Cat[n1.host, " ", n1.fileSystem], Rope.Cat[n2.host, " ", n2.fileSystem]]];
+};
+
+TapeChangeSchedule: TYPE ~ RECORD [
+date: GMT, -- Monday of the week to which this schedule applies, nullGMT for default
+permittedDumps: ARRAY Day OF DaySpec
+];
+
+DaySpec: TYPE ~ RECORD [
+changeTape: BOOL, -- if a new tape is to be used for this day
+allowFull: BOOL,
+allowIncremental: BOOL
+];  -- [FALSE, FALSE, FALSE] no tape change, no dumping
+
+
+serverHeader: ROPE ~ "[DUMP SERVERS]";
+clientHeader: ROPE ~ "[DUMP CLIENTS]";
+tcsHeader: ROPE ~ "[TAPE CHANGE SCHEDULE]";
+
+GetPath: PROC [in: IO.STREAM] RETURNS [ROPE] ~ {
+RETURN[IO.GetTokenRope[in, BetweenWhitespace].token];
+};
+
+ParseConfig: PROC [in: STREAM, msgs: STREAM] RETURNS [Config] ~ {
+config: Config ¨ NEW[ConfigRep ¨ [NIL, RedBlackTree.Create[GetClientKey, CompareClientNames], SymTab.Create[case~FALSE], RedBlackTree.Create[GetClientKey, CompareClientNames], NIL]];
+line: ROPE;
+lineStream: IO.STREAM;
+
+ParseError: ERROR ~ CODE;
+currLine: INT ¨ 0;
+
+ReadServers: PROC RETURNS[nServers: INT ¨ 0] ~ {
+msgs.PutRope["Reading servers...\n"];
+DO
+ENABLE {
+IO.Error, Convert.Error, ParseError => {
+msgs.PutF["Parsing error in line %g of config file near position %g in file.\n", [integer[currLine]], [integer[in.GetIndex[]]] ];
+LOOP;
+};
+};
+name, machine, device, rest: ROPE;
+size: REAL;
+currLine ¨ currLine+1;
+line ¨ IO.GetLineRope[in];
+IF line.Fetch[0]='[ THEN EXIT;
+IF line.Fetch[0]='# THEN LOOP;
+lineStream ¨ IO.RIS[line, lineStream];
+name ¨ GetPath[lineStream];
+size ¨ lineStream.GetReal[];
+machine ¨ GetPath[lineStream];
+device ¨ GetPath[lineStream];
+[] ¨ lineStream.SkipWhitespace[];
+rest ¨ lineStream.GetLineRope[! IO.EndOfStream => CONTINUE];
+config.dumpServers ¨ CONS[ NEW[DumpServerRep ¨ [name, nServers, Real.Floor[size*1024], machine, device, rest]], config.dumpServers];
+nServers ¨ nServers.SUCC;
+ENDLOOP;
+};
+ReadClients: PROC ~ {
+msgs.PutRope["Reading clients...\n"];
+DO
+ENABLE {
+IO.Error, Convert.Error, ParseError => {
+msgs.PutF["Parsing error in line %g of config file near position %g in file.\n", [integer[currLine]], [integer[in.GetIndex[]]] ];
+LOOP;
+};
+};
+host, fileSystem, dumpKind, rest: ROPE;
+priority: CARD ¨ 99;
+volatility: REAL ¨ 0.0;
+client: DumpClient ;
+currLine ¨ currLine+1;
+line ¨ IO.GetLineRope[in];
+IF line.Fetch[0]='[ THEN EXIT;
+IF line.Fetch[0]='# THEN LOOP;
+lineStream ¨ IO.RIS[line, lineStream];
+host ¨ GetPath[lineStream];
+fileSystem ¨ GetPath[lineStream];
+dumpKind ¨ GetPath[lineStream];
+IF DumpKindFromRope[dumpKind]#none THEN {
+priority ¨ lineStream.GetCard[];
+volatility ¨ lineStream.GetReal[];
+rest ¨ lineStream.GetLineRope[! IO.EndOfStream => CONTINUE];
+}
+ELSE {
+[] ¨ lineStream.GetLineRope[! IO.EndOfStream => CONTINUE];
+};
+IF NOT Rope.Equal[host, "default"] THEN [] ¨ config.dumpClientHosts.Store[host, NIL];
+client ¨ NEW[DumpClientRep ¨ [host, fileSystem, FALSE, 0, 0, 0, DumpKindFromRope[dumpKind], priority, volatility/100, rest]];
+IF Rope.Equal[fileSystem, "default"] OR Rope.Equal[host, "default"]
+THEN config.defaultClients.Insert[client, client]
+ELSE config.dumpClients.Insert[client, client];
+ENDLOOP;
+};
+ReadTCS: PROC ~ {
+msgs.PutRope["Reading tape change schedules...\n"];
+DO
+ENABLE {
+IO.Error, Convert.Error, ParseError => {
+msgs.PutF["Parsing error in line %g of config file near position %g in file.\n", [integer[currLine]], [integer[in.GetIndex[]]] ];
+LOOP;
+};
+};
+date: ROPE;
+changeSchedule: TapeChangeSchedule ¨ [date~nullGMT, permittedDumps~ALL[[TRUE,FALSE,FALSE]]];
+currLine ¨ currLine+1;
+line ¨ IO.GetLineRope[in ! IO.EndOfStream => EXIT];
+IF line.Fetch[0]='[ THEN EXIT;
+IF line.Fetch[0]='# THEN LOOP;
+lineStream ¨ IO.RIS[line, lineStream];
+date ¨ GetPath[lineStream];
+IF Rope.Equal[date, "default"] THEN changeSchedule.date ¨ nullGMT
+ELSE changeSchedule.date ¨ Convert.TimeFromRope[date];
+FOR day: Day IN [Day.FIRST .. Day.LAST] DO
+DO
+tokenKind: IO.TokenKind;
+token: ROPE;
+[tokenKind, token] ¨ lineStream.GetCedarTokenRope[];
+SELECT tokenKind FROM
+tokenSINGLE => SELECT token.Fetch[0] FROM
+'- => {changeSchedule.permittedDumps[day].changeTape ¨ FALSE; EXIT};
+'+ => {changeSchedule.permittedDumps[day].changeTape ¨ FALSE;  LOOP };
+ENDCASE => ERROR ParseError;
+tokenID => SELECT TRUE FROM
+Rope.Equal[token, "F"], Rope.Equal[token, "full"], Rope.Equal[token, "norm"], Rope.Equal[token, "N"] => {
+changeSchedule.permittedDumps[day].allowFull ¨ TRUE;
+changeSchedule.permittedDumps[day].allowIncremental ¨ TRUE;
+EXIT;
+};
+Rope.Equal[token, "I"], Rope.Equal[token, "inc"] => {
+changeSchedule.permittedDumps[day].allowIncremental ¨ TRUE;
+EXIT;
+};
+ENDCASE => ERROR ParseError;
+ENDCASE => ERROR ParseError;
+ENDLOOP;
+ENDLOOP;
+config.tapeChangeSchedule ¨ CONS[ changeSchedule, config.tapeChangeSchedule];
+ENDLOOP;
+};
+
+DO
+ENABLE {
+IO.EndOfStream => EXIT;
+};
+SELECT TRUE FROM
+Rope.CompareSubstrs[s1: line, len1: serverHeader.Length[], s2: serverHeader] = equal => config.nServers ¨ ReadServers[];
+Rope.CompareSubstrs[s1: line, len1: clientHeader.Length[], s2: clientHeader] = equal => ReadClients[];
+Rope.CompareSubstrs[s1: line, len1: tcsHeader.Length[], s2: tcsHeader] = equal => ReadTCS[];
+ENDCASE => { currLine ¨ currLine+1; line ¨ in.GetLineRope[] };
+ENDLOOP;
+FinishConfig[config, msgs];
+RETURN[config];
+};
+
+DFDone: ENTRY UnixSpawnTCP.FinishProc ~ {
+dfCommand: ROPE ¨ NARROW[clientData];
+IF dfCommand=currentDfCommand THEN {
+currentDfCommand ¨ NIL;
+BROADCAST dfDone;
+};
+};
+
+dfDone: CONDITION;
+currentDfCommand: ROPE;
+
+WaitForDFDone: ENTRY PROC [] RETURNS [reallyDone: BOOL] ~ TRUSTED {
+ENABLE UNWIND => NULL;
+Process.EnableAborts[@dfDone];
+Process.SetTimeout[@dfDone, Process.SecondsToTicks[60]];
+IF currentDfCommand # NIL THEN WAIT dfDone;
+RETURN[currentDfCommand=NIL];
+};
+
+BetweenWhitespace: IO.BreakProc ~ {RETURN[
+SELECT char FROM
+IN [IO.NUL .. IO.SP] => sepr,
+ENDCASE => other];
+};
+
+FinishConfig: PROC [c: Config, msgs: IO.STREAM] ~ {
+HasLocalTape: PROC [host: ROPE] RETURNS [BOOL, INT] ~ {
+FOR s: DumpServers ¨ c.dumpServers, s.rest WHILE s#NIL DO
+IF Rope.Equal[host, s.first.host] THEN RETURN [TRUE, s.first.index];
+ENDLOOP;
+RETURN[FALSE, -1];
+};
+EachHost: SymTab.EachPairAction ~ {
+host: ROPE ¨ NARROW[key];
+tryDefaultHostClient: DumpClient ¨ NEW[DumpClientRep ¨ [host, "default"]];
+defaultHostClient: DumpClient ¨ NARROW[c.defaultClients.Lookup[tryDefaultHostClient]];
+dfOutput: STREAM ¨ IO.ROS[];
+dfCommand: ROPE ¨ currentDfCommand ¨ Rope.Cat["/usr/ucb/rsh -n ", host, " df  2> /dev/null | /project/dumps/findRawDevices"];
+spawnData: REF UnixSpawnTCP.SpawnData ¨ UnixSpawnTCP.Spawn[command~dfCommand, out: dfOutput, finish: DFDone, clientData: dfCommand];
+msgs.PutF1["Enumerating file systems on %g\n", [rope[host]]];
+IF NOT WaitForDFDone[] THEN {
+msgs.PutF1["host %g did not respond in 60 seconds.\n", [rope[host]] ];
+UnixSpawnTCP.Kill[spawnData];
+}
+ELSE {
+dfOutputRope: ROPE ¨ IO.RopeFromROS[dfOutput];
+dfIn: STREAM ¨ IO.RIS[dfOutputRope];
+{ 
+ENABLE {
+IO.EndOfStream => CONTINUE;
+IO.Error, Convert.Error => {
+msgs.PutF["Error parsing df output from host %g near position %g.\n", [rope[host]], [integer[dfIn.GetIndex[]]] ];
+};
+};
+msgs.PutF1["%g's file systems:\n", [rope[host]] ];
+DO
+fileSystem: ROPE ¨ dfIn.GetTokenRope[BetweenWhitespace].token;
+size: CARD ¨ (dfIn.GetCard[]+1023)/1024;
+used: CARD ¨ (dfIn.GetCard[]+1023)/1024;
+avail: CARD ¨ dfIn.GetCard[];
+capacity: ROPE ¨ dfIn.GetTokenRope[BetweenWhitespace].token;
+mountPoint: ROPE ¨ dfIn.GetTokenRope[BetweenWhitespace].token;
+dumpClient: DumpClient ¨ NEW[DumpClientRep ¨ [host, fileSystem, FALSE, 0, size, used, normal, 99, 0.0, NIL]];
+existingClient: DumpClient;
+msgs.PutF1[ "\t%g\n", [rope[fileSystem]] ];
+IF (existingClient ¨ NARROW[c.dumpClients.Lookup[dumpClient]])#NIL THEN {
+existingClient.size ¨ size; 
+existingClient.used ¨ used;
+[existingClient.hasLocalTape, existingClient.localTapeIndex] ¨ HasLocalTape[existingClient.host];
+IF existingClient.comment=NIL THEN existingClient.comment ¨ Rope.Concat["# ", mountPoint];
+}
+ELSE {
+defaultMountPoint: ROPE ~ IF Rope.Equal[mountPoint, Rope.Concat["/", host]] THEN "/machine" ELSE mountPoint;
+tryDefaultFSClient: DumpClient ¨ NEW[DumpClientRep ¨ ["default", defaultMountPoint]];
+defaultFSClient: DumpClient ¨ NARROW[c.defaultClients.Lookup[tryDefaultFSClient]];
+defaultClient: DumpClient ¨ IF defaultFSClient#NIL THEN defaultFSClient ELSE defaultHostClient;
+IF defaultClient#NIL THEN {
+[dumpClient.hasLocalTape, dumpClient.localTapeIndex] ¨ HasLocalTape[dumpClient.host];
+dumpClient.dumpKind ¨ defaultClient.dumpKind;
+dumpClient.priority ¨ defaultClient.priority;
+dumpClient.volatility ¨ defaultClient.volatility;
+dumpClient.comment ¨ Rope.Concat["# ", mountPoint];
+c.dumpClients.Insert[dumpClient, dumpClient];
+}
+ELSE {
+msgs.PutF["skipping file system %g on host %g because it is not an explicit client and there is no applicable default client\n", [rope[fileSystem]], [rope[host]] ];
+};
+}
+ENDLOOP;
+};
+};
+};
+[] ¨ c.dumpClientHosts.Pairs[EachHost];
+};
+
+DumpKindFromRope: PROC [r: ROPE] RETURNS [DumpKind] ~ {
+SELECT TRUE FROM
+Rope.Equal[r, "full", FALSE] => RETURN [fullOnly];
+Rope.Equal[r, "incr", FALSE] => RETURN [incrOnly];
+Rope.Equal[r, "none", FALSE] => RETURN [none];
+Rope.Equal[r, "-", FALSE] => RETURN [none];
+Rope.Equal[r, "norm", FALSE] => RETURN [normal];
+ENDCASE => ERROR;
+};
+
+Tape: TYPE ~ REF TapeRep;
+TapeRep: TYPE ~ RECORD [
+dumpServer: DumpServer,
+day: Day,
+used: CARD, -- in megabytes
+remaining: INTEGER, -- in megabytes
+capacity: INTEGER,
+useForFullDumps: BOOL, -- full dumps are allowed on this tape
+maxForFullDumps: INTEGER,
+currentForFullDumps: INTEGER,
+estimatedIncremental: INTEGER,
+headRoom: INTEGER -- = capacity - (maxForFullDumps+estimatedIncremental)
+];
+
+Drive: TYPE ~ ARRAY Day OF Tape ¨ ALL[NIL];
+
+Tapes: TYPE ~ REF TapesRep;
+TapesRep: TYPE ~ RECORD [
+SEQUENCE nDrives: CARDINAL OF Drive
+];
+
+
+GetTapes: PROC [dumpServers: DumpServers, nServers: INT, changeSchedule: TapeChangeSchedule] RETURNS [tapes: Tapes] ~ {
+tapes ¨ NEW[TapesRep[nServers]];
+FOR sl: DumpServers ¨ dumpServers, sl.rest WHILE sl # NIL DO
+s: DumpServer ¨ sl.first;
+FOR d: Day IN [Day.FIRST..Day.LAST] DO
+thisTape: Tape ~ IF changeSchedule.permittedDumps[d].changeTape THEN NEW[TapeRep ¨ [s, d, 0, s.size, s.size, changeSchedule.permittedDumps[d].allowFull, 0, 0, 0, s.size]] ELSE tapes[s.index][PrevDay[d]]; 
+tapes[s.index][d] ¨ thisTape;
+ENDLOOP;
+FOR d: Day IN [Day.FIRST..Day.LAST] WHILE tapes[s.index][d] = NIL DO
+tapes[s.index][d] ¨ tapes[s.index][PrevDay[d]];
+ENDLOOP;
+ENDLOOP;
+};
+
+WeeklySchedule: TYPE ~ REF WeeklyScheduleRep;
+WeeklyScheduleRep: TYPE ~ RECORD [
+startDay: GMT,
+dumps: PQ, -- of DumpItem
+tapes: Tapes
+];
+
+DumpLevel: TYPE ~ { full, incremental, none };
+DumpLevelRope: ARRAY DumpLevel OF ROPE ~ ["0", "5", "-"];
+DumpItem: TYPE ~ REF DumpItemRep;
+DumpItemRep: TYPE ~ RECORD [
+name: VirtualTapeDriveName, -- e.g. SSL-A
+host: ROPE,
+fileSystem: ROPE,
+dailyDumpInstruction: ARRAY Day OF DumpLevel,
+priority: CARD,
+comments: ROPE
+];
+
+CompareDumpItems: PriorityQueue.SortPred ~ {
+d1: DumpItem ¨ NARROW[x];
+d2: DumpItem ¨ NARROW[y];
+IF Rope.Compare[d1.name, d2.name, FALSE]=less THEN RETURN[TRUE]
+ELSE IF Rope.Compare[d1.name, d2.name, FALSE]=greater THEN RETURN[FALSE]
+ELSE IF d1.priority < d2.priority THEN RETURN [TRUE]
+ELSE IF d1.priority > d2.priority THEN RETURN [FALSE]
+ELSE RETURN [Rope.Compare[Rope.Cat[d1.host, " ", d1.fileSystem], Rope.Cat[d2.host, " ", d2.fileSystem]]=less]
+};
+
+WeeklySchedules: TYPE ~ LIST OF WeeklySchedule;
+ComputeWeeklySchedules: PROC [config: Config, schedList: LIST OF GMT, msgs: IO.STREAM] RETURNS [ WeeklySchedules ] ~ {
+InSchedList: PROC [start: GMT] RETURNS [BOOL ¨ FALSE] ~ {
+IF schedList=NIL THEN RETURN [TRUE];
+FOR l: LIST OF GMT ¨ schedList, l.rest WHILE l#NIL DO
+IF l.first=start THEN RETURN[TRUE];
+ENDLOOP;
+};
+result: LIST OF WeeklySchedule ¨ NIL;
+FOR tcs: TapeChangeSchedules ¨ config.tapeChangeSchedule, tcs.rest WHILE tcs#NIL DO
+IF NOT InSchedList[tcs.first.date] THEN LOOP;
+{
+tapes: Tapes ¨ GetTapes[config.dumpServers, config.nServers, tcs.first];
+msgs.PutF1["Computing schedule for %g.\n", IF tcs.first.date=nullGMT THEN [rope["default"]] ELSE [time[tcs.first.date]] ];
+result ¨ CONS[ComputeOneSchedule[tapes, tcs.first, config.dumpClients, msgs], result];
+}
+ENDLOOP;
+RETURN[result];
+};
+
+ComputeOneSchedule: PROC [tapes: Tapes, tcs: TapeChangeSchedule, dumpClients: DumpClients, msgs: IO.STREAM] RETURNS [ WeeklySchedule ]~ {
+AssignLocally: PROC [client: DumpClient, tape: Tape] RETURNS [BOOL ¨ TRUE] ~ {
+incrCount: CARD ¨ IF client.dumpKind=incrOnly THEN 10 ELSE 1;
+thisDumpItem: DumpItem ¨ NEW[DumpItemRep ¨ [tape.dumpServer.name, client.host, client.fileSystem, ALL[none], client.priority, client.comment]];
+IF client.dumpKind IN [normal..fullOnly] AND tape.useForFullDumps THEN {
+IF tape.remaining < client.size THEN RETURN[FALSE];
+thisDumpItem.dailyDumpInstruction[tape.day] ¨ full;
+}
+ELSE IF client.dumpKind=incrOnly OR (client.dumpKind IN [normal..fullOnly] AND NOT tape.useForFullDumps) THEN {
+incrSize: INTEGER ¨ ComputeIncrementalSize[client, incrCount];
+incrCount ¨ 10; -- only incrementals; use gross size estimate
+IF tcs.permittedDumps[tape.day].allowIncremental THEN {
+IF tape.remaining < incrSize THEN RETURN[FALSE];
+thisDumpItem.dailyDumpInstruction[tape.day] ¨ incremental;
+}
+};
+FOR day: Day ¨ NextDay[tape.day], NextDay[day] WHILE day#tape.day DO
+incrTape: Tape ¨ tapes[tape.dumpServer.index][day];
+IF client.dumpKind=fullOnly AND tcs.permittedDumps[day].allowFull THEN { 
+IF incrTape.remaining < client.size THEN RETURN[FALSE];
+thisDumpItem.dailyDumpInstruction[day] ¨ full;
+incrCount ¨ 0;
+}
+ELSE IF client.dumpKind IN [incrOnly..normal] OR client.dumpKind=fullOnly AND NOT tcs.permittedDumps[day].allowFull THEN { 
+incrSize: INTEGER ¨ ComputeIncrementalSize[client, incrCount];
+IF incrTape#NIL AND tcs.permittedDumps[day].allowIncremental THEN {
+IF incrTape.remaining < incrSize THEN RETURN[FALSE];
+thisDumpItem.dailyDumpInstruction[day] ¨ incremental;
+};
+};
+incrCount ¨ incrCount+1;
+ENDLOOP;
+incrCount ¨ 10;
+IF thisDumpItem.dailyDumpInstruction[tape.day] = full THEN {
+DeductFullDump[tape, client];
+incrCount ¨ 1
+}
+ELSE {
+DeductIncrementalDump[tape, client, incrCount];
+};
+FOR day: Day ¨ NextDay[tape.day], NextDay[day] WHILE day#tape.day DO
+IF thisDumpItem.dailyDumpInstruction[day] = full THEN {
+DeductFullDump[tape, client];
+incrCount ¨ 0;
+}
+ELSE {
+DeductIncrementalDump[tape, client, incrCount];
+};
+incrCount ¨ incrCount+1;
+ENDLOOP;
+thisWeeksSchedule.dumps.Insert[thisDumpItem];
+};
+DeductFullDump: PROC [tape: Tape, client: DumpClient] ~ {
+tape.remaining ¨ tape.remaining - client.size;
+tape.used ¨ tape.used + client.size;
+tape.maxForFullDumps ¨ tape.maxForFullDumps + client.size;
+tape.currentForFullDumps ¨ tape.currentForFullDumps + client.used;
+};
+DeductIncrementalDump: PROC [tape: Tape, client: DumpClient, incrCount: INT] ~ {
+incrSize: INTEGER ¨ ComputeIncrementalSize[client, incrCount];
+tape.remaining ¨ tape.remaining - incrSize;
+tape.used ¨ tape.used + incrSize;
+tape.estimatedIncremental ¨ tape.estimatedIncremental + incrSize;
+};
+Assign: PROC [client: DumpClient, tape: Tape] ~ {
+NoRoomForFull: PROC [client: DumpClient, remaining: INTEGER] ~ {
+msgs.PutFL["%g %g needs %g megabytes but the biggest available space is only %g megabytes.\n", LIST[[rope[client.host]], [rope[client.fileSystem]], [cardinal[client.size]], [integer[remaining]]] ];
+done ¨ FALSE;
+};
+NoRoomForIncr: PROC [client: DumpClient, required, remaining: INTEGER] ~ {
+msgs.PutFL["%g %g needs %g megabytes but the incremental tape has only %g megabytes.\n", LIST[[rope[client.host]], [rope[client.fileSystem]], [cardinal[required]], [integer[remaining]]] ];
+done ¨ FALSE;
+};
+incrCount: CARD ¨ 10;
+thisDumpItem: DumpItem ¨ NEW[DumpItemRep ¨ [tape.dumpServer.name, client.host, client.fileSystem, ALL[none], client.priority, client.comment]];
+[] ¨ tapeHeap.Delete[tape];
+IF client.dumpKind IN [normal..fullOnly] AND tape.useForFullDumps THEN {
+IF tape.remaining < client.size THEN NoRoomForFull[client, tape.remaining];
+DeductFullDump[tape, client];
+thisDumpItem.dailyDumpInstruction[tape.day] ¨ full;
+incrCount ¨ 1;
+}
+ELSE IF client.dumpKind=incrOnly OR (client.dumpKind IN [normal..fullOnly] AND NOT tape.useForFullDumps) THEN {
+incrSize: INTEGER ¨ ComputeIncrementalSize[client, incrCount];
+IF tcs.permittedDumps[tape.day].allowIncremental THEN {
+IF tape.remaining < incrSize THEN NoRoomForIncr[client, incrSize, tape.remaining];
+DeductIncrementalDump[tape, client, incrCount];
+thisDumpItem.dailyDumpInstruction[tape.day] ¨ incremental;
+}
+};
+tapeHeap.Insert[tape, tape];
+FOR day: Day ¨ NextDay[tape.day], NextDay[day] WHILE day#tape.day DO
+incrTape: Tape ¨ tapes[tape.dumpServer.index][day];
+[] ¨ tapeHeap.Delete[incrTape];
+IF client.dumpKind=fullOnly AND tcs.permittedDumps[day].allowFull THEN { 
+IF incrTape.remaining < client.size THEN NoRoomForIncr[client, client.size, incrTape.remaining];
+DeductFullDump[incrTape, client];
+thisDumpItem.dailyDumpInstruction[day] ¨ full;
+incrCount ¨ 0;
+}
+ELSE IF client.dumpKind IN [incrOnly..normal] OR client.dumpKind=fullOnly AND NOT tcs.permittedDumps[day].allowFull THEN { 
+incrSize: INTEGER ¨ ComputeIncrementalSize[client, incrCount];
+IF incrTape#NIL AND tcs.permittedDumps[day].allowIncremental THEN {
+IF incrTape.remaining < incrSize THEN NoRoomForIncr[client, incrSize, incrTape.remaining];
+DeductIncrementalDump[incrTape, client, incrCount];
+thisDumpItem.dailyDumpInstruction[day] ¨ incremental;
+};
+};
+tapeHeap.Insert[incrTape, incrTape];
+incrCount ¨ incrCount+1;
+ENDLOOP;
+thisWeeksSchedule.dumps.Insert[thisDumpItem];
+};
+FindBest: PROC [drive: Drive] RETURNS [Tape] ~ {
+bestTape: Tape ¨ drive[Day.FIRST];
+FOR day: Day IN [Day.FIRST.SUCC..Day.LAST] DO
+IF CompareTapes[drive[day], bestTape]=greater THEN {
+bestTape ¨ drive[day];
+};
+ENDLOOP;
+RETURN[bestTape];
+};
+tapeHeap: Tree;
+clientHeap: PQ;
+done: BOOL ¨ TRUE;
+thisWeeksSchedule: WeeklySchedule ¨ NEW[WeeklyScheduleRep ¨ [tcs.date, NIL, tapes]];
+msgs.PutRope["Trying considering priority first\n"];
+InitTapes[tapes];
+thisWeeksSchedule.dumps ¨ PriorityQueue.Create[CompareDumpItems];
+clientHeap ¨ MakeClientHeap[dumpClients, priorityFirst, TRUE];
+WHILE clientHeap.Size[]#0 DO
+client: DumpClient ¨ NARROW[clientHeap.Remove[]];
+tape: Tape ¨ FindBest[tapes[client.localTapeIndex]];
+client.didLocally ¨ AssignLocally[client, tape];
+ENDLOOP; 
+tapeHeap  ¨ MakeTapeHeap[tapes];
+clientHeap ¨ MakeClientHeap[dumpClients, priorityFirst, FALSE];
+WHILE clientHeap.Size[]#0 DO
+client: DumpClient ¨ NARROW[clientHeap.Remove[]];
+tape: Tape ¨ NARROW[tapeHeap.LookupLargest[]];
+Assign[client, tape];
+ENDLOOP;
+
+IF done THEN RETURN[thisWeeksSchedule]; -- worked first time
+
+msgs.PutRope["Trying again, considering size first\n"];
+InitTapes[tapes];
+thisWeeksSchedule.dumps ¨ PriorityQueue.Create[CompareDumpItems];
+clientHeap ¨ MakeClientHeap[dumpClients, sizeFirst, TRUE];
+WHILE clientHeap.Size[]#0 DO
+client: DumpClient ¨ NARROW[clientHeap.Remove[]];
+tape: Tape ¨ FindBest[tapes[client.localTapeIndex]];
+client.didLocally ¨ AssignLocally[client, tape];
+ENDLOOP; 
+tapeHeap ¨ MakeTapeHeap[tapes];
+clientHeap ¨ MakeClientHeap[dumpClients, sizeFirst];
+WHILE clientHeap.Size[]#0 DO
+client: DumpClient ¨ NARROW[clientHeap.Remove[]];
+tape: Tape ¨ NARROW[tapeHeap.LookupLargest[]];
+Assign[client, tape];
+ENDLOOP; 
+RETURN[thisWeeksSchedule]
+};
+
+ProduceWeeklySchedule: PROC [s: WeeklySchedule, out: STREAM] ~ {
+IF s.startDay = BasicTime.nullGMT THEN out.PutRope["\n# The default schedule"]
+ELSE out.PutF1["\n# Schedule for week beginning %g", [rope[Convert.RopeFromTime[s.startDay, years, days, TRUE]]] ];
+IF s.dumps=NIL THEN out.PutRope["\n    No feasible schedule found\n"]
+ELSE WHILE s.dumps.Size[]#0 DO
+d: DumpItem ¨ NARROW[s.dumps.Remove[]];
+out.PutF["\n%g    %g    %g    ", [rope[d.name]], [rope[d.host]], [rope[d.fileSystem]] ];
+FOR day: Day IN [Monday..Sunday] DO
+out.PutRope[DumpLevelRope[d.dailyDumpInstruction[day]]];
+out.PutRope[" "];
+ENDLOOP;  
+out.PutF1[ "%g", [rope[d.comments]] ];
+ENDLOOP;
+out.PutRope["\n\n# Tape Use\n# Tape      used    forFull    inUse    headroom"];
+{ 
+prevTape: Tape ¨ NIL;
+FOR ds: CARD IN [0..s.tapes.nDrives) DO
+FOR day: Day IN [Day.FIRST..Day.LAST] DO
+tape: Tape ¨ s.tapes[ds][day];
+IF tape=NIL OR tape=prevTape THEN LOOP;
+out.PutFL["\n#  %g(%g)    %g    %g    %g    ", 
+LIST [[rope[tape.dumpServer.name]],
+[rope[Days[day]]],
+[cardinal[tape.used]], [cardinal[tape.maxForFullDumps]], 
+[cardinal[tape.currentForFullDumps]]]
+];
+out.PutF1["%g", [integer[tape.headRoom¨(tape.capacity-tape.used)]] ];
+prevTape ¨ tape;
+ENDLOOP;
+ENDLOOP;
+};
+out.PutRope["\n\n"];
+};
+
+
+ComputeIncrementalSize: PROC [client: DumpClient, incrCount: INT] RETURNS [INT] ~ {
+v: REAL ¨ client.volatility;
+incrSize: INT ¨ Real.Ceiling[v*client.size+v*v*client.size*(incrCount-1)];
+RETURN [incrSize];
+};
+
+CompareClient: PriorityQueue.SortPred ~ {
+priorityFirst: BOOL ¨ NARROW[data, REF BOOL]≠;
+c1: DumpClient ¨ NARROW[x];
+c2: DumpClient ¨ NARROW[y];
+IF priorityFirst THEN {
+IF c1.priority < c2.priority THEN RETURN [TRUE]
+ELSE IF c2.priority < c1.priority THEN RETURN [FALSE]
+ELSE RETURN [c1.size >= c2.size];
+}
+ELSE {
+IF c1.size > c2.size THEN RETURN [TRUE]
+ELSE IF c2.size > c1.size THEN RETURN [FALSE]
+ELSE RETURN [c1.priority <= c2.priority];
+};
+};
+
+MakeClientHeap: PROC [clients: DumpClients, key: {priorityFirst, sizeFirst}, localOnly: BOOL ¨ FALSE] RETURNS [PQ] ~ {
+pq: PQ ~ PriorityQueue.Create[ CompareClient, NEW[BOOL ¨ key=priorityFirst]];
+EachClient: RedBlackTree.EachNode ~ {
+dumpClient: DumpClient ¨ NARROW[data];
+IF NOT localOnly AND NOT dumpClient.didLocally THEN pq.Insert[data]
+ELSE IF localOnly THEN {
+dumpClient.didLocally ¨ FALSE;
+IF dumpClient.hasLocalTape THEN pq.Insert[data]
+};
+};
+clients.EnumerateIncreasing[EachClient];
+RETURN[pq];
+};
+
+GetTapeKey: RedBlackTree.GetKey ~ { RETURN[data] };
+CompareTapes: RedBlackTree.Compare ~ {
+n1: Tape ¨ NARROW[k];
+n2: Tape ¨ NARROW[data];
+IF n1.useForFullDumps AND NOT n2.useForFullDumps THEN RETURN [greater];
+IF n2.useForFullDumps AND NOT n1.useForFullDumps THEN RETURN [less];
+IF n1.remaining<n2.remaining THEN RETURN[less]
+ELSE IF n2.remaining<n1.remaining THEN RETURN[greater] 
+ELSE RETURN Basics.CompareCard[LOOPHOLE[n1], LOOPHOLE[n2]];
+};
+
+InitTapes: PROC [tapes: Tapes] ~ {
+FOR s: CARD IN [0..tapes.nDrives) DO
+FOR d: Day IN [Monday..Sunday] DO
+tape: Tape ¨ tapes[s][d];
+tape.used ¨ 0;
+tape.remaining ¨ tape.capacity;
+tape.maxForFullDumps ¨ 0;
+tape.currentForFullDumps ¨ 0;
+tape.estimatedIncremental ¨ 0;
+tape.headRoom ¨ 0;
+ENDLOOP;
+ENDLOOP;
+};
+
+MakeTapeHeap: PROC [tapes: Tapes, init: BOOL ¨ TRUE] RETURNS [Tree] ~ {
+tt: Tree ¨ RedBlackTree.Create[GetTapeKey, CompareTapes];
+FOR s: CARD IN [0..tapes.nDrives) DO
+FOR d: Day IN [Monday..Sunday] DO
+tape: Tape ¨ tapes[s][d];
+tt.Insert[tape, tape ! RedBlackTree.DuplicateKey => CONTINUE];
+ENDLOOP;
+ENDLOOP;
+RETURN[tt];
+};
+
+DoIt: PROC [configPath, schedPath, specialWeekPath: PFS.PATH, schedList: LIST OF GMT, msgs: IO.STREAM] ~ {
+configStream: IO.STREAM ~ PFS.StreamOpen[configPath ! PFS.Error => {msgs.PutF1["Couldn't open input file %g\n", [rope[PFS.RopeFromPath[configPath]]]]; GOTO out}];
+config: Config ~ ParseConfig[configStream, msgs];
+ws: WeeklySchedules ¨ ComputeWeeklySchedules[config, schedList, msgs];
+configStream.Close[];
+FOR sched: WeeklySchedules ¨ ws, sched.rest WHILE sched # NIL DO
+schedStream: IO.STREAM;
+IF sched.first.startDay = nullGMT THEN {
+ENABLE PFS.Error => {msgs.PutF1["Couldn't open output file %g\n", [rope[PFS.RopeFromPath[schedPath]]]]; LOOP};
+msgs.PutF1["writing %g\n", [rope[PFS.RopeFromPath[schedPath]]]];
+schedStream ¨ PFS.StreamOpen[schedPath, create];
+}
+ELSE {
+datedPath: PFS.PATH ~ MakeDatedPath[specialWeekPath, sched.first.startDay];
+{
+ENABLE PFS.Error => {msgs.PutF1["Couldn't open output file %g\n", [rope[PFS.RopeFromPath[datedPath]]]]; LOOP};
+msgs.PutF1["writing %g\n", [rope[PFS.RopeFromPath[datedPath]]]];
+schedStream ¨ PFS.StreamOpen[datedPath, create];
+}
+};
+ProduceWeeklySchedule[ sched.first, schedStream ];
+schedStream.Close[];
+ENDLOOP;
+EXITS
+out => NULL
+};
+
+MakeDatedPath: PROC [path: PFS.PATH, time: GMT] RETURNS [PFS.PATH] ~ {
+undatedName: ROPE ~ PFSNames.ComponentRope[PFSNames.ShortName[path]];
+unpacked: BasicTime.Unpacked ~ BasicTime.Unpack[time];
+ymd: ROPE ~ Rope.Cat[ 
+Rope.Substr[Convert.RopeFromCard[unpacked.year], 2], ".",
+IF unpacked.month < October THEN "0" ELSE NIL,
+Convert.RopeFromCard[ORD[unpacked.month]+1],
+Rope.Cat[".", 
+IF unpacked.day < 10 THEN "0" ELSE NIL,
+Convert.RopeFromCard[ORD[unpacked.day]]
+]
+];
+datedName: ROPE ~ undatedName.Cat[".", ymd];
+RETURN[PFSNames.ReplaceShortName[path, [[datedName, 0, datedName.Length[]]]]];
+};
+
+configSuffix: ROPE ~ ".dump_config";
+weeklySuffix: ROPE ~ ".weekly_schedule";
+specialWeekSuffix: ROPE ~ ".week_of";
+
+ComputeScheduleCommand: Commander.CommandProc ~ {
+argv: CommanderOps.ArgumentVector ¨ CommanderOps.Parse[cmd];
+IF argv.argc < 2 THEN GOTO usage;
+{
+input: ROPE ~ argv[1];
+inputPath: PFS.PATH ¨ PFS.PathFromRope[input];
+outputPath: PFS.PATH;
+specialWeekPath: PFS.PATH;
+shortName: ROPE ¨ PFSNames.ComponentRope[PFSNames.ShortName[inputPath]];
+schedList: LIST OF GMT;
+dotPos: INT ~ shortName.FindBackward["."];
+IF dotPos  # -1 THEN {
+shortName ¨ shortName.Substr[0, dotPos];
+}
+ELSE {
+inputName: ROPE ~ shortName.Concat[configSuffix];
+inputPath ¨ PFSNames.ReplaceShortName[inputPath, [[inputName, 0, inputName.Length[]]]];
+};
+{
+outputName: ROPE ~ shortName.Concat[weeklySuffix];
+specialWeekName: ROPE ~ shortName.Concat[specialWeekSuffix];
+outputPath ¨ PFSNames.ReplaceShortName[inputPath, [[outputName, 0, outputName.Length[]]]];
+specialWeekPath ¨ PFSNames.ReplaceShortName[inputPath, [[specialWeekName, 0, specialWeekName.Length[]]]];
+};
+FOR argp: INT IN [2..argv.argc) DO
+IF Rope.Equal[argv[argp], "default"] THEN schedList ¨ CONS[BasicTime.nullGMT, schedList]
+ELSE schedList ¨ CONS[Convert.TimeFromRope[argv[argp] ! Convert.Error => CONTINUE], schedList];
+ENDLOOP;
+{
+DoIt[inputPath, outputPath, specialWeekPath, schedList, cmd.out];
+};
+}
+EXITS
+usage => { cmd.out.PutRope["ScheduleDumps	"]; cmd.out.PutRope[helpMsg]; }
+};
+
+helpMsg: ROPE ~ "configFileName {MM/DD/YY | default}*\n
+Writes dump schedule files for the weeks specified (or all specified in the config if none specified on the command line).  configFileName suffix defaults to dump_config if it doesn't have a suffix." ;
+
+
+Commander.Register["ScheduleDumps", ComputeScheduleCommand, helpMsg];
+END.
+
+December 1, 1991
+   
+  
+BackupSchedulerImpl.mesa
+Copyright ” 1992 by Xerox Corporation.  All rights reserved.
+Chauser, September 14, 1992 10:10 am PDT
+Jules Bloomenthal July 19, 1992 10:36 pm PDT
+
+
+parses the given stream to make a Config
+rsh to each client host and find its file systems
+add new ones if default is found, update info on existing ones
+n.b.: the above must be in Bourne shell syntax, not in C shell syntax
+Interprets the tapeChangeSchedule and dumpServers to produce a matrix of Tape representations, correctly initialized.
+second time around the week fills in tapes for appended dumps at start of week
+This still doesn't work for entire weeks that don't have a new tape at some point.
+Computes a weekly schedule for each TapeChangeSpec in the config.
+This is considerably simplified by the assumption that a full dump and all of its incrementals should be done on the same virtual tape drive.
+Two different ways to do it:
+1.  In priority order, in decreasing size order, assign full dump and following incrementals
+If that doesn't produce a feasible schedule
+2.  In decreasing size order, assign full dump and following incrementals; sort each tape into priority order.
+The reason for trying 1 first is that it may produce a better distribution of high-priority dumps over tapes.  This is advantageous because it may tend to be more reliable.  The issue only arises when there are tapes of different sizes.
+It all fits: deduct the used sizes from the remaining capacity on each tape;
+assign clients with local tape drives
+Assign the rest of the clients
+assign clients with local tape drives
+Assign the rest of the clients
+throw away the items created in the previous pass.
+formats a WeeklySchedule onto the given stream
+First working version: correctly finds servers listed in dumpConfig.
+Problems
+needs an awk filter for df output: doesn't understand AIX format output
+input file parsing is still a mess: not nearly robust enough; no error messages
+output needs to go into separate files for different schedules; error output to user
+command switch needed to just recompute a particular week's schedule.
+December 2, 1991
+Fixed some output formatting
+Seems unable to schedule sufficiently much tape.  e.g. the CSL backups for Dec. 23 wk--gives up with at least 400mb on each tape even though any particular dump should be at most 80mb.  Cirio broken (Lorie says file is too big); can't debug.
+
+January 27, 1992
+This now requires /project/dumps/FindRawDevices to process the output of the "df" command into standard form, starting from the various outputs of the different OSs.
+February 19, 1992
+Add support for "default" host to capture defaults for particular mount points.
+February 20, 1992
+Add support for affinity: the notion that if a file server is also a dump server it ought to serve itself.
+ù ﬂ  ïNewlineDelimiter
+ñ(cedarcode) styleô öúôJöú
+œeú1ô<Jô(Jô,Jô Jô ócodeöœk	ò	KöúHûú1ûúòèKò óKò Kö–lnúûúûò"KöûúPûú,ûúòñöúûòKò óKöûúûúûúòKöûúûúûúûúòKöûúûúûúòKöú	ûúò!KöûúûúòKöúûúò Kò KöúûúDòMKöœnúûúûúûúRòiKò ö†úûú
+ûú
+ò(Kö
+ûúûú
+ûúûúûúò,Kòóö†úûú
+ûú
+ò(Kö
+ûúûú
+ûúûúûúò,KòóKò KöúûúûúòöúûúûúòKòKòKòKòKò(Köú
+ûúòKöúòKò Kò óKöúûúûúûúò'KöúûúòKöúûúûúûúò7Kò Köúûúûúò"Kò Köúûúûúò%öúûúûúòKöúœcò*KöúûúòKöúûú°òKöúûú°òKöúûú°ò Köú
+ûòKòKò óKöú
+ûú&ò4Köúûúûúò%öúûúûúòKöúûúòKöúûú°ò1KöúûúûúòKöúûúòKöúûú°ò"Köúûú°ò"KòKöú
+ûúûúûú°$ò@Köúûú	°=òVKöú	ûúûòKöúûúûòKöúòóKò Kö†úûú	ò5ö†úò,KöúûúòKöúûúòKöûú]òcKöúòKò óöúûúûúò#Köúûú°IòTKöúûúûúò$KòKò óöú	ûúûúòKöúûú°+ò=KöúûúòKöúûòKöú°3ò7Kò óKò Köúûúò&Köúûúò&Köúûúò+Kò ö†úûúûúûúûúûúò0Köûúûú,ò5KòKò óö
+†úûúûúûúûúòAKô(Kö	úûúûúLûú:ûúò∂KöúûúòKöúûúûúòKò Kö†
+úûúûúòKöú
+ûúòKò ö†úûúûúûú	ò0Kò%öûòöûúòöûú&ò(KòÅKöûúòKöúòóKöúòóKöúûúò"KöúûúòKòKöúûúòKöûúûúûúòKöûúûúûúòKöúûúûúò&KòKòKòKòKò!Köú ûúûúò<KöúûúûúfòÑKöúûúòKöûúòóKòóö†úûúòKò%öûòöûúòöûú&ò(KòÅKöûúòKöúòóKöúòóKöú"ûúò'Köú
+ûúòKöúûúòKöúòKòKöúûúòKöûúûúûúòKöûúûúûúòKöúûúûúò&KòKò!Kòöûú!ûúò)Kò Kò"Köú ûúûúò<KòóöûúòKöúûúûúò:KöúòóKöûúûúûú)ûúòUKöú	ûú$ûúHò}öûú#ûúòCKöûú-ò1Köûú+ò/óKöûúòóKòóö†úûúòKò3öûòöûúòöûú&ò(KòÅKöûúòKöúòóKöúòóKöúûúòKö	úCûúûúûúûúò\KòKöúûúûúûúò3KöûúûúûúòKöûúûúûúòKöúûúûúò&KòKöûúûúòAKöûú2ò6ö	ûú
+ûúûúûúûò*öûòKöúûúòKöúûúòKò4öûúûòöúûúûò)Köú7ûúûúòDKöú7ûúûúòFKöûúûúòóöúûúûúûòöúiòiKöú/ûúò4Köú6ûúò;KöûúòKòóöú5ò5Köú6ûúò;KöûúòKòóKöûúûúòóKöûúûúòóKöûúòóKöûúòóKöúûú-òMKöûúòóKòóKò öûòöûúòKöûúûúòKöúòóöûúûúûòKòxKöúfòfKöú\ò\Köûú7ò>óKöûúòóKòKöûú	òKòóKò ö†úûúò)Köúûúûúò%öûúûúò$KöúûúòKöû	úòKòóKöúòKò óKöúû	úòKöúûúòKò ö†úûúûúûúûúûúòCKöûúûúûúòKòKò8Köûúûúûúûúò+KöûúûúòKòKò óö†úûúûúò*öûúûòKö
+ûúûúûúûúûú
+òKöûúòóKöúòKò óö†úûúûúûúò3ô1Kô>óö†úûúûúûúûúûúò7öûú(ûúûúûò9Köûú ûúûúûúòDKöûúòóKöûúûúòKòóö†úò#KöúûúûúòKöú#ûú$òJKöú ûú0òVKöú
+ûúûúûúòöúûúnò}Köú0ùúôEóKöúûúvòÑKò=öûúûúûúòKòFKòKöúòóöûúòKöúûúûúò.Köúûúûúûúò$òöûúòKöûúûúòöûúòKòqKöúòóKöúòóKò2öûòKöúûú.ò>Köúûúò(Köúûúò(KöúûúòKöú
+ûú.ò<Köúûú.ò>Köúûú$ûú"ûúòmKòKò+öûúûú$ûúûúòIKòKòKòaKöûúûúûú8òZKöúòóöûúòKö	úûúûú0ûúûúòlKöú!ûú1òUKöúûú.òRKö	úûúûúûúûúò_öûúûúûúòKòUKò-Kò-Kò1Kò3Köú-ò-KöúòóöûúòKöú§ò§KöúòóKòóKöûúòóKòóKöúòóKòóKò'KòóKò ö†úûúûúûúò7öûúûúûòKöúûúûúò2Köúûúûúò2Köúûúûúò.Köúûúûúò+Köúûúûú
+ò0KöûúûúòóKòKò óKöúûúûú	òöú	ûúûúòKòKò	Köúûú°òKöúûú°ò#Köú
+ûúòKöúûú°&ò=KöúûúòKöúûúòKöúûúòKöú
+ûú°6òHKòóKò Köúûúûúûúûúûúò+Kò Köúûúûú
+òöú
+ûúûúòKöûú
+ûúûúò#KòKò Kò óö†úûú&ûú&ûúòwKôuKöúûúò öûú(ûúûúûò<Kòö	ûúûúûúûúûò&Kö	úûú-ûúûúcûúòÃKòKöûúòóKôNKôRöûúûúûúûúûúûúûòDKò/KöûúòóKöûúòóKöúòKò óKöúûúûúò-öúûúûúò"Köú
+ûúòKöúûú°òKòKöúòKò óKöúûúò.Kö†úûúûúûúò9Köú
+ûúûúò!öúûúûúòKöú°ò)KöúûúòKöúûúòKöúûúûúò-Köú
+ûúòKöú
+ûòKöúòóKò ö†úò,KöúûúòKöúûúòKö
+ûú ûúûúûúûúò?Köûúûú ûú
+ûúûúûúòHKö
+ûúûúûúûúûúò4Kö
+ûúûúûúûúûúò5KöûúûúbòmKòKò óKöúûúûúûúò/ö†úûúûúûúûúûúûúûúòvKôAö†úûú	ûúûúûúûúò9Kö
+ûúûúûúûúûúò$öûúûúûúûúûúûúûò5Köûúûúûúûúò#KöûúòóKòóKöúûúûúûúò%öûú@ûúûúûòSKöûúûúûúûúò-òKòHKöú+ûúûúûúòzKöú	ûúIòVKöúòóKöûúòóKöûú	òKöúòKò óö
+†úûúIûúûúûúòâKôçôKô\Kô+KônóKôÏö
+†úûú"ûúûúûúòNKö	úûúûúûúûúò=KöúûúFûú*òèöûúûúûúûúòHKöûúûúûúûúò3Kò3KòóöûúûúûúûúûúûúûúòoKöú
+ûú-ò>Köú°-ò=öûú/ûúò7Köûúûúûúûúò0Kò:KòóKòóöûú,ûúûòDKò3öûúûú#ûúòIKöûú"ûúûúûúò7Kò.KòKöúòóöûúûúûúûúûúûú#ûúò{Köú
+ûú-ò>öûú
+ûúûú*ûúòCKöûúûúûúûúò4Kò5KòóKòóKòKöûúòóKôLKòöûú4ûúò<KòKòKöúòóöûúòKò/Köúòóöûú,ûúûòDöûú/ûúò7KòKòKöúòóöûúòKò/KöúòóKòKöûúòóKöú-ò-Kòóö†úûú%ò9Kò.Kò$Kò:KòBKòóö†úûú-ûúòPKöú
+ûú-ò>Kò+Kò!KòAKòóö†úûú%ò1ö†úûú!ûúò@Kò≈KöúûúòKòóö†úûú+ûúòJKòºKöúûúòKòóKöúûúòKöúûúFûú*òèKòöûúûúûúûúòHKöûúûú'òKKòKò3KòKòóöûúûúûúûúûúûúûúòoKöú
+ûú-ò>öûú/ûúò7Köûúûú1òRKò/Kò:KòóKòóKöúòöûú,ûúûòDKò3Kòöûúûú#ûúòIKöûú"ûú8ò`Köú!ò!Kò.KòKöúòóöûúûúûúûúûúûú#ûúò{Köú
+ûú-ò>öûú
+ûúûú*ûúòCKöûúûú5òZKöú3ò3Kò5KòóKòóKöú$ò$KòKöûúòóKöú-ò-Kòóö†úûúûúò0Köúûúò"öûú
+ûúûúûúûúûò-öûú,ûúò4KòKöúòóKöûúòóKöûúòKòóKòKöúûúòKöúûúûúòKöú$ûú ûú
+òTKò4KòKòAô%Köú8ûúò>öûúûòKöúûúò1Kò4Kò0Köûúò	óóôKò Köú8ûúò?öûúûòKöúûúò1Köúûúò.KòKöûúòKò óóKöûúûúûú°ò<Kò Kò7KòKòAô%Köú4ûúò:öûúûòKöúûúò1Kò4Kò0Köûúò	óóôKòò4Kô2óöûúûòKöúûúò1Köúûúò.KòKöûúò	óóKöûúòKöúòKò óö†úûúûúò@Kô.Köûú ûú(òNKöûúeûúòsKöûú	ûúûú2òEöûúûúûòKöúûúò'KòXöûú
+ûúûò#Kò8KòKöûúò
+óKò&KöûúòóKòPöúòKöúûúòöûúûúûúûò'ö	ûú
+ûúûúûúûò(KòKö
+ûúûúûúûúûúò'ò/Kò#KòKò9Kò%KòóKòEKòKöûúòóKöûúòóKòóKòKòKò óKò ö
+†úûú!ûúûúûúòSKöúûúòKöú
+ûú=òJKöûúòKòóKò ö†úò)Kö	úûúûúûúûúò.KöúûúòKöúûúòöûúûúòKöûúûúûúûúò/Kö
+ûúûúûúûúûúò5Köûúûúò!KòóöûúòKöûúûúûúûúò'Kö
+ûúûúûúûúûúò-Köûúûúò)KòóKòKò óö†úûúDûúûúûúûúòvKöúûú(ûúûúòMö†
+úò%Köúûúò&Kö
+ûúûúûúûúûúòCöûúûúûúòKöúûúòKöûúûúò/KöúòóKöúòóKöú(ò(KöûúòKòóKò Kö†
+úûú	ò3ö†úò&KöúûúòKöúûúòKö
+ûúûúûúûúûúòGKö
+ûúûúûúûúûúòDKöûúûúûúò.Köûúûúûúûú
+ò7Köûúûúûúûúò;KòKò óö†	úûúò"öûúûúûúûò$öûúûúûò!KòKòKòKòKòKòKòKöûúòóKöûúòóKòKò óö
+†úûúûúûúûúòGKò9öûúûúûúûò$öûúûúûò!KòKöú4ûúò>KöûúòóKöûúòóKöûúòKòKò óö†úûú*ûúûúûúûúûúûúûúòjKöúûúûúûúûú=ûúûúò¢Köú1ò1KòFKòöûú)ûú	ûúûò@Köúûúûúòöûú ûúò(Köû
+ú>ûúûúònKöú!ûúò@Köúûúò0KòóöûúòKöúûúûú8òKöúòKöûúûú>ûúûúònKöú!ûúò@Köúûúò0KòóKòóKöú2ò2KöúòKöûúòóöûòKöúûòóKöúòKò óö†úûúûúûúûúûúûúûúòFKöúûú4òEKò6öúûúòKò9Köûúûúûúûúò.Köúûúò,òKöûúûúûúûúò'Köúûúò'KòóKòóKöúûúò,KöûúHòNKòKò óKöúûúò$Köúûúò(Köúûúò%Kò ö†úò1Kò<Köûúûúûúò!öúòKöúûúòKöúûúûúûúò.KöúûúûúòKöúûúûúòKöúûú9òHKöúûúûúûúòKöúûúò*öûúûúòKò(KòóöûúòKöúûú"ò1KòWKöúòóöúòKöúûú"ò2Köúûú'ò<KòZKòiKöúòóöûúûúûúûò"Köûú#ûú
+ûúûúòXKöûú
+ûúûú3û	úò_KöûúòóKòKöúAòAKöúòóKòöûòKöúIòIóKöúòóKò KòÅKò Kò KöúEòEKöûúòKò òKôDôKôGKôOKôTKôEóóôKôKôÒKô óôKô•óôKôOóôKôjóó Öó    oZ  ö)  

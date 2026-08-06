@@ -1,0 +1,1342 @@
+
+DIRECTORY
+Basics USING [BITXOR],
+CedarProcess USING [CheckAbort, Fork, Process],
+Commander USING [Handle],
+CommanderOps USING [DoCommand],
+FileNames USING [CurrentWorkingDirectory],
+IO USING [PutChar, PutF, PutF1, PutFR, PutFR1, PutRope, refAny, rope, STREAM],
+List USING [AList, DotCons],
+MakeDo,
+MakeDoBasics,
+MakeDoPrivate,
+Process USING [Abort, ConditionPointer, EnableAborts, GetCurrent, InitializeCondition, Pause, SecondsToTicks],
+ProcessProps USING [AddPropList, GetPropList],
+RefTab,
+Rope USING [Cat, Concat, Equal, ROPE],
+SimpleFeedback USING [Append, Blink],
+UserProfile USING [Boolean, CallWhenProfileChanges, ProfileChangeReason];
+
+MakeDoBasicImpl: CEDAR MONITOR
+IMPORTS Basics, CedarProcess, CommanderOps, FileNames, IO, List, MakeDo, MakeDoBasics, MakeDoPrivate, Process, ProcessProps, RefTab, Rope, SimpleFeedback, UserProfile 
+EXPORTS MakeDo, MakeDoBasics
+
+=
+BEGIN OPEN MakeDoBasics, MakeDo, MakeDoPrivate;
+
+ROPE: TYPE = Rope.ROPE;
+RefTable: TYPE = MakeDo.RefTable;
+NodeRep: PUBLIC TYPE = MakeDoPrivate.NodeRep;
+ActionRep: PUBLIC TYPE = MakeDoPrivate.ActionRep;
+NodeClassRep: PUBLIC TYPE = MakeDoPrivate.NodeClassRep;
+
+in: BOOL ¬ FALSE;
+whosIn: UNSAFE PROCESS;
+whatIn: PROC;
+monitorChange: CONDITION;
+entryTimeout: INT ¬ 60;
+makeDoMaxRetries: INT ¬ 1;		-- used to be 3 (no longer makes sense)
+
+
+DoIn: PUBLIC PROC [p: PROC] = {
+CedarProcess.CheckAbort[];
+Enter[p];
+p[!UNWIND => Exit[]];
+Exit[];
+RETURN};
+
+Enter: ENTRY PROC [p: PROC] = {
+ENABLE UNWIND => NULL;
+WHILE in DO WAIT monitorChange ENDLOOP;
+in ¬ TRUE;
+whosIn ¬ Process.GetCurrent[];
+TRUSTED {whatIn ¬ p};
+RETURN};
+
+Exit: ENTRY PROC = {
+ENABLE UNWIND => NULL;
+in ¬ FALSE;
+whosIn ¬ NIL;
+whatIn ¬ NIL;
+NOTIFY monitorChange;
+RETURN};
+
+TrackProfile: PROC [reason: UserProfile.ProfileChangeReason] --UserProfile.ProfileChangedProc-- = {
+SELECT reason FROM
+rollBack, firstTime, newUser => {
+forkParms: ForkParms ¬ ForkParmsFromProfile[];
+SetForkParms[forkParms];
+};
+edit => {
+reason ¬ reason;
+};
+ENDCASE => ERROR;
+alwaysGush ¬ UserProfile.Boolean["MakeDo.AlwaysGush", FALSE];
+deleteEmptyAuxBox ¬ UserProfile.Boolean["MakeDo.DeleteEmptyAuxBox", TRUE];
+RETURN};
+
+SetForkParms: PUBLIC --ENTRY-- PROC [forkParms: ForkParms] = {
+SPAWork: --INTERNAL-- PROC = {
+InnerSetForkParms[forkParms];
+BroadcastQueue[];
+RETURN};
+DoIn[SPAWork];
+RETURN};
+
+EndFork: PUBLIC --ENTRY-- PROC [resources: JobResources] = {
+InnerEndFork: --INTERNAL-- PROC = {
+RecordAFork[resources];
+BroadcastQueue[];
+RETURN};
+DoIn[InnerEndFork];
+RETURN};
+
+halt: BOOL ¬ FALSE;
+readyQueue: NodeList ¬ NIL;
+workCount: INTEGER ¬ 0;
+waitQueue: RefTable ¬ MakeRefTable[];
+queueChange: CONDITION;
+queueTimeout: INT ¬ 60;
+
+BroadcastQueue: ENTRY PROC = {
+ENABLE UNWIND => NULL;
+BROADCAST queueChange;
+RETURN};
+
+NotifyQueue: ENTRY PROC = {
+ENABLE UNWIND => NULL;
+NOTIFY queueChange;
+RETURN};
+
+WaitQueue: ENTRY PROC = {
+ENABLE UNWIND => NULL;
+WAIT queueChange;
+RETURN};
+
+SetState: --INTERNAL-- PROC [n: Node, new: NodeState] = {
+ENABLE UNWIND => NULL;
+SELECT n.state FROM
+inactive => NULL;
+ready => {IF n#readyQueue.first THEN ERROR;
+readyQueue ¬ readyQueue.rest};
+working => workCount ¬ workCount - 1;
+waiting => IF NOT DeleteFromRefTable[n, waitQueue] THEN ERROR;
+ENDCASE => ERROR;
+n.state ¬ new;
+SELECT n.state FROM
+inactive => NULL;
+ready => {
+readyQueue ¬ CONS[n, readyQueue];
+};
+working => workCount ¬ workCount + 1;
+waiting => {
+IF NOT waitQueue.Insert[n, $T] THEN ERROR;
+};
+ENDCASE => ERROR;
+NotifyQueue[];
+RETURN};
+
+InnerEnqueue: --INTERNAL-- PROC [job: Job, n: Node, inServiceOf: Node ¬ NIL] = {
+IF n.state = inactive THEN {
+n.someoneWhoCares ¬ job;
+SetState[n, ready];
+};
+IF inServiceOf # NIL THEN {
+n.waitingOnCurrent ¬ CONS[inServiceOf, n.waitingOnCurrent];
+inServiceOf.waitCount ¬ inServiceOf.waitCount + 1;
+SELECT inServiceOf.state FROM
+inactive, ready => ERROR;
+working => SetState[inServiceOf, waiting];
+waiting => n ¬ n;
+ENDCASE => ERROR;
+};
+RETURN};
+
+InnerEnsureMembership: --INTERNAL-- PROC [job: Job, ns: NodeSet, n: Node] = {
+IF (NOT ns.nodes.Fetch[n].found) THEN {
+IF NOT ns.nodes.Insert[n, $T] THEN ERROR;
+IF NOT n.memberships.Insert[ns, $T] THEN ERROR;
+CountNode[ns, n, 1];
+IF n.current#true AND n.state = inactive THEN InnerEnqueue[job, n, NIL];
+};
+RETURN};
+
+DestroyNodeSet: --ENTRY-- PROC [ns: NodeSet] = {
+DNSWork: --INTERNAL-- PROC = {
+UnMemberize: PROC [data: REF ANY] RETURNS [stop: BOOL ¬ FALSE] --RedBlackTree.EachNode-- = {
+n: Node = NARROW[data];
+IF NOT n.memberships.Delete[ns] THEN ERROR;
+RETURN};
+StatelessEnumerateRefTable[ns.nodes, UnMemberize];
+ns­ ¬ [nodes: ns.nodes];
+ns.nodes.Erase[];
+RETURN};
+DoIn[DNSWork];
+RETURN};
+
+CountNode: --INTERNAL-- PROC [ns: NodeSet, n: Node, D: INT] = {
+SELECT n.current FROM
+notComputed, false => ns.nonCurrents ¬ ns.nonCurrents + D;
+true => {
+ns.currents ¬ ns.currents + D;
+SELECT n.broken FROM
+FALSE => ns.ok ¬ ns.ok + D;
+TRUE => ns.broken ¬ ns.broken + D;
+ENDCASE => ERROR;
+};
+ENDCASE => ERROR;
+RETURN};
+
+SetCurrency: PUBLIC --INTERNAL-- PROC [n: Node, current: ExpensiveBool] = {
+Discount: PROC [data: REF ANY] RETURNS [stop: BOOL ¬ FALSE] --RedBlackTree.EachNode-- = {
+ns: NodeSet = NARROW[data];
+CountNode[ns, n, -1];
+RETURN};
+Count: PROC [data: REF ANY] RETURNS [stop: BOOL ¬ FALSE] --RedBlackTree.EachNode-- = {
+ns: NodeSet = NARROW[data];
+CountNode[ns, n, 1];
+RETURN};
+IF n.current = current THEN RETURN;
+StatelessEnumerateRefTable[n.memberships, Discount];
+n.current ¬ current;
+StatelessEnumerateRefTable[n.memberships, Count];
+RETURN};
+
+SetBroken: PUBLIC --INTERNAL-- PROC [n: Node, broken: BOOL] = {
+Discount: PROC [data: REF ANY] RETURNS [stop: BOOL ¬ FALSE] --RedBlackTree.EachNode-- = {
+ns: NodeSet = NARROW[data];
+CountNode[ns, n, -1];
+RETURN};
+Count: PROC [data: REF ANY] RETURNS [stop: BOOL ¬ FALSE] --RedBlackTree.EachNode-- = {
+ns: NodeSet = NARROW[data];
+CountNode[ns, n, 1];
+RETURN};
+IF n.broken = broken THEN RETURN;
+StatelessEnumerateRefTable[n.memberships, Discount];
+n.broken ¬ broken;
+StatelessEnumerateRefTable[n.memberships, Count];
+RETURN};
+
+NoteAchievement: --INTERNAL-- PROC [goal: Node] = {
+SetCurrency[goal, true];
+IF goal.state # working THEN ERROR;
+InnerGiveUp[goal];
+RETURN};
+
+GiveUp: --ENTRY-- PROC [goal: Node] = {
+GUWork: --INTERNAL-- PROC = {InnerGiveUp[goal]};
+DoIn[GUWork];
+RETURN};
+
+InnerGiveUp: --INTERNAL-- PROC [goal: Node] = {
+IF goal.state = working THEN {
+SetState[goal, inactive];
+goal.someoneWhoCares ¬ NIL;
+InnerWakeWaiters[goal];
+};
+IF readyQueue=NIL AND workCount=0 AND waitQueue.GetSize[]=0 THEN halt ¬ FALSE;
+RETURN};
+
+InnerWakeWaiters: --INTERNAL-- PROC [n: Node] = {
+WHILE n.waitingOnCurrent # NIL DO
+waiter: Node = n.waitingOnCurrent.first;
+n.waitingOnCurrent ¬ n.waitingOnCurrent.rest;
+IF waiter.state # waiting THEN ERROR;
+waiter.waitCount ¬ waiter.waitCount - 1;
+SELECT waiter.waitCount FROM
+<0 => ERROR;
+=0 => SetState[waiter, ready];
+>0 => NULL;
+ENDCASE => ERROR;
+ENDLOOP;
+RETURN};
+
+Ensure: PUBLIC PROC [goals: RefTable, modifiabilitySpec: ModifiabilitySpec, supportFiles: RefTable, PerMissedSupportFile: PROC [Node], parent: Commander.Handle] RETURNS [okGoalCount, nonOKGoalCount, nSteps: NAT, failedSteps: ActionList, nonOKGoalList: NodeList] = {
+callingJob: Job ¬ NEW [JobRep ¬ [
+wDir: FileNames.CurrentWorkingDirectory[],
+goals: goals,
+processes: MakeRefTable[],
+otherModifiable: modifiabilitySpec
+]];
+goalNS: NodeSet = NEW [NodeSetPrivate ¬ [
+nodes: MakeRefTable[]
+]];
+Initialize: --INTERNAL-- PROC = {
+StatelessEnumerateRefTable[goals, NoteGoal];
+IF modifiabilitySpec#NIL
+THEN StatelessEnumerateRefTable[modifiabilitySpec, NoteMod]
+ELSE goals ¬ goals;
+RETURN};
+NoteGoal: --INTERNAL-- PROC [data: REF ANY] RETURNS [stop: BOOL ¬ FALSE] --RedBlackTree.EachNode-- = {
+n: Node = NARROW[data];
+IF uncurrentGoals THEN InnerUncurrentNode[n];
+InnerSetModifiability[n, callingJob.goals, callingJob.otherModifiable];
+InnerEnsureMembership[callingJob, goalNS, n];
+RETURN};
+NoteMod: --INTERNAL-- PROC [data: REF ANY] RETURNS [stop: BOOL ¬ FALSE] --RedBlackTree.EachNode-- = {
+n: Node = NARROW[data];
+InnerSetModifiability[n, callingJob.goals, callingJob.otherModifiable];
+RETURN};
+{ENABLE UNWIND => {
+NoteEnsureUnwind[];
+};
+DoIn[Initialize];
+[okGoalCount, nonOKGoalCount, nonOKGoalList] ¬ HelpEmptyQueue[goalNS: goalNS, callingJob: callingJob, parent: parent, supportFiles: supportFiles, PerMissedSupportFile: PerMissedSupportFile];
+EnsureWDir[callingJob.wDir, parent];
+};
+nSteps ¬ callingJob.nSteps;
+failedSteps ¬ callingJob.failedSteps;
+goals.Erase[];
+DestroyNodeSet[goalNS];
+<<NoteFailure[callingJob, nonOKGoalCount>0];>>
+RETURN};
+uncurrentGoals: BOOL ¬ TRUE;
+
+NoteEnsureUnwind: --ENTRY-- PROC = {
+NEUWork: --INTERNAL-- PROC = {
+x: BOOL ¬ FALSE;
+IF readyQueue#NIL OR workCount#0 OR waitQueue.GetSize[]#0 THEN {
+halt ¬ TRUE;
+WHILE readyQueue # NIL DO
+victim: Node = readyQueue.first;
+SetState[victim, working];
+InnerGiveUp[victim];
+ENDLOOP;
+x ¬ x;
+};
+RETURN};
+DoIn[NEUWork];
+RETURN};
+
+HelpEmptyQueue: PROC [goalNS: NodeSet, callingJob: Job, parent: Commander.Handle, supportFiles: RefTable, PerMissedSupportFile: PROC [Node] ] RETURNS [okGoalCount, nonOKGoalCount: NAT, nonOKGoalList: NodeList] = {
+nonOKGoalList ¬ nonOKGoalList;
+DO
+ENABLE ABORTED => {
+KillIt: PROC [data: REF ANY] RETURNS [stop: BOOL ¬ FALSE] --RedBlackTree.EachNode-- = {
+process: CedarProcess.Process = NARROW[data];
+TRUSTED {Process.Abort[process.process]};
+RETURN};
+StatelessEnumerateRefTable[callingJob.processes, KillIt];
+};
+caringJob: Job ¬ NIL;
+goal: Node ¬ NIL;
+toExecute: Action ¬ NIL;
+consistencyReason: ROPE ¬ NIL;
+fails: ExpensiveBool;
+haveWorkers, fork: BOOL;
+resources: JobResources;
+[caringJob, goal, toExecute, consistencyReason, fails, haveWorkers, okGoalCount, nonOKGoalCount, nonOKGoalList, fork, resources] ¬ GetActionToExecute[goalNS, callingJob, parent, supportFiles, PerMissedSupportFile];
+IF toExecute = NIL THEN EXIT;
+{ENABLE UNWIND => {
+ReturnPermission[toExecute];
+GiveUp[goal];
+IF fork THEN EndFork[resources];
+};
+e: Execution = NEW [ExecutionPrivate ¬ [caringJob, toExecute, goal, parent, parent, fork, resources]];
+toExecute.reasonWhyLastDone ¬ consistencyReason;
+IF fails = false THEN Msg[parent, "%g%g retry of %g\n", [integer[e.a.timesTried.SUCC]], [rope[SELECT e.a.timesTried FROM 0 => "st", 1 => "nd", 2 => "rd", ENDCASE => "th"]], [rope[toExecute.cmd]]];
+IF debugging THEN Confirm[e.a.cmd];
+IF fork
+THEN {
+Buffer[e];
+{ENABLE UNWIND => Flush[e, TRUE, FALSE, toExecute.cmd];
+IF fork THEN Msg[parent, "%lForking %g%l\n", [rope["e"]], [rope[e.a.cmd]], [rope["E"]]];
+e.process ¬ CedarProcess.Fork[Execute, e, [inheritProperties: TRUE]];
+IF NOT caringJob.processes.Insert[e.process, $T] THEN ERROR;
+}}
+ELSE {
+[] ¬ Execute[e];
+};
+};
+ENDLOOP;
+RETURN};
+
+processToExecution: PUBLIC RefTab.Ref ¬ RefTab.Create[equal: EqualProcess, hash: HashProcess];
+
+ProcRef: PUBLIC TYPE ~ REF ProcRefRep;
+ProcRefRep: PUBLIC TYPE ~ MakeDoBasics.ProcRefRep;
+
+HashProcess: RefTab.HashProc ~ {
+proc: ProcRef = NARROW[key];
+val: CARDINAL ¬ 0;
+{
+N: INT ~ SIZE[PROCESS]/SIZE[CARDINAL];
+T: TYPE ~ ARRAY [1..N] OF CARDINAL;
+a: T;
+
+a ¬ LOOPHOLE[proc.process, T];
+FOR i: INT IN [1..N] DO
+val ¬ Basics.BITXOR[val, a[i]];
+ENDLOOP;
+};
+RETURN [val]
+};
+
+EqualProcess: RefTab.EqualProc ~ {
+proc1: ProcRef = NARROW[key1];
+proc2: ProcRef = NARROW[key2];
+RETURN [proc1.process = proc2.process];
+};
+
+alwaysGush: BOOL ¬ FALSE;
+deleteEmptyAuxBox: BOOL ¬ FALSE;
+
+Execute: PROC [data: REF ANY] RETURNS [results: REF ANY ¬ NIL] --CedarProcess.ForkableProc-- = {
+me: ProcRef ~ NEW [ProcRefRep ¬ [process: LOOPHOLE[Process.GetCurrent[]]]];
+e: Execution = NARROW[data];
+wDir: ROPE = e.job.wDir;
+oldPropList: List.AList = ProcessProps.GetPropList[];
+newPropList: List.AList ¬ CONS [
+List.DotCons[key: $WorkingDirectory, val: wDir],
+CONS [
+List.DotCons[key: $WorkingDirectoryStack, val: wDir],
+oldPropList]];
+innerExecute: PROC ~ {
+{OPEN e;
+ENABLE UNWIND => IF e.forked THEN {
+EndFork[e.resources];
+Flush[e, TRUE, FALSE, a.cmd];
+[] ¬ job.processes.Delete[process];
+};
+failed: BOOL ¬ FALSE;
+IF forked THEN {
+WHILE e.process=NIL OR (NOT job.processes.Fetch[e.process].found) DO Process.Pause[Process.SecondsToTicks[1]] ENDLOOP;
+IF NOT processToExecution.Insert[me, e] THEN ERROR;
+};
+IncrementStepCount[job];
+SetES[e, doing];
+IF NOT FileNames.CurrentWorkingDirectory[].Equal[wDir, FALSE] THEN ERROR; -- HERE --
+failed ¬ CommanderOps.DoCommand[a.cmd, bch !ABORTED => {failed ¬ TRUE; CONTINUE}] = $Failure;
+IF forked AND NOT processToExecution.Delete[me] THEN ERROR;
+IF NeedToFinish[e] THEN {
+a.timesTried ¬ a.timesTried.SUCC;
+IF forked THEN Flush[e, alwaysGush OR gushMe OR failed, FALSE, a.cmd];
+a.fails ¬ Expensify[failed];
+IF failed THEN AddFailedCmd[job, a];
+EnumerateResults[a, InnerSuspectNodeChange];
+CheckIn[job, goal, a, e.process];
+SetES[e, final];
+};
+};
+IF e.forked THEN EndFork[e.resources];
+};
+ProcessProps.AddPropList[newPropList, innerExecute];
+RETURN};
+
+SetES: PUBLIC ENTRY PROC [e: Execution, es: ExecutionState] ~ {
+ENABLE UNWIND => NULL;
+e.es ¬ es;
+RETURN};
+
+NeedToFinish: PUBLIC ENTRY PROC [e: Execution] RETURNS [BOOL] ~ {
+ENABLE UNWIND => NULL;
+SELECT e.es FROM
+initial, buffered => {
+SimpleFeedback.Append[$MakeDo, oneLiner, $info, "Wait 'till I get started!"];
+SimpleFeedback.Blink[$MakeDo, $info]};
+doing => {e.es ¬ ending; RETURN [TRUE]};
+ending, final => NULL;
+ENDCASE => ERROR;
+RETURN [FALSE]};
+
+InnerSetModifiability: PUBLIC --INTERNAL-- PROC [n: Node, goals: RefTable, ms: ModifiabilitySpec] = {
+new: Modifiability ¬ SELECT TRUE FROM
+goals.Fetch[n].found => yes,
+ms = NIL => guess,
+ms.Fetch[n].found => yes,
+ENDCASE => no;
+IF n.modifiability = new THEN RETURN;
+IF n.modifiability = no THEN [] ¬ InnerUnleafen[n];
+n.modifiability ¬ new;
+InnerUncurrentNode[n];
+RETURN};
+
+GetActionToExecute: --ENTRY-- PROC [goalNS: NodeSet, callingJob: Job, parent: Commander.Handle, supportFiles: RefTable, PerMissedSupportFile: PROC [Node] ] RETURNS [job: Job, goal: Node, toExecute: Action ¬ NIL, consistencyReason: ROPE, fails: ExpensiveBool, haveWorkers: BOOL ¬ FALSE, okGoalCount, nonOKGoalCount: NAT ¬ 0, nonOKGoalList: NodeList ¬ NIL, fork: BOOL ¬ FALSE, resources: JobResources] = {
+GAEWork: --INTERNAL-- PROC = {
+job ¬ job;
+DO
+a: Action;
+mandatoryMissing, sourcePresent, inputWanted: BOOL ¬ FALSE;
+sourceBroken, waits: BOOL ¬ FALSE;
+missedList: NodeList ¬ NIL;
+CheckSource: --INTERNAL-- PROC [n: Node, which: ActionDep, optional: BOOL] = {
+CedarProcess.CheckAbort[];
+inputWanted ¬ TRUE;
+InnerSetModifiability[n, job.goals, job.otherModifiable];
+IF n.modifiability=no AND n.class=fileClass AND supportFiles#NIL AND (NOT supportFiles.Fetch[n].found) AND ((NOT optional) OR InnerExists[n]) THEN {
+IF NOT supportFiles.Insert[n, $T] THEN ERROR;
+IF PerMissedSupportFile#NIL THEN PerMissedSupportFile[n];
+};
+IF n.created # notExistTime THEN sourcePresent ¬ TRUE
+ELSE IF NOT optional THEN {
+mandatoryMissing ¬ TRUE;
+missedList ¬ CONS[n, missedList];
+};
+SELECT n.current FROM
+true => {
+IF n.broken THEN SetBroken[goal, sourceBroken ¬ TRUE];
+RETURN;
+};
+false => SetCurrency[goal, false];
+notComputed => NULL;
+ENDCASE => ERROR;
+InnerEnqueue[job, n, goal];
+waits ¬ TRUE;
+};
+ComputeResults: PROC ~ {
+SurveyNode: PROC [data: REF ANY] RETURNS [stop: BOOL ¬ FALSE] --RedBlackTree.EachNode-- = {
+n: Node = NARROW[data];
+IF n.current=true AND NOT n.broken
+THEN {
+okGoalCount ¬ okGoalCount + 1;
+}
+ELSE {
+nonOKGoalCount ¬ nonOKGoalCount + 1;
+nonOKGoalList ¬ CONS[n, nonOKGoalList];
+};
+RETURN};
+okGoalCount ¬ nonOKGoalCount ¬ 0;
+nonOKGoalList ¬ NIL;
+StatelessEnumerateRefTable[goalNS.nodes, SurveyNode];
+IF deleteEmptyAuxBox AND readyQueue=NIL AND workCount=0 AND waitQueue.GetSize[]=0 AND NOT AuxBoxDestroyed[] THEN DestroyAuxBox[]; 
+RETURN};
+IF goal # NIL AND goal.state = working THEN ERROR;
+DO
+CedarProcess.CheckAbort[];
+IF goalNS.nonCurrents=0 THEN {ComputeResults; RETURN};
+IF readyQueue#NIL THEN EXIT;
+IF workCount=0 THEN {
+IF waitQueue.GetSize[]#0 THEN {
+FindCycles[];
+LOOP};
+{
+EnsureQueued: PROC [data: REF ANY] RETURNS [stop: BOOL ¬ FALSE] --RedBlackTree.EachNode-- = {
+n: Node = NARROW[data];
+IF n.state # inactive THEN ERROR;
+IF n.current#true THEN InnerEnqueue[callingJob, n, NIL];
+RETURN};
+StatelessEnumerateRefTable[goalNS.nodes, EnsureQueued];
+IF readyQueue = NIL THEN ERROR;
+LOOP;
+};
+};
+Exit[];
+WaitQueue[ !
+UNWIND => Enter[GAEWork]
+];
+Enter[GAEWork];
+ENDLOOP;
+goal ¬ readyQueue.first;
+IF goal.state # ready THEN ERROR;
+SetState[goal, working];
+IF halt THEN {
+InnerGiveUp[goal];
+IF readyQueue=NIL AND workCount=0 AND waitQueue.GetSize[]=0 THEN {ComputeResults; RETURN};
+LOOP};
+{ENABLE UNWIND => InnerGiveUp[goal];
+IF (job ¬ goal.someoneWhoCares) = NIL THEN ERROR;
+EnsureWDir[job.wDir, parent];
+IF goal.current=true THEN ERROR --shouldn't have current nodes in queue--;
+IF debugging THEN Log["Examining %g", [rope[goal.name]] ];
+SetBroken[goal, goal.modifiability=yes AND goal.created=notExistTime];
+IF goal.producer = NIL THEN InnerGetProduced[goal];
+IF InnerLeaf[goal] THEN {NoteAchievement[goal]; LOOP};
+a ¬ goal.producer.a;
+IF a.permissionGranted THEN {
+a.waitingForPermission ¬ CONS[goal, a.waitingForPermission];
+goal.waitCount ¬ 1;
+SetState[goal, waiting];
+LOOP};
+a.permissionGranted ¬ TRUE;
+a.queuedFailsInvalidation ¬ FALSE;
+{ENABLE UNWIND => InnerReturnPermission[a];
+goalExists: BOOL ~ goal.created#notExistTime;
+IF debugging THEN Log["Examining %g", [rope[a.cmd]] ];
+InnerEnumerateSources[a, cmd, CheckSource];
+IF waits THEN {InnerReturnPermission[a]; LOOP};
+IF sourceBroken THEN {InnerReturnPermission[a]; NoteAchievement[goal]; LOOP};
+SELECT a.derivedFromCurrentDeterminers FROM
+TRUE => NULL;
+FALSE => {
+InnerRederive[a];
+a.derivedFromCurrentDeterminers ¬ TRUE;
+};
+ENDCASE => ERROR;
+mandatoryMissing ¬ sourcePresent ¬ inputWanted ¬ FALSE;
+InnerEnumerateSources[a, data, CheckSource];
+IF waits THEN {InnerReturnPermission[a]; LOOP};
+IF sourceBroken THEN {InnerReturnPermission[a]; NoteAchievement[goal]; LOOP};
+IF mandatoryMissing AND goal.modifiability=yes THEN {el: ROPE; ec: CARDINAL;
+[el, ec] ¬ EnglishList[missedList];
+Warning[IO.PutFR["Can't %g because %g %g exist", [rope[a.cmd]], [rope[el]], [rope[IF ec=1 THEN "doesn't" ELSE "don't"]] ]];
+SetBroken[goal, TRUE]; InnerReturnPermission[a];
+NoteAchievement[goal]; LOOP};
+IF NOT goal.consistencyAsked THEN {
+[goal.consistent, goal.consistencyReason] ¬ a.class.CheckConsistency[a, goal];
+goal.consistencyAsked ¬ TRUE;
+};
+IF goal.consistent THEN {a.queuedFailsInvalidation ¬ TRUE; InnerReturnPermission[a]; NoteAchievement[goal]; LOOP};
+IF mandatoryMissing THEN {el: ROPE; ec: CARDINAL;
+[el, ec] ¬ EnglishList[missedList];
+Warning[IO.PutFR["Can't %g because %g %g exist", [rope[a.cmd]], [rope[el]], [rope[IF ec=1 THEN "doesn't" ELSE "don't"]] ]];
+SetBroken[goal, TRUE]; InnerReturnPermission[a];
+NoteAchievement[goal]; LOOP};
+SELECT fails ¬ a.fails FROM
+true => {SetBroken[goal, TRUE]; InnerReturnPermission[a]; NoteAchievement[goal]; LOOP};
+false => IF a.timesTried >= makeDoMaxRetries THEN {SetBroken[goal, TRUE]; InnerReturnPermission[a]; NoteAchievement[goal]; LOOP};
+notComputed => NULL;
+ENDCASE => ERROR;
+consistencyReason ¬ goal.consistencyReason;
+toExecute ¬ a;
+SetCurrency[goal, false];
+DO
+valid: BOOL;
+[fork: fork, valid: valid, resources: resources] ¬ ShouldFork[];
+IF valid THEN EXIT;
+Exit[];
+WaitQueue[ !
+UNWIND => Enter[GAEWork]
+];
+Enter[GAEWork];
+ENDLOOP;
+RETURN;
+};
+};
+ENDLOOP;
+};
+goal ¬ NIL;
+DoIn[GAEWork];
+RETURN};
+
+CheckIn: PUBLIC --ENTRY-- PROC [job: Job, goal: Node, producer: Action, process: CedarProcess.Process] = {
+CIWork: --INTERNAL-- PROC = {
+IF goal.state # working THEN ERROR;
+SetState[goal, ready];
+InnerReturnPermission[producer];
+IF process # NIL THEN [] ¬ job.processes.Delete[process];
+IF halt THEN WHILE readyQueue # NIL DO
+victim: Node = readyQueue.first;
+SetState[victim, working];
+InnerGiveUp[victim];
+ENDLOOP;
+RETURN};
+DoIn[CIWork];
+RETURN};
+
+ReturnPermission: --ENTRY-- PROC [a: Action] = {
+RPWork: --INTERNAL-- PROC = {InnerReturnPermission[a]};
+DoIn[RPWork];
+RETURN};
+
+InnerReturnPermission: --INTERNAL-- PROC [a: Action] = {
+a.permissionGranted ¬ FALSE;
+IF a.queuedFailsInvalidation THEN {a.fails ¬ notComputed; a.timesTried ¬ 0};
+a.queuedFailsInvalidation ¬ FALSE;
+InnerWakePermissionWaiters[a];
+RETURN};
+
+InnerWakePermissionWaiters: --INTERNAL-- PROC [a: Action] = {
+a ¬ a;
+WHILE a.waitingForPermission # NIL DO
+waiter: Node = a.waitingForPermission.first;
+a.waitingForPermission ¬ a.waitingForPermission.rest;
+IF waiter.state # waiting THEN ERROR;
+IF waiter.waitCount # 1 THEN ERROR;
+waiter.waitCount ¬ 0;
+SetState[waiter, ready];
+ENDLOOP;
+RETURN};
+
+InnerGetProduced: PUBLIC --INTERNAL-- PROC [n: Node] = {
+n2: Node;
+IF n.producer # NIL THEN ERROR;
+SELECT n.current FROM
+true, false => ERROR --we shouldn't know that much if we haven't tried to produce yet--;
+notComputed => NULL;
+ENDCASE => ERROR;
+n2 ¬ TryToProduce[n.given, n.class];
+IF n # n2 THEN Warning[IO.PutFR["Disagreement on cannonical name for %g or %g", IO.rope[n.name], IO.rope[n2.name]]];
+InnerVolunteerLeaf[n];
+RETURN};
+
+FindNode: PUBLIC --ENTRY-- PROC [someName: ROPE, class: NodeClass] RETURNS [node: Node] = {
+FNWork: --INTERNAL-- PROC = {
+node ¬ GetNode[someName, class, FALSE];
+IF node # NIL THEN RETURN;
+node ¬ TryToProduce[someName, class];
+InnerVolunteerLeaf[node];
+};
+DoIn[FNWork];
+};
+
+TryToProduce: --INTERNAL-- PROC [resultName: ROPE, class: NodeClass] RETURNS [sought: Node] =
+BEGIN
+PerFinder: --INTERNAL-- PROC [f: Finder] RETURNS [stop: BOOL ¬ FALSE] ~ {
+found: BOOLEAN;
+makes, cmdFrom: NodeList;
+from: From;
+cmd: ROPE;
+class: ActionClass;
+foundData: REF ANY;
+CedarProcess.CheckAbort[];
+[found, sought, makes, cmdFrom, from, cmd, class, foundData] ¬ f.finderProc[resultName: resultName, finderData: f.finderData];
+IF found THEN {
+first: BOOLEAN ¬ TRUE;
+soughtIn: BOOL ¬ FALSE;
+already: Action ¬ NIL;
+FOR ml: NodeList ¬ makes, ml.rest WHILE ml # NIL DO
+this: Action ¬ IF ml.first.producer = NIL THEN NIL ELSE ml.first.producer.a;
+soughtIn ¬ soughtIn OR (sought = ml.first);
+IF first
+THEN {already ¬ this; first ¬ FALSE}
+ELSE {IF this # already
+THEN Warning[IO.PutFR[
+"Action %g doesn't precisely cover command %g (e.g., at %g)",
+IO.refAny[cmd],
+IO.rope[IF already # NIL THEN already.cmd ELSE NIL],
+IO.rope[ml.first.name]]]};
+ENDLOOP;
+IF soughtIn
+THEN {
+a: Action;
+IF already # NIL THEN RETURN [TRUE];
+a ¬ NEW [ActionRep ¬ [cmd: cmd, class: class, foundData: foundData]];
+InnerAddAction[a, makes, cmdFrom, from];
+RETURN [TRUE];
+}
+ELSE {
+Warning[Rope.Cat["Finder (", f.name, ") blew it"]];
+sought ¬ NIL;
+};
+}
+ELSE sought ¬ NIL;
+};
+sought ¬ NIL;
+EnumerateFinders[PerFinder];
+IF sought=NIL THEN sought ¬ GetNode[resultName, class];
+END;
+
+actionClasses: RefTab.Ref ~ RefTab.Create[];
+
+InnerAddAction: --INTERNAL-- PROC [a: Action, makes, cmdFrom: NodeList, from: From] = {
+[] ¬ actionClasses.Insert[a.class, a.class];
+FOR nl: NodeList ¬ makes, nl.rest WHILE nl # NIL DO
+n: Node ¬ nl.first;
+peh: EdgeRingHead ¬ emptyHead;
+IF n.producer # NIL THEN ERROR;
+IF n.current # notComputed THEN ERROR;
+[a.makes, peh] ¬ Link[a, a.makes, n, peh, FALSE];
+n.producer ¬ peh.first;
+ENDLOOP;
+InnerAddConsumption[a, cmdFrom, cmd, TRUE];
+InnerAddConsumption[a, from.mustHave, data, FALSE];
+InnerAddConsumption[a, from.optional, data, TRUE];
+};
+
+VolunteerLeaf: --ENTRY-- PROC [n: Node] = {
+VLWork: --INTERNAL-- PROC = {InnerVolunteerLeaf[n]};
+DoIn[VLWork];
+};
+
+InnerVolunteerLeaf: --INTERNAL-- PROC [n: Node] = {
+IF n.producer = NIL THEN n.producer ¬ NEW [EdgeRep ¬ [
+a: leaf,
+n: n,
+aNext: NIL, aPrev: NIL, nNext: NIL, nPrev: NIL,
+optional: FALSE
+]]
+ELSE IF n.producer.a = NIL THEN ERROR;
+};
+
+InnerRederive: PUBLIC --INTERNAL-- PROC [a: Action] = {
+from: From;
+InnerRemoveConsumption[a, data];
+[from, a.cmd] ¬ a.class.Rederive[a];
+InnerAddConsumption[a, from.mustHave, data, FALSE];
+InnerAddConsumption[a, from.optional, data, TRUE];
+};
+
+AddConsumption: --ENTRY-- PROC [a: Action, nl: NodeList, which: ActionDep, optional: BOOL] = {
+ACWork: --INTERNAL-- PROC = {InnerAddConsumption[a, nl, which, optional]};
+DoIn[ACWork];
+};
+
+InnerAddConsumption: --INTERNAL-- PROC [a: Action, nl: NodeList, which: ActionDep, optional: BOOL] = {
+FOR nl ¬ nl, nl.rest WHILE nl # NIL DO
+n: Node ¬ nl.first;
+SELECT which FROM
+data => {
+[a.from[data], n.to[data]] ¬ Link[a, a.from[data], n, n.to[data], optional];
+};
+cmd => {
+[a.from[cmd], n.to[cmd]] ¬ Link[a, a.from[cmd], n, n.to[cmd], optional];
+};
+ENDCASE => ERROR;
+ENDLOOP;
+nl ¬ nl;
+};
+
+Link: --INTERNAL-- PROC [a: Action, ah: EdgeRingHead, n: Node, nh: EdgeRingHead, optional: BOOL] RETURNS [ahNew, nhNew: EdgeRingHead] = {
+e: Edge ¬ NEW [EdgeRep ¬ [
+optional: optional,
+n: n,
+a: a,
+aNext: ah.first,
+aPrev: NIL,
+nNext: nh.first,
+nPrev: NIL
+]];
+ah.first ¬ nh.first ¬ e;
+IF e.aNext # NIL THEN e.aNext.aPrev ¬ e ELSE ah.last ¬ e;
+IF e.nNext # NIL THEN e.nNext.nPrev ¬ e ELSE nh.last ¬ e;
+ahNew ¬ ah;
+nhNew ¬ nh;
+};
+
+InnerRemoveConsumption: --INTERNAL-- PROC [a: Action, which: ActionDep] = {
+ah: EdgeRingHead ¬ a.from[which];
+aNext: Edge;
+FOR e: Edge ¬ ah.first, aNext WHILE e # NIL DO
+n: Node ¬ e.n;
+IF e.a # a THEN ERROR;
+aNext ¬ e.aNext;
+e.aNext ¬ e.aPrev ¬ NIL;
+UnlinkToFrom[e, which];
+e.a ¬ NIL;
+e.n ¬ NIL;
+ENDLOOP;
+a.from[which] ¬ emptyHead;
+};
+
+UnlinkToFrom: --INTERNAL-- PROC [e: Edge--on n.to=a.from--, which: ActionDep] = {
+n: Node = e.n;
+IF e.nNext # NIL THEN e.nNext.nPrev ¬ e.nPrev ELSE SELECT which FROM cmd => n.to[cmd].last ¬ e.nPrev; data => n.to[data].last ¬ e.nPrev; ENDCASE => ERROR;
+IF e.nPrev # NIL THEN e.nPrev.nNext ¬ e.nNext ELSE SELECT which FROM cmd => n.to[cmd].first ¬ e.nNext; data => n.to[data].first ¬ e.nNext; ENDCASE => ERROR;
+e.nNext ¬ e.nPrev ¬ NIL;
+};
+
+InnerRemoveProduction: --INTERNAL-- PROC [a: Action] = {
+ah: EdgeRingHead ¬ a.makes;
+aNext: Edge;
+FOR e: Edge ¬ ah.first, aNext WHILE e # NIL DO
+n: Node ¬ e.n;
+IF e.a # a THEN ERROR;
+aNext ¬ e.aNext;
+e.aNext ¬ e.aPrev ¬ NIL;
+e.nNext ¬ e.nNext ¬ NIL;
+n.producer ¬ NIL;
+e.a ¬ NIL;
+e.n ¬ NIL;
+ENDLOOP;
+a.makes ¬ emptyHead;
+};
+
+Explain: PUBLIC PROC [ch: Commander.Handle, nodes: RefTable] = {
+to: IO.STREAM = ch.out;
+needDecode: BOOL ¬ FALSE;
+Work: PROC [data: REF ANY] RETURNS [stop: BOOL ¬ FALSE] --RedBlackTree.EachNode-- = {
+n: Node = NARROW[data];
+needDecode ¬ ExplainNode[n, to] OR needDecode;
+};
+StatelessEnumerateRefTable[nodes, Work];
+IF needDecode THEN to.PutRope["* => not current;\n! => broken;\nleading ? => doesn't exist;\nleading ?? => create time unknown;\ntrailing ? => optional.\n"];
+};
+
+ExplainNode: --ENTRY-- PROC [n: Node, to: IO.STREAM] RETURNS [needDecode: BOOL ¬ FALSE] = {
+ShowConsumer: --INTERNAL-- PROC [a: Action, which: ActionDep] = {
+to.PutF1["\n\t\t%g", [rope[a.cmd]]];
+};
+ShowDeterminer: --INTERNAL-- PROC [n: Node, which: ActionDep, optional: BOOL] = {
+nc: BOOL = n.current # true;
+broken: BOOL = n.current=true AND n.broken;
+created: Time ~ InnerGetCreated[n];
+to.PutF["\n%g\t%g\t%g",
+[rope[IF nc THEN "*" ELSE IF broken THEN "!" ELSE ""]],
+[rope[SELECT created FROM
+notExistTime => "?",
+unknownTime => "??",
+ENDCASE => ""]],
+IO.rope[n.name]
+];
+needDecode ¬ needDecode OR nc OR broken OR created=notExistTime OR created=unknownTime;
+RETURN};
+ShowInput: --INTERNAL-- PROC [n: Node, which: ActionDep, optional: BOOL] = {
+nc: BOOL = n.current # true;
+broken: BOOL = n.current=true AND n.broken;
+created: Time ~ InnerGetCreated[n];
+to.PutF["\n%g\t%g\t", 
+[rope[IF nc THEN "*" ELSE IF broken THEN "!" ELSE ""]],
+[rope[SELECT created FROM
+notExistTime => "?",
+unknownTime => "??",
+ENDCASE => ""]]
+];
+to.PutRope[n.name];
+IF optional THEN to.PutChar['?];
+needDecode ¬ needDecode OR nc OR broken OR created=notExistTime OR created=unknownTime;
+RETURN};
+ShowOutput: PROC [n: Node] = {
+to.PutF1["\n\t\t%g", IO.rope[n.name]];
+};
+ENWork: --INTERNAL-- PROC = {
+a: Action ¬ NIL;
+to.PutF1["%g\n", [rope[n.name]] ];
+to.PutF1["\tCreated %g.\n", [rope[FmtTime[n.created]]] ];
+to.PutF1["\t%g\n", [rope[SELECT n.current FROM
+true => "Is Current",
+false => "Not Current",
+notComputed => "Not known if Current",
+ENDCASE => ERROR]]];
+IF n.current=true THEN to.PutF1["\t%g.\n",
+[rope[IF n.broken THEN "Broken" ELSE "Not broken"]]
+];
+to.PutRope["\tNeeded by {"];
+InnerEnumerateConsumers[n, data, ShowConsumer];
+to.PutRope["};\n\tdetermines {"];
+InnerEnumerateConsumers[n, cmd, ShowConsumer];
+to.PutRope["}.\n"];
+SELECT TRUE FROM
+n.producer = NIL => to.PutRope["\tNever tried to determine producer.\n"];
+n.producer.a = leaf => to.PutRope["\tNothing knows how to produce it.\n"];
+ENDCASE => a ¬ n.producer.a;
+SELECT n.modifiability FROM
+yes => to.PutRope["\tCertainly modifiable.\n"];
+no => to.PutRope["\tCertainly NOT modifiable.\n"];
+guess => to.PutRope["\tModifiability unspecified.\n"];
+uninitialized => to.PutRope["\tModifiability undetermined.\n"];
+ENDCASE => ERROR;
+IF (a = NIL) OR (n.modifiability = no) THEN RETURN;
+IF NOT n.consistencyAsked THEN to.PutRope["\tConsistency not inquired.\n"]
+ELSE to.PutF[
+"\tCurrently %g consistent with inputs (because %g).\n",
+[rope[IF n.consistent THEN "is" ELSE "not"]],
+[rope[n.consistencyReason]]
+];
+to.PutF1["%g\n", [rope[a.cmd]] ];
+to.PutRope["\tAccording to {"];
+InnerEnumerateSources[a, cmd, ShowDeterminer];
+to.PutRope["}\n\tMakes {"];
+InnerEnumerateResults[a, ShowOutput];
+to.PutRope["}\n\tFrom {"];
+InnerEnumerateSources[a, data, ShowInput];
+to.PutRope["}.\n"];
+to.PutF1["\t%g from current determiners.\n",
+[rope[IF a.derivedFromCurrentDeterminers THEN "Derived" ELSE "Not derived"]] ];
+to.PutF1["\t%g with current inputs",
+[rope[SELECT TRUE FROM
+a.queuedFailsInvalidation OR a.fails=notComputed => "Not tried",
+a.fails=true => "Fails",
+a.fails=false => "Succeeds",
+ENDCASE => ERROR]] ];
+IF a.fails=false AND NOT a.queuedFailsInvalidation THEN to.PutF1[" (tried %g times with current inputs)", [integer[a.timesTried]] ];
+to.PutRope[".\n"];
+IF a.reasonWhyLastDone # NIL THEN to.PutF1["\tLast executed because %g.\n", [rope[a.reasonWhyLastDone]]];
+};
+DoIn[ENWork];
+};
+
+SuspectNodesChange: PUBLIC PROC [ns: RefTable] ~ {
+EnterEnumerateNodes[ns, InnerSuspectNodeChange]};
+
+UncurrentNodes: PUBLIC PROC [ns: RefTable] ~ {
+EnterEnumerateNodes[ns, InnerUncurrentNode]};
+
+UncurrentProducers: PUBLIC PROC [ns: RefTable] ~ {
+EnterEnumerateNodes[ns, InnerUncurrentProducer]};
+
+EnterEnumerateNodes: --ENTRY-- PROC [ns: RefTable, Consume: PROC [Node]] ~ {
+EENWork: --INTERNAL-- PROC ~ {EnumerateNodes[ns, Consume]};
+DoIn[EENWork];
+RETURN};
+
+SuspectNodeChange: PUBLIC --ENTRY-- PROC [n: Node] = {
+SNCWork: --INTERNAL-- PROC = {InnerSuspectNodeChange[n]};
+DoIn[SNCWork];
+};
+
+InnerSuspectNodeChange: PUBLIC --INTERNAL-- PROC [n: Node] = {
+lastCreated: Time = n.created;
+lastLength: INT ~ n.length;
+[n.created, n.length] ¬ n.class.GetInfo[n];
+IF n.created#lastCreated OR n.length#lastLength THEN InnerNoteContentChange[n];
+};
+
+reasonNotAsked: ROPE = "haven't yet asked if consistent";
+
+InnerNoteContentChange: --INTERNAL-- PROC [n: Node] = {
+InnerUnaskConsistency: --INTERNAL-- PROC [n: Node] = {
+n.consistencyAsked ¬ FALSE;
+n.consistencyReason ¬ reasonNotAsked;
+};
+PerDirectConsumer: --INTERNAL-- PROC [a: Action, which: ActionDep] = {
+SELECT which FROM
+cmd => {
+a.derivedFromCurrentDeterminers ¬ FALSE;
+};
+data => {
+InnerUnknowFails[a];
+InnerEnumerateResults[a, InnerUnaskConsistency];
+};
+ENDCASE => ERROR;
+};
+InnerUnaskConsistency[n];
+InnerEnumerateConsumers[n, data, PerDirectConsumer];
+InnerEnumerateConsumers[n, cmd, PerDirectConsumer];
+InnerUncurrentNode[n];
+n ¬ n;
+};
+
+InnerUnknowFails: PUBLIC --INTERNAL-- PROC [a: Action] = {
+SELECT a.permissionGranted FROM
+FALSE => {a.fails ¬ notComputed; a.timesTried ¬ 0};
+TRUE => a.queuedFailsInvalidation ¬ TRUE;
+ENDCASE => ERROR;
+};
+
+UncurrentNode: PUBLIC --ENTRY-- PROC [n: Node] = {
+UNWork: --INTERNAL-- PROC = {InnerUncurrentNode[n]};
+DoIn[UNWork];
+};
+
+InnerUncurrentNode: --INTERNAL-- PROC [n: Node] = {
+PerConsumer: --INTERNAL-- PROC [a: Action, which: ActionDep] = {
+InnerEnumerateResults[a, InnerUncurrentNode];
+};
+IF n.current = notComputed THEN RETURN;
+SetCurrency[n, notComputed];
+InnerEnumerateConsumers[n, data, PerConsumer];
+InnerEnumerateConsumers[n, cmd, PerConsumer];
+n ¬ n;
+};
+
+UncurrentProducer: PUBLIC --ENTRY-- PROC [n: Node] = {
+UPWork: --INTERNAL-- PROC = {InnerUncurrentProducer[n]};
+DoIn[UPWork];
+};
+
+InnerUncurrentProducer: --INTERNAL-- PROC [n: Node] = {
+IF n.producer = NIL OR n.producer.a = leaf
+THEN InnerUncurrentNode[n]
+ELSE {
+a: Action = n.producer.a;
+InnerUnknowFails[a];
+InnerEnumerateResults[a, InnerUncurrentNode];
+};
+};
+
+EnumerateConsumers: PUBLIC --ENTRY-- PROC [n: Node, which: ActionDep, to: PROC [Action, ActionDep]] = {
+ECWork: --INTERNAL-- PROC = {InnerEnumerateConsumers[n, which, to]};
+DoIn[ECWork];
+};
+
+InnerEnumerateConsumers: --INTERNAL-- PROC [n: Node, which: ActionDep, to: PROC [Action, ActionDep]] = {
+x: BOOL ¬ FALSE;
+x ¬ x;
+FOR e: Edge ¬ n.to[which].first, e.nNext WHILE e # NIL DO
+to[e.a, which];
+ENDLOOP;
+x ¬ x;
+};
+
+EnumerateResults: PUBLIC --ENTRY-- PROC [a: Action, to: PROC [Node]] = {
+ERWork: --INTERNAL-- PROC = {InnerEnumerateResults[a, to]};
+DoIn[ERWork];
+};
+
+InnerEnumerateResults: --INTERNAL-- PROC [a: Action, to: PROC [Node]] = {
+x: BOOL ¬ FALSE;
+x ¬ x;
+FOR e: Edge ¬ a.makes.first, e.aNext WHILE e # NIL DO
+to[e.n];
+ENDLOOP;
+x ¬ x;
+};
+
+EnumerateSources: PUBLIC --ENTRY-- PROC [a: Action, which: ActionDep, to: PROC [n: Node, which: ActionDep, optional: BOOL]] = {
+ESWork: --INTERNAL-- PROC = {InnerEnumerateSources[a, which, to]};
+DoIn[ESWork];
+};
+
+InnerEnumerateSources: PUBLIC --INTERNAL-- PROC [a: Action, which: ActionDep, to: PROC [n: Node, which: ActionDep, optional: BOOL]] = {
+which ¬ which;
+FOR e: Edge ¬ a.from[which].first, e.aNext WHILE e # NIL DO
+IF e.a # a THEN ERROR;
+to[e.n, which, e.optional];
+ENDLOOP;
+which ¬ which;
+};
+
+GetProducer: PUBLIC --ENTRY-- PROC [n: Node] RETURNS [producer: Action ¬ NIL] = {
+GPWork: --INTERNAL-- PROC = {IF n.producer#NIL AND n.producer.a#leaf THEN producer ¬ n.producer.a};
+DoIn[GPWork];
+RETURN};
+
+DestroyGraph: PUBLIC --ENTRY-- PROC = {
+DGWork: --INTERNAL-- PROC = {
+DestroyNode: --INTERNAL-- PROC [n: Node] = {
+IF n.producer # NIL AND n.producer.a # leaf THEN {
+a: Action = n.producer.a;
+a.class ¬ NIL;
+a.foundData ¬ NIL;
+InnerRemoveConsumption[a, cmd];
+InnerRemoveConsumption[a, data];
+InnerRemoveProduction[a];
+};
+};
+ClearClass: PROC [key, val: REF ANY] RETURNS [quit: BOOL ¬ FALSE] ~ {
+class: ActionClass ~ NARROW[key];
+IF class.ClearCaches#NIL THEN class.ClearCaches[class];
+RETURN};
+IF workCount > 0 THEN Warning["Hope no other processes in MakeDo..."];
+EnumerateAndDestroy[to: DestroyNode, andDestroy: TRUE];
+IF actionClasses.Pairs[ClearClass] THEN ERROR;
+readyQueue ¬ NIL;
+workCount ¬ 0;
+waitQueue.Erase[];
+EmptyCmdUtils[];
+halt ¬ FALSE;
+};
+DoIn[DGWork];
+};
+
+ForAll: PUBLIC --ENTRY-- PROC [suspectChange, uncurrent: BOOL] = {
+FAWork: --INTERNAL-- PROC = {
+PerNode: INTERNAL PROC [n: Node] = {
+IF suspectChange THEN InnerSuspectNodeChange[n];
+IF uncurrent THEN InnerUncurrentProducer[n];
+};
+EnumerateAndDestroy[to: PerNode, andDestroy: FALSE];
+};
+DoIn[FAWork];
+};
+
+RetryToProduce: PUBLIC --ENTRY-- PROC [n: Node] = {
+RPWork: --INTERNAL-- PROC = {
+n2: Node;
+IF NOT InnerUnleafen[n] THEN RETURN;
+n2 ¬ TryToProduce[n.given, n.class];
+IF n # n2 THEN Warning[IO.PutFR["Disagreement on cannonical name for %g or %g", IO.rope[n.name], IO.rope[n2.name]]];
+InnerVolunteerLeaf[n];
+};
+DoIn[RPWork];
+};
+
+InnerUnleafen: --INTERNAL-- PROC [n: Node] RETURNS [wasLeaf: BOOL] ~ {
+IF n.producer = NIL THEN RETURN [TRUE];
+IF n.producer.a # leaf THEN RETURN [FALSE];
+{e: Edge ~ n.producer;
+IF e.aNext # NIL OR e.aPrev # NIL THEN ERROR;
+IF e.nNext # NIL OR e.nPrev # NIL THEN ERROR;
+n.producer.a ¬ NIL;
+n.producer ¬ NIL;
+InnerUncurrentNode[n];
+RETURN [TRUE]}};
+
+FindCycles: --INTERNAL-- PROC = {
+out: IO.STREAM = GetCommanderHandle[].out;
+explored: RefTable ¬ MakeRefTable[];
+inStack: RefTable ¬ MakeRefTable[];
+stack: NodeList ¬ NIL;
+cycleCount: INTEGER ¬ 0;
+PerElement: PROC [n: Node] = {
+out.PutF1["\t%g\n", [rope[n.name]] ];
+InnerWakeWaiters[n];
+IF n.producer#NIL AND n.producer.a#leaf THEN InnerWakePermissionWaiters[n.producer.a];
+};
+NoteNode: --INTERNAL-- PROC [ra: REF ANY] RETURNS [BOOL] = {
+n: Node ~ NARROW[ra];
+IF explored.Fetch[n].found THEN RETURN [FALSE];
+IF inStack.Fetch[n].found THEN {
+cycleCount ¬ cycleCount + 1;
+out.PutRope["Found cycle:\n"];
+PerElement[n];
+FOR nl: NodeList ¬ stack, nl.rest WHILE nl.first # n DO
+PerElement[nl.first];
+ENDLOOP;
+out.PutRope["\n"];
+RETURN [FALSE];
+};
+IF NOT inStack.Insert[n, $T] THEN ERROR;
+stack ¬ CONS[n, stack];
+FOR wl: NodeList ¬ n.waitingOnCurrent, wl.rest WHILE wl # NIL DO
+[] ¬ NoteNode[wl.first];
+ENDLOOP;
+IF n.producer # NIL AND n.producer.a # leaf THEN {
+a: Action = n.producer.a;
+FOR wl: NodeList ¬ a.waitingForPermission, wl.rest WHILE wl # NIL DO
+[] ¬ NoteNode[wl.first];
+ENDLOOP;
+};
+stack ¬ stack.rest;
+IF NOT DeleteFromRefTable[n, inStack] THEN ERROR;
+IF NOT explored.Insert[n, $T] THEN ERROR;
+RETURN [FALSE]};
+halt ¬ TRUE;
+Warning["MakeDo deadlocked... hang on while I look for dependency cycles... "];
+StatelessEnumerateRefTable[waitQueue, NoteNode];
+Warning[IO.PutFR1["... found %g cycle(s) ... halting", [integer[cycleCount]] ]];
+};
+
+EnsureWDir: PROC [wDir: ROPE, parent: Commander.Handle] = {
+IF NOT FileNames.CurrentWorkingDirectory[].Equal[wDir, FALSE] THEN {
+[] ¬ CommanderOps.DoCommand[Rope.Concat["CD ", wDir], parent];
+IF NOT FileNames.CurrentWorkingDirectory[].Equal[wDir, FALSE] THEN ERROR;
+};
+};
+
+Start: PROC = {
+TRUSTED {
+mcp: Process.ConditionPointer = @monitorChange;
+qcp: Process.ConditionPointer = @queueChange;
+Process.InitializeCondition[mcp, Process.SecondsToTicks[entryTimeout]];
+Process.EnableAborts[mcp];
+Process.InitializeCondition[qcp, Process.SecondsToTicks[queueTimeout]];
+Process.EnableAborts[qcp];
+};
+UserProfile.CallWhenProfileChanges[TrackProfile];
+};
+
+Start[];
+
+END.
+   F  
+MakeDoBasicImpl.Mesa
+Copyright Ó 1989, 1991, 1993 by Xerox Corporation.  All rights reserved.
+Last tweaked by Mike Spreitzer on October 6, 1992 11:10 am PDT
+Carl Hauser, April 11, 1985 3:43:34 pm PST
+Eduardo Pelegri-Llopart March 21, 1989 5:32:55 pm PST
+JKF January 11, 1989 10:31:53 am PST
+Bill Jackson (bj) January 16, 1989 1:37:40 pm PST
+Willie-s, April 26, 1993 6:51 pm PDT
+Michael Plass, November 27, 1991 10:37 am PST
+INVARIANT
+in => some process in Basic monitor.
+condition variables.
+Only one process writing to a commander log at a time.
+Integrity of MakeDoAuxBox data structure.
+Additional invariants of the Basic monitor:
+Integrity of queue reps.
+Node is in queue node.state says it is.
+node.current=true => node not ready or waiting.
+node.current#true & someone wants it true => node in some queue.
+processUse & processAllocation are accurate.
+halt => make nodes inactive regardless of currency.
+halt => queues not all empty.
+To help debugging:
+We don't use Mesa's monitor entry mechanism only because we can't ABORT something waiting on entry --- what a pisser!
+With potentially non-empty queues:
+With permission to work on toExecute and goal:
+Mush: PROC [p: PROCESS] RETURNS [c: CARDINAL  _ 0] ~ INLINE {
+N: INT ~ SIZE[PROCESS]/SIZE[CARDINAL];
+T: TYPE ~ ARRAY [1..N] OF CARDINAL;
+a: T;
+
+a _ LOOPHOLE[p, T];
+FOR i: INT IN [1..N] DO
+c _ Basics.BITXOR[c, a[i]];
+ENDLOOP;
+RETURN [c];
+};
+
+HashProc: TYPE = PROC [key: Key] RETURNS [CARDINAL];
+EqualProc: TYPE = PROC [key1, key2: Key] RETURNS [BOOL];
+A Hack, but will do for a test -epll
+either
+toExecute = NIL & no work to be done
+or {
+toExecute#NIL
+not consistent
+fails = toExecute.fails
+fails # true
+}
+Does anything need to be put back in the queue?
+Would you believe...
+I'm thinking of not surprising the other UNWIND catch phrase cooler in the stack.
+With work lock on goal:
+With permission to work on a:
+Would you believe...
+I'm thinking of not surprising the other UNWIND catch phrase cooler in the stack.
+We don't have to notify anybody because we wouldn't be here unless NOT CorrectlyDerived[a], which implies all upstream stuff is suspicious.
+ Ê3K  –(cedarcode) style•NewlineDelimiter
+™ code™Kšœ
+Ïeœ=™HK™>Kšœ'Ïk™*Kšœ5™5K™$K™1K™$K™-—K˜ šž	˜	Kšœžœžœ˜Kšœžœ˜/Kšœ
+žœ
+˜Kšœžœ˜Kšœ
+žœ˜*Kšžœžœ>žœ˜NKšœžœ˜Kšœ˜Kšœ˜Kšœ˜Kšœžœa˜nKšœžœ˜.Kšœ˜Kšœžœžœ˜&Kšœžœ˜%Kšœžœ8˜I—K˜ šÑbnxœžœž˜Kšžœ0žœn˜§Kšžœ˜šž	™	K™$K™K™6K™)—™+K™K™'K™/K™@Kšœ,™,K™3K™——K˜ Kšœ˜Kšžœžœ%˜/K˜ Kšžœžœžœ˜Kšœ
+žœ˜!Kšœ	žœžœ˜-Kšœžœžœ˜1Kšœžœžœ˜7K˜ Kšœžœžœ˜™Kšœžœžœ˜Kšœžœ˜—Kšœž	œ˜Kšœžœ˜KšœžœÏc'˜CK˜ KšœBžœ ™uK˜ šÏnœžœžœžœ˜K˜K˜	Kšœžœ˜K˜Kšžœ˜—K˜ š¡œžœžœžœ˜Kšžœžœžœ˜Kšžœžœžœžœ˜'Kšœžœ˜
+K˜Kšžœ˜Kšžœ˜—K˜ š¡œžœžœ˜Kšžœžœžœ˜Kšœžœ˜Kšœ	žœ˜Kšœ	žœ˜Kšžœ˜Kšžœ˜—K˜ š¡œžœ+ "œ˜cšžœž˜šœ!˜!K˜.Kšœ˜K˜—˜	K˜K˜—Kšžœžœ˜—Kšœ6žœ˜=KšœDžœ˜JKšžœ˜—K˜ š¡œžœ 	œžœ˜>š¡œ œžœ˜K˜K˜Kšžœ˜—K˜Kšžœ˜—K˜ š¡œžœ 	œžœ˜<š¡œ œžœ˜#Kšœ˜K˜Kšžœ˜—Kšœ˜Kšžœ˜—K˜ Kšœžœžœ˜Kšœžœ˜Kšœžœ˜K˜%Kšœž	œ˜Kšœžœ˜K˜ š¡œžœžœ˜Kšžœžœžœ˜Kšž	œ˜Kšžœ˜—K˜ š¡œžœžœ˜Kšžœžœžœ˜Kšžœ˜Kšžœ˜—K˜ š¡	œžœžœ˜Kšžœžœžœ˜Kšžœ˜Kšžœ˜—K˜ š¡œ œžœ˜9Kšžœžœžœ˜šžœ	ž˜Kšœžœ˜šœ
+žœžœžœ˜+Kšœ˜—K˜%Kš	œžœžœ"žœžœ˜>Kšžœžœ˜—K˜šžœ	ž˜Kšœžœ˜˜
+Kšœžœ˜!K˜—K˜%˜Kšžœžœžœžœ˜*K˜—Kšžœžœ˜—K˜Kšžœ˜—K˜ š¡œ œžœ)žœ˜Pšžœžœ˜Kšœ˜K˜K˜—šžœžœžœ˜Kšœžœ"˜;Kšœ2˜2šžœž˜Kšœžœ˜Kšœ*˜*Kšœ˜Kšžœžœ˜—K˜—Kšžœ˜—K˜ š¡œ œžœ%˜Mšžœžœžœ˜'Kšžœžœžœžœ˜)Kšžœžœžœžœ˜/K˜Kšžœžœžœžœ˜HK˜—Kšžœ˜—K˜ š¡œ 	œžœ˜0š¡œ œžœ˜š¡œžœžœžœžœžœžœ œ˜\Kšœ
+žœ˜Kšžœžœžœžœ˜+Kšžœ˜—Kšœ2˜2K˜Kšœ˜Kšžœ˜—Kšœ˜Kšžœ˜—K˜ š
+¡	œ œžœÐgnœžœ˜?šžœž˜Kšœ8Ïgœ˜:˜	Kšœ£œ˜šžœ
+ž˜Kšžœ£œ˜Kšžœ£œ˜"Kšžœžœ˜—Kšœ˜—Kšžœžœ˜—Kšžœ˜—K˜ š¡œžœ œžœ&˜Kš¡œžœžœžœžœžœžœ œ˜YKšœžœ˜Kšœ˜Kšžœ˜—š¡œžœžœžœžœžœžœ œ˜VKšœžœ˜Kšœ˜Kšžœ˜—Kšžœžœžœ˜#Kšœ4˜4K˜Kšœ1˜1Kšžœ˜—K˜ š
+¡	œžœ œžœžœ˜?š¡œžœžœžœžœžœžœ œ˜YKšœžœ˜Kšœ˜Kšžœ˜—š¡œžœžœžœžœžœžœ œ˜VKšœžœ˜Kšœ˜Kšžœ˜—Kšžœžœžœ˜!Kšœ4˜4Kšœ˜Kšœ1˜1Kšžœ˜—K˜ š¡œ œžœ˜3Kšœ˜Kšžœžœžœ˜#K˜Kšžœ˜—K˜ š¡œ 	œžœ˜'Kš¡œ œžœ˜0K˜Kšžœ˜—K˜ š¡œ œžœ˜/šžœžœ˜K˜Kšœžœ˜Kšœ˜K˜—Kšžœžœžœžœžœžœ˜NKšžœ˜—K˜ š¡œ œžœ˜1šžœžœž˜!Kšœ(˜(Kšœ-˜-Kšžœžœžœ˜%K˜(šžœž˜Kšœžœ˜K˜Kšœžœ˜Kšžœžœ˜—Kšžœ˜—Kšžœ˜—K˜ š¡œžœžœQ¡œžœ#žœ'žœ7˜‰šœžœ˜!Kšœ*˜*K˜Kšœ˜Kšœ"˜"K˜—šœžœ˜)K˜K˜—š¡
+œ œžœ˜!Kšœ,˜,šžœž˜Kšžœ7˜;Kšžœ˜—Kšžœ˜—š¡œ œžœžœžœžœžœžœ œ˜fKšœ
+žœ˜Kšžœžœ˜-KšœG˜GK˜-Kšžœ˜—š¡œ œžœžœžœžœžœžœ œ˜eKšœ
+žœ˜KšœG˜GKšžœ˜—™"šœžœžœ˜K˜K˜—Kšœ˜Kšœ’¡œ˜¾K˜$K˜—K˜Kšœ%˜%K˜Kšœ˜Kšœ.˜.Kšžœ˜Kšœžœžœ˜—K˜ š¡œ 	œžœ˜$š¡œ œžœ˜Kšœžœžœ˜š
+žœžœžœžœžœ˜@Kšœžœ˜šžœžœž˜K˜ K˜K˜Kšžœ˜—K˜K˜—Kšžœ˜—K˜Kšžœ˜—K˜ š¡œžœV¡œžœ
+žœžœ˜ÕKšœ˜šž˜šžœžœ˜š¡œžœžœžœžœžœžœ œ˜WKšœ žœ˜-Kšžœ"˜)Kšžœ˜—Kšœ9˜9K˜—Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœžœ˜K˜Kšœžœ˜K˜KšœÖ˜ÖKšžœžœžœžœ˜šœ.™.šœžœžœ˜Kšœ˜K˜Kšžœžœ˜ K˜—KšœžœT˜fKšœ0˜0Kšžœžœ;žœ
+žœžœ"žœ#˜ÄKšžœžœ˜#šžœ˜šžœ˜Kšœ
+˜
+Kš	œžœžœžœžœ˜7KšžœžœL˜XKšœ>žœ˜EKšžœžœ+žœžœ˜<Kšœ˜—šžœ˜Kšœ˜Kšœ˜——K˜—Kšžœ˜—Kšžœ˜—K˜ KšœžœD˜^K˜ Kšœ	žœžœžœ˜&šœžœžœ˜2K˜ —š¡œžœžœžœžœ	žœ™=Kš¡œžœžœžœžœžœ™&Kš	œžœžœžœžœ™#K™K™ Kšœžœ™šžœžœžœž™Kšœžœ
+™Kšžœ™—Kšžœ™K™K™ —š¡œ˜ Kš	œ
+žœžœžœžœ™4Kšœžœ˜Kšœžœ˜šœ˜Kš¡œžœžœžœžœžœ˜&Kš	œžœžœžœžœ˜#K˜K˜ Kšœžœ˜šžœžœžœž˜Kšœžœ˜Kšžœ˜—Kšœ˜—Kšžœ˜K˜K˜ —š¡œ˜"Kš	œžœžœžœžœ™8Kšœžœ˜Kšœžœ˜Kšžœ!˜'K˜—K˜ Kšœžœžœ˜Kšœžœžœ˜ K˜ š¡œžœžœžœžœžœžœžœ œ˜`Kšœžœžœ˜KKšœžœ˜Kšœžœ˜K˜5šœžœ˜ Kšœ0˜0šžœ˜Kšœ5˜5Kšœ˜——šœžœ˜šœžœ˜šžœžœžœ
+žœ˜#Kšœ˜Kšœ	žœžœ	˜Kšœ#˜#Kšœ˜—Kšœžœžœ˜šžœžœ˜Kšžœžœžœžœ'žœ*žœ˜vKšžœžœ"žœžœ˜3Kšœ˜—Kšœ˜K˜Kšžœžœ1žœžœžœ 
+˜TKšœ,žœžœžœ˜]Kš
+žœžœžœžœžœ˜;šžœžœ˜Kšœžœ˜!Kš
+žœžœžœžœ	žœ	˜FKšœ˜Kšžœžœ˜$Kšœ,˜,K˜!K˜K˜—K˜Kšžœ
+žœ˜&—K˜—˜4K™$—Kšžœ˜—K˜ š¡œžœžœžœ'˜?Kšžœžœžœ˜K˜
+Kšžœ˜—K˜ š¡œžœžœžœžœžœ˜AKšžœžœžœ˜šžœž˜šœ˜KšœM˜MKšœ&˜&—Kšœžœžœ˜(Kšœžœ˜Kšžœžœ˜—Kšžœžœ˜—K˜ š¡œžœ œžœ6˜ešœžœžœž˜%K˜Kšœžœ
+˜K˜Kšžœ˜—Kšžœžœžœ˜%Kšžœžœ˜3Kšœ˜K˜Kšžœ˜—K˜ š¡œ 	œžœV¡œžœ
+žœ,žœžœ%žœžœžœ žœžœžœ˜“™Kšœžœ™$šœ™Kšœ
+ž™K™Kšœ™K™K™——š¡œ œžœ˜Kšœ
+˜
+šž˜K˜
+Kšœ.žœžœ˜;Kšœžœžœ˜"Kšœžœ˜š¡œ œžœ'žœ˜NK˜Kšœžœ˜Kšœ9˜9šžœžœžœžœžœžœžœžœžœžœ˜”Kšžœžœžœžœ˜-Kšžœžœžœ˜9K˜—Kšžœžœž˜5šžœžœžœ
+žœ˜Kšœžœ˜Kšœžœ˜!K˜—šžœž˜šœ	˜	Kšžœ
+žœ žœ˜6Kšžœ˜Kšœ˜—Kšœ"˜"Kšœžœ˜Kšžœžœ˜—K˜Kšœžœ˜K˜—š¡œžœ˜š¡
+œžœžœžœžœžœžœ œ˜[Kšœ
+žœ˜šžœžœžœ	˜"šžœ˜Kšœ˜K˜—šžœ˜Kšœ$˜$Kšœžœ˜'K˜——Kšžœ˜—Kšœ!˜!Kšœžœ˜Kšœ5˜5Kšžœžœžœžœžœžœžœžœ˜‚Kšžœ˜—Kš
+žœžœžœžœžœ˜2šž˜K˜Kšžœžœžœ˜6Kšžœžœžœžœ˜šžœžœ˜šžœžœ˜K˜Kšžœ˜—™/Kšœ˜š¡œžœžœžœžœžœžœ œ˜]Kšœ
+žœ˜Kšžœžœžœ˜!Kšžœžœžœ˜8Kšžœ˜—Kšœ7˜7Kšžœžœžœžœ˜Kšžœ˜K˜—Kšœ˜—K˜šœ˜™šžœ˜Kšœ)žœ"™Q——Kšœ˜—K˜Kšžœ˜—K˜Kšžœžœžœ˜!K˜šžœžœ˜Kšœ˜Kšžœžœžœžœžœžœ˜ZKšžœ˜—™Kšœžœžœ˜$Kšžœ žœžœžœ˜1Kšœ˜Kšžœžœžœ )œ˜JKšžœžœ)˜:Kšœ'žœ˜FKšžœžœžœ˜3Kšžœžœžœ˜6K˜šžœžœ˜Kšœžœ˜<K˜K˜Kšžœ˜—Kšœžœ˜Kšœžœ˜"™Kšœžœžœ˜+Kšœžœ˜-Kšžœžœ%˜6K˜+Kšžœžœžœ˜/Kšžœžœ3žœ˜Mšžœ!ž˜+Kšžœžœ˜šžœ˜
+K˜Kšœ"žœ˜'Kšœ˜—Kšžœžœ˜—Kšœ1žœ˜7K˜,Kšžœžœžœ˜/Kšžœžœ3žœ˜Mš
+žœžœžœžœžœ˜LK˜#Kš	œžœHžœžœžœ˜{Kšœžœ˜0Kšœžœ˜—šžœžœžœ˜#KšœN˜NKšœžœ˜K˜—Kšžœžœžœ3žœ˜ršžœžœžœžœ˜1K˜#Kš	œžœHžœžœžœ˜{Kšœžœ˜0Kšœžœ˜—šžœž˜Kšœžœ4žœ˜WKš	œ	žœ"žœžœ4žœ˜Kšœžœ˜Kšžœžœ˜—Kšœ+˜+K˜K˜šž˜Kšœžœ˜K˜@Kšžœžœžœ˜K˜šœ˜™šžœ˜Kšœ)žœ"™Q——Kšœ˜—K˜Kšžœ˜—Kšžœ˜K˜—K˜—Kšžœ˜—Kšœ˜—Kšœžœ˜K˜Kšžœ˜—K˜ š¡œžœ 	œžœL˜jš¡œ œžœ˜Kšžœžœžœ˜#K˜Kšœ ˜ Kšžœžœžœ$˜9š	žœžœžœžœž˜&K˜ K˜K˜Kšžœ˜—Kšžœ˜—K˜Kšžœ˜—K˜ š¡œ 	œžœ˜0Kš¡œ œžœ˜7K˜Kšžœ˜—K˜ š¡œ œžœ˜8Kšœžœ˜Kšžœžœ+˜LKšœžœ˜"Kšœ˜Kšžœ˜—K˜ š¡œ œžœ˜=K˜šžœžœž˜%Kšœ,˜,Kšœ5˜5Kšžœžœžœ˜%Kšžœžœžœ˜#K˜K˜Kšžœ˜—Kšžœ˜—K˜ š¡œžœ œžœ˜8K˜	Kšžœžœžœžœ˜šžœž˜Kšœžœ Bœ˜XKšœžœ˜Kšžœžœ˜—Kšœ$˜$Kš
+žœžœ	žœ7žœžœ˜tKšœ˜Kšžœ˜—K˜ š¡œžœ 	œžœžœžœ˜[š¡œ œžœ˜Kšœ žœ˜'Kšžœžœžœžœ˜Kšœ%˜%K˜K˜—K˜K˜—K˜ š
+¡œ œžœžœžœ˜]Kšž˜š¡	œ œžœžœžœžœ˜IKšœžœ˜K˜K˜Kšœžœ˜
+K˜Kšœžœžœ˜K˜Kšœ~˜~šžœžœ˜Kšœžœžœ˜Kšœ
+žœžœ˜Kšœžœ˜šžœžœžœž˜3Kšœžœžœžœžœžœ˜LKšœžœ˜+šžœ˜Kšžœžœ˜$šžœžœ˜šžœ	žœ˜Kšœ=˜=Kšžœ˜Kšžœžœžœžœžœžœ˜4Kšžœ˜———Kšžœ˜—šžœ	˜šžœ˜K˜
+Kš
+žœžœžœžœžœ˜$Kšœžœ>˜EKšœ(˜(Kšžœžœ˜K˜—šžœ˜Kšœ3˜3Kšœ	žœ˜Kšœ˜——Kšœ˜—Kšžœ
+žœ˜K˜—Kšœ	žœ˜Kšœ˜Kšžœžœžœ%˜7Kšžœ˜—K˜ K˜,K˜ š¡œ œžœ6˜WK˜,šžœžœžœž˜3K˜Kšœ˜Kšžœžœžœžœ˜Kšžœžœžœ˜&Kšœ*žœ˜1Kšœ˜Kšžœ˜—Kšœ%žœ˜+Kšœ,žœ˜3Kšœ,žœ˜2K˜—K˜ š¡œ 	œžœ˜+Kš¡œ œžœ˜4K˜K˜—K˜ š¡œ œžœ˜3šžœžœžœžœ˜6K˜K˜Kš	œžœ	žœ	žœ	žœ˜/Kšœ
+ž˜K˜—Kš
+žœžœžœžœžœ˜&K˜—K˜ š¡œžœ œžœ˜7K˜K˜ K˜$Kšœ,žœ˜3Kšœ,žœ˜2KšœCžœE™‹K˜—K˜ š¡œ 	œžœ7žœ˜^Kš¡œ œžœ1˜JK˜K˜—K˜ š¡œ œžœ7žœ˜fšžœžœžœž˜&K˜šžœž˜šœ	˜	KšœL˜LKšœ˜—šœ˜KšœH˜HKšœ˜—Kšžœžœ˜—Kšžœ˜—K˜K˜—K˜ š
+¡œ œžœDžœžœ!˜‰šœ
+žœ˜Kšœ˜K˜K˜K˜Kšœžœ˜K˜Kšœž˜
+K˜—K˜Kšžœžœžœžœ˜9Kšžœžœžœžœ˜9K˜K˜K˜—K˜ š¡œ œžœ"˜KKšœ!˜!K˜šžœžœžœž˜.K˜Kšžœ	žœžœ˜K˜Kšœžœ˜Kšœ˜Kšœžœ˜
+Kšœžœ˜
+Kšžœ˜—Kšœ˜K˜—K˜ š¡œ œžœ	 œ˜QK˜KšžœžœžœžœžœžœEžœžœ˜šKšžœžœžœžœžœžœGžœžœ˜œKšœžœ˜K˜—K˜ š¡œ œžœ˜8Kšœ˜K˜šžœžœžœž˜.K˜Kšžœ	žœžœ˜K˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜
+Kšœžœ˜
+Kšžœ˜—Kšœ˜K˜—K˜ š¡œžœžœ,˜@Kšœžœžœ
+˜Kšœžœžœ˜š¡œžœžœžœžœžœžœ œ˜UKšœ
+žœ˜Kšœ žœ˜.K˜—Kšœ(˜(Kšžœžœ‹˜K˜—K˜ š¡œ 	œžœžœžœžœžœžœ˜[š¡œ œžœ"˜AK˜$Kšœ˜—š¡œ œžœ'žœ˜QKšœžœ˜Kšœžœžœ
+˜+Kšœ#˜#šœ˜Kšœžœžœžœžœžœžœ˜7šœžœ	ž˜Kšœ˜Kšœ˜Kšžœ	˜—Kšžœ˜Kšœ˜—Kš	œžœžœžœžœ˜WKšžœ˜—š¡	œ œžœ'žœ˜LKšœžœ˜Kšœžœžœ
+˜+Kšœ#˜#šœ˜Kšœžœžœžœžœžœžœ˜7šœžœ	ž˜Kšœ˜Kšœ˜Kšžœ˜—Kšœ˜—Kšœ˜Kšžœ
+žœ˜ Kš	œžœžœžœžœ˜WKšžœ˜—š¡
+œžœ˜Kšœžœ˜&Kšœ˜—š¡œ œžœ˜Kšœžœ˜K˜"K˜9šœžœž˜.K˜K˜K˜&Kšžœžœ˜—šžœžœ˜*Kšœžœ
+žœ
+žœ˜3Kšœ˜—K˜Kšœ/˜/K˜!Kšœ.˜.Kšœ˜šžœžœž˜Kšœžœ9˜IK˜JKšžœ˜—šžœž˜K˜/K˜2K˜6K˜?Kšžœžœ˜—Kš
+žœžœžœžœžœ˜3Kšžœžœžœ,˜Jšžœ	˜Kšœ8˜8Kšœžœžœžœ	˜-Kšœ˜Kšœ˜—K˜!K˜Kšœ.˜.K˜Kšœ%˜%K˜Kšœ*˜*K˜˜,Kšœžœ!žœžœ˜O—˜$šœžœžœž˜Kšœžœ$˜@K˜K˜Kšžœžœ˜——KšžœžœžœžœM˜„K˜KšžœžœžœH˜iK˜—K˜K˜—K˜ š¡œžœžœ˜2Kšœ1˜1—K˜ š¡œžœžœ˜.Kšœ-˜-—K˜ š¡œžœžœ˜2Kšœ1˜1—K˜ š
+¡œ 	œžœ¡œžœ˜LKš¡œ œžœ!˜;K˜Kšžœ˜—K˜ š¡œžœ 	œžœ˜6Kš¡œ œžœ˜9K˜K˜—K˜ š¡œžœ œžœ˜>K˜Kšœžœ˜K˜+Kšžœžœžœ˜OK˜—K˜ Kšœžœ%˜9K˜ š¡œ œžœ˜7š¡œ œžœ˜6Kšœžœ˜Kšœ%˜%K˜—š¡œ œžœ"˜Fšžœž˜˜Kšœ"žœ˜(K˜—˜	K˜Kšœ0˜0K˜—Kšžœžœ˜—K˜—Kšœ˜Kšœ4˜4Kšœ3˜3Kšœ˜K˜K˜—K˜ š¡œžœ œžœ˜:šžœž˜Kšžœ.˜3Kšžœ žœ˜)Kšžœžœ˜—K˜—K˜ š¡œžœ 	œžœ˜2Kš¡œ œžœ˜4K˜K˜—K˜ š¡œ œžœ˜3š¡œ œžœ"˜@Kšœ-˜-K˜—Kšžœžœžœ˜'K˜Kšœ.˜.Kšœ-˜-K˜K˜—K˜ š¡œžœ 	œžœ˜6Kš¡œ œžœ˜8K˜K˜—K˜ š¡œ œžœ˜7šžœžœžœ˜*Kšžœ˜šžœ˜Kšœ˜Kšœ˜Kšœ-˜-Kšœ˜——K˜—K˜ š
+¡œžœ 	œžœ!žœ˜gKš¡œ œžœ+˜DK˜K˜—K˜ š¡œ œžœ!žœ˜hKšœžœžœ˜Kšœ˜šžœ&žœžœž˜9K˜Kšžœ˜—Kšœ˜K˜—K˜ š
+¡œžœ 	œžœžœ˜HKš¡œ œžœ"˜;K˜K˜—K˜ š¡œ œžœžœ˜IKšœžœžœ˜Kšœ˜šžœ"žœžœž˜5K˜Kšžœ˜—Kšœ˜K˜—K˜ š¡œžœ 	œžœ#žœ'žœ˜Kš¡œ œžœ)˜BK˜K˜—K˜ š¡œžœ œžœ#žœ'žœ˜‡K˜šžœ(žœžœž˜;Kšžœ	žœžœ˜K˜Kšžœ˜—K˜K˜—K˜ š¡œžœ 	œžœžœžœ˜QKš¡œ œžœžœžœžœžœ˜cK˜Kšžœ˜—K˜ š¡œžœ 	œžœ˜'š¡œ œžœ˜š¡œ œžœ˜,šžœžœžœžœ˜2K˜Kšœ
+žœ˜Kšœžœ˜K˜K˜ K˜K˜—K˜—š¡
+œžœžœžœžœžœžœ˜EKšœžœ˜!Kšžœžœžœ˜7Kšžœ˜—Kšžœžœ1˜FKšœ1žœ˜7Kšžœ!žœžœ˜.Kšœžœ˜K˜K˜Kšœ˜Kšœžœ˜K˜—K˜K˜—K˜ š
+¡œžœ 	œžœžœ˜Bš¡œ œžœ˜š¡œžœžœ˜$Kšžœžœ˜0Kšžœžœ˜,K˜—Kšœ-žœ˜4K˜—K˜K˜—K˜ š¡œžœ 	œžœ˜3š¡œ œžœ˜K˜	Kšžœžœžœžœ˜$Kšœ$˜$Kš
+žœžœ	žœ7žœžœ˜tKšœ˜K˜—K˜K˜—K˜ š
+¡œ œžœžœžœ˜FKš
+žœžœžœžœžœ˜'Kšžœžœžœžœ˜+K˜Kšžœžœžœžœžœžœ˜-Kšžœžœžœžœžœžœ˜-Kšœžœ˜Kšœžœ˜K˜Kšžœžœ˜—K˜ š¡
+œ œžœ˜!Kšœžœžœ˜*Kšœ$˜$Kšœ#˜#Kšœžœ˜Kšœžœ˜š¡
+œžœ˜K˜%K˜Kšžœžœžœžœ*˜VK˜—š¡œ œžœžœžœžœžœ˜<Kšœ
+žœ˜Kšžœžœžœžœ˜/šžœžœ˜ Kšœ˜K˜K˜šžœžœž˜7K˜Kšžœ˜—K˜Kšžœžœ˜K˜—Kšžœžœžœžœ˜(Kšœžœ˜šžœ,žœžœž˜@K˜Kšžœ˜—šžœžœžœžœ˜2K˜šžœ0žœžœž˜DK˜Kšžœ˜—K˜—K˜Kšžœžœ žœžœ˜1Kšžœžœžœžœ˜)Kšžœžœ˜—Kšœžœ˜K˜OK˜0KšœžœF˜PK˜—K˜ š¡
+œžœžœ˜;šžœžœ1žœžœ˜DK˜>Kš
+žœžœ1žœžœžœ˜IK˜—K˜—K˜ š¡œžœ˜šžœ˜	K˜/K˜-K˜GKšœ˜K˜GKšœ˜K˜—Kšœ1˜1K˜—K˜ K˜K˜ Kšžœ˜— …—    ’V  Íç  

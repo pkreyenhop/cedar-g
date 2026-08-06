@@ -1,0 +1,1190 @@
+
+
+
+DIRECTORY
+Atom USING [GetPName],
+BasicTime USING [Now, Period],
+Buttons USING [ButtonProc, Create],
+Commander USING [CommandProc, Register],
+Icons USING [IconFlavor, NewIconFromFile],
+InputFocus USING [GetInputFocus],
+List USING [Length, LORA],
+MailSend USING [Abort, GetRegisteredSendProcsList, MailSendProcsRef],
+MailSendSidedoor USING [AbortSendProc],
+Menus USING [AppendMenuEntry, CopyEntry, CreateEntry, FindEntry, Menu, MenuEntry, MenuProc, MouseButton, ReplaceMenuEntry, targetNotFound],
+IO,
+PFS,
+PFSNames,
+PopUpSelection USING [Request],
+Process USING [Detach, MsecToTicks, SetTimeout, Ticks],
+Rope,
+TEditInputOps USING [DoFindPlaceholders],
+TEditSplit USING[ Split ],
+TextEdit USING [GetNewlineDelimiter],
+TextNode USING [Root],
+Tioga,
+TiogaAccess,
+TiogaAccessViewers,
+TiogaMenuOps USING[ tiogaMenu, Empty, Load, Store ],
+TiogaOps USING [ Ref, Location, CancelSelection, GetSelection, IsComment, StepForward, ViewerDoc ],
+TypeScript USING [Create],
+ViewerEvents USING [EventProc, EventRegistration, RegisterEventProc, UnRegisterEventProc],
+ViewerOps USING [AddProp, BlinkIcon, ComputeColumn, CreateViewer, DestroyViewer, FetchProp, MoveBelowViewer, OpenIcon, PaintViewer, SaveViewer, SetMenu, SetNewVersion],
+ViewerIO USING [CreateViewerStreams, GetViewerFromStream],
+ViewerTools USING [EnableUserEdits, GetSelectionContents, InhibitUserEdits, SelPos, SelPosRec, SetSelection, SetTiogaContents, TiogaContents, TiogaContentsRec],
+ViewerClasses USING [Viewer],
+UserProfile USING [Boolean, CallWhenProfileChanges, Number, ProfileChangedProc,
+ListOfTokens, Token],
+SendMailInternal,
+SendMailOps;
+
+SendMailControlImpl: CEDAR MONITOR
+IMPORTS
+Atom, BasicTime, Buttons, Commander, IO, List, PFS, PFSNames, PopUpSelection, Process, Rope, Icons, InputFocus, MailSend, Menus, SendMailInternal, SendMailOps, TEditInputOps, TEditSplit, TextNode, TextEdit, TiogaAccess, TiogaAccessViewers, TiogaMenuOps, TiogaOps, TypeScript, ViewerEvents, ViewerIO, ViewerOps, ViewerTools, UserProfile
+EXPORTS
+SendMailInternal, SendMailOps
+SHARES ViewerClasses =
+
+BEGIN OPEN SendMailOps, SendMailInternal;
+
+-- Global types & variables
+
+STREAM: TYPE = IO.STREAM;
+ROPE: TYPE = Rope.ROPE;
+Viewer: TYPE = ViewerClasses.Viewer;
+TiogaContents: TYPE = ViewerTools.TiogaContents;
+OutBoxMsg: TYPE = SendMailOps.OutBoxMsg;
+viewerStart: ViewerTools.SelPos = NEW[ViewerTools.SelPosRec ¨ [0, 0]];
+
+alwaysOpenSender: BOOL ¨ FALSE;
+destroyAfterSend: BOOL ¨ FALSE;
+senderList: LIST OF SenderInfo ¨ NIL;
+
+popUpFormsList: LIST OF ROPE ¨ NIL;
+popUpFormsFileNames: LIST OF ROPE ¨ NIL;
+sendingSynch: CONDITION;
+
+iconicSender: BOOL ¨ TRUE;		-- make iconic initially only
+senderIcon: Icons.IconFlavor ¨ tool;
+edittingIcon: Icons.IconFlavor ¨ tool;
+notSentIcon: Icons.IconFlavor ¨ tool;
+labelFont: PUBLIC ROPE  ¨ NIL; -- font to use for printing of header labels
+
+reporter: STREAM ¨ NIL;
+senderTS: Viewer ¨ NIL;
+
+senderEvent: ViewerEvents.EventRegistration;
+defaultText: PUBLIC ViewerTools.TiogaContents;
+answerText: PUBLIC ViewerTools.TiogaContents;
+forwardText: PUBLIC ViewerTools.TiogaContents;
+
+SenderPropRec: TYPE = RECORD[proc: PROC[Viewer, ATOM, REF ANY], data: REF ANY];
+SenderPropValue: TYPE = REF SenderPropRec;
+SenderProp: TYPE = RECORD[key: ATOM, value: SenderPropValue];
+senderPropsList: LIST OF SenderProp ¨ NIL;
+
+FileStatus: TYPE = {illegalName, local, remote, notFound, otherError};
+
+
+SendMailCmd: Commander.CommandProc = { [] ¨ CreateSendViewer[fromExec: TRUE]};
+
+CreateSendViewer: PUBLIC PROC[fromExec: BOOL, transport: ATOM ¨ NIL]
+RETURNS[which: ATOM ¨ NIL] = {
+senderInfo: SenderInfo;
+IF fromExec THEN fromExec ¨ ~alwaysOpenSender;
+IF ~fromExec THEN iconicSender ¨ FALSE;
+[] ¨ CheckDefault[];
+senderInfo ¨ BuildSender[
+paint: TRUE, iconic: iconicSender, form: defaultForm, forceNew: alwaysNewSender];
+
+IF ~iconicSender THEN GrabFocus[senderInfo.senderV];
+iconicSender ¨ FALSE;		-- iconic only the first time
+};
+
+GrabFocus: PUBLIC ENTRY PROC[senderV: Viewer] = {
+ENABLE UNWIND => NULL;
+IF senderV.iconic THEN RETURN;
+ViewerTools.SetSelection[senderV, viewerStart];
+[] ¨ TEditInputOps.DoFindPlaceholders[next: TRUE, gotoend: FALSE];
+};
+
+BuildSendViewer: PUBLIC PROC[paint, iconic: BOOL, form: SendMailOps.Form ¨ NIL,
+who: Viewer ¨ NIL, forceNew: BOOL ¨ FALSE, transport: ATOM ¨ NIL]
+RETURNS[v: Viewer, which: ATOM ¨ NIL] = {
+senderInfo: SenderInfo;
+newForm: SendMailOps.Form = IF form # NIL THEN form ELSE CheckDefault[];
+senderInfo ¨ BuildSender[paint, iconic, newForm, who, forceNew, transport];
+RETURN[senderInfo.senderV, which];
+};
+
+CheckDefault: PROC RETURNS[form: SendMailOps.Form] = {
+IF simpleUserNameList = NIL THEN SendMailInit[firstTime];	-- check for login
+IF defaultForm.fields = NIL THEN RETURN;
+IF defaultForm.fields.rest = NIL THEN RETURN;
+IF defaultForm.fields.rest.rest = NIL THEN RETURN;
+RETURN[defaultForm];
+};
+
+BuildSender: ENTRY PROC[paint, iconic: BOOL, form: SendMailOps.Form,
+who: Viewer ¨ NIL, forceNew: BOOL ¨ FALSE, transport: ATOM ¨ NIL]
+RETURNS[senderInfo: SenderInfo] = {
+ENABLE UNWIND => IF senderInfo # NIL AND senderInfo.senderV # NIL
+THEN senderInfo.senderV.inhibitDestroy ¨ FALSE;
+
+senderV: Viewer;
+form1: SendMailOps.Form ¨ form;
+trx: ATOM ¨ transport;
+
+IF ~forceNew THEN
+FOR sL: LIST OF SenderInfo ¨ senderList, sL.rest UNTIL sL=NIL DO
+senderInfo ¨ sL.first;
+IF ~(senderInfo.senderV.newVersion) AND (senderInfo.sendHandle = NIL)
+AND ~senderInfo.senderV.destroyed AND (senderInfo.senderV.file = NIL )
+THEN
+{ senderV ¨ senderInfo.senderV;
+IF senderV.link # NIL THEN InternalDestroySplits[senderV];
+senderV.inhibitDestroy ¨ TRUE;
+IF TiogaOps.GetSelection[feedback].viewer = senderV THEN
+	TiogaOps.CancelSelection[feedback];
+IF senderV.iconic THEN {		-- inlined a call to ClearOpenEvent
+ra: REF ANY ¨ ViewerOps.FetchProp[senderV, $SendMailOpsForm];
+IF ra # NIL THEN {
+form: SendMailOps.Form = NARROW[ra];
+ViewerEvents.UnRegisterEventProc[senderInfo.openEvent, open];
+senderInfo.openEvent ¨ NIL;
+};
+IF (who # NIL) AND (senderV.column = who.column) THEN
+{ ViewerOps.OpenIcon[icon: senderV, paint: FALSE];
+ViewerOps.MoveBelowViewer[altered: senderV, static: who, paint: TRUE] }
+ELSE ViewerOps.OpenIcon[senderV];
+};
+IF form # NIL THEN InsertForm[senderInfo, form, TRUE]
+ELSE TiogaMenuOps.Empty[senderV];
+ViewerOps.PaintViewer[senderV, menu];
+senderV.inhibitDestroy ¨ FALSE;
+RETURN };
+ENDLOOP;
+
+--  need to create a new sender
+senderV ¨ ViewerOps.CreateViewer[
+flavor: $Text,
+info: [ name: sendCaption,
+	column: IF who#NIL THEN who.column ELSE left,
+	iconic: iconic,
+	icon: senderIcon],
+paint: who = NIL];
+
+IF who # NIL THEN {
+ViewerOps.MoveBelowViewer[altered: senderV, static: who, paint: FALSE];
+ViewerOps.ComputeColumn[column: senderV.column, paint: TRUE]
+};
+senderV.inhibitDestroy ¨ TRUE;
+senderInfo ¨ NEW[SenderInfoObject ¨ [senderV: senderV]];
+TRUSTED { Process.SetTimeout[@senderInfo.timeToWait, halfSecTicks] };
+HowCanWeSend[senderInfo, transport];
+ViewerOps.SetMenu[senderV, senderInfo.thisMenu];
+ViewerOps.AddProp[senderV, $SenderInfo, senderInfo];
+
+FOR spl: LIST OF SenderProp ¨ senderPropsList, spl.rest UNTIL spl=NIL DO
+ViewerOps.AddProp[senderV, spl.first.key, spl.first.value];
+ENDLOOP;
+
+senderList ¨ CONS[senderInfo, senderList];
+
+senderInfo.destroyEvent ¨ ViewerEvents.RegisterEventProc[
+  proc: DestroySendViewer, event: destroy, filter: senderV, before: TRUE];
+
+senderInfo.closeEvent ¨ ViewerEvents.RegisterEventProc[
+proc: CloseSendViewer, event: close, filter: senderV, before: TRUE];
+
+senderInfo.editEvent ¨ ViewerEvents.RegisterEventProc[
+proc: FirstEditSendViewer, event: edit, filter: senderV, before: TRUE];
+
+IF form # NIL THEN InsertForm[senderInfo, form, TRUE] ELSE
+TiogaMenuOps.Empty[senderV];
+senderV.inhibitDestroy ¨ FALSE;
+IF iconic AND ~senderV.iconic THEN ViewerOps.PaintViewer[senderV, all];
+};
+
+HowCanWeSend: PROC[senderInfo: SenderInfo, transport: ATOM] = {
+senderInfo.thisMenu ¨ sendMenu;
+};
+
+-- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+
+SendMailInit: UserProfile.ProfileChangedProc = {
+defaultFormFile: ROPE ¨ UserProfile.Token[key: "SendMailTool.DefaultForm", default: NIL];
+answerFormFile: ROPE ¨ UserProfile.Token[key: "SendMailTool.AnswerForm", default: NIL];
+forwardFormFile: ROPE ¨ UserProfile.Token[key: "SendMailTool.ForwardForm", default: NIL];
+formContents: ViewerTools.TiogaContents ¨ NIL;
+isDefault: BOOL ¨ TRUE;
+defaultFields: LIST OF ROPE ¨ NIL;
+
+DoUserNameAndRegistry[];
+IF localRNameList # NIL THEN defaultFields ¨ LIST[NIL, NIL, localRNameList.first];
+needToAuthenticate ¨ TRUE;
+outBoxLength ¨ UserProfile.Number[key: "SendMailTool.OutBoxLength", default: 1];
+replyToSelf ¨ UserProfile.Boolean[key: "SendMailTool.ReplyToSelf", default: FALSE];
+destroyAfterSend ¨ UserProfile.Boolean[key: "SendMailTool.DestroyAfterSend", default: FALSE];
+alwaysNewSender ¨
+UserProfile.Boolean[key: "SendMailTool.AlwaysNewSender", default: FALSE];
+alwaysOpenSender ¨
+UserProfile.Boolean[key: "SendMailTool.AlwaysOpenSender", default: FALSE];
+
+IF defaultFormFile = NIL THEN defaultFormFile ¨ Rope.Concat[initDir, "SendMailStandardSend.form"]
+ELSE isDefault ¨ FALSE;
+formContents ¨ GetSendForm[defaultFormFile];
+IF formContents # NIL THEN {
+defaultText ¨ defaultForm.formText ¨ formContents;
+defaultForm.fields ¨ IF isDefault THEN defaultFields ELSE NIL;
+}
+ELSE {
+defaultText ¨ defaultForm.formText ¨ standardDefaultText;
+defaultForm.fields ¨ defaultFields;
+};
+
+formContents ¨ NIL;
+IF answerFormFile = NIL THEN answerFormFile ¨ Rope.Concat[initDir, "SendMailStandardAnswer.form"];
+formContents ¨ GetSendForm[answerFormFile];
+IF formContents # NIL THEN answerText ¨ formContents
+ELSE answerText ¨ standardAnswerText;
+
+formContents ¨ NIL;
+IF forwardFormFile = NIL THEN forwardFormFile ¨ Rope.Concat[initDir, "SendMailStandardForward.form"];
+formContents ¨ GetSendForm[forwardFormFile];
+IF formContents # NIL THEN forwardText ¨ formContents
+ELSE forwardText ¨ standardForwardText;
+
+labelFont ¨ UserProfile.Token[key: "SendMailTool.MsgHeadersLooks", default: "sb"];
+SetFormsList[];
+};
+
+DisplayTxtInSender: ENTRY PROC[senderV: Viewer, txt: ROPE] = {
+ENABLE UNWIND => NULL;
+senderInfo: SenderInfo ¨ NARROW[ViewerOps.FetchProp[senderV, $SenderInfo]];
+tc: ViewerTools.TiogaContents ¨ NEW[ViewerTools.TiogaContentsRec];
+tc.contents ¨ txt;
+InternalDisplayTioga[senderInfo, tc, TRUE];
+};
+
+ClearSendViewer: PUBLIC ENTRY PROC[senderV: Viewer] = {
+ENABLE UNWIND => NULL;
+senderInfo: SenderInfo ¨ NARROW[ViewerOps.FetchProp[senderV, $SenderInfo]];
+IF senderInfo = NIL THEN RETURN;		-- not a sender
+InsertForm[senderInfo, defaultForm, TRUE]
+};
+
+StuffForm: PUBLIC ENTRY PROC[v: Viewer, contents: TiogaContents] = {
+ENABLE UNWIND => NULL;
+senderInfo: SenderInfo ¨ NARROW[ViewerOps.FetchProp[v, $SenderInfo]];
+IF senderInfo = NIL THEN RETURN;		-- not a sender
+InternalDisplayTioga[senderInfo, contents, TRUE]
+};
+
+
+AddToSenderProps: PUBLIC ENTRY PROC
+[key: ATOM, proc: PROC[Viewer, ATOM, REF ANY], data: REF ANY] = {
+ENABLE UNWIND => NULL;
+senderPropsList ¨
+CONS[[key: key, value: NEW[SenderPropRec ¨ [proc, data]]], senderPropsList];
+};
+
+RemoveFromSenderProps: PUBLIC ENTRY PROC[key: ATOM] = {
+ENABLE UNWIND => NULL;
+sp: LIST OF SenderProp;
+IF senderPropsList = NIL THEN RETURN;
+FOR spl: LIST OF SenderProp ¨ senderPropsList, spl.rest UNTIL spl = NIL DO
+IF spl.first.key = key THEN
+IF spl = senderPropsList THEN
+{ senderPropsList ¨ senderPropsList.rest; RETURN}
+ELSE
+{ sp.rest ¨ spl.rest; RETURN};
+sp ¨ spl;
+ENDLOOP;
+};
+
+AddToSendMenu: PUBLIC ENTRY PROC[label: ROPE, proc: Menus.MenuProc] = {
+ENABLE UNWIND => NULL;
+old: Menus.MenuEntry ¨ Menus.FindEntry[sendMenu, label];
+IF old = NIL THEN
+Menus.AppendMenuEntry[sendMenu, Menus.CreateEntry[label, proc]];
+FOR sL: LIST OF SenderInfo ¨ senderList, sL.rest UNTIL sL = NIL DO
+thisMenu: Menus.Menu;
+v: Viewer = sL.first.senderV;
+IF v = NIL OR v.destroyed THEN LOOP;
+old ¨ Menus.FindEntry[thisMenu ¨ sL.first.senderV.menu, label];
+IF old = NIL THEN {
+Menus.AppendMenuEntry[thisMenu, Menus.CreateEntry[label, proc]];
+ViewerOps.PaintViewer[sL.first.senderV, menu];
+};
+ENDLOOP;
+};
+
+ReplaceInSendMenu: PUBLIC ENTRY PROC[label: ROPE, proc: Menus.MenuProc]
+	RETURNS[oldFound: BOOL] = {
+ENABLE UNWIND => NULL;
+DoReplace: PROC[thisMenu: Menus.Menu] RETURNS[foundIt: BOOL ¨ TRUE]= {
+old: Menus.MenuEntry = Menus.FindEntry[thisMenu, label];
+new: Menus.MenuEntry = Menus.CreateEntry[label, proc];
+Menus.ReplaceMenuEntry[thisMenu, old, new ! Menus.targetNotFound =>
+{ foundIt ¨ FALSE ; CONTINUE }];
+IF NOT foundIt THEN Menus.AppendMenuEntry[thisMenu, new];
+};
+
+oldFound ¨ DoReplace[sendMenu];
+
+FOR sL: LIST OF SenderInfo ¨ senderList, sL.rest UNTIL sL = NIL DO
+v: Viewer = sL.first.senderV;
+thisFound: BOOL;
+IF v = NIL OR v.destroyed THEN LOOP;
+thisFound ¨ DoReplace[sL.first.senderV.menu];
+oldFound ¨ thisFound AND oldFound;
+ViewerOps.PaintViewer[sL.first.senderV, menu];
+ENDLOOP;
+};
+
+RemoveFromSendMenu: PUBLIC ENTRY PROC[name: ROPE] = {
+ENABLE UNWIND => NULL;
+old: Menus.MenuEntry ¨ Menus.FindEntry[sendMenu, name];
+IF old = NIL THEN RETURN;
+Menus.ReplaceMenuEntry[sendMenu, old ! Menus.targetNotFound => CONTINUE];
+FOR sL: LIST OF SenderInfo ¨ senderList, sL.rest UNTIL sL = NIL DO
+thisMenu: Menus.Menu;
+v: Viewer = sL.first.senderV;
+IF v = NIL OR v.destroyed THEN LOOP;
+old ¨ Menus.FindEntry[thisMenu ¨ sL.first.senderV.menu, name];
+IF old # NIL THEN {
+Menus.ReplaceMenuEntry[thisMenu, old ! Menus.targetNotFound => CONTINUE];
+ViewerOps.PaintViewer[sL.first.senderV, menu];
+};
+ENDLOOP;
+};
+
+-- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+--  Menu procedures
+
+NewMsgFormProc: ENTRY PROC[viewer: Viewer] = {
+ENABLE UNWIND => NULL;
+NewMsgForm[viewer]
+};
+
+PrevMsgProc: ENTRY PROC[viewer: Viewer, blueButton: BOOL]  = {
+ENABLE UNWIND => NULL;
+senderInfo: SenderInfo ¨ NARROW[ViewerOps.FetchProp[viewer, $SenderInfo]];
+tc: TiogaContents;
+IF viewer.link#NIL THEN InternalDestroySplits[viewer];
+ClearFileAssoc[viewer];
+[] ¨ CheckDefault[];
+IF outBox = NIL THEN InsertForm[senderInfo, defaultForm, TRUE]
+ ELSE {
+IF outBox.next = NIL THEN tc ¨ IF blueButton THEN outBox.sentTC ELSE outBox.replaceTC 
+ELSE {	-- more than one previous message
+which: INT;
+obm: OutBoxMsg ¨ outBox;
+outBoxList: LIST OF ROPE ¨ LIST[outBox.subject];
+last: LIST OF ROPE ¨ outBoxList;
+FOR oB: OutBoxMsg ¨ outBox.next, oB.next UNTIL oB = NIL DO
+last.rest ¨ LIST[oB.subject];
+last ¨ last.rest;
+ENDLOOP;
+which ¨ PopUpSelection.Request[header: "OutBox", choice: outBoxList, position: $Mouse];
+IF which = 0 THEN RETURN;
+last ¨ outBoxList;
+FOR i: INT IN [1..which) DO
+obm ¨ obm.next;
+ENDLOOP;
+tc ¨ IF blueButton THEN obm.sentTC ELSE obm.replaceTC;
+};
+IF TiogaOps.GetSelection[feedback].viewer = viewer THEN
+TiogaOps.CancelSelection[feedback];
+ViewerTools.SetTiogaContents[viewer, tc];
+UnsetNewVersion[viewer];
+};
+};
+
+NewSenderClickProc: Buttons.ButtonProc = {
+senderInfo: SenderInfo;
+[] ¨ CheckDefault[];
+senderInfo ¨ BuildSender[paint: TRUE, iconic: FALSE, form: defaultForm, forceNew: TRUE];
+GrabFocus[senderInfo.senderV];
+};
+
+NewSenderProc: PROC = {
+senderInfo: SenderInfo;
+[] ¨ CheckDefault[];
+senderInfo ¨ BuildSender[paint: TRUE, iconic: FALSE, form: defaultForm, forceNew: TRUE];
+GrabFocus[senderInfo.senderV];
+};
+
+NewMsgForm: INTERNAL PROC[viewer: Viewer] = {
+senderInfo: SenderInfo ¨ NARROW[ViewerOps.FetchProp[viewer, $SenderInfo]];
+[] ¨ CheckDefault[];
+InsertForm[senderInfo, defaultForm, TRUE];
+ClearFileAssoc[viewer];
+};
+
+-- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+
+DestroySendViewer: ViewerEvents.EventProc = {
+senderInfo: SenderInfo ¨ NARROW[ViewerOps.FetchProp[viewer, $SenderInfo]];
+IF senderInfo = NIL THEN RETURN[FALSE];
+IF senderInfo.senderV # NIL THEN senderInfo.senderV.file ¨ NIL;
+IF ViewerOps.FetchProp[viewer, $DestroySenderProc] = NIL THEN RETURN[FALSE];
+TRUSTED {Process.Detach[FORK CheckForDestroy[viewer, senderInfo]]};
+RETURN[TRUE];
+};
+
+EntryInsertForm: PUBLIC ENTRY PROC[senderInfo: SenderInfo, form: SendMailOps.Form] =
+{ ENABLE UNWIND => NULL; InsertForm[senderInfo, form, TRUE] };
+
+EntryPlaceHolders: PUBLIC ENTRY PROC[senderInfo: SenderInfo, fieldsList: LIST OF ROPE] =
+{ ENABLE UNWIND => NULL; DoPlaceHolders[senderInfo.senderV, fieldsList] };
+
+CloseSendViewer: ViewerEvents.EventProc = {
+senderInfo: SenderInfo ¨ NARROW[ViewerOps.FetchProp[viewer, $SenderInfo]];
+IF senderInfo = NIL THEN RETURN[FALSE];
+IF senderInfo.dontClose THEN
+{ SenderReport[format: "  **** Sender cannot be closed right now\n", blink: TRUE];
+RETURN[TRUE]
+};
+viewer.icon ¨ IF viewer.newVersion THEN edittingIcon ELSE senderIcon;
+RETURN[FALSE];
+};
+
+FirstEditSendViewer: ViewerEvents.EventProc = {
+OPEN Menus;
+senderInfo: SenderInfo ¨ NARROW[ViewerOps.FetchProp[viewer, $SenderInfo]];
+IF senderInfo = NIL THEN RETURN[FALSE];
+SenderNewVersion[viewer];		-- show as guarded
+RETURN[FALSE];
+};
+
+CheckForDestroy: ENTRY PROC[senderV: Viewer, senderInfo: SenderInfo] = {
+ENABLE UNWIND => NULL;
+okToDestroy: BOOL ¨ TRUE;
+IF senderV.destroyed THEN RETURN;		-- woops
+IF senderV.newVersion THEN
+{InternalReport["\nConfirm quitting with last message unsent"];
+IF okToDestroy ¨ SendingConfirm[senderInfo] THEN senderV.newVersion ¨ FALSE;
+};
+IF ~okToDestroy THEN RETURN;
+
+IF senderInfo.destroyEvent # NIL THEN
+ViewerEvents.UnRegisterEventProc[senderInfo.destroyEvent, destroy];
+
+IF senderInfo.closeEvent # NIL THEN
+ViewerEvents.UnRegisterEventProc[senderInfo.closeEvent, close];
+
+IF senderInfo.editEvent # NIL THEN
+ViewerEvents.UnRegisterEventProc[senderInfo.editEvent, edit];
+
+IF senderInfo.openEvent # NIL THEN
+ViewerEvents.UnRegisterEventProc[senderInfo.openEvent, open];
+
+IF senderInfo.focusEvent # NIL THEN
+ViewerEvents.UnRegisterEventProc[senderInfo.focusEvent, setInputFocus];
+
+senderInfo.destroyEvent ¨ NIL;
+senderInfo.closeEvent ¨ NIL;
+senderInfo.editEvent ¨ NIL;
+senderInfo.openEvent ¨ NIL;
+senderInfo.focusEvent ¨ NIL;
+
+TRUSTED {Process.Detach[FORK ViewerOps.DestroyViewer[senderV]]};
+};
+
+LockViewerOpen: PUBLIC ENTRY PROC[viewer: Viewer] = {
+ENABLE UNWIND => NULL;
+senderInfo: SenderInfo ¨ NARROW[ViewerOps.FetchProp[viewer, $SenderInfo]];
+IF senderInfo = NIL THEN RETURN;
+senderInfo.dontClose ¨ TRUE;
+};
+
+ReleaseOpenViewer: PUBLIC ENTRY PROC[viewer: Viewer] = {
+ENABLE UNWIND => NULL;
+senderInfo: SenderInfo ¨ NARROW[ViewerOps.FetchProp[viewer, $SenderInfo]];
+IF senderInfo = NIL THEN RETURN;
+senderInfo.dontClose ¨ FALSE;
+};
+
+SenderReport: PUBLIC ENTRY PROC[
+format: ROPE, v1, v2,v3: IO.Value ¨ [null[]], blink: BOOL ¨ FALSE] = {
+ENABLE UNWIND => NULL;
+InternalReport[format, v1, v2, v3, blink]
+};
+
+InternalReport: INTERNAL PROC[
+format: ROPE, v1, v2,v3: IO.Value ¨ [null[]], blink: BOOL ¨ FALSE] = {
+done: BOOL ¨ FALSE;
+tries: INT ¨ 0;
+ReallyReport: PROC = {
+IF reporter = NIL THEN {
+senderTS ¨ TypeScript.Create[
+info: [name: "SendMail", iconic: FALSE, column: right, openHeight: 64]];
+reporter ¨ ViewerIO.CreateViewerStreams[NIL, senderTS].out;
+senderEvent ¨ ViewerEvents.RegisterEventProc[
+proc: DestroyReporter, event: destroy, filter: senderTS, before: TRUE];
+};
+IF blink THEN
+{ viewer: Viewer = ViewerIO.GetViewerFromStream[reporter];	-- NIL for $Dribble class
+IF viewer # NIL THEN ViewerOps.BlinkIcon[viewer];
+};
+reporter.PutF[format, v1, v2, v3];
+done ¨ TRUE;
+};
+DO
+ReallyReport[ ! IO.Error => IF ec = StreamClosed THEN {
+reporter ¨ NIL; 
+IF ( tries ¨ tries + 1) > 2 THEN REJECT;
+CONTINUE } ];
+IF done THEN RETURN;
+ENDLOOP;
+};
+
+ReporterClump: TYPE = RECORD [reporters: SEQUENCE count: CARD16 OF STREAM];
+maxReporters: CARD16 ¨ 16;
+registeredReporters: REF ReporterClump ¨ NEW[ReporterClump[maxReporters]];
+
+DestroyReporter: ENTRY ViewerEvents.EventProc = {
+ENABLE UNWIND => NULL;
+IF senderEvent # NIL THEN ViewerEvents.UnRegisterEventProc[senderEvent, destroy];
+senderEvent ¨ NIL;
+senderTS ¨ NIL;
+FOR i: CARD16 IN [0..maxReporters) DO
+IF registeredReporters[i] # reporter THEN LOOP;
+registeredReporters[i] ¨ NIL;
+EXIT;
+ENDLOOP;
+reporter ¨ NIL;
+RETURN[FALSE];
+};
+
+RegisterReporter: PUBLIC ENTRY PROC[strm: STREAM] = {
+IF senderTS # NIL THEN
+{ reporter.Close[];
+ViewerEvents.UnRegisterEventProc[senderEvent, destroy];
+senderEvent ¨ NIL;
+ViewerOps.DestroyViewer[senderTS];
+senderTS ¨ NIL;
+reporter ¨ NIL;
+};
+IF reporter = NIL THEN reporter ¨ strm;
+FOR i: CARD16 IN [0.. maxReporters) DO
+IF registeredReporters[i] = strm THEN EXIT;
+IF registeredReporters[i] # NIL THEN LOOP;
+registeredReporters[i] ¨ strm;
+EXIT;
+ENDLOOP;
+};
+
+UnregisterReporter: PUBLIC ENTRY PROC[strm: STREAM] = {
+ENABLE UNWIND => NULL;
+IF reporter = strm THEN reporter ¨ NIL;
+FOR i: CARD16 IN [0.. maxReporters) DO
+IF registeredReporters[i] # strm THEN LOOP;
+registeredReporters[i] ¨ NIL;
+ENDLOOP;
+IF reporter = NIL THEN
+FOR i: CARD16 IN [0.. maxReporters) DO
+IF registeredReporters[i] = NIL THEN LOOP;
+reporter ¨ registeredReporters[i];
+EXIT;
+ENDLOOP;
+};
+
+DenySendProc: ENTRY Menus.MenuProc = {
+ENABLE UNWIND => NULL;
+viewer: Viewer ¨ NARROW[parent];
+senderInfo: SenderInfo ¨ NARROW[ViewerOps.FetchProp[viewer, $SenderInfo]];
+senderInfo.confirmed ¨ FALSE;
+senderInfo.userResponded ¨ TRUE;
+BROADCAST sendingSynch;
+};
+
+ConfirmSendProc: ENTRY Menus.MenuProc = {
+ENABLE UNWIND => NULL;
+viewer: Viewer ¨ NARROW[parent];
+senderInfo: SenderInfo ¨ NARROW[ViewerOps.FetchProp[viewer, $SenderInfo]];
+senderInfo.confirmed ¨ TRUE;
+senderInfo.userResponded ¨ TRUE;
+BROADCAST sendingSynch;
+};
+
+AbortSendProc: ENTRY Menus.MenuProc = {
+ENABLE UNWIND => NULL;
+viewer: Viewer ¨ NARROW[parent];
+senderInfo: SenderInfo ¨ NARROW[ViewerOps.FetchProp[viewer, $SenderInfo]];
+ViewerOps.SetMenu[viewer, blankMenu];
+senderInfo.aborted ¨ TRUE;
+};
+
+ReplyToSelfProc: ENTRY Menus.MenuProc = {
+ENABLE UNWIND => NULL;
+viewer: Viewer ¨ NARROW[parent];
+senderInfo: SenderInfo ¨ NARROW[ViewerOps.FetchProp[viewer, $SenderInfo]];
+senderInfo.replyToResponse ¨ self;
+senderInfo.userResponded ¨ TRUE;
+BROADCAST sendingSynch;
+};
+
+ReplyToAllProc: ENTRY Menus.MenuProc = {
+ENABLE UNWIND => NULL;
+viewer: Viewer ¨ NARROW[parent];
+senderInfo: SenderInfo ¨ NARROW[ViewerOps.FetchProp[viewer, $SenderInfo]];
+senderInfo.replyToResponse ¨ all;
+senderInfo.userResponded ¨ TRUE;
+BROADCAST sendingSynch;
+};
+
+ReplyToCancelProc: ENTRY Menus.MenuProc = {
+ENABLE UNWIND => NULL;
+viewer: Viewer ¨ NARROW[parent];
+senderInfo: SenderInfo ¨ NARROW[ViewerOps.FetchProp[viewer, $SenderInfo]];
+senderInfo.replyToResponse ¨ cancel;
+senderInfo.userResponded ¨ TRUE;
+BROADCAST sendingSynch;
+};
+
+ReplyToResponse: PUBLIC ENTRY PROC[senderInfo: SenderInfo] RETURNS [HowToReplyTo] = {
+ENABLE UNWIND => NULL;
+senderV: Viewer ¨ senderInfo.senderV;
+ViewerOps.BlinkIcon[senderV, IF senderV.iconic THEN 0 ELSE 1];
+UNTIL senderInfo.userResponded DO WAIT sendingSynch; ENDLOOP;
+senderInfo.userResponded ¨ FALSE;
+RETURN[senderInfo.replyToResponse];
+};
+
+CheckForAbortSend: PUBLIC ENTRY PROC[senderInfo: SenderInfo] RETURNS[BOOL] = {
+ENABLE UNWIND => NULL;
+IF senderInfo.aborted THEN {
+InternalReport[" Aborting delivery ...\n"];
+IF senderInfo.sendHandle#NIL THEN MailSend.Abort[senderInfo.sendHandle];
+IF senderInfo.aborted THEN senderInfo.senderV.inhibitDestroy ¨ FALSE;
+};
+RETURN[senderInfo.aborted];
+};
+
+halfSecTicks: Process.Ticks = Process.MsecToTicks[500];
+
+SenderAbortProc: PUBLIC ENTRY MailSendSidedoor.AbortSendProc = {
+ENABLE UNWIND => NULL;
+FOR sL: LIST OF SenderInfo ¨ senderList, sL.rest UNTIL sL = NIL DO
+elapsed, waitTime: INT;
+IF sL.first.sendHandle # msH THEN LOOP;
+IF NOT lastTime THEN RETURN[sL.first.aborted];
+IF ( elapsed ¨ BasicTime.Period[sL.first.startSendTime, BasicTime.Now[]] ) <
+( waitTime ¨ UserProfile.Number["SendMailTool.SendWaitSeconds", 8] ) THEN {
+IF elapsed < 0 THEN RETURN[sL.first.aborted];	-- strange
+FOR i: INT IN [0..2*(waitTime-elapsed)) DO
+WAIT sL.first.timeToWait;
+IF sL.first.aborted THEN RETURN[TRUE];
+ENDLOOP;
+ViewerOps.SetMenu[sL.first.senderV, blankMenu];
+WAIT sL.first.timeToWait;	-- 1/2 sec more
+RETURN[sL.first.aborted];
+};
+ENDLOOP;
+RETURN[FALSE];		-- strange but don't argue
+};
+
+Confirmation: PUBLIC ENTRY PROC[senderInfo: SenderInfo] RETURNS [BOOL] =
+{ ENABLE UNWIND => NULL;  RETURN[SendingConfirm[senderInfo]]};
+
+SendingConfirm: INTERNAL PROC[senderInfo: SenderInfo] RETURNS [BOOL] = {
+senderV: Viewer ¨ senderInfo.senderV;
+oldM: Menus.Menu ¨ ChangeMenu[senderV, confirmMenu];
+ViewerOps.BlinkIcon[senderV, IF senderV.iconic THEN 0 ELSE 1];
+UNTIL senderInfo.userResponded DO WAIT sendingSynch; ENDLOOP;
+ViewerOps.SetMenu[senderV, oldM];
+senderInfo.userResponded ¨ FALSE;
+RETURN[senderInfo.confirmed];
+};
+
+ChangeMenu: PROC[v: Viewer, menu: Menus.Menu] RETURNS [oldM: Menus.Menu] = {
+oldM ¨ v.menu;
+ViewerOps.SetMenu[v, menu];
+};
+
+MessageSendProc: PUBLIC Menus.MenuProc = {
+self: Viewer ¨ NARROW[parent];
+transport: ATOM ¨ NARROW[clientData];
+iHadFocus: BOOL ¨ InputFocus.GetInputFocus[].owner = self;
+ViewerTools.InhibitUserEdits[self];
+IF self.link#NIL THEN DestroySplits[self];
+IF ( ( transport = $xns ) AND control ) THEN transport ¨ $newXNS;
+TRUSTED { Process.Detach[FORK SendProc[self, mouseButton, iHadFocus, transport, TRUE]] };
+};
+
+MessageUSendProc: Menus.MenuProc = {
+self: Viewer ¨ NARROW[parent];
+transport: ATOM ¨ NARROW[clientData];
+iHadFocus: BOOL ¨ InputFocus.GetInputFocus[].owner = self;
+ViewerTools.InhibitUserEdits[self];
+IF self.link#NIL THEN DestroySplits[self];
+TRUSTED
+{ Process.Detach[FORK SendProc[self, mouseButton, iHadFocus, transport, FALSE]] };
+};
+
+MessageSendCheckedProc: Menus.MenuProc = {
+self: Viewer ¨ NARROW[parent];
+transport: ATOM ¨ NARROW[clientData];
+iHadFocus: BOOL ¨ InputFocus.GetInputFocus[].owner = self;
+hasComments: BOOL ¨ FALSE;
+ViewerTools.InhibitUserEdits[self];
+FOR next: TiogaOps.Ref ¨ TiogaOps.ViewerDoc[self], TiogaOps.StepForward[next]
+UNTIL next = NIL DO
+IF hasComments ¨ TiogaOps.IsComment[next] THEN EXIT;
+ENDLOOP;
+IF hasComments THEN {
+TRUSTED { Process.Detach[FORK CheckProc[self, mouseButton, iHadFocus, transport]] };
+RETURN;
+};
+IF self.link#NIL THEN DestroySplits[self];
+TRUSTED {Process.Detach[FORK SendProc[self, mouseButton, iHadFocus, transport, TRUE]]};
+};
+
+lf: CHAR ~ '\l;
+cr: CHAR ~ '\r;
+
+ForceCRLFProc: Menus.MenuProc = {
+self: Viewer ~ NARROW[parent];
+input: TiogaAccess.Reader ¨ TiogaAccessViewers.FromViewer[self];
+output: TiogaAccess.Writer ¨ TiogaAccess.Create[];
+root: Tioga.Node ~ TextNode.Root[TiogaAccess.GetLocation[input].node];
+changeTo: CHAR ~ Rope.Fetch[TextEdit.GetNewlineDelimiter[root], 0];
+changeFrom: CHAR ~ IF changeTo = lf THEN cr ELSE lf;  
+UNTIL input.EndOf[] DO
+char: TiogaAccess.TiogaChar ¨ input.Get[];
+IF char.charSet = 0 THEN IF char.char = changeFrom THEN char.char ¨ changeTo;
+output.Put[char];
+ENDLOOP;
+TiogaAccess.DoneWith[input];
+TiogaAccessViewers.WriteViewer[output, self];
+SendMailInternal.SenderNewVersion[self];	-- show as editted
+ViewerOps.PaintViewer[self, caption];
+};
+
+CheckProc: PROC[self: Viewer, mouseButton: Menus.MouseButton,
+iHadFocus: BOOL, transport: ATOM] = {
+senderInfo: SenderInfo = NARROW[ViewerOps.FetchProp[self, $SenderInfo]];
+SenderReport["\n*** Message to be sent contains comment nodes - are you sure you want to send it?"];
+IF ~Confirmation[senderInfo] THEN {
+SenderReport[" Message NOT sent"];
+ViewerTools.EnableUserEdits[self];
+RETURN;
+};
+IF self.link#NIL THEN DestroySplits[self];
+SendProc[self, mouseButton, iHadFocus, transport, TRUE];
+};
+
+SendProc: PROC[viewer: Viewer, mouseButton: Menus.MouseButton,
+iHadFocus: BOOL, transport: ATOM, sendFormatted: BOOL] = {
+OPEN ViewerOps;
+sendOK: BOOL;
+senderInfo: SenderInfo = NARROW[ViewerOps.FetchProp[viewer, $SenderInfo]];
+viewer.newVersion ¨ TRUE;
+viewer.name ¨ "Sending ...";
+PaintViewer[viewer, caption];
+viewer.file ¨ NIL;
+
+IF sendFormatted THEN
+sendOK ¨ SendMailOps.Send[v: viewer, doClose: mouseButton=blue, transport: transport]
+ELSE sendOK ¨ SendMailOps.SendUnformatted[v: viewer, doClose: mouseButton=blue, transport: transport];
+IF ~sendOK THEN SenderNewVersion[viewer];
+
+viewer.name ¨ viewer.label ¨ sendCaption;
+viewer.icon ¨ IF sendOK THEN senderIcon ELSE notSentIcon;
+PaintViewer[viewer, caption];
+ViewerTools.EnableUserEdits[viewer];
+IF sendOK THEN {
+AfterSendInsert: ENTRY PROC =
+{ ENABLE UNWIND => NULL; InsertForm[senderInfo, defaultForm, FALSE] };
+IF mouseButton=blue AND destroyAfterSend THEN {DestroyViewer[viewer]; RETURN};
+UnsetNewVersion[viewer];
+AfterSendInsert[];
+};
+};
+
+SenderSplitProc: Menus.MenuProc = {
+self: Viewer = NARROW[parent];
+newV: Viewer;
+nsI, senderInfo: SenderInfo;
+TEditSplit.Split[self];
+FOR newV ¨ self.link, newV.link UNTIL newV.link = self DO ENDLOOP;
+
+senderInfo ¨ NARROW[ViewerOps.FetchProp[self, $SenderInfo]];
+ViewerOps.AddProp[newV, $SenderInfo, nsI ¨ NEW[SenderInfoObject]];
+
+nsI.senderV ¨ newV;
+nsI.sendingTransports ¨ senderInfo.sendingTransports;
+nsI.thisMenu ¨ senderInfo.thisMenu;
+nsI.replyToResponse ¨ senderInfo.replyToResponse;
+nsI.numCharsToDelete ¨ senderInfo.numCharsToDelete;
+nsI.currentOutBox ¨ senderInfo.currentOutBox;
+nsI.dontClose ¨ senderInfo.dontClose;
+nsI.successfullySent ¨ senderInfo.successfullySent;
+nsI.userResponded ¨ senderInfo.userResponded;
+nsI.confirmed ¨ senderInfo.confirmed;
+nsI.aborted ¨ senderInfo.aborted;
+nsI.startSendTime ¨ senderInfo.startSendTime;
+nsI.validateFlag ¨ senderInfo.validateFlag;
+nsI.sendHandle ¨ senderInfo.sendHandle;
+TRUSTED { Process.SetTimeout[@nsI.timeToWait, halfSecTicks] };
+
+nsI.destroyEvent ¨ ViewerEvents.RegisterEventProc[
+	proc: DestroySendViewer, event: destroy, filter: newV, before: TRUE];
+nsI.closeEvent ¨ ViewerEvents.RegisterEventProc[
+	proc: CloseSendViewer, event: close, filter: newV, before: TRUE];
+nsI.editEvent ¨ ViewerEvents.RegisterEventProc[
+	proc: FirstEditSendViewer, event: edit, filter: newV, before: TRUE];
+newV.icon ¨ self.icon
+};
+
+DestroySplits: ENTRY PROC[keepThisOne: Viewer] =
+{ ENABLE UNWIND => NULL; InternalDestroySplits[keepThisOne] };
+
+InternalDestroySplits: PUBLIC PROC[keepThisOne: Viewer] = {
+next: Viewer ¨ keepThisOne.link;
+next2: Viewer;
+sI: SenderInfo;
+DO
+IF next = keepThisOne THEN EXIT;
+sI ¨ NARROW[ViewerOps.FetchProp[next, $SenderInfo]];
+IF sI # NIL THEN {
+IF sI.destroyEvent # NIL THEN
+	ViewerEvents.UnRegisterEventProc[sI.destroyEvent, destroy];
+IF sI.closeEvent # NIL THEN ViewerEvents.UnRegisterEventProc[sI.closeEvent, close];
+IF sI.editEvent # NIL THEN ViewerEvents.UnRegisterEventProc[sI.editEvent, edit];
+sI.destroyEvent ¨ NIL;
+sI.closeEvent ¨ NIL;
+sI.editEvent ¨ NIL;
+};
+next2 ¨ next.link;
+IF sI # NIL THEN ViewerOps.DestroyViewer[next];		-- DON'T FORK here
+next ¨ next2;
+ENDLOOP;
+--  make sure this sender is on the list of senders
+FOR sL: LIST OF SenderInfo ¨ senderList, sL.rest UNTIL sL=NIL DO
+IF sL.first.senderV = keepThisOne THEN RETURN;
+ENDLOOP;
+
+sI ¨ NARROW[ViewerOps.FetchProp[keepThisOne, $SenderInfo]];
+IF sI = NIL THEN RETURN;
+senderList ¨ CONS[sI, senderList];
+};
+
+SenderPlacesProc: Menus.MenuProc =
+Menus.CopyEntry[ Menus.FindEntry[ TiogaMenuOps.tiogaMenu, "Places" ] ].proc;
+
+SenderLevelsProc: Menus.MenuProc =
+Menus.CopyEntry[ Menus.FindEntry[ TiogaMenuOps.tiogaMenu, "Levels" ] ].proc;
+
+SenderGetFormProc: ENTRY PROC[self: Viewer, filename: ROPE] = {
+ENABLE UNWIND => NULL;
+fileStatus: FileStatus;
+exp, fName: ROPE;
+IF filename.Length[] = 0 THEN RETURN;
+
+[fileStatus, exp, fName] ¨ CheckForFile[filename];
+IF fileStatus = local OR fileStatus = remote THEN {
+tc: ViewerTools.TiogaContents ¨ GetSendForm[fName];
+senderInfo: SenderInfo ¨ NARROW[ViewerOps.FetchProp[self, $SenderInfo]];
+InternalDisplayTioga[senderInfo, tc, TRUE];
+ClearFileAssoc[self];
+}
+ELSE ErrorReport[exp];
+};
+
+SenderGetFileProc: Menus.MenuProc = {
+self: Viewer = NARROW[parent];
+filename: ROPE ¨ ViewerTools.GetSelectionContents[];
+IF filename.Length[] = 0 THEN RETURN;
+LoadFile[self, filename];
+};
+
+SenderFormsProc: Menus.MenuProc = {
+viewer: Viewer = NARROW[parent];
+which: INT;
+sel: LIST OF ROPE ¨ popUpFormsFileNames;
+blueButton: BOOL = mouseButton = blue;
+IF popUpFormsList = NIL THEN RETURN;
+which ¨ PopUpSelection.Request["Forms", popUpFormsList];
+SELECT which FROM
+<= 0 => RETURN;				-- no selection 
+1 => { NewSenderProc[]; RETURN };
+2 => { NewMsgFormProc[viewer]; RETURN };
+3 => { PrevMsgProc[viewer, blueButton]; RETURN };
+ENDCASE => which ¨ which - 3;
+
+FOR i: INT IN [1..which) DO
+sel ¨ sel.rest;
+ENDLOOP;
+SenderGetFormProc[viewer, sel.first];
+};
+
+SenderStoreProc: Menus.MenuProc = {
+self: Viewer ¨ NARROW[parent];
+fileName: Rope.ROPE = ViewerTools.GetSelectionContents[];
+status: FileStatus;
+exp: Rope.ROPE;
+[status, exp] ¨ CheckForFile[fileName];
+SELECT status FROM
+local, notFound => {
+TiogaMenuOps.Store[self, fileName];
+IF mouseButton # blue THEN
+{ IF ~self.newVersion THEN UnsetNewVersion[self] }
+ELSE IF ~self.newVersion THEN ViewerOps.SetNewVersion[self];
+};
+ENDCASE => BadSaveOrStore[status, exp, fileName];
+};
+
+SenderSaveProc: Menus.MenuProc = {
+self: Viewer ¨ NARROW[parent];
+status: FileStatus;
+exp: Rope.ROPE;
+IF self.file = NIL THEN { SenderReport["\nCan't save - no file name\n"]; RETURN };
+
+[status, exp] ¨ CheckForFile[self.name];
+SELECT status FROM
+local, notFound => {
+[] ¨ ViewerOps.SaveViewer[ self ];
+IF mouseButton # blue THEN
+{ IF ~self.newVersion THEN UnsetNewVersion[self] }
+ELSE IF ~self.newVersion THEN ViewerOps.SetNewVersion[self];
+};
+ENDCASE => BadSaveOrStore[status, exp, self.name];
+};
+
+-- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+
+LoadFile: PROC[self: Viewer, filename: ROPE, noName: BOOL ¨ FALSE] = {
+status: FileStatus;
+s, fName, nameToUse: ROPE;
+EntryErrorReport: ENTRY PROC[exp: ROPE] = INLINE {
+ENABLE UNWIND => NULL;
+ErrorReport[exp];
+};
+[status, s, fName] ¨ CheckForFile[filename, FALSE];
+IF status = notFound THEN {
+[status, s, fName] ¨ CheckForFile[filename];		-- try .form extension
+nameToUse ¨ fName;
+}
+ELSE nameToUse ¨ filename;
+  
+IF status = local OR status = remote THEN
+{ self.file ¨ NIL; -- make sure that no one else thinks you're saving something
+TiogaMenuOps.Load[ self, nameToUse ];
+ViewerTools.EnableUserEdits[ self ];		-- in case remote file specified
+IF noName THEN
+{ self.name ¨ sendCaption;
+ViewerOps.PaintViewer[self, caption];
+self.file ¨ NIL;		-- don't want any file association
+};
+GrabFocus[self];
+UnsetNewVersion[self];
+}
+ELSE EntryErrorReport[s];
+};
+
+CheckForFile: PROC[name: ROPE, addExt: BOOL ¨ TRUE]
+	RETURNS[fileStatus: FileStatus ¨ local, explanation, fName: ROPE] = {
+
+pathName: PFS.PATH  ¨ PFS.PathFromRope[name];
+fullPath: PFS.PATH;
+fullPath ¨ PFS.FileLookup[pathName, IF addExt THEN LIST[".form"] ELSE NIL ! PFS.Error => CONTINUE];
+IF fullPath = NIL THEN {
+explanation ¨ IO.PutFR1["%g not found", [rope[name]] ];
+fileStatus ¨ notFound;
+}
+ELSE fName ¨ PFS.RopeFromPath[fullPath];
+};
+
+ErrorReport: INTERNAL PROC[exp: ROPE] = {
+InternalReport[format: "\n%g\n", v1: [rope[exp]], blink: TRUE];
+};
+
+BadSaveOrStore: ENTRY PROC[status: FileStatus, exp, name: ROPE] = {
+ENABLE UNWIND => NULL;
+SELECT status FROM
+notFound =>
+InternalReport[format: "Can't store on remote file: \"%g\"\n", v1: [rope[name]], blink: TRUE];
+illegalName, otherError => ErrorReport[exp];
+ENDCASE => ERROR;
+};
+
+-- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+-- read the user profile line for message forms and add one menu entry for each
+
+SetFormsList: PROC = {
+OPEN Menus;
+fLLast: LIST OF ROPE ¨ NIL;
+popUpFormsFileNames ¨
+UserProfile.ListOfTokens[key: "SendMailTool.MsgForms", default: NIL];
+popUpFormsList ¨ NIL;
+
+FOR fl: LIST OF ROPE ¨ popUpFormsFileNames, fl.rest UNTIL fl = NIL DO
+form: ROPE ¨ fl.first;
+shortName: ROPE;
+fullPath: PFS.PATH;
+IF form.Length[] = 0 THEN LOOP;		-- zero length name not allowed
+
+shortName ¨ PFSNames.ComponentRope[PFSNames.ShortName[PFS.PathFromRope[form]]];
+shortName ¨ shortName.Substr[0, shortName.Index[0, "."]];
+IF fLLast = NIL THEN popUpFormsList ¨ fLLast ¨ LIST[shortName]
+ELSE {
+fLLast.rest ¨ LIST[shortName];
+fLLast ¨ fLLast.rest;
+};
+ENDLOOP;
+
+popUpFormsList ¨
+CONS["NewSender", CONS["Default Form", CONS["Previous Msg", popUpFormsList]]];
+};
+
+-- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+--  Start code: create menus and register ourselves
+
+DoInit: PROC = {
+OPEN Menus;
+pL: LIST OF MailSend.MailSendProcsRef ¨ MailSend.GetRegisteredSendProcsList[];
+len: INT;
+TRUSTED { len ¨ List.Length[LOOPHOLE[pL, List.LORA]] };
+FOR procs: LIST OF MailSend.MailSendProcsRef ¨ MailSend.GetRegisteredSendProcsList[],
+procs.rest UNTIL procs = NIL DO
+tName: ROPE ¨ IF ( len = 1 ) THEN NIL ELSE Atom.GetPName[procs.first.which];
+name: ROPE ¨ Rope.Concat[tName, "Send"];
+AppendMenuEntry[sendMenu,
+CreateEntry[name: name, proc: MessageSendProc, clientData: procs.first.which, fork: FALSE, guarded: procs.first.which = $gv]];
+IF (procs.first.which = $xns) THEN
+AppendMenuEntry[sendMenu,
+CreateEntry[name: Rope.Concat[tName, "USend"], proc: MessageUSendProc, clientData: procs.first.which, fork: FALSE]];
+ENDLOOP;
+
+AppendMenuEntry[sendMenu, CreateEntry["Get", SenderGetFileProc]];
+AppendMenuEntry[sendMenu,
+CreateEntry[name: "Store", proc: SenderStoreProc, guarded: TRUE]];
+AppendMenuEntry[sendMenu, CreateEntry["Save", SenderSaveProc]];
+AppendMenuEntry[sendMenu, CreateEntry["Forms", SenderFormsProc]];
+AppendMenuEntry[sendMenu, CreateEntry["CR/LF", ForceCRLFProc]];
+AppendMenuEntry[sendMenu, CreateEntry["Split", SenderSplitProc]];
+AppendMenuEntry[sendMenu, CreateEntry["Places", SenderPlacesProc]];
+AppendMenuEntry[sendMenu, CreateEntry["Levels", SenderLevelsProc]];
+
+AppendMenuEntry[sendingMenu, CreateEntry["StopSending!", AbortSendProc]];
+
+AppendMenuEntry[confirmMenu, CreateEntry["Confirm", ConfirmSendProc]];
+AppendMenuEntry[confirmMenu, CreateEntry["Deny", DenySendProc]];
+
+AppendMenuEntry[replyToMenu, CreateEntry["Self", ReplyToSelfProc]];
+AppendMenuEntry[replyToMenu, CreateEntry["All", ReplyToAllProc]];
+AppendMenuEntry[replyToMenu, CreateEntry["Cancel", ReplyToCancelProc]];
+
+Commander.Register["SendMail", SendMailCmd, "Mail sending tool"];
+Commander.Register["SendMailTool", SendMailCmd, "Mail sending tool"];
+SendMailInit[firstTime];
+UserProfile.CallWhenProfileChanges[SendMailInit];
+
+{
+path: ROPE = "SendMailTool.icons";
+senderIcon ¨ Icons.NewIconFromFile[path, 6];
+IF senderIcon = unInit THEN senderIcon ¨ tool
+ELSE {
+edittingIcon ¨ Icons.NewIconFromFile[path, 9];
+notSentIcon ¨ Icons.NewIconFromFile[path, 19];
+};
+};
+
+IF UserProfile.Boolean["SendMailTool.GlobalSenderButton", FALSE] THEN
+[] ¨ Buttons.Create[info: [name: "Sender"], proc: NewSenderClickProc];
+};
+
+initDir: ROPE ~ PFS.RopeFromPath[PFS.GetWDir[]];
+DoInit[];
+
+END.
+
+     SendMailControlImpl.mesa
+Copyright ” 1984, 1989, 1990, 1991, 1992, 1993 by Xerox Corporation.  All rights reserved.
+Willie-Sue, February 2, 1990 5:44:01 pm PST
+Willie-s, April 26, 1993 6:33 pm PDT
+Theimer, April 30, 1990 10:39 pm PDT
+
+Contents: Control module for SendMail
+Last Edited by: Willie-Sue, January 17, 1984 10:20:02 am PST
+Last Edited by: Donahue, October 7, 1983 9:42 am
+************************************************************************
+check for user name being set in defaultForm
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+be paranoid here
+IF defaultForm.fields.rest.rest.first = NIL THEN
+IF simpleUserNameList = NIL THEN SendMailInit[firstTime]; -- fixes up defaultForm
+ViewerOps.PaintViewer[senderV, menu];	-- shouldn't be necessary
+let's sidestep this issue for now
+removes the named button from the sender menu, if such a button exists; no errors
+make sure that there is no file pointed to so that you don't get something saved in UnSavedDocumentCache
+should take senderInfo off of chain of senderInfo's, but why bother?
+
+check if any comment nodes, and alert user if so
+for now, we assume single character newline delimiter - beware crlf
+assume cr and lf are the only values
+now find the newest link in the chain to copy properties
+ ù -ÿ  ïNewlineDelimiter
+ñ(cedarcode) styleò codeöœbôKöú
+œeúOôZKô+Kô$Kô$Kô Köú%ô%óKò Köú<ô<Köú0ô0Kò öœk	ò	KöúüúòKöú
+üúòKöúüúò#Köú
+üúò(Köúüúò*Köúüúò!Köúüú
+üúòKöú	üú7òEKöúüúò'KöúüúÄòãKöüúòKöüúòKò	KöúüúòKöúüú*ò7KòKöúüúò)Köúüú
+òKöú	üúò%Köú	üúòKòKòKòKöúüú"ò4Köú	üúUòcKöúüú
+òKöúüúHòZKöú
+üúôò®Köú	üú,ò:Köúüúèò†Köúüú
+òKöúüúTòeKöúòKòóKò öœnúüúüò"öüòKöú%üúüúùòœóöüòKöúòóKöüúòóKò Köüúüúò)Kò KöœcòKò KöüúüúüúüúòKöüúüúüúòKöúüúò$Köúüúò0Köúüúò(Köú"üú!òFKò KöúüúüúòKöúüúüúòKöúüúüúüúò%Kò Kö	úüúüúüúüúò#Kö	úüúüúüúüúò(Köúü	úòKò Köúüúüú°ò9Kò$Kò&Kò%Köúüúüúüú°,òKKò Köú
+üúüúòKöúüúòKò Köú,ò,Köúüúò.Köúüúò-Köúüúò.Kò Köúüúüúüú	üúüúüú	üúüúòOKöúüúüúò*Köúüúüúüúò=Köúüúüúüúò*Kò Köúüú6òFKò Kö°HôHò Kö†ú<üúòNóò ö†úüúüúüúüúüúüúüúüúòcKöúòKöüú
+üúò.Köüúüúüúò'Köú,ô,KòòKöúüúFòQóKò Köüúüúò4Köúüú°ò4Köúòóóò ö†	úüúüúüúò1KöüúüúüúòKöüúüúüúòKöú/ò/Köú,üúüúòBKöúòóóKò ö°UôUö†úüúüúüúüúüúüúüúüúüúòëKöüúüúüúò)KöúòKö	úüúüúüúüúòHKòKKöüúò"KöúòKò óö†úüúüúò6KôKöüúüúüú°òLKöüúüúüúüúò(Köüúüúüúüúò-Köüú üúüúüúò2Köüú&üúüúüúüúüú°ôÇKöüúòKòóóò ö†úüúüúüú(üúüúüúüúüúòÜKöüúò#öüúüúüúüúüúüòAKöüú%üúò/óKò KöúòKòKöúüúòKò öüúüòöüúüúüú"üúüúüò@Kòöüú"üúüúòEKöüúüúüúòFöüòòKöüúüúüú ò:Köúüúòöüú2üò8Köú$ò$óöüúüú°#ò=Köúüúüú2ò=öüúüúüúòKöúüúò$Köú=ò=KöúüúòKòóöüúüúüúüò5öú+üúò2Köú@üúòGóKöüúò!óKöúòóöüúüúüúüúò5Köüúò!óKöú%ò%KöúüúòKöüúò	óóóKöüúòóóKò ö°òò!KöúòöúòKö	ú	üúüúüúüúò.KöúòKöúòóKöúüúòóKò öüúüúüúòKöú@üúòGKöú7üúò<KöúòóKöúüúòKöúüú(ò8Köüú>òEKöú$ò$Köú0ò0Köú4ò4Kò öüúüúüú(üúüúüòHKöú;ò;KöüúòóKò Köúüúò*Kò Köú~üúòÑKò Köúvüúò|Kò Köúxüúò~Kò Kö
+üúüúüúüúüúòWKöú&°ô?KöúüúòKöüúüúüú%òGóKöúòKò óö†úüú$üúò?Kô!KòKòóóKò Kö°XòXò ö†ú$ò0Köúüú?üúòYKöúüú>üúòWKöúüú?üúòYKöú*üúò.KöúüúüúòKö	úüúüúüúüúò"Kò KòKöüúüúüúüúüúüúòRKöúüúòKòPKöúLüúòSKöúVüúò]òKöúBüúòIóòKöúCüúòJóKò öüúüúüúDòaKöüúüúòóKò,öüúüúüúòKò2Kö	úüúüúüúüúò>KöúòöüúòKò9Kò#KöúòóóKò KöúüúòKöüúüúüúFòbKò+öüúüúüúò4Köüú!ò%óKò KöúüúòKöüúüúüúHòeKò,öüúüúüúò5Köüú#ò'óKò KòRKöúòKöúòóóò ö†úüúüúüúò>KöüúüúüúòKöúüú,òKKöú üúòBKòKöú%üúò+Köúòóóò ö†úüúüúüúò7KöüúüúüúòKöúüú,òKKö	üúüúüúüú°ò1Köú$üúò)Köúòóóò ö†	úüúüúüú(òDKöüúüúüúòKöúüú&òEKö	üúüúüúüú°ò1Köú+üúò0KöúòóóKò ò ö†úüúüúüúüúüú	üúüúüú	üúüúòeöüúüúüúòòKöüúüú2òLóóKòóóò ö
+†úüúüúüúüúò7KöüúüúüúòKöúüúüúòKöüúüúüúüúò%öüúüúüú(üúüúüòJöüúüòöüúüòKöú*üúò1óöüòKöúüúòóóKò	KöüúòóKòóóò ö
+†úüúüúüúüúòGKöüúüúüúòKò8öüúüúüòKöú@ò@óöüúüúüú"üúüúüòBKòKöúòKö
+üúüúüúüúüúò$Kò?öüúüúüúòKöú@ò@Köú.ò.KòóKöüúòóKöúòKò óö
+†úüúüúüúüúòGKöúüúüúòKöüúüúüúòö
+†	úüúüú
+üúüúòFKöú8ò8Köú6ò6öúCòCKöúüúüúò óKöüúüú	üú&ò9KòóKò KòKò öüúüúüú"üúüúüòBKöúòKöúüúòKö
+üúüúüúüúüúò$Kò-Köúüú
+ò"Köú.ò.KöüúòóKöúòKò óö
+†úüúüúüúüúò5KôQKöüúüúüúòKò7KöüúüúüúüúòKöú>ü	úòIöüúüúüú"üúüúüòBKòKöúòKö
+üúüúüúüúüúò$Kò>öüúüúüúòKöú>ü	úòIKöú.ò.KòóKöüúòóKöúòóóKò Kö°XòXKö°òò ö†úüúüúò.KöüúüúüúòKöúòKöúòóóò ö†úüúüúüúò>KöüúüúüúòKöúüú+òJKòKöüúüúüúò6KöúòKòKöüú
+üúüú%üúò>öúüúòöüúüúüúüúüúüúòVöüú°!ò(KöúüúòKòKö	úüúüúüúüúò0Köúüúüúüúò öüú&üúüúüò:KöúüúòKòKöüúòóKòWKöüúüúüúòKòöüúüúüúüòKòKöüúòóKöúüúüúüúò6Köúòóóöüú1üò7Köú#ò#óKöú)ò)KöúòKòóKöúòóóò ö†úò*KöúòKòKöú üú
+üúüúòXKöúòKöúòKò óö†úüúòKöúòKòKöú üú
+üúüúòXKöúòKöúòóóò ö†
+úüúüúò-Köúüú+òJKòKöú$üúò*KöúòKöúòóóKò Kö°XòXò ö†úò-Köúüú+òJKö
+üúüúüúüúüúò'Köüúüúüúüúò?KöúhôhKö
+üú3üúüúüúüúòLKöüúüú'òCKöüúüúòKöúòóóò ö†úüúüúüú2òTKö	úüúüúüúüúò>óóò ö†úüúüúüú%üúüúüúòXKöúüúüúüú3òJóóò ö†úò+Köúüú+òJKö
+üúüúüúüúüúò'öüúüòöúLüúòRKöüúüúòóKöúòóKöúüúüúüúòEKöüúüúòKöúòóóò ö†úò/KöüúòKöúüú+òJKö
+üúüúüúüúüúò'Köú°ò-KöüúüúòKöúòóóò ö†úüúüú-òHKöüúüúüúòKöúüúüúòKöüúüúüú°ò+öüúüòöú?ò?Köüú*üúüúòLóKöúòóKöüúüúüúòKò öüúüúüò%KöúCòCóKò öüúüúüò#Köú?ò?óKò öüúüúüò"Köú=ò=óKò öüúüúüò"Köú=ò=óKò öüúüúüò#KöúGòGóKò KöúüúòKöúüúòKöúüúòKöúüúòKöúüúòKò KöúDôDKô Köüúüú$ò@Köúòóóò ö†úüúüúüúò5KöüúüúüúòKöúüú+òJKöüúüúüúüúò KöúüúòKöúòóóò ö†úüúüúüúò8KöüúüúüúòKöúüú+òJKöüúüúüúüúò KöúüúòKöúòKò óö†úüúüúüú
+üúüúüúüúògKöüúüúüúòKöú)ò)KöúòóKò ö†úüúüú
+üúüúüúüúòeKöúüúüúòKöúüúòö†úüúòöüúüúüúòKöú?üú"òfKöú(üúò;KöúoüúòuKöúòóöüúüòöú;°òTKöüú
+üúüúò1óKöúòóKöú"ò"KöúüúòKòóöüòöúüú
+üúüúò7KöúüúòKöüúüúüúò(KöüúòóKöüúüúüúòKöüúòóKöúòóóò KöúüúüúüúüúüúüúòKKöúüúòKöúüúüúòJóò ö†úüúò1KöüúüúüúòKöüúüúüú8òQKöúüúòKöúüúòöüúüúüúüò%Köüú#üúüúò/KöúüúòKöüúòKöüúòóKöúüúòKöüúüúòKöúòóóò ö
+†úüúüúüúüúò5öüúüúüòöúòKöú7ò7KöúüúòKöú"ò"KöúüúòKöúüúòóKöúòóKöüúüúüúò'öüúüúüúüò&Köüúüúüúò+Köüúüúüúüúò*KòKöüúòKöüúòóKöúòóóò ö
+†úüúüúüúüúò7KöüúüúüúòKöüúüúüúò'öüúüúüúüò&Köüúüúüúò+KöúüúòKöüúòóöüúüúüòöüúüúüúüò&Köüúüúüúüúò*Kò"KöüúòKöüúòóóKöúòóóò ö†úüúò&KöüúüúüúòKöúüú	ò Köúüú+òJKöúüúòKöúüúò Köü	úòKöúòóóò ö†úüúò)KöüúüúüúòKöúüú	ò Köúüú+òJKöúüúòKöúüúò Köü	úòKöúòóóò ö†úüúò'KöüúüúüúòKöúüú	ò Köúüú+òJKöú%ò%KöúüúòKöúòóóò ö†úüúò)KöüúüúüúòKöúüú	ò Köúüú+òJKò"Köúüúò Köü	úòKöúòóóò ö†úüúò(KöüúüúüúòKöúüú	ò Köúüú+òJKò!Köúüúò Köü	úòKöúòóóò ö†úüúò+KöüúüúüúòKöúüú	ò Köúüú+òJKò$Köúüúò Köü	úòKöúòóóò ö
+†úüúüúüúüúòUKöüúüúüúòKò%Köúüúüúüúò>Köüúüúüúüúò=Köúüúò!Köüúò#Köúòóóò ö†úüúüúüúüúüúòNKöüúüúüúòöüúüúòKöú+ò+Köüúüúüú'òHKöüúüú%üúòEKöúòóKöüúòKöúòóóò öú7ò7Kò óö†úüúüú#ò@Köüúüúüúòöüúüúüú"üúüúüòBKöúüúòKöüúüúüúò'Köüúüú
+üúüúò.öüúêüúòòKöüúüúüú°
+ò8öüúüúüúüò*KöüúòKöüúüúüúüúò&KöüúòóKöú/ò/Köüú°ò)KöüúòKòóKöüúòóKöüúüú°ò*KöúòKò óö†úüúüúüúüúüúòHKö	úüúüúüúüúò>óóò ö
+†úüúüúüúüúòHKò%Kò4Köúüúüúüúò>Köüúüúüúüúò=Köú!ò!Köúüúò!KöüúòKöúòóóò ö†
+úüúüúòLKòKöúòKöúòóóò ö†úüúò*Köúüú	òKöúüúüúò%Köúüú+ò:Köú#ò#Köüúüúüúò*KöüúüúüúòAKöüúüú3üúòYKöúòóóò ö†úò$Köúüú	òKöúüúüúò%Köúüú+ò:Köú#ò#Köüúüúüúò*Köüúüú3üúòZKöúòKò óö†úò*Köúüú	òKöúüúüúò%Köúüú+ò:KöúüúüúòKöú#ò#Köú0ô0öüúJòMöüúüúüòKöüú(üúüúò4KöüúòóóöüúüúòKöüúüú7òTKöüúòKòóKöüúüúüúò*Köüúüú3üúòWKöúòKò óKöúüúòöúüúòKò óö†úò!Köúüú	òKò@Kò2KòFKöú8ùôCKöú
+üú5òCKô$Kö	úüúüúüúüúò6öüúüòKò*KöüúüúüúüúòMKöúòKöüúòóKöúòKò-Köú)°ò;Kò%Kòóóò ö†	úüú:üúüúòcKöúüú)òHKöúdòdöüúüúò#Köú"ò"Köú"ò"KöüúòKòóKöüúüúüúò*Köú2üúò8KòKò óö
+†úüú<üúüúüúòyKöüúòKöúüúòKöúüú+òJKöúüúòKòKöúòKöúüúòKò öüúüúVòkKöüúbòfóKöüú	üúò)Kò Kò)Köúüúüúüúò9KöúòKöú$ò$öüúüúòö†úüúüúòKö	úüúüúüú&üúòFóKöüúüúüúüúòNKöúòKöúòKöúòóKöúòóóò ö†úò#Köúüú	òKöúòKöúòKöúòKöú8ô8KöüúüúüúüúòBKò Köúüú)ò<Köú+üúòBKò KòKò5Kò#Kò1Kò3Kò-Kò%Kò3Kò-Kò%Kò!Kò-Kò+Kò'Köüú7ò>Kò ò2Köú@üúòFóò0Köú<üúòBóò/Köú?üúòEóKòKöúòóóò ö†úüúüúò0Köúüúüúüú'ò>óóò ö†úüúüúò;Kò KöúòKöúòöüòKöüúüúüúò Köúüú)ò4öüúüúüúòöüúüúüòKöú<ò<óKöüúüúüú8òSKöüúüúüú6òPKöúüúòKöúüúòKöúüúòKöúòóKòKöüúüúüú!°òCKòKöüúòóKö°3ò3öüúüúüú"üúüúüò@Köüú üúüúò.KöüúòóKò Köúüú0ò;KöüúüúüúüúòKöúüúò"Köúòóóò ö†úò"KöúLòLóóò ö†úò"KöúLòLóóò ö†úüúüúüúò?KöüúüúüúòKöúòKöúüúòKöüúüúüúò%Kò Kò2öüúüúüúò3Kò3Köúüú)òHKöú%üúò+KöúòKöúòóKöüúòKöúòóóò ö†úò%Köúüú	òKöú
+üú&ò4Köüúüúüúò%KöúòKöúòóóò ö†úò#Köúüú	ò KöúüúòKöúüúüúüúò(Köúüúò&Köüúüúüúüúò$Kò8öüúüòKöúüú°úò#Köúüúò!Köúüúò(Köú(üúò1KöüúòóKò öüúüúüúüòKòKöüúòóKöú%ò%KöúòKò óö†úò#Köúüú	òKöúüú&ò9KöúòKöú
+üúòKò'öüúüòöúòKöú#ò#öüúüòKöúüúüúò2Köüúüúüúò<óKöúòóKöüú*ò1óKöúòóóò ö†úò"Köúüú	òKöúòKöú
+üúòKöüúüúüú2üúòRKò Kò(öüúüòöúòKò"öüúüòKöúüúüúò2Köüúüúüúò<óKòóKöüú+ò2óKöúòóóKò Kö°HòHò ö
+†úüúüú
+üúüúòFKöúòKöúüúòö
+†úüúüúüúüúò2KöüúüúüúòKöúòKòóKöú,üúò3öüúüúòKöú.°òDKòKòKöüúòóKöúòöüúüúüò)öúüú°<òOKöú%ò%Köú&° òFöüúüòòKöú%ò%Köúüú°"ò4óKöúòóKöúòKöúòóKöúòóKöüúòKöúòóóò ö
+†úüúüú
+üúüúò3öúüú5üúòFKò óKöú
+üúüúüúò-Köú
+üúüúòKöúüúüúüúüú
+üúüúüú
+üúòcöüúüúüúòKöúüú&üò7KòKöúòKöüú	üúò(óKöúòóóò ö†úüúüúüúò)Köú9üúò?Köúòóóò ö†úü
+ú üúòCKöüúüúüúòöüúüòöúòKöúXüúò^óKöú,ò,óKöüúüúòKöúòKò óóKö°HòHKö°OòOò ö†úüúòKöüúòKö	úüúüúüúüúòòKöú@üúòEóKöúüúòKò öüúüúüúüú üúüúüòEKöúüúòKöúüúòKöú
+üúüòKöüúüúüú°ò@Kò Köú6üúòOKò9öüú
+üúüúüúò>öüúòKöúüúòKòKòóóKöüúòóKò òKöüúüúüú#òNóKöúòóóKò Kö°HòHKö°3ò3Kò ö†úüúòKöüúòKöúüúüúCòNKöúüúò	Köüúüú
+üúò7öüúüúüúOüú	üúüòuKöúüúüúüúüúüú"òLKöúüúò(Köúnüú%òòöüúüò"KöúÜüúòéóKöüúòóKò KöúAòAKöúUüúò\Köú?ò?KöúAòAKò?KöúAòAKöúCòCKöúCòCKò KöúIòIKò KöúFòFKöú@ò@Kò KöúCòCKöúAòAKöúGòGóò KöúAòAKöúEòEKöúòKöú1ò1Kò öúòKöúüúò"Kò,öüúüúò-öüúòKò.Kò.KòóóKöúòóKò öüú8üúüòEKòFóKöúòKò óKöú	üúüúüúò0Kò	Kò Köüúòó Öó    ï  «¯  

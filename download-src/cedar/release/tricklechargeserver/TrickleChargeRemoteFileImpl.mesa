@@ -1,0 +1,620 @@
+
+DIRECTORY
+Basics USING [FWORD, HWORD, Int16FromH, Int32FromF],
+BasicTime USING [GMT, Now, nullGMT],
+CHNameP2V0 USING [],
+Commander USING [CommandProc, Register],
+CrRPC USING [BulkDataSink, CreateClientHandle, DestroyClientHandle, Error, ErrorReason, Handle],
+FilingP10V5,
+IO,
+PFS,
+PFSBackdoor USING [ErrorCode, ProduceError],
+PFSClass,
+PFSNames,
+RefText,
+Rope,
+TrickleChargeP9813V411 USING [AnyBodyHome, EnumerateForInfo, Error, FileInfo, FileNotFound, Retrieve],
+XNS USING [Address, unknownAddress],
+XNSCH USING [LookupAddressFromRope],
+XNSCHName USING [Name, RopeFromName],
+XNSRemoteFileTypes,
+XNSStream USING [ConnectionClosed, Timeout],
+XNSWKS USING [courier];
+
+
+TrickleChargeRemoteFileImpl: CEDAR PROGRAM
+IMPORTS Basics, BasicTime, CrRPC, Commander, IO, PFS, PFSBackdoor, PFSClass, PFSNames, RefText, Rope, TrickleChargeP9813V411, XNSCH, XNSCHName, XNSStream
+~ BEGIN OPEN XNSRemoteFileTypes;
+GMT: TYPE = BasicTime.GMT;
+ROPE: TYPE = Rope.ROPE;
+STREAM: TYPE = IO.STREAM;
+PATH: TYPE = PFSNames.PATH;
+Version: TYPE = PFSNames.Version;
+FSHandle: TYPE = PFSClass.FSHandle;
+myFlavor: ATOM ¬ $TC;
+initialConnectionTTL: CARD ¬ 8;
+credentialsErrorTTL: CARD ¬ 30;
+xnsFlavor: ATOM ~ $TC;
+mo: PFSClass.MaintenanceProcs ~ NEW [PFSClass.MaintenanceProcsObject ¬ [
+sweep: TCSweep,
+validate: TCValidate
+]];
+fmo: PFSClass.FileManipulationProcs ~ NEW[PFSClass.FileManipulationProcsObject ¬ [
+delete: TCDelete,
+enumerateForInfo: TCEnumerateForInfo,
+enumerateForNames: TCEnumerateForNames,
+fileInfo: TCFileInfo,
+lookupName: TCLookup,
+rename: TCRename,
+copy: TCCopy,
+setAttributes: TCSetAttributes,
+setByteCountAndUniqueID: TCSetByteCountAndUniqueID,
+setClientProperty: TCSetClientProperty,
+getClientProperty: TCGetClientProperty,
+enumerateClientProperties: TCEnumerateClientProperties,
+read: TCRead,
+write: TCWrite,
+open: TCOpen,
+close: TCClose,
+store: TCStore,
+retrieve: TCRetrieve,
+-- attach: TCAttach,
+getInfo: TCGetInfo
+]];
+vfsClass: PFSClass.FSHandle ~ NEW [PFSClass.FSObject ¬ [
+flavor: xnsFlavor,
+name: NIL, -- filled in upon instantiation
+maintenanceProcs: mo,
+procs: fmo,
+data: NIL -- filled in upon instantiation
+]];
+TransportProc: TYPE ~ PROC; --  [tr: Transport];
+Transport: TYPE ~ REF TransportBody;
+TransportBody: TYPE ~ MONITORED RECORD [
+crH: CrRPC.Handle,
+vfs: VFS
+];
+
+VFS: TYPE ~ REF VFSInstance;
+VFSInstance: TYPE ~ RECORD [
+fs: ROPE,
+flavorSpecified: BOOL,
+sD: ServerData
+];
+
+ServerData: TYPE ~ REF ServerDataObject;
+ServerDataObject: TYPE ~ RECORD [
+qualified: XNSCHName.Name,
+serverName: ROPE,
+address: REF XNS.Address,
+opened: BOOL,
+version: INT16
+];
+
+dcedarVersion: INT16 ~ 311;		-- magic
+nullGMT: BasicTime.GMT ~ BasicTime.nullGMT;
+startTime: BasicTime.GMT ¬ BasicTime.Now[];
+startEnum: BasicTime.GMT ¬ BasicTime.nullGMT;
+endEnum: BasicTime.GMT ¬ BasicTime.nullGMT;
+startFileInfo: BasicTime.GMT ¬ BasicTime.nullGMT;
+endFileInfo: BasicTime.GMT ¬ BasicTime.nullGMT;
+startRetrieve: BasicTime.GMT ¬ BasicTime.nullGMT;
+endRetrieve: BasicTime.GMT ¬ BasicTime.nullGMT;
+TCDelete: PFSClass.DeleteProc = {
+PFSBackdoor.ProduceError[notImplemented, "Delete not allowed for TC servers"];
+};
+
+TCCopy: PFSClass.CopyProc = {
+PFSBackdoor.ProduceError[notImplemented, "Copy not allowed for TC servers"];
+};
+
+TCEnumerateForInfo: PFSClass.EnumerateForInfoProc ~ {
+P: PROC [file: PATH, bytes: INT, created: GMT, version: Version]
+RETURNS [continue: BOOL] = {
+continue ¬ proc[fullFName: file, attachedTo: NIL, uniqueID: MakeUID[created], bytes: bytes, mutability: immutable, fileType: PFS.tUnspecified]
+};
+InnerEnumerate[h, pattern, FALSE, P];
+};
+
+
+TCEnumerateForNames: PFSClass.EnumerateForNamesProc ~ {
+P: PROC [file: PATH, bytes: INT, created: GMT, version: Version]
+RETURNS [continue: BOOL] = {
+continue ¬ proc[file]
+};
+InnerEnumerate[h, pattern, TRUE, P];
+};
+
+EnumerateProc: TYPE ~ PROC [--file:-- PATH, --bytes:-- INT, --created:-- GMT,
+--version: -- Version] RETURNS [--continue:-- BOOL];
+
+InnerEnumerate: PROC [h: FSHandle, pattern: PATH, namesOnly: BOOL,
+proc: EnumerateProc] = {
+Listing: CrRPC.BulkDataSink = {
+name: ROPE;
+nameLength: INT16; -- if the name of the file is bigger than this we have a real problem.
+created: INT; -- really BasicTime.GMT LOOPHOLEd
+size: INT; -- number of bytes in the file
+version: Version;
+UNTIL IO.EndOf[self: s] DO
+continue: BOOL ¬ FALSE;
+i: INT ¬ 0;
+Proc: PROC RETURNS [c: CHAR] = {
+c ¬ IO.GetChar[self: s ! IO.EndOfStream => GOTO Error];
+EXITS Error => ERROR PFS.Error[[$environment, $brainDamage, "TC protocol error"]];
+};
+nameLength ¬ Basics.Int16FromH[IO.GetHWord[self: s ! IO.EndOfStream => EXIT]];
+created ¬ Basics.Int32FromF[IO.GetFWord[self: s ! IO.EndOfStream => GOTO Error]];
+size ¬ Basics.Int32FromF[IO.GetFWord[self: s ! IO.EndOfStream => GOTO Error]];
+name ¬ Rope.FromProc[len: nameLength, p: Proc];
+version ¬ VersionFromName[name: name];
+continue ¬ proc[--file:-- PFS.PathFromRope[name], --bytes:-- size, --created:-- LOOPHOLE[created], -- version: -- version];
+IF NOT continue THEN RETURN[TRUE];
+IF checkAbort[h] THEN RETURN[TRUE];
+ENDLOOP;
+RETURN[FALSE];
+EXITS Error => ERROR PFS.Error[[$environment, $brainDamage, "TC protocol error"]];
+};
+class: PFSClass.FSHandle ~ h;
+vfs: VFS ~ NARROW[class.data];
+data: ServerData ~ vfs.sD;
+crH: CrRPC.Handle ¬ GetConnection[data];
+patRope: ROPE ¬ PFS.RopeFromPath[pattern];
+toUse: ROPE ¬ IF data.version # dcedarVersion THEN patRope
+ELSE Rope.Cat["/", vfs.fs, patRope]; 
+{ -- for ENABLE --
+ENABLE UNWIND => { ReturnConnection[crH] };
+P: PROC = {
+TrickleChargeP9813V411.EnumerateForInfo[h: crH, pattern: toUse, info: Listing];
+ReturnConnection[crH];
+};
+startEnum ¬ BasicTime.Now[];
+CallProtected[proc: P, h: h, filePath: NIL, uid: PFS.nullUniqueID];
+endEnum ¬ BasicTime.Now[];
+};
+};
+
+TCGetInfo: PFSClass.GetInfoProc ~ {
+vfs: VFS ~ NARROW[h.data];
+fullFName ¬ file.fullFName;
+attachedTo ¬ file.attachedTo;
+uniqueID ¬ file.uniqueID;
+bytes ¬ file.bytes;
+mutability ¬ file.mutability;
+fileType ¬ file.fileType;
+};
+
+TCFileInfo: PFSClass.FileInfoProc = {
+class: PFSClass.FSHandle ~ h;
+vfs: VFS ~ NARROW[class.data];
+data: ServerData ~ vfs.sD;
+crH: CrRPC.Handle ¬ GetConnection[data];
+{ -- for ENABLE --
+ENABLE UNWIND => ReturnConnection[crH];
+P: PROC = {
+created: GMT;
+fullFName: ROPE; createInt: INT;
+fileRope: ROPE ¬ PFS.RopeFromPath[file];
+toUse: ROPE ¬ IF data.version # dcedarVersion THEN fileRope
+ELSE Rope.Cat["/", vfs.fs, fileRope]; 
+
+[fullFName: fullFName, bytes: bytes, created: createInt] ¬ TrickleChargeP9813V411.FileInfo[h: crH, name: toUse, wantedCreatedTime: LOOPHOLE[wantedUniqueID.egmt.gmt]];
+ReturnConnection[crH];
+version ¬ VersionFromName[name: fullFName];
+created ¬ LOOPHOLE[createInt];
+uniqueID ¬ MakeUID[created];
+mutability ¬ immutable;
+fileType ¬ PFS.tUnspecified;
+attachedTo ¬ NIL;
+};
+startFileInfo ¬ BasicTime.Now[];
+CallProtected[proc: P, h: h, filePath: file, uid: wantedUniqueID];
+endFileInfo ¬ BasicTime.Now[];
+};
+
+};
+
+TCRename: PFSClass.RenameProc = {
+PFSBackdoor.ProduceError[code: notImplemented,
+explanation: "Rename not allowed for TC servers"];
+};
+
+TCRetrieve: PFSClass.RetrieveProc ~ {
+class: PFSClass.FSHandle ~ h;
+vfs: VFS ~ NARROW[class.data];
+data: ServerData ~ vfs.sD;
+crH: CrRPC.Handle ¬ GetConnection[data];
+localStream: STREAM ¬ NIL;
+Content: CrRPC.BulkDataSink = {
+buffer: REF TEXT = RefText.ObtainScratch[512];
+nBytes: NAT;
+abort ¬ FALSE;
+DO
+IF s.EndOf[] THEN EXIT;	-- seems to end this way sometimes
+nBytes ¬ s.GetBlock[buffer, 0];
+IF nBytes = 0 THEN EXIT;
+localStream.PutBlock[buffer, 0, nBytes];
+ENDLOOP;
+RefText.ReleaseScratch[buffer];
+};
+{ -- for ENABLE --
+ENABLE UNWIND => ReturnConnection[crH];
+P: PROC = {
+version: Version; bytes: INT; created: GMT;
+fullFName: ROPE; createInt: INT;
+fileRope: ROPE ¬ PFS.RopeFromPath[file];
+toUse: ROPE ¬ IF data.version # dcedarVersion THEN fileRope
+ELSE Rope.Cat["/", vfs.fs, fileRope]; 
+[fullFName: fullFName, bytes: bytes, created: createInt] ¬ TrickleChargeP9813V411.FileInfo[h: crH, name: toUse, wantedCreatedTime: LOOPHOLE[wantedUniqueID.egmt.gmt]];
+version ¬ VersionFromName[name: fullFName];
+created ¬ LOOPHOLE[createInt];
+localStream ¬ proc[file, bytes, MakeUID[created]];
+IF localStream # NIL THEN
+TrickleChargeP9813V411.Retrieve[h: crH, name: toUse, wantedCreatedTime: LOOPHOLE[wantedUniqueID.egmt.gmt], data: Content];
+ReturnConnection[crH];
+};
+startRetrieve ¬ BasicTime.Now[];
+CallProtected[proc: P, h: h, filePath: file, uid: wantedUniqueID];
+endRetrieve ¬ BasicTime.Now[];
+};
+};
+
+TCStore: PFSClass.StoreProc = {
+PFSBackdoor.ProduceError[code: notImplemented,
+explanation: "Store not allowed for TC servers"];
+};
+
+TCSetAttributes: PFSClass.SetAttributesProc = {
+PFSBackdoor.ProduceError[code: notImplemented,
+explanation: "SetAttributes not allowed for TC servers"];
+};
+
+TCSetByteCountAndUniqueID: PFSClass.SetByteCountAndUniqueIDProc = {
+PFSBackdoor.ProduceError[code: notImplemented,
+explanation: "SetByteCountAndUniqueID not allowed for TC servers"];
+};
+
+TCSetClientProperty: PFSClass.SetClientPropertyProc = {
+PFSBackdoor.ProduceError[code: notImplemented,
+explanation: "SetClientProperty not allowed for TC servers"];
+};
+
+TCGetClientProperty: PFSClass.GetClientPropertyProc = {
+PFSBackdoor.ProduceError[code: notImplemented,
+explanation: "GetClientProperty not allowed for TC servers"];
+};
+
+TCEnumerateClientProperties: PFSClass.EnumerateClientPropertiesProc = {
+PFSBackdoor.ProduceError[code: notImplemented,
+explanation: "EnumerateClientProperties not allowed for TC servers"];
+};
+
+TCRead: PFSClass.ReadProc = {
+bytesRead ¬ 0;
+PFSBackdoor.ProduceError[code: notImplemented,
+explanation: "Read not allowed for TC servers"];
+};
+
+TCWrite: PFSClass.WriteProc = {
+bytesWritten ¬ 0;
+PFSBackdoor.ProduceError[code: notImplemented,
+explanation: "Write not allowed for TC servers"];
+};
+
+TCOpen: PFSClass.OpenProc = {
+PFSBackdoor.ProduceError[code: notImplemented,
+explanation: "Open not allowed for TC servers"];
+RETURN[NIL];
+};
+
+TCClose: PFSClass.CloseProc = {
+PFSBackdoor.ProduceError[code: notImplemented,
+explanation: "Close not allowed for TC servers"];
+};
+
+TCLookup: PFSClass.LookupNameProc = {
+PFSBackdoor.ProduceError[code: notImplemented,
+explanation: "LookupName not allowed for TC servers"];
+RETURN[file];
+};
+
+MakeUID: PROC[gmt: GMT] RETURNS[uid: PFS.UniqueID] =
+{ uid.egmt.gmt ¬ gmt };
+
+EnsureOneLeadingSlash: PROC [maybeWithSlash: ROPE]
+RETURNS [withSlash: ROPE] ~ {
+IF ( maybeWithSlash.Fetch[0] # '/ ) THEN RETURN[Rope.Concat["/", maybeWithSlash] ];
+IF ( maybeWithSlash.Fetch[1] # '/ ) THEN RETURN[maybeWithSlash];
+RETURN[maybeWithSlash.Substr[1]];
+};
+
+RemoveLeadingSlash: PROC [maybeWithSlash: ROPE]
+RETURNS [noSlash: ROPE] ~ {
+noSlash ¬ IF ( maybeWithSlash.Fetch[0] = '/ ) THEN maybeWithSlash.Substr[1] ELSE maybeWithSlash;
+};
+
+ConvertFSNameToXNS: PROC [file: ROPE, op: Op] RETURNS [ROPE] = {
+AddChar: PROC [c: CHAR] = {text[text.length] ¬ c; text.length ¬ text.length + 1};
+name, versionR: ROPE ¬ NIL;
+text: REF TEXT ¬ RefText.ObtainScratch[nChars: 200];
+text.length ¬ 0;
+FOR i: INT IN [0 .. Rope.Length[file]) DO
+c: CHAR ~ Rope.Fetch[base: file, index: i];
+SELECT c FROM
+'< => LOOP; -- throw the < away.
+'> => AddChar['/];  -- the XNS server uses / as a file separator
+'* => {AddChar[c]; AddChar[c]};  -- kludge to handle *
+'! => { -- the version part is next
+versionR ¬ Rope.Substr[base: file, start: i]; -- the whole version including the !
+EXIT;
+};
+ENDCASE => AddChar[c];
+ENDLOOP;
+IF versionR # NIL THEN {
+SELECT Rope.Length[versionR] FROM
+0 => versionR ¬ NIL; -- no version specified
+1 => -- the version rope is just a ! so do the 'default' -- {
+SELECT op FROM
+delete => versionR ¬ "!-"; -- lowest
+enumerate, enumerateNames => versionR ¬ NIL;
+rename, retrieve => versionR ¬ "!+"; -- highest
+store => versionR ¬ "!+"; -- is this right?
+ENDCASE => ERROR; -- can't happen 
+};
+2 => { -- is it H, L or *?
+SELECT Rope.Fetch[versionR, 1] FROM
+'h, 'H => versionR ¬ "!+";
+'l, 'L => versionR ¬ "!-";
+'* => versionR ¬ NIL;
+ENDCASE => NULL;
+};
+ENDCASE => NULL;
+};
+name ¬ Rope.Concat[base: Rope.FromRefText[s: text], rest: versionR];
+RefText.ReleaseScratch[t: text];
+RETURN[name];
+};
+GetConnection: PUBLIC PROC [data: ServerData] RETURNS [crH: CrRPC.Handle] = {
+crH ¬ CrRPC.CreateClientHandle[$CMUX, data.address ! CrRPC.Error => MakeCrRPCError[errorReason, text]];
+};
+
+ReturnConnection: PUBLIC PROC [crH: CrRPC.Handle] = {
+IF crH # NIL THEN CrRPC.DestroyClientHandle[crH ! CrRPC.Error => CONTINUE];
+};
+TCGetServer: PFSClass.GetHandleProc ~ {
+vfs: VFS ~ NEW[VFSInstance ¬ [fs: fs, flavorSpecified: flavorSpecified, sD: NIL] ];
+data: ServerData;
+session: REF Session;
+qualified: XNSCHName.Name; address: REF XNS.Address; name: ROPE;
+crH: CrRPC.Handle;
+opened: BOOL ¬ FALSE;
+version: INT16 ¬ 0;
+downMsg ¬ "can\'t connect";
+{
+ENABLE {
+CrRPC.Error => {downMsg ¬ IO.PutFR["CrRPC Error: %g, %g", [rope[crRPCErrorRopes[errorReason]]], [rope[text]]]; CONTINUE};
+TrickleChargeP9813V411.Error => {downMsg ¬ IO.PutFR1["Server reports %g", [rope[description]]]; CONTINUE};
+};
+add: XNS.Address;
+[qualified, add] ¬ XNSCH.LookupAddressFromRope[fs];
+IF add = XNS.unknownAddress THEN -- host not known -- RETURN[NIL, NIL];
+name ¬ XNSCHName.RopeFromName[qualified];
+add.socket ¬ XNSWKS.courier;
+address ¬ NEW[XNS.Address ¬ add];
+crH ¬ CrRPC.CreateClientHandle[$CMUX, address];
+version ¬ TrickleChargeP9813V411.AnyBodyHome[h: crH];
+CrRPC.DestroyClientHandle[crH];
+opened ¬ TRUE;
+};
+IF NOT opened THEN RETURN [NIL, downMsg];
+data ¬ NEW[ServerDataObject ¬ [qualified: qualified, serverName: name, address: address, opened: opened, version: version]];
+vfs.sD ¬ data;
+h ¬ NEW[PFSClass.FSObject ¬ vfsClass­];
+h.name ¬ fs;
+h.data ¬ vfs;
+RETURN [h, NIL];
+};
+
+TCSweep: PFSClass.SweepProc -- [h: FSHandle, seconds: CARD] -- ~ {
+};
+
+TCValidate: PFSClass.ValidateProc ~ {
+class: PFSClass.FSHandle ~ h;
+vfs: VFS ~ NARROW[class.data];
+data: ServerData ~ vfs.sD;
+RETURN [FALSE, NIL];
+};
+
+CallProtected: PUBLIC PROC[proc: PROC, h: FSHandle, filePath: PATH, uid: PFS.UniqueID] ~ {
+time: GMT ~ uid.egmt.gmt;
+file: ROPE ~ PFS.RopeFromPath[filePath];
+gName: ROPE ~ Rope.Cat["[", h.name, "]", file];
+quotedGName: ROPE ~ Rope.Cat["\"", gName, "\""];
+{ -- for ENABLE
+ENABLE {
+XNSStream.ConnectionClosed => PFSBackdoor.ProduceError[resourceLimitExceeded, IO.PutFR1["Server for %g closed the connection.", [rope[quotedGName]]]]; --???
+
+CrRPC.Error => MakeCrRPCError[errorReason, text];
+IO.EndOfStream => ERROR PFS.Error[[environment, $unexpectedClose,
+IO.PutFR1["Server for %g closed the connection.", [rope[quotedGName]]]]];
+IO.Error => ERROR PFS.Error[[bug, $unexpectedError,
+IO.PutFR1["File: %g unexpected IO.Error.", [rope[quotedGName]]]]];
+TrickleChargeP9813V411.Error => ERROR PFS.Error[[environment, $notSure,
+IO.PutFR["Server for %g reported %g.", [rope[quotedGName]], [rope[description]]]]];
+TrickleChargeP9813V411.FileNotFound => UnknownFile[gName, time];
+PFSClass.Error => ERROR PFS.Error[[environment, code, msg]];
+};
+proc[ ! XNSStream.Timeout => RESUME]; -- since the timeout is retryable
+};
+};
+
+VersionFromName: PROC[name: ROPE] RETURNS[Version] = {
+path: PATH ~ PFS.PathFromRope[name];
+RETURN[PFSNames.ShortName[path].version];
+};
+
+UnknownFile: PUBLIC PROC[name: ROPE, createdTime: GMT] = {
+IF createdTime = nullGMT
+THEN PFSBackdoor.ProduceError[unknownFile, IO.PutFR1["Could not find %g", [rope[name]]] ]
+ELSE 
+PFSBackdoor.ProduceError[unknownUniqueID, IO.PutFR["Could not find \"%g\" created on %t", [rope[name]], [time[createdTime]]]];
+};
+
+REQUIREDROPE: TYPE ~ ROPE ¬;
+crRPCErrorRopes: REF ARRAY CrRPC.ErrorReason OF REQUIREDROPE ~
+NEW[ARRAY CrRPC.ErrorReason OF REQUIREDROPE ¬ [
+unknown: "Unknown",
+unknownClass: "unknownClass",
+courierVersionMismatch: "courierVersionMismatch",
+rejectedNoSuchProgram: "rejectedNoSuchProgram",
+rejectedNoSuchVersion: "rejectedNoSuchVersion",
+rejectedNoSuchProcedure: "rejectedNoSuchProcedure",
+rejectedInvalidArgument: "rejectedInvalidArgument",
+rejectedUnspecified: "rejectedUnspecified",
+remoteError: "remoteError",
+cantConnectToRemote: "Can't Connect To Remote",
+argsError: "Args Error",
+resultsError: "Results Error",
+bulkDataError: "Bulk DataError",
+protocolError: "Protocol Error",
+remoteClose: "Remote Close",
+communicationFailure: "Communication Failure",
+notImplemented: "notImplemented",
+unknownOperation: "unknownOperation",
+notServerHandle: "notServerHandle",
+notClientHandle: "notClientHandle",
+addressInappropriateForClass: "addressInappropriateForClass",
+other: "Other"
+]];
+
+MakeCrRPCError: PROC [errorReason: CrRPC.ErrorReason, text: ROPE] = {
+r: ROPE ~ IO.PutFR["CrRPC Error: %g, %g", [rope[crRPCErrorRopes[errorReason]]], [rope[text]]];
+ERROR PFS.Error[[$environment, $CrRPCError, r]];
+};
+
+FromPath: PROC[p: PFS.PATH] RETURNS[ROPE] ~
+{ RETURN[PFS.RopeFromPath[p]] };
+
+nullGMTRope: ROPE ~ "nullGMT";
+
+TCStats: Commander.CommandProc ~ {
+cmd.out.PutF1["***** Client started at %g\n", [time[startTime]] ];
+cmd.out.PutF["startEnum: %g\n\t enumEnd: %g\n",
+IF startEnum = BasicTime.nullGMT THEN [rope[nullGMTRope]] ELSE [time[startEnum]],
+IF endEnum = BasicTime.nullGMT THEN [rope[nullGMTRope]] ELSE [time[endEnum]] ];
+cmd.out.PutF["startFileInfo: %g\n\t enumEnd: %g\n",
+IF startFileInfo = BasicTime.nullGMT THEN [rope[nullGMTRope]] ELSE [time[startFileInfo]],
+IF endFileInfo = BasicTime.nullGMT THEN [rope[nullGMTRope]] ELSE [time[endFileInfo]] ];
+cmd.out.PutF["startRetrieve: %g\n\t endRetrieve: %g\n",
+IF startRetrieve = BasicTime.nullGMT THEN [rope[nullGMTRope]] ELSE [time[startRetrieve]],
+IF endRetrieve = BasicTime.nullGMT THEN [rope[nullGMTRope]] ELSE [time[endRetrieve]] ];
+};
+Init: PROC = {
+PFSClass.Register[myFlavor, TCGetServer];
+};
+
+Init[];
+Commander.Register["TCStats", TCStats, "Statistics about the TrickleChargeClient"];
+
+
+END.
+   	¤  
+TrickleChargeRemoteFileImpl.mesa
+Copyright Ó 1989, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Tim Diebert: September 19, 1989 7:19:19 am PDT
+Willie-s, September 10, 1992 5:34 pm PDT
+Copied Types
+Parameters
+PFS Class name
+Maintenance Object
+File Manipulation Object
+Initialized Data - order is important!
+Transport Management
+TC Virtual File System(s)
+Server cache 
+Copied Constants
+helpful variables
+Procs to provide PFS view
+[h: FSHandle, pattern: PATH, proc: PFS.InfoProc, lbound: PATH, hbound: PATH]
+InfoProc: TYPE ~ PROC [fullFName, attachedTo: PATH, uniqueID: UniqueID, bytes: INT, mutability: Mutability, fileType: FileType]RETURNS [continue: BOOL _ TRUE];
+[h: FSHandle, pattern: PATH, proc: PFS.NameProc, lbound: PATH, hbound: PATH]
+NameProc: TYPE ~ PROC [name: PATH] RETURNS [continue: BOOL _ TRUE;
+[h: CrRPC.Handle, s: STREAM, checkAbort: CrRPC.BulkDataCheckAbortProc] RETURNS [abort: BOOL]
+we need to prefix names with leadingDir, so that full path names are returned - this is a PFS thing
+h: FSHandle, file: OpenFile] RETURNS [fullFName, attachedTo: PATH, uniqueID: UniqueID, bytes: INT, mutability: PFS.Mutability, fileType: PFS.FileType
+Generic Implementation
+TCFileInfo: PFSClass.FileInfoProc = {
+mutability _ immutable;		-- to keep mimosa happy
+bytes _ 0;
+fileType _ PFS.tUnspecified;
+PFSBackdoor.ProduceError[code: notImplemented,
+explanation: "FileInfo not allowed for TC servers"];
+};
+
+[h: FSHandle, file: PATH, wantedUniqueID: UniqueID]RETURNS [version: Version, attachedTo: PATH, bytes: INT, uniqueID: UniqueID, mutability: PFS.Mutability, fileType: PFS.FileType]
+[h: FSHandle, file: PATH, wantedUniqueID: UniqueID, proc: PFS.RetrieveConfirmProc, checkFileType: BOOL _ FALSE, fileType: PFS.FileType]
+RetrieveConfirmProc: TYPE ~ PROC [fullFName: PATH, bytes: INT, uniqueID: UniqueID]RETURNS [STREAM];
+[h: CrRPC.Handle, s: STREAM, checkAbort: CrRPC.BulkDataCheckAbortProc] RETURNS [abort: BOOL]
+Utilities
+assume no more than 2 leading //'s
+Connection management
+Registered with PFSClass
+[fs: ROPE, flavorSpecified: BOOL] RETURNS [h: FSHandle, downMsg: ROPE]
+Returns [NIL, NIL] if server doesn't exist.
+Returns [NIL, msg] if server exists but is down.
+The flavorSpecified parameter is ignored.
+doesn't need to do anything
+vfs: VFS ~ NARROW[h.data];
+data: ServerData ~ vfs.sD;
+session: REF Session ¬ NIL; address: REF XNS.Address;
+[h: FSHandle] RETURNS [obsolete: BOOL, downMsg: ROPE]
+Error Reporting and Catching
+Initialization
+ Ê›  –(cedarcode) style•NewlineDelimiter
+™ ™ Icodešœ
+Ïeœ=™HK™.K™(—K˜ šÏk	˜	Kšœžœžœžœ˜4Kšœ
+žœžœ˜$Kšœžœ˜Kšœ
+žœ˜(KšœžœU˜`K˜Kšžœ˜Kšžœ˜Kšœžœ˜,K˜	K˜	K˜K˜KšœžœJ˜fKšžœžœ˜$Kšžœžœ˜$Kšœ
+žœ˜%K˜Kšœ
+žœ˜,Kšžœžœ˜—K˜ K˜ KšÐlnœžœž˜*Kšžœ&žœžœJžœ˜™šœžœžœ˜ head™Icode1šžœžœžœ˜Mšžœžœžœ˜Mšžœžœžœžœ˜Mšžœžœžœ˜Mšœ	žœ˜!Mšœ
+žœ˜#—™
+Mšœ
+žœ˜Mšœžœ˜Mšœžœ˜—šÏz™KšÏb	œžœ˜—š ™š¡œžœ%˜HK˜K˜K˜——š ™š¡œ#žœ)˜RK˜K˜%K˜'K˜K˜K˜K˜K˜K˜3K˜'K˜'K˜7K˜K˜K˜K˜K˜K˜K˜K˜K˜——š &™&š¡œžœ˜8Kšœ¡	œ˜KšœžœÏc˜*Kšœ¡œ˜Kšœ¡œ˜Kšœžœ¢˜)K˜——š ™Kšœžœžœ¢˜0Kšœžœžœ˜$šœžœž	œžœ˜(K˜Kšœž˜K˜K˜ ——š ™Kšžœžœžœ˜šœžœžœ˜Kšœžœ˜	Kšœžœ˜K˜K˜K˜ ——head2™Kšœžœžœ˜(šœžœžœ˜!K˜Kšœžœ˜Kšœ	žœžœ	˜Kšœž˜Kšœ	ž˜K˜K˜ —Kšœžœ	¢˜%—™Mšœžœ˜+—™Mšœžœ˜+Mšœžœ˜-Mšœžœ˜+Mšœžœ˜1Mšœžœ˜/Mšœžœ˜1Mšœžœ˜/—™•StartOfExpansionl -- [h: RemoteFile.ServerHandle, file: ROPE, wantedCreatedTime: GMT, proc: FSRemoteFileBackdoor.ConfirmProc]šÏnœ˜!K–3[code: FSBackdoor.ErrorCode, explanation: ROPE]˜NK˜K˜ —–l -- [h: RemoteFile.ServerHandle, file: ROPE, wantedCreatedTime: GMT, proc: FSRemoteFileBackdoor.ConfirmProc]š£œ˜K–3[code: FSBackdoor.ErrorCode, explanation: ROPE]˜LK˜—Icode2˜ š£œ#˜5Ošœ9žœ
+žœ™LKšœ
+žœžœžœžœ.žœžœžœ™ š£œžœžœ	žœžœžœžœ˜]Kšœ-žœ^˜ŽK˜—Ošœžœ˜%O˜O˜ —O˜ š£œ$˜7Oš	œžœžœžœ
+žœ™LKšœ
+žœžœžœžœžœžœ™Bš£œžœžœ	žœžœžœžœ˜]K˜K˜—Ošœžœ˜$Ošœž˜—O˜ šœžœžœ¢	œžœ¢
+œžœ¢œžœ¢œ
+žœ¢œžœ˜‚K˜ —–› -- [h: RemoteFile.ServerHandle, file: ROPE, wantedCreatedTime: GMT] RETURNS [version: FSBackdoor.Version, bytes: INT, created: GMT, fileType: FS.FileType]š£œžœžœžœ˜[–` -- [h: CrRPC.Handle, s: STREAM, checkAbort: CrRPC.BulkDataCheckAbortProc] RETURNS [abort: BOOL]š£œ˜KšÐck\™\Kšœžœ˜Kšœžœ¢F˜YKšœ	žœ¢!˜/Kšœžœ¢˜)K˜–[self: STREAM]šžœžœž˜K–[self: STREAM]šœ
+žœžœ˜Kšœžœ˜š£œžœžœžœ˜ K–[self: STREAM]šœžœžœžœ˜7Kšžœ
+žœžœ:˜RK˜—Kšœžœžœžœ˜NK–[self: STREAM]šœžœžœžœ	˜QK–[self: STREAM]šœžœžœžœ	˜NK–[len: INT, p: PROC˜/K˜&Kšœ¢	œžœ¢
+œ¢œžœ¢œ
+˜{Kš
+žœžœ
+žœžœžœ˜"Kšžœžœžœžœ˜#Kšžœ˜—Kšžœžœ˜Kšžœ
+žœžœ:˜RK˜—K˜Kšœžœžœ˜K˜K™cO˜(Ošœ	žœžœ˜*Oš	œžœžœžœ	žœ!˜`šœ¢ž¢˜Kšžœžœ˜+š£œžœ˜K˜OO˜O˜—O˜Ošœ'žœžœ˜CO˜K˜—K˜—O˜ š£	œ˜#Kšœžœžœžœ4™•Kšœžœžœ	˜O™Ošœžœ
+˜Ošœžœ˜K˜K˜K˜Kšœžœ	˜K˜—O˜ –x -- [h: RemoteFile.ServerHandle, fromFile: ROPE, fromCreated: GMT, toFile: ROPE, proc: FSRemoteFileBackdoor.ConfirmProc]š£
+œ™%Ošœ¢™0O™
+Ošœžœ™O™cO™O™ —–x -- [h: RemoteFile.ServerHandle, fromFile: ROPE, fromCreated: GMT, toFile: ROPE, proc: FSRemoteFileBackdoor.ConfirmProc]š£
+œ˜%OšœžœCžœ	žœ"žœžœ
+™´K˜Kšœžœžœ˜K˜O˜(šœ¢ž¢˜Kšžœžœ˜'š£œžœ˜Kšœ	žœ˜Ošœžœžœ˜ Ošœ
+žœžœ˜(Oš	œžœžœžœ
+žœ"˜bO˜ Ošœƒžœ˜¦O˜O–9[base: ROPE, start: INT _ 0, len: INT _ 2147483647]˜+Ošœ
+žœ˜O˜O˜Ošœžœ˜Ošœžœ˜O˜—O˜ O˜BO˜K˜—O˜ O˜O˜ —–x -- [h: RemoteFile.ServerHandle, fromFile: ROPE, fromCreated: GMT, toFile: ROPE, proc: FSRemoteFileBackdoor.ConfirmProc]š£œ˜!O˜aO˜—O˜ š£
+œ˜%Ošœžœ"žœ%žœžœžœ
+™‡Kšœžœžœžœ	žœžœžœ™dK˜Kšœžœžœ˜K˜O˜(Ošœžœžœ˜–´[h: CrRPC.Handle, attributes: FilingAttributesP10V5.AttributeSequence, directory: FilingP10V5.Handle, controls: FilingP10V5.ControlSequence, session: FilingP10V5.Session]š£œ˜Oš¤\™\Kšœžœžœ˜.Kšœžœ˜Kšœžœ˜šž˜Kšžœžœžœ¢"˜:K˜Kšžœžœžœ˜K˜(Kšžœ˜—K˜O˜—šœ¢ž¢˜Kšžœžœ˜'š£œžœ˜Kšœžœžœ˜+Ošœžœžœ˜ Ošœ
+žœžœ˜(Oš	œžœžœžœ
+žœ"˜bOšœƒžœ˜¦O–9[base: ROPE, start: INT _ 0, len: INT _ 2147483647]˜+Ošœ
+žœ˜K˜2šžœžœž˜K–n[h: CrRPC.Handle, file: FilingP10V5.Handle, content: CrRPC.BulkDataSink, session: FilingP10V5.Session]šœHžœ*˜z—O˜O˜—O˜ O˜BO˜K˜—O˜O˜ —–o -- [h: RemoteFile.ServerHandle, file: ROPE, str: STREAM, created: GMT, proc: FSRemoteFileBackdoor.ConfirmProc]š£œ˜O˜`O˜—O–F -- [h: RemoteFile.ServerHandle, file: ROPE, newFileType: FS.FileType]˜ –F -- [h: RemoteFile.ServerHandle, file: ROPE, newFileType: FS.FileType]š£œ ˜/O˜hO˜O˜ —–F -- [h: RemoteFile.ServerHandle, file: ROPE, newFileType: FS.FileType]š£œ*˜CO˜rO˜O˜ —–F -- [h: RemoteFile.ServerHandle, file: ROPE, newFileType: FS.FileType]š£œ$˜7O˜lO˜O˜ —–F -- [h: RemoteFile.ServerHandle, file: ROPE, newFileType: FS.FileType]š£œ$˜7O˜lO˜O˜ —–F -- [h: RemoteFile.ServerHandle, file: ROPE, newFileType: FS.FileType]š£œ,˜GO˜tO˜O˜ —–F -- [h: RemoteFile.ServerHandle, file: ROPE, newFileType: FS.FileType]š£œ˜O˜O˜_O˜O˜ —–F -- [h: RemoteFile.ServerHandle, file: ROPE, newFileType: FS.FileType]š£œ˜O˜O˜`O˜O˜ —–F -- [h: RemoteFile.ServerHandle, file: ROPE, newFileType: FS.FileType]š£œ˜O˜_Ošžœžœ˜O˜O˜ —–F -- [h: RemoteFile.ServerHandle, file: ROPE, newFileType: FS.FileType]š£œ˜O˜`O˜O˜ —–F -- [h: RemoteFile.ServerHandle, file: ROPE, newFileType: FS.FileType]š£œ˜%O˜eOšžœ˜O˜O˜ —š
+£œžœžœžœžœ˜4K˜—O˜ —N™	š
+£œžœžœžœžœ˜PK™"Kšžœ"žœžœ$˜SKšžœ"žœžœ˜@Kšžœ˜!K˜K˜ —š
+£œžœžœžœžœ˜KKšœ
+žœ"žœžœ˜`K˜K˜ —š
+£œžœžœ
+žœžœ˜@K–[nChars: NAT]š£œžœžœ;˜QKšœžœžœ˜Kšœžœžœ&˜4K˜šžœžœžœž˜)K– [base: ROPE, index: INT _ 0]šœžœ$˜+šžœž˜Kšœžœ¢˜ Kšœ¢,˜@Kšœ!¢˜6šœ¢˜#K–9[base: ROPE, start: INT _ 0, len: INT _ 2147483647]šœ.¢$˜RKšžœ˜K˜—Kšžœ˜—Kšžœ˜—šžœžœžœ˜šžœž˜!Kšœžœ¢˜,šœ¢6œ˜=šžœž˜Kšœ¢	˜$Kšœ(žœ˜,Kšœ%¢
+˜/Kšœ¢˜+Kšžœžœ¢˜"—K˜—šœ¢˜šžœž˜#K˜K˜Kšœžœ˜Kšžœžœ˜—K˜—Kšžœžœ˜—K˜—K–([base: ROPE _ NIL, rest: ROPE _ NIL]˜DK–[t: REF TEXT]˜ Kšžœ˜K˜—™š£œžœžœžœ˜MK˜gK˜—K˜ š£œžœžœ˜5Kšžœžœžœ0žœ˜KK˜——™š£œ˜'Kš	œžœžœžœžœ™FKšœ	žœžœ™+Kšœ	žœ$™0Kšœœ™)Kšœžœžœ>žœ˜SK˜Kšœ	žœ	˜Kšœ$žœžœžœ˜@K˜Kšœžœžœ˜Kšœ	žœ˜K˜˜šžœ˜KšœžœSžœ˜yKšœ+žœ3žœ˜jK˜—Kšœžœ	˜Kšœžœ˜3Kšžœžœžœ¢œžœžœžœ˜GK˜)Kšœžœ	˜Kšœ
+žœžœ˜!K˜/K˜5K˜Kšœ	žœ˜K˜—Kš
+žœžœžœžœžœ˜)Kšœžœr˜|K˜Kšœžœ¡œ˜'K˜K˜Kšžœžœ˜K˜K˜ —š£œ¢Ïi¢œ˜BK™Kšœžœžœ	™K™Kš	œ	žœžœžœžœ	™5K˜K˜ —š£
+œ˜%K™5K˜Kšœžœžœ˜K˜Kšžœžœžœ˜K˜K˜ ——™š£œžœžœžœžœžœ˜ZKšœžœ˜Kšœžœžœ˜(Kšœžœ$˜/Ošœžœ˜0šœ¢¤˜šžœ˜KšœNžœG¢˜œK˜ K˜1Kšžœžœžœ'žœG˜‹Kšžœ
+žœžœžœ@˜vKšœ žœžœžœQ˜›K˜@Kšœžœžœ!˜<K˜—Kšœžœ¢!˜GK˜—K˜K˜ —š£œžœžœžœ˜6Kšœžœžœ˜$Kšžœ#˜)K˜—K˜ š
+£œžœžœžœžœ˜:šžœ˜Ošžœ'žœ,˜Yšžœ˜Ošœ*žœR˜~——K˜K˜ —Kšžœžœžœ˜š	œžœžœžœžœ˜>šžœžœžœžœ˜/K˜K˜K˜1K˜/K˜/K˜3K˜3K˜+K˜K˜/K˜K˜K˜ K˜ K˜K˜.K˜!K˜%K˜#K˜#K˜=K˜K˜K˜ ——š£œžœ(žœ˜EKšœžœžœR˜^Kšžœžœ'˜0K˜K˜ —š£œžœžœžœžœžœ˜+Kšœžœžœ˜ K˜ —šœžœ˜K˜ —š£œ˜"K˜B˜/Kšžœžœžœ˜QKšžœžœžœ˜O—˜3Kšžœ#žœžœ˜YKšžœ!žœžœ˜W—˜7Kšžœ#žœžœ˜YKšžœ!žœžœ˜W—K˜——™š£œžœ˜K˜)K˜K˜ —K˜K˜S—K˜ —K˜ Kšžœ˜— …—    D–  kÕ  

@@ -1,0 +1,1157 @@
+DIRECTORY
+Ascii USING [CR, LF, Lower],
+Atom USING [MakeAtom],
+Char USING [XCHAR, Widen],
+Convert USING [Error, IntFromRope],
+InstallationBasicComforts USING [BasicModuleName, BasicProcFromNamedInterface],
+Menus USING [Menu, MenuEntry, MenuProc, SetLine],
+MessageWindow USING [Append, Blink, Clear],
+NodeProps USING [GetProp, NullCopy, NullRead, NullWrite, PutProp, Register],
+NodeReader USING [Ref, New, Free, FetchChar, Size],
+PFS,
+PFSNames,
+Rope USING [Concat, Equal, Fetch, Flatten, Find, Match, ROPE, Size, SkipTo, Substr, Translate],
+TEditDisplay USING [EstablishLine],
+TEditDocument USING [maxClip, Selection, SpinAndLock, TEditDocumentData, Unlock],
+TEditDocumentPrivate USING [findMenu, FindUnsavedDocument, InitViewerDoc, InitViewerDocInternal, levelMenu, PositionHistory, RecordUnsavedDocument],
+TEditInput USING [CurrentEvent, FreeTree],
+TEditInputOps USING [WaitForInsertToFinish],
+TEditOps USING [FileNameProc],
+TEditProfile USING [DefaultMenuChoice, implExtensions, menu1, menu2, menu3, openFirstLevelOnly, sourceExtensions, tryVersionMap],
+TEditSelection USING [FindRope, fSel, LockSel, MakeSelection, pSel, sSel, UnlockSel],
+TEditSelectionOps USING [ShowGivenPosition],
+TextEdit USING [PutProp],
+TextNode USING [FirstChild, Location, LocNumber, LocWithin, nullLocation, Ref, Root],
+ViewerClasses USING [Column, Viewer],
+ViewerForkers USING [CallBack, ForkCall, ForkPaint],
+ViewerGroupLocks USING [CallRootAndLinksUnderWriteLock],
+ViewerLocks USING [CallUnderColumnLocks],
+ViewerOps USING [AddProp, BlinkViewer, CloseViewer, ComputeColumn, CreateViewer, DestroyViewer, EnumerateViewers, EnumProc, EstablishViewerPosition, FetchProp, MoveBelowViewer, OpenIcon, PaintHint, PaintViewer, SaveViewer],
+ViewerPrivate USING [AcquireWriteLocks, ReleaseWriteLocks],
+ViewerTools USING [GetContents, GetSelectionContents, SelPos, SelPosRec, SetSelection];
+
+TEditDocuments2Impl: CEDAR MONITOR
+IMPORTS Atom, Ascii, Char, Convert, InstallationBasicComforts, Menus, MessageWindow, NodeProps, NodeReader, PFS, PFSNames, Rope, TEditDocument, TEditDocumentPrivate, TextEdit, TextNode, TEditDisplay, TEditInput, TEditInputOps, TEditProfile, TEditSelection, TEditSelectionOps, ViewerForkers, ViewerGroupLocks, ViewerLocks, ViewerOps, ViewerPrivate, ViewerTools
+EXPORTS TEditDocument, TEditDocumentPrivate, TEditOps
+= BEGIN
+
+PATH: TYPE = PFS.PATH;
+ROPE: TYPE = Rope.ROPE;
+Viewer: TYPE = ViewerClasses.Viewer;
+Column: TYPE = ViewerClasses.Column;
+File: TYPE = PFS.OpenFile;
+noFile: File = PFS.nullOpenFile;
+
+initialCaret: ViewerTools.SelPos ¨ NEW[ViewerTools.SelPosRec ¨ []];
+
+ColumnOf: PROC [parent: Viewer] RETURNS [Column] = {
+RETURN [IF parent # NIL THEN parent.column ELSE left] 
+};
+
+ForceInitialCaret: PROC [viewer: Viewer] = {
+ViewerTools.SetSelection[viewer, initialCaret];
+};
+
+lastRoot: TextNode.Ref;
+lastViewer: Viewer;
+
+GetViewerForRootI: INTERNAL PROC [root: TextNode.Ref] RETURNS [viewer: Viewer] = {
+IF root = NIL THEN RETURN [NIL];
+IF root = lastRoot THEN RETURN [lastViewer];
+lastRoot ¨ root;
+RETURN [lastViewer ¨ NARROW[NodeProps.GetProp[root,$Viewer]]];
+};
+
+RecordViewerForRootI: INTERNAL PROC [viewer: Viewer, root: TextNode.Ref] = {
+NodeProps.PutProp[root,$Viewer,viewer];
+IF root = lastRoot THEN lastViewer ¨ viewer; -- keep the cache up to date
+};
+
+GetViewerForRoot: PUBLIC ENTRY PROC [root: TextNode.Ref] RETURNS [viewer: Viewer] = {
+ENABLE UNWIND => NULL;
+RETURN [GetViewerForRootI[root]];
+};
+
+RecordViewerForRoot: PUBLIC ENTRY PROC [viewer: Viewer, root: TextNode.Ref] = {
+ENABLE UNWIND => NULL;
+RecordViewerForRootI[viewer, root];
+};
+
+ForgetViewer: PUBLIC ENTRY PROC [viewer: Viewer] = {
+ENABLE UNWIND => NULL;
+tdd: TEditDocument.TEditDocumentData = NARROW[viewer.data];
+root: TextNode.Ref;
+IF tdd=NIL THEN RETURN;
+root ¨ tdd.text;
+IF GetViewerForRootI[root] # viewer THEN RETURN;
+IF viewer.link # NIL THEN {
+RecordViewerForRootI[viewer.link,root];
+RETURN;
+};
+RecordViewerForRootI[NIL,root];
+};
+
+LoadHistory: TYPE = RECORD[name: ROPE, place: INT];
+
+CopyLoadHistory: PUBLIC PROC [from, to: Viewer] = {
+old: REF LoadHistory ¨ NARROW[ViewerOps.FetchProp[from, $LoadHistory]];
+new: REF LoadHistory ¨ NARROW[ViewerOps.FetchProp[to, $LoadHistory]];
+IF old=NIL THEN RETURN;
+IF new=NIL THEN {
+new ¨ NEW[LoadHistory];
+ViewerOps.AddProp[to, $LoadHistory, new] };
+new≠ ¨ old≠;
+};
+
+AllocLoadHistory: PROC [viewer: Viewer] RETURNS [prop: REF LoadHistory] = {
+IF (prop ¨ NARROW[ViewerOps.FetchProp[viewer, $LoadHistory]]) # NIL THEN RETURN;
+prop ¨ NEW[LoadHistory];
+ViewerOps.AddProp[viewer, $LoadHistory, prop];
+};
+
+SetLoadHistoryInfo: PROC [viewer: Viewer, prop: REF LoadHistory] = {
+tdd: TEditDocument.TEditDocumentData ¨ NARROW[viewer.data];
+IF tdd = NIL THEN RETURN;
+prop.name ¨ viewer.name;
+prop.place ¨ TextNode.LocNumber[tdd.lineTable.lines[0].pos];
+};
+
+SetLoadHistory: PROC [parent, viewer: Viewer] = {
+prop: REF LoadHistory ¨ AllocLoadHistory[viewer];
+SetLoadHistoryInfo[parent, prop];
+};
+
+SaveLoadHistory: PROC [viewer: Viewer] = {
+prop: REF LoadHistory ¨ AllocLoadHistory[viewer];
+SetLoadHistoryInfo[viewer, prop];
+};
+
+PositionHistory: TYPE = TEditDocumentPrivate.PositionHistory;
+
+CopyPositionHistory: PUBLIC PROC [from, to: Viewer] = {
+old: REF PositionHistory ¨ NARROW[ViewerOps.FetchProp[from, $PositionHistory]];
+new: REF PositionHistory ¨ NARROW[ViewerOps.FetchProp[to, $PositionHistory]];
+IF old=NIL THEN RETURN;
+IF new=NIL THEN {
+new ¨ NEW[PositionHistory];
+ViewerOps.AddProp[to, $PositionHistory, new];
+};
+new≠ ¨ old≠;
+};
+
+ClearPositionHistory: PROC [viewer: Viewer] = {
+prop: REF PositionHistory ¨ NARROW[ViewerOps.FetchProp[viewer, $PositionHistory]];
+IF prop = NIL THEN RETURN;
+prop.pos ¨ prop.prev ¨ TextNode.nullLocation;
+};
+
+RememberCurrentPosition: PUBLIC PROC [viewer: Viewer] = {
+tdd: TEditDocument.TEditDocumentData ¨ NARROW[viewer.data];
+prop: REF PositionHistory ¨ NARROW[ViewerOps.FetchProp[viewer, $PositionHistory]];
+loc: TextNode.Location;
+IF tdd=NIL THEN RETURN;
+IF prop = NIL THEN {
+prop ¨ NEW[PositionHistory];
+ViewerOps.AddProp[viewer, $PositionHistory, prop] };
+[] ¨ TEditDocument.SpinAndLock[tdd, "RememberCurrentPosition"];
+loc ¨ tdd.lineTable.lines[0].pos;
+TEditDocument.Unlock[tdd];
+IF loc = prop.pos THEN RETURN;
+prop.prev ¨ prop.pos; prop.pos ¨ loc;
+};
+
+PositionViewer: PUBLIC PROC [viewer: Viewer, loc: TextNode.Location, hint: ViewerOps.PaintHint ¨ client] RETURNS [ok: BOOL ¨ FALSE] = {
+ok ¨ PositionViewerInternal[viewer, loc];
+IF ok THEN ForkViewerPainter[viewer, hint];
+};
+
+xCR: Char.XCHAR ~ Char.Widen[Ascii.CR];
+xLF: Char.XCHAR ~ Char.Widen[Ascii.LF];
+
+PositionViewerInternal: PROC [viewer: Viewer, loc: TextNode.Location] RETURNS [ok: BOOL ¨ FALSE] = {
+CheckPosition: PROC [viewer: Viewer, loc: TextNode.Location] RETURNS [good: BOOL, goodloc: TextNode.Location] = {
+IF NOT(viewer=NIL OR viewer.destroyed) THEN WITH viewer.data SELECT FROM
+tdd: TEditDocument.TEditDocumentData => {
+root: TextNode.Ref ~ tdd.text;
+IF root#NIL THEN {
+IF TextNode.Root[loc.node]=root AND loc.node#root
+THEN RETURN[TRUE, loc]
+ELSE RETURN[TRUE, [TextNode.FirstChild[root], 0]];
+};
+};
+ENDCASE;
+RETURN [FALSE, TextNode.nullLocation];
+};
+WITH viewer.data SELECT FROM
+tdd: TEditDocument.TEditDocumentData => {
+[ok, loc] ¨ CheckPosition[viewer, loc];
+IF ok THEN {
+RememberCurrentPosition[viewer];
+IF loc.node#NIL THEN {
+rdr: NodeReader.Ref ~ NodeReader.New[loc.node];
+where: INT ¨ MAX[0, MIN[loc.where, NodeReader.Size[rdr]-1]];
+backStop: INT ¨ MAX[0, where-300];
+WHILE where>backStop DO
+SELECT NodeReader.FetchChar[rdr, where-1] FROM
+xCR, xLF => EXIT;
+ENDCASE => where ¨ where-1;
+ENDLOOP;
+loc.where ¨ where;
+NodeReader.Free[rdr];
+};
+TEditDisplay.EstablishLine[tdd, loc];
+};
+};
+ENDCASE;
+};
+
+CloseAndForkPaint: PROC [viewer: Viewer] = TRUSTED {
+ViewerOps.CloseViewer[viewer, FALSE];
+ViewerForkers.ForkPaint[viewer, all];
+};
+
+ForkViewerPainter: PROC [viewer: Viewer, hint: ViewerOps.PaintHint] = TRUSTED {
+ViewerForkers.ForkPaint[viewer, hint];
+};
+
+ViewerPainter: PROC [viewer: Viewer, hint: ViewerOps.PaintHint] = {
+ENABLE ABORTED => CONTINUE;
+ViewerOps.PaintViewer[viewer, hint];
+};
+
+KillSelections: PUBLIC PROC [parent: Viewer] = {
+OPEN TEditSelection;
+IF pSel # NIL AND pSel.viewer = parent THEN MakeSelection[selection: primary];
+IF sSel # NIL AND sSel.viewer = parent THEN MakeSelection[selection: secondary];
+IF fSel # NIL AND fSel.viewer = parent THEN MakeSelection[selection: feedback];
+};
+
+CancelLinks: PUBLIC PROC [viewer: Viewer] = {
+ForgetViewer[viewer];
+IF viewer.link.link=viewer
+THEN {
+viewer.link.link ¨ NIL;
+ForkViewerPainter[viewer.link, caption];
+}
+ELSE FOR v: Viewer ¨ viewer.link.link, v.link UNTIL v.link=viewer DO
+REPEAT FINISHED => v.link ¨ viewer.link;
+ENDLOOP;
+viewer.link ¨ NIL;
+};
+
+DefaultMenus: PUBLIC PROC [viewer: Viewer, paint: BOOL ¨ FALSE] = {
+menu: Menus.Menu ¨ viewer.menu;
+num: INTEGER ¨ 1;
+DoLine: PROC [which: TEditProfile.DefaultMenuChoice] = {
+entry: Menus.MenuEntry ¨ SELECT which FROM
+places => TEditDocumentPrivate.findMenu,
+levels => TEditDocumentPrivate.levelMenu,
+ENDCASE => NIL;
+IF entry = NIL THEN RETURN;
+Menus.SetLine[menu, num, entry];
+num ¨ num+1 };
+DoLine[TEditProfile.menu1];
+DoLine[TEditProfile.menu2];
+DoLine[TEditProfile.menu3];
+ViewerOps.EstablishViewerPosition[viewer, viewer.wx, viewer.wy, viewer.ww, viewer.wh];
+IF paint THEN ForkViewerPainter[viewer, all];
+};
+
+MakeNewViewer: PROC [column: Column, parent: Viewer, wDir: ROPE ¨ NIL] RETURNS [viewer: Viewer] = {
+viewer ¨ MakeNewIcon[column, parent, wDir];
+IF parent = NIL OR parent.column # column
+THEN ViewerOps.OpenIcon[icon: viewer, paint: TRUE]
+ELSE {
+inner: PROC = {
+IF parent.destroyed THEN RETURN;
+IF parent.iconic THEN RETURN;
+IF NOT viewer.iconic THEN RETURN;
+IF parent.column # column THEN RETURN; -- parent.column must have changed!
+viewer.openHeight ¨ parent.openHeight;
+ViewerOps.OpenIcon[icon: viewer, paint: FALSE];
+ViewerOps.MoveBelowViewer[static: parent, altered: viewer, paint: FALSE];
+ViewerOps.ComputeColumn[column];
+};
+IF TEditProfile.openFirstLevelOnly THEN
+WITH viewer.data SELECT FROM
+tdd: TEditDocument.TEditDocumentData => tdd.clipLevel ¨ 1;
+ENDCASE;
+ViewerLocks.CallUnderColumnLocks[inner, column, static];
+};
+};
+
+MakeNewIcon: PROC [column: Column, parent: Viewer ¨ NIL, wDir: ROPE ¨ NIL] RETURNS [viewer: Viewer] = {
+IF wDir=NIL THEN wDir ¨ WorkingDirectoryFromViewer[parent];
+IF column=static THEN column ¨ left;
+viewer ¨ ViewerOps.CreateViewer[
+flavor: $Text,
+info: [name: wDir, column: column, iconic: TRUE],
+paint: FALSE];
+IF TEditProfile.openFirstLevelOnly THEN
+WITH viewer.data SELECT FROM
+tdd: TEditDocument.TEditDocumentData => tdd.clipLevel ¨ 1;
+ENDCASE;
+DefaultMenus[viewer];
+};
+
+ReplaceByNewViewer: PROC [parent: Viewer, wDir: ROPE ¨ NIL] RETURNS [viewer: Viewer] = {
+viewer ¨ MakeNewIcon[column: ColumnOf[parent], parent: parent, wDir: wDir];
+SwapViewers[parent, viewer];
+};
+
+SwapViewers: PROC [parent: Viewer, icon: Viewer] = {
+inner: PROC = {
+IF parent.destroyed THEN RETURN;
+IF parent.iconic THEN RETURN;
+IF NOT icon.iconic THEN RETURN;
+IF parent.column # col THEN RETURN;
+icon.openHeight ¨ parent.openHeight;
+ViewerOps.OpenIcon[icon: icon, paint: FALSE];
+ViewerOps.MoveBelowViewer[static: parent, altered: icon, paint: FALSE];
+CloseAndForkPaint[parent];
+ViewerOps.ComputeColumn[col];
+};
+col: ViewerClasses.Column = parent.column;
+KillSelections[parent]; -- need to deselect before making new viewer
+ViewerLocks.CallUnderColumnLocks[inner, col, static];
+};
+
+FindOldViewer: PROC [name: ROPE, viewer: Viewer] RETURNS [old: Viewer ¨ NIL] = {
+Match: ViewerOps.EnumProc -- PROC[v: Viewer] RETURNS[BOOL ¨ TRUE] -- = {
+IF v#viewer AND Rope.Equal[name, v.name, FALSE] THEN { old ¨ v; RETURN [FALSE] };
+};
+ViewerOps.EnumerateViewers[Match];
+};
+
+Report: PROC [m1, m2, m3, m4: ROPE ¨ NIL, flash: BOOL ¨ FALSE] = {
+ENABLE ABORTED => CONTINUE;
+MessageWindow.Append[m1, TRUE];
+IF m2#NIL THEN MessageWindow.Append[m2];
+IF m3#NIL THEN MessageWindow.Append[m3];
+IF m4#NIL THEN MessageWindow.Append[m4];
+IF flash THEN MessageWindow.Blink[];
+};
+
+Flash: PROC [m1, m2: ROPE ¨ NIL] = {
+Report[m1: m1, m2: m2, flash: TRUE];
+};
+
+PleaseSelectFileName: PROC = {
+Flash["Please select file name."];
+};
+
+IllegalFileName: ViewerForkers.CallBack = {
+Flash["Illegal file name."];
+};
+
+ReloadedMessage: ViewerForkers.CallBack = {
+WITH data SELECT FROM
+name: ROPE => Flash[name," restored with previous unsaved edits."];
+ENDCASE;
+};
+
+RemoveVersion: PROC [x: ROPE] RETURNS [ROPE] = {
+RETURN [x.Flatten[len: x.SkipTo[skip: "!"]]];
+};
+
+GetFileName: PROC [file: PFS.OpenFile, removeVersion: BOOL ¨ FALSE] RETURNS [name: ROPE ¨ NIL] = {
+name ¨ PFS.RopeFromPath[PFS.GetName[file ! PFS.Error => CONTINUE].fullFName];
+IF name#NIL AND removeVersion THEN name ¨ RemoveVersion[name];
+};
+
+LoadOp: TYPE ~ {load, open, replace};
+LookupType: TYPE ~ {source, impl};
+
+CreateAndFillTiogaViewer: PROC [parent: Viewer, column: Column, file: PFS.OpenFile, specificVersion: BOOL, op: LoadOp ¨ $load, place: INT ¨ 0, search: ROPE ¨ NIL, forceOpen: BOOL ¨ TRUE] RETURNS [viewer: Viewer] = {
+viewerIn: Viewer ¨ parent;
+needPaint: BOOL ¨ FALSE;
+loaded: BOOL ¨ FALSE;
+IF parent = NIL THEN op ¨ open;
+SELECT op FROM
+load => viewerIn ¨ parent;
+open => viewerIn ¨ MakeNewIcon[column: column, parent: parent];
+replace => viewerIn ¨ ReplaceByNewViewer[parent];
+ENDCASE => ERROR;
+[viewer, loaded] ¨ DoLoad[viewer: viewerIn, file: file, op: op, specificVersion: specificVersion, place: place];
+IF viewer # NIL THEN { -- we were able to do the load
+IF viewer # viewerIn THEN { -- a previous viewer existed
+Report[viewer.name, " was already loaded."];
+ViewerOps.BlinkViewer[viewer: viewer, milliseconds: 200];
+SELECT op FROM
+open, replace => TRUSTED {
+ViewerForkers.ForkCall[viewerIn, FlameOut, viewerIn];
+viewerIn ¨ NIL};
+ENDCASE;
+};
+IF Rope.Size[search] # 0 THEN WITH viewer.data SELECT FROM
+ntdd: TEditDocument.TEditDocumentData => {
+IF Rope.Match["|*", search]
+THEN {
+pos: INT ¨ Convert.IntFromRope[Rope.Flatten[search, 1]
+! Convert.Error => GO TO faulty];
+nloc: TextNode.Location ~ TextNode.LocWithin[n: ntdd.text, count: pos, skipCommentNodes: TRUE];
+[] ¨ PositionViewerInternal[viewer, nloc];
+TEditSelectionOps.ShowGivenPosition[viewer, pos];
+EXITS faulty => {};
+}
+ELSE {
+loc: TextNode.Location ¨ [TextNode.FirstChild[ntdd.text], 0];
+sel: TEditDocument.Selection ¨ NIL;
+TEditDisplay.EstablishLine[ntdd, loc];
+TEditSelection.FindRope[viewer: viewer, rope: search, 
+case: TRUE, def: TRUE, id: feedback];
+sel ¨ TEditSelection.fSel;
+IF sel#NIL AND sel.viewer=viewer THEN loc ¨ sel.start.pos;
+TEditDisplay.EstablishLine[ntdd, loc];
+};
+RememberCurrentPosition[viewer];
+needPaint ¨ TRUE;
+};
+ENDCASE;
+SELECT TRUE FROM
+viewer.iconic AND forceOpen => {
+ViewerOps.OpenIcon[viewer];
+IF parent # NIL AND parent # viewer AND NOT parent.destroyed THEN
+IF op = replace
+THEN CloseAndForkPaint[parent]
+ELSE ViewerOps.MoveBelowViewer[viewer, parent, TRUE];
+};
+loaded =>
+ForkViewerPainter[viewer, all];
+needPaint =>
+ForkViewerPainter[viewer, client];
+ENDCASE;
+};
+};
+
+DoLoad: PROC [viewer: Viewer, file: PFS.OpenFile, op: LoadOp, specificVersion: BOOL ¨ FALSE, place: INT ¨ 0] RETURNS [out: Viewer, loaded: BOOL ¨ FALSE] = {
+clearMessage: BOOL ¨ TRUE;
+fileName: ROPE ~ PFS.RopeFromPath[PFS.GetName[file].fullFName];
+name: ROPE ¨ fileName;
+out ¨ viewer;
+IF NOT specificVersion THEN name ¨ name.Flatten[len: name.SkipTo[skip: "!"]];
+IF Rope.Equal[viewer.file, fileName, FALSE] THEN {
+Report[fileName, " is already loaded."];
+ViewerOps.BlinkViewer[viewer: viewer, milliseconds: 200];
+RETURN;
+};
+Report["Loading ", name];
+KillSelections[viewer];
+WITH viewer.data SELECT FROM
+tdd: TEditDocument.TEditDocumentData => {
+oldViewer: Viewer ¨ NIL;
+linkViewer: Viewer ¨ NIL;
+vFile: ROPE ¨ NIL;
+DO
+oldViewer ¨ FindOldViewer[name, viewer];
+IF oldViewer # NIL THEN linkViewer ¨ oldViewer.link;
+ViewerPrivate.AcquireWriteLocks[viewer, oldViewer, linkViewer];
+IF oldViewer = FindOldViewer[name, viewer] AND (oldViewer = NIL OR linkViewer = oldViewer.link) THEN EXIT;
+ViewerPrivate.ReleaseWriteLocks[viewer, oldViewer, linkViewer];
+ENDLOOP;
+{
+ENABLE UNWIND => ViewerPrivate.ReleaseWriteLocks[viewer, oldViewer, linkViewer];
+[] ¨ TEditDocument.SpinAndLock[tdd, "DoLoad"];
+IF (vFile ¨ viewer.file) #NIL THEN SaveLoadHistory[viewer];
+IF oldViewer # NIL THEN {
+IF NOT oldViewer.destroyed
+THEN WITH oldViewer.data SELECT FROM
+tddOld: TEditDocument.TEditDocumentData => GO TO oldCase;
+ENDCASE;
+EXITS oldCase => {};
+};
+SELECT TRUE FROM
+oldViewer = NIL => {
+root: TextNode.Ref ~ TEditDocumentPrivate.FindUnsavedDocument[fileName];
+IF viewer.link=NIL
+THEN {
+ForgetViewer[viewer]; -- remove this from the root => viewer mapping
+IF viewer.newVersion AND (NOT viewer.saveInProgress) AND vFile#NIL
+THEN TEditDocumentPrivate.RecordUnsavedDocument[vFile, tdd.text]
+ELSE TEditInput.FreeTree[tdd.text];
+}
+ELSE
+CancelLinks[viewer];
+viewer.name ¨ name;
+viewer.file ¨ fileName;
+viewer.newVersion ¨ viewer.newFile ¨ FALSE;
+IF root # NIL THEN {
+ViewerForkers.ForkCall[NIL, ReloadedMessage, name];
+clearMessage ¨ FALSE;
+};
+tdd.text ¨ NIL; -- so InitViewerDoc won't worry about freeing it
+TEditDocumentPrivate.InitViewerDocInternal[viewer, file, root];
+viewer.newFile ¨ FALSE;
+viewer.newVersion ¨ root#NIL;
+loaded ¨ TRUE;
+ClearPositionHistory[viewer];
+[] ¨ PositionViewerInternal[viewer, TextNode.LocWithin[tdd.text, place]];
+RememberCurrentPosition[viewer];
+};
+ENDCASE => {
+out ¨ oldViewer;
+};
+
+TEditDocument.Unlock[tdd];
+ViewerPrivate.ReleaseWriteLocks[viewer, oldViewer, linkViewer];
+};
+
+IF clearMessage THEN MessageWindow.Clear[];
+};
+ENDCASE;
+};
+
+FlameOut: ViewerForkers.CallBack = {
+ENABLE ABORTED => CONTINUE;
+WITH data SELECT FROM
+v: Viewer => ViewerOps.DestroyViewer[v];
+ENDCASE;
+};
+
+TryToOpen: PROC [name: ROPE, wDir: ROPE ¨ NIL] RETURNS [file: PFS.OpenFile ¨ PFS.nullOpenFile] = {
+namePath: PATH ~ PFS.AbsoluteName[short: PFS.PathFromRope[name], wDir: PFS.PathFromRope[wDir]];
+file ¨ PFS.Open[name: namePath
+! PFS.Error => IF error.code=$unknownFile THEN CONTINUE];
+};
+
+TryExtensions: PROC [name: ROPE, wDir: ROPE, extensions: LIST OF ROPE] RETURNS [file: PFS.OpenFile ¨ PFS.nullOpenFile] = {
+base: ROPE ~ name.Concat["."];
+FOR list: LIST OF ROPE ¨ extensions, list.rest UNTIL list=NIL DO
+file ¨ TryToOpen[name: base.Concat[list.first], wDir: wDir];
+IF file#PFS.nullOpenFile THEN EXIT;
+ENDLOOP;
+};
+
+IsAnExtension: PROC [ext: ROPE, extensions: LIST OF ROPE] RETURNS [BOOL] = {
+FOR list: LIST OF ROPE ¨ extensions, list.rest UNTIL list=NIL DO
+IF Rope.Equal[ext, list.first, FALSE] THEN RETURN [TRUE];
+ENDLOOP;
+RETURN [FALSE];
+};
+
+FileNameProc: TYPE = TEditOps.FileNameProc;
+
+fileNameProc: FileNameProc ¨ NIL;
+
+RegisterFileNameProc: PUBLIC PROC [proc: FileNameProc] = {
+fileNameProc ¨ proc;
+};
+
+ReplaceFileNameProc: PUBLIC PROC [new: FileNameProc] RETURNS [old: FileNameProc] = {
+old ¨ fileNameProc;
+fileNameProc ¨ new;
+};
+
+TryVersionMap: PROC [shortName: ROPE] RETURNS [PFS.OpenFile] = {
+RETURN[TryToOpen[name: shortName, wDir: "/R/"]];
+};
+
+TryVersionMapExtensions: PROC [name: ROPE, extensions: LIST OF ROPE] RETURNS [PFS.OpenFile] = {
+RETURN[TryExtensions[name: name, wDir: "/R/", extensions: extensions]];
+};
+
+FileNotFound: ERROR[fileName: ROPE] = CODE;
+
+LookupSource: PROC [sel: ROPE, wDir: ROPE, fileNameProcViewer: Viewer ¨ NIL] RETURNS [file: PFS.OpenFile ¨ PFS.nullOpenFile, specificVersion: BOOL ¨ FALSE, search: ROPE ¨ NIL] = {
+dot: INT ¨ 0;
+hasExtension, standardExtension, simpleName: BOOL ¨ FALSE;
+base, ext: ROPE ¨ NIL;
+proc: FileNameProc ~ fileNameProc;
+Report["Directory lookup for ", sel];
+FOR i: INT DECREASING IN[0..sel.Size[]) DO
+SELECT sel.Fetch[i] FROM
+'| => {search ¨ Rope.Flatten[sel, i]; sel ¨ Rope.Flatten[sel, 0, i]; EXIT};
+IN ['0..'9] => {};
+ENDCASE => EXIT;
+ENDLOOP;
+FOR i: INT DECREASING IN[0..sel.Size[]) DO
+SELECT sel.Fetch[i] FROM
+'! => specificVersion ¨ TRUE;
+'. => IF hasExtension THEN NULL ELSE { dot ¨ i; hasExtension ¨ TRUE };
+'], '>, '/ => EXIT;
+ENDCASE;
+REPEAT FINISHED => simpleName ¨ TRUE;
+ENDLOOP;
+file ¨ TryToOpen[name: sel, wDir: wDir];
+IF file#PFS.nullOpenFile THEN RETURN;
+IF hasExtension OR specificVersion THEN NULL
+ELSE {
+file ¨ TryExtensions[name: sel, wDir: wDir, extensions: TEditProfile.sourceExtensions];
+IF file#PFS.nullOpenFile THEN RETURN;
+};
+IF proc#NIL THEN {
+pname, psearch: ROPE;
+[pname, psearch] ¨ proc[sel, fileNameProcViewer];
+IF pname.Size[]#0 THEN {
+file ¨ TryToOpen[name: pname, wDir: wDir];
+IF file#PFS.nullOpenFile THEN { search ¨ psearch; RETURN };
+};
+};
+IF specificVersion THEN RETURN;
+IF hasExtension THEN {
+base ¨ sel.Substr[len: dot];
+ext ¨ sel.Substr[start: dot+1];
+IF IsAnExtension[ext, TEditProfile.sourceExtensions] THEN standardExtension ¨ TRUE;
+IF NOT standardExtension THEN {
+file ¨ TryExtensions[name: base, wDir: wDir, extensions: TEditProfile.implExtensions];
+IF file#PFS.nullOpenFile THEN { search ¨ ext; RETURN };
+};
+};
+IF simpleName AND TEditProfile.tryVersionMap THEN {
+Report["Get: trying version map for ", sel];
+file ¨ TryVersionMap[sel]; -- try sel verbatim first
+IF file#PFS.nullOpenFile THEN RETURN;
+IF NOT hasExtension THEN {
+file ¨ TryVersionMapExtensions[sel, TEditProfile.sourceExtensions];
+IF file#PFS.nullOpenFile THEN RETURN;
+}
+ELSE IF NOT standardExtension THEN {
+file ¨ TryVersionMapExtensions[base, TEditProfile.implExtensions];
+IF file#PFS.nullOpenFile THEN { search ¨ ext; RETURN };
+};
+};
+};
+
+LookupImpl: PROC [sel: ROPE, wDir: ROPE] RETURNS [file: PFS.OpenFile ¨ PFS.nullOpenFile, search: ROPE ¨ NIL] = {
+simpleName: BOOL ~ sel.SkipTo[skip: "[]<>/"]=sel.Size[];
+dir: ROPE ~ GetDirectory[sel, wDir];
+base: ROPE ~ GetBase[sel]; -- base part is defs name
+ext: ROPE ~ GetExtension[sel, wDir]; -- extension part is search item
+impl: ROPE ¨ NIL;
+IF ext.Size[]#0 THEN { ENABLE UNCAUGHT => CONTINUE;
+proc: PROC ANY RETURNS ANY ¨ NIL;
+Report["Load state lookup for implementor of ", base, ".", ext];
+proc ¨ InstallationBasicComforts.BasicProcFromNamedInterface[base, ext];
+IF proc#NIL THEN impl ¨ InstallationBasicComforts.BasicModuleName[proc];
+};
+IF impl=NIL THEN impl ¨ base.Concat["Impl"];
+Report["Directory lookup for ", impl];
+file ¨ TryExtensions[name: impl, wDir: dir,
+extensions: TEditProfile.implExtensions];
+IF file#PFS.nullOpenFile THEN { search ¨ ext; RETURN };
+IF simpleName AND TEditProfile.tryVersionMap THEN {
+Report["GetImpl: trying version map for ", impl];
+file ¨ TryVersionMapExtensions[impl, TEditProfile.implExtensions];
+IF file#PFS.nullOpenFile THEN { search ¨ ext; RETURN };
+};
+ERROR FileNotFound[impl];
+};
+
+WorkingDirectoryFromViewer: PUBLIC PROC [parent: Viewer] RETURNS [ROPE] = {
+name, dir: ROPE ¨ NIL;
+IF parent#NIL THEN name ¨ parent.name;
+{ ENABLE PFS.Error => CONTINUE;
+IF name=NIL OR parent.file=NIL
+THEN dir ¨ GetDirectory[name: "*", wDir: name]
+ELSE dir ¨ GetDirectory[name: name];
+RETURN [dir];
+};
+RETURN ["[]<>"];
+};
+
+ IsAWorkingDirectory: PROC [name: ROPE] RETURNS [BOOL] = {
+RETURN [Rope.Match["*/", name] OR Rope.Match["*>", name]];
+};
+
+CanonicalWorkingDirectory: PROC [txt: ROPE, wDir: ROPE ¨ NIL] 
+RETURNS [dir: ROPE ¨ NIL] = {
+dir ¨ GetDirectory[name: txt.Concat["*"], wDir: wDir ! PFS.Error => CONTINUE];
+};
+
+DoGetFile: PROC [txt: ROPE, column: Column, parent: Viewer, op: LoadOp ¨ $load, lookup: LookupType ¨ $source, fileNameProcViewer: Viewer ¨ NIL] RETURNS [viewer: Viewer ¨ NIL] = {
+parentDir: ROPE ~ WorkingDirectoryFromViewer[parent];
+file: PFS.OpenFile ¨ PFS.nullOpenFile;
+specificVersion: BOOL ¨ FALSE;
+search: ROPE ¨ NIL;
+IF txt=NIL THEN txt ¨ ViewerTools.GetSelectionContents[];
+IF fileNameProcViewer=NIL THEN fileNameProcViewer ¨ parent;
+IF txt.Size[]=0 THEN { PleaseSelectFileName[]; GOTO Fail };
+IF IsAWorkingDirectory[txt] THEN {
+wDir: ROPE ~ CanonicalWorkingDirectory[txt, parentDir];
+IF wDir=NIL THEN { Flash[txt, " is an illegal working directory."]; GOTO Fail };
+SELECT op FROM
+load => DoEmptyViewer[parent: viewer ¨ parent, wDir: wDir];
+open => viewer ¨ MakeNewViewer[column: column, parent: parent, wDir: wDir];
+replace => viewer ¨ ReplaceByNewViewer[parent: parent, wDir: wDir];
+ENDCASE => ERROR;
+RETURN [viewer];
+};
+{
+ENABLE {
+PFS.Error => { Flash[error.explanation]; GOTO Fail };
+FileNotFound => { Flash[fileName, " not found."]; GOTO Fail };
+};
+SELECT lookup FROM
+$source => [file: file, specificVersion: specificVersion, search: search] ¨
+LookupSource[sel: txt, wDir: parentDir, fileNameProcViewer: fileNameProcViewer];
+$impl => [file: file, search: search] ¨ LookupImpl[sel: txt, wDir: parentDir];
+ENDCASE => ERROR;
+IF file=PFS.nullOpenFile THEN { Flash[txt, " not found."]; GOTO Fail };
+};
+viewer ¨ CreateAndFillTiogaViewer[parent, column, file, specificVersion, op, 0, search];
+EXITS Fail => RETURN [NIL];
+};
+DoEmptyViewer: PROC [parent: Viewer, wDir: ROPE ¨ NIL] = {
+inner: PROC [tdd: TEditDocument.TEditDocumentData] = {
+link1: Viewer ¨ parent.link;
+link2: Viewer ¨ NIL;
+IF wDir=NIL THEN wDir ¨ WorkingDirectoryFromViewer[parent];
+TEditSelection.LockSel[primary, "EmptyViewer"];
+{
+ENABLE UNWIND => TEditSelection.UnlockSel[primary];
+prop: REF LoadHistory;
+[] ¨ TEditDocument.SpinAndLock[tdd, "EmptyViewer"];
+KillSelections[parent];
+SaveLoadHistory[parent];
+prop ¨ NARROW[ViewerOps.FetchProp[parent, $LoadHistory]]; -- hang onto it
+SELECT TRUE FROM
+link1 # NIL => CancelLinks[parent];
+parent.newVersion AND ~parent.saveInProgress AND parent.file # NIL =>
+TEditDocumentPrivate.RecordUnsavedDocument[parent.file, tdd.text];
+ENDCASE => TEditInput.FreeTree[tdd.text];
+parent.name ¨ wDir;
+parent.file ¨ NIL;
+parent.newVersion ¨ parent.newFile ¨ FALSE;
+tdd.text  ¨ NIL; -- so InitViewerDoc won't free it
+TEditDocumentPrivate.InitViewerDoc[parent,NIL];
+TEditDocument.Unlock[tdd];
+ClearPositionHistory[parent];
+ViewerOps.AddProp[parent, $LoadHistory, prop]; -- restore file history
+ViewerPainter[parent, all];
+ForceInitialCaret[parent];
+};
+TEditSelection.UnlockSel[primary];
+};
+IF parent # NIL THEN LockTheWorks[inner, parent, "EmptyViewer"];
+};
+
+EmptyViewer: PUBLIC PROC [parent: Viewer] = {
+DoEmptyViewer[parent];
+};
+
+DoNewViewer: PUBLIC PROC [column: Column, parent: Viewer ¨ NIL] RETURNS [new: Viewer] = {
+TEditSelection.LockSel[primary, "DoNewViewer"];
+{
+ENABLE UNWIND => TEditSelection.UnlockSel[primary];
+new ¨ MakeNewViewer[column, parent];
+ForceInitialCaret[new];
+};
+TEditSelection.UnlockSel[primary];
+};
+
+NewViewer: PUBLIC PROC [parent: Viewer] = {
+[] ¨ DoNewViewer[column: ColumnOf[parent], parent: parent];
+};
+
+DoCloseAndNewViewer: PUBLIC PROC [parent: Viewer] RETURNS [new: Viewer] = {
+TEditSelection.LockSel[primary, "DoCloseAndNewViewer"];
+{ ENABLE UNWIND => TEditSelection.UnlockSel[primary];
+new ¨ ReplaceByNewViewer[parent];
+ForceInitialCaret[new];
+};
+TEditSelection.UnlockSel[primary];
+};
+
+CloseAndNewViewer: PUBLIC PROC [parent: Viewer] = {
+[] ¨ DoCloseAndNewViewer[parent];
+};
+
+DoLoadFile: PUBLIC PROC [parent: Viewer, fileName: ROPE ¨ NIL, close: BOOL ¨ FALSE,
+fileNameProcViewer: Viewer ¨ NIL] RETURNS [viewer: Viewer] = {
+viewer ¨ DoGetFile[txt: fileName, column: ColumnOf[parent], parent: parent,
+op: IF close THEN $replace ELSE $load, lookup: $source,
+fileNameProcViewer: fileNameProcViewer];
+};
+
+LoadFile: PUBLIC PROC [parent: Viewer] = {
+[] ¨ DoLoadFile[parent: parent, fileName: NIL, close: FALSE];
+};
+
+DoOpenFile: PUBLIC PROC [fileName: ROPE ¨ NIL, column: Column, parent: Viewer ¨ NIL, fileNameProcViewer: Viewer ¨ NIL] RETURNS [viewer: Viewer] = {
+viewer ¨ DoGetFile[
+txt: fileName, column: column, parent: parent, op: $open,
+lookup: $source, fileNameProcViewer: fileNameProcViewer];
+};
+
+OpenFile: PUBLIC PROC [parent: Viewer] = {
+[] ¨ DoOpenFile[fileName: NIL, column: ColumnOf[parent], parent: parent];
+};
+
+DoCloseAndOpenFile: PUBLIC PROC [parent: Viewer, fileName: ROPE ¨ NIL] RETURNS [viewer: Viewer] = {
+viewer ¨ DoGetFile[txt: fileName, column: ColumnOf[parent], parent: parent, op: $replace, lookup: $source];
+};
+
+CloseAndOpenFile: PUBLIC PROC [parent: Viewer, fileNameProcViewer: Viewer ¨ NIL] = {
+[] ¨ DoGetFile[txt: NIL, column: ColumnOf[parent], parent: parent, op: $replace, lookup: $source,
+fileNameProcViewer: fileNameProcViewer];
+};
+
+DoLoadImplFile: PUBLIC PROC [parent: Viewer, fileName: ROPE ¨ NIL, close: BOOL ¨ FALSE] RETURNS [viewer: Viewer] = {
+viewer ¨ DoGetFile[txt: fileName, column: ColumnOf[parent], parent: parent,
+op: IF close THEN $replace ELSE $load, lookup: $impl];
+};
+
+LoadImplFile: PUBLIC PROC [parent: Viewer] = {
+[] ¨ DoLoadImplFile[parent: parent, fileName: NIL];
+};
+
+DoOpenImplFile: PUBLIC PROC [fileName: ROPE ¨ NIL, column: Column, parent: Viewer ¨ NIL] RETURNS [viewer: Viewer] = {
+viewer ¨ DoGetFile[txt: fileName, column: column, parent: parent, op: $open, lookup: $impl];
+};
+
+OpenImplFile: PUBLIC PROC [parent: Viewer] = {
+[] ¨ DoOpenImplFile[fileName: NIL, column: ColumnOf[parent], parent: parent];
+};
+
+DoCloseAndOpenImplFile: PUBLIC PROC [parent: Viewer, fileName: ROPE ¨ NIL] RETURNS [viewer: Viewer] = {
+viewer ¨ DoGetFile[txt: fileName, column: ColumnOf[parent], parent: parent, op: $replace, lookup: $impl];
+};
+
+CloseAndOpenImplFile: PUBLIC PROC [parent: Viewer] = {
+[] ¨ DoCloseAndOpenImplFile[parent, NIL];
+};
+
+PreLoadPrevious: PUBLIC Menus.MenuProc = { -- called when unguarding PrevFile
+viewer: Viewer = NARROW[parent];
+tdd: TEditDocument.TEditDocumentData;
+prop: REF LoadHistory;
+propName: ROPE;
+tdd ¨ NARROW[viewer.data];
+IF tdd = NIL THEN RETURN;
+[] ¨ TEditDocument.SpinAndLock[tdd, "PreLoadPrevious"];
+prop ¨ NARROW[ViewerOps.FetchProp[viewer, $LoadHistory]];
+TEditDocument.Unlock[tdd];
+IF prop=NIL OR Rope.Equal[prop.name, viewer.file, FALSE] THEN {
+Flash["No record of previous file loaded in this viewer"];
+RETURN;
+};
+propName ¨ prop.name;
+Report[propName," ~ Click LEFT to load, MIDDLE for new, RIGHT for close & new"];
+};
+
+DoLoadPreviousFile: PROC [parent: Viewer, op: LoadOp] = {
+WITH parent.data SELECT FROM
+tdd: TEditDocument.TEditDocumentData => {
+prop: REF LoadHistory;
+propName: ROPE;
+propPlace: INT;
+file: PFS.OpenFile;
+[] ¨ TEditDocument.SpinAndLock[tdd, "DoLoadPreviousFile"];
+prop ¨ NARROW[ViewerOps.FetchProp[parent, $LoadHistory]];
+TEditDocument.Unlock[tdd];
+IF prop = NIL OR Rope.Equal[prop.name, parent.file, FALSE] THEN {
+Flash["No record of previous file loaded in this viewer"];
+RETURN };
+propName ¨ prop.name; propPlace ¨ prop.place;
+file ¨ PFS.Open[PFS.PathFromRope[propName] ! PFS.Error => { Flash[error.explanation]; GOTO Fail }];
+[] ¨ CreateAndFillTiogaViewer[parent: parent, column: ColumnOf[parent], file: file, specificVersion: (propName.Find["!"]>=0), op: op, place: propPlace, forceOpen: FALSE];
+};
+ENDCASE;
+EXITS Fail => NULL;
+};
+
+LoadPreviousFile: PUBLIC PROC [parent: Viewer] = {
+DoLoadPreviousFile[parent: parent, op: $load];
+};
+
+OpenPreviousFile: PUBLIC PROC [parent: Viewer] = {
+DoLoadPreviousFile[parent: parent, op: $open];
+};
+
+CloseAndOpenPreviousFile: PUBLIC PROC [parent: Viewer] = {
+DoLoadPreviousFile[parent: parent, op: $replace];
+};
+
+ForceCharLower: PROC [old: CHAR] RETURNS [new: CHAR] = {
+RETURN [Ascii.Lower[old]];
+};
+
+ForceLower: PROC [r: ROPE] RETURNS [ROPE] = {
+RETURN [Rope.Translate[base: r, translator: ForceCharLower]];
+};
+
+FName: TYPE ~ RECORD [fullFName: ROPE ¨ NIL, extension: ATOM ¨ NIL];
+GetCreateName: PROC [parent: Viewer, name: ROPE] RETURNS [fName: FName ¨ [NIL, NIL]] = {
+wDir: ROPE ~ WorkingDirectoryFromViewer[parent];
+namePath: PATH ~ PFS.AbsoluteName[short: PFS.PathFromRope[name], wDir: PFS.PathFromRope[wDir]];
+fName.fullFName ¨ PFS.RopeFromPath[PFSNames.StripVersionNumber[namePath ! PFS.Error => GOTO Fail]];
+fName.extension ¨ Atom.MakeAtom[ForceLower[GetExtension[name, wDir]]];
+EXITS Fail => ViewerForkers.ForkCall[NIL, IllegalFileName];
+};
+
+GetDirectory: PROC[name: ROPE, wDir: ROPE ¨ NIL] RETURNS[ext: ROPE ¨ NIL] = {
+namePath: PATH ~ PFS.AbsoluteName[short: PFS.PathFromRope[name], wDir: PFS.PathFromRope[wDir]];
+RETURN[PFS.RopeFromPath[PFSNames.Directory[namePath]]];
+};
+
+GetBase: PROC[name: ROPE] RETURNS[base: ROPE ¨ NIL] = {
+short: ROPE ~ PFSNames.ComponentRope[PFSNames.ShortName[PFS.PathFromRope[name]]];
+pos: INT ~ short.Find["."];
+IF pos >=0 THEN base ¨ short.Substr[0, pos] ELSE base ¨ short;
+};
+
+GetExtension: PROC[name, wDir: ROPE] RETURNS[ext: ROPE ¨ NIL] = {
+namePath: PATH ~ PFS.AbsoluteName[short: PFS.PathFromRope[name], wDir: PFS.PathFromRope[wDir]];
+short: ROPE ~ PFSNames.ComponentRope[PFSNames.ShortName[namePath]];
+pos: INT ~ short.Find["."];
+IF pos >=0 THEN ext ¨ short.Substr[pos+1];
+};
+
+IsNewFile: PROC [name: ROPE] RETURNS [BOOL] = {
+RETURN[PFS.FileLookup[PFS.PathFromRope[name], NIL].fullPath=NIL];
+};
+
+PreStore: PUBLIC Menus.MenuProc = { -- called when unguarding Store
+sel: ROPE ¨ ViewerTools.GetSelectionContents[];
+fileName: ROPE ¨ NIL; new: BOOL ¨ FALSE;
+IF sel.Size[]=0 THEN {PleaseSelectFileName[]; RETURN};
+fileName ¨ GetCreateName[NARROW[parent], sel].fullFName;
+IF fileName=NIL THEN RETURN;
+new ¨ IsNewFile[fileName];
+Report["Confirm Store to file: ", fileName, IF new THEN " [New File]" ELSE " [Old File]"];
+};
+
+AddFileExtension: PROC [root: TextNode.Ref, extension: ATOM] ~ {
+TextEdit.PutProp[node: root, name: $FileExtension, value: IF extension=NIL THEN $null
+ELSE extension, event: TEditInput.CurrentEvent[]];
+};
+
+DoStoreFile: PUBLIC PROC [parent: Viewer, fileName: ROPE ¨ NIL] = {
+inner: PROC [tdd: TEditDocument.TEditDocumentData] = {
+linked: BOOL ¨ parent.link#NIL;
+oldName: ROPE ~ parent.name;
+oldFile: ROPE ~ parent.file;
+extension: ATOM ¨ NIL;
+IF fileName=NIL THEN fileName ¨ ViewerTools.GetSelectionContents[];
+IF fileName.Size[]=0 THEN {PleaseSelectFileName[]; RETURN};
+[[fileName, extension]] ¨ GetCreateName[parent, fileName];
+IF fileName=NIL THEN RETURN;
+IF parent.file # NIL THEN SaveLoadHistory[parent];
+IF linked THEN CancelLinks[parent]; -- remove viewer from link chain
+parent.name ¨ parent.file ¨ fileName;
+NodeProps.PutProp[tdd.text, $FileCreateDate, NIL]; -- remove so Save won't test
+AddFileExtension[tdd.text, extension]; -- for semantics based on file extensions
+[] ¨ ViewerOps.SaveViewer[parent
+! UNWIND => { parent.name ¨ oldName; parent.file ¨ oldFile }];
+IF linked THEN {
+loc: INT;
+KillSelections[parent];
+loc ¨ TextNode.LocNumber[tdd.lineTable.lines[0].pos];
+tdd.text ¨ NIL; -- so InitViewerDoc won't free it
+TEditDocumentPrivate.InitViewerDoc[parent, NIL];
+RememberCurrentPosition[parent];
+ForkViewerPainter[parent, caption];
+};
+};
+LockTheWorks[inner, parent, "StoreFile"];
+};
+
+LockTheWorks: PROC [inner: PROC [tdd: TEditDocument.TEditDocumentData], viewer: Viewer, who: ROPE] = {
+innerWorks: PROC = {
+WITH viewer.data SELECT FROM
+tdd: TEditDocument.TEditDocumentData => {
+[] ¨ TEditDocument.SpinAndLock[tdd, who];
+inner[tdd ! UNWIND => TEditDocument.Unlock[tdd]];
+TEditDocument.Unlock[tdd];
+}
+ENDCASE
+};
+ViewerGroupLocks.CallRootAndLinksUnderWriteLock[innerWorks, viewer];
+};
+
+StoreFile: PUBLIC PROC [parent: Viewer] = {
+DoStoreFile[parent: parent, fileName: NIL];
+};
+
+GetViewerContents: PROC [viewer: Viewer] RETURNS [ROPE] = {
+TEditInputOps.WaitForInsertToFinish[];
+RETURN [ViewerTools.GetContents[viewer]];
+};
+
+DoAnonymousLoadFile: PROC [parent: Viewer, lookup: LookupType, fileNameProcViewer: Viewer ¨ NIL] = {
+IF parent.file#NIL
+THEN Flash["Viewer already contains a file."]
+ELSE {
+txt: ROPE ~ GetViewerContents[parent];
+size: INT ~ txt.Size[];
+IF size=0
+THEN Flash["Enter a file name."]
+ELSE {
+v: Viewer ¨ DoGetFile[txt: txt, column: ColumnOf[parent], parent: parent, op: $load, lookup: lookup, fileNameProcViewer: fileNameProcViewer];
+IF v#NIL AND v#parent THEN ViewerForkers.ForkCall[parent, FlameOut, parent];
+};
+};
+};
+
+AnonymousLoadFile: PUBLIC PROC [parent: Viewer, fileNameProcViewer: Viewer ¨ NIL] = {
+DoAnonymousLoadFile[parent: parent, lookup: $source, fileNameProcViewer: fileNameProcViewer];
+};
+
+AnonymousLoadImplFile: PUBLIC PROC [parent: Viewer] = {
+DoAnonymousLoadFile[parent: parent, lookup: $impl];
+};
+
+
+NodeProps.Register[$Viewer,
+NodeProps.NullRead, NodeProps.NullWrite, NodeProps.NullCopy];
+NodeProps.Register[$LockedViewer,
+NodeProps.NullRead, NodeProps.NullWrite, NodeProps.NullCopy];
+NodeProps.Register[$FileCreateDate,
+NodeProps.NullRead, NodeProps.NullWrite, NodeProps.NullCopy];
+NodeProps.Register[$FileExtension,
+NodeProps.NullRead, NodeProps.NullWrite, NodeProps.NullCopy];
+
+END.
+
+ 
+  æ  
+TEditDocuments2Impl.mesa
+Copyright ” 1985, 1987, 1988, 1989, 1990, 1991, 1992, 1993 by Xerox Corporation.  All rights reserved.
+Plass, April 8, 1985 5:20:37 pm PST
+Russ Atkinson (RRA) June 25, 1985 2:12:21 am PDT
+Michael Plass, September 24, 1991 2:49 pm PDT
+Bier, January 10, 1989 11:47:46 am PST
+Willie-s, July 26, 1991 1:44 pm PDT
+Doug Wyatt, June 9, 1993 2:58 pm PDT
+
+change to a linked viewer
+Make viewer's load history point to current contents of parent
+backup to line start
+All calls in this module to ViewerOps.PaintViewer go through here to aid debugging.
+(note that calls to ComputeColumn also paint the screen)
+Makes a new, empty, $Text viewer, placing it under the parent viewer (if any, and in column).
+copy height and position info from old to new
+... returns a new iconic $Text viewer with default menus, no painting done.
+Must lock both columns
+copy height and position info from old to new
+Fill the viewer with a Tioga Document.
+Then, open or close viewers depending on "op", and scroll to the correct place.
+We created a viewer to hold the result, but we will never use it now.
+We need to perform a search for the given definition.
+This is a position spec to parse
+This is a definition to search for
+capture the location found and establish it as the place to display
+RRA: For some stupid reason we have to open the icon first before moving things.  I wonder why?
+Load a file into a viewer
+viewer is the viewer to be loaded with the contents of the file
+name is the specified name for the file
+file is the open file
+Note that if anything changed while we were waiting for the lock we should release our locks, then go around and try again
+Can this deadlock?  We hope not!
+An old viewer was found, so don't do the load!
+There is no other viewer with the same name
+Another viewer has this name, so return it (caller will handle this case)
+assumes MapViews has been installed, to define /R/ directory
+The first pass is for the position specification (if any)
+Open the file ...
+... and load the file into a Tioga viewer.
+
+The following are the top level procedures that implement the Tioga file operations: they are available as menu items, system buttons, or keystrokes (LF).
+Clear:
+EmptyViewer[viewer]
+NewViewer[viewer]
+CloseAndNewViewer[viewer]
+Reset:
+TEditDocuments3Impl.ResetOp[viewer]
+Get:
+[] _ DoLoadFile[viewer, selection, FALSE]
+[] _ DoOpenFile[selection, viewer]
+[] _ DoCloseAndOpenFile[viewer, selection]
+GetImpl:
+[] _ DoLoadImplFile[viewer, selection, FALSE]
+[] _ DoOpenImplFile[selection, viewer]
+[] _ DoCloseAndOpenImplFile[viewer, selection]
+PrevFile:
+LoadPreviousFile[viewer]
+OpenPreviousFile[viewer]
+CloseAndOpenPreviousFile[viewer]
+Store:
+DoStoreFile[viewer, selection]
+Save:
+TEditDocuments3Impl.SaveOp[viewer]
+
+New button:
+NewViewer[NIL]
+Open button:
+[] _ DoOpenFile[NIL, selection]
+
+LF keyboard command:
+AnonymousLoadFile[viewer]
+AnonymousLoadImplFile[viewer]
+
+delay until after other op completes
+delay until after other op completes
+copy tdd.text data structure
+ù -{  ïNewlineDelimiter
+ñ(cedarcode) styleô codeöúôKöú
+œeú[ôfKöú#ô#Köú0ô0Köú-ô-Kô&Kô#Kô$Kô óöœk	ò	Köúûúûúûú	òKöúûúòKöúûúûú	òKöúûúò#Köúûú0òOKöúûú&ò1Köúûúò+Köú
+ûú=òLKöúûú#ò3KöûúòKò	Köúûú.ûú#ò_Köúûúò#Köúûú>òQKöúûúzòîKöúûúò*Köúûúò,Köú	ûúòKöúûúoòÅKöúûúAòUKöúûúò,Köú	ûúòKöú	ûúGòUKöúûúò%Köúûú!ò4Köúûú"ò8Köúûúò)Köú
+ûú–òﬂKöúûú(ò;KöúûúFòWóKò ö—blnúûúûò"Köûúeûú¯òÁKöûú.ò5KöúûòKò KöûúûúûúûúòKöûúûúûúòKöúûúò$Köúûúò$Köúûúûú
+òKöúûúò Kò öú#ûúòCKò óöœnúûúûúò4Kö
+ûúûú
+ûúûúûúò6KöúòKò óö†úûúò,Köú/ò/KöúòKò óKòöúòKò óö†úûúûúûúòRKö
+ûúûúûúûúûúò Köûúûúûúò,KòKöûúûú#ò>KöúòKò óö†úûúûú)òLKò'KöûúûúœcòIKòKò óö
+†úûúûúûúûúòUKöûúûúûúòKöûúò!KöúòKò óö†úûúûúûú)òOKöûúûúûúòKò#KòKò óö†úûúûúûúò4KöûúûúûúòKöú'ûúò;KòKöûúûúûúûúòKòKöûú"ûúûúò0öûúûúûúòKöúôKò'KöûúòKöúòóKöúûúòKöúòóKò ö	úûúûúûú	ûúò3Kò óö†úûúûúò3Köúûúûú*òGKöúûúûú(òEKöûúûúûúûúòöûúûúûúòKöúûúòKöú+ò+óKòKòKò óö†úûúûúûúòKKö
+ûú	ûú/ûúûúûúòPKöúûúòKöú.ò.KòKò óö†úûúûúòDKöú'ûúò;KöûúûúûúûúòKöúòKò<KòKò óö†úûúò1Kô>Köúûú(ò1Köú!ò!KöúòKò óö†úûúò*Köúûú(ò1Köú!ò!KöúòóKò öúûú(ò=Kò óö†úûúûúò7Köúûúûú.òOKöúûúûú,òMKöûúûúûúûúòöûúûúûúòKöúûúòKò-KòóKòKòKò óö†úûúò/Köúûúûú0òRKöûúûúûúûúòKò-KòKò óö†úûúûúò9Köú'ûúò;Köúûúûú0òRKòKöûúûúûúûúòöûúûúûúòKöúûúòKò4óKöú?ò?Kò!KöúòKöûúûúûúòKò%KòKò óö†úûúûúNûúûúûúòáKöú)ò)Köûúûú!ò+KòKò óKöú
+ûúûúò'Köú
+ûúûúò'Kò ö
+†úûú*ûúûúûúòdö†úûú*ûúûú!òqöûúûúûúûúûúûúûúûòHò)Kòöûúûúûúòöûúûúò1KöûúûúûúòKöûúûúûú"ò2óKòóKòóKöûúòóKöûúûúò&Kòóöûúûúûòöú)ò)Kò'öûúûúòKò öûú
+ûúûúòKöúôKò/Köúûúûúûú%ò<Köú
+ûúûúò"öûúûòöûú$ûò.KöúûúòKöûúòóKöûúòóKòKòKòóKò%KòóKòóKöûúòóKòKò óö†úûúûúò4Köúûúò%Köú%ò%KòKò óö†úûú/ûúòOKöú&ò&KòKò óö†úûú0òCKöûúûúûúòöúSôSKô8óKöú$ò$KòKò óö†úûúûúò0KöûúòKöûúûúûúûú#òNKöûúûúûúûú%òPKöûúûúûúûú$òOKöúòKò óö†úûúûúò-KòöûúòöûúòKöúûúòKò(Köúòóöûúûú&ûúûòDKöûúûúò(KöûúòóóKöúûúòKöúòKò óö
+†úûúûúûúûúòCKòKöúûúòö†úûú,ò8öúûúûò*Köú(ò(Köú)ò)KöûúûúòóKöûú	ûúûúûúòKò KòóKòKòKòKòVKöûúûú ò-KöúòóKò ö
+†úûú(ûúûúûúòcKöú]ô]Köú+ò+öûú
+ûúûúò)Köûú)ûúò2öûúòöúûúòKöûúûúûúò KöûúûúûúòKöûúûúûúûúò!Köûúûúûú°#òJKô-Köú&ò&Köú(ûúò/KöúBûúòIKöú ò Kòóöûú!ûò'öûúûúûòKöú:ò:KöûúòóóKöú8ò8KòóóKòKò óö†úûú#ûúûúûúûúògKöúKôKKöûúûúûú+ò;Köûúûúò$öú ò KöúòKöú+ûúò1Köúûúòóöûú!ûò'öûúûúûòKöú:ò:KöûúòóóKöúòKòKò óö
+†úûúûúûúûúòXKöúKòKKöúòKòKò óö†úûú#ò4KôöúûúòKöûúûúûúò KöûúûúûúòKöûúûúûúûúòKöûúûúûúò#Kô-Köú$ò$Köú&ûúò-Köú@ûúòGKöúòKöúòKòóKöú*ò*Köú°,òDKöú5ò5KòKò óö
+†úûúûúûúûúòPö†ú°*úòHKöûú
+ûúûúûúûúûúòQKöúòóKò"KöúòKò óö†úûúûúûú	ûúûúòBKöûúûúûúòKöúûúòKöûúûúûúò(Köûúûúûúò(Köûúûúûúò(Köûúûúò$KòKò óö†úûú
+ûúûúò$Köúûúò$KòKò óö†úûúòKöú"ò"KöúòóKò ö†úò+KöúòKöúòKò óö†úò+öûúûúûòKöúûú9òCKöûúòóKöúòKò óö
+†úûúûúûúûúò0Köûú'ò-KöúòKò óö†úûúûúûúûúûúûúûúòbKö	úûúûúûú
+ûúòMKöûúûúûúûúò>KöúòóKò Köúûúò%öúûúò"Kò óö†úûú(ûúûúûúûúûúûúûúûúò◊KöúòKöúûúûúòKöúûúûúòKöûú
+ûúûúòöûúûòKöúòKöú?ò?Köú1ò1KöûúûúòóKô&KöúœbúWòpKôOöûú
+ûúûú°ò5öûúûú°ò8Köú,ò,Köú9ò9öûúûòöúûúòKöúEôEKöú5ò5KöúûúòóKöûúòóKòóö	ûúûúûúûúûò:öú*ò*Köú5ô5öûúòöûúòKöú ô öúûú.ò6Köúûúûú	ò!óKöúYûúò_Köú*ò*Köú1ò1KöûúòKòóöûúòKöú"ô"Kò=Köúûúò#Köú&ò&Köú=ûúûúò\Köúòöûúûúûúûúò:KöúCôCóKöú&ò&KòóóKöú ò KöúûúòKòóKöûúòóöûúûúûòöúûúò Köûú\ô_Köúòöûú
+ûúûúûúûúûòAöûúòKöûúòKöûú+ûúò5óóKòóöú	ò	KöúòóöúòKöú"ò"óKöûúòóKòóKöúòKò óö†úûúûú(ûúûú	ûúûúûúûúòúöúôKô?Kô'KôóKöúûúûúòKöú
+ûúûúûúò?KöúûúòKöúòKöûúûúûú2òMöûú#ûúûúò2Köú(ò(Köú9ò9KöûúòKöúòóKöúòKöúòöûúûúûòò)KöúûúòKöúûúòKöúûúûúòöûòKöú(ò(Köûúûúûúò4Köú?ò?öûú)ûúûúûúûúûúòjKöúzôzóKöú?ò?KöûúòóòKöûúûúCòPöú.ò.Kô óKöûúûúûúò;öûúûúûúòöûúûúòöûúûúûúûò$öú+ûúûú	ò9Köú.ô.óKöûúòóóKöûúòKòóöûúûúûòöúûúòKöú+ô+KöúHòHöûúûòöûúòKöú°.òDö	ûúûúûúûúûòBKöûú<ò@Köûúò#óKöúòóöûòKöúòóóKòKòKöú%ûúò+öûúûúûúòKöúûúò3KöúûúòKöúòóKöúûú°0ò@Köú¢úò?KöúûúòKöúûúòKöú	ûúòKòKöúIòIKöú ò KòóöûúòKöúIôIKöúòKòóóKò KöúòKöú?ò?KöúòKò óKöûúûúò+KòóKöûúòóKöúòKò óö†úò$KöûúûúûúòöûúûúûòKöú(ò(KöûúòóKòóKò ö†	úûúûúûúûúûúûúûúòbKö	ú
+ûúûúûúûúò_öúûúòKö	úûú
+ûúûúûúò9óKöúòKò óö†úûúûúûúûúûúûúûúûúûúòzKöúûúòöûúûúûúûúûúûúûò@Köú<ò<Köûúûúûúûúò#KöûúòóKòKò óö†úûúûúûúûúûúûúûúòLöûúûúûúûúûúûúûò@Kö
+ûúûúûúûúûúò9KöûúòóKöûúûúòKòóKò öúûúò+Kò óöúûúò!Kò óö†úûúûúò:KöúòKöúòKò óö†úûúûúûúòTKöúòKöúòKöúòóKò ö
+†úûúûúûúûúò@Kô<Köûú*ò0KòKò óö†úûúûúûúûúûúûúûúò_KöûúAòGKòóKò ö†úûúûúûúò+Kò óö†úûúûúûúûúûúûúûú ûúûú
+ûúûúò≥KöúûúòKöú-ûúûúò:KöúûúûúòKò"Köú%ò%Köú9ô9ö	ûúûúû
+úûúûò*öûúûòKöúEûúòKKöûúòKöûúûúòóKöûúòóö	ûúûúû
+úûúûò*öûúûòKöúûúòKöúûúûúûúûúûúòFKöúûúòKöûúòóKöûúûúûúò%KöûúòóKöú(ò(Köûúûúûúûúò%öûúûúûúûò,öûúòKöú¢úCòWKöûúûúûúûúò%KòóóöûúûúûúòKöúûúòKöú1ò1öûúûúòKöú¢	úò*Köûúûúûúûúò;KöúòóKòóKöûúûúûúòöûúûúòKöúòKöúòKöûú3ûúûúòSöûúûúûúòKöú¢úBòVKöûúûúûúûúò7KòóKöúòóöûúûúûúò3Köú,ò,Köú°ò4Köûúûúûúûúò%öûúûúûúòKòCKöûúûúûúûúò%Kòóöûúûúûúûúò$KöúBòBKöûúûúûúûúò7KòóKòóKòKò óö†
+úûúûúûúûúûúûúûúûúòpKöúûú(ò8Köúûúò$Köúûú°ò4Köúûú° òEKöúûúûúòö
+ûúûúûúûúûúò3Köúûúûúûúûúûúò!Köú@ò@KòHKöûúûúûú8òHKöúòóKöûúûúûúò,Köú&ò&öú+ò+Köú)ò)óKöûúûúûúûúò7öûúûúûúò3Köú1ò1KöúBòBKöûúûúûúûúò7KòóKöûúòKòKò óö
+†úûúûúûúûúòKKöúûúûúòKöûúûúûúò&öúûúûú
+ûúòöûúûúûúûòKöûú*ò.Köûú ò$óKöûúòKòóKöûú
+òKòKò óöú†úûúûúûúûúò:Köûúûúò:KòKò óö†úûúûúûúûúûúûúûúò\Köú7ûú
+ûúòNKòKò óö†	úûúûúqûúûúûúò≤Köúûú&ò5Köúûúûúò&KöúûúûúòKöúûúûúòKöûúûúûú*ò9Köûúûúûúò;Köûúûúûúò;öûúûúò"Köúûú-ò7Köûúûúûú4ûúòPöûúûòKöú;ò;KöúKòKKöúCòCKöûúûúòóKöûú
+òKòóöúòöûúòKöûú&ûúò5Köú2ûúò>KòóKôöûúûòöúKòKKö¢úDòPóKöú(¢
+úòNKöûúûúòóKöûúûúûúûúòGKòóKô*Köú	¢ú7òXKöûú	ûúûúòKòKô óöúñûúôööúôKöúôKöúôKöúôóöúôKöú#ô#óöúôKöú#ûúô)Köú"ô"Köú*ô*óöúôKöú'ûúô-Köú&ô&Köú.ô.óöú	ô	KöúôKöúôKöú ô óöúôKöúôóöúôKöú"ô"Kô óöúôKöú
+ûúôóöúôKöúûúôKô óöûúôKöúôKöúôóKô óö†úûúûúûúò:öúûú+ò6KöúòKöúûúòKöûúûúûú+ò;Köú/ò/öúòKöûúûú&ò3KöúûúòKöú3ò3KòKòKöúûú-°òIöûúûúûòKöúûúò#öúûúûúûúòEKöúBòBóKöûú"ò)óKöúòKöúûúòKöú%ûúò+Köúûú°!ò2Köú*ûúò/KöúòKòKöú/°òFKòKòKòóKöú"ò"KòóKöûú
+ûúûú,ò@KöúòKò óö†úûúûúò-KòKöúòKò óö
+†úûúûú#ûúûúòYKöú/ò/öúòKöûúûú&ò3Köú$ò$KöúòKöúòóKöú"ò"KöúòKò óö†	úûúûúò+Köú;ò;KöúòKò óö†úûúûúûúòKKöú7ò7öúûúûú&ò5Kò!KòKòóKöú"ò"KòKò óö†úûúûúò3Köú!ò!KöúòKò óö†
+úûúûúûúûú	ûúûúòSKöúûúûúò>öúKòKKöúûúûú
+ûúò7Köú(ò(óKöúòKò óö†úûúûúò*Köú*ûú	ûúò=KöúòKò óö†
+úûúûúûúûú#ûúûúûúòìKöúáòáKöúòKò óö†úûúûúò*Köúûú,òIKöúòKò óö†úûúûúûúûúûúòcKöúkòkKöúòKò óö†úûúûú/ûúòTöúûúJòaKöú(ò(óKöúòóKò ö†úûúûúûúûú	ûúûúûúòtöúKòKKöúûúûú
+ûúò6óKöúòKò óö†úûúûúò.Köú.ûúò3KöúòKò óö†úûúûúûúûú#ûúûúòuKöú\ò\KöúòKò óö†úûúûúò.Köúûú,òMKöúòKò óö†úûúûúûúûúûúògKöúiòiKöúòKò óö†úûúûúò6Köú$ûúò)KöúòKò óö†úûú°"òMKöúûú	ò Köú%ò%KöúûúòKöú
+ûúòKöúûúòKöûúûúûúûúòöú7ò7Köú$ô$óKöúûú,ò9Köúòö
+ûúûúûú$ûúûúò?Köú:ò:KöûúòKöúòóKòKöúPòPKòKò óö†úûú!ò9öûúûúûòöú)ò)KöúûúòKöú
+ûúòKöúûúòKöúûú
+òöú:ò:Köú$ô$óKöúûú,ò9Köúòö
+ûúûúûú$ûúûúòAKöú:ò:Köûúò	óKò-Kö	úûúûúûú&ûú	òcKöú£ûúò™KòóKöûúòóKöûú	ûúòKöúòKò óö†úûúûúò2Köú.ò.KöúòKò óö†úûúûúò2Köú.ò.KöúòKò óö†úûúûúò:Köú1ò1KöúòKò óö
+–nzœz–kz§•§•§•§ò8Kö•§òKö§òKò óö
+£
+§•§•§•§•§ò-Kö•§7ò=Kö§òKò óKö§•§•§•§•§•§•§òDö†úûúûúûú§•§•§úòXKöúûú&ò0Kö	ú
+ûúûúûúûúò_Kö§úûú5ûú
+ûúòcKö§8ú
+§òFKöûú ûúò;KòKò óö†úûúûúûúûúûúûúûúòMKö	ú
+ûúûúûúûúò_Köûúûú-ò7KòKò óö†úûúûúûúûúûúò7Köúûú-ûúòQKöúûúòKöûú	ûúûúò>KòKò óö†úûúûúûúûúûúòAKö	ú
+ûúûúûúûúò_Köúûú8òCKöúûúòKöûú	ûúò*KòKò óö
+†	úûúûúûúûúò/Kö
+ûúûúûúûúûúòAKöúòKò óö†úûú°òCKöúûú&ò/Kö	ú
+ûúûúûúûúò(Köûúûúûúò6Köúûú§
+úò8Köûú
+ûúûúûúòKòKöú,ûúûúûúòZKòKò óö£§•§!•§ò@ïStartOfExpansionÅ[node: TextEdit.RefTextNode, name: ATOM, value: REF ANY, event: TextEdit.Event _ NIL, root: TextEdit.RefTextNode _ NIL]ö§:•§•§•§òUKö•§.ò2óKö§òKò óö
+†úûúûúûúûúòCöúûú+ò6KöúûúûúòKöú	ûúòKöú	ûúòKö§•§•§òKöûú
+ûúûú/òCKöûúûúûúò;Kö§ú#ò:Köûú
+ûúûúûúòKöûúûúûúò2Köûúûú° òDKò%Köú-ûú°òOKö§'–cz)òPöú ò Köúûú6ò>óöûúûúòKöúôKöúûúò	KòKöú5ò5Köúûú°!ò1Köú+ûúò0Köú ò Köú#ò#KöúòóKòóKöú)ò)KöúòKò óö†úûú	ûú>ûúòföúûúòöûúûúûòöú)ò)Köú)ò)Köúûúò1KöúòKòóKöûòóKòóKöúDòDKòKò óö†	úûúûúò+Köú&ûúò+KöúòKò óö†úûúûúûúò;Köú&ò&Köûú#ò)KòKò óö†úûúCûúòdöûúûòKöûú)ò-öûúòKöúûúò&Köúûúòöûúò	Köûúò öûúòKöúçòçKöûúûúûú
+ûú2òLKòóóKòóóKòKò óö†úûúûú/ûúòUKöú]ò]KòKò óö†úûúûúò7Köú3ò3KòKò óKò öúòKöú=ò=óöú!ò!Köú=ò=óöú#ò#Köú=ò=óöú"ò"Köú=ò=óKò óKöûúòKò Kòó Öó    å6  ≈o  

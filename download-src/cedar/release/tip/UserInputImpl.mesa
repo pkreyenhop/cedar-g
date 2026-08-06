@@ -1,0 +1,1004 @@
+
+DIRECTORY 
+BasicTime, Commander, Convert, Devices, DeviceTypes, IO, KeyMapping, KeyStateTypes, KeyTypes, PreDebug, Process, RelativeTimes, Rope, ScreenCoordsTypes, SimpleFeedback, SpecialKeySyms, UserInput, UserInputDiscrimination, UserInputGetActions, UserInputInsertActions, UserInputLookahead, UserInputOps, UserInputOpsExtras, UserInputOpsExtras2, UserInputOpsExtras3, UserInputPrivate, UserInputTypes;
+
+UserInputImpl: CEDAR MONITOR
+IMPORTS BasicTime, Commander, Convert, Devices, IO, KeyMapping, PreDebug, Process, RelativeTimes, Rope, SimpleFeedback
+EXPORTS UserInput, UserInputDiscrimination, UserInputGetActions, UserInputInsertActions, UserInputLookahead, UserInputOps, UserInputOpsExtras, UserInputOpsExtras2, UserInputOpsExtras3, UserInputPrivate ~ BEGIN 
+
+HandleRep: PUBLIC TYPE = UserInputPrivate.Rep;
+Rep: TYPE = UserInputPrivate.Rep;
+Handle: TYPE = REF Rep;
+
+NarrowHandle: PUBLIC <<UserInputDiscrimination>> PROC [x: REF ANY] RETURNS [UserInput.Handle] = {
+RETURN [NARROW[x, Handle]]
+};
+
+IsHandle: PUBLIC <<UserInputDiscrimination>> PROC [x: REF ANY] RETURNS [BOOL] = {
+RETURN [ISTYPE[x, Handle]];
+};
+
+ActionKind: TYPE ~ {
+deltaEventTime, eventTime, 
+mousePosition, fakeMouseMotion, penPosition,
+keyDown, keyUp, keyStillDown, allUp, end,
+timedOut -- never stored --
+};
+
+TimeStamp: TYPE = RelativeTimes.TimeStamp;
+Acceptance: TYPE = UserInputTypes.Acceptance;
+DeltaTime: TYPE = RelativeTimes.DeltaTime;
+KeyCode: TYPE = KeyTypes.KeyCode;
+KeyCodes: TYPE = KeyMapping.KeyCodes;
+KeyTable: TYPE = KeyMapping.KeyTable;
+MousePosition: TYPE = ScreenCoordsTypes.TIPScreenCoordsRec;
+PenPosition: TYPE = ScreenCoordsTypes.TIPScreenCoordsRec;
+KeySym: TYPE = KeyTypes.KeySym;
+UpDown: TYPE = KeyStateTypes.UpDown;
+WaitMode: TYPE = UserInputTypes.WaitMode;
+
+PrivateData: TYPE ~ REF PrivateDataRep;
+PrivateDataRep: PUBLIC TYPE ~ RECORD [
+next: REF EventRecord, -- the event that will next be read from the queue
+shared: REF SharedDataRep,
+number: CARD, -- a number that uniquely identifies this handle for debugging
+name: ATOM, -- a unique name for this handle, also for debugging
+newLogger: NewLoggingProc ¨ NIL
+];
+
+NewLoggingProc: TYPE = UserInputGetActions.NewLoggingProc;
+
+SharedDataRep: TYPE ~ RECORD [
+latest: REF EventRecord, -- The most recent event for this collection of handles
+epochGMT: BasicTime.GMT, -- best guess for absolute time associated with epochTimeStamp
+epochTimeStamp: TimeStamp,
+isMouse: PACKED ARRAY KeyCode OF BOOL ¨ ALL[FALSE]
+];
+
+EventRecord: TYPE ~ RECORD [
+refCount: INT, -- counts references from other EventRecords and from private.next fields
+kind: ActionKind,
+type: ATOM, -- the new scheme, more extensible than the "kind" field
+eventTime: TimeStamp,
+keyCode: KeyCode, -- valid for kind one of {keyDown, keyStillDown, keyUp}
+preferredSym: INTEGER, -- valid for kind one of {keyDown, keyStillDown, keyUp}
+newPosition: MousePosition, -- valid for kind one of {mousePosition, fakeMouseMotion, penPosition}
+device: REF, -- the particular mouse, keyboard, voice recognizer, etc., from which this event came
+display: REF,
+user: REF, -- the user who produced this event (if known)
+data: REF, -- private information associated with this event by the queueing process
+ref: REF,
+eventSource: REF READONLY ANY,
+acceptance: Acceptance ¨ clicksAndMotion,
+next: REF EventRecord,
+onFreeList: BOOL ¨ FALSE -- for debugging, Bier, Jacobi September 30, 1991
+];
+
+avail: REF EventRecord ¨ NIL; -- "free" list of EventRecords
+availMax: INT ¨ 1200; -- the free list may not grow larger than this
+availCount: INT ¨ 0; -- the number of elements on the free list
+allocCount: CARD ¨ 0; -- number of EventRecords allocated via NEW (for statistics only).
+
+Alloc: PROC [er: EventRecord] RETURNS [e: REF EventRecord] ~ INLINE {
+msg: Rope.ROPE;
+[e, msg] ¨ EntryAlloc[];
+IF msg#NIL THEN Warn[oneLiner, msg];
+e≠ ¨ er;
+};
+
+EntryAlloc: ENTRY PROC [] RETURNS [e: REF EventRecord, msg: Rope.ROPE ¨ NIL] ~ INLINE {
+[e, msg] ¨ AllocInternal[]
+};
+
+AllocInternal: INTERNAL PROC RETURNS [e: REF EventRecord, msg: Rope.ROPE ¨ NIL] ~ {
+IF avail = NIL
+THEN { -- allocate an EventRecord from the heap
+e ¨ NEW[EventRecord];
+e.onFreeList ¨ FALSE;
+allocCount ¨ allocCount + 1;
+IF allocCount >= 100 AND allocCount MOD 50 = 0 THEN 
+msg ¨ IO.PutFR1["TIP has allocated %g EventRecords so far", [integer[allocCount]]] 
+}
+ELSE { -- take one from the free list
+e ¨ avail;
+avail ¨ avail.next;
+availCount ¨ availCount-1;
+IF ~e.onFreeList THEN {
+msg ¨ "TIP problem: attempt to allocate event that wasn't really free";
+e ¨ NEW[EventRecord];
+};
+e.onFreeList ¨ FALSE;
+};
+};
+
+Warn: PROC [msgType: SimpleFeedback.MsgType, r: Rope.ROPE] = {
+ENABLE ANY => GOTO oops;
+IF msgType=oneLiner OR msgType=begin THEN r ¨ Rope.Concat["UserInputImpl: ", r];
+SimpleFeedback.Append[$TIP, msgType, $Warning, r];
+EXITS oops => {}
+};
+
+NillHandle: ERROR ~ CODE;
+Bug: SIGNAL [msg: REF READONLY TEXT] ~ CODE;
+
+SetUpEventRecord: INTERNAL PROC [handle: Handle, deltaTime: DeltaTime] RETURNS [new: REF EventRecord ¨ NIL, shared: REF SharedDataRep ¨ NIL, error: REF READONLY TEXT ¨ NIL] = {
+private: PrivateData;
+warning: Rope.ROPE;
+IF handle = NIL THEN RETURN [NIL, NIL, "NIL-handle"];
+private ¨ handle.private;
+IF private = NIL THEN RETURN [NIL, NIL, "NIL-private"];
+shared ¨ private.shared;
+[new, warning] ¨ AllocInternal[];
+IF warning#NIL THEN Warn[oneLiner, warning];
+new.next ¨ NIL;
+IF deltaTime < 0 THEN 
+RETURN [NIL, NIL, "deltaTime < 0"];
+IF shared = NIL THEN 
+RETURN [NIL, NIL, "SetUpEventRecord shared=NIL"];
+IF shared.latest = NIL THEN 
+RETURN [NIL, NIL, "SetUpEventRecord shared.latest=NIL"];
+IF shared.latest.next # NIL THEN {
+IF shared.latest.onFreeList THEN 
+RETURN [NIL, NIL, "SetUpEventRecord shared.latest.next#NIL, latest is on free list"];
+RETURN [NIL, NIL, "SetUpEventRecord shared.latest.next#NIL, latest is active"];
+};
+new.eventTime.t ¨ shared.latest.eventTime.t + LOOPHOLE[deltaTime, CARD32];
+new.newPosition ¨ shared.latest.newPosition; -- if there is no new mouse position, assume we are still at the last one
+};
+
+PutEventRecordOnQueue: INTERNAL PROC [new: REF EventRecord, shared: REF SharedDataRep] = {
+ReportTimeUpdateFailed: PROC [] = {
+epochAsRope: Rope.ROPE ¨ NIL;
+epochAsRope ¨ Convert.RopeFromTime[from: shared.epochGMT, end: seconds !BasicTime.OutOfRange, BasicTime.TimeNotKnown, BasicTime.TimeParametersNotKnown, Convert.Error => CONTINUE];
+IF epochAsRope#NIL
+THEN Warn[oneLiner, IO.PutFR1["PutEventRecordOnQueue got an event dated after %g.", [rope[epochAsRope]]] ]
+ELSE Warn[oneLiner, IO.PutFR1["PutEventRecordOnQueue got an event when shared.epochGMT was broken (%08x).", [cardinal[LOOPHOLE[shared.epochGMT]]]] ];
+};
+shared.latest.next ¨ new; -- these three lines put the action on the queue
+new.refCount ¨ 1;
+shared.latest ¨ new;
+BEGIN
+WHILE RelativeTimes.InlinePeriod[from: shared.epochTimeStamp, to: new.eventTime] > 100000 DO
+shared.epochGMT ¨ BasicTime.Update[shared.epochGMT, 100
+! BasicTime.OutOfRange => GOTO TimeUpdateFailed];
+shared.epochTimeStamp.t ¨ shared.epochTimeStamp.t + 100000;
+ENDLOOP;
+EXITS
+TimeUpdateFailed => { -- shared.epochGMT was about to go beyond year 2036
+ReportTimeUpdateFailed[ ! ANY => CONTINUE];
+shared.epochGMT ¨ BasicTime.Now[]; -- set it back to now, Bier, January 16, 1991
+shared.epochTimeStamp ¨ new.eventTime;
+};
+END;
+BROADCAST newEventCame;
+};
+
+InsertInputAction: PUBLIC PROC [handle: Handle, a: InputAction] = {
+InsertInputActionBody[handle, a≠];
+};
+InsertInputActionBody: PUBLIC ENTRY PROC [handle: Handle, a: InputActionBody] = {
+new: REF EventRecord;
+shared: REF SharedDataRep;
+errorMessage: REF READONLY TEXT;
+[new, shared, errorMessage] ¨ SetUpEventRecord[handle, a.deltaTime];
+IF errorMessage # NIL THEN RETURN WITH ERROR Bug[errorMessage];
+new.eventSource ¨ a.eventSource;
+new.type ¨ a.kind;
+SELECT a.kind FROM
+$TimeIsPassing => new.kind ¨ deltaEventTime;
+$Key => IF a.down THEN {
+new.kind ¨ keyDown;
+handle.rawKeyboardState[a.keyCode] ¨ down;
+}
+ELSE {
+new.kind ¨ keyUp;
+handle.rawKeyboardState[a.keyCode] ¨ up;
+};
+$IntegerPosition => {
+new.kind ¨ mousePosition;
+new.newPosition ¨ [a.x, a.y, ColorDisplayFromBool[a.display = $Color OR a.display = $Display1]];
+};
+$FakePosition => {
+new.kind ¨ fakeMouseMotion;
+new.newPosition ¨ shared.latest.newPosition;
+};
+$Enter => new.kind ¨ fakeMouseMotion; -- old clients will ignore this event
+$Exit => new.kind ¨ fakeMouseMotion; -- old clients will ignore this event
+$Ref => {
+new.kind ¨ fakeMouseMotion; -- old clients will ignore this event
+new.ref ¨ a.ref;
+new.acceptance ¨ all; -- there is no a.acceptance so re-inserting these events doesn't work well
+};
+$AllUp => {
+new.kind ¨ allUp;
+handle.rawKeyboardState ¨ ALL[up];
+};
+$KeyStillDown => {
+new.kind ¨ keyStillDown;
+handle.rawKeyboardState[a.keyCode] ¨ down;
+};
+$EventTime => {
+new.kind ¨ eventTime;
+IF shared.epochGMT = BasicTime.nullGMT THEN {
+shared.epochGMT ¨ BasicTime.Now[];
+shared.epochTimeStamp ¨ new.eventTime;
+};
+};
+$End => new.kind ¨ end;
+ENDCASE => {
+Warn[oneLiner, IO.PutFR1["Unexpected event %g in InsertInputActionBody", [atom[a.kind]]]]
+};
+new.eventTime ¨ a.eventTime;
+new.keyCode ¨ a.keyCode;
+new.preferredSym ¨ a.preferredSym;
+new.device ¨ a.device;
+new.display ¨ a.display;
+new.user ¨ a.user;
+new.data ¨ a.data;
+PutEventRecordOnQueue[new, shared];
+};
+InsertTimeIsPassing: PUBLIC ENTRY PROC [handle: Handle, deltaTime: DeltaTime, data: REF ¨ NIL, eventSource: REF READONLY ANY ¨ NIL] = {
+new: REF EventRecord;
+shared: REF SharedDataRep;
+errorMessage: REF READONLY TEXT;
+[new, shared, errorMessage] ¨ SetUpEventRecord[handle, deltaTime];
+IF errorMessage # NIL THEN RETURN WITH ERROR Bug[errorMessage];
+new.kind ¨ deltaEventTime; -- for backwards compatibility
+new.type ¨ $TimeIsPassing;
+new.data ¨ data;
+new.eventSource ¨ eventSource;
+PutEventRecordOnQueue[new, shared];
+};
+
+InsertKey: PUBLIC ENTRY PROC [handle: Handle, deltaTime: DeltaTime, down: BOOL, keyCode: KeyCode ¨ NULL, preferredSym: KeySym ¨ [0], device: REF ¨ NIL, user: REF ¨ NIL, data: REF ¨ NIL, eventSource: REF READONLY ANY ¨ NIL] = {
+new: REF EventRecord;
+shared: REF SharedDataRep;
+errorMessage: REF READONLY TEXT;
+[new, shared, errorMessage] ¨ SetUpEventRecord[handle, deltaTime];
+IF errorMessage # NIL THEN RETURN WITH ERROR Bug[errorMessage];
+IF down THEN {
+new.kind ¨ keyDown;
+handle.rawKeyboardState[keyCode] ¨ down;
+}
+ELSE {
+new.kind ¨ keyUp;
+handle.rawKeyboardState[keyCode] ¨ up;
+};
+new.type ¨ $Key;
+new.keyCode ¨ keyCode;
+new.preferredSym ¨ preferredSym;
+new.device ¨ device;
+new.user ¨ user;
+new.data ¨ data;
+new.eventSource ¨ eventSource;
+PutEventRecordOnQueue[new, shared];
+};
+InsertIntegerPosition: PUBLIC ENTRY PROC [handle: Handle, deltaTime: DeltaTime, x, y: INTEGER, device: REF ¨ NIL, user: REF ¨ NIL, display: REF ¨ NIL, data: REF ¨ NIL, eventSource: REF READONLY ANY ¨ NIL] = {
+new: REF EventRecord;
+shared: REF SharedDataRep;
+errorMessage: REF READONLY TEXT;
+[new, shared, errorMessage] ¨ SetUpEventRecord[handle, deltaTime];
+IF errorMessage # NIL THEN RETURN WITH ERROR Bug[errorMessage];
+new.kind ¨ mousePosition; -- for backwards compatibility
+new.type ¨ $IntegerPosition;
+new.newPosition ¨ [x, y, ColorDisplayFromBool[display = $Color OR display = $Display1]];
+new.device ¨ device;
+new.user ¨ user;
+new.display ¨ display;
+new.data ¨ data;
+new.eventSource ¨ eventSource;
+PutEventRecordOnQueue[new, shared];
+};
+ColorDisplayFromBool: PROC [b: BOOL] RETURNS [BOOL] = INLINE {
+RETURN [b];
+};
+
+InsertFakePosition: PUBLIC ENTRY PROC [handle: Handle, deltaTime: DeltaTime, device: REF ¨ NIL, user: REF ¨ NIL, display: REF ¨ NIL, data: REF ¨ NIL, eventSource: REF READONLY ANY ¨ NIL] = {
+new: REF EventRecord;
+shared: REF SharedDataRep;
+errorMessage: REF READONLY TEXT;
+
+[new, shared, errorMessage] ¨ SetUpEventRecord[handle, deltaTime];
+IF errorMessage # NIL THEN RETURN WITH ERROR Bug[errorMessage];
+new.kind ¨ fakeMouseMotion;  -- for backwards compatibility
+new.type ¨ $FakePosition;
+new.newPosition ¨ shared.latest.newPosition;
+new.device ¨ device;
+new.user ¨ user;
+new.display ¨ display;
+new.eventSource ¨ eventSource;
+new.data ¨ data;
+PutEventRecordOnQueue[new, shared];
+};
+InsertEnter: PUBLIC ENTRY PROC [handle: Handle, deltaTime: DeltaTime, device: REF ¨ NIL, user: REF ¨ NIL, display: REF ¨ NIL, data: REF ¨ NIL, eventSource: REF READONLY ANY ¨ NIL] = {
+new: REF EventRecord;
+shared: REF SharedDataRep;
+errorMessage: REF READONLY TEXT;
+[new, shared, errorMessage] ¨ SetUpEventRecord[handle, deltaTime];
+IF errorMessage # NIL THEN RETURN WITH ERROR Bug[errorMessage];
+new.kind ¨ allUp; -- so that this event will be ignored by old clients
+new.type ¨ $Enter;
+new.device ¨ device;
+new.user ¨ user;
+new.display ¨ display;
+new.eventSource ¨ eventSource;
+new.data ¨ data;
+PutEventRecordOnQueue[new, shared];
+};
+InsertExit: PUBLIC ENTRY PROC [handle: Handle, deltaTime: DeltaTime, device: REF ¨ NIL, user: REF ¨ NIL, display: REF ¨ NIL, data: REF ¨ NIL, eventSource: REF READONLY ANY ¨ NIL] = {
+new: REF EventRecord;
+shared: REF SharedDataRep;
+errorMessage: REF READONLY TEXT;
+[new, shared, errorMessage] ¨ SetUpEventRecord[handle, deltaTime];
+IF errorMessage # NIL THEN RETURN WITH ERROR Bug[errorMessage];
+new.kind ¨ allUp; -- so that this event will be ignored by old clients
+new.type ¨ $Exit;
+new.device ¨ device;
+new.user ¨ user;
+new.display ¨ display;
+new.eventSource ¨ eventSource;
+new.data ¨ data;
+PutEventRecordOnQueue[new, shared];
+};
+InsertRef: PUBLIC ENTRY PROC [handle: Handle, deltaTime: DeltaTime, ref: REF, acceptance: Acceptance, device: REF ¨ NIL, user: REF ¨ NIL, data: REF ¨ NIL, eventSource: REF READONLY ANY ¨ NIL] = {
+new: REF EventRecord;
+shared: REF SharedDataRep;
+errorMessage: REF READONLY TEXT;
+[new, shared, errorMessage] ¨ SetUpEventRecord[handle, deltaTime];
+IF errorMessage # NIL THEN RETURN WITH ERROR Bug[errorMessage];
+new.kind ¨ fakeMouseMotion; -- there is no kind=ref, so we'll be something innocuous
+new.type ¨ $Ref;
+new.ref ¨ ref;
+new.acceptance ¨ acceptance;
+new.device ¨ device;
+new.user ¨ user;
+new.eventSource ¨ eventSource;
+new.data ¨ data;
+PutEventRecordOnQueue[new, shared];
+};
+
+InsertAllUp: PUBLIC ENTRY PROC [handle: Handle, deltaTime: DeltaTime, device: REF ¨ NIL, user: REF ¨ NIL, data: REF ¨ NIL, eventSource: REF READONLY ANY ¨ NIL] = {
+new: REF EventRecord;
+shared: REF SharedDataRep;
+errorMessage: REF READONLY TEXT;
+[new, shared, errorMessage] ¨ SetUpEventRecord[handle, deltaTime];
+IF errorMessage # NIL THEN RETURN WITH ERROR Bug[errorMessage];
+new.kind ¨ allUp;
+new.type ¨ $AllUp;
+new.device ¨ device;
+new.user ¨ user;
+new.data ¨ data;
+new.eventSource ¨ eventSource;
+handle.rawKeyboardState ¨ ALL[up];
+PutEventRecordOnQueue[new, shared];
+};
+
+InsertKeyStillDown: PUBLIC ENTRY PROC [handle: Handle, deltaTime: DeltaTime, keyCode: KeyCode ¨ NULL, preferredSym: KeySym ¨ [0], device: REF ¨ NIL, user: REF ¨ NIL, data: REF ¨ NIL, eventSource: REF READONLY ANY ¨ NIL] = {
+new: REF EventRecord;
+shared: REF SharedDataRep;
+errorMessage: REF READONLY TEXT;
+[new, shared, errorMessage] ¨ SetUpEventRecord[handle, deltaTime];
+IF errorMessage # NIL THEN RETURN WITH ERROR Bug[errorMessage];
+new.kind ¨ keyStillDown;
+new.type ¨ $KeyStillDown;
+new.keyCode ¨ keyCode;
+new.preferredSym ¨ preferredSym;
+new.device ¨ device;
+new.user ¨ user;
+new.data ¨ data;
+new.eventSource ¨ eventSource;
+handle.rawKeyboardState[keyCode] ¨ down;
+PutEventRecordOnQueue[new, shared];
+};
+
+InsertEventTime: PUBLIC ENTRY PROC [handle: Handle, eventTime: TimeStamp, data: REF ¨ NIL, eventSource: REF READONLY ANY ¨ NIL] = {
+new: REF EventRecord;
+shared: REF SharedDataRep;
+errorMessage: REF READONLY TEXT;
+[new, shared, errorMessage] ¨ SetUpEventRecord[handle, 0];
+IF errorMessage # NIL THEN RETURN WITH ERROR Bug[errorMessage];
+IF RelativeTimes.InlineIsLaterTime[t1: eventTime, t2: shared.latest.eventTime]
+THEN Warn[oneLiner, "The event clock was just set backwards"];
+new.kind ¨ eventTime;
+new.type ¨ $EventTime;
+new.eventTime ¨ eventTime;
+new.data ¨ data;
+new.eventSource ¨ eventSource;
+IF shared.epochGMT = BasicTime.nullGMT THEN {
+shared.epochGMT ¨ BasicTime.Now[];
+shared.epochTimeStamp ¨ new.eventTime;
+};
+PutEventRecordOnQueue[new, shared];
+};
+
+InsertEnd: PUBLIC ENTRY PROC [handle: Handle, deltaTime: DeltaTime, data: REF ¨ NIL, eventSource: REF READONLY ANY ¨ NIL] = {
+new: REF EventRecord;
+shared: REF SharedDataRep;
+errorMessage: REF READONLY TEXT;
+[new, shared, errorMessage] ¨ SetUpEventRecord[handle, deltaTime];
+IF errorMessage # NIL THEN RETURN WITH ERROR Bug[errorMessage];
+new.kind ¨ end;
+new.type ¨ $End;
+new.data ¨ data;
+new.eventSource ¨ eventSource;
+PutEventRecordOnQueue[new, shared];
+};
+
+handles, handlesTailPointer: LIST OF Handle;
+handleCount: NAT ¨ 0;
+RegisterHandle: PROC [handle: Handle] = {
+handleCount ¨ handleCount + 1;
+handle.private.number ¨ handleCount;
+IF handles = NIL THEN {
+handles ¨ handlesTailPointer ¨ LIST[handle];
+}
+ELSE {
+handlesTailPointer.rest ¨ LIST[handle];
+handlesTailPointer ¨ handlesTailPointer.rest;
+};
+};
+
+ThisHandleProc: TYPE = PROC [handle: Handle] RETURNS [done: BOOL ¨ FALSE];
+WalkHandles: PROC [thisHandleProc: ThisHandleProc] RETURNS [aborted: BOOL ¨ FALSE] = {
+FOR list: LIST OF Handle ¨ handles, list.rest UNTIL list = NIL DO
+aborted ¨ thisHandleProc[list.first];
+IF aborted THEN RETURN;
+ENDLOOP;
+};
+
+ListHandles: Commander.CommandProc = {
+PrintHandleInfo: ThisHandleProc = {
+IF handle.private.next = NIL THEN cmd.out.PutF["(%g) %g: CLOSED\n", [integer[handle.private.number]], [atom[handle.private.name]] ]
+ELSE cmd.out.PutF["(%g) %g: at event %g\n", [integer[handle.private.number]], [atom[handle.private.name]], [integer[handle.private.next.eventTime]] ];
+IF handle.private.next # NIL AND handle.private.next.eventTime # 0 AND handle.private.next.eventTime < earliestTime THEN {
+earliestTime ¨ handle.private.next.eventTime;
+earliestHandle ¨ handle;
+};
+};
+PrintFinalHandle: PROC [handle: Handle] = {
+IF handle.private.next = NIL THEN cmd.out.PutF["(%g) %g: now CLOSED\n", [integer[handle.private.number]], [atom[handle.private.name]] ]
+ELSE cmd.out.PutF["(%g) %g: now at event %g\n", [integer[handle.private.number]], [atom[handle.private.name]], [integer[handle.private.next.eventTime]] ];
+};
+thisTime: RelativeTimes.TimeStamp ¨ RelativeTimes.nullTimeStamp;
+earliestTime: RelativeTimes.TimeStamp ¨ [CARD.LAST];
+earliestHandle: Handle ¨ NIL;
+[] ¨ WalkHandles[PrintHandleInfo];
+IF earliestHandle = NIL
+THEN cmd.out.PutRope["No earliest handle"]
+ELSE {
+cmd.out.PutRope["Earliest handle = "];
+[] ¨ PrintFinalHandle[earliestHandle];
+};
+};
+
+DummyEvent: PROC [] RETURNS [e: REF EventRecord] = {
+e ¨ Alloc[[refCount: 1, kind: eventTime, eventTime: RelativeTimes.nullTimeStamp, keyCode: KeyCode.FIRST, preferredSym: 0, newPosition: [0, 0, ], next: NIL]];
+};
+
+Create: PUBLIC PROC [source: PROC [handle: UserInput.Handle] ¨ NIL, sourceData: REF ANY ¨ NIL, name: ATOM ¨ $UnNamed] RETURNS [Handle] ~ {
+handle: Handle ~ NEW[Rep];
+private: PrivateData ~ NEW[PrivateDataRep];
+handle.private ¨ private;
+private.shared ¨ NEW[SharedDataRep];
+
+handle.mouseGrainTime ¨ 1;
+handle.mouseGrainDots ¨ 1;
+handle.source ¨ source;
+handle.sourceData ¨ sourceData;
+private.next ¨ private.shared.latest ¨ DummyEvent[];
+private.shared.epochGMT ¨ BasicTime.nullGMT;
+private.shared.epochTimeStamp ¨ RelativeTimes.nullTimeStamp;
+private.name ¨ name;
+RegisterHandle[handle];
+RETURN [handle];
+};
+
+SetAbsoluteTime: PUBLIC ENTRY PROC [handle: Handle, epochGMT: BasicTime.GMT ¨ BasicTime.nullGMT, epochTimeStamp: TimeStamp ¨ RelativeTimes.nullTimeStamp] ~ {
+private: PrivateData; shared: REF SharedDataRep;
+IF handle=NIL THEN RETURN WITH ERROR NillHandle;
+private ¨ handle.private;
+IF private=NIL THEN RETURN WITH ERROR Bug[NIL];
+shared ¨ private.shared;
+IF shared=NIL THEN RETURN WITH ERROR Bug[NIL];
+shared.epochGMT ¨ epochGMT;
+shared.epochTimeStamp ¨ epochTimeStamp;
+};
+
+SetMapping: PUBLIC PROC [handle: Handle, mapping: KeyMapping.Mapping] = {
+private: PrivateData ~ handle.private;
+handle.mapping ¨ mapping;
+FOR k: KeyCode IN KeyCode DO
+SELECT KeyMapping.GetKeySym[mapping, k, 0] FROM
+SpecialKeySyms.Button1, SpecialKeySyms.Button2, SpecialKeySyms.Button3, SpecialKeySyms.Button4, SpecialKeySyms.Button5 => private.shared.isMouse[k] ¨ TRUE;
+ENDCASE => private.shared.isMouse[k] ¨ FALSE;
+ENDLOOP;
+};
+
+GetMapping: PUBLIC PROC [handle: Handle] RETURNS [mapping: KeyMapping.Mapping] = {
+RETURN [handle.mapping];
+};
+
+Close: PUBLIC ENTRY PROC [handle: Handle] ~ {
+CloseInternal[handle];
+};
+
+CloseInternal: INTERNAL PROC [handle: Handle] ~ {
+private: PrivateData ~ handle.private;
+IF private.next # NIL THEN { 
+DecrementRefCountInternal[private.next]; private.next ¨ NIL 
+};
+};
+
+SaveState: PUBLIC ENTRY PROC [saved: Handle, handle: Handle] ~ {
+savedPrivate: PrivateData ~ saved.private;
+handlePrivate: PrivateData ~ handle.private;
+IF saved = handle THEN ERROR Bug["SaveState args are EQ"];
+CloseInternal[saved]; -- in the common case, this CloseInternal should leave savedPrivate.next.refCount = 0
+saved.timeStamp ¨ handle.timeStamp;
+saved.mousePosition ¨ handle.mousePosition;
+saved.penPosition ¨ handle.penPosition;
+saved.keyboardState ¨ handle.keyboardState;
+saved.mapping ¨ handle.mapping;
+savedPrivate.next ¨ handlePrivate.next; -- set the next action to read from the stream
+IncrementRefCountInternal[savedPrivate.next];
+IF handlePrivate.shared = NIL THEN SIGNAL Bug[msg: "SaveState: Tail pointer becoming NIL"];
+savedPrivate.shared ¨ handlePrivate.shared;
+};
+
+RestoreState: PUBLIC ENTRY PROC [saved: Handle, handle: Handle] ~ {
+savedPrivate: PrivateData ~ saved.private;
+handlePrivate: PrivateData ~ handle.private;
+IF saved = handle THEN ERROR Bug["RestoreState args are EQ"];
+CloseInternal[handle];
+handle.timeStamp ¨ saved.timeStamp;
+handle.mousePosition ¨ saved.mousePosition;
+handle.penPosition ¨ saved.penPosition;
+handle.keyboardState ¨ saved.keyboardState;
+handlePrivate.next ¨ savedPrivate.next; -- set the next action to read from the stream
+IncrementRefCountInternal[handlePrivate.next];
+IF savedPrivate.shared = NIL THEN SIGNAL Bug[msg: "RestoreState: Tail pointer becoming NIL"];
+handlePrivate.shared ¨ savedPrivate.shared;
+};
+
+IncrementRefCountInternal: INTERNAL PROC [e: REF EventRecord] ~ {
+IF e # NIL THEN e.refCount ¨ e.refCount + 1;
+};
+
+DecrementRefCountInternal: INTERNAL PROC [e: REF EventRecord] ~ {
+WHILE e # NIL AND (e.refCount ¨ e.refCount - 1) = 0 DO
+next: REF EventRecord ¨ e.next;
+AddToFreeList[e];
+e ¨ next;
+ENDLOOP;
+};
+
+AddToFreeList: INTERNAL PROC [e: REF EventRecord] ~ INLINE {
+IF e.onFreeList THEN {
+Warn[oneLiner, "attempt to free event that wasn't really allocated"];
+RETURN;
+};
+e.onFreeList ¨ TRUE;
+IF availCount >= availMax
+THEN { e.next ¨ NIL -- let garbage collector have it -- }
+ELSE { e.next ¨ avail; avail ¨ e; availCount ¨ availCount + 1 };
+};
+
+newEventCame: CONDITION;
+InitializeCONDITION: PROC = TRUSTED { -- called when this module is started
+Process.EnableAborts[@newEventCame];
+};
+
+GetEventRecord: ENTRY PROC [handle: Handle, waitMode: WaitMode ¨ forever, finalTime: TimeStamp, acceptance: Acceptance ¨ clicks] RETURNS [e: REF EventRecord] ~ {
+ENABLE UNWIND => NULL; --because external process can be calling Process.Abort while we wait on condition newEventCame.
+private: PrivateData ~ handle.private;
+success: BOOL ¨ FALSE;
+
+[success, e] ¨ GetEventRecordInternal[handle, private, waitMode, finalTime, acceptance];
+IF NOT success THEN RETURN [NIL];
+
+IncrementRefCountInternal[e];
+DecrementRefCountInternal[private.next];
+private.next ¨ e; -- so, private.next is the most recent event that GetEventRecord returned
+};
+
+GetEventRecordInternal: INTERNAL PROC [handle: Handle, private: PrivateData, waitMode: WaitMode, finalTime: TimeStamp, acceptance: Acceptance] RETURNS [success: BOOL ¨ TRUE, e: REF EventRecord ¨ NIL] = {
+SELECT waitMode FROM
+forever, timed => {
+CheckInvariants1[private];
+WHILE private.next.next = NIL DO
+IF handle.source # NIL THEN {
+handle.source[handle]; -- if we have a built-in source, try to use it to get an event.
+IF private.next.next = NIL THEN WAIT newEventCame;
+}
+ELSE WAIT newEventCame;
+CheckInvariants2[private];
+ENDLOOP;
+e ¨ private.next.next;
+};
+dontWait => {
+IF private.next.next = NIL 
+THEN RETURN [FALSE, NIL]
+ELSE RETURN [TRUE, private.next.next];
+};
+ENDCASE => ERROR;
+};
+
+CheckInvariants1: PROC [private: PrivateData] = INLINE {
+IF private.next = NIL THEN {
+Warn[begin, "attempt to get an event from a closed handle"];
+IF private.shared.latest = NIL 
+THEN {
+Warn[end, " but latest event exists."];
+private.next ¨ private.shared.latest ¨ DummyEvent[]
+}
+ELSE {
+Warn[end, " and no latest event!"];
+private.next ¨ private.shared.latest;
+};
+};
+};
+
+CheckInvariants2: PROC [private: PrivateData] = INLINE {
+IF private.next = NIL THEN {
+Warn[oneLiner, "handle became closed during GetEventRecordInternal"];
+IF private.shared.latest = NIL 
+THEN private.next ¨ private.shared.latest ¨ DummyEvent[]
+ELSE private.next ¨ private.shared.latest;
+};
+};
+
+
+
+InputAction: TYPE ~ UserInputGetActions.InputAction;
+InputActionBody: TYPE ~ UserInputGetActions.InputActionBody;
+GetInputAction: PUBLIC PROC [handle: Handle, waitMode: WaitMode ¨ forever, waitInterval: DeltaTime ¨ 100, acceptance: Acceptance ¨ all] RETURNS [a: InputAction] = {
+a ¨ NEW[InputActionBody];
+a^ ¨ GetInputActionBody[handle, waitMode, waitInterval, acceptance];
+};
+
+GetInputActionBody: PUBLIC PROC [handle: Handle, waitMode: WaitMode ¨ forever, waitInterval: DeltaTime ¨ 100, acceptance: Acceptance ¨ all] RETURNS [a: InputActionBody] = {
+private: PrivateData ~ handle.private;
+startTime: TimeStamp ¨ handle.timeStamp; -- time of the last successful GetAction
+finalTime: TimeStamp ¨ [startTime.t + LOOPHOLE[waitInterval, CARD32]]; -- this arithmetic is (implictly) performed modulo 2≠32.
+deltaTime: DeltaTime;
+DO -- Exit by RETURN.  Keep trying until your time runs out and GetEventRecord = NIL
+event: REF EventRecord ~ GetEventRecord[handle, waitMode, finalTime, acceptance];
+IF event = NIL THEN GOTO Timeout; -- can only happen if waitMode = dontWait
+deltaTime ¨ RelativeTimes.InlinePeriod[from: handle.timeStamp, to: event.eventTime];
+handle.timeStamp ¨ event.eventTime;
+a.kind ¨ event.type;
+a.eventSource ¨ event.eventSource;
+a.deltaTime ¨ deltaTime;
+a.eventTime ¨ handle.timeStamp; -- The comment in UserInputGetActions now lies.  eventTime is now valid for all event types
+IF waitMode = timed THEN {
+IF RelativeTimes.InlineIsLaterTime[finalTime, event.eventTime] THEN GOTO Timeout;
+};
+SELECT event.type FROM
+$EventTime => IF acceptance = all THEN {
+a.data ¨ event.data;
+RETURN;
+};
+$TimeIsPassing => {
+IF acceptance = all THEN {
+a.data ¨ event.data;
+RETURN;
+};
+};
+$End => {
+a.data ¨ event.data;
+RETURN; -- regardless of acceptance
+};
+$AllUp => {
+handle.keyboardState ¨ ALL[up];
+IF acceptance = all THEN {
+a.device ¨ event.device;
+a.data ¨ event.data;
+RETURN;
+};
+};
+$KeyStillDown => {
+handle.keyboardState[event.keyCode] ¨ down;
+IF acceptance = all THEN {
+a.keyCode ¨ event.keyCode;
+a.device ¨ event.device;
+a.data ¨ event.data;
+RETURN;
+};
+};
+$Key => {
+a.down ¨ event.kind = keyDown;
+handle.keyboardState[event.keyCode] ¨ IF a.down THEN down ELSE up;
+a.keyCode ¨ event.keyCode;
+a.preferredSym ¨ [event.preferredSym];
+a.user ¨ event.user;
+a.device ¨ event.device;
+a.data ¨ event.data;
+RETURN; -- regardless of acceptance
+};
+$IntegerPosition => {
+handle.mousePosition ¨ event.newPosition;
+IF acceptance # clicks THEN {
+a.device ¨ event.device;
+a.user ¨ event.user;
+a.data ¨ event.data;
+a.x ¨ event.newPosition.mouseX;
+a.y ¨ event.newPosition.mouseY;
+a.display ¨ event.display;
+RETURN;
+};
+};
+$Position => {
+handle.mousePosition ¨ event.newPosition;
+IF acceptance # clicks THEN {
+a.device ¨ event.device;
+a.user ¨ event.user;
+a.data ¨ event.data;
+a.rx ¨ event.newPosition.mouseX; -- for now, Bier, July 24, 1990
+a.ry ¨ event.newPosition.mouseY; -- for now, Bier, July 24, 1990
+a.display ¨ event.display;
+RETURN;
+};
+};
+$FakePosition => {
+handle.mousePosition ¨ event.newPosition;
+IF acceptance # clicks THEN {
+a.device ¨ event.device;
+a.user ¨ event.user;
+a.data ¨ event.data;
+a.display ¨ event.display;
+RETURN;
+};
+};
+$Enter, $Exit => {
+handle.mousePosition ¨ event.newPosition;
+IF acceptance # clicks THEN {
+a.device ¨ event.device;
+a.user ¨ event.user;
+a.data ¨ event.data;
+a.display ¨ event.display;
+RETURN;
+};
+};
+$Ref => {
+handle.mousePosition ¨ event.newPosition;
+IF acceptance = all OR (acceptance = clicksAndMotion AND event.acceptance # all) OR (acceptance = clicks AND event.acceptance = clicks) THEN {
+WITH event.ref SELECT FROM
+change: DeviceTypes.DeviceStateChange => {
+deviceClassName: ATOM ¨ Devices.NameOfClass[change.class];
+IF deviceClassName = $FastTRAP THEN
+handle.fastTrapState _ event.data;
+};
+ENDCASE;
+a.device ¨ event.device;
+a.user ¨ event.user;
+a.data ¨ event.data;
+a.ref ¨ event.ref;
+RETURN;
+};
+};
+ENDCASE => ERROR Bug["Unexpected event type"];
+ENDLOOP;
+EXITS
+Timeout => {
+a.deltaTime ¨ 0;
+a.kind ¨ $TimeOut;
+RETURN;
+};
+};
+LogNewActions: PUBLIC PROC [handle: Handle, logger: NewLoggingProc ¨ NIL] = {
+handle.private.newLogger ¨ logger;
+};
+
+GetKeyState: PUBLIC PROC [handle: Handle, keyCode: KeyCode] RETURNS [state: UpDown] ~ {
+RETURN [handle.keyboardState[keyCode]]
+};
+
+GetKeySymState: PUBLIC PROC [handle: Handle, keySym: KeySym] RETURNS [state: UpDown ¨ up] = {
+keyCodes: KeyCodes ¨ KeyMapping.KeyCodesFromKeySym[handle.mapping, keySym];
+FOR n: NAT IN [0..keyCodes.n) DO
+IF handle.keyboardState[keyCodes[n].keyCode] = down THEN RETURN[down];
+ENDLOOP
+};
+GetLatestKeyState: PUBLIC PROC [handle: Handle, keyCode: KeyCode] RETURNS [state: UpDown] = {
+RETURN [handle.rawKeyboardState[keyCode]];
+};
+
+GetLatestKeySymState: PUBLIC PROC [handle: Handle, keySym: KeySym] RETURNS [state: UpDown ¨ up] = {
+keyCodes: KeyCodes ¨ KeyMapping.KeyCodesFromKeySym[handle.mapping, keySym];
+FOR n: NAT IN [0..keyCodes.n) DO
+IF GetLatestKeyState[handle, keyCodes[n].keyCode] = down THEN RETURN[down];
+ENDLOOP
+};
+
+GetTime: PUBLIC PROC [handle: Handle] RETURNS [TimeStamp] ~ {
+RETURN [handle.timeStamp]
+};
+
+GetLatestTime: PUBLIC PROC [handle: Handle] RETURNS [TimeStamp] ~ {
+private: PrivateData ~ handle.private;
+RETURN[private.shared.latest.eventTime]
+};
+
+GetLatestPosition: PUBLIC PROC [handle: Handle] RETURNS [ScreenCoordsTypes.TIPScreenCoordsRec] = {
+private: PrivateData ~ handle.private;
+RETURN[private.shared.latest.newPosition];
+};
+
+UpdateGMT: PROC [base: BasicTime.GMT, period: INT] RETURNS [BasicTime.GMT] = INLINE {
+RETURN [LOOPHOLE[LOOPHOLE[base, INT32]+period]]
+};
+
+GetAbsoluteTime: PUBLIC ENTRY PROC [handle: Handle, timeStamp: TimeStamp] RETURNS [gmt: BasicTime.GMT, milliseconds: INT] ~ {
+delta: DeltaTime; private: PrivateData; shared: REF SharedDataRep;
+IF handle=NIL THEN RETURN WITH ERROR NillHandle;
+private ¨ handle.private;
+IF private=NIL THEN RETURN WITH ERROR Bug[NIL];
+shared ¨ private.shared;
+IF shared=NIL THEN RETURN WITH ERROR Bug[NIL];
+delta ¨ RelativeTimes.InlinePeriod[from: shared.epochTimeStamp, to: timeStamp];
+gmt ¨ UpdateGMT[base: shared.epochGMT, period: delta/1000];
+milliseconds ¨ delta MOD 1000;
+};
+
+GetEpochTimes: PUBLIC ENTRY PROC [handle: Handle] RETURNS [epochGMT: BasicTime.GMT, epochTimeStamp: TimeStamp] ~ {
+private: PrivateData; shared: REF SharedDataRep;
+IF handle=NIL THEN RETURN WITH ERROR NillHandle;
+private ¨ handle.private;
+IF private=NIL THEN RETURN WITH ERROR Bug[NIL];
+shared ¨ private.shared;
+IF shared=NIL THEN RETURN WITH ERROR Bug[NIL];
+RETURN [shared.epochGMT, shared.epochTimeStamp]
+};
+
+SetAtLatest: PUBLIC PROC [handle: Handle] ~ {
+a: UserInputGetActions.InputAction;
+DO
+a ¨ GetInputAction[handle: handle, waitMode: dontWait]; 
+IF a=NIL OR a.kind=$TimeOut THEN RETURN
+ENDLOOP;
+};
+
+IsMouseButton: PUBLIC PROC [handle: Handle, keyCode: KeyCode] RETURNS [BOOL] ~ {
+private: PrivateData ~ handle.private;
+RETURN [private.shared.isMouse[keyCode]];
+};
+
+ExplainBug: PROC [signalOrError: PreDebug.SIGANY, args: POINTER, registerData: REF] RETURNS [msg: Rope.ROPE ¨ NIL] ~ {
+txt: REF READONLY TEXT ¨ NIL;
+PreDebug.Raise[signalOrError, args ! Bug => {txt ¨ msg; CONTINUE}];
+IF txt#NIL THEN msg ¨ Rope.Concat["problem in UserInputImpl: ", Rope.FromRefText[txt]];
+};
+
+GetPosition: PUBLIC PROC [handle: Handle] RETURNS [ScreenCoordsTypes.TIPScreenCoordsRec] = {
+RETURN [handle.mousePosition]
+};
+InitializeCONDITION[];
+PreDebug.RegisterSignalExplainer[Bug, ExplainBug, NIL];
+Commander.Register["TIPListHandles", ListHandles, "Lists the numbers of the UserInput handles that are currently reading input and the time in milliseconds of the event that each handle is about to read"];
+
+END.
+
+
+   N  
+UserInputImpl.mesa
+Copyright ” 1988, 1992 by Xerox Corporation.  All rights reserved.
+Michael Plass, November 26, 1991 1:37 pm PST
+Bier, September 30, 1993 11:02 am PDT
+Pier, August 4, 1992 6:20 pm PDT
+Christian Jacobi, August 25, 1992 2:13 pm PDT
+Spreitze, March 14, 1991 9:50 am PST
+Willie-s, October 29, 1991 3:57 pm PST
+Information about the queue that is independent of where in the queue you are reading
+
+
+Update new
+Update new
+
+Update new
+
+Update new
+
+Update new
+
+Update new
+
+Update new
+Update new
+Update new
+Update new
+Update new
+PROC [handle: Handle] RETURNS [done: BOOL _ FALSE];
+This handle no longer points to the queue at position private.next.  Decrement the ref count and set the pointer to NIL.
+The chief purpose of this copy operation is to allow the TIPMatcher to remember a position in the queue, continue to parse, and return to that position again later.  The state that needs to be copied, then, includes the queue itself (handlePrivate.next) and the data associated with the next event (e.g., timeStamp, mousePosition, penPosition, and keyboardState).  It is not necessary to copy the rawKeyboardState, mouseGrainTime, mouseGrainDots, source, or sourceData, as these are independent of our position in the queue, and need only belong to the master queue (i.e., the queue that is passed to InsertAction).
+The (nearly) inverse of SaveState.
+--Don't restore the mapping?
+Process.SetTimeout[@newEventOrTimeout, Process.MsecToTicks[100]];
+Note that the record returned by GetEventRecord will have a refCount of 1 if this is the only handle with a pointer to the queue, or a refCount of 2, if one or more other handles have saved a pointer to the queue at some earlier event.
+The next three lines redirect handle from the last event (private.next) to the new event (e)
+If waitMode = forever, then we wait until we can return an event.
+Otherwise, we wait for waitInterval (as judged by TimeIsPassing events) or until a non-TimeIsPassing event arrives, whichever comes first.
+<<
+At this point, waitMode = timed.
+WHILE private.next.next = NIL DO -- wait in 100 millisecond intervals
+IF handle.source # NIL THEN handle.source[handle];
+IF private.next.next = NIL THEN WAIT newEventCame;
+ENDLOOP;
+At last, we have received an event.  Does its timestamp indicate that it came in time?
+success ¨ RelativeTimes.InlineIsLaterTime[private.next.next.eventTime, finalTime];
+IF success THEN e ¨ private.next.next;
+>> -- Bier, September 24, 1993 2:49:56 pm PDT
+Keep getting events until we get one that is OK to return.
+IF waitMode = timed, then we may return $TimeOut if nothing comes in the required time.
+Get the next event.
+IF this is a FastTRAP event then ...
+
+Associates a logging proc with the handle.  This proc will be called whenever a new action is received.  Useful for debugging.
+A KeySym is considered down if any KeyCode having that KeySym is down.  If this keySym does not exist on this keyboard, assume the key is up.
+
+A KeySym is considered down if any KeyCode having that KeySym is down.  If this keySym does not exist on this keyboard, assume the key is up.
+own copy of BasicTime(Impl).Update so we won't raise errors
+ 
+ ù #%  ïNewlineDelimiter
+ñ(cedarcode) styleô ôIcodeöú
+œeú7ôBKöú,ô,Kô%Kô Kô-Kô$Kô&Kò óöœk	úò
+Jöú5ûú‘òãKò óöœnúûúûòJöûú)ûúDòvJöûúƒûò“óKò Köúûúûúò.Köúûúò!KöúûúûúòKò öüúûúûúûúûúûúòaKöûúûúòòKò óóöüúûúûúûúûúûúûúòQKöûúûúòKòKò óöúûúòKöúòKöú,ò,Köú)ò)Köú	œcòKöúòKò óKöúûúò*Köúûúò-Köúûúò*Köú	ûúò!Köú
+ûúò%Köú
+ûúò%Köúûú(ò;Köúûú(ò9KöúûúòKöúûúò$Köú
+ûúò)Kò Köúûúûúò'öúûúûúûúò&Köúûú†2òIKöúûúòKöúûú†>òLKöúûú†4ò@KöúûòKöúòKò óöúûú&ò:Kò óöúûúûúòKö†UôUKöúûú†7òPKöúûú†>òWKöúòKöú	ûúûú	ûúûúûúûúò2KöúòKò óöúûúûúòKöú
+ûú†IòXKöúòKöúûú†8òDKöúòKöú†7òIKöúûú†7òNKöú†FòbKöúûú†UòbKöú	ûúòKöúûú†.ò9Köúûú†IòTKöúûúò	KöúûúûúûúòKò)KöúûúòKöúûúûú†1òJöúòKò óóKöúûúûú†ò<Köú
+ûú	†.òDKöúûú†*ò?Köúûú†BòXKò ö
+üúûúûúûúûúòEKöú
+ûúòKöúòKöûúûúûúò$KòKöúòKò óöü
+úûúûúûúûúûúûúûúòWKòKòKò óöüúûúûúûúûúûúûúòSöûú	ûòöûú†(ò/KöúûúòKöúûúòKòöûúûúûúûúò4KöúûúKòSóKöúòóöûú†ò%Kò
+KòKòöûúûúòKòGKöúûúòKòóKöúûúòKöúòóóKöúòKò óöüúûú+ûúò>KöûúûúûúòKöûúûúûú'òPKò2KöûúòKòKò óKöü
+úûúûúòKö
+üúûúûúûúûúò,Kò öüúûúûú(ûúûúûú
+ûúûú	ûúûúûúûúò∞KöúòKöúûúòKöûú
+ûúûúûúûúûúò5KòKöûúûúûúûúûúûúò7KòKò!Köûú	ûúûúò,KöúûúòöûúûúòKöûúûúûúò#óöûú
+ûúûúòKöûúûúûú!ò1óöûúûúûúòKöûúûúûú(ò8óöûúûúûúò"öûúûúò!KöûúûúûúEòUóKöûúûúûú?òOKòóKöú.ûúûúòJKöú-†IòvKòKò óö
+üúûúûúûúûúòZöüúûúò#KöúûúûúòKöú©ûúò≥öûúûòKöûúûúTòjKöûúûú`ûúòïóKòóKöú†0òJKöœbú°òKòöûòöûúUûò\ò7Köúûúò1óKò;Köûúòóöûòöú†3òIKöúûúûúò+Köú#†-òPKò&KöúòóóKöûúòóKöû	úòKòKò óöüúûúûú%òCKò"KòKô óöüúûúû
+ú)òQKöúûúòKöúûúòKöúûúûúûúò KòDKöûúûúûúûúûúûúò?Kò KòöûúûòKò,öúûúûúòKòKò*KòóöûúòKòKò(KòóöúòKòKöúEûúò`KòóöúòKòKò,KòóKöú&†%òKKöú%†%òJöú	ò	Köú†%òAKòKöú†Jò`KòóöúòKòKöúûúò"KòóöúòKòKò*KòóöúòKòöûú%ûúò-Kò"Kò&KöúòóKòóKòöûúòKöúûúHòYKòóóKòKòKò"KòKòKòKòKò#KòKô óöüúûúû
+ú.ûúûúûúûúûúûúòáKöúûúòKöúûúòKöúûúûúûúò KòBKöûúûúûúûúûúûúò?ô
+Köú†ò9KòKòKöúòóKöú#ò#KòKò óöü	úûúû
+ú.ûúûú&ûúûúûúûúûúûúûúûúûúûúò‚KöúûúòKöúûúòKöúûúûúûúò KòBKöûúûúûúûúûúûúò?ô
+öûúûúòKòKò(KòóöûúòKòKò&KòóKòKòKò KòKòKòKöúòóKöú#ò#KòKô óö üúûúû
+ú.ûú
+ûúûúûúûúûúûúûúûúûúûúûúûúò–KöúûúòKöúûúòKöúûúûúûúò KòBKöûúûúûúûúûúûúò?ô
+Köú†ò8KòKöú?ûúòXKòKòKòKòKöúòóKöú#ò#KòKô óöüúûúûúûúûúûúò>KöûúòKòóKò öüúûúû
+ú0ûúûúûúûúûúûúûúûúûúûúûúûúòæKöúûúòKöúûúòKöúûúûúûúò Kò KòBKöûúûúûúûúûúûúò?ô
+Köú†ò;KòKò,KòKòKòKöúòKòóKöú#ò#KòKô óöüúûúû
+ú0ûúûúûúûúûúûúûúûúûúûúûúûúò∑KöúûúòKöúûúòKöúûúûúûúò KòBKöûúûúûúûúûúûúò?ô
+Köú†4òFKòKòKòKòKöúòKòóKöú#ò#KòKô óöü
+úûúû
+ú0ûúûúûúûúûúûúûúûúûúûúûúûúò∂KöúûúòKöúûúòKöúûúûúûúò KòBKöûúûúûúûúûúûúò?ô
+Köú†4òFKòKòKòKòKöúòKòóKöú#ò#KòKô óöü	úûúûúûú-ûú"ûúûúûúûúûúûúûúûúûúûúò√KöúûúòKöúûúòKöúûúûúûúò KòBKöûúûúûúûúûúûúò?ô
+Köú†8òTKòKòKòKòKòKöúòKòóKöú#ò#KòKò óöüúûú0ûúûúûúûúûúûúûúûúûúûúò£KöúûúòKöúûúòKöúûúûúûúò KòBKöûúûúûúûúûúûúò?ô
+KòKòKòKòKòKöúòKöúûúò"óKöú#ò#KòKò óöüúûúû
+ú;ûú&ûúûúûúûúûúûúûúûúûúûúòﬂKöúûúòKöúûúòKöúûúûúûúò KòBKöûúûúûúûúûúûúò?ô
+KòKòKòKò KòKòKòKöúòKò(óKöú#ò#KòKò óöüúûúû
+ú.ûúûúûúûúûúûúòÉKöúûúòKöúûúòKöúûúûúûúò Kò:Köûúûúûúûúûúûúò?öûúLòNKö
+ûúúúúúúúúúò>óô
+KòKòKòKòKöúòöûú%ûúò-Kò"Kò&KöúòóóKò#KòóKò öü	úûúû
+ú.ûúûúûúûúûúûúò}KöúûúòKöúûúòKöúûúûúûúò KòBKöûúûúûúûúûúûúò?ô
+KòKòKòKöúòóKöú#ò#KòóKò Köúûúûúò,Köúûúòöüúûúò)KòKò$öûúûúûúòKöúûú	ò,KòóöûúòKöúûú	ò'Kò-KòóKòKò óKöúûúûúûúûúûúòJö
+üúûú"ûúûúûúòVöûúûúûúûúûúûòAKò%Köûú	ûúûúòKöûúòóKòKò óöüúò&öüúò#Köûúûúûúûúô3öûúûúûúbòÉKöûúíòñóö
+ûúûúûú#ûú.ûúòzKò-KòKòóKòóöüúûúò+öûúûúûúfòáKöûúñòöóKòóKò@Köú)ûúûúò4KöúûúòKò"öûúûòKöûú&ò*öûúòKöú&ò&Kò&KòóóKòKò óöü
+úûúûúûúò4Köúbûú0ûúòùKòKò óöüúûúûú
+ûúûúûúûúûúûúûúòäKöúûúòKöúûúò+KòKöúûúò$Kò KòKòKòKòKò4Kò,Kò<KòKöúòKöûú
+òKòKò óöüúûúû
+ú&ûúRòùKöúûúûò0Köûúûúûúûúûúûúò0KòKöûú	ûúûúûúûúûúûúò/KòKöûúûúûúûúûúûúûúò.KòKò'KöúòKò óöü
+úûúûú2òIKöú&ò&Kòöûúûú	ûòöûú%ûò/KöúñûúòõKöûú ûúò-óKöûúòóKòKò óöü
+úûúûúûú"òRKöûúòKòóKò öüúûúûúûúò-KöúxôxKöúòKöúòKò óöüúûúûúò1Köú&ò&öûúûúûúòKöú8ûúò<KòóKòKò óöü	úûúû
+ú$ò@KöúÁôÁKöú*ò*Köú,ò,Köûúûúûúò:Köú†UòkKò#Kò+Kò'Kò+KòKö°ú°ú†.òVKöú-ò-Köûúûúûúûú2ò[Kò+KöúòKò óöüúûúû
+ú$òCKöú"ô"Köú*ò*Köú,ò,Köûúûúûú!ò=KöúòKò#Kò+Kò'Kò+KôKö°ú°ú†.òVKöú.ò.Köûúûúûúûú5ò]Kò+KöúòKò óöüúûúûúûúòAKöûúûúûúò,KöúòKò óöüúûúûúûúòAöûúûúûú°ú°úûò6KöúûúòKöúòKò	KöûúòóKöúòKò óö
+üúûúûúûúûúò<öûúûúòKòEKöûúòKòóKöúûúòöûúòKöûúûú†#úò9Köûú<ò@óKòKò óKöúû	úòöüúûúûú†%òKKöúAôAKò$KöúòKò óö
+üúûúûúgûúûúò°KöúÎôÎKöûúûúûú†`òwKò&Köú	ûúûúòKò KòXKö
+ûúûú	ûúûúûúò!Kò Köú\ô\KöúòKöú(ò(Köú†Iò[KöúòKò óöüúûúûújûúûúûúûúûúòÀKôAKôäöûú
+ûòòKòöûúûúûò öûúûúûúòKöú†?òVKö	ûúûúûú–bk°úò2KòóKöûú¢°úòKòKöûúòóKòKòóòöûúûúòKöûúûúûúûúòKöûúûúûúò&óKòóKöûúûúòKôKöú ô öûúûúûú†$ôEKöûúûúûúô2Kö	ûúûúûú¢°úô2KöûúôóKôVKôRKöûú	ûúô&Köú†*ô-óKòKò óöüúûúûúò8öûúûúûúòKò<öûúûúòöûúòKò'Kò3KòóöûúòKò#Kò%KòóóKòóKòKò óöüúûúûúò8öûúûúûúòKòEöûúûúòKöûú4ò8Köûú&ò*óKòóKòKò óKò Kò Köúûú#ò4Köúûú'ò<öüúûúûúmûúò§KöúûúòKòDKòóKò öüúûúûúmûúò¨Kô:KôWKò&Köú)†(òQKöú&ûúûú†4ú†òKòöûú†QòTKöúûú°ú*òQKö	ûú	ûúûúûú
+†)òKKòTKò#KòKò"KòKöú †[ò{öûúûúòKöûú=ûúûú	òQKòóöûúûòöúûúûúûò(KòKöûúòKòóöúûòöûúûúûòKòKöûúòKòóKôKòóöúûò	KòKöûú†ò#KòóöúòKöúûúòöûúûúûòKòKòKöûúòKòóKöúòóöúòKò+öûúûúûòKòKòKòKöûúòKòóKöúòóöú	ò	KòKöú&ûúûúûúòBKòKò&KòKòKòKöûú†ò#KöúòóöúòKò)öûúûúûòKòKòKòKòKòKòKöûúòKòóKöúòóöúòKò)öûúûúûòKòKòKòKöú!†ò@Köú!†ò@KòKöûúòKòóKöúòóöúòKò)öûúûúûòKòKòKòKòKöûúòKòóKöúòóöúòKò)öûúûúûòKòKòKòKòKöûúòKòóKòóöú	ò	Kò)öûúûúûúûúûúûúòéKô$öûúûúûòöú*ò*Köúûú%ò:öûúûò#Kö°"ò"óKòóKöûúòóKòKòKòKòKöûúòKòóKòóKöûúûúò.óKöûúòóöûòòKòKòKöûúòKòóóKòKô óöüúûúûú+ûúòMKô~Kò"KòKò óöüúûúûú$ûúòWKöûú ò&KöúòKò óöüúûúûú"ûúò]KöúK†+úôçKöúKòKöûúûúûúûò Köûú2ûúûúòFKöûòóKòKô óöüúûúûú$ûúò]Köûú$ò*KöúòKò óöüúûúûú"ûúòcKöúK†+úôçKöúKòKöûúûúûúûò Köûú7ûúûúòKKöûòóKòKò óöüúûúûúûúò=KöûúòKöúòKò óöüúûúûúûúòCKöú&ò&Köûú!ò'KöúòKò óöüúûúûúûú+òbKöú&ò&Köûú$ò*KòKò óöü	úûúûú
+ûúûúûúûúòUKô;Köûúûúûúûú
+ò/KòóKò öüúûúûúûú(ûúûúûúò}KöúûúûúûòBKöûúûúûúûúûúûúò0KòKöûú	ûúûúûúûúûúûúò/KòKöûúûúûúûúûúûúûúò.KòOKò;KöúûúòKöúòKò óö
+üúûúû
+úûúûú òrKöúûúûò0Köûúûúûúûúûúûúò0KòKöûú	ûúûúûúûúûúûúò/KòKöûúûúûúûúûúûúûúò.Köûú)ò/KòKò óöüúûúûúò-Köú#ò#öûòKò8Kö	ûúûúûúûúûò'KöûúòóKöúòKò óö
+üúûúûú$ûúûúòPKöú&ò&Köûú#ò)öúòKò óóöü
+úûúûúûúûúûúûúûúòvKö	úûúûúûúûúòKöú8ûúòCKöûúûúûúHòWKòóKò öüúûúûúûú+ò\KöûúòKòKôóKöúòKöú2ûúò7KöúÕòÕKò KöûúòKò Kò ó Öó    ~  ≠ã  

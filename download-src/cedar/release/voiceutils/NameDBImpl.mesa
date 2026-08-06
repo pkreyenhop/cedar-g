@@ -1,0 +1,699 @@
+
+DIRECTORY
+Atom USING [ MakeAtom ],
+BasicTime USING [ FromNSTime, GMT, Now, nullGMT, Period, ToNSTime, Update ],
+Commander USING [ CommandProc, Handle, Register ],
+CommanderOps USING [ NextArgument ],
+Convert USING [ CardFromRope ],
+DESFace USING [ CorrectParity, EncryptBlock ],
+IO,
+LoganBerry USING [ AttributeType, AttributeValue, Close, DeleteEntry, Error, IsLocal, Open, OpenDB, ReadEntry, RegisterWriteProc, WriteEntry, WriteProc ],
+NameDB USING [ AttributeSeq, Authenticity ],
+NameDBBackDoor,
+Process USING [ Detach ],
+RefID USING [ nullID ],
+RefTab USING [ Create, Fetch, Ref, Store ],
+Rope USING [ Equal, Length, ROPE, SkipOver ],
+RPC USING [ EncryptionKey ],
+SymTab USING [ Create, Delete, Erase, Fetch, Ref, Store ],
+UserProfile USING [ Token ]
+;
+
+NameDBImpl: CEDAR MONITOR
+IMPORTS Atom, BasicTime, Commander, CommanderOps, Convert, DESFace, IO, LoganBerry, Process, RefTab, Rope, SymTab, UserProfile
+EXPORTS NameDB, NameDBBackDoor = {
+
+ROPE: TYPE= Rope.ROPE;
+AttributeSeq: TYPE = NameDB.AttributeSeq; -- LoganBerry.Entry = LIST OF [$attribute, value]
+OpenDB: TYPE = REF OpenDBBody;
+nullDB: OpenDB = NIL;
+OpenDBBody: TYPE = RECORD [
+db: LoganBerry.OpenDB¨RefID.nullID,
+dbCache: DBCache ¨ NIL,
+timeoutCache: BOOL¨TRUE, -- TRUE if should time out entries based on timeToLive
+timeToLive: INT ¨ 20 -- Seconds duration of NameDB cache entries.
+];
+
+Error: PUBLIC ERROR [ec: ATOM, explanation: Rope.ROPE ¨ NIL] = CODE;
+
+DBCache: TYPE = SymTab.Ref;
+
+DBHandle: TYPE = RECORD [ -- In case there ever have to be instances
+dbPrefix: Rope.ROPE,
+white: OpenDB¨nullDB, -- Name/number database
+blue: OpenDB¨nullDB, -- Name/Lark/Workstation/Preferences database
+red: OpenDB¨nullDB, -- GV cache database
+doCache: BOOL ¨ TRUE,
+whiteTTL: INT ¨ 60*60*4, -- 4 hours cache duration
+blueTTL: INT ¨ 20, -- short cache duration
+redTTL: INT ¨ 60*60 -- 1 hour cache duration
+];
+dbHandle: DBHandle; -- There is but one instance now.
+
+minQueryInterval: INT ¨ 60;
+
+
+GetAttributes: PUBLIC PROC[rName: ROPE, key: ATOM¨$rname, dbType: ATOM¨$white]
+RETURNS [value: AttributeSeq¨NIL] = {
+ENABLE { UNWIND => NULL; LoganBerry.Error => Error[ec, explanation]; };
+RETURN[ReadEntry[db: DBFromType[dbType], key: key, value: rName].attributes];
+};
+GetAttribute: PUBLIC PROC[
+rName: ROPE, attribute: ATOM, default: ROPE¨NIL, key: ATOM¨$rname]
+RETURNS [value: ROPE¨NIL] = {
+ENABLE { UNWIND => NULL; LoganBerry.Error => Error[ec, explanation]; };
+dbKType: ATOM;
+dbType: ATOM;
+openDB: OpenDB;
+cached: BOOL¨FALSE;
+attributes: AttributeSeq;
+
+[dbKType, , openDB] ¨ WhichDB[key];
+IF dbKType#$noProbe THEN {
+attributes ¨ ReadEntry[db: openDB, key: key, value: rName].attributes;
+rName ¨ FetchAttribute[attributes, $rname, NIL].value;
+IF rName=NIL THEN RETURN[default];
+};
+
+[dbType, , openDB] ¨ WhichDB[attribute];
+SELECT dbType FROM
+$red => RETURN[GetGVAttribute[rName, attribute, default]];
+$noProbe => RETURN[rName];
+#dbKType => attributes ¨ ReadEntry[db: openDB, key: $rname, value: rName].attributes;
+ENDCASE;
+
+value ¨ FetchAttribute[attributes, attribute, default].value;
+
+IF value.Equal["#"] THEN {
+value ¨ FetchAttribute[attributes, TAttr[attribute, "time"]].value;
+value ¨ FetchAttribute[attributes, TAttr[attribute,
+(IF value#NIL AND RelTime[value] > 0 THEN "timed" ELSE "untimed")], default].value;
+};
+};
+
+SetAttribute: PUBLIC PROC[rName: ROPE, attribute: ATOM, value: ROPE] = {
+ENABLE { UNWIND => NULL; LoganBerry.Error => Error[ec, explanation]; };
+dbType: ATOM;
+openDB: OpenDB;
+attributes: AttributeSeq;
+previousValue: ROPE;
+IF value#NIL THEN SELECT attribute FROM
+$larkhost, $workstationhost => {
+oldRname: ROPE=GetAttribute[value, $rname, NIL, attribute];
+IF oldRname#NIL THEN
+SetAttribute[rName: oldRname, attribute: attribute, value: NIL];
+};
+ENDCASE;
+[dbType, , openDB] ¨ WhichDB[attribute];
+IF dbType=$noProbe THEN RETURN;
+attributes ¨ ReadEntry[openDB, $rname, rName, FALSE].attributes;
+IF attributes=NIL THEN attributes ¨ LIST[[$rname, rName]];
+previousValue ¨ FetchAttribute[attributes, attribute].value;
+IF previousValue.Equal[value] THEN RETURN; -- previous was untimed and equal
+attributes ¨ StoreAttribute[attributes, attribute, value];
+IF previousValue.Equal["#"] THEN { -- Remove the timed values
+attributes ¨ StoreAttribute[attributes, TAttr[attribute, "timed"], NIL];
+attributes ¨ StoreAttribute[attributes, TAttr[attribute, "untimed"], NIL];
+attributes ¨ StoreAttribute[attributes, TAttr[attribute, "time"], NIL];
+};
+LoganBerry.WriteEntry[db: openDB.db, entry: attributes, replace: TRUE];
+};
+
+SetAttributeTimed: PUBLIC PROC[
+rName: Rope.ROPE, attribute: ATOM, value: Rope.ROPE,
+time: BasicTime.GMT¨BasicTime.nullGMT, interval: INT¨0] = {
+ENABLE LoganBerry.Error => Error[ec, explanation];
+dbType: ATOM;
+keyClass: KeyClass;
+openDB: OpenDB;
+attributes: AttributeSeq;
+untimedValue: Rope.ROPE;
+wasUntimed: BOOL;
+IF time=BasicTime.nullGMT THEN time ¨ BasicTime.Update[BasicTime.Now[], interval];
+[dbType, keyClass, openDB] ¨ WhichDB[attribute];
+IF keyClass#$notKey THEN
+Error[$InvalidAttribute, "SetAttributeTimed cannot be applied to an attribute that is also a key"];
+attributes ¨ ReadEntry[openDB, $rname, rName, FALSE].attributes; -- No trust cache
+IF attributes=NIL THEN attributes ¨ LIST[[$rname, rName]];
+untimedValue ¨ FetchAttribute[attributes, attribute].value;
+wasUntimed ¨ ~Rope.Equal[untimedValue, "#"];
+IF wasUntimed AND untimedValue#NIL THEN
+attributes ¨ StoreAttribute[attributes, TAttr[attribute, "untimed"], untimedValue];
+attributes ¨ StoreAttribute[attributes, TAttr[attribute, "timed"], value];
+attributes ¨ StoreAttribute[attributes, TAttr[attribute, "time"], TimeRope[time]];
+IF wasUntimed THEN attributes ¨ StoreAttribute[attributes, attribute, "#"];
+LoganBerry.WriteEntry[db: openDB.db, entry: attributes, replace: TRUE];
+};
+
+Authenticate: PUBLIC PROC[rName: ROPE, key: RPC.EncryptionKey]
+RETURNS [authenticity: NameDB.Authenticity¨$unknown] = {
+ENABLE {
+LoganBerry.Error => Error[ec, explanation];
+Error => IF ec = $GVServersDown THEN CONTINUE;
+};
+keyRope: ROPE ¨ GetGVAttribute[rName, $key, NIL, TRUE, key];
+RETURN[SELECT TRUE FROM
+keyRope=NIL => $nonexistent,
+keyRope.Equal["?"] => $bogus,
+ENDCASE => $authentic
+];
+};
+
+IsAuthenticated: PUBLIC PROC[rName: ROPE]
+RETURNS [authenticity: NameDB.Authenticity ¨ $unknown] = {
+ENABLE {
+LoganBerry.Error => Error[ec, explanation];
+Error => IF ec = $GVServersDown THEN CONTINUE;
+};
+key: ROPE ¨ GetGVAttribute[rName, $key, NIL];
+RETURN[SELECT TRUE FROM
+key=NIL => $nonexistent,
+key.Equal["?"] => $perhaps,
+ENDCASE => $authentic
+];
+};
+
+
+nullKey: RPC.EncryptionKey = ALL[0];
+
+GetGVAttribute: PROC[
+rName: ROPE, attribute: ATOM, default: ROPE,
+keySupplied: BOOL¨FALSE, encryptionKey: RPC.EncryptionKey¨nullKey]
+RETURNS[value: ROPE¨NIL] = {
+openDB: OpenDB ¨ DBFromType[$red];
+attributes: AttributeSeq;
+cached: BOOL;
+[attributes, cached] ¨ ReadEntry[openDB, $rname, rName];
+IF attributes=NIL OR
+(attribute=$key AND keySupplied AND
+~FetchAttribute[attributes, $key, "?"].value.Equal[KeyRope[encryptionKey]]) THEN
+[attributes, cached] ¨ GetGVUpdate[rName, keySupplied, encryptionKey];
+value ¨ FetchAttribute[attributes, attribute, default].value;
+IF ~cached THEN QueueGVUpdate[rName, keySupplied, encryptionKey];
+};
+
+GetGVUpdate: PROC[
+rName: ROPE, keySupplied: BOOL¨FALSE, encryptionKey: RPC.EncryptionKey¨nullKey]
+RETURNS[attributes: AttributeSeq¨NIL, cached: BOOL¨FALSE] = {
+};
+
+DeleteGVEntry: PROC[rName: ROPE] RETURNS [nilRope: ROPE¨NIL] = {
+IF dbHandle.white=nullDB OR rName=NIL THEN RETURN;
+LoganBerry.DeleteEntry[db: DBFromType[$red].db, key: $rname, value: rName];
+};
+
+QueueGVUpdate: PROC[
+rName: ROPE, keySupplied: BOOL¨FALSE, encryptionKey: RPC.EncryptionKey] = TRUSTED {
+Process.Detach[FORK ForkGVUpdate[rName, keySupplied, encryptionKey]];
+};
+
+ForkGVUpdate: PROC[rName: ROPE, keySupplied: BOOL¨FALSE, encryptionKey: RPC.EncryptionKey] = {
+ENABLE Error => CONTINUE; -- Should report it, I guess.
+[] ¨ GetGVUpdate[rName, keySupplied, encryptionKey];
+};
+
+KeyRope: PUBLIC -- to back door -- PROC[key: RPC.EncryptionKey] RETURNS[keyRope: ROPE] = TRUSTED {
+encryptedKey: RPC.EncryptionKey;
+cpKey: RPC.EncryptionKey ¨ key;
+halves: LONG POINTER TO RECORD[firstHalf: CARD, secondHalf: CARD] ¨
+LOOPHOLE[LONG[@encryptedKey]];
+DESFace.CorrectParity[LOOPHOLE[LONG[@cpKey]]];
+DESFace.EncryptBlock[key: LOOPHOLE[cpKey], from: @key, to: LOOPHOLE[halves]];
+keyRope ¨ IO.PutFR["%bB %bB", [cardinal[halves.firstHalf]], [cardinal[halves.secondHalf]]];
+};
+
+ReadEntry: PROC[
+db: OpenDB, key: LoganBerry.AttributeType,
+value: LoganBerry.AttributeValue, useCache: BOOL¨TRUE]
+RETURNS [attributes:  AttributeSeq¨NIL, cached: BOOL¨FALSE] = {
+IF dbHandle.doCache AND useCache THEN
+IF key=$rname THEN attributes¨ReadCache[db, value];
+IF attributes#NIL THEN RETURN[attributes, TRUE];
+attributes ¨ LoganBerry.ReadEntry[db: db.db, key: key, value: value].entry;
+IF dbHandle.doCache AND attributes#NIL THEN
+IF useCache THEN RecordCache[db, attributes] ELSE DeleteFromCache[db, attributes];
+};
+
+FetchAttribute: PUBLIC -- to back door -- PROC[
+attributes: AttributeSeq, attribute: ATOM, default: ROPE¨NIL]
+RETURNS [value: ROPE, valueLoc: AttributeSeq¨NIL] = {
+value ¨ default;
+FOR aL: AttributeSeq ¨ attributes, aL.rest WHILE aL#NIL DO
+IF aL.first.type = attribute THEN RETURN[aL.first.value, aL]; ENDLOOP;
+};
+
+ExtractAttribute: PUBLIC -- to back door -- PROC[
+attributes: AttributeSeq, attribute: ATOM]
+RETURNS [newAttributes: AttributeSeq¨NIL] = {
+IF attributes=NIL THEN RETURN;
+IF attributes.first.type=attribute THEN RETURN[attributes.rest];
+newAttributes ¨ attributes;
+FOR aL: AttributeSeq ¨ attributes, aL.rest WHILE aL.rest#NIL DO
+IF aL.rest.first.type # attribute THEN LOOP;
+aL.rest ¨ aL.rest.rest;
+RETURN;
+ENDLOOP;
+};
+
+StoreAttribute: PUBLIC -- to back door -- PROC[attributes: AttributeSeq, attribute: ATOM, value: ROPE]
+RETURNS[newAttributes: AttributeSeq] = {
+oldLoc: AttributeSeq;
+IF value=NIL OR value.Length[]=value.SkipOver[skip: "\015\011"] THEN
+RETURN[ExtractAttribute[attributes, attribute]];
+newAttributes ¨ attributes;
+oldLoc ¨ FetchAttribute[attributes, attribute].valueLoc;
+IF oldLoc#NIL THEN oldLoc.first ¨ [attribute, value]
+ELSE newAttributes ¨ Append[attributes, LIST[[attribute, value]]];
+};
+
+Append: PUBLIC -- to back door -- PROC[
+a1, a2: AttributeSeq]
+RETURNS [newAttributes: AttributeSeq] = {
+IF a2=NIL THEN RETURN[a1];
+IF a1=NIL THEN RETURN[a2];
+newAttributes ¨ a1;
+FOR aL: AttributeSeq ¨ a1, aL.rest WHILE aL#NIL DO
+IF aL.rest#NIL THEN LOOP;
+aL.rest ¨ a2;
+RETURN;
+ENDLOOP;
+ERROR;
+};
+DBFromType: PROC[dbType: ATOM] RETURNS [openDB: OpenDB ¨ nullDB] = {
+IF dbHandle.white=nullDB THEN Open[];
+RETURN[SELECT dbType FROM
+$white => dbHandle.white,
+$blue => dbHandle.blue,
+$red => dbHandle.red,
+ENDCASE => nullDB
+];
+};
+
+WhichDB: PROC[keyType: ATOM]
+RETURNS [
+dbType: ATOM¨$blue, keyClass: KeyClass¨$notKey, openDB: OpenDB ¨ nullDB] = {
+mer: MapEntry ¨ NARROW[dbMap.Fetch[keyType].val, MapEntry];
+IF mer#NIL THEN {
+dbType ¨ mer.dbType;
+keyClass ¨ mer.keyClass;
+};
+openDB ¨ DBFromType[dbType];
+};
+
+RelTime: PUBLIC -- to back door -- PROC[ropeTime: ROPE] RETURNS [relativeToNow: INT] = {
+RETURN[BasicTime.Period[from: BasicTime.Now[],
+to: BasicTime.FromNSTime[Convert.CardFromRope[ropeTime]]]];
+};
+
+TimeRope: PUBLIC -- to back door -- PROC [time: BasicTime.GMT ¨ BasicTime.nullGMT] RETURNS[nowRope: ROPE] = {
+IF time = BasicTime.nullGMT THEN time ¨ BasicTime.Now[];
+RETURN[IO.PutFR1["%bB", [cardinal[BasicTime.ToNSTime[time]]]]];
+};
+
+TAttr: PUBLIC -- to back door -- PROC[attribute: ATOM, prefix: Rope.ROPE] RETURNS [tAttr: ATOM] = {
+RETURN[Atom.MakeAtom[IO.PutFR["%g.%g", [rope[prefix]], [atom[attribute]]]]]; };
+
+Open: PROC[forceOpen: BOOL¨FALSE] = {
+ENABLE LoganBerry.Error => Error[ec, explanation];
+prefixValue: IO.Value ¨ [rope[dbHandle.dbPrefix]];
+IF forceOpen THEN {
+IF dbHandle.white#nullDB THEN
+LoganBerry.Close[db: dbHandle.white.db];
+IF dbHandle.blue#nullDB THEN
+LoganBerry.Close[db: dbHandle.blue.db];
+IF dbHandle.red#nullDB THEN
+LoganBerry.Close[db: dbHandle.red.db];
+};
+dbHandle.white ¨ LBOpen[IO.PutFR1["%gWhitePages.df", prefixValue], dbHandle.whiteTTL];
+dbHandle.blue ¨ LBOpen[IO.PutFR1["%gBluePages.df", prefixValue], dbHandle.blueTTL];
+dbHandle.red ¨ LBOpen[IO.PutFR1["%gRedPages.df", prefixValue], dbHandle.redTTL, TRUE];
+};
+
+LBOpen: PROC[dbName: ROPE, timeToLive: INT, alwaysTimeout: BOOL¨FALSE] RETURNS [
+openDB: OpenDB] = {
+openDB ¨ NEW[OpenDBBody ¨ []];
+openDB.dbCache ¨ SymTab.Create[case: FALSE];
+openDB.db ¨ LoganBerry.Open[dbName: dbName];
+LoganBerry.RegisterWriteProc[
+proc: RecordWrite, db: openDB.db, ident: $nameDB, clientData: openDB];
+openDB.timeoutCache ¨ alwaysTimeout OR ~LoganBerry.IsLocal[openDB.db];
+openDB.timeToLive ¨ timeToLive;
+};
+
+CacheEntry: TYPE = REF CacheEntryBody;
+CacheEntryBody: TYPE = RECORD [
+attributes: AttributeSeq ¨ NIL,
+lastValid: BasicTime.GMT ¨ BasicTime.nullGMT
+];
+
+ReadCache: PROC[openDB: OpenDB, keyValue: LoganBerry.AttributeValue]
+RETURNS[attributes: AttributeSeq¨NIL] = {
+cacheEntry: CacheEntry;
+IF openDB=NIL OR ~dbHandle.doCache THEN RETURN;
+cacheEntry ¨ NARROW[SymTab.Fetch[openDB.dbCache, keyValue].val];
+IF cacheEntry=NIL OR (openDB.timeoutCache AND
+BasicTime.Period[from: cacheEntry.lastValid, to: BasicTime.Now[]] > openDB.timeToLive)
+THEN RETURN;
+RETURN[cacheEntry.attributes];
+};
+
+RecordCache: PROC[openDB: OpenDB, attributes: AttributeSeq] = {
+cacheEntry: CacheEntry;
+rName: ROPE ¨ FetchAttribute[attributes, $rname, NIL].value;
+IF openDB=NIL OR rName = NIL THEN RETURN;
+cacheEntry ¨ NARROW[SymTab.Fetch[openDB.dbCache, rName].val];
+IF cacheEntry = NIL THEN {
+cacheEntry ¨ NEW[CacheEntryBody ¨ []];
+[] ¨ SymTab.Store[openDB.dbCache, rName, cacheEntry];
+};
+cacheEntry.attributes ¨ attributes;
+cacheEntry.lastValid ¨ BasicTime.Now[];
+};
+
+RecordWrite: -- INTERNAL -- LoganBerry.WriteProc = {
+DeleteFromCache[NARROW[clientData], entry];
+};
+
+DeleteFromCache: -- INTERNAL -- PROC[openDB: OpenDB, attributes: AttributeSeq] = {
+rName: ROPE;
+IF attributes=NIL OR openDB=NIL THEN RETURN;
+rName ¨ FetchAttribute[attributes, $rname, NIL].value;
+IF rName#NIL THEN []¨SymTab.Delete[openDB.dbCache, rName];
+};
+
+CmdDBOpen: Commander.CommandProc = {
+arg: ROPE ¨ CommanderOps.NextArgument[cmd];
+IF arg#NIL THEN dbHandle.dbPrefix ¨ arg;
+Open[TRUE];
+};
+
+CmdDBDetails: Commander.CommandProc = {
+DoDetails[cmd, CommanderOps.NextArgument[cmd]];
+};
+
+DoDetails: PROC[cmd: Commander.Handle, rName: ROPE] = {
+DoSomeDetails[cmd, rName, $white, TRUE];
+DoSomeDetails[cmd, rName, $blue];
+DoSomeDetails[cmd, rName, $red];
+IO.PutChar[cmd.out, '\n];
+};
+
+DoSomeDetails: PROC[
+cmd: Commander.Handle, rName: ROPE, dbType: ATOM, includeRName: BOOL¨FALSE] = {
+attributes: AttributeSeq ¨ GetAttributes[rName, $rname, dbType];
+IF attributes#NIL AND ~includeRName THEN attributes ¨ attributes.rest;
+FOR attr: AttributeSeq ¨ attributes, attr.rest WHILE attr#NIL DO
+IO.PutF[cmd.out, "%g: %g\n", [atom[attr.first.type]], [rope[attr.first.value]]];
+ENDLOOP;
+};
+
+CmdLarkDebug: Commander.CommandProc = {
+larkNumber: ROPE ¨ CommanderOps.NextArgument[cmd];
+instance: ROPE ¨ CommanderOps.NextArgument[cmd];
+IF instance=NIL THEN
+instance ¨ UserProfile.Token[key: "LarktestInstance", default: "Einstein.lark"];
+DoOperate[cmd, larkNumber, "D", instance];
+};
+
+CmdLarkOperate: Commander.CommandProc = {
+larkNumber: ROPE ¨ CommanderOps.NextArgument[cmd];
+instance: ROPE ¨ CommanderOps.NextArgument[cmd];
+IF instance=NIL THEN
+instance ¨ UserProfile.Token[key: "ThrushClientServerInstance", default: "Strowger.lark"];
+DoOperate[cmd, larkNumber, "O", instance];
+};
+
+DoOperate: PROC[cmd: Commander.Handle, larkNumber: ROPE, mode: ROPE, instance: ROPE] = {
+rName: ROPE;
+IF larkNumber=NIL THEN RETURN;
+larkNumber ¨ IO.PutFR1["173#%g#", [rope[larkNumber]]];
+rName ¨ GetAttribute[larkNumber, $rname, NIL, $larkhost];
+IF rName=NIL THEN RETURN;
+SetAttribute[rName, $mode, mode];
+SetAttribute[rName, $instance, instance];
+DoDetails[cmd, rName];
+};
+
+CmdLarkOwner: Commander.CommandProc = {
+larkNumber: ROPE ¨ CommanderOps.NextArgument[cmd];
+newOwner: ROPE ¨ CommanderOps.NextArgument[cmd];
+IF larkNumber=NIL OR newOwner=NIL THEN RETURN;
+larkNumber ¨ IO.PutFR1["173#%g#", [rope[larkNumber]]];
+SetAttribute[newOwner, $larkhost, larkNumber];
+DoDetails[cmd, newOwner];
+};
+
+CmdLarkDBGet: Commander.CommandProc = {
+rName: ROPE ¨ CommanderOps.NextArgument[cmd];
+attribute: ROPE ¨ CommanderOps.NextArgument[cmd];
+value: ROPE;
+IF rName=NIL OR attribute=NIL THEN RETURN;
+value ¨ GetAttribute[rName, Atom.MakeAtom[attribute]];
+IO.PutF[cmd.out, "Name: %g\n%g: %g\n\n", [rope[rName]], [rope[attribute]], [rope[value]]];
+};
+
+CmdLarkDBSet: Commander.CommandProc = {
+rName: ROPE ¨ CommanderOps.NextArgument[cmd];
+attribute: ROPE ¨ CommanderOps.NextArgument[cmd];
+value: ROPE ¨ CommanderOps.NextArgument[cmd];
+IF rName=NIL OR attribute=NIL THEN RETURN;
+SetAttribute[rName, Atom.MakeAtom[attribute], value];
+DoDetails[cmd, rName];
+};
+
+CmdDBFlush: Commander.CommandProc = {
+IF dbHandle.white#NIL THEN SymTab.Erase[dbHandle.white.dbCache];
+IF dbHandle.blue#NIL THEN SymTab.Erase[dbHandle.blue.dbCache];
+IF dbHandle.red#NIL THEN SymTab.Erase[dbHandle.red.dbCache];
+};
+
+CmdGVUpdate: Commander.CommandProc = {
+rName: ROPE ¨ CommanderOps.NextArgument[cmd];
+[]¨DeleteGVEntry[rName];
+DoDetails[cmd, rName];
+};
+
+KeyClass: TYPE = { primary, secondary, notKey };
+
+MapEntry: TYPE = REF MER;
+MER: TYPE = RECORD [
+dbType: ATOM,
+keyClass: KeyClass¨$notKey
+];
+
+dbMap: RefTab.Ref ¨ RefTab.Create[];
+[] ¨ dbMap.Store[$rname, NEW[MER ¨ [$noProbe, $primary]]];
+[] ¨ dbMap.Store[$name, NEW[MER ¨ [$white, $secondary]]];
+[] ¨ dbMap.Store[$fnm, NEW[MER ¨ [$white, $secondary]]];
+[] ¨ dbMap.Store[$rgnm, NEW[MER ¨ [$white, $secondary]]];
+[] ¨ dbMap.Store[$fstnm, NEW[MER ¨ [$white, $secondary]]];
+[] ¨ dbMap.Store[$officenumber, NEW[MER ¨ [$white]]];
+[] ¨ dbMap.Store[$homenumber, NEW[MER ¨ [$white]]];
+[] ¨ dbMap.Store[$officeaddress, NEW[MER ¨ [$white]]];
+[] ¨ dbMap.Store[$homeaddress, NEW[MER ¨ [$white]]];
+[] ¨ dbMap.Store[$larkhost, NEW[MER ¨ [$blue, $secondary]]];
+[] ¨ dbMap.Store[$workstationhost, NEW[MER ¨ [$blue, $secondary]]];
+[] ¨ dbMap.Store[$dotune, NEW[MER ¨ [$blue]]];
+[] ¨ dbMap.Store[$instance, NEW[MER ¨ [$blue]]];
+[] ¨ dbMap.Store[$interface, NEW[MER ¨ [$blue]]];
+[] ¨ dbMap.Store[$mode, NEW[MER ¨ [$blue]]];
+[] ¨ dbMap.Store[$multiring, NEW[MER ¨ [$blue]]];
+[] ¨ dbMap.Store[$program, NEW[MER ¨ [$blue]]];
+[] ¨ dbMap.Store[$ringmode, NEW[MER ¨ [$blue]]];
+[] ¨ dbMap.Store[$ringtune, NEW[MER ¨ [$blue]]];
+[] ¨ dbMap.Store[$connect, NEW[MER ¨ [$red]]];
+[] ¨ dbMap.Store[$key, NEW[MER ¨ [$red]]];
+[] ¨ dbMap.Store[$authenticity, NEW[MER ¨ [$red]]]; -- useful only for IsAuthenticated
+
+
+dbHandle.dbPrefix ¨ UserProfile.Token["ThrushSunDBPrefix", "/Growler-SUN///Strowger/"];
+
+Commander.Register["NameDBOpen", CmdDBOpen, "Specify location of system databases.
+ Usage: NameDBOpen <directoryPrefix>
+ Example: NameDBOpen /Growler-SUN///Strowger/
+ Example: NameDBOpen /Strowger.lark//Strowger/
+ Example: NameDBOpen ///Users/self.pa/
+  (first example is the default)\n"];
+Commander.Register["NameDBDetails", CmdDBDetails, "Print entire merged DB listing.
+ Usage: NameDBDetails <rName>\n"]; 
+Commander.Register["LarkDebug", CmdLarkDebug, "Tune Lark into development server, debug mode.
+ Usage: LarkDebug <larkNumber> [<instance>]
+ Example: LarkDebug 110 (default instance is UserProfile.LarkTestInstance[])
+ Example: LarkDebug 110 Curie.lark\n"];
+Commander.Register["LarkOperate", CmdLarkOperate, "Tune Lark into operational server, operational mode.
+ Usage: LarkOperate <larkNumber> [<instance>]
+ Example: LarkOperate 110 (default instance is UserProfile.ThrushClientServerInstance[])
+ Example: LarkOperate 110 Curie.lark\n"];
+Commander.Register["LarkOwner", CmdLarkOwner, "Change assignment of Lark to user.
+ Usage: LarkOwner <larkNumber> <rName>
+ Example: LarkOwner 155 Swinehart.pa\n"];
+Commander.Register["NameDBSet", CmdLarkDBSet, "Change Name database attribute.
+ Usage: NameDBSet <rName> <attribute> <value>
+ Example: NameDBSet Swinehart.pa ringmode S\n"];
+Commander.Register["NameDBGet", CmdLarkDBGet, "Query Name database attribute.
+ Usage: NameDBGet <rName> <attribute>
+ Example: NameDBGet Swinehart.pa ringmode\n"];
+Commander.Register["NameDBFlushCache", CmdDBFlush, "Flush local DB cache.
+ Usage: NameDBFlushCache\n"];
+Commander.Register["NameDBGVUpdate", CmdGVUpdate, "Restore GV values from Grapevine.
+ Usage: NameDBGVUpdate <rName>
+ Example: NameDBGVUpdate Curie.lark\n"];
+}.
+   2  
+NameDBImpl.Mesa
+Copyright ” 1987, 1990, 1992 by Xerox Corporation.  All rights reserved.
+Last modified by Swinehart, June 4, 1992 10:28 am PDT
+Polle Zellweger (PTZ) August 23, 1990 9:18:26 pm PDT
+Vin, July 24, 1990 1:24 pm PDT
+Lock as little as possible
+Data
+
+Mostly just repeats LoganBerry errors.
+conversation: RPC.Conversation_RPC.unencrypted,
+Don't query Grapevine about any given value any more frequently.
+conversationLevel: RPC.ConversationLevel _ ECB;
+Procedures exported to NameDB
+
+If key#rname, acquire the rname
+If attribute is not in the same entry, use rName to get the entry it's in.
+Obtain the specified attribute
+If we're dealing with a timed value, select one of timed.attribute and untimed.attribute
+These secondary keys must be unique.  Cancel any previous values.
+Can't alter primary key!  And deletion of entire entries is done by hand.
+Don't trust cached values for write!
+Grapevine update
+info: GVNames.Outcome;
+openDB: OpenDB _ DBFromType[$red];
+connect: ROPE;
+changed: BOOL_FALSE;
+keyRope: ROPE_NIL;
+oldKeyRope: ROPE_NIL;
+[info, connect] _ GVNames.GetConnect[rName];
+SELECT info FROM
+individual => IF connect=NIL OR connect.Length[]=0 THEN connect _ "?";
+group, notFound => connect _ DeleteGVEntry[rName];
+wrongServer, allDown => Error[$GVServersDown, "All GV servers down"];
+protocolError => Error[$GVNamesProtocolViolation, "GV Names protocol violation"];
+ENDCASE => Error[$GVNamesProtocolViolation, "Unknown return code"];
+IF connect=NIL THEN RETURN;
+IF keySupplied THEN {
+SELECT GVNames.AuthenticateKey[rName, encryptionKey] FROM
+group, notFound => keyRope _ DeleteGVEntry[rName];
+individual => keyRope _ KeyRope[encryptionKey];
+protocolError => Error[$GVNamesProtocolViolation, "GV Names protocol violation"];
+wrongServer, allDown => Error[$GVServersDown, "All GV servers down"];
+badPwd => keyRope _ "?";
+ENDCASE => Error[$GVNamesProtocolViolation, "Unknown return code"];
+IF keyRope=NIL THEN RETURN; -- Hmmm; individual existed for connect, but not now!
+};
+attributes _ ReadEntry[openDB, $rname, rName].attributes; -- accept cached value
+-- attributes _ ReadEntry[openDB, $rname, rName, FALSE].attributes;
+IF attributes=NIL THEN attributes _ LIST[[$rname, rName]];
+IF ~connect.Equal[FetchAttribute[attributes, $connect, NIL].value] THEN {
+DeleteFromCache[openDB, attributes];
+changed _ TRUE; attributes _ StoreAttribute[attributes, $connect, connect]; };
+oldKeyRope _ FetchAttribute[attributes, $key, NIL].value;
+IF oldKeyRope=NIL AND keyRope=NIL THEN {
+DeleteFromCache[openDB, attributes];
+changed _ TRUE; attributes _ StoreAttribute[attributes, $key, "?"]; }
+ELSE IF keyRope#NIL AND ~keyRope.Equal[oldKeyRope] AND ~keyRope.Equal["?"] THEN {
+DeleteFromCache[openDB, attributes];
+changed _ TRUE; attributes _ StoreAttribute[attributes, $key, keyRope]; };
+IF changed THEN LoganBerry.WriteEntry[
+db: dbHandle.red.db, entry: attributes, replace: TRUE];
+RecordCache[openDB, attributes];
+cached _ TRUE;
+Utilities
+
+
+Entry caching
+
+Can't really be INTERNAL, because sometimes called from registered procedures, but always with monitor locked!
+Shell commands
+
+[cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]
+[cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]
+[cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]
+[cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]
+[cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]
+[cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]
+[cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]
+[cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]
+[cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]
+[cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]
+Mappings
+
+rname is handled specially
+whitePages; names, public addresses&numbers
+bluePages; private voice system mappings
+Blue is also the default for unknown attributes, so that we can extend the private mappings without recompiling this table.
+redPages; cached Grapevine mappings
+Initialization
+Default prefix value.
+Polle Zellweger (PTZ) July 19, 1990 3:06:43 pm PDT
+Remove Pup dependencies: change to LoganBerry access via Sun RPC, remove conversation from DBHandle record.
+changes to: DIRECTORY, DBHandle, SetAttribute, SetAttributeTimed, GetGVUpdate, DeleteGVEntry, ReadEntry, Open, LBOpen, ForceOpenOnNextCall, dbHandle, dbHandle, Commander
+Polle Zellweger (PTZ) July 21, 1990 9:27:46 pm PDT
+More Pup dependencies: remove references to GVNames.
+changes to: DIRECTORY, NameDBImpl, GetGVUpdate
+Polle Zellweger (PTZ) August 23, 1990 9:18:27 pm PDT
+changes to: DIRECTORY, NameDBImpl, HostFromInstance, GetGVUpdate, dbHandle
+Dan Swinehart June 4, 1992 9:36:45 am PDT
+Pull Booting, Pup, other obsolete references
+changes to: DIRECTORY, NameDBImpl, HostFromInstance, GetGVUpdate, dbHandle
+
+
+ ù ™  ïNewlineDelimiter
+ñ(cedarcode) styleô öúôIcodeöú
+œeú=ôHJô5Kô4KôóKò öœk	ò	KöúûúòKöú
+ûúûú+òLKöú
+ûú#ò2Köúûúò$KöúûúòKöúûú!ò.KöûúòKöúûúäòöKò,KòKöúûúòKöúûúòKöúûúò+Köúûúûúò-KöûúûúòKöúûú.ò:Köúûú
+òKòKò óöœn
+úûúûòJôKöûú=ûú8ò~öûúò"Kò óóôJô KöûúûúûúòKöúûúœc–ck†ò[öúûúûúòKöúûúòöúûúûúòKò#KöúûòKöúûúûú†6òOKöúûú†,òAKòóóKò öúûúûúûúûúûúûúòDJöú&ô&óKò Köú	ûúòKò öú
+ûúûú†*òDKöúûúòJöúûúûúô/Köú†ò-Köú†-òBKöú†ò(Köú	ûúûúòKöú
+ûú†ò2Köú	ûú†ò*Köúûú	†ò,KòóKöú5ò5Kò öúûúòJöú@ô@óJöúûúûúô/Kò óôKò öüúûúûúûúûúûúòNKöûúûúò%Köûúûúûú0òGKöûúGòMKòJô óöüúûúûúòKöúûúûúûúûúûúòBKöûú	ûúûúòKöûúûúûú0òGKöú	ûúòKöúûúòKòKöúûúûúòKòKò JôKò#öûúûúòKòFKöú+ûúò6Köûúûúûúûú
+ò"KòKò óJôJKò(öûúûòKöúûú,ò:KöúûúòKòUKöûúòKò óJôKò=Kò JôXöûúûúòKòCò3Köúûúûúûúûú	ûúòSóKòóKòKò óöüúûúûúûúûú	ûúòHKöûúûúûú0òGKöúûúòKòKöúòKöúûúòö	ûúûúûúûúûò'ò JôAKöú
+ûúûúò;Köûú
+ûúûòKöú;ûúò@KòóKöûúòóKò(öûúûúûúòJöúIôIóöú.ûúò@Jöú$ô$óKöûúûúûúûúò:Kò<Köûúûúûú†!òLKò:öûúûú†ò=KöúCûúòHKöúEûúòJKöúBûúòGKòóKöúAûúòGKòKò óöüúûúûúòKöúûúûúûúò4Köúûúûúò;Köûú,ò2KöúûúòKòKòKöúòKöúûúòKöúûúòKöûúûú4òRKò0öûúûòKòcóKöú.ûú†òRKöûúûúûúûúò:Kò;Kò,öûúûúûúûò'KòSóKòJKòRKöûúûú9òKKöúAûúòGKòKò óö
+üúûúûúûúûúò>Köûú1ò8öûúòKò+Köú	ûúûúûúò.KòóKöú	ûúûúûúò<öûúûúûúûòKöúûúòKöúòKöûúòKòóKòKò óöüúûúûúò)Köûú3ò:öûúòKò+Köú	ûúûúûúò.KòóKöúûúûúò-öûúûúûúûòKöúûúòKöúòKöûúòKòóKòKò óóôKò Köú	ûúûúò$Kò öüúûúòKöúûúûúûúò,KöúûúûúûúòBKöûúûúûúòKò"KòKöúûúòKò8öûúûúûòöúûúûò#KöúLûòPóKòFóKò=Köûú	ûú2òAKòKò óöüúûúòKö	úûúûúûúûúòOKöûúûú
+ûúûúò=JôJô"Jöú	ûúôJöú	ûúûúôJöú	ûúûúôJöúûúûúôJöú,ô,öûúûôJö	úûú	ûúûúûúôFJöú2ô2JôEJöúQôQJöûú<ôCóJöûú	ûúûúûúôöûúûúôöûú/ûô9Jöú2ô2Jô/JöúQôQJôEJôJöûú<ôCóJö	ûú	ûúûúûú†5ôQJôóJöú:†œt†¢ôRJöú1ûúôCJöûúûúûúûúô:öûú5ûú	ûúôIJô$Jöú
+ûú@ôNóJöú.ûúô9ö
+ûúûúûú	ûúûúô(Jô$Jöú
+ûú7ôEóöûúûú	ûúûúûúûúôQJô$Jöú
+ûú<ôJóöûú	ûúô&Jöú1ûúô7óJô Jöú	ûúôKòKò óöüúûúûúûúûúûúò@Kö
+ûúûúûúûúûúò2KöúKòKKòKò óöüúûúòKöúûúûúûúûúûúòSKïStartOfExpansionT[q: MBQueue.Queue, proc: PROC [...], data: REF ANY, immediate: BOOL _ FALSE]öúûú2òEKòKò óöüúûúûúûúûúûúò^Köûú
+ûú†ò7Kò4KòKò óöüúûú†úûúûúûú
+ûúûúòbKöúûúò KöúûúòöúûúûúûúûúûúûúòCKöûúûúòóKöúûúûúò.Köúûúûú
+òMKöú
+ûúOò[KòóKò óô	Jô öü	úûúòKöú*ò*Köú,ûúûúò6Köûúûú
+ûúûúò?öûúûú
+ûò%Köûúûú!ò3óKö
+ûúûúûúûúûúò0KòKöûúûúûúûò+Köûú
+ûúûú!òRóKòóKò öüúûú†úûúò/Köú%ûúûúûúò=Köûú	ûúûúò5Kòöûú(ûúûúûò:KöûúûúûúûúòFóKòKò óöüúûú†úûúò1Köú%ûúò*Köûúûúò-KöûúûúûúûúòKöûú!ûúûúò@Kòöûú(ûú	ûúûò?Köûú ûúûò,KòKöûúòKöûúòóKòKò óöüúûú†úûú&ûú	ûúòfKöûú!ò(Kòöûúûúûú1ûòDKöûú*ò0óKòKò8öûúûúûú"ò4Köûú$ûúòBóKòKò óöüúûú†úûúò'KöúòKöûú"ò)KöûúûúûúûúòKöûúûúûúûúòKòöûú ûúûúûò2Köûú	ûúûúûúòKòKöûúòKöûúòóKöûúòKòóJô öü
+úûú	ûúûúòDKöûúûúò%öûúûúûòKöúòKöúòKöúòKöûú
+òKöúòóKòKò óöüúûú
+ûúòöûúò	Köúûú@òLóKöúûú%ò;öûúûúûúòKòKòKòóKòKòKò óöüúûú†úûúûúûúûúòXöûú(ò.Köú;ò;KòKò óóöüúûú†úûúûúûú
+ûúòmKöûúûúò8Köûúûú6ò?KòKò óöüúûú†úûúûúûúûú	ûúòcKöûúûú8òOKò óöüúûúûúûúò%Köûú,ò2Köúûú#ò2öûúûúòñ8[conv: LoganBerry.Conv _ NIL, db: LoganBerry.OpenDB]öûúûòKöú(ò(óñ8[conv: LoganBerry.Conv _ NIL, db: LoganBerry.OpenDB]öûúûòKöú'ò'óñ8[conv: LoganBerry.Conv _ NIL, db: LoganBerry.OpenDB]öûúûòKöú&ò&óKòóKöúûú<òVKöúûú:òSKöúûú8ûúòVKòKò óöüúûú	ûúûúûúûúûúòPKöúòKöú	ûúòKöú%ûúò,Kò,òKòFóKöú$ûú òFKòKòKò óóôJô KñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]öúûúûúò&öúûúûúòKöúûúòKöúûúò,KöúòKò óñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]öü	úûú5òDKöûúûúò)KòKö
+ûúûúûúûúûúò/Köúûú-ò@öûúûúûúûò-öúVòVKöûúûúòóóKöûúòKòKò óñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]öüúûú.ò?KòKöúûú&ûúò<Kö
+ûúûúûú	ûúûúò)Köúûú*ò=öûúûúûúòKöúûúò&Kò5KöúòóKò#Kò'KòKò óöüú†úò4JöúûúVônKöúûúò+KòKò óöüú†úûú.òRKöúûúòKöûúûúûúûúûúûúò,Köú+ûúò6Köûúûúûú)ò:KòKò óóôJô ñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]öü	úò$Jöúûú
+ûúûúûúûúûúôHKöúûú"ò+Köûúûúûúò(KöúûúòKòKò óñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]öüúò'Jöúûú
+ûúûúûúûúûúôHKò/KòKò óñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]öü	úûúûúò7Köú"ûúò(Kò!Kò KöûúòKòKò óöüúûúòKö	úûú
+ûúûúûúòOKò@KöûúûúûúûúòFöûú,ûúûúûò@KöûúNòPKöûúòóKòKò óñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]öüúò'Jöúûú
+ûúûúûúûúûúôHKöúûú"ò2Köú
+ûú"ò0öûú
+ûúûòKòPóKò*KòKò óñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]öüúò)Jöúûú
+ûúûúûúûúûúôHKöúûú"ò2Köú
+ûú"ò0öûú
+ûúûòKòZóKò*KòKò óñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]ö
+ü	úûú$ûúûúûúòXJöúûú
+ûúûúûúûúûúôHKöúûúòKöûúûúûúûúòKöúûú'ò6Köú)ûúò9KöûúûúûúûúòKöú!ò!Köú)ò)KòKòKò óñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]öüúò'Jöúûú
+ûúûúûúûúûúôHKöúûú"ò2Köú
+ûú"ò0Köûúûúûú
+ûúûúûúò.Köúûú'ò6Köú.ò.KöúòKòKò óñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]öüúò'Jöúûú
+ûúûúûúûúûúôHKöúûú"ò-Köúûú"ò1KöúûúòKöûúûúûúûúûúûúò*Kò6KöûúXòZKòKò óñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]öüúò'Jöúûú
+ûúûúûúûúûúôHKöúûú"ò-Köúûú"ò1Köúûúûúò-Köûúûúûúûúûúûúò*Köú5ò5KòKòKò óñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]öü
+úò%Jöúûú
+ûúûúûúûúûúôHKöûúûúûú&ò@Köûúûúûú%ò>Köûúûúûú$ò<KòKò óñL -- [cmd: Commander.Handle] RETURNS [result: REF ANY _ NIL, msg: ROPE _ NIL]öüúò&Jöúûú
+ûúûúûúûúûúôHKöúûú"ò-KòKòKòKò óóôJô Köú
+ûú"ò0Kò Köú
+ûúûúòöúûúûúòKöúûúòKòKòKò óò$öúôKöú¢úûúûúò:óöú+ô+Köú¢úûúûúò9Köúûúûúò8Köúûúûúò9Köúûúûúò:Köú ûúûúò5Köúûúûúò3Köú!ûúûúò6Köúûúûúò4óöú(ô(Köúûúûúò<Köú#ûúûúòCKöúûúûúò.Köúûúûúò0Köúûúûúò1Köúûúûúò,Köúûúûúò1Köúûúûúò/Köúûúûúò0Köúûúûúò0Jô{óöú#ô#Köúûúûúò.Köúûúûúò*Köú ûúûú†"òVKò óóóôKò òWJôóKò Kò°KòvKò˛KòòKò¢Kò≠Kò¢KògKòúóKòô2Köú[œrúôkKöú£ùô©óô2Kô4Köú£"ô.óô4Köú£>ôJóô)Kô,Köú£>ôJóKô Kô ó Öó    O`  Å<  

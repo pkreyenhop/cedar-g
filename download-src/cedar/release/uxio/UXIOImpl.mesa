@@ -1,0 +1,402 @@
+DIRECTORY
+Atom USING [PutPropOnList],
+Basics USING [UnsafeBlock],
+BasicTime USING [GMT],
+EnvironmentVariables USING [Get],
+HostTime USING [ExtendedGMTFromHostTime],
+IO USING [STREAM, CreateStream, CreateStreamProcs, EndOfStream, StreamProcs],
+List USING [Assoc, AList],
+ProcessProps USING [GetPropList],
+RefText USING [AppendChar, AppendRope, ObtainScratch, ReleaseScratch],
+Rope USING [Concat, Equal, Fetch, Flatten, IsEmpty, ROPE, Length],
+StandardStreams,
+UnixErrno USING [GetErrno, Errno],
+UnixSysCalls USING [Close, FStat, FSync, LSeek, Open, Read, Unlink, Write],
+UnixTypes USING [CHARPtr, FD, FileFlags, Mode, RES, Stat],
+UXIO;
+
+
+UXIOImpl: CEDAR PROGRAM
+IMPORTS Atom, EnvironmentVariables, HostTime, IO, List, ProcessProps, Rope, RefText, UnixErrno, UnixSysCalls
+EXPORTS StandardStreams, UXIO
+SHARES IO
+~ BEGIN 
+
+ROPE: TYPE = Rope.ROPE;
+GMT: TYPE = BasicTime.GMT;
+OpenFile: TYPE = UXIO.OpenFile;
+FD: TYPE = UnixTypes.FD;
+RES: TYPE = UnixTypes.RES;
+CHARPtr: TYPE = UnixTypes.CHARPtr;
+
+Error: PUBLIC ERROR [error: UXIO.ErrorDesc] = CODE;
+
+StreamData: TYPE ~ RECORD [
+fd: FD, 
+fileName: ROPE,
+isReset: BOOL ¨ FALSE -- used only as hack in standard input stream case
+];
+
+stdInputProcs: REF IO.StreamProcs ~ IO.CreateStreamProcs[
+variety: $input, class: $UXStdIO,
+getChar: GetChar, endOf: EndOfInput,
+reset: ResetInput, charsAvail: InputCharsAvail
+];
+
+stdOutputProcs: REF IO.StreamProcs ~ IO.CreateStreamProcs[
+variety: $output, class: $UXStdIO,
+putChar: PutChar,
+unsafePutBlock: UnsafePutBlock
+];
+
+fileInputProcs: REF IO.StreamProcs ~ IO.CreateStreamProcs[
+variety: $input, class: $UXFileIO,
+getChar: GetChar, unsafeGetBlock: UnsafeGetBlock, endOf: EndOf,
+getIndex: GetIndex, setIndex: SetIndex, getLength: GetLength, close: Close
+];
+
+fileOutputProcs: REF IO.StreamProcs ~ IO.CreateStreamProcs[
+variety: $output, class: $UXFileIO,
+putChar: PutChar, unsafePutBlock: UnsafePutBlock, 
+getIndex: GetIndex, getLength: GetLength, setIndex: SetIndex, flush: Flush, close: Close
+];
+
+CreateStandardStream: PUBLIC PROC [kind: UXIO.Kind] RETURNS [stream: IO.STREAM] ~ {
+SELECT kind FROM
+input => stream ¨ IO.CreateStream[streamProcs: stdInputProcs, 
+streamData: NEW[StreamData ¨ [stdin, NIL]]];
+output => stream ¨ IO.CreateStream[streamProcs: stdOutputProcs,
+streamData: NEW[StreamData ¨ [stdout, NIL]]];
+trace => stream ¨ IO.CreateStream[streamProcs: stdOutputProcs,
+streamData: NEW[StreamData ¨ [stdtrc, NIL]]];
+ENDCASE;
+};
+
+CreateStandardInputStream: PUBLIC PROC RETURNS [stream: IO.STREAM] ~ {
+stream ¨ IO.CreateStream[streamProcs: stdInputProcs, streamData: NEW[StreamData ¨ [stdin, NIL]]];
+};
+
+CreateStandardOutputStream: PUBLIC PROC RETURNS [stream: IO.STREAM] ~ {
+stream ¨ IO.CreateStream[streamProcs: stdOutputProcs, streamData: NEW[StreamData ¨ [stdout, NIL]]];
+};
+
+magicFlags: ARRAY UXIO.Access OF UnixTypes.FileFlags ~ [
+read: [access: RDONLY], -- read only
+append: [creat: true, append: true, access: WRONLY], -- create, append, write only
+write: [trunc: true, creat: true, access: WRONLY] -- truncate, create, write only
+];
+
+CreateFileStream: PUBLIC PROC [name: Rope.ROPE, access: UXIO.Access, mode: UnixTypes.Mode ¨ UXIO.defaultMode] RETURNS [stream: IO.STREAM] ~ {
+fd: FD ~ RopeOpen[name, magicFlags[access], mode];
+stream ¨ IO.CreateStream[
+streamProcs: IF access=read THEN fileInputProcs ELSE fileOutputProcs,
+streamData: NEW[StreamData ¨ [fd, name]]
+];
+stream.propList ¨ Atom.PutPropOnList[stream.propList, $FileName, Rope.Flatten[name]];
+stream.propList ¨ Atom.PutPropOnList[stream.propList, $FD, NEW[FD ¨ fd]];
+};
+
+charsPerWord: CARD ~ BITS[WORD]/BITS[CHAR];
+WordOfPackedChars: TYPE ~ PACKED ARRAY [0..charsPerWord) OF CHAR;
+
+GetChar: PROC [self: IO.STREAM] RETURNS [CHAR] ~ {
+data: REF StreamData ~ NARROW[self.streamData];
+charsRead: INT;
+chars: WordOfPackedChars; -- @chars points to chars[0]
+TRUSTED {charsRead ¨ UnixSysCalls.Read[data.fd, LOOPHOLE[@chars], 1]};
+IF charsRead = 0 THEN {
+ERROR IO.EndOfStream[self];
+};
+IF charsRead < 0 THEN {
+errno: UnixErrno.Errno ¨ UnixErrno.GetErrno[];
+ERROR Error[[client, NIL, "read failed to return any bytes in GetChar"]];
+};
+RETURN[chars[0]];
+};
+
+EndOfInput: PROC [self: IO.STREAM] RETURNS [BOOL] = {
+backing: IO.STREAM ¨ self.backingStream;
+IF backing # NIL THEN RETURN[backing.streamProcs.endOf[backing]]
+ELSE RETURN[FALSE];  -- not a concept for stdin
+};
+
+PutChar: PROC [self: IO.STREAM, char: CHAR] ~ {
+data: REF StreamData ~ NARROW[self.streamData];
+charsWritten: INT;
+chars: WordOfPackedChars; -- @chars points to chars[0]
+chars[0] ¨ char;
+TRUSTED {charsWritten ¨ UnixSysCalls.Write[data.fd, LOOPHOLE[@chars], 1]};
+};
+
+UnsafeGetBlock: UNSAFE PROC [self: IO.STREAM, block: Basics.UnsafeBlock] RETURNS [nBytesRead: INT] ~ UNCHECKED {
+data: REF StreamData ~ NARROW[self.streamData];
+pointer: CHARPtr ~ LOOPHOLE[LOOPHOLE[block.base, POINTER]+CARD[block.startIndex]]; -- byte address!
+n: INT ~ UnixSysCalls.Read[data.fd, pointer, CARD[block.count]];
+IF n<0 THEN {
+errno: UnixErrno.Errno ¨ UnixErrno.GetErrno[];
+ERROR Error[[client, NIL, "read failed to return any bytes in UnsafeGetBlock"]];
+};
+RETURN[n];
+};
+
+UnsafePutBlock: PROC [self: IO.STREAM, block: Basics.UnsafeBlock] ~ {
+data: REF StreamData ~ NARROW[self.streamData];
+start: INT ¨ CARD[block.startIndex];
+stop: INT ~ start+CARD[block.count];
+WHILE start<stop DO
+pointer: CHARPtr ~ LOOPHOLE[LOOPHOLE[block.base, POINTER]+start]; -- byte address!
+n: INT;
+TRUSTED { n ¨ UnixSysCalls.Write[data.fd, pointer, stop-start] };
+IF n<0 THEN {
+errno: UnixErrno.Errno ¨ UnixErrno.GetErrno[];
+ERROR Error[[client, NIL, "write failed to write any bytes in UnsafePutBlock"]];
+};
+start ¨ start+n;
+ENDLOOP;
+};
+
+GetIndex: PROC [self: IO.STREAM] RETURNS [INT] ~ {
+data: REF StreamData ~ NARROW[self.streamData];
+index: INT ~ UnixSysCalls.LSeek[data.fd, 0, $incr];
+IF index<0 THEN {
+errno: UnixErrno.Errno ¨ UnixErrno.GetErrno[];
+ERROR Error[[client, NIL, "lseek failed in GetIndex"]];
+};
+RETURN[index];
+};
+
+SetIndex: PROC [self: IO.STREAM, index: INT] ~ {
+data: REF StreamData ~ NARROW[self.streamData];
+newIndex: INT ~ UnixSysCalls.LSeek[data.fd, index, $set];
+IF newIndex<0 THEN {
+errno: UnixErrno.Errno ¨ UnixErrno.GetErrno[];
+ERROR Error[[client, NIL, "lseek failed in SetIndex"]];
+};
+};
+
+GetStat: PROC [fd: FD] RETURNS [stat: UnixTypes.Stat] ~ TRUSTED {
+result: RES ~ UnixSysCalls.FStat[fd, @stat];
+IF result=failure THEN {
+errno: UnixErrno.Errno ¨ UnixErrno.GetErrno[];
+ERROR Error[[client, NIL, "fstat failed in GetStat"]];
+};
+};
+
+GetLength: PROC [self: IO.STREAM] RETURNS [INT] ~ {
+data: REF StreamData ~ NARROW[self.streamData];
+RETURN[GetStat[data.fd].size];
+};
+
+EndOf: PROC [self: IO.STREAM] RETURNS [BOOL] ~ {
+data: REF StreamData ~ NARROW[self.streamData];
+size: INT ~ GetStat[data.fd].size;
+index: INT ~ UnixSysCalls.LSeek[data.fd, 0, $incr];
+IF index<0 THEN {
+errno: UnixErrno.Errno ¨ UnixErrno.GetErrno[];
+ERROR Error[[client, NIL, "lseek failed in EndOf"]];
+};
+RETURN[NOT index<size];
+};
+
+Flush: PROC [self: IO.STREAM] ~ {
+data: REF StreamData ~ NARROW[self.streamData];
+result: RES ~ UnixSysCalls.FSync[data.fd];
+IF result=failure THEN {
+errno: UnixErrno.Errno ¨ UnixErrno.GetErrno[];
+ERROR Error[[client, NIL, "fsync failed in Flush"]];
+};
+};
+
+Close: PROC [self: IO.STREAM, abort: BOOL] ~ {
+data: REF StreamData ~ NARROW[self.streamData];
+result: RES ~ UnixSysCalls.Close[data.fd];
+IF result=failure THEN {
+errno: UnixErrno.Errno ¨ UnixErrno.GetErrno[];
+ERROR Error[[client, NIL, "close failed"]];
+};
+};
+
+ResetInput: PROC [self: IO.STREAM] ~ {
+data: REF StreamData ~ NARROW[self.streamData];
+data.isReset ¨ TRUE;
+};
+
+InputCharsAvail: PROC [self: IO.STREAM, wait: BOOL] RETURNS[INT] ~ {
+data: REF StreamData ~ NARROW[self.streamData];
+IF data.isReset THEN {
+data.isReset ¨ FALSE;
+RETURN[0];
+}
+ELSE RETURN[ LAST[INT] ];
+};
+
+
+Delete: PUBLIC PROC [name: Rope.ROPE] = {
+RopeDelete[name];
+};
+
+OpenFileFromStream: PUBLIC PROC [self: IO.STREAM] RETURNS [OpenFile] = {
+data: REF StreamData ~ NARROW[self.streamData];
+RETURN[[NEW[StreamData ¨ [data.fd, data.fileName]]]]};
+
+GetCreateTime: PUBLIC PROC [file: OpenFile] RETURNS [created: BasicTime.GMT] = {
+data: REF StreamData ~ NARROW[file];
+created ¨ HostTime.ExtendedGMTFromHostTime[[GetStat[data.fd].mtime, 0, 0, 0]].gmt;
+};
+
+GetName: PUBLIC PROC [file: OpenFile] RETURNS [fullFName: Rope.ROPE] = {
+data: REF StreamData ~ NARROW[file];
+RETURN[data.fileName];
+};
+
+
+
+wDirKey: ATOM ~ $WorkingDirectory;
+ExpandName: PROC [name: ROPE] RETURNS [fullUName: ROPE] = {
+IF NOT Rope.Equal[name, NIL] AND Rope.Fetch[name, 0] = '/
+THEN fullUName ¨ name
+ELSE fullUName ¨ Rope.Flatten[Rope.Concat[GetWDir[NIL], name]];
+};
+
+GetWDir: PUBLIC PROC [wDir: ROPE] RETURNS [ROPE] = {
+IF Rope.IsEmpty[wDir] THEN {
+propList: List.AList ~ ProcessProps.GetPropList[];
+WITH List.Assoc[key: wDirKey, aList: propList] SELECT FROM
+rope: ROPE => wDir ¨ rope;
+ENDCASE;
+};
+IF Rope.IsEmpty[wDir] THEN wDir ¨ GetDefaultWDir[];
+RETURN[wDir];
+};
+
+GetDefaultWDir: PROC RETURNS [wdir: Rope.ROPE] ~ {
+RETURN[Rope.Concat[EnvironmentVariables.Get["PWD"], "/"]];
+};
+
+RopeOpen: PROC [name: Rope.ROPE, flags: UnixTypes.FileFlags, mode: UnixTypes.Mode]
+RETURNS [fd: FD] ~ {
+IF Rope.Length[name]=0 THEN ERROR Error[[client, NIL, "empty name in RopeOpen"]] 
+ELSE {
+expandedName: ROPE ¨ ExpandName[name];
+scratch: REF TEXT ~ RefText.ObtainScratch[Rope.Length[expandedName]+1];
+nameText: REF TEXT ~ RefText.AppendChar[RefText.AppendRope[scratch, expandedName], '\000];
+namePointer: CHARPtr ~ LOOPHOLE[LOOPHOLE[nameText, POINTER]+SIZE[TEXT[0]]];
+result: FD;
+TRUSTED { result ¨ UnixSysCalls.Open[namePointer, flags, mode] };
+RefText.ReleaseScratch[scratch];
+IF result=error THEN {
+errno: UnixErrno.Errno ¨ UnixErrno.GetErrno[];
+ERROR Error[[client, NIL, "open failed in RopeOpen"]];
+};
+RETURN[result];
+};
+};
+
+RopeDelete: PROC [name: Rope.ROPE] ~ {
+IF Rope.Length[name]=0 THEN ERROR Error[[client, NIL, "empty name in RopeDelete"]]
+ELSE {
+expandedName: ROPE ¨ ExpandName[name];
+scratch: REF TEXT ~ RefText.ObtainScratch[Rope.Length[expandedName]+1];
+nameText: REF TEXT ~ RefText.AppendChar[RefText.AppendRope[scratch, expandedName], '\000];
+namePointer: CHARPtr ~ LOOPHOLE[LOOPHOLE[nameText, POINTER]+SIZE[TEXT[0]]];
+result: RES;
+TRUSTED { result ¨ UnixSysCalls.Unlink[namePointer] };
+RefText.ReleaseScratch[scratch];
+IF result=failure THEN {
+errno: UnixErrno.Errno ¨ UnixErrno.GetErrno[];
+ERROR Error[[client, NIL, "unlink failed in RopeDelete"]];
+};
+};
+};
+
+END.
+
+   2  
+UXIOImpl.mesa
+Copyright ” 1988, 1991, 1993 by Xerox Corporation.  All rights reserved.
+Carl Hauser, February 16, 1989 2:13:50 pm PST
+Doug Wyatt, May 24, 1988 11:06:24 am PDT
+JKF August 1, 1988 11:43:07 am PDT
+Eduardo Pelegri-Llopart February 8, 1989 4:22:29 pm PST
+Michael Plass, July 19, 1989 9:54:09 am PDT
+Chauser, March 13, 1990 1:25 pm PST
+Willie-s, June 17, 1993 3:03 pm PDT
+Christian Jacobi, March 31, 1993 3:23 pm PST
+
+use this to obtain a (byte) pointer to a CHAR; { char: CHAR; ... @char ... } is wrong!
+Is there any better way to do this?!
+a grand hack: helps out the command tool when running with the standard input stream.  Nobody else uses it, I hope.
+DirPointer: TYPE ~ POINTER TO READONLY DirectStruct;
+DirProc: TYPE ~ PROC [d: DirPointer] RETURNS [quit: BOOL _ FALSE];
+DirEnumerate: PROC [fd: FD, proc: DirProc] ~ TRUSTED {
+nbytes: INT ~ GetStat[fd].blksize;
+scratch: REF TEXT ~ RefText.ObtainScratch[nbytes];
+buf: POINTER ~ LOOPHOLE[scratch, POINTER]+SIZE[TEXT[0]];
+base: INT;
+DO
+cc: INT ~ Xgetdirentries[fd, buf, nbytes, @base];
+index: INT _ 0;
+IF cc<0 THEN ERROR Error;
+IF cc=0 THEN GOTO Quit;
+WHILE index<cc DO
+d: DirPointer ~ LOOPHOLE[buf+index];
+IF proc[d] THEN GOTO Quit;
+index _ index+d.reclen;
+ENDLOOP;
+REPEAT Quit => NULL;
+ENDLOOP;
+RefText.ReleaseScratch[scratch];
+};
+
+EnumerateForNames: PUBLIC PROC [dir: Rope.ROPE, proc: UXIOExtras.NameProc] ~ {
+fd: FD ~ RopeOpen[dir, magicFlags[read]];
+dirProc: DirProc ~ TRUSTED {
+i: NAT _ 0; p: SAFE PROC RETURNS [c: CHAR] ~ TRUSTED { c _ d.name[i]; i _ i+1 };
+rope: Rope.ROPE ~ Rope.FromProc[d.namlen, p];
+RETURN[proc[rope]];
+};
+DirEnumerate[fd, dirProc];
+};
+
+Handling of working directories is as in UFSImpl.mesa (not used to 
+Returns the actual working directory implied by wDir.  If wDir is empty, gets the current $WorkingDirectory property from the process property list; if that too is empty, uses the default working directory []<>.  The result is expressed in brackets syntax, with a final "/".
+CHauser February 16, 1989: added mode parameter to CreateFileStream and RopeOpen.  Moved defaultMode to the interface.
+ ù ~  ïNewlineDelimiter
+ñ(cedarcode) styleô öúôIcodeöú
+œeú=ôHKô-Kô(Kô"Kô7Kô+Kô#Kô#Kô,Jô óöœk	ò	KöúûúòKöúûúòKöú
+ûúûúòKöúûúò!Köú	ûúò)Köûúûúûú=òMKöúûúòKöúûúò!Köúûú9òFKöúûú*ûú
+òBKòKöú
+ûúò"Köúûú9òKKöú
+ûúûúûúúò:KöûúòKò óKò öœnúûúûòKöûú'ûú<òlKöûúûòKöûúûò	KöúûúòKò óKöûúûúûúòKöûúûúûúòKöú
+ûúûú
+òKöûúûúûúòKöûúûúûúòKöú	ûúò"Kò Köüúûúûúûúò3Kò öúûúûúòKöúûúòKöú
+ûòKöú	ûúûúœc2òHKöúòKò óöúûúûúûúò9Köú!ò!Köú$ò$Kò.KöúòKò óöúûúûúûúò:Köú"ò"KöúòKöúòKöúòKò óöúûúûúûúò:Köú"ò"Köú?ò?KöúJòJKöúòKò óöúûúûúûúò;Köú#ò#Köú2ò2KöúXòXKöúòKò óöüúûúûúûúûú
+ûúûúòSöûúûòöúûú*ò>Köúûúûúò,óöúûú*ò?Köúûúûúò-óöúûú*ò>Köúûúûúò-óKöûúòóKòKò óöüúûúûúûú
+ûúûúòFKö	ú	ûú)úúûúûúòaKòKò óöüúûúûúûú
+ûúûúòGKö	ú	ûú*úúûúûúòcKòóKò öúûúûúûúò8Köúûú†ò$Köú,ûú†òRKöú*ûú†òQKòKò óöüúûúûúûú
+ûú ûúûú
+ûúûúòçKöúûú,ò2öú	ûúòKöúûúûúûúòEKöúûúò(KöúòóKöúUòUKöú;ûúûúòIKòKò óKöúûúûúûúûúûúò+öúûúûúûúûúûúòAKöú)ûú
+ûúôVKò óöüúûúûúûúûúûúò2Köúûúûúò/KöúûúòKöú†ò6Köûú)ûúòFöûúûúûòKöûúûúòKòóöûúûúûòKöú.ò.KöûúDòIKòóKöûúòKòKò óö
+ü
+úûúû	úûúûúò5Köú	û	úò(Köûúûúûúûú$ûúûúûú†òpKòKò óö
+üúûúûúûúûúò/Köúûúûúò/KöúûúòKöú†ò6KòKöûú-ûúòJKòKò óöüúûúûúûúûúûúûúû	úòpKöúûúûúò/Kö
+úûúûúûúûú†òcKöúûú'ûúò@öûúûúûòKöú.ò.KöûúKòPKòóKöûúò
+KòKò óöüúûúûúûú òEKöúûúûúò/Köúûúûúò$Köúûú	ûúò$öûúûòKöúûúûúûú
+†òRKöúûúòKöûú:òAöûúûúòKöú.ò.KöûúKòPKòóKòKöûúòóKòKò óöüúûúûúûúûúûúò2Köúûúûúò/Köúûú)ò3öûú	ûúûòKöú.ò.Köûú2ò7KòóKöûúòKòKò óö
+üúûúûúûú	ûúò0Köúûúûúò/Köú
+ûú,ò9öûúûúûòKöú.ò.Köûú2ò7KòóKòKò óö
+üúûúûúûúûúòAKöúûú!ò,öûúûúòKöú.ò.Köûú1ò6KòóKòKò óöü	úûúûúûúûúûúò3Köúûúûúò/KöûúòKòKò óöüúûúûúûúûúûúò0Kô$Köúûúûúò/Köúûúò"Köúûú)ò3öûú	ûúòKöú.ò.Köûú/ò4KòóKöûúûúòKòKò óöüúûúûúûúò!Köúûúûúò/Köúûúò*öûúûúûòKöú.ò.Köûú/ò4KòóKòKò óö
+üúûúûúûú	ûúò.Köúûúûúò/Köúûúò*öûúûúûòKöú.ò.Köûú&ò+KòóKòKò óöü
+úûúûúûúò&Köúûúûúò/KöúûúòKòKò óöüúûúûúûúûúûúûúòDKôsKöúûúûúò/öûúûúòKöúûúòKöûúò
+KòóKöûúûúûúûúòKòKò Kò óöüúûúûúò)KòKòóKò öüúûúû	úûúòHKöúûúûúò/Köûúûú+ò6Kò óöüúûúûúûúòPKöúûúûúò$KöúRòRKòKò óöüúûúûúû	úòHKöúûúûúò$KòKòóò Kò óKö	úûúûúûúûúô4Köú	ûúûúûúûúûúôBöüúûúûúûúô6Köúûúô"Köú	ûúûú!ô2Jöúûúûú
+ûúûúûúô8Jöúûúô
+öûôJöúûú*ô1JöúûúôJöûúûúûúôJöûúûúûúôöûú
+ûôJöúûúô$Jöûú	ûúûúôJôJöûúôóJöûú	ûúôJöûúôóJô KôKô óöüúûúûúûú ôNKöúûú#ô)öúûúôKöúûú	ûúûúûúûúûúôPKöúûúô-KöûúôKôóKôKôKô óKò KôCIcode2öú	ûúò"ö
+ü
+úûúûúûúûúò;ö
+ûúûúûúûúûúòOKöûú.ûú
+ò?óKöúòKò óöüúûúûúûúûúûúò4JôíöûúûúòLöú2ò2öûú+ûúûò:LöúûúòLöûúòóLòóKöûúûúò3KöûúòKöúòKò óöüúûúûúûúò2Köûú4ò:KòKò óö
+üúûúûú4ûúûúògKöûúûúûúûúòQöûúòKöúûúò&Köú	ûúûú6òGKöú
+ûúûúHòZKöúûúûúûúûúûúòKKöúûúòKöûú:òAKò öûúûúòKöú.ò.Köûú1ò6KòóKöûú	òKòóKòKò óöü
+úûúûúò&Köûúûúûú1òRöûúòKöúûúò&Köú	ûúûú6òGKöú
+ûúûúHòZKöúûúûúûúûúûúòKKöúûúòKöûú/ò6Kò öûúûúòKöú.ò.Köûú5ò:KòóKòóKòKò óKöûúòKò Köúvôvó Öó    (Ü  @6  

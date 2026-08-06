@@ -1,0 +1,519 @@
+
+
+DIRECTORY
+BasicTime,
+KeyMapping,
+RefTab,
+RelativeTimes,
+UserInput,
+UserInputOps,
+UserInputInsertActions,
+Xl,
+XlPredefinedAtoms,
+XlTimeEvents,
+XlTQPrivate,
+XTk,
+XTkOps,
+XTkTIPSource,
+XlRecycleMotionEvents;
+
+XTkTIPSourceImpl: CEDAR MONITOR
+IMPORTS BasicTime, RefTab, UserInputOps, UserInputInsertActions, Xl, XlRecycleMotionEvents, XlTimeEvents, XlTQPrivate, XTk, XTkOps
+EXPORTS XTkTIPSource
+SHARES Xl = 
+BEGIN OPEN XTkTIPSource;
+
+dummyCache: REF XlRecycleMotionEvents.EventCache ~ NEW[XlRecycleMotionEvents.EventCache];
+
+
+InsertWidgetInRefTabWhileLive: PROC [tab: RefTab.Ref, w: XTk.Widget] RETURNS [done: BOOL] = {
+IF w.fastAccessAllowed=ok THEN {
+done ¨ RefTab.Insert[tab, w, $x];
+IF done THEN {
+XTk.RegisterNotifier[w, XTk.preStopFastAccessKey, RemoveFromRefTab, tab];
+IF w.fastAccessAllowed#ok THEN [] ¨ RefTab.Delete[tab, w];
+};
+};
+};
+
+RemoveFromRefTab: XTk.WidgetNotifyProc = {
+tab: RefTab.Ref ~ NARROW[registerData]; 
+[] ¨ RefTab.Delete[tab, widget]
+};
+
+serverTimesCount: NAT = 64; --power of 2 to avoid bounds checking and speed up MOD
+serverTimesCountM1: NAT = serverTimesCount - 1;
+LastSTIndex: TYPE = [0..serverTimesCount);
+
+TipSourceHandleRep: PUBLIC TYPE = TipSourceHandleRec;
+Handle: TYPE = REF TipSourceHandleRec;
+TipSourceHandleRec: TYPE = RECORD [
+widget: XTk.Widget ¨ NIL,
+uioHandle: UserInputInsertActions.Handle ¨ NIL,
+uioHandleProtector: UserInputInsertActions.Handle ¨ NIL, --assigned after uioHandle when time is initialized
+cache: REF XlRecycleMotionEvents.EventCache ¨ NIL,
+inputTQ: Xl.TQ ¨ NIL,
+setAbsoluteTime: BOOL ¨ FALSE,
+latestTime: Xl.TimeStamp ¨ Xl.currentTime, 
+serverTime: Xl.TimeStamp ¨ Xl.currentTime, 
+reportedTime: Xl.TimeStamp ¨ Xl.currentTime, 
+teh: XlTimeEvents.TEHandle ¨ NIL,
+serverToClientDelta: CARD32 ¨ 0,
+timeNotYetInitialized: BOOL,
+mapping: KeyMapping.Mapping ¨ NIL,
+mappingSet: BOOL ¨ FALSE, --set means set into uioHandle
+surfaceUnitsPerPixel: NAT ¨ 1,
+pseudoHeight: INT ¨ 0, --like widget.actual.size.height, but tracked by client 
+widgetHeight: INT ¨ 0, --like widget.actual.size.height, but tracked on ThreadQueue or client
+yup: BOOL ¨ FALSE, --also pronounced y-up, sometimes
+scrollPos: Xl.Point ¨ [0, 0],
+lastSTIndex: LastSTIndex ¨ 0,
+lastServerTimes: ARRAY LastSTIndex OF Xl.TimeStamp ¨ ALL[Xl.currentTime]
+];
+
+pseudoRandom: INT ¨ 0;  
+
+inputEvents: Xl.EventFilter ~ Xl.FullCreateEventFilter[LIST[buttonPress, buttonRelease, motionNotify, leaveNotify, enterNotify, keyPress, keyRelease, mapNotify, configureNotify, focusIn, keymapNotify, propertyNotify]];
+keyEvents: Xl.EventFilter ~ Xl.CreateEventFilter[keyPress, keyRelease];
+mappingEvents: Xl.EventFilter ~ Xl.CreateEventFilter[mappingNotify];
+
+eventMask: Xl.SetOfEvent ~ [buttonPress: TRUE, buttonRelease: TRUE, structureNotify: TRUE, keymapState: TRUE, enterWindow: TRUE, leaveWindow: TRUE, pointerMotion: TRUE, propertyChange: TRUE, keyPress: TRUE, keyRelease: TRUE, focusChange: TRUE];
+
+TranslateKey: PROC [keyCode: Xl.KeyCode] RETURNS [UserInputInsertActions.KeyCode] = INLINE {
+RETURN [LOOPHOLE[keyCode]];
+};
+
+TranslateButton: PROC [butCode: BYTE] RETURNS [UserInputInsertActions.KeyCode] = INLINE {
+RETURN [LOOPHOLE[butCode]];
+};
+
+GetDeltaTime: --inputTQ-- PROC [handle: Handle] RETURNS [delta: UserInputInsertActions.DeltaTime] = INLINE {
+delta ¨ LOOPHOLE[handle.latestTime.t-handle.reportedTime.t];
+handle.reportedTime ¨ handle.latestTime;
+};
+
+ReportTime: --inputTQ-- PROC [handle: Handle, event: Xl.Event] = INLINE { 
+IF handle.reportedTime#handle.latestTime THEN {
+handle.reportedTime ¨ handle.latestTime;
+UserInputInsertActions.InsertEventTime[handle: handle.uioHandle, eventTime: LOOPHOLE[handle.latestTime.t+handle.serverToClientDelta], eventSource: event];
+};
+};
+
+NoteTime: --inputTQ-- PROC [handle: Handle, serverTime: Xl.TimeStamp, windup: BOOL ¨ TRUE] = {
+IF handle.timeNotYetInitialized THEN {
+uioHandle: UserInputInsertActions.Handle ~ handle.uioHandle;
+IF uioHandle=NIL THEN RETURN;
+handle.serverTime ¨ serverTime;
+handle.latestTime ¨ serverTime;
+handle.reportedTime ¨ serverTime;
+handle.lastServerTimes ¨ ALL[Xl.currentTime];
+handle.serverToClientDelta ¨ UserInputOps.GetTime[uioHandle].t-serverTime.t;
+handle.timeNotYetInitialized ¨ FALSE;
+XlTimeEvents.SetCorrectTime[handle.teh, serverTime];
+};
+IF Xl.Period[from: handle.serverTime, to: serverTime]>0 THEN {
+handle.serverTime ¨ serverTime;
+XlTimeEvents.SetCorrectTime[handle.teh, serverTime];
+BEGIN
+n: LastSTIndex = (handle.lastSTIndex + 1) MOD serverTimesCount;
+handle.lastServerTimes[n] ¨ serverTime;
+handle.lastSTIndex ¨ n;
+END;
+IF Xl.Period[from: handle.latestTime, to: serverTime]>0
+THEN {
+handle.latestTime ¨ serverTime;
+}
+ELSE {
+};
+};
+IF windup THEN XlTimeEvents.Windup[handle.teh] 
+};
+
+FakeTimeEvent: --inputTQ-- Xl.EventProcType = {
+handle: Handle ~ NARROW[clientData];
+fakeTime: Xl.TimeStamp ~ XlTimeEvents.GetFakeTime[handle.teh];
+IF Xl.Period[from: handle.latestTime, to: fakeTime]>0 AND ~handle.timeNotYetInitialized THEN {
+handle.latestTime ¨ fakeTime;
+ReportTime[handle, event];
+};
+};
+
+PerConnectionInit: Xl.InitializeProcType = {
+tab: RefTab.Ref ~ RefTab.Create[];
+match: Xl.Match ~ NEW[Xl.MatchRep ¨ [proc: MappingChanged, handles: mappingEvents, tq: Xl.CreateTQ[], data: tab]];
+Xl.AddDispatch[c, Xl.nullWindow, match];
+RETURN [tab];
+};
+
+MappingChanged: Xl.EventProcType = {
+PerWidget: RefTab.EachPairAction = {
+w: XTk.Widget ~ NARROW[key];
+IF w.fastAccessAllowed=ok THEN {
+WITH XTk.GetWidgetProp[w, $TipSource] SELECT FROM
+h: Handle => {
+Xl.Enqueue[tq: h.inputTQ, proc: EnsureKeyTableFromMapping, data: h, event: event]; --so real stuff runs on right ThreadQueue
+};
+ENDCASE => {};
+};
+};
+tab: RefTab.Ref ~ NARROW[clientData];
+IF tab#NIL THEN [] ¨ RefTab.Pairs[x: tab, action: PerWidget]; --propagate event to all widgets
+};
+
+EnsureKeyTableFromMapping: Xl.EventProcType = {
+handle: Handle ¨ NARROW[clientData];
+SELECT event.type FROM
+Xl.EventCode.mappingNotify => EnsureKeyTable[handle];
+ENDCASE => {};
+};
+
+AdditionalKeyEvent: Xl.EventProcType = {
+handle: Handle ~ NARROW[clientData];
+uioHandle: UserInputInsertActions.Handle ~ handle.uioHandleProtector;
+IF uioHandle=NIL THEN RETURN;
+SELECT event.type FROM
+Xl.EventCode.keyPress => {
+kp: Xl.KeyPressEvent ~ NARROW[event];
+keyCode: UserInputInsertActions.KeyCode ~ TranslateKey[kp.keyCode];
+NoteTime[handle, kp.timeStamp, TRUE];
+UserInputInsertActions.InsertKey[handle: uioHandle, deltaTime: GetDeltaTime[handle], down: TRUE, keyCode: keyCode, device: $kbd, eventSource: event];
+};
+Xl.EventCode.keyRelease => {
+kr: Xl.KeyReleaseEvent ~ NARROW[event];
+keyCode: UserInputInsertActions.KeyCode ~ TranslateKey[kr.keyCode];
+NoteTime[handle, kr.timeStamp, TRUE];
+UserInputInsertActions.InsertKey[handle: uioHandle, deltaTime: GetDeltaTime[handle], down: FALSE, keyCode: keyCode, device: $kbd, eventSource: event];
+};
+ENDCASE => {};
+};
+
+InputEvent: Xl.EventProcType = {
+handle: Handle ~ NARROW[clientData];
+uioHandle: UserInputInsertActions.Handle ~ handle.uioHandleProtector;
+HandlePosTime: PROC [p: Xl.Point] = INLINE {
+x: INTEGER ¨ p.x-handle.scrollPos.x;
+y: INTEGER;
+IF handle.yup 
+THEN y ¨ handle.widgetHeight-(p.y-handle.scrollPos.y)
+ELSE y ¨ p.y-handle.scrollPos.y;
+IF handle.surfaceUnitsPerPixel#1 THEN {
+supp: NAT ¨ handle.surfaceUnitsPerPixel;
+x ¨ x/supp; y ¨ y/supp
+};
+UserInputInsertActions.InsertIntegerPosition[handle: uioHandle, deltaTime: GetDeltaTime[handle], x: x, y: y, device: $mouse, eventSource: event];
+};
+IF uioHandle=NIL THEN RETURN;
+SELECT event.type FROM
+Xl.EventCode.motionNotify => {
+motion: Xl.MotionNotifyEvent ~ NARROW[event];
+NoteTime[handle, motion.timeStamp, FALSE];
+IF XlTQPrivate.DirtyPeekNextIsMouseEvent[tq] THEN {
+IF (pseudoRandom ¨ pseudoRandom+1) < 8 THEN {
+TRUSTED { XlRecycleMotionEvents.UnsafeRecycle[handle.cache, motion] };
+RETURN;
+};
+pseudoRandom ¨ 0;
+};
+HandlePosTime[motion.pos];
+TRUSTED { XlRecycleMotionEvents.UnsafeRecycle[handle.cache, motion] };
+};
+Xl.EventCode.buttonPress => {
+bp: Xl.ButtonPressEvent ~ NARROW[event];
+keyCode: UserInputInsertActions.KeyCode ~ TranslateButton[bp.button];
+NoteTime[handle, bp.timeStamp, TRUE];
+HandlePosTime[bp.pos];
+UserInputInsertActions.InsertKey[handle: uioHandle, deltaTime: 0, down: TRUE, keyCode: keyCode, device: $mouse, eventSource: event];
+};
+Xl.EventCode.buttonRelease => {
+br: Xl.ButtonReleaseEvent ~ NARROW[event];
+keyCode: UserInputInsertActions.KeyCode ~ TranslateButton[br.button];
+NoteTime[handle, br.timeStamp, TRUE];
+HandlePosTime[br.pos];
+UserInputInsertActions.InsertKey[handle: uioHandle, deltaTime: 0, down: FALSE, keyCode: keyCode, device: $mouse, eventSource: event];
+};
+Xl.EventCode.keyPress => {
+kp: Xl.KeyPressEvent ~ NARROW[event];
+keyCode: UserInputInsertActions.KeyCode ~ TranslateKey[kp.keyCode];
+NoteTime[handle, kp.timeStamp, TRUE];
+UserInputInsertActions.InsertKey[handle: uioHandle, deltaTime: GetDeltaTime[handle], down: TRUE, keyCode: keyCode, device: $kbd, eventSource: event];
+};
+Xl.EventCode.keyRelease => {
+kr: Xl.KeyReleaseEvent ~ NARROW[event];
+keyCode: UserInputInsertActions.KeyCode ~ TranslateKey[kr.keyCode];
+NoteTime[handle, kr.timeStamp, TRUE];
+UserInputInsertActions.InsertKey[handle: uioHandle, deltaTime: GetDeltaTime[handle], down: FALSE, keyCode: keyCode, device: $kbd, eventSource: event];
+};
+Xl.EventCode.enterNotify => {
+enter: Xl.EnterNotifyEvent ~ NARROW[event];
+NoteTime[handle, enter.timeStamp, FALSE];
+ReportTime[handle, enter];
+};
+Xl.EventCode.leaveNotify => {
+leave: Xl.LeaveNotifyEvent ~ NARROW[event];
+NoteTime[handle, leave.timeStamp, FALSE];
+ReportTime[handle, leave];
+};
+Xl.EventCode.configureNotify => {
+configure: Xl.ConfigureNotifyEvent ~ NARROW[event];
+IF handle.pseudoHeight=-1 THEN handle.widgetHeight ¨ configure.geometry.size.height;
+};
+Xl.EventCode.mapNotify => {
+g: Xl.GeometryRec ¨ Xl.GetGeometry[handle.widget.connection, handle.widget.window];
+IF handle.pseudoHeight=-1 THEN handle.widgetHeight ¨ g.geometry.size.height;
+};
+Xl.EventCode.keymapNotify => {
+e: Xl.KeymapNotifyEvent ~ NARROW[event];
+IF e.keys=ALL[0] THEN {
+WITH e.previousEvent SELECT FROM
+enter: Xl.EnterNotifyEvent => {
+IF enter.state=[] THEN 
+UserInputInsertActions.InsertAllUp[handle: uioHandle, deltaTime: 0, device: $kbd, eventSource: enter]; 
+};
+ENDCASE => {};
+};
+};
+ENDCASE => {};
+};
+
+RemapKeySym: PROC [from: Xl.KeySym] RETURNS [to: Xl.KeySym] = INLINE {
+to ¨ from
+};
+
+EnsureKeyTable: PROC [handle: Handle] = {
+ENABLE Xl.XError, ABORTED => GOTO oops;
+uioHandle: UserInput.Handle ~ handle.uioHandle; --no time is involved
+xKeyMap: Xl.KeyboardMapping;
+IF handle.widget.fastAccessAllowed#ok THEN RETURN;
+xKeyMap ¨ Xl.GetKeyboardMapping[handle.widget.connection];
+IF handle.mapping # xKeyMap THEN {
+--not cached...
+handle.mapping ¨ xKeyMap;
+handle.mappingSet ¨ FALSE;
+};
+IF ~handle.mappingSet AND uioHandle#NIL THEN {
+UserInputOps.SetMapping[uioHandle, handle.mapping];
+handle.mappingSet ¨ FALSE;
+};
+EnsureMapping[handle];
+EXITS oops => {};
+};
+
+EnsureMapping: PROC [handle: Handle] = {
+GetRefTab: PROC [c: Xl.Connection] RETURNS [RefTab.Ref ¨ NIL] = {
+IF Xl.Alive[c] THEN { 
+WITH Xl.GetConnectionPropAndInit[c, $XTkTIPSourceImpl, PerConnectionInit] SELECT FROM
+ref: RefTab.Ref => RETURN [ref];
+ENDCASE => {};
+};
+};
+w: XTk.Widget ~ handle.widget;
+IF w#NIL AND w.fastAccessAllowed=ok THEN {
+tab: RefTab.Ref ~ GetRefTab[w.connection];
+IF tab#NIL THEN {
+[] _ InsertWidgetInRefTabWhileLive[tab, w];
+IF w.fastAccessAllowed#ok THEN [] ¨ RefTab.Delete[tab, w];
+};
+};
+};
+
+CurrentMapping: PUBLIC PROC [handle: TipSourceHandle] RETURNS [mapping: KeyMapping.Mapping] = {
+h: Handle ¨ handle;
+EnsureKeyTable[h];
+RETURN [h.mapping];
+};
+
+PreWindowCreation: XTk.WidgetNotifyProc = {
+handle: Handle ~ NARROW[registerData];
+ChangePseudoHeight[handle, handle.pseudoHeight]; --re-registers widget height if necessary
+EnsureKeyTable[handle];
+};
+
+AdditionalKeySource: PUBLIC PROC [handle: TipSourceHandle, w: XTk.Widget] = {
+XTk.AddPermanentMatch[w, [proc: AdditionalKeyEvent, handles: keyEvents, tq: handle.inputTQ, data: handle], [keyPress: TRUE, keyRelease: TRUE]];
+};
+
+BindTranslationToWidget: PROC [w: XTk.Widget, handle: Handle] = {
+m: Xl.Match ~ NEW[Xl.MatchRep ¨ [proc: InputEvent, handles: inputEvents, tq: handle.inputTQ, data: handle]];
+IF handle.widget#NIL THEN ERROR;
+handle.widget ¨ w;
+IF w.actualMapping<unconfigured THEN { 
+IF handle.pseudoHeight=-1 THEN handle.widgetHeight ¨ w.actual.size.height;
+EnsureKeyTable[handle];
+};
+XTk.RegisterNotifier[w, XTk.preWindowCreationKey, PreWindowCreation, handle];
+IF ~handle.setAbsoluteTime THEN handle.uioHandleProtector ¨ handle.uioHandle;
+XTkOps.CallAndRegisterOnPostRealize[w, PostRealizeNotify, handle];
+XTk.AddPermanentMatch[w, [proc: InputEvent, handles: inputEvents, tq: handle.inputTQ, data: handle], eventMask];
+};
+
+BindTipSource: PUBLIC PROC [widget: XTk.Widget, uioHandle: UserInput.Handle, inputTQ: Xl.TQ, yup: BOOL, pseudoHeight: INT ¨ -1, scrollPos: Xl.Point ¨ [0, 0], surfaceUnitsPerPixel: NAT, setAbsoluteTime: BOOL ¨ TRUE] RETURNS [TipSourceHandle] = {
+WITH XTk.GetWidgetProp[widget, $TipSource] SELECT FROM
+handle: Handle => ERROR;
+ENDCASE => {
+handle: Handle ~ NEW[TipSourceHandleRec ¨ [surfaceUnitsPerPixel: surfaceUnitsPerPixel, yup: yup, uioHandle: uioHandle, setAbsoluteTime: setAbsoluteTime, cache: dummyCache, timeNotYetInitialized: TRUE]];
+IF inputTQ=NIL THEN inputTQ ¨ Xl.CreateTQ[];
+handle.inputTQ ¨ inputTQ;
+handle.pseudoHeight ¨ pseudoHeight;
+IF handle.pseudoHeight#-1 THEN handle.widgetHeight ¨ handle.pseudoHeight;
+handle.scrollPos ¨ scrollPos;
+handle.teh ¨ XlTimeEvents.Create[inputTQ, FakeTimeEvent, handle];
+BindTranslationToWidget[widget, handle];
+XTk.PutWidgetProp[widget, $TipSource, handle];
+RETURN [handle];
+}
+};
+
+GetTipSourceHandle: PUBLIC PROC [widget: XTk.Widget] RETURNS [TipSourceHandle] = {
+WITH XTk.GetWidgetProp[widget, $TipSource] SELECT FROM
+handle: Handle => RETURN [handle];
+ENDCASE => RETURN [NIL];
+};
+
+PostRealizeNotify: XTk.WidgetNotifyProc = {
+handle: Handle ~ NARROW[registerData];
+handle.cache ¨ XlRecycleMotionEvents.GetCache[widget.connection, widget.window];
+handle.timeNotYetInitialized ¨ TRUE;
+handle.lastServerTimes ¨ ALL[Xl.currentTime];
+ChangePseudoHeight[handle, handle.pseudoHeight]; --re-registers widget height if necessary
+IF handle.setAbsoluteTime THEN SetAbsoluteTime[handle]; 
+handle.uioHandleProtector ¨ handle.uioHandle;
+};
+
+SetAbsoluteTime: PROC [handle: REF TipSourceHandleRec] = {
+uioHandle: UserInputInsertActions.Handle ¨ handle.uioHandle;
+IF uioHandle=NIL THEN RETURN;
+UserInputOps.SetAbsoluteTime[handle: uioHandle, epochTimeStamp: UserInputOps.GetTime[uioHandle], epochGMT: BasicTime.Now[]];
+};
+
+ReplaceUIOHandle: PUBLIC PROC [handle: TipSourceHandle, uioHandle: UserInput.Handle, setAbsoluteTime: BOOL] = {
+h: Handle ~ handle;
+h.uioHandleProtector ¨ NIL;
+h.uioHandle ¨ uioHandle;
+h.setAbsoluteTime ¨ setAbsoluteTime;
+h.mapping ¨ NIL;
+h.mappingSet ¨ FALSE;
+EnsureKeyTable[h];
+handle.timeNotYetInitialized ¨ TRUE;
+IF setAbsoluteTime THEN SetAbsoluteTime[h];
+h.uioHandleProtector ¨ h.uioHandle;
+UserInputInsertActions.InsertAllUp[handle: uioHandle, deltaTime: 0, device: $kbd];
+};
+
+ChangeSurfaceUnitsPerPixel: PUBLIC PROC [handle: TipSourceHandle, surfaceUnitsPerPixel: NAT] = {
+h: Handle ~ handle;
+h.surfaceUnitsPerPixel ¨ surfaceUnitsPerPixel;
+};
+
+ChangePseudoHeight: PUBLIC PROC [handle: TipSourceHandle, pseudoHeight: INT] = {
+h: Handle ~ handle;
+h.pseudoHeight ¨ pseudoHeight;
+IF pseudoHeight#-1 
+THEN h.widgetHeight ¨ pseudoHeight
+ELSE {
+w: XTk.Widget ~ handle.widget;
+IF w#NIL THEN h.widgetHeight ¨ w.actual.size.height;
+};
+};
+
+ChangeScrollPos: PUBLIC PROC [handle: TipSourceHandle, scrollPos: Xl.Point] = {
+h: Handle ~ handle;
+h.scrollPos ¨ scrollPos;
+};
+
+GetServerTime: PUBLIC PROC [handle: TipSourceHandle] RETURNS [st: Xl.TimeStamp] = {
+uioHandle: UserInputInsertActions.Handle ~ handle.uioHandle;
+idx: LastSTIndex ¨ handle.lastSTIndex;
+st ¨ handle.lastServerTimes[idx];
+IF uioHandle#NIL THEN {
+t: RelativeTimes.TimeStamp ~ [UserInputOps.GetTime[uioHandle].t-handle.serverToClientDelta];
+WHILE Xl.Period[from: st, to: [--host time-- t]]<0 DO
+idx ¨ (idx + serverTimesCountM1) MOD serverTimesCount;
+IF idx=handle.lastSTIndex THEN --failed-- RETURN [Xl.currentTime];
+st ¨ handle.lastServerTimes[idx];
+ENDLOOP;
+}; 
+};
+
+AllUp: PUBLIC PROC [widget: XTk.Widget, event: Xl.Event ¨ NIL] = {
+handle: Handle ~ GetTipSourceHandle[widget];
+IF handle#NIL THEN {
+uioHandle: UserInputInsertActions.Handle ~ handle.uioHandle;
+IF uioHandle#NIL THEN 
+UserInputInsertActions.InsertAllUp[handle: uioHandle, deltaTime: 0, device: $kbd, eventSource: event];
+};
+};
+
+END.
+
+  
+<  XTkTIPSourceImpl.mesa
+Copyright ” 1988, 1989, 1990, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Created by Christian Jacobi, November 21, 1988 10:37:52 am PST
+Complete redesigned by Christian Jacobi, June 11, 1990 11:49:17 am PDT 
+Christian Jacobi, May 28, 1993 1:02 pm PDT
+Bier, January 12, 1989 9:03:32 pm PST
+Willie-s, October 30, 1991 11:27 am PST
+------------------
+Little utility...
+------------------
+--
+--"Globals"
+--
+--Times
+--   all times are relative to the X server's epoch; 
+--   serverToClientDelta is added before reporting a time to user input
+--   all times are invalid if timeNotYetInitialized
+--   all times are monitored by inputTQ 
+--the latest time noted (either from X server or from time enforcer process)
+--the latest time noted from X server
+--the latest time which has been forwarded to UserInput 
+--UserInput time = X time + serverToClientDelta
+--
+--Keyboard and coordinates
+--
+--Resetting keyboard
+--
+--Backwards times
+--
+--Caller must promises to report delta
+--Also resets delta-base
+--Internally notes a new server time (without reporting to clients)
+--Since lastServerTimes is accessed unmonitored from other process (GetServerTime)
+--Increment lastSTIndex only after new value is in place
+--(if other process finds old value on lastSTIndex location this will not cause a failure)
+--X time later than latestTime
+--X time NOT later then enforced time; use enforced time
+--Called for connection when mapping changes
+--Still using a shared ThreadQueue instead of inputTQ
+--Wrapper to allow calling EnsureKeyTable on right ThreadQueue (inputTQ)
+--Input event on inputTQ; but from other window
+--this compensates for input focus non-sense (bug)
+--Input event on inputTQ thread 
+--Discard this event because another one directly follows
+--But: sometimes don't, to prevent running around never processing event but allways discarding at same speed as events come in...
+focus: Xl.FocusInEvent => {
+IF focus.??=[] THEN 
+UserInputInsertActions.InsertAllUp[handle: uioHandle, deltaTime: 0, device: $kbd, eventSource: focus];
+};
+--Make sure that when connection gets a mappingNotify event this will be propagated to all widgets with handles
+--Ha! ha! we don't bother to ask the X server
+--Returns server generated TimeStamp from event producing front of UserInput.Handle
+--Successfull most of the time
+--Returns Xl.currentTime if tip-sink is so slow that the actual server time falls out of buffer
+--Undefined after ReplaceUIOHandle until actual input in UserInput.Handle happens
+--
+--Not monitored, but: we don't change any data
+--See comments where values are changed (NoteTime)
+ ù   ïNewlineDelimiter
+ñ(cedarcode) styleò codeôKöú	œeúHôTKöú;œkô>KôGKô*Kô%Kô'óKò öû	ò	Kò
+KöúòKòKòKò
+KòKöúòKöúòKöúòKöúòKöúòKòKòKòKöúòóKò öœnúûúûòKöûú{òÇKöûúòKöûúòóöûúûúòKò óöúûú$ûú#òYKò óKöúôKôKò öüúûú"ûúûúò]öûúûúò Köú!ò!öûúûúòKöúIòIKöûúûúò:KòóKòóKòKò öüúò*Köúûúò(KòKòóóKò KöúôKöúûúœc6òRKöúûúò/Köúûúò*Kò Köúûúûúò5Köúûúûúò&öúûúûúò#KôKôKöúûúòKöú+ûúò/Köú4ûú†3òlKöúûú$ûúò2KöúûúûúòKöúûúûúòKôKôKô5KôGKô3Kô(ò+KôLóò+Kô%óöú-ò-Kô8óKöúûúò!öúûúò Kô/óKöúûúòKôKôKöúûúò"Köúûúûú†ò8KöúûúòKöúûú†8òOKöúûú†Fò]Köúûúûú†!ò4KòKôKôKôKôKòKöúûúûúûúòHKôKòóKò KöúûúòKò Köú7ûúüò⁄KöúGòGKöúDòDKò öú)ûúûúûúûúûúûúûúûúûúûúûúòÙKò óöüúûúûú$ûúò\KöûúûúòKòóKò ö
+üúûúûúûú$ûúòYKöûúûúòKòóKò ö
+üú†úûúûú-ûúòlKô&Köúûú,ò<Kò(KòKò óöü
+ú†úûú%ûúòJKôöûú'ûúò/Kò(KöúLûúFòöKòóKòKò óö
+üú†úûú4ûúûúò^Kö†CôCöûúûúò&Kò<KöûúûúûúûúòKòKòKò!Köúûúò-KòLKöúûúò%Kò4Kòóöûú6ûúò>KòKò4öûòKôRKöúœbúô8KöúF°úôZKöú*ûúò?Kò'KòKöûúòóöûú5ò7öûúòKö†ôKòKòóöûúòKö†%–cs†ô8KòóóKòóKöûúûú!ò/KòKò óöüú†úò/Köúûúò$Kò>öûú4ûúûúò^KòKòKòóKòKò óöüúò,Köú"ò"Köúûú]òrKöú(ò(KöûúòKöúòKò óöüúò$Kô,Kô5öü	úò$Köúûúòöûúûúò öûú"ûúûò1òKöúS†)ò|KòóKöûúòóKòóKòóKöúûúò%Köûúûúûú/† ò^KòKò óöüúò/Köú3†ú†ôHKöúûúò$öûúûòKöú5ò5KöûúòóKòóKò öüúò(Kô/Kô2Köúûúò$KòEKöûúûúûúûúòöûúûòöúòKöúûúò%KòCKöúûúò%Köú[ûú6òïKòóöúòKöúûúò'KòCKöúûúò%Köú[ûú6òñKòóKöûúòóKòKò óöü
+úò Kô Köúûúò$KòEöüúûúûúò,Köúûúò$KöúûúòöûúòKöûú1ò5Köûúò óöûúûúò'Köúûúò(KòKòóKòëKòóKöûúûúûúûúòöûúûòòKöúûúò-Köú#ûúò*öûú+ûúò3Jô9Jöú†gôÇöûú%ûúò-Köûú?òFKöûúòKòóKòKòóKòKöûú?òFKòóòKöúûúò(KöúEòEKöúûúò%KòKöúHûú8òÑKòóòKöúûúò*KöúEòEKöúûúò%KòKöúHûú8òÖKòóòKöúûúò%KöúCòCKöúûúò%Köú[ûú6òïKòóòKöúûúò'KöúCòCKöúûúò%Köú[ûú6òñKòóòKöúûúò+Köú"ûúò)KòKòóòKöúûúò+Köú"ûúò)KòKòóöú!ò!Köú%ûúò3Köûúûú6òTKòóòKöúSòSKöûúûú.òLKòóöúòKöúûúò(öûúûúûúòöûúûúûò öúòöûúûúòKògóKòóöúôöúôKôfóKôóKöûúòóKòóKòóKöûúòóKòóKò öüúûúûúûúòFKò	KòKò óöüúûúò)Köûúûúûúò'Köú0†òEKöúòKöûú$ûúûúò2Köú:ò:öûúûúò"Kö†òKöúòKöúûúòKòóöûúûúûúûúò.Kò3KöúûúòKöúòóKòKöûúòKòKò óöüúûúò(Jôoöü	úûúûúûúòAöûúûúòöûúFûúûòUJöúûúò JöûúòóJòóJöúòóKöúòöûúûúûúûúò*Köú*ò*öûúûúûúòJò+Köûúûúò:KòóKòóKòKò óöüúûúûú"ò_KòKòKöûúòKòóKò öüúò+Köúûúò&Köú1†)òZKòKòKò óöüúûúûú-òMKöúvûúûúòèKòKò óöüúûú$òAKöúûú[òlKöûúûúûúûúò Kòöûúûúò'Köûúûú,òJKöúòKòóKòMKöûúûú.òMKöúBòBKòpKòóKò öüúûúûú?ûúûúûú;ûúûúûúûúòÙöûú'ûúûò6KöúûúòöûúòKöúûú∂ò Köûú	ûúûúò,KòKò#Köûúûú+òIKòKöúAòAKò(Kò.Köûú
+òKòóóKòóKò öüúûúûúûúòRöûú'ûúûò6Köúûú
+ò"KöûúûúûúòóKòóKò öüúò+Köúûúò&KöúPòPKöú–bfú—bfkúò$Köúûúò-Köú1†)òZKöûúûúò8Kò-KòKò óöüúûú
+ûúò:Kô-Kò<KöûúûúûúûúòKò|KòóöüúûúûúIûúòoKöúòKöúûúòKòKöú$ò$KöúûúòKöúûúòKòKöúûúò$Köûúûúò+Kò#KòRKöúòKò óöüúûúûú1ûúò`KöúòKò.KòKò óöüúûúûú)ûúòPKöúòKòöûúòKöûúò"öûúûòKöúòKöûúûúûú'ò4KòóóKòKò óöüúûúûú3òOKöúòKòKòKò óöüúûúûúûúòSKôSKôKô_KôQJôJô.Jô2Kò<Kò&Kò!öûúûúûúòKò\öûú†úûò5Köú!ûúò6Köûúûú†
+úûúòBKò!KöûúòóKòóKòKò óöüúûúûú(ûúòBKò,öûúûúûúòKò<öûúûúûúòKòfóKòóKòóKò KöûúòKò ó Öó    @L  Zî  

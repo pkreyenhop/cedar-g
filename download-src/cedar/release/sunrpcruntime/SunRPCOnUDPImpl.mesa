@@ -1,0 +1,941 @@
+
+DIRECTORY
+Arpa USING [Address, IsBroadcast, nullAddress],
+ArpaUDP USING [nullPort, Port],
+Basics USING [CopyBytes, FWORD, HWORD, UnsafeBlock],
+DatagramSocket USING [Create, Destroy, Error, GetLocal, Handle, Kick, Recv, Send],
+FinalizeOps USING [CallQueue, CreateCallQueue, EnableFinalization, FinalizeProc],
+Process USING [Detach],
+RefText USING [New, ObtainScratch, ReleaseScratch],
+Rope USING [ROPE],
+
+SunRPC,
+SunRPCAuth USING [Authenticate, AuthenticateResult, CheckReplyVerifier, Conversation, Flavor, maxValueBytes, nullFlavor],
+SunRPCNumbers USING [],
+SunRPCOnUDP,
+SunRPCType USING [AcceptStat, AuthStat, MsgType, RejectStat, ReplyStat, rpcVersion]
+;
+
+SunRPCOnUDPImpl: CEDAR MONITOR
+LOCKS sd USING sd: PacketServer
+IMPORTS Arpa, Basics, DatagramSocket, FinalizeOps, Process, RefText, SunRPC, SunRPCAuth
+EXPORTS SunRPCOnUDP
+~ {
+OPEN RPCT: SunRPCType;
+ROPE: TYPE ~ Rope.ROPE;
+
+Address: TYPE ~ Arpa.Address;
+nullAddress: Address ~ Arpa.nullAddress;
+
+Port: TYPE ~ ArpaUDP.Port;
+nullPort: Port ~ ArpaUDP.nullPort;
+
+UnsafeBlock: TYPE ~ Basics.UnsafeBlock;
+
+Handle: TYPE ~ REF Object;
+Object: TYPE ~ SunRPC.Object;
+
+Conversation: TYPE ~ SunRPCAuth.Conversation;
+AuthFlavor: TYPE ~ SunRPCAuth.Flavor;
+nullFlavor: AuthFlavor ~ SunRPCAuth.nullFlavor;
+AuthValue: TYPE ~ REF TEXT;
+
+Error: ERROR[code: ATOM] ~ SunRPC.Error;
+udpFlavor: ATOM ~ $UDP;
+
+dataBufBytes: CARDINAL ~ 8704;
+
+maxAuthBytes: CARDINAL ~ SunRPCAuth.maxValueBytes;
+maxRefTextLength: CARDINAL ¨ 8*1024;
+maxUnsafeBlockLength: CARDINAL ¨ CARDINAL.LAST - 3;	-- ensures stopIndexPlusOne fields won't overflow in calls to ByteBlt
+
+maxProcessesPerServer: CARDINAL ~ 6;
+
+minTimeout: CARD ¨ 100;
+maxTimeout: CARD ¨ 15*1000;
+
+maxRetries: CARDINAL ¨ 20;
+maxReads: CARDINAL ¨ 10;	-- max reads before resend
+
+retryCeiling: CARDINAL ~ 6;
+getTimeouts: ARRAY [0..retryCeiling] OF CARD ~ [ 250, 250, 500, 1000, 2000, 4000, 8000 ];
+
+ComputeGetTimeout: PROC [tryNo: CARDINAL, callTime: CARD]
+RETURNS [getTimeout: CARD] ~ INLINE {
+getTimeout ¨ MAX[callTime, getTimeouts[MIN[tryNo, retryCeiling]]];
+};
+
+rwCacheSize: CARDINAL ~ 8;
+
+defaultReplyTTL: CARDINAL ¨ 5; -- seconds
+TextPtrFromRefText: UNSAFE PROC [block: REF READONLY TEXT] RETURNS [LONG POINTER] ~ TRUSTED INLINE {
+RETURN[ LOOPHOLE[block, LONG POINTER] + UNITS[TEXT[0]] ] };
+PacketData: TYPE ~ REF PacketDataObject;
+PacketDataObject: TYPE ~ RECORD [
+datagramHandle: DatagramSocket.Handle,
+address: Arpa.Address ¨ Arpa.nullAddress,
+port: ArpaUDP.Port ¨ ArpaUDP.nullPort,
+lastRemoteAddress: Arpa.Address ¨ Arpa.nullAddress,
+lastRemotePort: ArpaUDP.Port ¨ ArpaUDP.nullPort,
+ttl: CARDINAL ¨ 0,
+busy: BOOL ¨ FALSE,
+sendBuf: REF TEXT,
+recvBuf: REF TEXT,
+index: CARDINAL ¨ 0
+];
+
+Create: PUBLIC PROC [remoteAddress: Address ¨ nullAddress, remotePort: Port ¨ nullPort] RETURNS [h: Handle]
+~ {
+d: PacketData;
+h ¨ NEW[Object];
+h.flavor ¨ udpFlavor;
+h.procs ¨ packetProcs;
+h.flavorData ¨ d ¨ NEW[PacketDataObject];
+d.sendBuf ¨ RefText.ObtainScratch[dataBufBytes];
+d.recvBuf ¨ RefText.ObtainScratch[dataBufBytes];
+d.datagramHandle ¨ DatagramSocket.Create[];
+IF remoteAddress=nullAddress THEN
+remoteAddress ¨ DatagramSocket.GetLocal[d.datagramHandle].address;
+h ¨ SetRemote[h, remoteAddress, remotePort];
+[] ¨ FinalizeOps.EnableFinalization[h, fQueue];
+};
+
+
+GetRemote: PUBLIC PROC [h: Handle] RETURNS [remoteAddress: Address, remotePort: Port]
+~ {
+d: PacketData ¨ NARROW[h.flavorData];
+remoteAddress ¨ d.address;
+remotePort ¨ d.port;
+};
+
+SetRemote: PUBLIC PROC [h: Handle, remoteAddress: Address, remotePort: Port]
+RETURNS [newH: Handle]
+~ {
+d: PacketData ¨ NARROW[h.flavorData];
+d.address ¨ remoteAddress;
+d.port ¨ remotePort;
+newH ¨ h;
+};
+
+GetReplyAddress: PUBLIC PROC [h: Handle] RETURNS [remoteAddress: Address, remotePort: Port] ~ {
+d: PacketData ~ NARROW[h.flavorData];
+RETURN[d.lastRemoteAddress, d.lastRemotePort];
+};
+packetProcs: REF SunRPC.ProcsObject ~ NEW[ SunRPC.ProcsObject ¨ [
+destroy~DestroyPacketHandle,
+sendCallAndReceiveReply~SendCallAndReceiveReply,
+receiveAnotherReply~ReceiveAnotherReply,
+releaseReply~ReleaseReply,
+bytesRemaining~BytesRemaining,
+getByte~GetByte,
+getAlign~GetAlign,
+getH~GetH,
+getF~GetF,
+unsafeGetBlock~UnsafeGetBlock,
+getBlock~GetBlock,
+putByte~PutByte,
+putAlign~PutAlign,
+putH~PutH,
+putF~PutF,
+unsafePutBlock~UnsafePutBlock, 
+putBlock~PutBlock,
+prepareForMessage~PrepareForMessage
+]];
+
+readerWriterProcs: REF SunRPC.ProcsObject ~ NEW[ SunRPC.ProcsObject ¨ [
+destroy~DestroyReaderOrWriter,
+sendCallAndReceiveReply~CantSendCallAndReceiveReply,
+receiveAnotherReply~CantReceiveAnotherReply,
+releaseReply~ReleaseReply,
+bytesRemaining~BytesRemaining,
+getByte~GetByte,
+getAlign~GetAlign,
+getH~GetH,
+getF~GetF,
+unsafeGetBlock~UnsafeGetBlock,
+getBlock~GetBlock,
+putByte~PutByte,
+putAlign~PutAlign,
+putH~PutH,
+putF~PutF,
+unsafePutBlock~UnsafePutBlock, 
+putBlock~PutBlock,
+prepareForMessage~PrepareForMessage
+]];
+
+DestroyPacketHandle: PROC [h: Handle] ~ {
+WITH h.flavorData SELECT FROM
+d: PacketData => {
+IF d.sendBuf # NIL THEN { RefText.ReleaseScratch[d.sendBuf]; d.sendBuf ¨ NIL };
+IF d.recvBuf # NIL THEN { RefText.ReleaseScratch[d.recvBuf]; d.recvBuf ¨ NIL };
+IF d.datagramHandle # NIL THEN { DatagramSocket.Destroy[d.datagramHandle]; d.datagramHandle ¨ NIL };
+h.flavorData ¨ NIL;
+};
+ENDCASE;
+};
+
+DestroyReaderOrWriter: PROC [h: Handle] ~ {
+SELECT h.flavor FROM
+$reader, $writer => {
+d: PacketData ~ NARROW[h.flavorData];
+d.sendBuf ¨ NIL;
+d.recvBuf ¨ NIL;
+FreeLocalHandle[h~h];
+};
+ENDCASE => Error[$wrongFlavor];
+};
+
+SendCallAndReceiveReply: PROC [h: Handle, timeoutMsec: CARD, retries: CARD] ~ {
+SendAndReceive[h, timeoutMsec, retries, TRUE];
+};
+
+CantSendCallAndReceiveReply: PROC [h: Handle, timeoutMsec: CARD, retries: CARD] ~ {
+Error[$wrongFlavor];
+};
+
+ReceiveAnotherReply: PROC [h: Handle, timeoutMsec: CARD] ~ {
+SendAndReceive[h, timeoutMsec, 0, FALSE];
+};
+
+CantReceiveAnotherReply: PROC [h: Handle, timeoutMsec: CARD] ~ {
+Error[$wrongFlavor];
+};
+
+SendAndReceive: PROC [h: Handle, timeoutMsec: CARD, retries: CARD, doSend: BOOL] ~ {
+d: PacketData ¨ NARROW[h.flavorData]; 
+errorCode: ATOM ¨ NIL;
+replyVerifier: AuthValue;
+tryNo: CARDINAL ¨ 0;
+
+retries ¨ MIN[retries, maxRetries];
+timeoutMsec ¨ MAX[timeoutMsec, minTimeout];
+IF retries > 0 THEN timeoutMsec ¨ MIN[timeoutMsec, maxTimeout];
+
+FOR tryNo: CARD IN [0 .. retries] DO
+IF doSend THEN {
+errorCode ¨ NIL;
+DatagramSocket.Send[d.datagramHandle, d.address, d.port, d.sendBuf
+! DatagramSocket.Error => { errorCode ¨ code; CONTINUE }];
+SELECT errorCode FROM
+NIL => NULL;
+$transientError => LOOP;
+ENDCASE => GOTO Done;
+};
+THROUGH [0 .. maxReads) DO
+d.index ¨ 0;
+errorCode ¨ NIL;
+[, d.lastRemoteAddress, d.lastRemotePort] ¨ DatagramSocket.Recv[d.datagramHandle, d.recvBuf, 0, NAT.LAST, ComputeGetTimeout[tryNo, timeoutMsec]
+! DatagramSocket.Error => { errorCode ¨ code; CONTINUE }];
+SELECT errorCode FROM
+NIL => {
+IF d.lastRemoteAddress # d.address
+THEN IF NOT Arpa.IsBroadcast[d.address]
+THEN LOOP;
+{ ENABLE Error => LOOP;
+returnedXid, returnedMsgType: CARD32;
+returnedXid ¨ SunRPC.GetCard32[h];
+returnedMsgType ¨ SunRPC.GetCard32[h];
+IF (returnedXid # h.xid) OR (returnedMsgType # ORD[RPCT.MsgType.reply]) THEN LOOP;
+};
+{ ENABLE Error => { errorCode ¨ $protocolError; GOTO Done };
+replyStat, acceptStat, rejectStat, authStat: CARD32;
+replyFlavor: AuthFlavor;
+SELECT (replyStat ¨ SunRPC.GetCard32[h]) FROM
+ORD[RPCT.ReplyStat.msgAccepted] => {
+[replyFlavor, replyVerifier] ¨ SunRPC.GetAuth[h];
+errorCode ¨ SELECT SunRPCAuth.CheckReplyVerifier[NARROW[h.authData], replyFlavor, replyVerifier] FROM
+ok => NIL,
+badVerifier => $badReplyVerifier,
+wrongVerifier => $wrongReplyVerifier, 
+ENDCASE => ERROR;
+IF errorCode # NIL THEN GOTO Done;
+acceptStat ¨ SunRPC.GetCard32[h];
+errorCode ¨ SELECT acceptStat FROM
+ORD[RPCT.AcceptStat.success] => NIL, -- winner!
+ORD[RPCT.AcceptStat.progUnavail] => $wrongProgram,
+ORD[RPCT.AcceptStat.progMismatch] => $wrongProgramVersion,
+ORD[RPCT.AcceptStat.procUnavail] => $wrongProc,
+ENDCASE => $protocolError;
+GOTO Done;
+};
+ORD[RPCT.ReplyStat.msgDenied] => {
+SELECT (rejectStat ¨ SunRPC.GetCard32[h]) FROM
+ORD[RPCT.RejectStat.rpcMismatch] => {
+errorCode ¨ $wrongRPCVersion;
+};
+ORD[RPCT.RejectStat.authError] => {
+authStat ¨ SunRPC.GetCard32[h];
+errorCode ¨ SELECT authStat FROM
+ORD[RPCT.AuthStat.authBadcred] => $badCredentials,
+ORD[RPCT.AuthStat.authRejectedcred] => $wrongCredentials,
+ORD[RPCT.AuthStat.authBadverf] => $badVerifier,
+ORD[RPCT.AuthStat.authRejectedverf] => $wrongVerifier,
+ORD[RPCT.AuthStat.authTooweak] => $weakCredentials,
+ENDCASE => $protocolError;
+};
+ENDCASE => {
+errorCode ¨ $protocolError
+};
+GOTO Done;
+};
+ENDCASE => {
+errorCode ¨ $protocolError;
+GOTO Done;
+};
+};
+};
+$timeout => {
+errorCode ¨ $timeout;
+EXIT;		-- and repeat outer loop if we should
+};
+$transientError => {
+LOOP;
+};
+$unreachable => {
+errorCode ¨ $unreachable;
+EXIT;
+};
+ENDCASE => {
+errorCode ¨ $protocolError;
+GOTO Done;
+};
+ENDLOOP;
+REPEAT
+Done => NULL;
+ENDLOOP;
+IF replyVerifier # NIL
+THEN { RefText.ReleaseScratch[replyVerifier]; replyVerifier ¨ NIL };
+IF errorCode # NIL THEN { ERROR Error[errorCode] };
+};
+
+ReleaseReply: PROC [h: Handle] ~ {
+h.authData ¨ NIL; -- help finalization
+};
+Server: TYPE ~ SunRPC.Server;
+ServerObject: TYPE ~ SunRPC.ServerObject;
+
+PacketServer: TYPE ~ REF PacketServerObject;
+PacketServerObject: TYPE ~ MONITORED RECORD [
+datagramHandle: DatagramSocket.Handle,
+serverPort: ArpaUDP.Port,
+dead: BOOL ¨ FALSE,
+freeHandle: CONDITION,
+freeHandleIndex: CARDINAL ¨ 0,
+handles: SEQUENCE concurrencyPlusOne: CARDINAL OF Handle
+];
+
+myServerMgtProcs: SunRPC.ServerMgtProcs ~ NEW[SunRPC.ServerMgtProcsObject ¨ [
+destroyServer~DestroyServer
+]];
+
+CreateServer: PUBLIC PROC [pgm, version: CARD, serverProc: SunRPC.ServerProc, port: Port, concurrency: CARDINAL, clientData: REF] RETURNS [s: Server]
+~ {
+sd: PacketServer;
+concurrency ¨ MAX[concurrency, 1];
+concurrency ¨ MIN[concurrency, maxProcessesPerServer]; 
+sd ¨ NEW[PacketServerObject[concurrency+1]];
+s ¨ NEW[ServerObject];
+s.pgm ¨ pgm;
+s.version ¨ version;
+s.flavor ¨ udpFlavor;
+s.flavorData ¨ sd;
+s.mgtProcs ¨ myServerMgtProcs;
+sd.datagramHandle ¨ DatagramSocket.Create[port];
+sd.serverPort ¨ DatagramSocket.GetLocal[sd.datagramHandle].port;
+s.clientData ¨ clientData;
+s.serverProc ¨ serverProc;
+FOR i: CARDINAL IN [0..concurrency+1) DO
+h: Handle ¨ NEW[Object];
+d: PacketData ¨ NEW[PacketDataObject];
+h.flavor ¨ udpFlavor;
+h.flavorData ¨ d;
+h.procs ¨ packetProcs;
+d.sendBuf ¨ RefText.ObtainScratch[dataBufBytes];
+d.recvBuf ¨ RefText.ObtainScratch[dataBufBytes];
+d.datagramHandle ¨ sd.datagramHandle;
+sd.handles[i] ¨ h;
+ENDLOOP;
+createdServers ¨ createdServers.SUCC;
+[] ¨ FinalizeOps.EnableFinalization[s, fQueue];
+TRUSTED { Process.Detach[ FORK Serve[s, sd] ] };
+TRUSTED { Process.Detach[ FORK AgeResults[s, sd] ] };
+};
+
+GetServerPort: PUBLIC PROC [s: Server] RETURNS [port: Port] ~ {
+nS: Server ~ IF s.flavor=udpFlavor THEN s ELSE Error[$wrongFlavor];
+d: PacketServer ~ NARROW[s.flavorData];
+RETURN[ d.serverPort ];
+};
+
+DestroyServer: PROC [s: Server] ~ {
+sd: PacketServer ~ NARROW[s.flavorData];
+LockedDestroyServer: ENTRY PROC[ s: Server, sd: PacketServer ] ~ {
+IF NOT s.dead THEN destroyedServers ¨ destroyedServers.SUCC;
+s.dead ¨ TRUE;
+BROADCAST sd.freeHandle;
+DatagramSocket.Kick[sd.datagramHandle];
+};
+LockedDestroyServer[s, sd];
+};
+createdServers: CARD ¨ 0;
+droppedServers: CARD ¨ 0;
+destroyedServers: CARD ¨ 0;
+finishedServers: CARD ¨ 0;
+
+FinalizeServer: PROC [s: Server] = {
+IF NOT s.dead
+THEN { -- Can't happen unless the daemons have failed for some reason ...
+droppedServers ¨ droppedServers.SUCC;
+[] ¨ FinalizeOps.EnableFinalization[s, fQueue];
+DestroyServer[s];
+}
+ELSE { -- Normal end of life
+sd: PacketServer ~ NARROW[s.flavorData];
+finishedServers ¨ finishedServers.SUCC;
+FOR i: CARDINAL IN [0 .. sd.concurrencyPlusOne) DO
+h: Handle ~ sd.handles[i];
+d: PacketData ~ IF h=NIL THEN NIL ELSE NARROW[h.flavorData];
+IF d # NIL THEN {
+IF d.sendBuf # NIL
+THEN { RefText.ReleaseScratch[d.sendBuf]; d.sendBuf ¨ NIL };
+IF d.recvBuf # NIL
+THEN { RefText.ReleaseScratch[d.recvBuf]; d.recvBuf ¨ NIL };
+d.datagramHandle ¨ NIL;
+};
+ENDLOOP;
+IF sd.datagramHandle # NIL
+THEN { DatagramSocket.Destroy[sd.datagramHandle]; sd.datagramHandle ¨ NIL };
+};
+};
+GetFreeHandle: ENTRY PROC [s: Server, sd: PacketServer] RETURNS [handle: Handle] ~ {
+WHILE NOT s.dead DO
+i: CARDINAL ¨ sd.freeHandleIndex;
+bestTTL: CARDINAL ¨ CARDINAL.LAST;
+bestIndex: CARDINAL ¨ sd.concurrencyPlusOne;
+THROUGH [0 .. sd.concurrencyPlusOne) DO
+h: Handle;
+d: PacketData;
+IF (i ¨ i + 1) >= sd.concurrencyPlusOne THEN i ¨ 0;
+h ¨ sd.handles[i];
+d ¨ NARROW[h.flavorData];
+IF (NOT d.busy) AND (d.ttl < bestTTL)
+THEN { bestTTL ¨ d.ttl; bestIndex ¨ i };
+ENDLOOP;
+IF bestIndex < sd.concurrencyPlusOne THEN {
+d: PacketData;
+handle ¨ sd.handles[bestIndex];
+d ¨ NARROW[handle.flavorData];
+d.busy ¨ TRUE;
+RETURN;
+};
+WAIT sd.freeHandle;
+ENDLOOP;
+};
+
+GetThisFreeHandle: ENTRY PROC [sd: PacketServer, h: Handle] RETURNS [gotIt: BOOL] ~ {
+d: PacketData ¨ NARROW[h.flavorData];
+IF d.busy THEN RETURN [FALSE];
+RETURN [d.busy ¨ TRUE];
+};
+
+NotifyFreeHandle: ENTRY PROC [sd: PacketServer, h: Handle] ~ {
+d: PacketData ¨ NARROW[h.flavorData];
+d.busy ¨ FALSE;
+BROADCAST sd.freeHandle;
+};
+
+AgeResults: ENTRY PROC [s: Server, sd: PacketServer] ~ {
+WHILE NOT s.dead DO
+FOR i: CARDINAL IN [0 .. sd.concurrencyPlusOne) DO
+h: Handle ~ sd.handles[i];
+d: PacketData ¨ NARROW[h.flavorData];
+IF d.busy THEN LOOP;
+IF d.ttl > 0 THEN d.ttl ¨ d.ttl - 1;
+ENDLOOP;
+WAIT sd.freeHandle;
+ENDLOOP;
+};
+
+Serve: PROC [s: Server, sd: PacketServer] ~  {
+h: Handle ¨ GetFreeHandle[s, sd];
+d: PacketData;
+WHILE NOT s.dead DO
+ENABLE DatagramSocket.Error => {
+SELECT code FROM
+$transientError, $datagramTooShort, $datagramTooLong, $protocol => NULL;
+ENDCASE => s.dead ¨ TRUE;
+LOOP;
+};
+d ¨ NARROW[h.flavorData];
+[, d.address, d.port] ¨ DatagramSocket.Recv[sd.datagramHandle, d.recvBuf, 0, NAT.LAST];
+d.index ¨ 0;
+{ ENABLE Error => CONTINUE;
+msgType: CARD32;
+h.xid ¨ SunRPC.GetCard32[h];
+msgType ¨ SunRPC.GetCard32[h];
+SELECT TRUE FROM
+(msgType # ORD[RPCT.MsgType.call]) => {
+NULL;
+};
+ENDCASE => {
+isDuplicate: BOOL ¨ FALSE;
+finger: Handle;
+fingerD: PacketData;
+FOR i: CARDINAL IN [0 .. sd.concurrencyPlusOne) DO
+finger ¨ sd.handles[i];
+fingerD ¨ NARROW[finger.flavorData];
+IF (finger # h) AND (finger.xid = h.xid) AND (fingerD.port = d.port) AND (fingerD.address = d.address) AND (fingerD.ttl > 0)
+THEN { isDuplicate ¨ TRUE; EXIT };
+ENDLOOP;
+IF isDuplicate
+THEN {
+IF GetThisFreeHandle[sd, finger] THEN {
+TRUSTED { Process.Detach[FORK SendDuplicateReply[s, finger]] };
+};
+}
+ELSE -- not a duplicate -- {
+finger ¨ GetFreeHandle[s, sd]; -- may block
+TRUSTED { Process.Detach[FORK CallServerProcAndSendReply[s, h]] };
+h ¨ finger;
+};
+};
+};
+ENDLOOP;
+};
+
+SendDuplicateReply: PROC [s: Server, h: Handle] ~ {
+d: PacketData ~ NARROW[h.flavorData];
+sd: PacketServer ~ NARROW[s.flavorData];
+DatagramSocket.Send[d.datagramHandle, d.address, d.port, d.sendBuf];
+d.ttl ¨ MAX[d.ttl, defaultReplyTTL];
+NotifyFreeHandle[sd, h];
+};
+
+CallServerProcAndSendReply: PROC [s: Server, h: Handle] ~ {
+sd: PacketServer ~ NARROW[s.flavorData];
+errorCode: ATOM;
+credentials, verifier: AuthValue;
+sendReply: BOOL ¨ TRUE;
+d: PacketData ~ NARROW[h.flavorData];
+d.ttl ¨ defaultReplyTTL;
+BEGIN
+{ ENABLE Error => { sendReply ¨ FALSE; GOTO Out };
+rpcvers, prog, vers, proc: CARD32;
+cFlavor, vFlavor: AuthFlavor;
+authResult: SunRPCAuth.AuthenticateResult;
+conversation: Conversation;
+
+rpcvers ¨ SunRPC.GetCard32[h];
+IF (rpcvers # RPCT.rpcVersion)
+THEN { errorCode ¨ $wrongRPCVersion; GOTO Reply };
+prog ¨ SunRPC.GetCard32[h];
+vers ¨ SunRPC.GetCard32[h];
+proc ¨ SunRPC.GetCard32[h];
+[cFlavor, credentials] ¨ SunRPC.GetAuth[h
+! Error => { errorCode ¨ $badCredentials; GOTO Reply }];
+[vFlavor, verifier] ¨ SunRPC.GetAuth[h
+! Error => { errorCode ¨ $badVerifier; GOTO Reply }];
+[authResult, h.authFlavor, h.authData, conversation] ¨ SunRPCAuth.Authenticate[cFlavor, credentials, vFlavor, verifier];
+IF authResult # ok THEN {
+errorCode ¨ SELECT authResult FROM
+badCredentials => $badCredentials,
+wrongCredentials => $wrongCredentials,
+badVerifier => $badVerifier,
+wrongVerifier => $wrongVerifier,
+ENDCASE => ERROR;
+GOTO Reply;
+};
+IF prog # s.pgm
+THEN { errorCode ¨ $wrongProgram; GOTO Reply };
+IF vers # s.version
+THEN { errorCode ¨ $wrongProgramVersion; GOTO Reply };
+[sendReply, d.ttl] ¨ s.serverProc[h, conversation, proc, s.clientData
+! Error => { errorCode ¨ code; CONTINUE }];
+EXITS
+Reply => NULL;
+};
+
+{ ENABLE Error => ERROR;
+SELECT errorCode FROM
+NIL => NULL;
+$wrongRPCVersion => {
+SunRPC.StartRejectReply[h, ORD[RPCT.RejectStat.rpcMismatch]];
+SunRPC.PutCard32[h, RPCT.rpcVersion];
+SunRPC.PutCard32[h, RPCT.rpcVersion];
+};
+$badCredentials => {
+SunRPC.StartRejectReply[h, ORD[RPCT.RejectStat.authError]];
+SunRPC.PutCard32[h, ORD[RPCT.AuthStat.authBadcred]];
+};
+$wrongCredentials => {
+SunRPC.StartRejectReply[h, ORD[RPCT.RejectStat.authError]];
+SunRPC.PutCard32[h, ORD[RPCT.AuthStat.authRejectedcred]];
+};
+$badVerifier => {
+SunRPC.StartRejectReply[h, ORD[RPCT.RejectStat.authError]];
+SunRPC.PutCard32[h, ORD[RPCT.AuthStat.authBadverf]];
+};
+$wrongVerifier => {
+SunRPC.StartRejectReply[h, ORD[RPCT.RejectStat.authError]];
+SunRPC.PutCard32[h, ORD[RPCT.AuthStat.authRejectedverf]];
+};
+$weakCredentials => {
+SunRPC.StartRejectReply[h, ORD[RPCT.RejectStat.authError]];
+SunRPC.PutCard32[h, ORD[RPCT.AuthStat.authTooweak]];
+};
+$wrongProgram => {
+SunRPC.StartAcceptReply[h, ORD[RPCT.AcceptStat.progUnavail]];
+};
+$wrongProgramVersion => {
+SunRPC.StartAcceptReply[h, ORD[RPCT.AcceptStat.progMismatch]];
+SunRPC.PutCard32[h, s.version];
+SunRPC.PutCard32[h, s.version];
+};
+$wrongProc => {
+SunRPC.StartAcceptReply[h, ORD[RPCT.AcceptStat.procUnavail]];
+};
+$abortWithoutReturn => {
+sendReply ¨ FALSE;
+};
+ENDCASE => {
+SunRPC.StartAcceptReply[h, ORD[RPCT.AcceptStat.garbageArgs]];
+};
+};
+EXITS
+Out => NULL;
+END;
+
+IF sendReply
+THEN -- send the reply -- {
+d: PacketData ¨ NARROW[h.flavorData];
+DatagramSocket.Send[d.datagramHandle, d.address, d.port, d.sendBuf
+! DatagramSocket.Error => CONTINUE];
+};
+
+h.authData ¨ NIL; -- help finalization
+NotifyFreeHandle[sd, h];
+IF credentials # NIL THEN { RefText.ReleaseScratch[credentials]; credentials ¨ NIL };
+IF verifier # NIL THEN { RefText.ReleaseScratch[verifier]; verifier ¨ NIL };
+};
+rwCache: PacketServer ¨ NEW[PacketServerObject[rwCacheSize]];
+
+AllocLocalHandle: ENTRY PROC [flavor: ATOM, sd: PacketServer ¨ rwCache]
+RETURNS [h: Handle]
+~ {
+IF rwCache.freeHandleIndex > 0
+THEN {
+rwCache.freeHandleIndex ¨ rwCache.freeHandleIndex - 1;
+h ¨ rwCache.handles[rwCache.freeHandleIndex];
+rwCache.handles[rwCache.freeHandleIndex] ¨ NIL;
+}
+ELSE {
+d: PacketData ¨ NEW[PacketDataObject];
+h ¨ NEW[Object];
+h.flavor ¨ flavor;
+h.flavorData ¨ d;
+h.procs ¨ readerWriterProcs;
+};
+};
+
+FreeLocalHandle: ENTRY PROC [sd: PacketServer ¨ rwCache, h: Handle] ~ {
+IF rwCache.freeHandleIndex < rwCacheSize THEN {
+rwCache.handles[rwCache.freeHandleIndex] ¨ h;
+rwCache.freeHandleIndex ¨ rwCache.freeHandleIndex + 1;
+};
+};
+
+OpenReader: PUBLIC PROC [block: REF TEXT] RETURNS [h: Handle] ~ {
+h ¨ AllocLocalHandle[$reader];
+{
+d: PacketData ¨ NARROW[h.flavorData];
+d.recvBuf ¨ block;
+d.index ¨ 0;
+d.recvBuf ¨ block;
+};
+};
+
+OpenWriter: PUBLIC PROC [maxBytes: CARDINAL] RETURNS [h: Handle] ~ {
+dB: REF TEXT ~ RefText.New[maxBytes];
+h ¨ AllocLocalHandle[$writer];
+{
+d: PacketData ~ NARROW[h.flavorData];
+d.sendBuf ¨ dB;
+};
+dB.length ¨ 0;
+};
+
+TextFromWriter: PUBLIC PROC [h: Handle] RETURNS [output: REF TEXT] ~ {
+hN: Handle ~ IF h.flavor=$writer THEN h ELSE Error[$wrongFlavor];
+d: PacketData ~ NARROW[hN.flavorData];
+output ¨ d.sendBuf; 
+};
+
+BytesRemaining: PROC [h: Handle] RETURNS [bytes: CARDINAL] ~ {
+d: PacketData ~ NARROW[h.flavorData];
+bytes ¨ d.recvBuf.length - d.index;
+};
+
+GetByte: PROC [h: Handle] RETURNS [byte: BYTE] ~ {
+d: PacketData ~ NARROW[h.flavorData];
+dB: REF TEXT ~ d.recvBuf;
+IF (d.index+BYTES[BYTE]) > dB.length THEN ERROR Error[$outOfData];
+byte ¨ ORD[dB[d.index]];
+d.index ¨ d.index+BYTES[BYTE];
+};
+
+GetH: PROC [h: Handle] RETURNS [hword: Basics.HWORD] ~ {
+d: PacketData ~ NARROW[h.flavorData];
+dB: REF TEXT ~ d.recvBuf;
+IF (d.index+BYTES[Basics.HWORD]) > dB.length THEN ERROR Error[$outOfData];
+hword ¨ [hi~ORD[dB[d.index]], lo~ORD[dB[d.index+1]]];
+d.index ¨ d.index+BYTES[Basics.HWORD];
+};
+
+GetF: PUBLIC PROC [h: Handle] RETURNS [fword: Basics.FWORD] ~ {
+d: PacketData ~ NARROW[h.flavorData];
+dB: REF TEXT ~ d.recvBuf;
+IF (d.index+BYTES[Basics.FWORD]) > dB.length THEN ERROR Error[$outOfData];
+fword ¨ [
+hi~[hi~ORD[dB[d.index]], lo~ORD[dB[d.index+1]]],
+lo~[hi~ORD[dB[d.index+2]], lo~ORD[dB[d.index+3]]]];
+d.index ¨ d.index+BYTES[Basics.FWORD];
+};
+
+UnsafeGetBlock: UNSAFE PROC [h: Handle, block: UnsafeBlock]
+~ UNCHECKED {
+delta: INT ¨ block.startIndex / BYTES[WORD]; -- delta is in WORDs
+block.base ¨ block.base + delta*UNITS[WORD]; -- base is in UNITs
+block.startIndex ¨ (block.startIndex - delta*BYTES[WORD]); -- index is in BYTEs
+IF (CARD[block.count] > maxUnsafeBlockLength)
+OR (UnsafeGetBlockInner[h, block] # CARD[block.count])
+THEN ERROR Error[$outOfData];
+};
+
+UnsafeGetBlockInner: UNSAFE PROC [h: Handle, block: UnsafeBlock]
+RETURNS[bytesMoved: CARDINAL]
+~ {
+d: PacketData ~ NARROW[h.flavorData];
+IF (bytesMoved ¨ MIN[CARD[block.count], d.recvBuf.length - d.index]) > 0 THEN {
+TRUSTED {
+Basics.CopyBytes[
+dstBase: block.base, dstStart: block.startIndex,
+srcBase: TextPtrFromRefText[d.recvBuf], srcStart: d.index,
+count: bytesMoved];
+};
+d.index ¨ d.index + bytesMoved;
+};
+};
+
+GetBlock: PROC [h: Handle, block: REF TEXT, startIndex, count: CARDINAL] ~ {
+actualCount: CARDINAL;
+IF startIndex > block.length THEN ERROR;
+count ¨ MIN[count, CARDINAL[CARDINAL[block.maxLength]-startIndex]];
+TRUSTED { actualCount ¨ UnsafeGetBlockInner[h, [base~TextPtrFromRefText[block], startIndex~startIndex, count~count]] };
+block.length ¨ startIndex + actualCount;
+IF actualCount # count THEN ERROR Error[$outOfData];
+};
+
+GetAlign: PROC [h: Handle] ~ {
+n: CARDINAL ;
+d: PacketData ~ NARROW[h.flavorData];
+IF (n ¨ (d.index MOD 4)) # 0 THEN d.index ¨ d.index + 4 - n;
+};
+
+PutByte: PROC [h: Handle, byte: BYTE] ~ {
+d: PacketData ~ NARROW[h.flavorData];
+dB: REF TEXT ~ d.sendBuf;
+index: CARDINAL ¨ dB.length;
+IF (index + BYTES[BYTE]) > dB.maxLength
+THEN ERROR Error[$outOfBufferSpace];
+dB.length ¨ index + BYTES[BYTE];
+dB[index] ¨ VAL[byte];
+};
+
+PutH: PROC [h: Handle, hword: Basics.HWORD] ~ {
+d: PacketData ~ NARROW[h.flavorData];
+dB: REF TEXT ~ d.sendBuf;
+index: CARDINAL ¨ dB.length;
+IF (index + BYTES[Basics.HWORD]) > dB.maxLength
+THEN ERROR Error[$outOfBufferSpace];
+dB.length ¨ index + BYTES[Basics.HWORD];
+dB[index] ¨ VAL[hword.hi];
+dB[index+1] ¨ VAL[hword.lo];
+};
+
+PutF: PROC [h: Handle, fword: Basics.FWORD] ~ {
+d: PacketData ~ NARROW[h.flavorData];
+dB: REF TEXT ~ d.sendBuf;
+index: CARDINAL ¨ dB.length;
+IF (index + BYTES[Basics.FWORD]) > dB.maxLength
+THEN ERROR Error[$outOfBufferSpace];
+dB.length ¨ index + BYTES[Basics.FWORD];
+dB[index] ¨ VAL[fword.hi.hi];
+dB[index+1] ¨ VAL[fword.hi.lo];
+dB[index+2] ¨ VAL[fword.lo.hi];
+dB[index+3] ¨ VAL[fword.lo.lo];
+};
+
+UnsafePutBlock: UNSAFE PROC [h: Handle, block: UnsafeBlock]
+~ {
+d: PacketData ~ NARROW[h.flavorData];
+dB: REF TEXT ~ d.sendBuf;
+
+TRUSTED {
+delta: INT ¨ block.startIndex / BYTES[WORD]; -- delta in WORDs
+block.base ¨ block.base + delta*UNITS[WORD]; -- base in UNITs
+block.startIndex ¨ (block.startIndex - delta*BYTES[WORD]); -- index in BYTEs
+};
+SELECT CARD[block.count] FROM
+0 => RETURN;
+> maxUnsafeBlockLength => ERROR Error[$outOfBufferSpace];
+ENDCASE;
+IF (dB.length + block.count) > dB.maxLength
+THEN ERROR Error[$outOfBufferSpace];
+TRUSTED {
+Basics.CopyBytes[
+dstBase: TextPtrFromRefText[dB], dstStart: dB.length,
+srcBase: block.base, srcStart: block.startIndex,
+count: block.count];
+};
+dB.length ¨ dB.length + block.count;
+};
+
+PutBlock: PROC [h: Handle, block: REF READONLY TEXT, startIndex: CARDINAL ¨ 0, count: CARDINAL]
+~ TRUSTED {
+IF startIndex > block.length THEN ERROR;
+count ¨ MIN[count, CARDINAL[CARDINAL[block.length]-startIndex]];
+UnsafePutBlock[h, [base~TextPtrFromRefText[block], startIndex~startIndex, count~count]];
+};
+
+PutAlign: PROC [h: Handle, padValue: BYTE] ~ {
+d: PacketData ~ NARROW[h.flavorData];
+dB: REF TEXT ~ d.sendBuf;
+WHILE (dB.length MOD 4) # 0 DO
+PutByte[h, padValue];
+ENDLOOP;
+};
+
+PrepareForMessage: PROC [h: Handle] ~ {
+d: PacketData ~ NARROW[h.flavorData];
+dB: REF TEXT ~ d.sendBuf;
+dB.length ¨ 0;
+};
+
+fQueue: FinalizeOps.CallQueue ¨ FinalizeOps.CreateCallQueue[Finalizer];
+Finalizer: FinalizeOps.FinalizeProc = {
+WITH object SELECT FROM
+h: Handle => SunRPC.Destroy[h];
+s: Server => FinalizeServer[s];
+ENDCASE;
+};
+
+}...
+
+   J  
+SunRPCOnUDPImpl.mesa
+Copyright ” 1989, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Demers, November 23, 1988 2:45:39 pm PST
+Carl Hauser, November 22, 1988 4:01:56 pm PST
+Willie-Sue, March 16, 1989 7:03:43 pm PST
+Michael Plass, September 23, 1991 11:51 am PDT
+David Nichols, January 15, 1991 5:44 pm PST
+Willie-s, August 21, 1991 12:27 pm PDT
+Chauser, January 14, 1992 1:21 pm PST
+Christian Jacobi, July 24, 1992 2:28 pm PDT
+Types
+Parameters
+LOOPHOLEs
+Client Handles
+Default remote address is ME:
+Class procs
+Is it from the guy I'm interested in?
+Is it a reply message for this call?
+At this point, committed to accepting the reply message.  Parse it, switching on replyStat ...
+Server Registration
+Drop the server, let finalization finish it off.
+Server Finalization
+Statistics
+Servers
+client must assure that s.flavorData=sd
+client must assure s.flavorData=sd
+$timeout, $handleDestroyed => s.dead _ TRUE;
+Attach the incoming datagram to the free handle ...
+Check RPC version (else we can't parse the message)
+Get <prog, vers, proc>.  There's nothing we can do with them yet, until we've examined the credentials and verifier, but that's the way they defined the protocol.
+Get credentials ...
+Get verifier ...
+Authenticate ...
+Check program, version ...
+Call the server proc!
+Readers / Writers
+Serializing / Deserializing
+Finalization
+ ù    ïNewlineDelimiter
+ñ(cedarcode) styleô codeôKöú
+œeú=ôHKô(Kô-Kô)Kô.Kô+Kô&Kô%Kô+Kò óöœk	ò	Köúûú%ò/KöúûúòKöúûúûúûúò4Köúûú>òRKöúûú@òQKöúûú
+òKöúûú&ò3KöúûúûúòKò KöúòKöúûúiòyKöúûúòKòKöúûúCòSKòKò óöœnúûúûòKöûúûúòKöûúPòWKöûúòKòKöûúûúòheadôKöûúûúûúòKò Köú	ûúòKò(Kò KöúûúòKò"Kò Köúûúò'Kò KöúûúûúòKöúûúòKò Köúûúò-öúûúò%Köú/ò/óKöúûúûúûúòKò Köüúûúûúò(óô
+KöúûúòKò KöúûúòKò Köúûúò2Köúûú
+ò$KöúûúûúûúœcEòyKò Köúûúò$Kò KöúûúòKöúûúòKò KöúûúòKöú
+ûú†ò3Kò KöúûúòKöúûúûúûú-òYKò öüúûú	ûúûúûúûúûúò_KöúûúûúòBKòKò óKöúûúòKò Köúûú†
+ò)óô	öüúûúûú	ûúûúûúûúûúûúûúûúòdKöûúûúûúûúûúûú	ò;óóôKò(öúûúûúò!Köú&ò&Kò)Kò&Kò3Kò0KöúûúòKöúûúûúòKöú	ûúûúòKöú	ûúûúòKöúûúòKöúòKò óöüúûúûúDûúòkKòKòKöúûú	òKöúòKòKöúûúò)Köú0ò0Köú0ò0Köú+ò+ôöûúûò!KöúBòBóóKò,Kò/KòKò Kò óöü	úûúûúûú+òUKòKöúûúò%KòKòKòKò óöü	úûúûú7ûúòcKòKöúûúò%KöúòKöúòKò	KòKò óöüúûúûúûú/ò_Köúûúò%Köûú(ò.KöúòóóôöúûúûúòAKöúòKöú0ò0Köú(ò(KöúòKöúòKöúòKöúòKöú
+ò
+Köú
+ò
+KöúòKöúòKöúòKöúòKöú
+ò
+Köú
+ò
+KöúòKöúòKò#KöúòKò óöúûúûúòGKöúòKöú4ò4Köú,ò,KöúòKöúòKöúòKöúòKöú
+ò
+Köú
+ò
+KöúòKöúòKöúòKöúòKöú
+ò
+Köú
+ò
+KöúòKöúòKò#KöúòKò óöüúûúò)öûúûúûòöúòKöûúûúûú2ûúòOKöûúûúûú2ûúòOKöûúûúûú@ûúòdKöúûúòKöúòóKöûúòóKöúòKò óöüúûúò+öûú
+ûòöúòKöúûúò%KöúûúòKöúûúòKòKöúòóKöûúòóKòKò óöüúûúûúûúòOKöú(ûúò.KöúòóKò öüúûúûúûúòSKöúòKöúòKò óöüúûúûúûúò<Köú"ûúò)KòKò óöüúûúûúûúò@KöúòKöúòóKò ö
+üúûúûúûú
+ûúòTKöúûúò&KöúûúûúòKòKöúûúòKò Köú
+ûúò#Köúûúò+öûúûúûúò?Kò óöûúûúûúûò$öûúûúòKöúûúòKöúqûúò}öûúûòKöûúûúòKöúûúòKöûúûúòóKòóöûúûòKòKöúûúòKöú`ûúûúVûúò öûúûòöûúòô%öûú ò"öûúûúûúò'Köûúûúò
+óóóKô$öúûú
+ûúòKöúûúò%Köú"ò"Köú&ò&KöûúûúûúûúûúûúòRKòóKöú^ô^öúûú(ûúò<Köú-ûúò4Kòöûú#ûò-öûúûúò$Köú1ò1öúûúûú*ûòeKöúûúò
+Köú!ò!Köú&ò&KöûúûúòóKöûúûúûúûúò"Köú!ò!öúûúûò"Köûúûúûú†
+ò/Köûúûú*ò2Köûúûú2ò:Köûúûú'ò/KöûúòóKöûúò
+Kòóöûúûúò"öûú$ûò.öûúûúò%KöúòKöúòóöûúûúò#Köúûòöúûú
+ûò Köûúûú*ò2Köûúûú1ò9Köûúûú'ò/Köûúûú.ò6Köûúûú+ò3KöûúòóKòóöûúòKöúòKöúòóóKöûúò
+KòóöûúòKöúòKöûúò
+KöúòóóKòóKòóòKòKöûú†%ò,KòóöúòKöûúòKöúòóòKöúòKöûúòKöúòóöûúòKòKöûúò
+KòóóKöûúòóöûòKöúûúòóKöûúòóöûúûòKöûú:ûúòDóKöûúûúûúûúò3KòKò óöüúûúò"Köúûú†ò&KöúòóóôKöúûúòKöúûúò)Kò Köúûúûúò,öúûúû	úûúò-Kò&KöúòKöúûúûúòKöúû	úòKöúûúòKöú	ûúûúûúò8KòóKò öú*ûú òMKòKöúòKò óöüúûúûúûú:ûúûúûúòïKòKòKöúûúò"Köúûú&ò7Köúûú$ò,KöúûúòKòKòKöúòKöúòKöúòKöú0ò0Köú@ò@KòKòöûúûúûúûò(Köúûú	òKöúûúò&KöúòKòKòKöú0ò0Köú0ò0Köú%ò%KöúòKöûúòóKöú ûúò%Kò/Köûúûúò0Köûúûúò5KòKò óöüúûúûúûúò?KöúûúûúûúòCKöúûúò'KöûúòKòKò óöüúûúò#Köúûúò(öüúûúûú#òBKöûúûúûú%ûúò<Köú	ûúòKöû	úòKöú'ò'Köú†/ô0KöúòóKöúòKòóôô
+KöúûúòKöúûúòKöúûúòKöúûúòóKò öüúûúò$öûúûúòöûú†BòIKöú ûúò%Kò/KöúòKöúòóöûú†òKöúûúò(Köú"ûúò'öûúûúûúûò2KöúòKöúûúûúûúûúûúûúò<öûúûúûúòöûúûòKöûú2ûúò<óöûúûòKöûú2ûúò<óKöúûúòKòóKöûúòóöûúûòKöûúBûúòLóKöúòóóKöûúòóóóôöüúûúûúûúòTKô'öûúûúûòKöúûúò!Köú	ûúûúûúò"Köúûúò,öûúûò'Kò
+KòKöûú&ûúò3KòKöúûúòöûúûú	ûúò%Köûú$ò(óKöûúòóöûú#ûúò+KòKöúòKöúûúòKöú	ûúòKöûúòKòóKöûúòKöûúòóKòKò óö
+üúûúûúûú	ûúòUKöúûúò%KöûúûúûúûúòKöûúûúòKòKò óöüúûúûú"ò>Köúûúò%Köú	ûúòKöû	úòKòKò óöü
+úûúûú"ò8öûúûúûòöûúûúûúûò2KòKöúûúò%KöûúûúûúòKöûúûúò$KöûúòóKöûúòKöûúòóKòKò óöüúûú#ò.Kô"Köú!ò!Köúòöûúûúûòöûúûò öûúûòKöúCûúòHKöú'ûúô,Köûú	ûúòóKöûúòKòóKöúûúòô3KöúMûúûúòWKòóöúûú
+ûúòKöú	ûúòKöúòKöúòöûúûúûòöúûúûúò'KöûúòKòóöûúòKöúûúûúòKòKòöûúûúûúûò2KòKöú
+ûúò$ö
+ûúûúûúûúûúò|Köûúûúûúò"óKöûúòóöûúòöûúòöûúûúò'Köûúûú"ò?KòóKòóöûú†úòKöú†ò+Köûúûú%òBKòKòóóKòóóKòóKöûúòóKòKò óöüúûúò3Köúûúò%Köúûúò(KòDKöúûúò$KòKòKò óöüúûúò;Köúûúò(KöúûúòKöú!ò!KöúûúûúòKöúûúò%Kòöûòöúûúûúûúò2Köúûúò"KòKò*KòKò ô3KöúòöûúûúòKöûú!ûú	ò2óóô¢KöúòKöúòKöúòóôKöúTûú
+òbóôKöúNûú
+ò\óôKöúxòxöûúûúòöúûúûò"Köú"ò"Köú&ò&KöúòKöú ò KöûúûúòóKöûúòKòóóôöûúòKöûúûú	ò/óöûúòKöûú%ûú	ò6óóôKöúeûúòqóöûòKöú	ûúòóKòKò óöúûú
+ûúòöûúûòKöûúûúòòKöúûúûúò=Köúûúò%Köúûúò%KòóòKöúûúûúò;Köúûúûúò4KòóòKöúûúûúò;Köúûúûúò9KòóòKöúûúûúò;Köúûúûúò4KòóòKöúûúûúò;Köúûúûúò9KòóòKöúûúûúò;Köúûúûúò4KòóòKöúûúûúò=KòóòKöúûúûúò>KöúòKöúòKòóòKöúûúûúò=KòóòKöúûúòKòóöûúòKöúûúûúò=KòóóKòóöûòKöúûúòóKöûúòóKò öûú
+òöûú†úòKöúûúò%Köú]ûúògKòóóKò Köúûú†ò&KòKöûúûúûú6ûúòUKöûúûúûú0ûúòLKòóóôKöúûú"ò=Kò ö
+üúûúûú
+ûúûúò[KöúòKöûúòöûúòKöú6ò6Köú-ò-Köú+ûúò/KòóöûúòKöúûúò&Köúûú	òKòKòKòKòóKöúòKò óöüúûúûú,òGöûú'ûúò/Köú-ò-Köú6ò6KòóKòKò óöü
+úûúûú	ûúûúûúòAKöúòöúòKöúûúò%KòKòKòKöúòóKòKò óö
+ü
+úûúûúûúûúòDKöúûúûúò%KöúòöúòKöúûúò%KòKöúòóKòKòKò óöüúûúûúûú
+ûúûúòFKöúûúûúûúòAKöúûúò&KöúòKòóKò óôöüúûúûú	ûúò>Köúûúò%Kò#KòKò óöüúûúûúûúò2Köúûúò%KöúûúûúòKö
+ûú
+ûúûúûúûúòBKöúûúòKöúûúûúòKòKò óöüúûúûúûúò8Köúûúò%KöúûúûúòKö
+ûú
+ûúûúûúûúòJKöúûúûúò5Köúûúûúò&KöúòKò óö
+üúûúûúûúûúò?Köúûúò%KöúûúûúòKö
+ûú
+ûúûúûúûúòJKö	úûúûúûúûúònKöúûúûúò&KöúòKò óöüúûúûú ò;Köúû	úòKöúûúûúûú†òAKöú ûúûú†ò@Köú-ûúûú†òOöûúûú&ûú"ûúòdKöûúûúòóKòKò óö
+üúûúûú!ûúûúò^KöúòKöúûúò%öûúûúûú0ûúòOöûúò	öúòKöú0ò0Köú:ò:KöúòóKöúòóKöúòKòóKòKò óö
+üúûúûúûúûúòLKöúûúòKöûúûúûúò(KöúûúûúûúòCKöûúpòwKöú(ò(Köûúûúûúò4KöúòKò óöüúûúòKöúû	úòKöúûúò%Köûúûú	ûúò<KòKò óöüúûúûúûúò)Köúûúò%KöúûúûúòKöúûúòKö
+ûú
+ûúûúûúûúòLKöúûúûúò KöúûúòKòKò óöüúûúûúûúò/Köúûúò%KöúûúûúòKöúûúòKö
+ûú
+ûúûúûúûúòTKöúûúûúò(KöúûúòKöúûúòKòKò óöüúûúûúûúò/Köúûúò%KöúûúûúòKöúûúòKö
+ûú
+ûúûúûúûúòTKöúûúûúò(KöúûúòKöúûúòKöúûúòKöúûúòKòKò óöüúûúûú ò;KöúòKöúûúò%KöúûúûúòKò öûúò	Köúûúûúûú†ò>Köú ûúûú†ò=Köú-ûúûú†òLKòóöûúûúûòKöúûúòKöúûúò9KöûúòóKöûú*ûúûúòPöûúò	öúòKöú5ò5Köú0ò0KöúòóKöúòóKöú$ò$KòKò óöüúûúûúûúûúûúûúò_KöúûúòKöûúûúûúò(Köúûúûúûúò@KöúXòXKöúòKò óöüúûúûúò.Köúûúò%KöúûúûúòöûúûúûòKòKöûúòóKòóKò öüúûúò'Köúûúò%KöúûúûúòKòKòKò óóôKòGöü	úûúò'öûúûúûòKöúòKöúòKöûúòóKòóKò óKòóKò ó Öó    _ê  Ñ‡  

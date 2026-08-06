@@ -1,0 +1,610 @@
+
+DIRECTORY
+Ascii USING [Lower],
+BasicTime USING [GMT, Now, nullGMT, Period, ToNSTime],
+Commander USING [CommandObject, Handle, Register],
+CompilerOps USING [AppendHerald, DefaultSwitches, DoTransaction, LetterSwitches, Punt, Start, Stop, StreamId, Transaction],
+FileNames USING [GetShortName],
+FileParms USING [BindingProc, nullActual],
+FileParmOps USING [ClearAList, Finalize, Initialize, SetAList],
+FileViewerOps USING [AttachErrorLog, RemoveErrorLog, ShowLog, WaitUntilSaved],
+IO USING [EndOfStream, Error, GetRope, GetTokenRope, IDProc, Put, PutChar, PutF, PutF1, PutRope, RIS, TIS, STREAM],
+MimCommandUtil USING [Echo, Failed, GetNth, GetRootName, ListLength, PairList, Parse, SetExtension],
+MimosaInterface USING [],
+MimSysOps USING [Cleanup, Close, Delete, Open],
+MobDefs USING [NullVersion],
+Process USING [CheckForAbort, ConditionPointer, GetPriority, MsecToTicks, PauseMsec, Priority, priorityBackground, SetPriority, SetTimeout],
+RefText USING [AppendChar, AppendRope, New],
+Rope USING [Fetch, Length, Match, ROPE],
+UserProfile USING [Boolean, Token];
+MimosaInterfaceImpl: MONITOR
+IMPORTS Ascii, BasicTime, Commander, CompilerOps, FileNames, FileParmOps, FileViewerOps, IO, MimCommandUtil, MimSysOps, Process, RefText, Rope, UserProfile
+EXPORTS MimosaInterface
+= {
+
+ROPE: TYPE = Rope.ROPE;
+STREAM: TYPE = IO.STREAM;
+
+Outcome: TYPE = {ok, warnings, errors, aborted};
+
+parms: REF CompilerOps.Transaction = NEW[CompilerOps.Transaction];
+standardSwitchDefaults: CompilerOps.LetterSwitches = CompilerOps.DefaultSwitches[];
+standardChecksDefaults: CompilerOps.LetterSwitches = ALL[FALSE];
+sourceName: ROPE ¬ NIL;
+sourceTime: BasicTime.GMT ¬ BasicTime.nullGMT;
+objectName: ROPE ¬ NIL;
+errorName: ROPE ¬ NIL;
+rootName: ROPE ¬ NIL;
+sourceStream: STREAM ¬ NIL;
+objectStream: STREAM ¬ NIL;
+errorStream: STREAM ¬ NIL;
+useLog: BOOL;		-- use compiler.log for error reporting
+log: STREAM ¬ NIL;
+logName: ROPE ¬ "Mimosa.log";
+
+compilerInUse: BOOL ¬ FALSE;
+inUseChanged: CONDITION;
+inUseTimeoutMillis: NAT ¬ 1000;
+
+InterfaceError: ERROR [why: ROPE] = CODE;
+
+Compile: SAFE PROC [cmd: Commander.Handle]
+RETURNS [result: REF ¬ NIL, msg: ROPE ¬ NIL] ~ CHECKED {
+in: STREAM ¬ IO.RIS[cmd.commandLine];
+out: STREAM ¬ cmd.out;
+data: REF ¬ cmd.procData.clientData;
+[result, msg] ¬ DoCompile[in, out, data];
+IF result#$Failure THEN msg ¬ NIL; -- DKW
+};
+
+DoCompile: PUBLIC SAFE PROC [in: STREAM, out: STREAM, clientData: REF]
+RETURNS [result: REF ¬ NIL, msg: ROPE ¬ NIL] ~ TRUSTED { 
+userAbort: BOOL ¬ FALSE;	-- set by ­DEL, STOP
+errors, warnings: BOOL ¬ FALSE;
+priority: Process.Priority = Process.GetPriority[];
+compilerStartTime, moduleStartTime: BasicTime.GMT;
+switchDefaults: CompilerOps.LetterSwitches;
+moduleCount: CARDINAL ¬ 0;
+complex: BOOL = (SELECT clientData FROM $Complex => TRUE, ENDCASE => FALSE);
+compilerSwitches: Rope.ROPE ¬ UserProfile.Token["Mimosa.Switches"];
+filesInit: BOOL ¬ FALSE;
+started: BOOL ¬ FALSE;
+errmsg: ROPE ¬ NIL;
+destroyLogOnSuccess: BOOL ¬ UserProfile.Boolean["Mimosa.DestroyLogOnSuccess", TRUE];
+createIconic: BOOL ¬ UserProfile.Boolean["Mimosa.IconicLogs", FALSE];
+blinkIfIconic: BOOL ¬ UserProfile.Boolean["Mimosa.BlinkLogs", TRUE];
+viewSeparateLogs: BOOL ¬ UserProfile.Boolean["Mimosa.ViewSeparateLogs", FALSE];
+useFileViewerOps: BOOL ¬ TRUE;
+
+WaitForCompilerFree: ENTRY PROC = {
+ENABLE UNWIND => NULL;
+Process.SetPriority[Process.priorityBackground]; 
+WHILE compilerInUse DO
+Long: PROC [p: LONG POINTER] RETURNS [LONG POINTER] = {RETURN[p]};
+Process.CheckForAbort[];
+Process.SetTimeout[LOOPHOLE[Long[@inUseChanged]], Process.MsecToTicks[inUseTimeoutMillis]];
+WAIT inUseChanged;
+ENDLOOP;
+compilerInUse ¬ TRUE;
+};
+
+SetCompilerFree: ENTRY PROC = {
+ENABLE UNWIND => NULL;
+Process.SetPriority[priority];
+compilerInUse ¬ FALSE;
+BROADCAST inUseChanged;
+};
+
+Cleanup: PROC [oops: BOOL] = {
+started ¬ FALSE;
+CompilerOps.Stop[];
+filesInit ¬ FALSE;
+FileParmOps.Finalize[];
+MimSysOps.Cleanup[oops];
+log ¬ NIL;
+sourceStream ¬ NIL;
+objectStream ¬ NIL;
+errorStream ¬ NIL;
+SetCompilerFree[];
+};
+
+Finalize: PROC [userAbort: BOOL] = {
+errmsg: ROPE ¬ NIL;
+IF objectStream # NIL THEN {
+abortAndDelete: BOOL ¬ userAbort OR parms.nErrors # 0;
+errmsg ¬ MimSysOps.Close[objectStream, abortAndDelete];
+};
+IF sourceStream # NIL THEN errmsg ¬ MimSysOps.Close[sourceStream, userAbort];
+IF errorStream # NIL AND errorStream # log THEN
+errmsg ¬ MimSysOps.Close[errorStream, userAbort];
+objectStream ¬ sourceStream ¬ errorStream ¬ NIL;
+IF errorName = NIL AND NOT userAbort THEN {
+errlogFileName: ROPE ¬ MimCommandUtil.SetExtension[rootName, "errlog"]; 
+[] ¬ MimSysOps.Delete[errlogFileName];
+};
+};
+
+WaitForCompilerFree[! ABORTED => {msg ¬ "A"; GO TO earlyFailure}];
+
+
+MimSysOps.Cleanup[TRUE];
+
+--in ¬ in;
+sourceName ¬ NIL;
+
+IF compilerSwitches.Length[] # 0 THEN {
+newCommand: REF TEXT ¬ RefText.New[compilerSwitches.Length[]+30];
+newCommand ¬ RefText.AppendChar[newCommand, IF complex THEN '/ ELSE '-];
+newCommand ¬ RefText.AppendRope[newCommand, compilerSwitches];
+newCommand ¬ RefText.AppendRope[newCommand, IO.GetRope[in]];
+in ¬ IO.TIS[newCommand];
+};
+
+BEGIN
+ENABLE {
+UNWIND => Cleanup[TRUE];
+InterfaceError => {
+msg ¬ why;
+IF parms.nErrors = 0 THEN parms.nErrors ¬ 1;
+Cleanup[TRUE];
+GO TO earlyFailure;
+}
+};
+
+StartPass: PROC [pass: CARDINAL] RETURNS [goOn: BOOL] = {
+msg: ROPE ¬ " .";
+userAbort ¬ FALSE;
+SELECT TRUE FROM
+parms.nErrors # 0 => msg ¬ " !";
+parms.nWarnings # 0 => msg ¬ " ?";
+ENDCASE;
+IO.PutRope[out, msg ! ABORTED => {userAbort ¬ TRUE; CONTINUE}];
+Process.CheckForAbort[ ! ABORTED => {userAbort ¬ TRUE; CONTINUE}];
+IF userAbort THEN IO.PutRope[out, " aborted." ! ABORTED => CONTINUE];
+RETURN [~userAbort];
+};
+
+compilerStartTime ¬ BasicTime.Now[];
+switchDefaults ¬ CompilerOps.DefaultSwitches[];
+parms.fileParms ¬ FileParmOps.Initialize[];
+filesInit ¬ TRUE;
+CompilerOps.Start[];
+started ¬ TRUE;
+
+IF log = NIL THEN {
+[stream: log, err: msg] ¬ MimSysOps.Open[logName, $writeLog];
+IF log = NIL THEN {Cleanup[TRUE]; GO TO earlyFailure};
+};
+WriteHerald[log, NIL];
+parms.debugPass ¬ CARDINAL.LAST;
+parms.checks ¬ standardChecksDefaults;
+
+DO
+first: BOOL;
+args, results: MimCommandUtil.PairList;
+switches: ROPE ¬ NIL;
+localPause: BOOL;
+sense: BOOL;
+
+SELECT clientData FROM
+$MimosaServer => useFileViewerOps ¬ FALSE;
+$MimosaDebug => switchDefaults['d] ¬ TRUE;
+$MimosaOnly => switchDefaults['m] ¬ TRUE;
+$MimosaOnlyDebug => switchDefaults['d] ¬ switchDefaults['m] ¬ TRUE;
+ENDCASE;
+{
+parms.switches ¬ switchDefaults;
+parms.getStream ¬ GetStream;
+parms.closeStream ¬ CloseStream;
+parms.startPass ¬ StartPass;
+parms.nErrors ¬ parms.nWarnings ¬ 0;
+parms.sourceTokens ¬ 0;
+
+IF complex
+THEN
+[sourceName, args, results, switches] ¬ MimCommandUtil.Parse[in
+! MimCommandUtil.Failed => GO TO badSyntax]
+ELSE {
+sourceName ¬ NIL;
+DO
+token: ROPE ¬ in.GetTokenRope[IO.IDProc
+! IO.EndOfStream => EXIT].token;
+i: INT ¬ 1;
+len: INT = Rope.Length[token];
+IF NOT Rope.Match["-*", token] THEN {
+sourceName ¬ token;
+EXIT;
+};
+sense ¬ TRUE;
+switches ¬ token;
+WHILE i < len DO
+c: CHAR ¬ Rope.Fetch[switches, i];
+SELECT c FROM
+'~ => {sense ¬ NOT sense; i ¬ i + 1; LOOP};
+'% => {
+i ¬ i + 1;
+IF i = len THEN EXIT;
+c ¬ Rope.Fetch[switches, i];
+SELECT c FROM
+'% => parms.checks ¬ ALL[sense];
+IN ['a..'z], IN ['A..'Z] => parms.checks[Ascii.Lower[c]] ¬ sense;
+ENDCASE;
+};
+IN ['a..'z], IN ['A..'Z] => parms.switches[Ascii.Lower[c]] ¬ sense;
+IN ['0..'9] => parms.debugPass ¬ c-'0;
+ENDCASE;
+i ¬ i + 1;
+sense ¬ TRUE;
+ENDLOOP;
+ENDLOOP;
+switchDefaults ¬ parms.switches;
+};
+IF sourceName = NIL AND switches = NIL THEN EXIT;
+IO.PutRope[log, "\nCommand: "];
+MimCommandUtil.Echo[log, sourceName, args, results, switches];
+IF MimCommandUtil.ListLength[results] > 1 THEN GOTO badSemantics;
+rootName ¬ FileNames.GetShortName[MimCommandUtil.GetRootName[IF MimCommandUtil.ListLength[results] = 1
+THEN MimCommandUtil.GetNth[results, 0]
+ELSE sourceName]];
+sourceName ¬ MimCommandUtil.SetExtension[sourceName, "mesa"];
+IF useFileViewerOps THEN
+FileViewerOps.WaitUntilSaved[sourceName, out];
+parms.source.locator ¬ FileNames.GetShortName[sourceName];
+
+IF MimCommandUtil.ListLength[results] # 0
+THEN {
+objectName ¬ FileNames.GetShortName[
+MimCommandUtil.GetNth[list: results, n: 0, delete: TRUE]];
+results ¬ NIL;
+}
+ELSE objectName ¬ rootName;
+objectName ¬ MimCommandUtil.SetExtension[objectName, "mob"];
+parms.objectName ¬ objectName;
+
+moduleCount ¬ moduleCount + 1;
+
+IO.PutRope[out, "Mimosa"];
+first ¬ TRUE;
+FOR c: CHAR IN ['a..'z] DO
+sd: BOOL = standardSwitchDefaults[c];
+IF parms.switches[c] # sd THEN {
+IF first THEN {first ¬ FALSE; IO.PutRope[out, " -"]};
+IF sd THEN IO.PutChar[out, '~];
+out.PutChar[c];
+};
+ENDLOOP;
+IF parms.checks = ALL[TRUE] THEN {
+IF first THEN {first ¬ FALSE; IO.PutRope[out, " -"]};
+out.PutRope["%%"];
+}
+ELSE
+FOR c: CHAR IN ['a..'z] DO
+sd: BOOL = standardChecksDefaults[c];
+IF parms.checks[c] # sd THEN {
+IF first THEN {first ¬ FALSE; IO.PutRope[out, " -"]};
+IF sd THEN IO.PutChar[out, '~];
+out.PutChar['%];
+out.PutChar[c];
+};
+ENDLOOP;
+IO.PutRope[out, " "];
+IO.PutRope[out, rootName];
+useLog ¬ FALSE;
+localPause ¬ parms.switches['p];
+
+[sourceStream, errmsg, sourceTime] ¬ MimSysOps.Open[sourceName, $read];
+IF sourceStream = NIL THEN GO TO noSource;
+parms.sourceStream ¬ sourceStream;
+parms.source.version ¬ MobDefs.NullVersion;
+parms.source.version[0] ¬ BasicTime.ToNSTime[sourceTime];
+{
+ENABLE UNWIND => Finalize[userAbort];
+FileParmOps.SetAList[args];
+{
+ENABLE UNWIND => FileParmOps.ClearAList[];
+BindPattern: FileParms.BindingProc = {
+parms.pattern ¬ actual;
+parms.op ¬ IF actual = FileParms.nullActual THEN $compile ELSE $replace;
+};
+parms.fileParms.Binding[
+formalId: "$", formalType: NIL, defaultLocator: NIL, binder: BindPattern];
+IO.PutChar[log, '\n];  
+moduleStartTime ¬ BasicTime.Now[];
+CompilerOps.DoTransaction[parms
+! 
+CompilerOps.Punt => {
+FileParmOps.ClearAList[];
+Finalize[userAbort];
+GO TO punt;
+};
+ABORTED => {
+userAbort ¬ TRUE;
+FileParmOps.ClearAList[];
+Finalize[userAbort];
+GO TO punt;
+}
+];
+};
+FileParmOps.ClearAList[];
+};
+Finalize[userAbort];
+
+SELECT WriteResults[out, moduleStartTime ! IO.Error => CONTINUE] FROM
+errors => errors ¬ TRUE;
+warnings => warnings ¬ TRUE;
+ENDCASE;
+IF useFileViewerOps THEN {
+IF (errors OR warnings OR parms.debugPass # CARDINAL.LAST)
+AND errorName # NIL
+THEN {
+SELECT TRUE FROM
+viewSeparateLogs =>
+FileViewerOps.ShowLog[
+fileName: errorName,
+createIconic: createIconic,
+blinkIfIconic: blinkIfIconic];
+sourceName # NIL =>
+FileViewerOps.AttachErrorLog[sourceName];
+ENDCASE;
+}
+ELSE {
+IF destroyLogOnSuccess AND errorName # NIL THEN
+FileViewerOps.ShowLog[fileName: errorName, destroyIt: TRUE];
+IF sourceName # NIL THEN
+FileViewerOps.RemoveErrorLog[sourceName];
+}
+};
+EXITS
+noSource => {
+log.Put[[rope[" -- source not found\n"]], [time[BasicTime.Now[]]]];
+IO.PutRope[out, " -- source not found\n"];
+errors ¬ TRUE;
+parms.nErrors ¬ 1;
+args ¬ NIL;
+};
+badSemantics => {
+objectName ¬ NIL;
+errors ¬ TRUE;
+IO.PutRope[log, " -- Illegal command"];
+args ¬ NIL;
+};
+};
+
+sourceName ¬ rootName ¬ objectName ¬ errorName ¬ NIL;
+parms.objectName ¬ NIL;
+results ¬ NIL;
+IO.PutChar[log, '\n];
+IF userAbort THEN {IO.PutRope[log, "\n... command aborted\n"]; GO TO punt};
+IF (errors OR warnings) AND localPause THEN GO TO punt;
+
+IF NOT errors THEN
+SELECT result FROM
+NIL => IF parms.interface THEN result ¬ $Definition ELSE result ¬ $Implementation;
+$Definition => IF NOT parms.interface THEN result ¬ $Mixed;
+$Implementation => IF parms.interface THEN result ¬ $Mixed;
+ENDCASE;
+
+REPEAT
+badSyntax => {IO.PutRope[log, "\n-- Illegal syntax"]; errors ¬ TRUE};
+punt => {
+errors ¬ TRUE;
+[] ¬ WriteResults[out, moduleStartTime ! IO.Error => CONTINUE];
+IO.PutChar[log, '\n];
+};
+ENDLOOP;
+WriteClosing[out, compilerStartTime, moduleCount];
+
+SELECT TRUE FROM 
+userAbort => {result ¬ $Failure; msg ¬ "A"};
+errors => {result ¬ $Failure; msg ¬ "F"};
+warnings => {
+SELECT result FROM
+$Definition => msg ¬ "W (Interface)";
+$Implementation => msg ¬ "W (Implementation)";
+ENDCASE => msg ¬ "W";
+result ¬ $Failure};
+ENDCASE =>  {msg ¬ "S"};
+END;  -- end catch phrase to release the resource and reset the process priority
+Cleanup[FALSE];
+EXITS
+earlyFailure => result ¬ $Failure;
+};
+
+
+WriteResults: PROC [out: STREAM, startTime: BasicTime.GMT] RETURNS [outcome: Outcome] = {
+elapsed: INT;
+IO.Put[log, [rope[sourceName]], [rope[" -- "]]];
+elapsed ¬ BasicTime.Period[from: startTime, to: BasicTime.Now[]];
+IF parms.nErrors # 0
+THEN {
+IO.PutF1[log, "aborted, %g errors", [integer[parms.nErrors]]];
+IF parms.nWarnings # 0 THEN
+IO.PutF1[log, " and %g warnings", [integer[parms.nWarnings]]];
+IF ~useLog THEN IO.PutF1[log, " on %g", [rope[errorName]]];
+IO.PutF1[log, ", seconds: %g", [integer[elapsed]]];
+}
+ELSE {
+log.PutF["source tokens: %g, seconds: %g",
+[integer[parms.sourceTokens]], [integer[elapsed]] ];
+IF parms.nWarnings # 0 THEN {
+IO.PutF1[log, "\n warnings", [integer[parms.nWarnings]] ];
+IF log # NIL AND ~useLog THEN IO.PutF1[log, " on %g", [rope[errorName]] ];
+};
+};
+IO.PutRope[out, " "];
+SELECT parms.nErrors FROM
+0 => IO.PutRope[out, "no errors"];
+1 => IO.PutRope[out, "1 error"];
+ENDCASE => IO.PutF1[out, "%g errors", [integer[parms.nErrors]]];
+SELECT parms.nWarnings FROM
+0 => NULL;
+1 => IO.PutRope[out, ", 1 warning"];
+ENDCASE => IO.PutF1[out, ", %g warnings", [integer[parms.nWarnings]]];
+IO.PutRope[out, ".\n"];
+RETURN [SELECT TRUE FROM
+parms.nErrors # 0 => $errors,
+parms.nWarnings # 0 => $warnings,
+ENDCASE => $ok]
+};
+
+WriteHerald: PROC [s: STREAM, id: ROPE] = {
+CompilerOps.AppendHerald[s];
+IO.PutRope[s, " (PortaCedar Version)\n"];
+IF id # NIL THEN IO.PutF1[s, "%g --", [rope[id]] ];
+IO.PutF1[s, "%g\n", [time[BasicTime.Now[]]] ];
+};
+
+WriteClosing: PROC [out: STREAM, startTime: BasicTime.GMT, moduleCount: CARDINAL] = {
+elapsed: INT;
+elapsed ¬ BasicTime.Period[from: startTime, to: BasicTime.Now[]];
+IF moduleCount > 1 THEN 
+IO.Put[log, [rope["\nTotal elapsed seconds: "]], [integer[elapsed]]];
+IO.PutChar[log, '\n];
+};
+
+
+outputDate: BasicTime.GMT ¬ BasicTime.Now[];
+GetStream: PROC [id: CompilerOps.StreamId] RETURNS [s: STREAM] = {
+error: ROPE ¬ NIL;
+SELECT id FROM
+source => RETURN [sourceStream];
+object => {
+IF objectStream = NIL THEN {
+WHILE BasicTime.Period[from: outputDate, to: BasicTime.Now[]] = 0 DO
+Process.PauseMsec[100];
+ENDLOOP;
+[stream: objectStream, err: error, time: outputDate]
+¬ MimSysOps.Open[objectName, $write];
+IF error # NIL THEN ERROR InterfaceError[error];
+};
+RETURN [objectStream];
+};
+log => {
+IF errorStream = NIL THEN {
+IF useLog
+THEN errorStream ¬ log
+ELSE {
+errorName ¬ MimCommandUtil.SetExtension[rootName, "errlog"];
+[stream: errorStream, err: error] ¬ MimSysOps.Open[errorName, $writeLog];
+IF error # NIL THEN ERROR InterfaceError[error];
+WriteHerald[errorStream, errorName];
+IO.PutChar[errorStream, '\n];
+};
+};
+RETURN [errorStream];
+};
+ENDCASE => ERROR;
+};
+
+CloseStream: PROC [id: CompilerOps.StreamId] = {
+SELECT id FROM
+source =>
+IF sourceStream # NIL THEN {
+[] ¬ MimSysOps.Close[sourceStream];
+sourceStream ¬ NIL;
+};
+object =>
+IF objectStream # NIL THEN {
+[] ¬ MimSysOps.Close[objectStream, parms.nErrors # 0];
+objectStream ¬ NIL;
+};
+log =>
+IF errorStream # NIL THEN {
+[] ¬ MimSysOps.Close[errorStream];
+errorStream ¬ NIL;
+};
+ENDCASE => ERROR;
+};
+
+mimDoc: ROPE = "Mimosa compiler (Cedar to C)";
+Commander.Register["Mimosa", Compile, mimDoc, $Mimosa];
+Commander.Register["MimosaServer", Compile, mimDoc, $MimosaServer];
+Commander.Register["MimosaDebug", Compile, mimDoc, $MimosaDebug];
+Commander.Register["MimosaOnly", Compile, mimDoc, $MimosaOnly];
+Commander.Register["MimosaOnlyDebug", Compile, mimDoc, $MimosaOnlyDebug];
+
+}.
+   @  
+MimosaInterfaceImpl.mesa
+Copyright Ó 1985, 1986, 1987, 1988, 1989, 1990, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Satterthwaite, April 21, 1986 5:20:59 pm PST
+Spreitzer, May 16, 1984 7:45:09 pm PDT
+Russ Atkinson (RRA) March 8, 1991 11:12 am PST
+Bob Hagmann May 24, 1985 11:48:36 am PDT
+JKF March 5, 1990 5:11:51 pm PST
+Doug Wyatt, March 14, 1992 4:06 pm PST
+
+Workaround for Mimosa bug:
+There were no errors, so delete the error log
+acquire the compiler's resource lock; await success
+init in and sourceName
+Just in case someone did not cleanup properly last time
+do the compilation
+Must use this exit, because "failed" is not in the right scope (sigh)
+Must use this exit, because "failed" is not in the right scope (sigh)
+start scope for EXITS
+use a simple syntax for the command line
+The following letter denotes a checking option
+feedback to user
+main line code
+Here after completion of subcommand
+was Finalize[]; , but this is done by new UNWIND catch phrase
+Here after completion of all subcommands
+Only use this exit before compiler lock has been acquired,
+or after doing a Cleanup to release the compiler.
+compiler sequencing
+write to the Commander output file
+IO.PutRope[out, "End of compilation\n"]; -- DKW
+special output stream control
+Wait for the time to change enough to have different output dates
+START HERE
+ ÊÕ  –(cedarcode) style•NewlineDelimiter
+™ headšœ™Icodešœ
+Ïeœ[™fLšÏy,™,L™&L™.L™(L™ L™&—˜ šÏk	˜	LšœŸœ	˜Lšœ
+ŸœŸœ"˜6Lšœ
+ŸœŸœ
+˜2LšœŸœj˜{Lšœ
+Ÿœ˜Lšœ
+Ÿœ˜*LšœŸœ.˜?LšœŸœ;˜NLš
+ŸœŸœYŸœŸœŸœ˜sLšœŸœP˜dLšœŸœ˜Lšœ
+Ÿœ ˜/LšœŸœ˜LšœŸœ˜ŒLšœŸœ˜,LšœŸœŸœ˜(LšœŸœ˜#——šÏnœŸ˜LšŸœRŸœ@˜›LšŸœ˜Lšœ˜L˜ LšŸœŸœŸœ˜LšŸœŸœŸœŸœ˜L˜ Lšœ	Ÿœ#˜0L˜ LšœŸœŸœ˜BL˜SLšœ5ŸœŸœ˜@LšœŸœŸœ˜LšœŸœ˜.LšœŸœŸœ˜LšœŸœŸœ˜Lšœ
+ŸœŸœ˜LšœŸœŸœ˜LšœŸœŸœ˜LšœŸœŸœ˜L™ LšœŸœÏc'˜6LšœŸœŸœ˜Lšœ	Ÿœ˜L˜ LšœŸœŸœ˜LšœŸ	œ˜LšœŸœ˜L˜ Lš œŸœŸœŸœ˜)L˜ —š œŸœŸœŸœ
+ŸœŸœŸœŸœŸœ˜cLšœŸœŸœŸœ˜%LšœŸœ˜LšœŸœ˜$Lšœ)˜)LšŸœŸœŸœ¡˜)L˜—L˜ š 	œŸœŸ	œŸœŸœŸœŸœ
+ŸœŸœŸœŸœŸœ˜€LšœŸœŸœ¡˜-LšœŸœŸœ˜L˜3Lšœ.Ÿœ˜2L˜+LšœŸœ˜Lšœ	ŸœŸœŸœŸœŸœŸœ˜LLšœŸœ(˜CLšœŸœŸœ˜Lšœ	ŸœŸœ˜LšœŸœŸœ˜LšœŸœ5Ÿœ˜TLšœŸœ,Ÿœ˜ELšœŸœ+Ÿœ˜DLšœŸœ2Ÿœ˜OLšœŸœŸœ˜L˜ š œŸœŸœ˜#LšŸœŸœŸœ˜Lšœ1˜1šŸœŸ˜Lšœ™Lš œŸœŸœŸœŸœŸœŸœŸœ˜BL˜LšœŸœ@˜[LšŸœ˜LšŸœ˜—LšœŸœ˜Lšœ˜L˜ —š œŸœŸœ˜LšŸœŸœŸœ˜L˜LšœŸœ˜LšŸ	œ˜Lšœ˜L˜ —š œŸœŸœ˜Lšœ
+Ÿœ˜Lšœ˜LšœŸœ˜Lšœ˜Lšœ˜LšœŸœ˜
+LšœŸœ˜LšœŸœ˜LšœŸœ˜Lšœ˜Lšœ˜L˜ —š œŸœŸœ˜$LšœŸœŸœ˜šŸœŸœŸ˜LšœŸœŸœ˜6Lšœ7˜7L˜—LšŸœŸœŸœ3˜MšŸœŸœŸœŸ˜/Lšœ1˜1—Lšœ,Ÿœ˜0š
+ŸœŸœŸœŸœŸœ˜+L™-LšœŸœ4˜HLšœ&˜&L˜—L˜—L˜ Lšœ3™3LšœŸœŸœŸœ˜BL˜ Lšœ™L˜ šœŸœ˜L™7—L˜ Lšœ
+˜
+LšœŸœ˜L˜ šŸœŸ˜'LšœŸœŸœ-˜ALšœ,Ÿœ	ŸœŸœ˜HLšœ>˜>Lšœ<˜<LšœŸœŸœ˜L˜L˜ —Lšœ™šŸ˜šŸœ˜LšŸœŸœ˜šœ˜Lšœ
+˜
+LšŸœŸœ˜,LšœŸœ˜šŸœŸœ˜L™E—Lšœ˜—L˜—L˜ š
+ 	œŸœŸœŸœŸœ˜9LšœŸœ˜LšœŸœ˜šŸœŸœŸ˜Lšœ ˜ Lšœ"˜"LšŸœ˜—LšŸœŸœŸœŸœ˜?LšœŸœŸœŸœ˜BLš
+ŸœŸœŸœŸœŸœ˜ELšŸœ˜Lšœ˜L˜ —L˜$L˜/L˜+LšœŸœ˜L˜Lšœ
+Ÿœ˜L˜ šŸœŸœŸœ˜Lšœ=˜=šŸœŸœŸœ
+ŸœŸœŸœ˜6L™E—L˜—LšœŸœ˜LšœŸœŸœ˜ Lšœ&˜&L˜ šŸ˜LšœŸœ˜Lšœ'˜'Lšœ
+ŸœŸœ˜LšœŸœ˜LšœŸœ˜L˜ šŸœŸ˜Lšœ$Ÿœ˜*Lšœ%Ÿœ˜*Lšœ$Ÿœ˜)Lšœ>Ÿœ˜CLšŸœ˜—šœ˜Lšœ™Lšœ ˜ L˜Lšœ ˜ L˜L˜$L˜L˜ šŸœ˜
+šŸ˜šœ?˜?LšœŸœŸœ˜+——šŸœ˜Lšœ(™(LšœŸœ˜šŸ˜šœŸœŸœ˜'LšœŸœŸœ˜ —LšœŸœ˜LšœŸœ˜šŸœŸœŸœ˜%Lšœ˜LšŸœ˜Lšœ˜—LšœŸœ˜L˜šŸœ	Ÿ˜LšœŸœ˜"šŸœŸ˜LšœŸœŸœ˜+˜L™.L˜
+LšŸœ	ŸœŸœ˜Lšœ˜šŸœŸ˜LšœŸœ˜ LšŸœŸœ2˜ALšŸœ˜—L˜—LšŸœŸœ4˜CLšŸœ$˜&LšŸœ˜—L˜
+LšœŸœ˜LšŸœ˜—LšŸœ˜—Lšœ ˜ Lšœ˜——LšŸœŸœŸœŸœŸœŸœ˜1LšŸœ˜Lšœ>˜>LšŸœ(ŸœŸœ˜Ašœ=Ÿœ'˜fLšŸœ"˜&LšŸœ˜—Lšœ=˜=šŸœŸ˜Lšœ.˜.—Lšœ:˜:L˜ šŸœ'˜)šŸœ˜LšœXŸœ˜_Lšœ
+Ÿœ˜Lšœ˜—LšŸœ˜—Lšœ<˜<L˜L˜ L˜L˜ Lšœ™LšŸœ˜LšœŸœ˜šŸœŸœŸœ
+Ÿ˜LšœŸœ˜%šŸœŸœ˜ LšŸœŸœ
+ŸœŸœ˜5LšŸœŸœŸœ˜Lšœ˜Lšœ˜—LšŸœ˜—šŸœŸœŸœŸœ˜"LšŸœŸœ
+ŸœŸœ˜5L˜L˜—šŸ˜šŸœŸœŸœ
+Ÿ˜LšœŸœ˜%šŸœŸœ˜LšŸœŸœ
+ŸœŸœ˜5LšŸœŸœŸœ˜Lšœ˜Lšœ˜Lšœ˜—LšŸœ˜——LšŸœ˜LšŸœ˜Lšœ	Ÿœ˜Lšœ ˜ L˜ L™LšœG˜GLš
+ŸœŸœŸœŸœŸœ
+˜*Lšœ"˜"L˜+Lšœ9˜9šœ˜LšŸœŸœ˜%L˜šœ˜LšŸœŸœ˜*šÐbnœ˜&L˜LšœŸœŸœ
+Ÿœ
+˜HLšœ˜—Lšœ4ŸœŸœ˜cLšŸœ˜L˜"šœ˜šœ˜šœ˜Lšœ˜Lšœ˜LšŸœŸœ˜Lšœ˜—šŸœ˜LšœŸœ˜Lšœ˜Lšœ˜LšŸœŸœ˜Lšœ˜—Lšœ˜——Lšœ˜—L˜Lšœ˜—Lšœ˜L˜ šŸœ%Ÿœ
+ŸœŸ˜ELšœŸœ˜LšœŸœ˜LšŸœ˜—šŸœŸœ˜šŸœ	Ÿœ
+ŸœŸœŸœŸœŸ˜NšŸœ˜šŸœŸœŸ˜šœ˜Lšœf˜f—šœŸœ˜Lšœ)˜)—LšŸœ˜—L˜—šŸœ˜šŸœŸœŸœŸ˜/Lšœ6Ÿœ˜<—šŸœŸœŸ˜Lšœ)˜)—L˜——L˜—šŸ˜˜LšœC˜CLšŸœ(˜*Lšœ	Ÿœ˜Lšœ˜LšœŸœ˜Lšœ˜—˜LšœŸœ˜Lšœ	Ÿœ˜LšŸœ%˜'LšœŸœ˜Lšœ˜——Lšœ˜—L˜ L™#Lšœ1Ÿœ˜5LšœŸœ˜Lšœ
+Ÿœ˜LšŸœ˜Lš
+ŸœŸœŸœ*ŸœŸœ˜KLšŸœ	ŸœŸœŸœŸœŸœ˜7L˜ šŸœŸœŸ˜šŸœŸ˜LšŸœŸœŸœŸœ˜RLšœŸœŸœŸœ˜;LšœŸœŸœ˜;LšŸœ˜——L˜ šŸ˜LšœŸœ/Ÿœ˜Ešœ	˜	Lšœ*Ÿœ™=Lšœ	Ÿœ˜Lšœ)Ÿœ
+Ÿœ˜?LšŸœ˜Lšœ˜——LšŸœ˜—L™(Lšœ2˜2L˜ šŸœŸœŸœ˜Lšœ,˜,Lšœ)˜)šœ˜šŸœŸ˜Lšœ%˜%Lšœ.˜.LšŸœ˜—Lšœ˜—LšŸœ˜—LšŸœ¡J˜P—LšœŸœ˜šŸ˜šœ"˜"L™l——Lšœ˜L˜ —šœ™L˜ š
+ œŸœŸœŸœŸœ˜YLšœ	Ÿœ˜LšŸœ.˜0LšœA˜AšŸœ˜šŸœ˜LšŸœ<˜>šŸœŸ˜LšŸœ<˜>—LšŸœ	ŸœŸœ)˜;LšŸœ1˜3Lšœ˜—šŸœ˜Lšœ_˜_šŸœŸœ˜LšŸœ8˜:Lš
+ŸœŸœŸœ	ŸœŸœ*˜JLšœ˜—Lšœ˜——Lšœ"™"LšŸœ˜šŸœŸ˜LšœŸœ˜"LšœŸœ˜ LšŸœŸœ3˜@—šŸœŸ˜LšœŸœ˜
+LšœŸœ˜$LšŸœŸœ9˜F—LšŸœ˜šŸœŸœŸœŸ˜Lšœ˜L˜!LšŸœ˜—Lšœ˜L˜ —š œŸœŸœŸœ˜+Lšœ˜LšŸœ'˜)LšŸœŸœŸœŸœ ˜3LšŸœ,˜.Lšœ˜L˜ —š
+ œŸœŸœŸœŸœ˜ULšœ	Ÿœ˜LšÐkyž&œ™/LšœA˜AšŸœŸœ˜LšŸœC˜E—LšŸœ˜Lšœ˜L˜ —Lšœ™L˜ LšœŸœ˜,š 	œŸœŸœŸœ˜BLšœŸœŸœ˜šŸœŸ˜Lšœ
+Ÿœ˜ šœ˜šŸœŸœŸœ˜šŸœ=Ÿ˜DL™AL˜LšŸœ˜—LšœZ˜ZLšŸœ	ŸœŸœŸœ˜0L˜—LšŸœ˜Lšœ˜—šœ˜šŸœŸœŸœ˜šŸœ˜	LšŸœ˜šŸœ˜Lšœ<˜<LšœI˜ILšŸœ	ŸœŸœŸœ˜0L˜$LšŸœ˜Lšœ˜——L˜—LšŸœ˜Lšœ˜—LšŸœŸœ˜—Lšœ˜L˜ —š œŸœ˜0šŸœŸ˜šœ	˜	šŸœŸœŸœ˜Lšœ#˜#LšœŸœ˜L˜——šœ	˜	šŸœŸœŸœ˜Lšœ6˜6LšœŸœ˜L˜——šœ˜šŸœŸœŸœ˜Lšœ"˜"LšœŸœ˜L˜——LšŸœŸœ˜—Lšœ˜L˜ ——šœ
+™
+LšœŸœ"˜.Lšœ7˜7LšœC˜CLšœA˜ALšœ?˜?LšœI˜IL˜ —L˜— …—    <f  W{  

@@ -1,0 +1,333 @@
+DIRECTORY
+Commander,
+Carets USING [ResumeCarets, SuspendCarets],
+CedarProcess USING [DoWithPriority],
+MultiCursors,
+InputFocus USING [GetInputFocus, SetInputFocus],
+Menus USING [CopyMenu, Menu],
+MessageWindow USING [Append, Blink],
+RefTab USING [Create, Fetch, Ref, Store],
+Rope USING [Compare, ROPE],
+TIPUser USING [TIPScreenCoords],
+ViewerBLT USING [Invalidate],
+ViewerClasses USING [Column, Viewer, ViewerClass, ViewerFlavor],
+ViewerEvents USING [ProcessEvent],
+ViewerForkers USING [ForkPaint],
+ViewerLocks USING [CallUnderViewerTreeLock, CallUnderWriteLock],
+ViewerGroupLocks USING [CallRootAndLinksUnderWriteLock],
+ViewerOps USING [ComputeColumn, EnumProc, EstablishViewerPosition, PaintViewer],
+ViewerPrivate USING [GreyScreen, rootViewerTree, WaitForPaintingToFinish],
+ViewerSpecs USING [captionHeight, menuBarHeight, menuHeight, nColumns, windowBorderSize],
+WindowManager USING [colorDisplayOn];
+
+ViewerOpsImplB: CEDAR PROGRAM
+IMPORTS Commander, Carets, CedarProcess, MultiCursors, InputFocus, Menus, MessageWindow, RefTab, Rope, ViewerBLT, ViewerEvents, ViewerForkers, ViewerGroupLocks, ViewerLocks, ViewerOps, ViewerPrivate, ViewerSpecs, WindowManager
+EXPORTS ViewerClasses, ViewerOps
+SHARES Menus, ViewerEvents
+= BEGIN OPEN ViewerClasses, ViewerSpecs, ViewerOps, WindowManager;
+
+ROPE: TYPE = Rope.ROPE;
+
+classTable: RefTab.Ref ¬ RefTab.Create[mod:31];
+
+RegisterViewerClass: PUBLIC PROC [flavor: ViewerFlavor, class: ViewerClass] = {
+class.flavor ¬ flavor;
+[] ¬ RefTab.Store[classTable, flavor, class];
+};
+
+FetchViewerClass: PUBLIC PROC [flavor: ViewerFlavor] RETURNS [ViewerClass] = {
+IF flavor = $TypeScript THEN flavor ¬ $Typescript;
+RETURN[NARROW[RefTab.Fetch[classTable, flavor].val]];
+};
+EnumerateViewers: PUBLIC PROC [enum: EnumProc] = {
+FOR c: Column DECREASING IN [Column.FIRST..VAL[ViewerSpecs.nColumns]) DO -- decreasing so will try static viewers last
+v: Viewer ¬ ViewerPrivate.rootViewerTree[c];
+next: Viewer;
+UNTIL v=NIL DO
+next ¬ v.sibling;
+IF ~enum[v] THEN RETURN;
+v ¬ next;
+ENDLOOP;
+ENDLOOP;
+};
+
+EnumerateChildren: PUBLIC PROC [viewer: Viewer, enum: EnumProc] = {
+v: Viewer ¬ viewer.child;
+next: Viewer;
+WHILE v#NIL DO
+next ¬ v.sibling;
+EnumerateChildren[v, enum];
+IF ~enum[v] THEN RETURN;
+v ¬ next; 
+ENDLOOP;
+};
+
+FindViewer: PUBLIC PROC [name: ROPE] RETURNS [viewer: Viewer] = {
+MatchName: EnumProc = {
+IF Rope.Compare[name, v.name, FALSE]=equal THEN {
+viewer ¬ v;
+RETURN[FALSE];
+}
+ELSE RETURN[TRUE];
+};
+EnumerateViewers[MatchName];
+};
+SaveAborted: PUBLIC ERROR [error: ROPE] = CODE; -- exported to ViewerClasses
+
+SaveViewer: PUBLIC PROC [viewer: Viewer] RETURNS [ok: BOOL ¬ TRUE] ~ {
+innerSaveFile: PROC = {
+list: LIST OF Viewer;
+errorMessage: ROPE ¬ NIL;
+
+FOR v: Viewer ¬ viewer, v.link WHILE v # NIL DO
+IF ViewerEvents.ProcessEvent[save, v, TRUE].abort THEN RETURN;
+IF v.link = viewer THEN EXIT;
+ENDLOOP;
+
+FOR v: Viewer ¬ viewer, v.link WHILE v # NIL DO
+v.saveInProgress ¬ TRUE;
+PaintViewer[v, caption, FALSE];
+list ¬ CONS[v, list];
+IF v.link = viewer THEN EXIT;
+ENDLOOP;
+
+IF viewer.class.save=NIL
+THEN errorMessage ¬ "no save procedure in viewer class"
+ELSE viewer.class.save[viewer ! SaveAborted => {
+errorMessage ¬ (IF error#NIL THEN error ELSE "SaveAborted");
+CONTINUE;
+}];
+IF errorMessage#NIL THEN {
+ok ¬ FALSE;
+MessageWindow.Append["Can't SAVE -- ", TRUE];
+MessageWindow.Append[errorMessage];
+MessageWindow.Blink[];
+};
+
+FOR saved: LIST OF Viewer ¬ list, saved.rest UNTIL saved = NIL DO
+v: Viewer = saved.first;
+IF v.destroyed THEN LOOP;
+IF ok THEN v.newVersion ¬ v.newFile ¬ FALSE;
+v.saveInProgress ¬ FALSE;
+PaintViewer[v, caption, FALSE];
+[] ¬ ViewerEvents.ProcessEvent[save, v, FALSE];
+ENDLOOP;
+};
+ViewerGroupLocks.CallRootAndLinksUnderWriteLock[innerSaveFile, viewer];
+};
+
+RestoreViewer: PUBLIC PROC [viewer: Viewer] = {
+innerRestore: PROC = {
+IF viewer.link # NIL THEN {linked ¬ TRUE; RETURN};
+KillInputFocus[viewer];
+IF viewer.class.init # NIL THEN viewer.class.init[viewer];
+viewer.newVersion ¬ viewer.newFile ¬ FALSE;
+ViewerForkers.ForkPaint[viewer: viewer, hint: all];
+};
+linked: BOOL ¬ FALSE;
+ViewerGroupLocks.CallRootAndLinksUnderWriteLock[innerRestore, viewer];
+IF linked THEN {
+MessageWindow.Append["Sorry, can't reset a split viewer!"];
+MessageWindow.Blink[];
+};
+};
+
+KillInputFocus: PROC [viewer: Viewer] = {
+focus: Viewer ¬ InputFocus.GetInputFocus[].owner;
+WHILE focus # NIL DO
+IF focus # viewer
+THEN focus ¬ focus.parent
+ELSE {InputFocus.SetInputFocus[]; EXIT};
+ENDLOOP;
+};
+
+SetMenu: PUBLIC PROC [viewer: Viewer, menu: Menus.Menu, paint: BOOL ¬ TRUE] = {
+sameSize: BOOL = (menu#NIL AND viewer.menu#NIL AND
+viewer.menu.linesUsed=menu.linesUsed);
+IF viewer.iconic THEN paint ¬ FALSE;
+IF viewer.parent # NIL THEN ERROR;
+viewer.menu ¬ IF menu=NIL THEN NIL ELSE Menus.CopyMenu[menu];
+IF ~sameSize AND paint THEN
+EstablishViewerPosition[viewer, viewer.wx, viewer.wy, viewer.ww, viewer.wh];
+IF paint THEN
+ViewerForkers.ForkPaint[viewer: viewer, hint: IF sameSize THEN menu ELSE all, tryShortCuts: TRUE];
+};
+
+IndicateNewVersion: PUBLIC PROC [viewer: Viewer] = {
+FOR v: Viewer ¬ viewer, v.link WHILE v # NIL DO
+IF ViewerEvents.ProcessEvent[edit, v, TRUE].abort THEN RETURN;
+IF v.link = viewer THEN EXIT;
+ENDLOOP;
+FOR v: Viewer ¬ viewer, v.link WHILE v # NIL DO
+v.newVersion ¬ TRUE;
+ViewerForkers.ForkPaint[viewer: v, hint: caption, tryShortCuts: TRUE];
+[] ¬ ViewerEvents.ProcessEvent[edit, v, FALSE];
+IF v.link = viewer THEN EXIT;
+ENDLOOP;
+};
+
+SetNewFile: PUBLIC PROC [viewer: Viewer] = {
+FOR v: Viewer ¬ viewer, v.link WHILE v # NIL DO
+v.newFile ¬ TRUE;
+ViewerForkers.ForkPaint[viewer: v, hint: caption, tryShortCuts: TRUE];
+IF v.link = viewer THEN EXIT;
+ENDLOOP;
+};
+
+SetOpenHeight: PUBLIC PROC [viewer: Viewer, clientHeight: INTEGER] = {
+innerSetHeight: PROC = {
+wbs: INTEGER ~ IF viewer.border THEN ViewerSpecs.windowBorderSize ELSE 0;
+h: INTEGER ¬ clientHeight;
+h ¬ h+(IF viewer.caption THEN ViewerSpecs.captionHeight ELSE wbs); -- top border or caption
+IF viewer.menu#NIL THEN {
+lines: NAT ~ viewer.menu.linesUsed;
+h ¬ h+lines*ViewerSpecs.menuHeight+ViewerSpecs.menuBarHeight;
+};
+h ¬ h+wbs; -- bottom border
+viewer.openHeight ¬ h;
+};
+ViewerLocks.CallUnderWriteLock[innerSetHeight, viewer];
+};
+
+SaveAllEdits: PUBLIC PROC = {
+Save: EnumProc = {
+MultiCursors.InvertACursor[NIL]; -- main cursor becomes a filled box
+IF (v.newVersion OR v.newFile) AND v.class.save # NIL THEN
+v.class.save[v, TRUE ! ANY => CONTINUE];
+v.newVersion ¬ v.newFile ¬ FALSE;
+IF v.icon=dirtyDocument THEN v.icon ¬ document;
+IF v.link#NIL THEN FOR t: Viewer ¬ v.link, t.link UNTIL t=v DO
+t.newVersion ¬ t.newFile ¬ FALSE;
+ENDLOOP;
+MultiCursors.InvertACursor[NIL]; -- main cursor becomes a hollow box, again
+RETURN[TRUE];
+};
+PaintCaption: EnumProc = { PaintViewer[v, caption] };
+inner: PROC = {
+MultiCursors.SetACursor[activate, NIL]; -- main cursor becomes a hollow box
+EnumerateViewers[Save];
+MultiCursors.SetACursor[textPointer, NIL]; -- to show the saves are done
+EnumerateViewers[PaintCaption]; -- ok if this doesn't finish
+};
+CedarProcess.DoWithPriority[foreground, inner];
+};
+
+PaintEverything: PUBLIC PROC ~ {
+inner: PROC = {
+ViewerPrivate.GreyScreen[main, 0, 0, 9999, 9999];
+ViewerBLT.Invalidate[];
+ComputeColumn[static];
+ComputeColumn[left];
+ComputeColumn[right];
+IF WindowManager.colorDisplayOn THEN ComputeColumn[color];
+};
+Carets.SuspendCarets[];
+ViewerLocks.CallUnderViewerTreeLock[inner];
+ViewerPrivate.WaitForPaintingToFinish[];
+Carets.ResumeCarets[];
+};
+
+UserToScreenCoords: PUBLIC PROC [self: Viewer, vx, vy: INTEGER ¬ 0] 
+RETURNS [sx, sy: INTEGER] ~ {
+sx ¬ vx;
+sy ¬ vy;
+FOR viewer: Viewer ¬ self, viewer.parent UNTIL viewer=NIL DO
+parent: Viewer ~ viewer.parent;
+invert: BOOL ~ (parent#NIL AND parent.class.topDownCoordSys);
+sx ¬ sx+viewer.cx+viewer.wx;
+sy ¬ sy+viewer.cy+(IF invert THEN parent.ch-(viewer.wy+viewer.wh) ELSE viewer.wy);
+ENDLOOP;
+};
+
+TopLevelHit: PROC [x, y: INTEGER, color: BOOL] RETURNS [Viewer] = {
+FOR column: Column DECREASING IN [Column.FIRST..VAL[ViewerSpecs.nColumns]) DO
+firstInColumn: Viewer ~ ViewerPrivate.rootViewerTree[column];
+FOR v: Viewer ¬ firstInColumn, v.sibling UNTIL v=NIL DO
+IF x IN[v.wx..v.wx+v.ww) AND y IN[v.wy..v.wy+v.wh) 
+AND color=(v.column=color AND NOT v.iconic) THEN RETURN[v];
+ENDLOOP;
+ENDLOOP;
+RETURN[NIL];
+};
+
+ViewerHit: PROC [parent: Viewer, px, py: INTEGER] 
+RETURNS [viewer: Viewer, x, y: INTEGER, client: BOOL] ~ {
+IF NOT parent.iconic
+AND px IN[parent.cx..parent.cx+parent.cw)
+AND py IN[parent.cy..parent.cy+parent.ch)
+THEN {
+topDown: BOOL ~ parent.class.topDownCoordSys;
+x ¬ px-parent.cx; y ¬ py-parent.cy;
+FOR v: Viewer ¬ parent.child, v.sibling UNTIL v=NIL DO
+wx: INTEGER ~ v.wx;
+wy: INTEGER ~ IF topDown THEN parent.ch-(v.wy+v.wh) ELSE v.wy;
+IF x IN[wx..wx+v.ww) AND y IN[wy..wy+v.wh) THEN
+RETURN ViewerHit[v, x-wx, y-wy];
+ENDLOOP;
+RETURN [viewer: parent, x: x, y: y, client: TRUE];
+}
+ELSE RETURN [viewer: parent, x: px, y: py, client: FALSE];
+};
+
+MouseInViewer: PUBLIC PROC[tsc: TIPUser.TIPScreenCoords] 
+RETURNS [viewer: Viewer ¬ NIL, client: BOOL ¬ FALSE] ~ {
+parent: Viewer ~ TopLevelHit[tsc.mouseX, tsc.mouseY, tsc.color];
+IF parent#NIL THEN
+[viewer, tsc.mouseX, tsc.mouseY, client] ¬ 
+ViewerHit[parent, tsc.mouseX-parent.wx, tsc.mouseY-parent.wy];
+};
+
+SaveAllEditsCommand: Commander.CommandProc ~ { SaveAllEdits[] }; 
+Commander.Register["SaveAllEdits", SaveAllEditsCommand, "Save all viewers, subverting locks (for rescuing files in case of a dreaded Viewers lock)."];
+
+END.
+  D  
+ViewerOpsImplB.mesa
+Copyright Ó 1985, 1986, 1988, 1989, 1990, 1991 by Xerox Corporation.  All rights reserved.
+Russ Atkinson (RRA) August 7, 1985 9:15:55 pm PDT
+Bier, March 5, 1991 6:22 pm PST
+Michael Plass, March 13, 1992 11:00 am PST
+Doug Wyatt, October 24, 1990 12:24 pm PDT
+Willie-s, October 9, 1991 5:07 pm PDT
+
+to hold viewer classes 
+let the Viewer package know about a new class of viewer.
+class information from an existing viewer class.
+
+Safe in that caller can move the enumerated viewer in the tree in which case all viewers get seen at least once
+
+First interogate the preSave procedures registered for this viewer to see if we should abort the save.
+Now post the Save message in the caption(s)
+Now call the Save procedure for the class (if any)
+Finally, post the notice that the viewer is no longer being saved, and notify the postSave procedures registered for this viewer.
+RRA: for some reason, reset of a split viewer is fatal.  I don't have time to fix this, but I can keep it from hurting anyone (I think).
+Can't lock this because some callers do not have the proper locks set.  The code is reasonably careful, and we fork all of the paints.
+Can't lock this because some callers do not have the proper locks set.  The code is reasonably careful, and we fork all of the paints.
+menu and menu bar
+poor man's crash recovery
+ Êí  –(cedarcode) style•NewlineDelimiter
+™ codešœ™Kšœ
+ÏeœO™ZK™1K™K™*K™)K™%K™ —šÏk	˜	K˜
+Kšœžœ˜+Kšœžœ˜$Kšœ˜Kšœžœ ˜0Kšœžœ˜Kšœžœ˜$Kšœžœ˜)Kšœžœžœ˜Kšœžœ˜ Kšœ
+žœ˜Kšœžœ-˜@Kšœžœ˜"Kšœžœ˜ Kšœžœ/˜@Kšœžœ"˜8Kšœ
+žœA˜PKšœžœ7˜JKšœžœH˜YKšœžœ˜%—K˜ šÐblœžœž˜KšžœœÚ˜âKšžœ˜ Kšžœ˜Kšœžœžœ6˜BK˜ Kšžœžœžœ˜K˜ —šœ/˜/Kšœ™K˜ —šÏnœžœžœ/˜OKšœ8™8K˜K˜-K˜K˜ —š œžœžœžœ˜NKšœ0™0Kšžœžœ˜2Kšžœžœ(˜5Kšœ˜—K™ š œžœžœ˜2Kšœo™ošžœž
+œžœ	žœžœžœÏc-˜vKšœ,˜,K˜šžœžœž˜K˜Kšžœ
+žœžœ˜K˜	Kšžœ˜—Kšžœ˜—Kšœ˜K˜ —š œžœžœ%˜CK˜Kšœ˜šžœžœž˜K˜K˜Kšžœ
+žœžœ˜K˜
+Kšžœ˜—Kšœ˜K˜ —š
+ 
+œžœžœžœžœ˜Ašœ˜šžœžœžœ˜1K˜Kšžœžœ˜Kšœ˜—Kšžœžœžœ˜Kšœ˜—K˜Kšœ˜—K™ Kš œžœžœ	žœžœ¡˜LK˜ š 
+œžœžœžœžœžœ˜Fšœžœ˜Kšœžœžœ˜Kšœžœžœ˜K˜ Kšœf™fšžœžœžœž˜/Kšžœ$žœžœžœ˜>Kšžœžœžœ˜Kšžœ˜—K˜ Kšœ+™+šžœžœžœž˜/Kšœžœ˜Kšœžœ˜Kšœžœ
+˜Kšžœžœžœ˜Kšžœ˜K˜ —Kšœ2™2šžœž˜Kšžœ3˜7šžœ,˜0Kš	œžœžœžœžœ˜<Kšžœ˜	Kšœ˜——šžœžœžœ˜Kšœžœ˜Kšœ'žœ˜-Kšœ#˜#K˜Kšœ˜K˜ —Kšœ™šžœžœžœžœ	žœž˜AKšœ˜Kšžœžœžœ˜Kšžœžœžœ˜,Kšœžœ˜Kšœžœ˜Kšœ(žœ˜/Kšžœ˜—K˜—KšœG˜GKšœ˜K˜ —š œžœžœ˜/Kšžœ…™ˆšœžœ˜Kš
+žœžœžœžœžœ˜2Kšœ˜Kšžœžœžœ˜:Kšœ%žœ˜+Kšœ3˜3K˜—Kšœžœžœ˜KšœF˜Fšžœžœ˜Kšœ;˜;Kšœ˜Kšœ˜—Kšœ˜K˜ —š œžœ˜)Kšœ1˜1šžœ	žœž˜šžœ˜Kšžœ˜Kšžœžœ˜(—Kšžœ˜—Kšœ˜—K˜ š
+ œžœžœ+žœžœ˜Oš
+œ
+žœ	žœžœžœž˜2K˜&—Kšžœžœ	žœ˜$Kšžœžœžœžœ˜"Kšœžœžœžœžœžœ˜=šžœžœž˜K˜L—šžœž˜Kš	œ.žœ
+žœžœžœ˜b—Kšœ˜K˜ —š œžœžœ˜4Kšœ†™†šžœžœžœž˜/Kšžœ$žœžœžœ˜>Kšžœžœžœ˜Kšžœ˜—šžœžœžœž˜/Kšœžœ˜Kšœ@žœ˜FKšœ(žœ˜/Kšžœžœžœ˜Kšžœ˜—Kšœ˜K˜ —š 
+œžœžœ˜,Kšœ†™†šžœžœžœž˜/Kšœžœ˜Kšœ@žœ˜FKšžœžœžœ˜Kšžœ˜—Kšœ˜K˜ —š œžœžœ žœ˜Fšœžœ˜Kš	œžœžœžœžœ˜IKšœžœ˜Kšœžœžœžœ¡˜[šžœžœžœ˜Kšœ™Kšœžœ˜#Kšœ=˜=K˜—Kšœ¡˜Kšœ˜K˜—Kšœ7˜7Kšœ˜—K˜ š œžœžœ˜Kšœ™šœ˜Kšœžœ¡#˜Dšžœžœžœž˜:Kšœžœžœžœ˜(—Kšœžœ˜!Kšžœžœ˜/šžœžœžœžœžœž˜>Kšœžœ˜!Kšžœ˜—Kšœžœ¡*˜KKšžœžœ˜Kšœ˜—Kšœ5˜5šœžœ˜Kšœ"žœ¡#˜KK˜Kšœ%žœ¡˜HKšœ ¡˜<K˜—K˜/Kšœ˜K˜ —š œžœžœ˜ šœžœ˜Kšœ1˜1K˜Kšœ˜K˜K˜Kšžœžœ˜:K˜—K˜Kšœ+˜+K˜(K˜Kšœ˜K˜ —š œžœžœžœžœ
+žœ˜bK˜K˜šžœ&žœžœž˜<Kšœ˜Kšœžœžœžœ˜=Kšœ˜Kšœžœžœ!žœ˜RKšžœ˜—Kšœ˜K˜ —š
+ œžœžœ	žœžœ˜Cšžœž
+œžœ	žœžœž˜MKšœ=˜=šžœ&žœžœž˜7Kšžœžœžœžœ˜3Kš
+žœžœžœžœžœ˜;Kšžœ˜—Kšžœ˜—Kšžœžœ˜K˜K˜ —š 	œžœžœžœžœ
+žœ˜lšžœžœžœžœ!žœžœ ˜hšžœ˜Kšœ	žœ ˜-Kšœ#˜#šžœ%žœžœž˜6Kšœžœ˜Kš	œžœžœ	žœžœ˜>š	žœžœžœžœž˜/Kšžœ˜ —Kšžœ˜—Kšžœ&žœ˜2K˜—Kšžœžœ(žœ˜:—Kšœ˜—K˜ š œžœžœ žœžœ
+žœžœ˜rKšœ@˜@šžœžœž˜Kšœj˜j—Kšœ˜K˜ —Kš œ.˜A˜–K˜ —Kšžœ˜— …—    $   6Ñ  

@@ -1,0 +1,360 @@
+DIRECTORY Ascii, EditedStream, IO, Process, PseudoTerminal, RefText, Rope, UnixErrno, UnixSpawn, UnixSysCallExtensions, UnixSysCalls, UnixTypes, UXStrings;
+
+
+UnixSpawnImpl: CEDAR MONITOR LOCKS wire USING wire: Wire
+IMPORTS EditedStream, IO, Process, PseudoTerminal, RefText, Rope, UnixErrno, UnixSysCallExtensions, UXStrings, UnixSysCalls
+EXPORTS UnixSpawn
+~ BEGIN OPEN PT: PseudoTerminal;
+
+ROPE: TYPE ~ Rope.ROPE;
+
+Error: PUBLIC ERROR [code: ATOM, msg: ROPE] ~ CODE;
+
+PseudoTerminal: TYPE ~ PT.PseudoTerminal;
+
+AllocatePseudoTerminal: PROC RETURNS [PseudoTerminal] ~ {
+ENABLE PT.Error => Error[code, msg];
+pseudoTerminal: PseudoTerminal ¬ PT.Allocate[];
+RETURN [pseudoTerminal]
+};
+
+ClosePseudoTerminal: PROC [pty: PseudoTerminal] ~ {
+ENABLE PT.Error => Error[code, msg];
+PT.Close[pty];
+};
+
+CHARPtrFromRefText: PROC [refText: REF TEXT] RETURNS [UnixTypes.CHARPtr] ~ TRUSTED {
+charPtr: UnixTypes.CHARPtr ~ 
+LOOPHOLE[LOOPHOLE[refText, LONG POINTER]+SIZE[TEXT[0]]];
+RETURN [charPtr];
+};
+
+CopyFDToStream: PROC [in: UnixTypes.FileDescriptor, out: IO.STREAM, wire: Wire] ~ {
+bufLength: NAT ~ 1; -- Reading one byte at a time seems to circumvent a PCR/Unix interaction problem that causes output at the end to get lost.
+buffer: REF TEXT ~ RefText.New[bufLength];
+bufPtr: UnixTypes.CHARPtr ~ CHARPtrFromRefText[refText: buffer];
+BEGIN
+ENABLE {
+IO.Error => {
+NoteResult[wire, LIST[$ioerror, NEW[INT ¬ ORD[ec]]]];
+CONTINUE;
+};
+ABORTED => {
+NoteResult[wire, $aborted];
+CONTINUE;
+};
+};
+WHILE Active[wire] DO TRUSTED {
+res: INT ¬ 0;
+res ¬ UnixSysCalls.Read[d: in, buf: bufPtr, nBytes: bufLength];
+IF UserAborted[wire] THEN EXIT;
+IF res <= 0 THEN {
+NoteResult[wire, LIST[$uioerror, NEW[INT ¬ ORD[UnixErrno.GetErrno[]]]]];
+RETURN;
+};
+buffer.length ¬ res;
+IO.PutBlock[self: out, block: buffer];
+Process.CheckForAbort[];
+} ENDLOOP;
+NoteResult[wire, $terminated];
+END;
+};
+
+CopyStreamToFD: PROC [in: IO.STREAM, out: UnixTypes.FileDescriptor, wire: Wire] = {
+buffer: REF TEXT ~ RefText.New[1];
+bufPtr: UnixTypes.CHARPtr ~ CHARPtrFromRefText[refText: buffer];
+BEGIN
+ENABLE {
+IO.Error => {
+NoteResult[wire, LIST[$ioerror, NEW[INT ¬ ORD[ec]]]];
+CONTINUE;
+};
+IO.Rubout => {
+echo: IO.STREAM ¬ NIL;
+echo ¬ EditedStream.GetEcho[stream ! IO.Error => CONTINUE];
+IO.Reset[stream];
+IF echo # NIL THEN IO.PutRope[echo, "^C"];
+buffer[0] ¬ 'C-ORD['@];
+[] ¬ UnixSysCalls.Write[d: out, buf: bufPtr, nBytes: 1];
+RETRY;
+};
+ABORTED => {
+NoteResult[wire, $aborted];
+CONTINUE;
+};
+};
+WHILE Active[wire] DO
+res: INT ¬ 0;
+nBytes: INT ¬ 0;
+IF AbortEnable[wire, TRUE] THEN ERROR ABORTED;
+nBytes ¬ IO.GetBlock[in, buffer, 0, 1];
+IF AbortEnable[wire, FALSE] THEN {
+Process.CancelAbort[Process.GetCurrent[]]; -- An abort was requested after the last time the IO.GetBlock checked; we are about to terminate anyway, so we would rather do it cleanly.
+IF nBytes # 0 THEN {IO.Backup[in, buffer[0]]}; -- not meant for us!
+EXIT;
+};
+IF nBytes = 0 THEN {
+res: UnixTypes.RES ¬ UnixSysCalls.Close[out];
+IF res # $success THEN {
+IF UnixErrno.GetErrno[] = $EABORTED THEN ERROR ABORTED;
+NoteResult[wire, LIST[$uioerror, NEW[INT ¬ ORD[UnixErrno.GetErrno[]]]]];
+RETURN;
+};
+NoteResult[wire, $eof];
+RETURN;
+};
+IF AbortEnable[wire, TRUE] THEN ERROR ABORTED;
+res ¬ UnixSysCalls.Write[d: out, buf: bufPtr, nBytes: nBytes];
+[] ¬ AbortEnable[wire, FALSE];
+IF res <= 0 THEN {
+IF UnixErrno.GetErrno[] = $EABORTED THEN ERROR ABORTED;
+NoteResult[wire, LIST[$uioerror, NEW[INT ¬ ORD[UnixErrno.GetErrno[]]]]];
+RETURN;
+};
+ENDLOOP;
+NoteResult[wire, $terminated];
+END;
+};
+
+Wire: TYPE ~ REF WireRep ¬ NIL;
+WireRep: TYPE ~ MONITORED RECORD [
+active: BOOLEAN ¬ FALSE,
+userAborted: BOOLEAN ¬ FALSE,
+getBlocked: BOOLEAN ¬ FALSE,
+connectedTo: ROPE ¬ NIL,
+process: PROCESS ¬ NIL,
+result: REF ¬ NIL
+];
+
+Active: ENTRY PROC [wire: Wire] RETURNS [BOOL] ~ {
+RETURN [wire.active]
+};
+
+UserAborted: ENTRY PROC [wire: Wire] RETURNS [BOOL] ~ {
+RETURN [wire.userAborted]
+};
+
+AbortEnable: ENTRY PROC [wire: Wire, bool: BOOL] RETURNS [BOOL] ~ {
+wire.getBlocked ¬ bool;
+RETURN [NOT wire.active];
+};
+
+NoteResult: ENTRY PROC [wire: Wire, result: REF] ~ {
+wire.result ¬ result;
+};
+
+BreakWire: ENTRY PROC [wire: Wire, abort: BOOLEAN] RETURNS [process: PROCESS ¬ NIL] ~ {
+wire.userAborted ¬ abort;
+IF (abort OR wire.getBlocked) AND wire.process # NIL THEN TRUSTED {
+Process.Abort[wire.process];
+};
+process ¬ wire.process;
+wire.process ¬ NIL;
+wire.active ¬ FALSE;
+};
+
+BreakConduit: PROC [conduit: Conduit, abort: BOOLEAN] ~ {
+p: ARRAY [0..3) OF PROCESS ¬ ALL[NIL];
+BEGIN
+ENABLE UNWIND => {
+FOR i: NAT IN [0..3) DO
+process: PROCESS ¬ p[i];
+IF process # NIL THEN TRUSTED {
+ENABLE Process.InvalidProcess => CONTINUE;
+Process.Abort[process];
+Process.Detach[process];
+};
+ENDLOOP;
+};
+p[0] ¬ BreakWire[wire: conduit.stdin, abort: abort];
+p[1] ¬ BreakWire[wire: conduit.stdout, abort: abort];
+p[2] ¬ BreakWire[wire: conduit.stderr, abort: abort];
+FOR i: NAT IN [0..3) DO
+process: PROCESS ¬ p[i];
+IF process # NIL THEN TRUSTED {
+JOIN process;
+p[i] ¬ NIL;
+};
+ENDLOOP;
+END;
+IF conduit.pty # NIL THEN {
+ClosePseudoTerminal[conduit.pty];
+};
+};
+
+Conduit: TYPE = REF ConduitRep;
+ConduitRep: TYPE = RECORD [
+pty: PseudoTerminal ¬ NIL,
+stdin: Wire,
+stdout: Wire,
+stderr: Wire,
+completeCommand: ROPE ¬ NIL, -- for informational purposes
+message: REF
+];
+
+MakeConduit: PROC [stdin, stdout, stderr: REF, debug: BOOL] RETURNS [Conduit] ~ {
+conduit: Conduit ¬ NEW[ConduitRep ¬ [
+stdin: NEW[WireRep ¬ [active: TRUE]], 
+stdout: NEW[WireRep ¬ [active: TRUE]], 
+stderr: NIL,
+message: IF debug THEN stderr ELSE NIL]];
+WITH stdin SELECT FROM
+rope: ROPE => conduit.stdin.connectedTo ¬ rope;
+refText: REF TEXT => conduit.stdin.connectedTo ¬ Rope.FromRefText[s: refText];
+stream: IO.STREAM => {
+IF conduit.pty = NIL THEN {
+conduit.pty ¬ AllocatePseudoTerminal[];
+};
+conduit.stdin.connectedTo ¬ conduit.pty.slaveName;
+TRUSTED {
+conduit.stdin.process ¬ FORK CopyStreamToFD[
+in: stream, out: conduit.pty.controllerFD, wire: conduit.stdin]
+};
+};
+ENDCASE => ERROR;
+WITH stdout SELECT FROM
+rope: ROPE => conduit.stdout.connectedTo ¬ rope;
+refText: REF TEXT => conduit.stdout.connectedTo ¬ Rope.FromRefText[s: refText];
+stream: IO.STREAM => {
+IF conduit.pty = NIL THEN {
+conduit.pty ¬ AllocatePseudoTerminal[];
+};
+conduit.stdout.connectedTo ¬ conduit.pty.slaveName;
+TRUSTED {
+conduit.stdout.process ¬ FORK CopyFDToStream[
+in: conduit.pty.controllerFD, out: stream, wire: conduit.stdout]
+};
+};
+ENDCASE => ERROR;
+IF stderr = stdout
+THEN { conduit.stderr ¬ conduit.stdout }
+ELSE {
+conduit.stderr ¬ NEW[WireRep ¬ [active: TRUE]];
+WITH stderr SELECT FROM
+rope: ROPE => conduit.stderr.connectedTo ¬ rope;
+refText: REF TEXT => conduit.stderr.connectedTo ¬ Rope.FromRefText[s: refText];
+stream: IO.STREAM => {
+IF conduit.pty = NIL THEN {
+conduit.pty ¬ AllocatePseudoTerminal[];
+};
+conduit.stderr.connectedTo ¬ conduit.pty.slaveName;
+IF NOT Rope.Equal[conduit.stderr.connectedTo, conduit.stdout.connectedTo] THEN {
+TRUSTED {
+conduit.stderr.process ¬ FORK CopyFDToStream[
+in: conduit.pty.controllerFD, out: stream, wire: conduit.stderr]
+};
+}
+};
+ENDCASE => ERROR;
+};
+RETURN [conduit];
+};
+
+DebugPrint: PROC [conduit: Conduit, rope: ROPE] ~ {
+WITH conduit.message SELECT FROM
+stream: IO.STREAM => {
+IO.PutF[stream, "%l%g%l", [rope["sb"]], [rope[rope]], [rope["SB"]]];
+};
+ENDCASE => NULL;
+};
+
+Cleanup: PROC [conduit: Conduit, abort: BOOLEAN, msg: ROPE] ~ {
+in: ROPE ~ conduit.stdin.connectedTo;
+out: ROPE ~ conduit.stdout.connectedTo;
+err: ROPE ~ conduit.stderr.connectedTo;
+BreakConduit[conduit: conduit, abort: abort];
+DebugPrint[
+conduit: conduit,
+rope: IO.PutFLR["%g %g (in=%g, out=%g, err=%g) [[%g]]\n", LIST[
+[rope[IF abort THEN "Aborting" ELSE "Terminating"]], 
+[rope[conduit.completeCommand]], 
+[rope[in]], 
+[rope[out]], 
+[rope[err]],
+[rope[msg]]]]];
+};
+
+Spawn: PUBLIC PROC [command: ROPE, wd: ROPE, stdin: REF, stdout: REF, stderr: REF, exec: BOOLEAN, tty: BOOLEAN, debug: BOOLEAN] RETURNS [UnixSpawn.SpawnResult] ~ {
+conduit: Conduit ~ MakeConduit[stdin: stdin, stdout: stdout, stderr: stderr, debug: debug];
+res: INT;
+errno: UnixErrno.Errno;
+completeCommand: ROPE ¬ command;
+FOR i: INT DECREASING IN [0..Rope.Size[completeCommand]) WHILE Rope.Fetch[completeCommand, i] = '\n DO
+completeCommand ¬ Rope.Substr[completeCommand, 0, i];
+ENDLOOP;
+IF exec THEN {
+completeCommand ¬ Rope.Concat[base: "exec ", rest: completeCommand];
+};
+IF tty AND (conduit.pty # NIL) THEN {
+completeCommand ¬ Rope.Cat[
+r1: completeCommand,
+r2: " -t ", r3: conduit.pty.slaveName,
+r4: " -p ", r5: conduit.pty.controllerName];
+};
+conduit.completeCommand ¬ completeCommand;
+DebugPrint[
+conduit: conduit,
+rope: IO.PutFLR["\nSpawning %g (in=%g, out=%g, err=%g, wd=%g, conduit=%g)\n",  LIST[
+[rope[conduit.completeCommand]], 
+[rope[conduit.stdin.connectedTo]], 
+[rope[conduit.stdout.connectedTo]], 
+[rope[conduit.stderr.connectedTo]],
+[rope[wd]],
+[cardinal[LOOPHOLE[conduit]]]
+]]
+];
+res ¬ UnixSysCallExtensions.CDSpawn[
+cmd: UXStrings.Create[completeCommand], 
+wd: UXStrings.Create[wd], 
+stdin: UXStrings.Create[conduit.stdin.connectedTo], 
+stdout: UXStrings.Create[conduit.stdout.connectedTo], 
+stderr: UXStrings.Create[conduit.stderr.connectedTo] 
+! UNWIND => Cleanup[conduit: conduit, abort: TRUE, msg: "Spawn!UNWIND"]];
+errno ¬ UnixErrno.GetErrno[];
+Cleanup[conduit: conduit, abort: res # 0 AND errno = $EABORTED, msg: "Cleanup"];
+RETURN [[
+res: res,
+errno: errno.ORD,
+details: LIST[
+NEW[INT ¬ res], 
+NEW[INT ¬ errno.ORD], 
+conduit.stdin.result, conduit.stdout.result, conduit.stderr.result
+]
+]]
+};
+
+END.
+
+
+     
+UnixSpawnImpl.mesa
+Copyright Ó 1989, 1990, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Michael Plass, January 14, 1993 5:12 pm PST
+Peter B. Kessler, January 16, 1990 10:32:25 am PST
+
+This is just like PlumberImpl, except that there are no dependencies on Viewers interfaces.
+Abort and detach any processed that have not already been joined up.
+If stdout is already reading from the pty, stderr shouldn't.
+A pity that stdout and stderr are merged into the output of a pty.
+Hopefully we go through this loop just once!
+ Ê(  •NewlineDelimiter
+–(cedarcode) style™ codešœ™Kšœ
+ÏeœC™NK™+Kšœ2™2K™ —šÏk	œžœz˜›K˜ K™[—K˜ Kš
+Ïnœžœžœžœžœ˜8Kšžœžœc˜{Kšžœ
+˜šœžœžœžœ˜ K˜ šžœžœžœ˜K˜ —šŸœžœžœžœžœžœ˜3K˜ —šœžœ˜)K˜ —šŸœžœžœ˜9Kšžœžœ˜$Kšœ!žœ˜/Kšžœ˜K˜K˜ —šŸœžœ˜3Kšžœžœ˜$Kšžœ˜K˜K˜ —šŸœžœžœžœžœžœ˜T˜Kšžœžœ
+žœžœžœžœ˜8—Kšžœ˜K˜K˜ —šŸœžœ%žœžœ˜SKšœžœÏc( 3      ˜Kšœžœžœ˜*K˜@šž˜šžœ˜šžœ˜Kš	œžœžœžœžœ˜5Kšžœ˜	K˜—šžœ˜K˜Kšžœ˜	K˜—Kšœ˜—šžœžœžœ˜Kšœžœ˜K˜?Kšžœžœžœ˜šžœ
+žœ˜Kš	œžœžœžœžœ˜HKšžœ˜K˜—K˜Kšžœ$˜&K˜Kšœžœ˜
+—K˜Kšžœ˜—K˜—K˜ šŸœžœžœžœ0˜SKšœžœžœ˜"K˜@šž˜šžœ˜šžœ˜Kš	œžœžœžœžœ˜5Kšžœ˜	K˜—šžœ˜Kšœžœžœžœ˜Kšœ%žœ
+žœ˜;Kšžœ˜Kšžœžœžœžœ˜*Kšœžœ˜K˜8Kšžœ˜K˜—šžœ˜K˜Kšžœ˜	K˜—Kšœ˜—šžœž˜Kšœžœ˜Kšœžœ˜Kš
+žœžœžœžœžœ˜.Kšœ	žœ˜'šžœžœžœ˜"Jšœ+ Š˜µKšžœžœžœ ˜CKšžœ˜Kšœ˜—šžœžœ˜K˜-šžœžœ˜Kšžœ"žœžœžœ˜7Kš	œžœžœžœžœ˜HKšžœ˜K˜—K˜Kšžœ˜Kšœ˜—Kš
+žœžœžœžœžœ˜.K˜>Kšœžœ˜šžœ
+žœ˜Kšžœ"žœžœžœ˜7Kš	œžœžœžœžœ˜HKšžœ˜K˜—Kšžœ˜—K˜Kšžœ˜—K˜K˜ —Kšœžœžœžœ˜šœ	žœž	œžœ˜"Kšœžœžœ˜Kšœžœžœ˜Kšœžœžœ˜Kšœžœžœ˜Kšœ	žœžœ˜Kšœžœž˜K˜K˜ —š
+Ÿœžœžœžœžœ˜2Kšžœ˜Kšœ˜K˜ —š
+Ÿœžœžœžœžœ˜7Kšžœ˜Kšœ˜K˜ —šŸœžœžœžœžœžœ˜CK˜Kšžœžœ˜K˜K˜ —šŸ
+œžœžœžœ˜4K˜Kšœ˜—K˜ šŸ	œžœžœžœžœžœžœ˜WK˜šžœžœžœžœžœžœ˜CK˜K˜—K˜Kšœžœ˜Kšœžœ˜K˜K˜ —šŸœžœžœ˜9Kšœžœžœžœžœžœ˜&šž˜šžœžœ˜K™Dšžœžœžœž˜Kšœ	žœ˜šžœžœžœžœ˜Kšžœžœ˜*K˜K˜K˜—Kšžœ˜—Kšœ˜—K˜4K˜5K˜5šžœžœžœž˜Kšœ	žœ˜šžœžœžœžœ˜Kšžœ	˜Kšœžœ˜K˜—Kšžœ˜—Kšžœ˜—šžœžœžœ˜K˜!K˜—K˜K˜ —Kšœ	žœžœ˜šœžœžœ˜Kšœžœ˜K˜K˜K˜Kšœžœžœ ˜:Kšœ	ž˜K˜K˜ —š
+Ÿœžœžœ	žœžœ˜Qšœžœ˜%Kšœžœžœ˜&Kšœžœžœ˜'Kšœžœ˜Kš	œ	žœžœžœžœ˜)—šžœžœž˜Kšœžœ%˜/Kšœ	žœžœ=˜Nšœžœžœ˜šžœžœžœ˜K˜'K˜—K˜2šžœ˜	šœžœ˜,K˜?—K˜—K˜—Kšžœžœ˜—šžœžœž˜Kšœžœ&˜0Kšœ	žœžœ>˜Ošœžœžœ˜šžœžœžœ˜K˜'K˜—K˜3šžœ˜	šœžœ˜-Kšœ@˜@—K˜—K˜—Kšžœžœ˜—šžœ˜Kšžœ$˜(šžœ˜Kšœžœžœ˜/šžœžœž˜Kšœžœ&˜0Kšœ	žœžœ>˜Ošœžœžœ˜šžœžœžœ˜K˜'K˜—K˜3šžœžœDžœ˜Pšœ<™<KšœB™B—šžœ˜	šœžœ˜-K˜@—K˜—K˜—K˜—Kšžœžœ˜—Kšœ˜——Kšžœ˜K˜K˜ —šŸ
+œžœžœ˜3šžœžœž˜ šœžœžœ˜KšžœB˜DKšœ˜—Kšžœžœ˜—K˜K˜ —šŸœžœžœžœ˜?Kšœžœ˜%Kšœžœ˜'Kšœžœ˜'K˜-˜K˜šœžœ2žœ˜?Kšœžœžœžœ˜5K˜!Kšœ˜Kšœ˜Kšœ˜K˜——K˜K˜ —šŸœžœžœžœžœ	žœ
+žœ
+žœžœžœ	žœžœ˜£Kšœ[˜[Kšœžœ˜	K˜Kšœžœ˜ šžœžœž
+œžœ!žœ$ž˜fK™,Kšœ5˜5Kšžœ˜—šžœžœ˜K˜DK˜—šžœžœžœžœ˜%˜K˜K˜&K˜,—K˜—K˜*˜K˜šœžœGžœ˜TK˜!K˜#K˜$K˜#K˜Kšœ
+žœ˜K˜—K˜—šœ$˜$K˜(K˜K˜4K˜6K˜5Kšœžœ%žœ˜I—K˜Kšœ)žœ$˜Pšžœ˜	K˜	Kšœžœ˜šœ	žœ˜Kšžœžœ	˜Kšžœžœ	žœ˜K˜BK˜—Kšœ˜—K˜K˜ —Kšžœ˜—K˜ K˜ — …—    $Ö  4  

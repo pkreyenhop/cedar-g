@@ -1,0 +1,465 @@
+
+DIRECTORY 
+Xl, XlPredefinedAtoms, XlTQOps, X11SelectionPrivate, X11SelectionRequestor;
+
+X11SelectionRequestorImpl: CEDAR MONITOR
+IMPORTS Xl, XlTQOps, X11SelectionPrivate
+EXPORTS X11SelectionRequestor ~ 
+BEGIN OPEN X11SelectionRequestor, X11SelectionPrivate;
+
+flushNow: Xl.Details ~ NEW[Xl.DetailsRec ¨ [flush: now]];
+firstUsedProperty: Xl.XAtom ~ XlPredefinedAtoms.cutBuffer0;
+firstUnusedProperty: Xl.XAtom ~ [XlPredefinedAtoms.cutBuffer7.a+1];
+
+RHandle: TYPE = REF RHandleRec;
+RHandleRec: TYPE = RECORD [
+cd: ConnectionData ¨ NIL,
+nextFree: RHandle ¨ NIL, --monitored
+w: Xl.Window ¨ Xl.nullWindow,  --use hidden windows so we can simply destroy it after confusions
+freeProperty: Xl.XAtom ¨ firstUsedProperty,
+thisMultipleProperty: Xl.XAtom ¨ [0],
+eventTQ: Xl.TQ ¨ NIL, --ThreadQueue for events directly from server
+reportTQ: Xl.TQ ¨ NIL, --ThreadQueue for reporting the callback; NIL means not forked
+checkedOut: BOOL ¨ FALSE,
+selection: Xl.XAtom ¨ [0], --requested selection
+timeStamp: Xl.TimeStamp ¨ Xl.currentTime, --requested selection
+removeAtEnd: Xl.XAtom ¨ [0], --if not [0]
+numberOpen: INT ¨ 0, --number of unfinished opens; protected by eventTQ
+opens: LIST OF REF OpenRequest ¨ NIL,
+opensTail: LIST OF REF OpenRequest ¨ NIL,
+seq: REF Xl.Card32Sequence ¨ NIL,
+confused: BOOL ¨ FALSE,
+goOn: BOOL ¨ FALSE,
+timeoutId: Xl.Event ¨ NIL, --allows recognizing aim of a timeout
+wake: CONDITION
+];
+
+OpenRequest: TYPE = RECORD [
+property: Xl.XAtom,
+target: Xl.XAtom,
+rh: RHandle ¨ NIL, --back pointer
+callback: SelectionReceivedProc,
+clientData: REF ¨ NIL,
+type: Xl.XAtom ¨ [0], --returned type
+format: BYTE ¨ 0, --returned element size
+res: Result ¨ ok,
+doingIncr: BOOL ¨ FALSE, --returned
+open: BOOL ¨ TRUE, --means: not yet called back; protected by eventTQ.
+resultList: LIST OF REF ANY ¨ NIL,
+resultTail: LIST OF REF ANY ¨ NIL
+];
+
+NewRHandle: PROC [cd: ConnectionData, selection: Xl.XAtom, timeStamp: Xl.TimeStamp, timeoutId: Xl.Event, reportTQ: Xl.TQ] RETURNS [rh: RHandle] = {
+EntryOptionalNewRHandle: ENTRY PROC[cd: ConnectionData] RETURNS [rh: RHandle] = {
+rh ¨ NARROW[cd.requestorPrivateFreeList];
+IF rh#NIL THEN {cd.requestorPrivateFreeList ¨ rh.nextFree; rh.nextFree ¨ NIL};
+};
+rh ¨ EntryOptionalNewRHandle[cd];
+IF rh=NIL THEN {
+match: Xl.Match;
+att: Xl.Attributes ¨ [eventMask: [propertyChange: TRUE]];
+eventTQ: Xl.TQ ¨ Xl.CreateTQ[$X11SelectionRequestor]; --Must not be shared with a selection owner to prevent wedge.
+rh ¨ NEW[RHandleRec ¨ [cd: cd, eventTQ: eventTQ, checkedOut: TRUE]];
+match ¨ NEW[Xl.MatchRep ¨ [proc: SelectionReceive, handles: events, tq: eventTQ, data: rh]];
+rh.w ¨ Xl.CreateWindow[c: cd.connection, matchList: LIST[match], parent: cd.hiddenParent, attributes: att];
+};
+rh.numberOpen ¨ 0;
+rh.opens ¨ rh.opensTail ¨ NIL;
+rh.removeAtEnd.a ¨ 0;
+rh.checkedOut ¨ TRUE;
+rh.goOn ¨ FALSE;
+rh.selection ¨ selection;
+rh.timeStamp ¨ timeStamp;
+rh.timeoutId ¨ timeoutId;
+rh.reportTQ ¨ reportTQ;
+};
+
+RecycleRHandle: PROC [rh: RHandle] = {
+EntryRecycleRHandle: ENTRY PROC [rh: RHandle] = {
+cd: ConnectionData ¨ rh.cd;
+IF cd#NIL THEN {
+rh.nextFree ¨ NARROW[cd.requestorPrivateFreeList]; cd.requestorPrivateFreeList ¨ rh;
+};
+};
+rh.checkedOut ¨ FALSE;
+rh.opens ¨ rh.opensTail ¨ NIL;
+rh.freeProperty ¨ firstUsedProperty;
+EntryRecycleRHandle[rh];
+};
+
+DumpRHandle: PROC [rh: RHandle, notifySelectionOwner: BOOL ¨ TRUE] = {
+cd: ConnectionData ¨ rh.cd;
+rh.checkedOut ¨ FALSE;
+IF cd#NIL AND Xl.Alive[cd.connection] THEN {
+Xl.DestroyWindow[cd.connection, rh.w];
+IF notifySelectionOwner THEN Xl.Flush[cd.connection];
+};
+NiloutORs[rh]; rh.cd ¨ NIL; rh.reportTQ ¨ NIL;
+};
+
+NiloutORs: PROC [rh: RHandle] = {
+FOR l: LIST OF REF OpenRequest ¨ rh.opens, l.rest WHILE l#NIL DO
+l.first.callback ¨ SelectionReceiveNoOp;
+l.first.clientData ¨ NIL;
+l.first.rh ¨ NIL;  --remove circularity
+ENDLOOP;
+rh.opens ¨ rh.opensTail ¨ NIL; 
+};
+
+NewProperty: PROC [rh: RHandle, proposal: Xl.XAtom] RETURNS [x: Xl.XAtom] = {
+IF proposal.a#0 THEN RETURN [proposal];
+IF rh.freeProperty.a>=firstUnusedProperty.a THEN ERROR; --used up too many properties
+x ¨ rh.freeProperty;
+rh.freeProperty.a ¨ rh.freeProperty.a+1;
+};
+
+SelectionReceiveNoOp: SelectionReceivedProc = {};
+
+FancyPropertyReturnRec: TYPE = RECORD [
+firstRet: Xl.PropertyReturnRec,
+rest: LIST OF REF ANY ¨ NIL,
+tail: LIST OF REF ANY ¨ NIL
+];
+
+FancyGetProperty: PROC [c: Xl.Connection, w: Xl.Window, property: Xl.XAtom, delete: BOOL ¨ FALSE, pieceLongMax: INT ¨ 2000] RETURNS [r: FancyPropertyReturnRec] = {
+ret: Xl.PropertyReturnRec;
+longPos: INT ¨ 0; 
+pieceLongMax ¨ MIN[Xl.Info[c].maxRequestLength, pieceLongMax];
+r.firstRet ¨ Xl.GetProperty[c: c, w: w, property: property, delete: delete, longLength: pieceLongMax, longOff: longPos];
+ret.bytesAfter ¨ r.firstRet.bytesAfter;
+WHILE ret.bytesAfter>0 DO
+longPos ¨ longPos + pieceLongMax;
+ret ¨ Xl.GetProperty[c: c, w: w, property: property, delete: delete, longLength: pieceLongMax, longOff: longPos];
+IF ret.value#NIL THEN {
+IF r.tail=NIL 
+THEN r.rest ¨ r.tail ¨ LIST[ret.value]
+ELSE {r.tail.rest ¨ LIST[ret.value]; r.tail ¨ r.tail.rest};
+}
+ENDLOOP;
+};
+
+AppendPropRets: PROC [list, tail: LIST OF REF ANY, ret: FancyPropertyReturnRec] RETURNS [LIST OF REF ANY, LIST OF REF ANY] = {
+IF ret.firstRet.value=NIL THEN RETURN [list, tail];
+IF list=NIL THEN {
+IF ret.tail=NIL 
+THEN {list ¨ LIST[ret.firstRet.value]; RETURN[list, list]} 
+ELSE RETURN [CONS[ret.firstRet.value, ret.rest], ret.tail]
+};
+IF tail=NIL THEN ERROR;
+tail.rest ¨ LIST[ret.firstRet.value]; tail ¨ tail.rest;
+tail.rest ¨ ret.tail; WHILE tail.rest#NIL DO tail ¨ tail.rest ENDLOOP;
+RETURN [list, tail];
+};
+
+Callbacks: PROC [rh: RHandle] = {
+criticalFailure: BOOL ¨ FALSE;
+FOR ol: LIST OF REF OpenRequest ¨ rh.opens, ol.rest WHILE ol#NIL DO
+o: REF OpenRequest = ol.first; 
+d: REF ANY = o.clientData; --order!
+p: SelectionReceivedProc = o.callback; --order!
+IF p#NIL THEN 
+p[result: o.res, clientData: d, selection: rh.selection, target: o.target, type: o.type, value: o.resultList, format: o.format];
+o.resultTail ¨ o.resultList ¨ NIL; 
+IF o.res#ok AND o.res#none THEN criticalFailure ¨ TRUE;
+ENDLOOP;
+IF criticalFailure OR rh.confused
+THEN DumpRHandle[rh]
+ELSE RecycleRHandle[rh];
+};
+
+QueuedCallbacks: Xl.EventProcType = {
+Callbacks[NARROW[clientData]];
+};
+
+Report: PROC [o: REF OpenRequest, result: Result] = {
+ReportAll: PROC [rh: RHandle] = {
+flushConnection: Xl.Connection ¨ NIL;
+rh.timeoutId ¨ NIL; --no more interrested in timer
+IF rh.removeAtEnd.a#0 THEN {
+flushConnection ¨ rh.cd.connection;
+Xl.DeleteProperty[flushConnection, rh.w, rh.removeAtEnd]; 
+};
+IF rh.reportTQ#NIL 
+THEN Xl.Enqueue[rh.reportTQ, QueuedCallbacks, rh, NIL]
+ELSE WakeUp[rh];
+IF flushConnection#NIL THEN Xl.Flush[flushConnection];
+};
+IF o=NIL THEN RETURN;
+IF o.open THEN {
+rh: RHandle = o.rh;
+o.open ¨ FALSE; 
+o.res ¨ result;
+IF rh#NIL AND (rh.numberOpen ¨ rh.numberOpen - 1) <= 0 THEN ReportAll[rh];
+};
+};
+
+events: Xl.EventFilter = Xl.CreateEventFilter[selectionNotify, propertyNotify];
+SelectionReceive: Xl.EventProcType = {
+ENABLE Xl.XError => {
+rh: RHandle ~ NARROW[clientData];
+rh.confused ¨ TRUE; 
+rh.removeAtEnd ¨ [0];
+CloseAll[rh, timeout];
+};
+rh: RHandle ¨ NARROW[clientData];
+WITH event SELECT FROM
+e: Xl.SelectionNotifyEvent => {
+HandleOne: PROC [o: REF OpenRequest, property: Xl.XAtom] = {
+IF property=rh.cd.incrXAtom THEN {
+o.doingIncr ¨ TRUE;
+Xl.DeleteProperty[e.connection, rh.w, rh.cd.incrXAtom]; Xl.Flush[e.connection];
+}; 
+IF property=XlPredefinedAtoms.nullNotAnAtom 
+THEN Report[o, none]
+ELSE {
+ret: FancyPropertyReturnRec ¨ FancyGetProperty[e.connection, rh.w, property, TRUE];
+[o.resultList, o.resultTail] ¨  AppendPropRets[o.resultList, o.resultTail, ret];
+o.format ¨ ret.firstRet.format;
+o.type ¨ ret.firstRet.type;
+IF property#rh.cd.incrXAtom OR ret.firstRet.value=NIL THEN Report[o, ok];
+};
+};
+IF (rh.timeStamp#e.timeStamp AND rh.timeStamp#Xl.currentTime) OR rh.selection#e.selection THEN {
+rh.confused ¨ TRUE; RETURN;
+};
+IF e.property=XlPredefinedAtoms.nullNotAnAtom THEN {
+CloseAll[rh, none];
+RETURN
+};
+IF e.target=rh.cd.multipleXAtom 
+THEN  {
+fr: FancyPropertyReturnRec;
+fr ¨ FancyGetProperty[rh.cd.connection, rh.w, e.property, FALSE, 10000];
+rh.removeAtEnd ¨ e.property;
+WITH fr.firstRet.value SELECT FROM
+rc32s: REF Xl.Card32Sequence => {
+IF rc32s.leng#rh.numberOpen*2 THEN {rh.confused ¨ TRUE};
+IF fr.rest#NIL THEN {rh.confused ¨ TRUE};
+FOR i: INT IN [0..rc32s.leng/2) DO
+target: Xl.XAtom ¨ [rc32s[i*2]];
+property: Xl.XAtom ¨ [rc32s[i*2+1]];
+o: REF OpenRequest ¨ FindFromTarget[rh, target];
+IF o=NIL THEN {rh.confused ¨ TRUE; RETURN};
+HandleOne[o, property];
+ENDLOOP;
+};
+ENDCASE => {rh.confused ¨ TRUE; RETURN --lets timeout--};
+}
+ELSE {
+o: REF OpenRequest ¨ FindFromTarget[rh, e.target];
+IF o=NIL THEN {
+rh.confused ¨ TRUE; RETURN
+};
+HandleOne[o, e.property]
+};
+};
+e: Xl.PropertyNotifyEvent => {
+SELECT e.state FROM
+newValue => {
+ret: FancyPropertyReturnRec;
+o: REF OpenRequest ¨ FindFromProperty[rh, e.atom]; 
+IF o=NIL OR ~o.open OR ~o.doingIncr OR e.atom=XlPredefinedAtoms.nullNotAnAtom THEN {
+RETURN;
+};
+ret ¨ FancyGetProperty[e.connection, rh.w, e.atom, TRUE]; --smaller then max request size, but use proc anyway because it is there for other case
+[o.resultList, o.resultTail] ¨ AppendPropRets[o.resultList, o.resultTail, ret];
+IF ret.firstRet.value=NIL THEN Report[o, ok];
+};
+deleted => {
+IF rh.numberOpen>1 AND rh.thisMultipleProperty=e.atom THEN {
+CloseAll[rh, none];
+};
+};
+ENDCASE => {}
+};
+ENDCASE => {};
+};
+
+CloseAll: PROC [rh: RHandle, r: Result] = {
+FOR ol: LIST OF REF OpenRequest ¨ rh.opens, ol.rest WHILE ol#NIL DO
+IF ol.first.open THEN Report[ol.first, r];
+ENDLOOP;
+};
+
+TimedOut: Xl.EventProcType = {
+rh: RHandle = NARROW[clientData];
+IF rh.timeoutId#event THEN RETURN; --timer NOT actual
+CloseAll[rh, timeout];
+};
+
+FindFromProperty: PROC [rh: RHandle, property: Xl.XAtom] RETURNS [REF OpenRequest ¨ NIL] = {
+FOR ol: LIST OF REF OpenRequest ¨ rh.opens, ol.rest WHILE ol # NIL DO
+o: REF OpenRequest = ol.first;
+IF o.property=property AND o.open THEN RETURN [o];
+ENDLOOP;
+};
+
+FindFromTarget: PROC [rh: RHandle, target: Xl.XAtom] RETURNS [REF OpenRequest ¨ NIL] = {
+FOR ol: LIST OF REF OpenRequest ¨ rh.opens, ol.rest WHILE ol # NIL DO
+o: REF OpenRequest = ol.first;
+IF o.target=target AND o.open THEN RETURN [o];
+ENDLOOP;
+};
+
+WakeUp: ENTRY PROC [rh: RHandle] = {
+rh.goOn ¨ TRUE; NOTIFY rh.wake 
+};
+
+WaitUntilReported: ENTRY PROC [rh: RHandle] = {
+WHILE ~rh.goOn DO WAIT rh.wake ENDLOOP;
+};
+
+AppendOpenRequest: PROC [rh: RHandle, r: Request] RETURNS [REF OpenRequest] = {
+property: Xl.XAtom ~ NewProperty[rh, [0]];
+o: REF OpenRequest ~ NEW[OpenRequest ¨ [property: property, callback: r.callback, clientData: r.clientData, target: r.target, rh: rh]];
+list: LIST OF REF OpenRequest ~ LIST[o];
+IF r.setUp#NIL THEN 
+r.setUp[selection: rh.selection, target: o.target, window: rh.w, property: o.property, clientData: o.clientData, connection: rh.cd.connection];
+rh.numberOpen ¨ rh.numberOpen + 1;
+IF rh.opens=NIL THEN rh.opens ¨ list ELSE rh.opensTail.rest ¨ list;
+rh.opensTail ¨ list;
+RETURN [o];
+};
+
+
+GetSelection: PUBLIC PROC [c: Xl.Connection, selection: Xl.XAtom ¨ XlPredefinedAtoms.primary, timeStamp: Xl.TimeStamp, request: Request, tq: Xl.TQ ¨ NIL, timeout: INT] = {
+IF request.target=XlPredefinedAtoms.nullNotAnAtom THEN ERROR;
+IF timeout<=0 THEN timeout ¨ 8;
+BEGIN
+timeoutId: Xl.Event ~ NEW[Xl.EventRep.local]; --for check whether timeout is valid. 
+cd: ConnectionData ~ GetConnectionData[c];
+rh: RHandle ¨ NewRHandle[cd, selection, timeStamp, timeoutId, tq];
+o: REF OpenRequest ~ AppendOpenRequest[rh, request];
+rh.thisMultipleProperty ¨ [0];
+Xl.ConvertSelection[c: c, requestor: rh.w, selection: selection, target: o.target, property: o.property, time: timeStamp, details: flushNow]; 
+IF timeout>0 AND timeout<=3600 THEN {
+XlTQOps.EnqueueSoon[ms: timeout*1000, tq: rh.eventTQ, proc: TimedOut, data: rh, event: timeoutId];
+};
+IF tq=NIL THEN {
+WaitUntilReported[rh];
+Callbacks[rh];
+};
+END;
+};
+
+GetSelectionMultiple: PUBLIC PROC [c: Xl.Connection, selection: Xl.XAtom ¨ XlPredefinedAtoms.primary, timeStamp: Xl.TimeStamp, requests: RequestList, tq: Xl.TQ ¨ NIL, timeout: INT] = {
+Count: PROC [l: RequestList, limit: INT ¨ 5] RETURNS [n: INT ¨ 0] = {
+WHILE l#NIL DO
+IF l.first.target=XlPredefinedAtoms.nullNotAnAtom THEN ERROR;
+IF n>=limit THEN ERROR;
+l ¨ l.rest; n ¨ n+1; 
+ENDLOOP 
+};
+IF requests=NIL THEN RETURN;
+IF requests.rest=NIL THEN {
+GetSelection[c: c, selection: selection, timeStamp: timeStamp, request: requests.first, tq: tq, timeout: timeout];
+RETURN;
+};
+IF timeout<=0 THEN timeout ¨ 8;
+BEGIN
+timeoutId: Xl.Event ~ NEW[Xl.EventRep.local]; --for check whether timeout is valid. 
+cd: ConnectionData ~ GetConnectionData[c];
+rh: RHandle ~ NewRHandle[cd, selection, timeStamp, timeoutId, tq];
+property: Xl.XAtom ~ NewProperty[rh, [0]];
+idx: INT ¨ 0;
+cnt: INT ¨ Count[requests];
+IF rh.seq=NIL OR rh.seq.leng<cnt*2 THEN rh.seq ¨ NEW[Xl.Card32Sequence[cnt*2]];
+FOR rl: RequestList ¨ requests, rl.rest WHILE rl#NIL DO 
+o: REF OpenRequest ~ AppendOpenRequest[rh, rl.first];
+rh.seq[idx] ¨ o.target; idx ¨ idx + 1;
+rh.seq[idx] ¨ o.property; idx ¨ idx + 1;
+ENDLOOP;
+rh.thisMultipleProperty ¨ property;
+Xl.ChangeProperty[c: c, w: rh.w, property: property, type: cd.atomPairXAtom, data: rh.seq, num: cnt*2];
+Xl.ConvertSelection[c: c, requestor: rh.w, selection: selection, target: cd.multipleXAtom, property: property, time: timeStamp, details: flushNow]; 
+IF timeout>0 AND timeout<=3600 THEN {
+XlTQOps.EnqueueSoon[ms: timeout*1000, tq: rh.eventTQ, proc: TimedOut, data: rh, event: timeoutId];
+};
+IF tq=NIL THEN {
+WaitUntilReported[rh];
+Callbacks[rh];
+};
+END;
+};
+
+END.
+
+   ˛  X11SelectionRequestorImpl.mesa
+Copyright ” 1990, 1991, 1992, 1993 by Xerox Corporation.  All rights reserved.
+Christian Jacobi, November 12, 1990 5:42 pm PST
+Christian Jacobi, September 30, 1993 2:25 pm PDT
+
+--Returns a window handle.  Reuse a free one if available, else create a new one.
+--Caller must promises handle will be either recycled or dumped later.
+--Return a window handle if one can get reused.
+--Releases window handle after a successfully finished request, so it can be reused for a further request.  We do trust selection owners to not fool with window properties after a successfull request. 
+--Discard window handle never to be reused. 
+--Destroy window so selection owner notices it, and, can't do any harm to the properties of a future request.  
+--I believe in helping the garbage collector
+l.first _ NIL; --dont, for the benefit of dorado rct tables
+--Returns a new property to be used for this handle
+--Cycle through small number of properties; caller must make sure we don't use too many.
+--GetProperty request which takes care of getting properties longer then max request length
+--Given a pair, list, tail: append the pieces from a FancyPropertyReturnRec and
+--return new pair for list, tail.
+--Does the calling back with the accumulated results, and, free up rh.
+--Wrapper for Callback
+--One of the properties got handled
+--Called on event tq only
+--Received an event; handle it.
+--silly business about length which we don't use.   I was told this would be of help allocating storage, but don't understand how a lower bound could help even in C.
+--part of the INCR protocol
+--first property of multiple protocol
+--first property of multiple protocol, or, confusion
+--Not necessary according to ICCCM
+--Practice showed that the sun tools fail on multiple targets and will delete the property instead of sending a SelectionNotifyEvent
+--Timer woke up. 
+--Find out whether we ought to really timeout or simply discard alarm. 
+--given a property find open request storing its results on this property 
+--given a target find open request storing its results on some property 
+--Appends one target to list of open requests of a window handle.
+--Monitoring method: this is only player having this window handle checked out.
+--c: ...
+--selection: name of requested selection.
+--timeStamp: Timestamp of event which initiated asking for the selection.  Do NOT use Xl.currentTime.
+--request:
+--callback: Procedure called/enqueued to return desired results.  
+--target: data type desired by requestor.
+--clientData: data passed to callback. 
+--setUp: procedure eventually called in setup. 
+--tq: ThreadQueue used to enqueue callback.  (or called directly if tq=NIL).  
+timeout: In seconds; 0 defaults to some reasonable small value.
+--Differences to standard Xt: property and window is made up and not under client control.
+--carefull: from now on rh might be already recycled or dumped asynchronously 
+--Like multiple GetSelection but guaranteed using the same owner.
+--carefull: from now on rh might be already recycled or dumped asynchronously 
+ù Ÿ  ñ(cedarcode) styleïNewlineDelimiter
+ò codeôKöú
+œeúCôNKô/Kô0Kô óöœk	úò
+KöúKòKKò óöœnúûúûò(Köûú!ò(Köûúò óKöûúûú,ò6Kò Köúûúò9Köú;ò;KöúCòCKò Köú	ûúûúòöúûúûúòKöúûúòKöúûúœcò$Köú†Aò`Kò+Köú%ò%Köúûú†-òCKöúûú†>òUKöúûúûúòKöú†ò0Köú*†ò?Köú†ò)Köúûú†2òGKö	úûúûúûúûúò%Kö	úûúûúûúûúò)Köúûúûúò!Köú
+ûúûúòKöúûúûúòKöúûú†%ò@Köúû	òKòóKò öúûúûúòKöúòKöúòKöúûú†ò!Kò KöúûúûúòKöú†ò%Köúûú†ò)KòKöúûúûú†
+ò#Köúûúûú†3òFKöúûúûúûúûúûúò"Kö
+úûúûúûúûúûò!KòóKò öü
+úûújûúòìKôQKôFöüúûúûúûúòQKô/Köúûúò)Köûúûúûú;ûúòNKòóKò!öûúûúûúòKöúòKöú2ûúò9Köú6†=òsKöúûú5ûúòDKöúûúQò\Köú4ûú3òkKòóKòKöúûúòKòKöúûúòKöú
+ûúòKòKòKòKöúòKòKò óöüúûúò&Köú¥œbú
+ô…öüúûúûúò1KòöûúûúûúòKöúûú@òTKòóKòóKöúûúòKöúûúòKò$KòKòKò óöüúûú%ûúûúòFKô,KôoKòKöúûúòöûúûúûúûúò,Köú&ò&Köûúûúò5KòóKöúûúûúò.KòóKò öü	úûúò!Kô,öûúûúûúûú ûúûúûò@Kò(KöúûúòKöúûú†ò'Köú
+ûú.ô;KöûúòóKöúûúòKòóKò öüúûú#ûúòMKô3KôXKöûúûúûúò'Köûú*ûúûú†òUKòKò(KòóKò Köüúò1Kò öúûúûúò'KöúòKöúûúûúûúûúûúòKö
+úûúûúûúûúûòKòóKò öüúûú>ûúûúûú	ûú ò£Kô[KöúòKöú	ûúòKöúûú,ò>KöúxòxKò'öûúûòKò!KöúqòqöûúûúûúòöûúûúòKöûúûúò&Köûúûú#ò;óKòóKöûúòóKòóKò öüúûúûúûúûúûúûúûúûúûúûúûúûúûúûúò~KôOKô!Köûúûúûúûúò3öûúûúûúòöûú
+ûúòKöûú	ûúûúò;Köûúûúûú)ò:óKòóKöûúûúûúûúòKöúûú'ò7Kö	úûúûúûúûúòFKöûúòKòóKò öü	úûúò!KôFKöúûúûúòöûúûúûúûú!ûúûúûòCKöúûúòKöúûúûú†ò#Köú'†ò/öûúûúûúòKöúÄòÄóKöúûúò#Köûú
+ûúûúûúò7Köûúòóöûúûúò!KöûúòKöûúòóKòKò óöüúò%KôKöú
+ûúòKòKò óöüúûúûú!ò5Kô#Kôöü	úûúò!Köú!ûúò%Köúûú†ò2öûúûúòKò#Köú:ò:KòóöûúûúòKöûú.ûúò6KöûúòóKöûúûúûúò6KòóKöûúûúûúûúòöûúûúòKòKöú	ûúòKòKöûúûúûú*ûúòJKòóKòKò óKöúOòOöüúò&KôöûúòKöúûúò!KöúûúòKòKòKòóKöúûúò!öûúûúûòöúòöü	úûúûú%ò<öûúûúò"KöúûúòKô•KöúOòOKòóöûú*ò,KöûúòöûúòKöúM–bkúòSKòPKòKòKöûúûúûúûúòIKòóóKòóöûúûúûúûúò`KöúûúûúòKòóöûú°ú*ûúò4KöúòKöûòKòóöûúò öûúòKöúòKöú.°ú¢°úòHKöú°ú
+òöûúûúûò"öúûúò!Köûúûúûúò8Köûú	ûúûúûúò)öûúûúûúûò"Köú ò Köú$ò$Köúûú*ò0Kö
+ûúûúûúûúûúò+KòKöûúòóKòóKöûúûúûú†úò9óKòóöûúòKöúûú,ò2öûúûúûúòKöúûúûòKöúòóKòKòóóKòóöúòKôKöú%ô%öûú	ûòöúòKòKöúûú-ò3öûúûúûú	ûúûú(ûúòTKöú%ûô4KöûúòKòóKöú3¢ú†WòëKòOKöûúûúûúò-KòóöúòKô"KöúÑôÑöûúûú ûúò<KöúòKòóKòóKöûúòóKòóKöûúòóKòKò öüúûúò+öûúûúûúûú!ûúûúûòCKöûúûúò*KöûúòóKòKò óöüúòKôKôGKöúûúò!Köûúûúûú†ò5KöúòKòóóKò ö
+üúûú#ûúûúûúò\KôJöûúûúûúûú!ûúûúûòEKöúûúòKöûúûúûúûúò2KöûúòóKòKò óö
+üúûú!ûúûúûúòXKôHöûúûúûúûú!ûúûúûòEKöúûúòKöûúûúûúûúò.KöûúòóKòóKò öüúûúûúò$Köú
+ûúûú	òKòKò óöüúûúûúò/Köûú
+ûúûú	ûúò'KòóKò öüúûúûúûúòOKôAKôOKò*KöúûúûúoòáKö	úûúûúûúûúò(öûú	ûúûúòKöú3°ú°úFòèóKò"Köûú
+ûúûúûúòCKòKöûúòKòKò óKò ö
+üúûúûú|ûúûúò´KôKô)Kôeô
+KôBKô)Kô'Kô/óKôNKöú?ô?Köú°ú>ôZKöûú0ûúûúò=KöûúûúòöûòKöúûú†&òTKò*KòBKöúûú.ò4KöúòKöúéòéKôNöûúûúûúò%KöúbòbKòóöûúûúûúòKòKòKòóKöûúòóKòóKò ö
+üúûúûúÅûúûúò∏KöúAôAö
+üúûúûúûúûú	òEöûúûúûòKöûú0ûúûúò=Köûú
+ûúûúòKòKöûúòóKòóKöûú
+ûúûúûúòöûúûúûúòKòrKöûúòKòóKöûúûúòöûòKöúûú†&òTKò*KòBKò*KöúûúòKöúûúòKö
+ûúûúûúûú
+ûúòOöûú%ûúûúûúò8Köúûú/ò5Kò&Kò(KöûúòóKöú#ò#KöúgògKöúîòîKôNöûúûúûúò%KöúbòbKòóöûúûúûúòKòKòKòóKöûúòóKòóKò KöûúòKò ó Öó    4Ï  Q√  

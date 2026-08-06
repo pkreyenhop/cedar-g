@@ -1,0 +1,777 @@
+
+
+DIRECTORY
+BasicTime USING [GMT, Now],
+Char USING [Code, XCHAR],
+Convert USING [RopeFromTimeRFC822],
+IO,
+MailBasics USING [ItemType, RName, RNameList],
+MailBasicsItemTypes USING [header, multinationalNote, plainTextForFormatting, tioga1],
+MailParse,
+MailSend USING [AddRecipient, AddToItem, Create, MailSendHandle,
+SendingCredentialsList, StartItem, StartSend],
+MailSendSidedoor USING [SendWithAbort],
+MailUtilsBackdoor USING [GetCRTiogaContents, WritePlainCR],
+MailUtils USING [GetLoggedInUser],
+Menus,
+PFS,
+PFSNames,
+Rope,
+RuntimeError USING [BoundsFault],
+SendMailOps,
+SendMailInternal,
+SendMailParseMsg USING [MessageFieldIndex, MessageInfo, messageParseArray],
+TextEdit USING [FetchChar, Size],
+TextNode USING [FirstChild, LastLocWithin, Location, LocOffset, LocRelative, Ref],
+Tioga USING [Node],
+TiogaIO USING [FromPair],
+TiogaOps,
+UserProfile USING [Number, Token],
+ViewerClasses USING [Viewer],
+ViewerOps,
+ViewerTools USING [GetTiogaContents, EnableUserEdits, InhibitUserEdits, TiogaContents];
+
+SendMailImpl: CEDAR MONITOR
+IMPORTS
+BasicTime, Char, Convert,
+IO, MailParse, MailSend, MailSendSidedoor, MailUtilsBackdoor, MailUtils, PFS, PFSNames, Rope, RuntimeError,
+SendMailParseMsg, SendMailInternal, SendMailOps,
+TextEdit, TextNode, TiogaIO, TiogaOps,
+ViewerOps, ViewerTools,
+UserProfile
+EXPORTS
+SendMailInternal, SendMailOps =
+
+BEGIN OPEN SendMailInternal, SendMailOps;
+
+RName: TYPE = MailBasics.RName;
+ROPE: TYPE = Rope.ROPE;
+Viewer: TYPE = ViewerClasses.Viewer;
+OutBoxMsg: TYPE = SendMailOps.OutBoxMsg;
+
+testingFormatting: BOOL ¨ TRUE;		-- works in gv land
+sendingCredentials: MailSend.SendingCredentialsList ¨ NIL;
+needUserName: BOOL ¨ TRUE;
+
+Send: PUBLIC PROC[v: Viewer, doClose: BOOL ¨ FALSE, transport: ATOM ¨ NIL]
+RETURNS[sent: BOOL] = {
+oldMenu: Menus.Menu = v.menu;
+v.inhibitDestroy ¨ TRUE;
+sent ¨ FALSE;
+BEGIN ENABLE UNWIND => GOTO out;
+ViewerOps.SetMenu[v, sendingMenu];
+sent ¨ InternalSendMsg[v, doClose, transport, TRUE];
+EXITS
+out => NULL;
+END;
+ViewerOps.SetMenu[v, oldMenu];
+v.inhibitDestroy ¨ FALSE;
+};
+
+SendUnformatted: PUBLIC PROC[v: Viewer, doClose: BOOL ¨ FALSE, transport: ATOM ¨ NIL]
+RETURNS[sent: BOOL] = {
+oldMenu: Menus.Menu = v.menu;
+v.inhibitDestroy ¨ TRUE;
+sent ¨ FALSE;
+BEGIN ENABLE UNWIND => GOTO out;
+ViewerOps.SetMenu[v, sendingMenu];
+sent ¨ InternalSendMsg[v, doClose, transport, FALSE];
+EXITS
+out => NULL;
+END;
+ViewerOps.SetMenu[v, oldMenu];
+v.inhibitDestroy ¨ FALSE;
+};
+
+
+AppendHeaderLine: PUBLIC PROC[v: Viewer, line: ROPE, changeSelection: BOOL ¨ FALSE] = {
+ENABLE RuntimeError.BoundsFault => GOTO exit;
+text: ROPE;
+i: INT ¨ 0;
+ch: CHAR;
+
+TRUSTED {text ¨ CreateRopeForTextNode[LOOPHOLE [TiogaOps.ViewerDoc[v]]]};
+DO		-- find the double CR at the end of the headers
+UNTIL (ch ¨ text.Fetch[i]) = '\r DO i ¨ i + 1; ENDLOOP;
+IF (ch ¨ text.Fetch[i ¨ i + 1]) = '\r THEN EXIT;
+ENDLOOP;
+InsertIntoViewer[v, line, i-1, SendMailOps.labelFont, changeSelection];
+ViewerTools.EnableUserEdits[v];
+EXITS
+exit => SenderReport["Malformed headers; append of %g not done", [rope[line]] ];
+};
+
+InternalSendMsg: PROC[senderV: Viewer, doClose: BOOL, transport: ATOM, sendFormatted: BOOL]
+RETURNS[sendOk: BOOL] = {
+status: SendParseStatus;
+sPos, mPos: INT;
+formatting: ROPE;
+smr: SendingRec;
+addedTxtLength: INT;
+newTxt: ROPE;
+textNodeRef: TextNode.Ref ¨ NIL;
+allowDL, dlNotAllowed: BOOL ¨ FALSE;
+contents, currentText: ViewerTools.TiogaContents;
+senderInfo: SenderInfo ¨ NARROW[ViewerOps.FetchProp[senderV, $SenderInfo]];
+numForReplyTo: INT ¨ UserProfile.Number["SendMailTool.MaxRecipientsWithoutReplyTo", 10];
+endHeadersPosForReplyTo: INT;
+ReplyToOption: PROC RETURNS[continue: BOOL ¨ TRUE] = {
+howToReply: HowToReplyTo ¨ self;
+IF ~replyToSelf THEN {
+oldM: Menus.Menu ¨ senderV.menu;
+IF CheckForAbortSend[senderInfo] THEN RETURN;
+ViewerOps.SetMenu[senderV, replyToMenu];
+SendMailOps.SenderReport["..."];
+IF smr.numPublicDLs > 0 THEN
+SenderReport[" , %g public DLs", [integer[smr.numPublicDLs]] ];
+IF smr.numPrivateDLs > 0 THEN
+SenderReport[", %g private DLs", [integer[smr.numPrivateDLs]] ];
+IF smr.numRecipients > 0 THEN
+SenderReport[", %g other recipients", [integer[smr.numRecipients]] ];
+SendMailOps.SenderReport["; please choose Reply-To option"];
+SenderReport[
+"\nClick Self to reply-to self, All to reply-to all, Cancel to cancel Send\n"];
+howToReply ¨ ReplyToResponse[senderInfo];
+ViewerOps.SetMenu[senderV, oldM];
+};
+IF howToReply # all THEN {
+ViewerTools.EnableUserEdits[senderV];
+InternalInsert[senderV, "Reply-to: ", NameForXport[transport], endHeadersPosForReplyTo, SendMailOps.labelFont];
+};
+
+ViewerTools.EnableUserEdits[senderV];	-- make sure can edit
+SELECT TRUE FROM
+( howToReply = cancel ) => {
+SenderReport["\nDelivery cancelled. Reply-to: has been added\n"]; 
+continue ¨ FALSE;
+};
+ENDCASE => allowDL ¨ TRUE;
+};
+DoReader: PROC ~ {
+tc: ViewerTools.TiogaContents ~ ViewerTools.GetTiogaContents[senderV];
+textNodeRef: Tioga.Node ~ TiogaIO.FromPair[[tc.contents, tc.formatting]];
+contents ¨  MailUtilsBackdoor.GetCRTiogaContents[textNodeRef];
+IF transport = $xns THEN {
+smr.fullText ¨ MailUtilsBackdoor.WritePlainCR[textNodeRef];
+formatting ¨ contents.formatting;
+}
+ELSE {
+last: INT ¨ contents.contents.Length[] - 1;
+IF contents.contents.Fetch[last] = '\000 THEN {		-- NULL for padding
+smr.fullText ¨ Rope.Substr[contents.contents, 1, last-1];
+formatting ¨ Rope.Concat["\000", contents.formatting];
+}
+ELSE { 
+smr.fullText ¨ Rope.Substr[contents.contents, 1];
+formatting ¨ contents.formatting;
+};
+};
+IF NOT sendFormatted THEN formatting ¨ NIL;
+};
+
+IF transport = NIL THEN transport ¨ $xns; 
+
+IF numForReplyTo > 20 THEN numForReplyTo ¨ 20;		-- hard limit
+sendOk ¨ FALSE;
+senderInfo.aborted ¨ FALSE;
+
+IF senderInfo.successfullySent AND ~senderV.newVersion THEN
+{ SenderReport["\nDo you really want to send this message again?"];
+IF ~Confirmation[senderInfo] THEN
+{ SenderReport[" .. Not sent\n"];
+senderInfo.successfullySent ¨ FALSE;
+RETURN}
+};
+
+senderInfo.successfullySent ¨ FALSE;
+
+SenderReport["... Parsing..."];
+
+smr ¨ NEW[SendMsgRecObject];
+TRUSTED { textNodeRef ¨ LOOPHOLE [TiogaOps.ViewerDoc[senderV]] };
+smr.fullText ¨ CreateRopeForTextNode[textNodeRef];
+[status, sPos, mPos] ¨ ParseText[smr, transport];
+endHeadersPosForReplyTo ¨ smr.endHeadersPos-1;
+
+SELECT status FROM
+fieldNotAllowed => {
+IF sPos # mPos THEN {
+substr: ROPE = Rope.Substr[smr.fullText, MAX[0, sPos-1], mPos-sPos];
+ShowErrorFeedback[senderV, sPos, mPos];
+SenderReport["\n* * * %g field is not allowed\n", [rope[substr]] ]
+}
+ELSE SenderReport["  field at pos %g is not allowed\n", [integer[sPos]] ];
+Blink[senderV];
+RETURN
+};
+syntaxError => { 
+IF sPos # mPos THEN {
+substr: ROPE = Rope.Substr[smr.fullText, MAX[0, sPos-1], mPos-sPos];
+ShowErrorFeedback[senderV, sPos, mPos];
+SenderReport["\n* * * Syntax error on line beginning with %g\n", [rope[substr]] ];
+}
+ELSE SenderReport["\n* * * Syntax error at position %g\n", [integer[sPos]] ];
+Blink[senderV];
+RETURN
+};
+pdlNotFound, pdlSyntaxError => { 
+Blink[senderV];
+RETURN
+};
+ENDCASE => NULL;
+
+IF CheckForAbortSend[senderInfo] THEN RETURN;
+
+allowDL ¨ smr.replyTo;
+IF (status = includesPublicDL OR status = includesPrivateDL
+OR smr.numRecipients > numForReplyTo) AND ~smr.replyTo THEN {
+IF ~replyToSelf THEN IF NOT ReplyToOption[] THEN RETURN;
+IF CheckForAbortSend[senderInfo] THEN RETURN;	 
+};
+
+IF doClose AND ~senderV.iconic THEN ViewerOps.CloseViewer[senderV];
+
+DO		--for adding reply-to
+currentText ¨ GetCRTiogaContents[senderV];
+
+newTxt ¨ Rope.Concat[IF smr.from.name = NIL THEN "From: " ELSE "Sender: ", MailUtils.GetLoggedInUser[transport] ];
+ 
+addedTxtLength ¨ newTxt.Length[];
+InsertIntoViewer[senderV, newTxt, 0, SendMailOps.labelFont];
+newTxt ¨ Rope.Concat["Date: ", Convert.RopeFromTimeRFC822[BasicTime.Now[], TRUE, TRUE]];
+addedTxtLength ¨ newTxt.Length[] + addedTxtLength + 1;
+InsertIntoViewer[senderV, newTxt, 0, SendMailOps.labelFont];
+
+
+DoReader[];
+IF smr.subject.Length[] > 40 THEN
+smr.subject ¨ Rope.Concat[Rope.Substr[smr.subject, 0, 35], " ..."];
+smr.subject ¨ Rope.Cat[" \"", smr.subject, "\" "];
+IF ( smr.endHeadersPos ¨ Rope.Find[smr.fullText, "\r\r", 0] ) < 0 THEN
+smr.endHeadersPos ¨ smr.fullText.Length[] 
+ELSE smr.endHeadersPos ¨ smr.endHeadersPos + 2;
+
+senderInfo.currentOutBox ¨ NEW[SendMailOps.OutBoxMsgRec ¨
+	[contents, currentText, smr.subject, NIL] ];
+SenderReport["... Sending %g", [rope[smr.subject]] ];
+[sendOk, dlNotAllowed] ¨ SendIt[smr, senderInfo, formatting, contents.contents, allowDL, transport];
+SELECT TRUE FROM
+( senderInfo.successfullySent ¨ sendOk ) => {
+SenderReport["%g has been delivered\n", [rope[smr.subject]] ];
+AddToOutBox[ senderInfo.currentOutBox ];
+RETURN;
+};
+dlNotAllowed => {
+DeleteChars[senderV, addedTxtLength];
+ViewerTools.InhibitUserEdits[senderV];	-- don't allow edits while waiting
+IF NOT ReplyToOption[] THEN RETURN;
+allowDL ¨ TRUE;
+LOOP;
+};
+ENDCASE => {
+DeleteChars[senderV, addedTxtLength];
+SenderReport["%g NOT sent\n", [rope[smr.subject]] ];
+RETURN;
+};
+ENDLOOP;
+};
+
+GetCRTiogaContents: PUBLIC PROC[viewer: Viewer]
+RETURNS [contents: ViewerTools.TiogaContents ¨ NIL] = {
+tc: ViewerTools.TiogaContents ~ ViewerTools.GetTiogaContents[viewer];
+textNodeRef: Tioga.Node ~ TiogaIO.FromPair[[tc.contents, tc.formatting]];
+contents ¨ MailUtilsBackdoor.GetCRTiogaContents[textNodeRef];
+};
+
+AddToOutBox: PUBLIC ENTRY PROC[outBoxMsg: OutBoxMsg] = {
+ENABLE UNWIND => NULL;
+outBoxMsg.next ¨ SendMailOps.outBox;
+SendMailOps.outBox ¨ outBoxMsg;
+IF SendMailOps.outBoxLength > 0 THEN {
+count: INT ¨ 1;
+oB: OutBoxMsg ¨ SendMailOps.outBox;
+DO
+IF oB.next = NIL THEN EXIT;
+IF count = SendMailOps.outBoxLength THEN { oB.next ¨ NIL; EXIT };
+count ¨ count + 1;
+oB ¨ oB.next;
+ENDLOOP;
+};
+};
+
+ChangeOutBoxLength: PUBLIC ENTRY PROC[new: INT] RETURNS[old: INT] = {
+ENABLE UNWIND => NULL;
+old ¨ SendMailOps.outBoxLength;
+SendMailOps.outBoxLength ¨ new;
+};
+
+GetOutBoxMsgForSender: PUBLIC PROC[sender: Viewer] RETURNS[OutBoxMsg] = {
+senderInfo: SenderInfo ¨ NARROW[ViewerOps.FetchProp[sender, $SenderInfo]];
+RETURN[senderInfo.currentOutBox];
+};
+
+ShowErrorFeedback: PUBLIC PROC[v: Viewer, start, end: INT] =
+BEGIN OPEN TiogaOps;
+ENABLE UNWIND => GOTO exit;
+startLoc, endLoc: Location;
+thisV: Ref = ViewerDoc[v];
+beginning: Location ¨ [FirstChild[thisV], 0];
+startLoc ¨ LocRelative[beginning, start];
+endLoc ¨ LocRelative[beginning, end];
+SetSelection[viewer: v, start: startLoc, end: endLoc, which: feedback];
+EXITS
+exit => NULL;
+END;
+
+InsertIntoViewer: PUBLIC PROC
+[v: Viewer, what: ROPE, where: INT, labelFont: ROPE, changeSelection: BOOL ¨ FALSE] = {
+prefix: ROPE ¨ Rope.Substr[ what, 0, Rope.Find[s1: what, s2: ":"] ];
+field: ROPE ¨ Rope.Replace[base: what, start: 0, len: prefix.Length, with: NIL];
+InternalInsert[v, prefix, field, where, labelFont, changeSelection];
+};
+
+InternalInsert: PROC
+[v: Viewer, prefix, field: ROPE, where: INT, labelFont: ROPE, changeSelection: BOOL ¨ FALSE] =
+BEGIN OPEN TiogaOps;
+thisV: Ref = ViewerDoc[v];
+InsertChars: PROC[root: Ref] =
+BEGIN
+insertLoc: Location;
+prevV: Viewer;
+prevStart, prevEnd: Location;
+prevLevel: SelectionGrain;
+cb, pd: BOOL;
+IF where < 0 THEN  insertLoc ¨ LastLocWithin[LastChild[thisV]]
+ELSE insertLoc ¨ LocRelative[[FirstChild[thisV], 0], where];
+
+[prevV, prevStart, prevEnd, prevLevel, cb, pd] ¨ GetSelection[primary];
+ViewerTools.EnableUserEdits[v];
+SelectPoint[v, insertLoc, primary];
+
+IF where # 0 THEN TiogaOps.Break[];		-- make a new node
+
+IF labelFont # NIL THEN TiogaOps.SetLooks[labelFont, caret];
+TiogaOps.InsertRope[prefix];
+IF labelFont # NIL THEN TiogaOps.ClearLooks[caret];
+TiogaOps.InsertRope[field];
+
+IF where = 0 THEN TiogaOps.Break[];		-- make a new node
+
+ViewerTools.InhibitUserEdits[v];
+IF ~changeSelection AND (prevV # v) AND (prevV#NIL) AND ~prevV.destroyed THEN
+SetSelection[prevV, prevStart, prevEnd, prevLevel, cb, pd !
+TiogaOps.SelectionError => CONTINUE];  
+END;
+LockViewerOpen[v];
+IF thisV = NIL THEN InsertChars[thisV] ELSE CallWithLocks[InsertChars, thisV];
+ReleaseOpenViewer[v];
+END;
+
+DeleteChars: PUBLIC ENTRY PROC[v: Viewer, num: INT] = 
+BEGIN ENABLE UNWIND => NULL;
+IF num # 0 THEN DeleteLeadingChars[v, num]
+END;
+
+DeleteLeadingChars: INTERNAL PROC[v: Viewer, num: INT] =
+BEGIN OPEN TiogaOps;
+thisV: Ref ¨ ViewerDoc[v];
+DelChars: PROC[root: Ref] =
+BEGIN
+prevV: Viewer;
+prevStart, prevEnd: Location;
+prevLevel: SelectionGrain;
+cb, pd: BOOL;
+startLoc: Location ¨ [FirstChild[thisV], 0];
+endLoc: Location ¨ LocRelative[startLoc, num];
+[prevV, prevStart, prevEnd, prevLevel, cb, pd] ¨ GetSelection[primary];
+ViewerTools.EnableUserEdits[v];
+SetSelection[viewer: v, start: startLoc, end: endLoc];
+Delete[];
+GoToNextNode[];
+Join[];
+IF (prevV # v) AND (prevV#NIL) THEN
+SetSelection[prevV, prevStart, prevEnd, prevLevel, cb, pd];
+END;
+IF thisV = NIL THEN DelChars[thisV] ELSE CallWithLocks[DelChars, thisV];
+END;
+
+SendIt: PROC[smr: SendingRec, senderInfo: SenderInfo, formatting, textForFormatting: ROPE, allowDL: BOOL, transport: ATOM] RETURNS[ sent, dlNotAllowed: BOOL] = {
+InitSending: ENTRY PROC = {
+ENABLE UNWIND => NULL;
+senderInfo.sendHandle ¨ MailSend.Create[];
+senderInfo.aborted ¨ FALSE;
+};
+FinishedSending: ENTRY PROC = {
+ENABLE UNWIND => NULL;
+senderInfo.sendHandle ¨ NIL
+};
+
+InitSending[];
+[sent, dlNotAllowed] ¨
+SendMessage[smr, senderInfo, formatting, textForFormatting, TRUE, allowDL, transport];
+FinishedSending[];
+};
+
+SendMessage: PROC[smr: SendingRec,  senderInfo: SenderInfo,
+formatting, textForFormatting: ROPE, validateFlag, allowDL: BOOL, transport: ATOM]
+RETURNS[ sent, noDlsAllowed: BOOL ¨ FALSE ] = {
+msH: MailSend.MailSendHandle ¨ senderInfo.sendHandle;
+stepper: LIST OF RName;
+numRecips: INT ¨ 0;
+failureReason: ROPE;
+firstInvalidUser: BOOL ¨ TRUE;
+invalidRecipients, dlsNotAllowed, fakeDls: MailBasics.RNameList;
+
+DO
+MailSend.StartSend[ msH: senderInfo.sendHandle, credentialsList: sendingCredentials];
+stepper ¨ smr.to;
+WHILE stepper # NIL DO 
+IF stepper.first.name # NIL THEN {
+MailSend.AddRecipient[ msH, stepper.first ] ;
+numRecips ¨ numRecips + 1 ;
+};
+stepper ¨ stepper.rest;
+ENDLOOP;
+IF CheckForAbortSend[senderInfo] THEN RETURN;
+stepper ¨ smr.cc;
+WHILE stepper # NIL DO 
+IF stepper.first.name # NIL THEN {
+MailSend.AddRecipient[ msH, stepper.first ] ;
+numRecips ¨ numRecips + 1 ;
+};
+stepper ¨ stepper.rest ;
+ENDLOOP ;
+IF CheckForAbortSend[senderInfo] THEN RETURN;
+
+SenderReport[".. sending to %g recipients\n", [integer[numRecips]] ];
+
+MailSend.StartItem[msH, MailBasicsItemTypes.header];
+MailSend.AddToItem[msH, Rope.Substr[smr.fullText, 0, smr.endHeadersPos] ];
+
+MailSend.StartItem[msH, MailBasicsItemTypes.multinationalNote];
+MailSend.AddToItem[msH, Rope.Substr[smr.fullText, smr.endHeadersPos] ];
+
+IF formatting # NIL THEN {
+MailSend.StartItem[msH, MailBasicsItemTypes.tioga1];
+MailSend.AddToItem[msH, formatting];
+IF transport # $gv THEN {
+MailSend.StartItem[msH, MailBasicsItemTypes.plainTextForFormatting];
+MailSend.AddToItem[msH, textForFormatting];
+};
+};
+
+
+IF CheckForAbortSend[senderInfo] THEN RETURN;
+senderInfo.startSendTime ¨ BasicTime.Now[];
+[sent, failureReason, invalidRecipients, dlsNotAllowed, fakeDls] ¨
+MailSendSidedoor.SendWithAbort[msH, validateFlag, FALSE, allowDL, SenderAbortProc, transport];
+IF sent THEN RETURN;
+IF ( invalidRecipients = NIL ) AND ( dlsNotAllowed = NIL ) THEN {
+IF ( fakeDls = NIL ) THEN SenderReport[failureReason]
+ELSE { allowDL ¨ TRUE; numRecips ¨ 0; LOOP };
+};
+IF ( invalidRecipients # NIL ) THEN {
+SenderReport["\nThe following are invalid recipients: "];
+SenderReport["(%g) %g", [atom[invalidRecipients.first.ns]],
+[rope[invalidRecipients.first.name]] ];
+FOR rL: MailBasics.RNameList ¨ invalidRecipients.rest, rL.rest UNTIL rL = NIL DO
+SenderReport[", (%g) %g", [atom[rL.first.ns]], [rope[rL.first.name]] ];
+ENDLOOP;
+};
+IF ( dlsNotAllowed # NIL ) THEN {
+nDLs: INT ¨ 1;
+SenderReport["\nThe following appear to be dl recipients (dl recipients should have a Reply-To field): "];
+SenderReport["(%g) %g", [atom[dlsNotAllowed.first.ns]],
+[rope[dlsNotAllowed.first.name]] ];
+FOR rL: MailBasics.RNameList ¨ dlsNotAllowed.rest, rL.rest UNTIL rL = NIL DO
+SenderReport[", (%g) %g", [atom[rL.first.ns]], [rope[rL.first.name]] ];
+nDLs ¨ nDLs.SUCC;
+ENDLOOP;
+noDlsAllowed ¨ TRUE;
+smr.numPublicDLs ¨ nDLs;
+smr.numRecipients ¨ smr.numRecipients - nDLs;
+};
+SenderReport["\n"];
+RETURN;
+ENDLOOP;
+};
+
+
+ParseText: PUBLIC PROC[msg: SendingRec, transport: ATOM]
+RETURNS[status: SendParseStatus, sPos, mPos: INT] = {
+OPEN MailParse;
+mLF: SendMailParseMsg.MessageInfo;
+tHeaders: LIST OF ROPE ¨ NIL;
+msgText: ROPE ¨ msg.fullText;
+lastCharPos: INT ¨ msgText.Length[] - 1;
+lastCharIsCR: BOOL ¨ ( msgText.Fetch[lastCharPos] = '\r );
+countOfRecipients, publicDLCount, privateDLCount: INT ¨ 0;
+pdlStatus: SendParseStatus ¨ ok;
+
+GetNextMsgChar: PROC RETURNS [ch: CHAR] = {
+IF mPos <= lastCharPos THEN ch ¨ Rope.Fetch[msgText, mPos]
+ELSE IF (mPos=lastCharPos+1) AND ~lastCharIsCR THEN ch ¨ '\r
+ELSE ch ¨ endOfInput;
+mPos ¨ mPos + 1;
+};
+
+RNameListField: PROC[index: SendMailParseMsg.MessageFieldIndex] = {
+fieldBody, fbEnd: LIST OF RName ¨ NIL;
+ParsePvtDL: PROC [fname: ROPE]  = {
+pdlH: ParseHandle ¨ NIL; -- need new handle for each PDL
+pdlStream: IO.STREAM ¨ NIL;
+fullPath, reallyName: PFS.PATH;
+BEGIN ENABLE UNWIND => {
+IF pdlH # NIL THEN FinalizeParse[pdlH];
+IF pdlStream # NIL THEN pdlStream.Close[];
+};
+
+GetPDLChar: PROC RETURNS [c: CHAR] = {
+-- No CR's allowed in file.
+IF pdlStream # NIL AND NOT pdlStream.EndOf[] THEN
+{ IF (c ¨ pdlStream.GetChar[]) = '; THEN c ¨ endOfList }
+ELSE c ¨ endOfList;
+};
+
+-- Extract filename from between quotes
+IF fname.Fetch[0] = '" THEN
+fname ¨ Rope.Substr[fname, 1, Rope.Length[fname]-2];
+BEGIN
+wDir: ROPE ¨ UserProfile.Token["SendMailTool.DefaultDLDir"];
+fullPath ¨ PFSNames.ExpandName[PFS.PathFromRope[fname], PFS.PathFromRope[wDir] ! PFS.Error => { 
+SenderReport["\nPFS.Error: %g\n", [rope[error.explanation]] ];
+pdlStatus ¨ pdlSyntaxError;
+CONTINUE} ];
+IF pdlStatus = pdlSyntaxError THEN RETURN;
+END;
+
+pdlH ¨ InitializeParse[];
+reallyName ¨ PFS.FileLookup[fullPath, LIST["dl"]  ! PFS.Error => CONTINUE];
+IF reallyName = NIL THEN {
+SenderReport["\nFileLookup failed for %g\n", [rope[fname]] ];
+RETURN;
+};
+pdlStream ¨ PFS.StreamOpen[reallyName ! PFS.Error => { 
+SenderReport["\nPFS.Error: (file %g) %g\n", [rope[PFS.RopeFromPath[reallyName]]], [rope[error.explanation]] ];
+pdlStatus ¨ pdlNotFound;
+CONTINUE} ];
+IF pdlStream = NIL THEN RETURN;
+BEGIN
+insideQuote: BOOL ¨ FALSE;
+DO
+IF pdlStream.EndOf[] THEN { pdlStream.SetIndex[0]; EXIT }	-- no : found
+ELSE {
+c: CHAR = pdlStream.GetChar[];
+SELECT c FROM
+': => IF NOT insideQuote THEN EXIT;	-- leave positioned after :
+'" => insideQuote ¨ NOT insideQuote;
+'\r => {
+SenderReport["\nCR's not allowed in private dl's\n"];
+pdlStream.Close[];
+pdlStatus ¨ pdlSyntaxError;
+RETURN; 
+};
+ENDCASE => NULL;
+};
+ENDLOOP;
+END;
+pdlH ¨ InitializeParse[];
+NameList[pdlH, transport, GetPDLChar, AnotherRName, NIL];
+FinalizeParse[pdlH]; pdlH ¨ NIL;
+pdlStream.Close[];
+END;
+};
+
+AnotherRName: PROC[rName: RName] RETURNS [nameToWrite: ROPE ¨ NIL] = {
+name: ROPE = rName.name;
+IF rName.ns = $file THEN {
+status ¨ includesPrivateDL;
+privateDLCount ¨ privateDLCount + 1;
+ParsePvtDL[name];
+RETURN;
+};
+IF fbEnd=NIL THEN fbEnd ¨ fieldBody ¨ CONS[rName, NIL]
+ELSE fbEnd ¨ fbEnd.rest ¨ CONS[rName, NIL];
+IF ( name.Find["^"] < 0 ) AND ( name.Find["≠"] < 0 ) THEN
+countOfRecipients ¨ countOfRecipients + 1
+ELSE
+IF status = includesPrivateDL THEN privateDLCount ¨ privateDLCount + 1
+ELSE {
+status ¨ includesPublicDL;
+publicDLCount ¨ publicDLCount + 1;
+};
+};
+DRNameListAppend: PROC[one, two: LIST OF RName] RETURNS[LIST OF RName] = {
+tail: LIST OF RName;
+IF one = NIL THEN RETURN[two];
+tail ¨ one;
+UNTIL tail.rest = NIL DO tail ¨ tail.rest; ENDLOOP;
+tail.rest ¨ two;
+RETURN[one];
+};
+
+NameList[pH, transport, GetNextMsgChar, AnotherRName, NIL];
+SELECT index FROM
+toF => IF msg.to = NIL THEN msg.to ¨ fieldBody
+ELSE IF fieldBody#NIL THEN msg.to ¨ DRNameListAppend[msg.to, fieldBody];
+ccF, cF, bccF => IF msg.cc = NIL THEN msg.cc ¨ fieldBody
+ELSE IF fieldBody#NIL THEN msg.cc ¨ DRNameListAppend[msg.cc, fieldBody];
+fromF => IF fieldBody # NIL THEN msg.from ¨ fieldBody.first
+ELSE ERROR MailParse.ParseError[badFieldBody];		-- needs to be non-NIL
+replyToF => NULL;		-- just to syntax check the ReplyTo field
+ENDCASE => ERROR;
+};
+
+pH: ParseHandle;
+field: ROPE ¨ NIL;
+fieldNotRecognized: BOOL;
+mPos ¨ 0;		-- where we are in the fulltext
+status ¨ ok;		-- start with good status
+
+pH ¨ InitializeParse[];
+
+DO
+sPos ¨ mPos;
+field ¨ GetFieldName[pH, GetNextMsgChar ! ParseError =>
+{ FinalizeParse[pH]; GOTO errorExit}];
+IF field = NIL THEN EXIT;
+IF Rope.Equal[field, "Sender", FALSE] OR Rope.Equal[field, "Date", FALSE] THEN
+RETURN[fieldNotAllowed, sPos, mPos];
+
+fieldNotRecognized ¨ TRUE;
+FOR i: SendMailParseMsg.MessageFieldIndex IN SendMailParseMsg.MessageFieldIndex DO {
+mLF ¨ SendMailParseMsg.messageParseArray[i];
+IF Rope.Equal[SendMailParseMsg.messageParseArray[i].name, field, FALSE] THEN {
+fieldNotRecognized ¨ FALSE;
+SELECT mLF.fType FROM
+simpleRope =>
+SELECT i FROM
+fromF => RNameListField[i ! ParseError => GOTO errorExit];
+replyToF => {
+msg.replyTo ¨ TRUE;
+RNameListField[i ! ParseError => GOTO errorExit];
+};
+subjectF => msg.subject ¨ GetFieldBody[pH, GetNextMsgChar];
+voiceF => msg.voiceID ¨ GetFieldBody[pH, GetNextMsgChar];
+ENDCASE => [] ¨ GetFieldBody[pH, GetNextMsgChar, TRUE];
+
+rCatList => [] ¨ GetFieldBody[pH, GetNextMsgChar, TRUE];
+rNameList => RNameListField[i ! ParseError => GOTO errorExit];
+ENDCASE => ERROR;
+EXIT
+};
+};
+ENDLOOP;
+IF fieldNotRecognized THEN
+[] ¨ GetFieldBody[pH, GetNextMsgChar];	-- skip anything not recognized
+ENDLOOP;
+
+FinalizeParse[pH];
+msg.endHeadersPos ¨ mPos - 1;
+
+msg.numRecipients ¨ countOfRecipients; 
+msg.numPublicDLs ¨ publicDLCount;
+msg.numPrivateDLs ¨ privateDLCount;
+IF pdlStatus # ok THEN RETURN[pdlStatus, 0, 0];
+EXITS
+errorExit => RETURN[syntaxError, sPos, mPos];
+};
+
+Blink: PROC[v: Viewer] = { ViewerOps.BlinkIcon[v, IF v.iconic THEN 0 ELSE 1]};
+
+NameForXport: PROC[transport: ATOM] RETURNS[who: ROPE] = {
+retry: BOOL ¨ TRUE;
+DO
+FOR rL: MailBasics.RNameList ¨ SendMailOps.userRNameList, rL.rest UNTIL rL=NIL DO
+IF rL.first.ns # transport THEN LOOP;
+who ¨ rL.first.name;
+EXIT; 
+ENDLOOP;
+IF ( who = NIL ) AND ( SendMailOps.userRNameList # NIL ) THEN who ¨ SendMailOps.userRNameList.first.name;
+IF who # NIL THEN RETURN;
+IF retry THEN DoUserNameAndRegistry[] ELSE RETURN;
+retry ¨ FALSE;
+ENDLOOP;
+};
+
+
+CreateRopeForTextNode: PUBLIC PROC [doc: TextNode.Ref] RETURNS [r: ROPE] ~ {
+docSize: INT ~ TextNode.LocOffset[[doc, 0], TextNode.LastLocWithin[doc]];
+r ¨ Rope.MakeRope[base: doc, size: docSize, fetch: Fetch];
+r ¨ Rope.Substr[r, TextNode.LocOffset[[doc, 0], [TextNode.FirstChild[doc], 0]]];
+};
+
+Fetch: PROC [data: REF, index: INT] RETURNS [CHAR] ~ {
+doc: TextNode.Ref ~ NARROW[data];
+loc: TextNode.Location ~ TextNode.LocRelative[[doc, 0], index];
+IF loc.where < TextEdit.Size[loc.node] THEN {
+char: Char.XCHAR ~ TextEdit.FetchChar[loc.node, loc.where];
+RETURN[VAL[Char.Code[char]]]; -- char MOD 256
+}
+ELSE RETURN['\r];
+};
+
+
+END.
+
+    SendMailImpl.mesa 
+Copyright ” 1984, 1988, 1989, 1990, 1992 by Xerox Corporation.  All rights reserved.
+Hal Murray August 6, 1985 1:04:01 am PDT
+Last Edited by:  Donahue, October 2, 1985 7:59:30 am PDT
+Willie Sue Orr,  February 2, 1990 5:22:27 pm PST
+Last Edited by: Neil Gunther, April 17, 1985 1:06:34 pm PST
+Theimer, April 30, 1990 10:27 pm PDT
+Willie-s, August 6, 1992 1:14 pm PDT
+
+Contents: Implementation of the WalnutMsg Send operation
+************************************************************************
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+first add the From:/Sender: line 
+now put the date at the very front
+for now, if the transport is $xns, we cannot send formatting, on the off chance that the message will need to traverse the ggw, which will reject the message because it has unsupported body parts 
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+transportToUse: ATOM = ( IF transport = $newXNS THEN $xns ELSE transport );
+IF smr.voiceID.Length[] # 0 THEN
+{ MailSend.StartItem[h, Audio]; AddToItem[h, smr.voiceID] };
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+
+check the syntax of the pdl
+name _ SendMailParseMsg.CanonicalName[rName];
+destructive append
+now we are positioned at the beginning of the body of the message
+move from WalnutDocumentRopeImpl
+dont't want chars from the root node, so start at firstChild
+ù O  ñ(cedarcode) styleïNewlineDelimiter
+ò codeöœnúôKöú
+œeúIôTKöœy(ô(Köü8ô8Köú0ô0Köú;ô;Kô$Kô$Kô Köú8ô8óKò öœk	ò	Köú
+†ú†úòKöú†ú†úòKöú†úò#Kö†úòKöú†úò.Köú†ú=òVKò
+Köú	†úaòoKöú†úò'Köú†ú$ò;Köú
+†úò"KòKö†úòKò	KòKöú†úò!KòKòKöú†ú5òKKöú	†úò!Köú	†úDòRKöú†úòKöú†úòKò	Köú†úò"Köú†ú
+òKò
+Köú†úFòWKò óöùú†ú†òö†òKòKö†úG†úòkKöú0ò0Kò&KòKöúòóö†òKòKò óóKö†ú†úò)Kò Köú†úòKö†ú†ú†úòKöú†úò$Köú†úò(Kò Köú†ú†úœcò4Köú6†úò:Köú†ú†úòKò KöúHôHöùú†ú†ú†ú†ú†ú†ú†ú†úòbKöúòKöú†úòKöú†úòö†ú†ú†ú†úò Kò"Köú.†úò4ö†òKöú†úòóKö†úòóKòKöú†úòKòKò óöùú†ú†ú†ú†ú†ú†ú†ú†úòmKöúòKöú†úòKöú†úòö†ú†ú†ú†úò Kò"Köú.†úò5ö†òKöú†úòóKö†úòóKòKöú†úòKòKò óKò KöúUôUöùú†ú†ú†ú†ú†úòWö†ú†úò-Köú†úòKöú†úòKöú†úò	Kò Kö†ú†úòIö†ú°/ò3Kö†ú†ú†úò7Kö†ú$†ú†úò0óö†úòKöúGòGKòóö†òKöúPòPóóKöúòKò óKöúUôUöùú†ú†ú†ú†ú†ú	†úòuKòKöú†úòKöú†úòKòKöú†úòKöú†úòKöú†úò Köú†ú†úò$Kò1Köú†ú,òKKöú†úFòXKöú†úòö
+ùú†ú†ú†ú†úò6Kò ö†ú†úòKò Kö†ú†ú†úò-Kò(Köú ò ö†ú†òKöú?ò?óö†ú†òKöú@ò@óö†ú†òKöúEòEóKöú<ò<òKòOóKò)Kò!Kòóö†ú†úòKöú%ò%KöúoòoKòKò óKöú&°ò;ö†ú†ú†òöúòKòBKöú†úòKòóKö†ú†úòóKòóöùú†úòKòFKòIKò>ö†ú†úòKò;Kò!Kòö†úòKöú†ú"ò+ö†ú'†ú°òDKò9Kò6Kòö†úòKò1Kò!KòóóKòóóKö†ú†ú†ú†úò+KòKò óö†ú†	úò*Kò óKö†ú†ú°ò=Köú	†úòKöú†úòóò ö†ú†ú†ò;òCKö†ú†ò!ò!Köú†úò$Kö†úòóKòKò óóKöú†úò$Kò KòKò Köú†úòö†ú†ú!òAKò2Kò1Kò.óò ö†ú†òòö†ú†úòKöú†ú†úòDKò'KöúBòBKòKö†úFòJóKòKö†òKòóòö†ú†úòKöú†ú†úòDKò'KöúRòRKöúòKö†úIòMóKòKö†òKòóöú!ò!KòKö†òKòóKö†ú†úòKò óö†ú†ú†úò-Kò óKòö†ú†úò;ö†ú$†ú†úò=Kö†ú†ú†ú†ú†ú†úò8Kö†ú†ú†úò/KòóKò óö†ú	†ú†ú òCKò óö†ú°òKò*Kò Köú!ô!ö	ú†ú†ú†ú
+†ú4òrKöúòóKò!Kò<Köú"ô"KöúK†ú†úòXKò6Kò<Kò KôƒKò óKòö†ú†ò!KòCóKò2ö†ú@†ú+òqKö†ú+ò/óKò öú†úò9Köú&†úò-óKöú5ò5Kòdö†ú†ú†òò-Köú>ò>Köú(ò(Kö†úòKòóöúòKò%Köú'°"òIKö†ú†ú†ú†úò#Köú
+†úòKö†úòKòóö†úòKò%Köú4ò4Kö†úòKòóKö†úòóóKöúòKò óö
+ùú†ú†ú†ú(†úògKòEKòIKò=KòKò óöùú†ú†ú†úò8Kö†ú†ú†úòKò$Kòö†ú†úò&Köú†úòKò#ö†òKö†ú†ú†ú†úòKö†ú"†ú†ú†úòAKòKòKö†úòóKòóKòKò óöùú†ú†ú†ú†ú†ú†úòEKö†ú†ú†úòKòKòKòKò óöùú†ú†ú†úòIKöú†ú+òJKö†úò!KòKò óöùú†ú†ú†úò<Kö†ú†ú
+òö†ú†ú†úòKòKòKò-Kò)Kò%KòGö†òKöú†úòóóKö†úòóKò öùú†ú†òKöú†ú	†ú†ú†ú†úòWKöú†ú8òDKöú†ú@†úòPKöúDòDKòóKò öùú†òKöú†ú	†ú†ú†ú†úò^ö†ú†ú
+òKòöùú†úòö†òKòKòKòKòKöú†úòö†ú†ú-ò>Kö†ú8ò<Kò óKòGKòKò#Kò Kö†ú†ú°ò7Kò Kö†ú†ú†ú%ò<KòKö†ú†ú†úò3KòKò Kö†ú†ú°ò7Kò Kò ö†ú†ú†ú†ú†ú†òMò;Köú†úò'óóóKö†úòóKòKö†ú	†ú†ú†ú#òNKòóKö†úòKò óö
+ùú†ú†ú†ú†úò6ö†ú†ú†ú†úòKö†ú	†úò*óKö†úòKò óöùú†ú†ú†úò8ö†ú†ú
+òKòöùú†úòö†òKòKòKòKöú†úòKò,Kò.KòGKòKò6Kò	KòKòö†ú†ú†ú†ò#Kò;óóKö†úòKö†ú	†ú†ú†ú òHóóKö†úòKò óKöúOôOöùú†úI†ú†ú†ú†ú†úò°öùú†ú†úòKö†ú†ú†úòKò*Köú†úòKòóöùú†ú†úòKö†ú†ú†úòKöú†òKòóKò KòKöúS†úòmKòòKò óóö
+ùú†úJ†ú†ú†úòéKö†ú†ú†úò/Kò5Köú	†ú†úòKöú†úòKöú†úòKöú†ú†úòKöú@ò@Kö	ú†ú†ú†ú†úôKKò ö†òKöúUòUKòö†ú†ú†úòö†ú†ú†úò"Köú-ò-KòKòóKòKö†úòóKö†ú†ú†úò-Kòö†ú†ú†úòö†ú†ú†úò"Köú-ò-KòKòóKòKö†úò	óKö†ú†ú†úò-Kò KöúEòEKò Kò4KòJKò Kò?òGKò óö†ú†ú†úòKò4Kò$ö†ú†úòKòDKöú+ò+KòóKòóKò ö†ú†ô Kô<Kò óKö†ú†ú†úò-Kò+òBKöú2†ú'ò^óKö†ú†ú†úòö
+†ú†ú†ú†ú†úòAö†ú†ú†úò5Kö†ú†ú†úò-óKòóö†ú†ú†úò%Köú9ò9Köúcòcö†ú<†ú†ú†òPKöúGòGKö†úòóKòóö†ú†ú†úò!Köú†úòKöújòjKöú[ò[ö†ú8†ú†ú†òLKöúGòGKöú†úòKö†úòóKöú†úòKòKò-KòóKöúòKö†úòKö†úòóKòóKò Kò KöúOôOöù	ú†ú†ú†ú†ú&†úònKö†úòKò"Kö	ú
+†ú†ú†ú†úòKöú	†úòKöú†úò(Köú†ú(ò:Köú2†úò:Kò Kò öùú†ú†ú†úò+ö†ú†úò:ö†ú†ú†ú†ú	ò<Kö†úòóóKòKòóKò öùú†ú/òCKöú†ú†ú	†úò&öœb
+ú†ú	†úò#Köú†úœiò8Köú†ú†ú†úòKöú†ú†úòö†ú†ú†úòKö†ú†ú†úò'Kö†ú†ú†úò*KöúòóKò ö¢
+ú†ú†úò&Köú£ú£úòö	†ú†ú†ú†ú†ò1Köú†ú †úò8Kö†£úòóKöúòóò Köú£$ò'ö†ú†òKò4óö†òKöú†ú2ò<öú†ú†ú†úò`Köú>ò>KòKö†úòóKö†ú†ú†úò*Kö†úòóKò KòKö	ú†ú†ú
+†ú
+†úòKö†ú†ú†úòKöú=ò=Kö†úòKòóöú†ú†úò7Köú2†ú9ònKòKö†úòóKö†ú†ú†ú†úòKô Köúôö†òKöú†ú†úòö†òKö†ú†ú†ú°òGö†úòKöú†úòö†ú†òKö
+ú†ú†ú†ú†ú°ò?Köú†úò$öúòKöú5ò5KöúòKòKö†úòKòóKö†ú†úòóKòóKö†úòóKö†úòóKòKöú4†úò9Köú†úò KöúòKö†úòóKòóKò ö
+ùú†ú†ú†ú†úòFKöú†úòö†ú†úòKòKò$KöúòKö†úòKöúòóKöú-ô-ö
+†ú†ú†ú†ú†úò6Kö†ú†ú†úò+óö†ú†ú†ú*òcö†òKö†ú†ú#òFö†úòKòKò"KòóóóKòóöùú†ú†ú†ú†ú†ú†úòJKôKöú†ú†úòKö†ú†ú†ú†úòKòKö†ú†ú†ú†úò3KòKö†úòKòKò óKöú6†úò;ö†ú†òöú†ú
+†ú†úò.Kö†ú†ú†ú†ú.òHóöú†ú
+†ú†úò8Kö†ú†ú†ú†ú.òHóöú	†ú†ú†úò;Kö†ú†ú&°òFóKöú†ú°)ò<Kö†ú†úòóKöúòKò óKòKöú†ú†úòKöú†úòKöú°ò*Köú°ò'Kò KòKò ö†òKòò7Köú†úò&óö†ú	†ú†ú†úòö	†ú†ú†ú†ú†òNKö†úò$Kò óKöú†úòö†ú'†ú$†úòTò,ö†ú?†ú†úòNKöú†úòö†ú†òòö†ú†òKöú*†úò:öúòKöú†úòKöú!†úò1KöúòóKò;Kò9óKö†ú*†úò7Kò óKöú2†úò8Köú.†úò>Kö†ú†úòKö†òKòóKòóKö†úòö†ú†òKöú'°òFóóóKö†úòóóKò KöúAôAKòKòóò Kò'Kò!Kò#ö†ú†ú†úò/ö†òKöú†úò-óóKöúòKò óö
+ùú†ú'†ú
+†ú†úòNKò óö
+ùú†ú†ú†ú†úò:Köú†ú†úòö†òö†ú?†ú†ú†òQKö†ú†ú†úò%KòKö†úòKö†úòóKö
+†ú	†ú†ú†ú†ú,òiKö†ú†ú†ú†úòKö†ú†ú†ú†úò2Köú†úòKö†úòóKòóKò öú ô Kò ö
+ùú†ú†ú†ú†úòLKöú	†ú=òIKò:Kô<KòPKòóKò öùú†ú†ú	†ú†ú†úò6Köú†úò!Kò?ö†ú%†úò-Köú†ú+ò;Kö†ú†ú°ò-KòKö†ú†úòóKöúòKò óKò óKö†úòKò ó Öó    YX  yØ  

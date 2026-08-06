@@ -1,0 +1,516 @@
+
+
+DIRECTORY
+Arpa USING [ Address, nullAddress ],
+ArpaUDP USING [ Port, nullPort ],
+Atom USING [ GetProp, MakeAtom, PropList, PutProp ],
+Basics USING [ HFromCard16, LowHalf ],
+BasicTime USING [ earliestGMT, GMT, Now, nullGMT, Period, TimeNotKnown, Unpack, Unpacked, Update ],
+Commander USING [ CommandProc, Handle, Register ], 
+CommanderOps USING [ NextArgument ],
+Convert USING [ ArpaAddressFromRope, CardFromRope, RopeFromCard, RopeFromInt ],
+Feedback USING [ CreateRouter ],
+FeedbackClasses USING [ CreateStreamOnRouter ],
+IO,
+IOUtils USING [ CopyPFProcs, PFCodeProc, SetDefaultPFCodeProc, SetPFCodeProc ],
+MBQueue USING [ Create, Queue, QueueClientAction ],
+Process USING [ Pause, SecondsToTicks ],
+ProcessProps USING [ GetProp ],
+RefTab USING [ Create, Fetch, Ref, Store ],
+Rope USING [ Cat, Concat, Equal, Fetch, Find, Length, MakeRope, ROPE, Size, SkipTo, Substr ],
+RPC USING [ MakeKey, EncryptionKey ],
+SimpleMailer USING [ SendMessage ],
+SystemNames USING [ UserName ],
+ThisMachine USING [ Address ],
+UserProfile USING [ Token ],
+VoiceUtils,
+XNSAuth USING [ GetIdentityDetails ],
+XNSCredentials USING [ GetIdentity ]
+;
+
+VoiceUtilsImpl: CEDAR MONITOR -- For report printing synchronization.
+IMPORTS
+Atom,
+Basics,
+BasicTime,
+Commander,
+CommanderOps,
+Convert,
+Feedback,
+FeedbackClasses,
+IO,
+IOUtils,
+MBQueue,
+Process,
+ProcessProps,
+RefTab,
+Rope,
+RPC,
+SimpleMailer,
+SystemNames,
+ThisMachine,
+UserProfile,
+XNSAuth,
+XNSCredentials
+EXPORTS VoiceUtils = {
+OPEN IO;
+
+
+pd: PUBLIC REF VoiceUtils.PD ¨ NEW[VoiceUtils.PD¨[]];
+
+
+ROPE: TYPE = Rope.ROPE;
+STREAM: TYPE = IO.STREAM;
+WhereToReport: TYPE = VoiceUtils.WhereToReport;
+WhereProc: TYPE = VoiceUtils.WhereProc;
+
+WP: TYPE = REF WPRec;
+WPRec: TYPE = RECORD [
+proc: WhereProc,
+fixedWhereData: REF,
+defaultIfNotFound: VoiceUtils.DNFProc¨NIL
+];
+
+RegisterWhereToReport: PUBLIC PROC[
+proc: WhereProc, where: WhereToReport, fixedWhereData: REF,
+defaultIfNotFound: VoiceUtils.DNFProc] = {
+Atom.PutProp[$ReportStreams, where, NEW[WPRec¨[proc: proc, fixedWhereData: fixedWhereData, defaultIfNotFound: defaultIfNotFound]]];
+};
+
+FindWhere: PUBLIC PROC[where: WhereToReport, whereData: REF] RETURNS [s: IO.STREAM] = {
+wp: WP;
+IF where=NIL THEN RETURN[DefaultWhere[NIL, NIL]];
+wp ¨ NARROW[Atom.GetProp[$ReportStreams, where]];
+IF wp#NIL THEN {
+s¨wp.proc[wp.fixedWhereData, whereData];
+IF s#NIL THEN RETURN[s];
+IF wp.defaultIfNotFound#NIL AND wp.defaultIfNotFound[where, whereData] THEN
+RETURN[NIL];
+};
+s ¨ DefaultWhere[NIL, NIL];
+};
+
+DoReport: INTERNAL PROC[remark: ROPE, where: WhereToReport, whereData: REF ¨NIL, problem: BOOL]
+RETURNS[reportValue: ROPE¨NIL] = { -- NIL if report wasn't sent
+ENABLE UNWIND => NULL;
+resetTime: BOOL¨FALSE;
+reportS: STREAM ¨ FindWhere[where, whereData]; {
+ENABLE IO.Error => IF ec=$StreamClosed THEN {
+resetTime ¨ TRUE;
+where ¨ NIL;
+IF reportS # pd.defaultReportStream THEN reportS ¨ pd.defaultReportStream ELSE REJECT;
+RETRY;
+};
+seconds: INT;
+IF remark=NIL OR reportS = NIL THEN RETURN;
+seconds ¨ LogTime[reportS, where, problem, resetTime];
+IF seconds<0 THEN RETURN[NIL];
+reportValue ¨ IO.PutFR["   %02d: %s\n", int[seconds], rope[remark]];
+reportS.PutRope[reportValue]; -- wish I could afford looking up caller.
+};
+};
+
+Report: PUBLIC ENTRY PROC[remark: ROPE, where: WhereToReport, whereData: REF ¨NIL] = {
+ENABLE UNWIND => NULL;
+[] ¨ DoReport[remark, where, whereData, FALSE];
+};
+
+ReportFR: PUBLIC PROC[remark: ROPE, where: WhereToReport, whereData: REF,
+a1, a2, a3: IO.Value ¨ VoiceUtils.nullValue] = {
+Report[IO.PutFR[remark, a1, a2, a3], where, whereData];
+};
+
+Problem: PUBLIC ENTRY PROC[
+remark: ROPE, where: WhereToReport, whereData: REF,
+priority: VoiceUtils.ProblemPriority ¨ maximum] = TRUSTED {
+ENABLE UNWIND => NULL;
+ProblemInt[remark, where, whereData, priority];
+};
+
+ProblemInt: INTERNAL PROC[
+remark: ROPE, where: WhereToReport, whereData: REF,
+priority: VoiceUtils.ProblemPriority ¨ maximum] = TRUSTED {
+reportValue: ROPE;
+IF remark=NIL THEN remark¨"Unspecified problem";
+IF (reportValue¨DoReport[remark, where, whereData, TRUE])#NIL AND
+pd.reportMethods[priority].reportByMail THEN MailReport[reportValue, priority];
+};
+
+ProblemFR: PUBLIC PROC[
+remark: ROPE, where: WhereToReport, whereData: REF, a1, a2: IO.Value,
+priority: VoiceUtils.ProblemPriority ¨ maximum] = TRUSTED {
+Problem[IO.PutFR[remark, a1, a2], where, whereData, priority];
+};
+
+DefaultWhere: WhereProc = {
+s ¨ NARROW[ProcessProps.GetProp[$ErrOut]];
+IF s = NIL THEN s ¨ pd.defaultReportStream;
+};
+
+DefaultWindow: WhereProc = {
+s ¨ pd.defaultReportStream;
+};
+
+SetAttended: Commander.CommandProc = {
+pd.attended ¨ TRUE;
+Report["Attended[TRUE]", $Default, NIL];
+};
+
+ClearAttended: Commander.CommandProc = {
+pd.attended ¨ FALSE;
+Report["Attended[FALSE]", $Default, NIL];
+};
+
+DefaultReport: Commander.CommandProc = {
+Report[CommanderOps.NextArgument[cmd], $DefaultWindow, NIL];
+};
+
+MailReports: Commander.CommandProc = {
+ablement: ATOM ¨ NARROW[cmd.procData.clientData, ATOM];
+onOff: BOOL ¨ SELECT ablement FROM
+$on => TRUE, $off => FALSE, ENDCASE => ERROR;
+pd.reportMethods ¨ ALL[[FALSE, "Swinehart.pa"]];
+pd.reportMethods[$high].reportByMail ¨ onOff;
+pd.reportMethods[$maximum].reportByMail ¨ onOff;
+ReportFR["Mail reporting %g (see VoiceUtilsImpl.pd.reportMethods)",
+$Default, NIL, atom[ablement]];
+};
+
+LogTime: INTERNAL PROC[s: IO.STREAM, where: ATOM, problem: BOOL, resetTime: BOOL] RETURNS [seconds: INT] = {
+oldT: REF BasicTime.Unpacked ¨ NARROW[RefTab.Fetch[logTimes, where].val];
+now: BasicTime.GMT ¨ BasicTime.Now[];
+nowU: BasicTime.Unpacked ¨ BasicTime.Unpack[now];
+i1: INT;
+crowbar: BOOL¨FALSE;
+crowbar ¨ IF problem THEN (problemCount¨problemCount+1) >= pd.problemLimit
+ELSE (reportCount¨reportCount+1) >= pd.reportLimit;
+IF crowbar THEN {
+reportCount¨problemCount¨0;
+IF pd.reportingEnabled THEN ProblemInt["Report limits Exceeded", $System, NIL, maximum];
+pd.reportingEnabled ¨ FALSE;
+intervalStartTime ¨ now;
+};
+i1 ¨ BasicTime.Period[from: intervalStartTime, to: now];
+IF i1 >= pd.limitInterval THEN {
+intervalStartTime ¨ now;
+IF (reportCount+problemCount) <= pd.problemLimit -- severe hysteresis!
+THEN pd.reportingEnabled ¨ TRUE;
+reportCount¨problemCount¨0;
+};
+IF ~pd.reportingEnabled THEN RETURN[-1];
+seconds ¨ nowU.second;
+nowU.second ¨ 0;
+nowU.secondsThisYear ¨ 0;
+IF oldT=NIL THEN {
+oldT¨NEW[BasicTime.Unpacked];
+[]¨RefTab.Store[logTimes, where, oldT];
+};
+IF ~resetTime AND nowU=oldT≠ THEN RETURN;
+oldT≠ ¨ nowU;
+s.PutF1["%g\n", time[now]];
+};
+
+logTimes: RefTab.Ref ¨ RefTab.Create[];
+Envelope: TYPE = REF EnvelopeBody;
+EnvelopeBody: TYPE = RECORD [
+reportValue: ROPE,
+priority: VoiceUtils.ProblemPriority
+];
+
+MailReport: PROC[reportValue: ROPE, priority: VoiceUtils.ProblemPriority] = {
+MBQueue.QueueClientAction[mailbox, QdMailReport,
+NEW[EnvelopeBody¨[reportValue, priority]]];
+};
+
+Q: TYPE = RECORD [
+LOCK: WORD,
+notifier: WORD,
+firstEvent: LIST OF REF
+];
+
+QdMailReport: PROC[r: REF ANY] = {
+envelope: Envelope ¨ NARROW[r];
+now: BasicTime.GMT;
+period: INT;
+to: ROPE;
+WHILE
+(period¨BasicTime.Period[from: lastMailedReportTime, to: (now¨BasicTime.Now[])]) < pd.maximumMailReportInterval DO
+Process.Pause[MIN[77777B, 
+Process.SecondsToTicks[pd.maximumMailReportInterval-period]]];
+ENDLOOP;
+cumulativeValue ¨ Rope.Concat[cumulativeValue, envelope.reportValue];
+currentMailPriority ¨ MAX[currentMailPriority, envelope.priority];
+TRUSTED {IF LOOPHOLE[mailbox, REF Q].firstEvent#NIL THEN RETURN;};
+IF cumulativeValue=NIL THEN RETURN;
+to ¨ pd.reportMethods[currentMailPriority].reportTo;
+IF to#NIL THEN []¨SimpleMailer.SendMessage[
+to: LIST[[$gv, to]], subject: "** Voice Server Report", body: cumulativeValue, validate: FALSE];  -- PCedar conversion - check this!
+lastMailedReportTime ¨ now;
+cumulativeValue ¨ NIL;
+currentMailPriority ¨ minimal;
+};
+
+intervalStartTime: BasicTime.GMT; -- these are variables computing the limit algorithm
+reportCount: INT¨0;
+problemCount: INT¨0;
+lastMailedReportTime: BasicTime.GMT ¨ BasicTime.earliestGMT;
+currentMailPriority: VoiceUtils.ProblemPriority ¨ minimal;
+cumulativeValue: ROPE;
+mailbox: MBQueue.Queue ¨ MBQueue.Create[];
+
+origPrintTime: IOUtils.PFCodeProc ¨ NIL;
+
+PrintTime: IOUtils.PFCodeProc = TRUSTED {
+ts: ROPE ¨ NIL;
+i: INT ¨ 0;
+zipTime: BasicTime.GMT ¨ LOOPHOLE[i];
+WITH v: val SELECT FROM
+time => {
+SELECT v.value FROM
+BasicTime.nullGMT => ts ¨ "<Doomsday>";
+zipTime => ts¨"<BigBang>";
+ENDCASE;
+IF ts#NIL THEN { stream.PutRope[ts]; RETURN; };
+};
+ENDCASE;
+IF origPrintTime#NIL THEN origPrintTime[stream, val, format, char];
+};
+
+Registrize: PUBLIC PROC[name: ROPE] RETURNS [ROPE] = {
+dot: INT;
+IF name=NIL THEN RETURN[NIL];
+dot¨Rope.SkipTo[name, 0, "."];
+IF dot=name.Length[] THEN name¨Rope.Concat[name, DefaultRegistry[]];
+RETURN[name]; };
+
+DefaultRegistry: PROC RETURNS [registry: ROPE] = INLINE {
+name: ROPE=CurrentRName[];
+dot: INT=Rope.SkipTo[name, 0, "."];
+IF dot=name.Length[] THEN ERROR;
+RETURN[name.Substr[dot]];
+};
+
+CurrentRName: PUBLIC PROC RETURNS [ROPE] = {
+name: ROPE ¨ SystemNames.UserName[];
+IF Rope.Find[name, "."] = -1 THEN name ¨ Rope.Concat[name, ".pa"];
+RETURN[UserProfile.Token["Finch.GVName", name]];
+};
+
+CurrentPasskey: PUBLIC PROC[passwordText: ROPE] RETURNS [RPC.EncryptionKey] = {
+IF passwordText=NIL THEN passwordText¨XNSAuth.GetIdentityDetails[XNSCredentials.GetIdentity[]].password;
+RETURN[RPC.MakeKey[passwordText]]; };
+
+LowerCaseRope: PUBLIC PROC[r: ROPE] RETURNS [ROPE] = {
+RETURN[Rope.MakeRope[base: r, size: r.Size[], fetch: LCFetch]]};
+LCFetch: SAFE PROC[data: REF, index: INT] RETURNS [c: CHAR] = TRUSTED {
+SELECT (c¨NARROW[data,ROPE].Fetch[index]) FROM IN ['A..'Z]=>c¨c+('a-'A); ENDCASE};
+RnameToRspec: PUBLIC PROC[name: VoiceUtils.Rname, defaultRegistry: ROPE¨NIL] RETURNS [spec: VoiceUtils.Rspec] ={
+j: INT¨0;
+i: INT;
+WHILE (i¨Rope.SkipTo[s: name, pos: j, skip: "."])#Rope.Size[name] DO j¨i+1; ENDLOOP;
+IF j#0 THEN defaultRegistry¨Rope.Substr[base: name, start: j] ELSE j¨i+1;
+IF Rope.Size[defaultRegistry]=0 THEN RETURN[NIL];
+spec¨NEW[VoiceUtils.RspecBody¨[simpleName: Rope.Substr[name, 0, j-1],
+registry: defaultRegistry]]; };
+RspecToRname: PUBLIC PROC[spec: VoiceUtils.Rspec] RETURNS [name: VoiceUtils.Rname] = {
+RETURN[Rope.Concat[spec.simpleName, Rope.Concat[".", spec.registry]]]; };
+RspecToSortName: PUBLIC PROC[spec: VoiceUtils.Rspec] RETURNS [name: ROPE] ={
+RETURN[Rope.Concat[spec.registry, Rope.Concat[".", spec.simpleName]]]; };
+MakeRName: PUBLIC PROC[name: ROPE, style: VoiceUtils.RNameStyle¨ rNameDotLark]
+RETURNS[rName: ROPE] = {
+s1: VoiceUtils.Rspec = RnameToRspec[name, "lark"];
+s2: VoiceUtils.Rspec = RnameToRspec[s1.simpleName];
+isDotLark: BOOL = s1.registry.Equal["lark", FALSE];
+RETURN[SELECT style FROM
+rName => RspecToRname[s1],
+nameDotLark => IF isDotLark THEN RspecToRname[s1]
+ELSE RspecToRname[s1].Concat[".lark"],
+rNameDotLark => IF s2#NIL THEN 
+IF isDotLark THEN RspecToRname[s1] ELSE ERROR
+ELSE RspecToRname[s1].Concat[".lark"],
+ENDCASE=>NIL];
+};
+
+
+OwnNetAddress: PUBLIC PROC RETURNS [netAddress: VoiceUtils.NetAddress] = {
+arpaAddr: Arpa.Address;
+addrRope: ROPE ¨ ThisMachine.Address[$Arpa];
+arpaAddr ¨ Convert.ArpaAddressFromRope[addrRope];
+netAddress.net ¨ [arpaAddr.c];
+netAddress.host ¨ [arpaAddr.d];
+netAddress.socket ¨ VoiceUtils.nullSocket;
+};
+
+InstanceFromNetAddress: PUBLIC PROC[netAddress: VoiceUtils.NetAddress, suffix: ROPE¨NIL]
+RETURNS [instance: ROPE] = {
+instance ¨ Rope.Cat[Convert.RopeFromInt[netAddress.net, 8, FALSE], "#", 
+Convert.RopeFromInt[netAddress.host, 8, FALSE], "#", suffix];
+};
+SunProtocol: PUBLIC PROC [netAddressRope: ROPE] RETURNS [BOOL] ~ {
+RETURN [ Rope.Equal[s1: Rope.Substr[base: netAddressRope, len: 3], s2: "sun", case: FALSE] ];
+};
+
+SunAddrFromRope: PUBLIC PROC [netAddressRope: ROPE]RETURNS [address: Arpa.Address¨Arpa.nullAddress, port: ArpaUDP.Port¨ArpaUDP.nullPort] = {
+i, j: INT;
+protocol, addrRope, portRope: Rope.ROPE;
+IF netAddressRope=NIL THEN RETURN;
+i ¨ Rope.Find[s1: netAddressRope, s2: "#"];
+protocol ¨ Rope.Substr[base: netAddressRope, len: i];
+IF NOT Rope.Equal[protocol, "sun", FALSE] THEN RETURN;  -- malformed address
+j ¨ Rope.Find[s1: netAddressRope, s2: "#", pos1: i+1];
+addrRope ¨ Rope.Substr[base: netAddressRope, start: i+1, len: j-i-1];
+portRope ¨ Rope.Substr[base: netAddressRope, start: j+1];
+address ¨ Convert.ArpaAddressFromRope[addrRope];
+port ¨ Basics.HFromCard16[Basics.LowHalf[Convert.CardFromRope[portRope]]];
+};
+
+RopeFromSunAddr: PUBLIC PROC[address: ROPE¨NIL, port: CARD] RETURNS [netAddressRope: ROPE] = {
+IF address=NIL THEN
+address ¨ ThisMachine.Address[$Arpa];  -- use Arpa address of this machine
+netAddressRope ¨ Rope.Cat [ "sun#", address, "#", Convert.RopeFromCard[port] ];
+};
+MakeAtom: PUBLIC PROC[rName: VoiceUtils.Rname, case: BOOL¨FALSE] RETURNS [ATOM] = {
+RETURN[Atom.MakeAtom[
+IF ~case THEN LowerCaseRope[rName] ELSE rName]]; };
+
+unique: BasicTime.GMT ¨ BasicTime.earliestGMT;
+
+GetUniqueID: PUBLIC ENTRY PROC RETURNS [CARD32] = {
+now: BasicTime.GMT;
+now ¨ BasicTime.Now[
+! BasicTime.TimeNotKnown => { now ¨ BasicTime.earliestGMT; CONTINUE } ];
+IF BasicTime.Period[from~unique, to~now] > 0
+THEN unique ¨ now
+ELSE unique ¨ BasicTime.Update[unique, 1];
+RETURN[LOOPHOLE[unique]];
+};
+CmdOrToken: PUBLIC PROC[cmd: Commander.Handle, key: ROPE, default: ROPE]
+RETURNS [value: ROPE¨NIL] = {
+value ¨ CommanderOps.NextArgument[cmd];
+IF value#NIL OR value.Equal["NIL", FALSE] THEN RETURN;
+value ¨ UserProfile.Token[key: key, default: default];
+};
+
+{
+r: REF = Atom.GetProp[$Interfaces, $PrintTime];
+origPrintTime ¨
+IF r=NIL THEN IOUtils.SetPFCodeProc[IOUtils.CopyPFProcs[NIL], 't, PrintTime].previous
+ELSE NARROW[r, REF IOUtils.PFCodeProc]≠;
+IF r=NIL THEN
+Atom.PutProp[$Interfaces, $PrintTime, NEW[IOUtils.PFCodeProc ¨ origPrintTime]];
+[]¨IOUtils.SetDefaultPFCodeProc['t, PrintTime];
+};
+
+pd.defaultReportStream ¨ FeedbackClasses.CreateStreamOnRouter[
+Feedback.CreateRouter[], $Default];
+intervalStartTime ¨ BasicTime.Now[];
+RegisterWhereToReport[DefaultWhere, $Default, NIL, NIL];
+RegisterWhereToReport[DefaultWindow, $DefaultWindow, NIL, NIL];
+Commander.Register["DefaultReport", DefaultReport, "Test new Feedback-based reporting"];
+Commander.Register["Attended", SetAttended, "Break on errors"];
+Commander.Register["Unattended", ClearAttended, "Log on errors, then muddle on."];
+Commander.Register["MailReports", MailReports, "Set up default mail-reporting methods for  Problem routines.  See pd.reportMethods.", $on];
+Commander.Register["DontMailReports", MailReports, "Set up default mail-reporting methods for  Problem routines.  See pd.reportMethods.", $off];
+}.
+
+
+  v  VoiceUtilsImpl.mesa
+Copyright ” 1985, 1986, 1987, 1990, 1992 by Xerox Corporation.  All rights reserved.
+Last modified by D. Swinehart, August 10, 1992 11:16 am PDT
+Polle Zellweger (PTZ) August 23, 1990 4:19:48 pm PDT
+AMEvents USING [ CallDebugger ],
+AMEvents,
+Variables
+Copies
+Reporting and Suspending
+
+**PTZ PCedar conversion
+IF pd.attended THEN AMEvents.CallDebugger[remark];
+Determine whether any report limits have been exceeded.  If so, return -1
+Associates Where atoms with print times.
+
+Queue reports, since mailing takes time.
+Send no more than one report in one pd.maximumMailReportInterval period.  Accumulate messages in the interim.
+
+Render null times harmless in printouts
+RName management
+
+This is a hack!  PTZ July 19, 1990 2:13:17 pm PDT
+
+
+Net Address Functions
+
+Sun RPC addresses should look like "sun#[1.2.3.4]#5", where [1.2.3.4] is the Arpa address, and 5 is the port.
+
+
+Random Utilities
+
+case: if FALSE, case considered not important . . . all calls that expect results to match must use FALSE, since implementation is to convert rName to lower case.
+if TRUE, leave rope alone and make the ATOM as is.
+Unique within a session.  May be reused due to rollback or reboot, if ids were generated at more than 1 per second just before the restart.  Not unique across multiple workstations.
+
+CommandTool parsing aid, to VoiceUtils
+
+If token read is "NIL" (or "nil"), return NIL -- allows arguments to be skipped.
+Initialization
+Swinehart, May 9, 1986 11:06:55 am PDT
+Convert to new Cedar communications package
+changes to: DIRECTORY, VoiceUtilsImpl, OwnNetAddress, NetAddressFromRope, InstanceFromNetAddress
+Swinehart, February 9, 1987 9:00:30 am PST
+Add mail message reporting for Problem calls.  Also problem priority, so that not all problems need be reported (all will be, at present, since default is maximum.)  Add control over runaway reports and problem reports.  A message is posted terminating reports until the number drops below some minimum.
+changes to: LogTime, MailReport, Q, QdMailReport, problemCount, cumulativeValue, Commander, MailReports, IF
+Polle Zellweger (PTZ) August 31, 1987 6:46:30 pm PDT
+changes to: VoiceUtilsImpl, DoReport, reportS, DIRECTORY
+Polle Zellweger (PTZ) July 19, 1990 3:08:44 pm PDT
+Trying to eradicate Pups insofar as is possible.  Fairly hacky so far.
+changes to: DIRECTORY, CurrentRName, OwnNetAddress, VoiceUtilsImpl
+Polle Zellweger (PTZ) August 13, 1990 2:19:52 pm PDT
+Add utilities needed for Sun world (export to VoiceUtilsExtras).
+changes to: SunProtocol, SunAddrFromRope, RopeFromSunAddr, unique, GetUniqueID
+Polle Zellweger (PTZ) August 23, 1990 3:05:18 pm PDT
+changes to: DIRECTORY, VoiceUtilsImpl, NetAddressFromRope, InstanceFromNetAddress
+Polle Zellweger (PTZ) August 23, 1990 4:19:48 pm PDT
+changes to: DIRECTORY, OwnNetAddress
+Dan Swinehart June 4, 1992 7:51:47 am PDT
+Eliminate all direct Pup references, remove unneeded functions to extent possible.
+changes to: DIRECTORY, OwnNetAddress
+Dan Swinehart August 10, 1992 9:35:36 am PDT
+Convert default reporting to use a stream on a feedback router that routes to the global default.  Could later use the Feedback router approach more directly in these reports.
+
+ ù D  ïNewlineDelimiter
+ñ(cedarcode) styleò öúôIcodeöú
+œeúIôTJô;Kô4óKò öœk	ò	Jöú	ûúô Köúûúò$Köúûúò!Köúûú*ò4Köúûúò&Köú
+ûúûúAòcKöú
+ûú$ò3Köúûúò$KöúûúBòOKöú	ûúò Köúûúò/KöûúòKöúûúBòOKöúûú&ò3Köúûúò(KöúûúòKöúûúò+Köúûú6ûúò]Köûúûúò%Köúûúò#KöúûúòKöúûúòKöúûúòKòKò%Köúûúò$KòKò óöœnúûúûúœc'òEöûòJô	KöúòKòKò
+Kò
+KòKòKò	KòKöûúòKòKòKòKöúòKöúòKòKöûúòKòKòKòKòKòKòóöûúòKöûúûúòóKò óJô	Kò öúûúûúûúûúûúò5Kò óöúôKò KöûúûúûúòKöûúûúûúûúòKöúûúò/Köúûúò'óKò ôJô KöûúûúûúòöúûúûúòKòKöúûòKöú&ûò)KòKò óöüúûúûúò#Köú7ûò;Köú*ò*Köú$ûú\òÉKöúòóKò öü	úûúûú"ûúûúûúûúòWKöúûúòKöûúûúûúûúûúûúò1Köúûú&ò1öûúûúûúòKò(Köûúûúûúûúòöûúûúûú(ûòKKöûúûúòóKòóKöúûúûúòKöúòóKò öüúûú	ûú#ûúûúûúò_Köûúûúûú†ò?KöûúûúûúòKöúûúûúòKöú	ûúœbò0öûúûú
+ûúûúò-KöúûúòKöúûúòKöûú"ûú"ûúûúòVKöûúòKöúòóKöú	ûúòKöûúûúûúûúûúûúò+Kò6KöûúûúûúûúòKöúûú4òDKöú†)òGKö°òKòKò óöüúûúû
+ú	ûú#ûúûúòVKöûúûúûúòKöú(ûúò/KòóKò ö
+üúûúûú	ûú#ûúòIKöúûú"ò0Köúûú.ò7KòKò óöüúûúû
+úòKöúûú#ûúò3Köú2ûúò;KöûúûúûúòKò/KòKò óöü
+úûúòKöúûú#ûúò3Köú2ûúò;KöúûúòKöûúûúûúò0öûú1ûúûúûòAKöú(ûú#òOóJôJöûúûúô2KòóKò öü	úûúòKöúûú#ûúûúòEKöú2ûúò;Köúûú4ò>KòóKò öüúòKöúûú ò*Köûúûúûúò+KòKò óöüúòKòKòóKò öüúò&KöúûúòKöú#ûúò(KöúòóKò öüúò(KöúûúòKöú$ûúò)KöúòóKò öüúò(Köú7ûúò<KöúòKò óöüúò&Köú
+ûúûúûúò7öúûúûú
+ûò"Kö	úûú
+ûúûúûúò-óKöúûúûúò0Kò-Kò0öúCòCKöú
+ûúòóKöúòKò óöüúûúûúûúûú	ûúûúûúûúûúòlKöúûúûú$òIKöúûúò%Kò1KöúûúòKöú	ûúûúòôIöú
+ûú	ûú1òJKöûú/ò3óöûú	ûúòKòKöûúûú=òXKöúûúòKòKòóKò8öûúûúò Kòöûú/†òFKöûúûúò óKòKöúòóKöûúûúûúò(óKòKòKòöûúûúûúòKöúûúòKò'KòóKöûúûúûúûúò)KòKòKòKò óò'Jô(Jô óKöú
+ûúûúò"öúûúûúòKöúûúòKöú$ò$KòKò óöü
+úûúûú+òMJô(ò0Köûú(ò+óKòKò óöúûúûúòKöûúûúòKöú
+ûúòKöúûúûúûòKòóKò öüúûúûúûúò"KöúûúòKöúûúòKöúûúòKöúûúò	JöúmômöûòKöúoûòröúûú	òKöú>ò>óKöûúòóKòEKöúûú)òBKöûúûúûú
+ûúûúûúûúòBKöûúûúûúûúò#Kò4öûúûúûúò+KöúûúQûú†"òÑóKòKöúûúòKòKòKò óKöúûú†4òVKöúûúòKöúûúòKöú ûúò<Kò:KöúûúòKò*Jô óô'Kò Köú$ûúò(Kò öú ûúò)KöúûúûúòKöúûúòKöúûúûúò%öûúûúûòò	öûú	ûòKò'KòKöûúòóKöûúûúûúûúò/KòóKöûúòóKöûúûúûú*òCKòKò óóôJô öü
+úûúûúûúûúûúò6Köúûúò	Kö
+ûúûúûúûúûúòKòKöûúûú+òDKöûú
+òKò ö
+üúûúûúûúûúò9KöúûúòKöúûúò#Köûúûúûúò KöûúòKöúòKò óóö
+üúûúûúûúûúò,Jô1Köúûúò$Köûúûú!òBKöûú*ò0KöúòKò óöüúûúûúûúûúûúòOKöûúûúûúPòhKöûúûúò%Kò óö
+üúûúûúûúûúò6Köûú:ò@óöüúûúûúûú	ûúûúûúûúòGKöûúûúûúûúûúûúòRóóô öüúûúûú*ûúûúûúòpIintöúûúò	LöúûúòLöûú=ûúûúòTKöûúûú3ûúòIKöûúûúûúûúò1öúûú=òEKòóóöüúûúûúûúòVKöûúCòIóö
+üúûúûúûúûúòLKöûúCòIóöü	úûúûú-òNKöûúûúòKò2Köú3ò3Köúûúûúò3öûúûúûòKòò1Köûú"ò&óöúûúûúûúòKöûúûúûúûò-Köûú"ò&óKöûúûúòóKòKò óJô óôKò öüúûúûúûú(òJKöúòKöú
+ûúò,Kò1KòKòKò*KòKò óö
+üúûúûú,ûúûúòXKöûúûúòöú;ûúòHKöú(ûúò=óKòJô óKômKô öüúûúûúûúûúûúòBKöûúNûúò]KòKò óö
+üúûúûúûúûúRòçKöúûúò
+Köú#ûúò(Köûúûúûúûúò"Kò+Kò5Köûúûúûúûúûú†òLKò6KòEKò9Kò0KòJKòKò óöüúûúûú
+ûúûúûúûúûúò^öûú	ûúûòKöú'†#òJóKòOKòóJô óôJô öüúûúûú ûúûúûúûúòSöú	ûúVûú9ô¢Jöúûú ûúô2óöûúòKöûúûúûúò3óóKò Köúûúò.Kò ö
+üúûúûúûúûúò3KôµKöúûúòKöúPûúò]öûú*ò,KöûúòKöûú&ò*óKöûúûú
+òKöúòóJô óô&Jô ö
+ü
+úûúûúûúûúòHJöú*ûú†"ôPKöûú	ûúûúòKò'Köûúûúûúûúûúûúò6Kò6KòóKò óôòKöúûú)ò/òKöûúûúûú+ûúòUKöûúûúûúò(óöûúûúûòKöú&ûú&òOóKò/KòKò óöúûú%ò>Kò#óKò$Köú.ûúûúò8Köú5ûúûúò?KòXKò?KòRKòãKòêóKòKò Kò ô&Kô+KöúœrTô`óô*KôØKöú¢_ôkóô4Köú¢,ô8óô2KôFKöú¢6ôBóô4Kô@Köú¢BôNóô4Köú¢EôQóô4Köú¢ô$óô)KôRKöú¢ô$óô,KôØóKô ó Öó    8X  W  

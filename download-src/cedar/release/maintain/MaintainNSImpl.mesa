@@ -1,0 +1,1972 @@
+
+DIRECTORY
+Atom USING[ GetPName ],
+AuthenticationP14V2 USING[ Problem, CallProblem ],
+BasicTime USING[ FromNSTime, GetClockPulses, GMT, Now, Period, Pulses, PulsesToSeconds, ToNSTime, UnpackedPeriod, UnpackPeriod ],
+CHEntriesP0V0,
+CHOpsP2V3 USING [ItemObject],
+Convert USING[ CardFromRope, Error, RopeFromCard, RopeFromInt, RopeFromTime, RopeFromXNSAddress, XNSAddressFromRope, XNSHostFromRope ],
+GluePruneHacks USING [CacheEntry, DomainsForServer, ExposeErrorCode, RopeList],
+IO USING[ PutChar, PutF, PutF1, PutRope ],
+MaintainDefs USING[ CmdButton, Level, MyData, MyDataObject, RetrieveProc, What ],
+MaintainProcs USING[ ChangeLooksProc ],
+MaintainMisc USING[ CallForItems, EnumGroups, EnumIndividuals, Plural, Verify ],
+MaintainNS,
+Process USING[Pause, SecondsToTicks],
+Real USING[Fix],
+Rope USING[ Cat, Concat, Equal, Find, FindBackward, Index, Length, Replace, ROPE, Substr ],
+XNS USING[ Address, Host, unknownAddress, unknownHost, unknownSocket ],
+XNSAuth USING[ AuthenticationError, CallError, ChangeMyPasswords, CreateSimpleKey, CreateStrongKey, DeleteSimpleKey, DeleteStrongKey, GetIdentityDetails, Identity, SimpleKeyFromPassword, StrongKeyFromPassword],
+XNSCH USING[ Add, AddAlias, AddGroupProperty, AddItemProperty, AddMember, AddSelf, ChangeItemProperty, Conversation, Delete, DeleteAlias, DeleteMember, DeleteProperty, DeleteSelf, ElementStreamProc, Enumerate, EnumerateDomains, EnumerateOrganizations, Error, ErrorCode, GetProperties, InitiateConversation, IsMember, IsMemberClosure, Item, ListAliases, ListMembers, Lookup, LookupAddressFromRope, LookupItemProperty, Name, Properties, RopeFromItem, TerminateConversation, Which],
+XNSCHACL USING[ AccessList, AddMemberToPropertyACL, DeleteMemberFromPropertyACL, ListMembersOfPropertyACL],
+XNSCHItemOps USING[AddressListFromItem, BoolFromItem, Card32FromItem, Card16IntoItem, Card32IntoItem, CreateNewItem, Error, ItemFromAddressList, ItemFromCard16, ItemFromName, ItemFromRope, NameListFromItem, NameFromItem, NameIntoItem],
+XNSCHName USING[ FieldTooLong, NameFromRope, RopeFromName];
+
+MaintainNSImpl: CEDAR MONITOR LOCKS d USING d: MyData
+IMPORTS Atom, BasicTime, Convert, GluePruneHacks, IO, MaintainDefs, MaintainMisc, Process, Real, Rope, XNSAuth, XNSCH, XNSCHACL, XNSCHItemOps, XNSCHName
+EXPORTS MaintainNS = {
+OPEN CHEntriesP0V0;
+ROPE: TYPE = Rope.ROPE;
+
+MyData: TYPE ~ MaintainDefs.MyData;
+MyDataObject: TYPE ~ MaintainDefs.MyDataObject;
+What: TYPE ~ MaintainDefs.What;
+
+Name: TYPE = XNSCH.Name;
+NameRef: TYPE = REF Name;
+NameList: TYPE = LIST OF NameRef;
+
+Item: TYPE = XNSCH.Item;
+AccessList: TYPE = XNSCHACL.AccessList;
+Identity: TYPE = XNSAuth.Identity;
+
+PropType: TYPE = {unknown, group, rope, name, addressList, authenticationLevel, userData, mailboxInfo};
+
+Property: TYPE = CARD32;
+
+
+DoCommand: PUBLIC PROC [d: MyData, cb: MaintainDefs.CmdButton, name, args: ROPE] = {
+SELECT cb.cmd FROM
+type, isMember => DoTypeCommand[d, cb, name, args];
+set, add, remove, misc => DoUpdateCommand[d, cb, name, args];
+ENDCASE => ERROR;
+};
+
+DoEnumerate: PUBLIC PROC [d: MyData, cb: MaintainDefs.CmdButton, pattern, args: ROPE] = {
+Enumerate: PROC [d: MyData, cb: MaintainDefs.CmdButton, pattern, args: ROPE] = {
+AddNameToOrgList: PROC [name: Name] = {
+nr: NameRef ¬ NEW[Name ¬ name];
+orgNameList ¬ CONS[nr, orgNameList];
+nOrganizations ¬ SUCC[nOrganizations];
+IF d.verbose THEN d.out.PutChar['.];
+};
+AddNameToDomainList: PROC [name: Name] = {
+nr: NameRef ¬ NEW[Name ¬ name];
+domainNameList ¬ CONS[nr, domainNameList];
+nDomains ¬ SUCC[nDomains];
+IF d.verbose THEN d.out.PutChar['.];
+};
+AddNameToFullList: PROC [name: Name] = {
+nr: NameRef ¬ NEW[Name ¬ name];
+fullNameList ¬ CONS[nr, fullNameList];
+nNames ¬ SUCC[nNames];
+};
+ReverseList: PROC [original: NameList] RETURNS[newList: NameList]= {
+FOR list: NameList ¬ original, list.rest UNTIL list = NIL DO
+newList ¬ CONS[list.first, newList];
+ENDLOOP;
+};
+startTime: BasicTime.GMT;
+patternName, pat: Name;
+wildcardInAnyField, wildcardInObject, wildcardInDomain, wildcardInOrganization: BOOL;
+orgNameList, domainNameList, fullNameList: NameList ¬ NIL;
+eC: XNSCH.ErrorCode;
+eW: XNSCH.Which;
+problems: BOOL ¬ FALSE;
+fieldTooLong: BOOL ¬ FALSE;
+patternName ¬ XNSCHName.NameFromRope[pattern
+! XNSCHName.FieldTooLong => {fieldTooLong ¬ TRUE; RESUME;}];
+wildcardInObject ¬ Rope.Find[patternName.object, "*"] >= 0;
+wildcardInDomain ¬ Rope.Find[patternName.domain, "*"] >= 0;
+wildcardInOrganization ¬ Rope.Find[patternName.organization, "*"] >= 0;
+wildcardInAnyField ¬ wildcardInObject OR wildcardInDomain OR wildcardInOrganization;
+IF ~wildcardInAnyField AND cb.what # matches THEN {
+DoCommand[d, cb, pattern, args];
+RETURN;
+};
+pat ¬ patternName;
+startTime ¬ BasicTime.Now[];
+IF d.verbose THEN d.out.PutF1["\n[Starting name expansion of \"%g\"]", [rope[pattern]]];
+IF ~wildcardInOrganization
+THEN AddNameToOrgList[pat]
+ELSE {
+XNSCH.EnumerateOrganizations[c, pat, AddNameToOrgList
+! XNSCH.Error => {
+eC ¬ code;
+eW ¬ which;
+problems ¬ TRUE;
+d.out.PutF["\n=> Error: %g (\"%g\")\n",
+[rope[ExposeErrorCode[eC, LOOPHOLE[eW]]]],
+[rope[XNSCHName.RopeFromName[pat]]]];
+CONTINUE;
+}];
+orgNameList ¬ ReverseList[orgNameList];
+};
+FOR thisOrg: NameList ¬ orgNameList, thisOrg.rest UNTIL (thisOrg = NIL OR d.stop) DO
+domainNameList ¬ NIL;
+pat.organization ¬ thisOrg.first.organization;
+pat.domain ¬ patternName.domain;
+IF d.verbose THEN d.out.PutF1["\n[Org: \"%g\"]", [rope[pat.organization]]];
+IF ~wildcardInDomain
+THEN AddNameToDomainList[pat]
+ELSE {
+XNSCH.EnumerateDomains[c, pat, AddNameToDomainList
+! XNSCH.Error => {
+nOrganizationProblems ¬ nOrganizationProblems+1;
+eC ¬ code;
+eW ¬ which;
+problems ¬ TRUE;
+d.out.PutF["\n=> Error: %g (\"%g\")\n",
+[rope[ExposeErrorCode[eC, LOOPHOLE[eW]]]],
+[rope[XNSCHName.RopeFromName[pat]]]];
+CONTINUE;
+}];
+domainNameList ¬ ReverseList[domainNameList];
+};
+FOR thisDomain: NameList ¬ domainNameList, thisDomain.rest UNTIL (thisDomain = NIL OR d.stop) DO
+firstObjectInDomain: BOOL ¬ TRUE;
+prop: Property;
+host: XNS.Host;
+atom: ATOM;
+IF cb.what = matches THEN atom ¬ NARROW[d.cmdData];
+fullNameList ¬ NIL;
+pat.organization ¬ thisDomain.first.organization;
+pat.domain ¬ thisDomain.first.domain;
+pat.object ¬ patternName.object;
+IF d.verbose THEN d.out.PutF["\n  [Domain: \"%g:%g\"]", [rope[pat.domain]], [rope[pat.organization]]];
+IF cb.what = matches THEN prop ¬ PropertyFromAtom[atom, d];
+IF cb.what = matches AND atom # $GroupsAndUsers
+THEN {
+d.out.PutF1["(matching: %g) ... ", [rope[GetPropertyInfo[prop].shortLabel]]];
+XNSCH.Enumerate[c, pat, prop, AddNameToFullList
+! XNSCH.Error => {
+nDomainProblems ¬ nDomainProblems+1;
+eC ¬ code;
+eW ¬ which;
+problems ¬ TRUE;
+d.out.PutF["\n=> Error: %g (\"%g\")\n",
+[rope[ExposeErrorCode[eC, LOOPHOLE[eW]]]],
+[rope[XNSCHName.RopeFromName[pat]]]];
+CONTINUE;
+}];
+}
+ELSE {
+IF MaintainMisc.EnumGroups[cb] THEN
+XNSCH.Enumerate[c, pat, userGroup, AddNameToFullList
+! XNSCH.Error => {
+nDomainProblems ¬ nDomainProblems+1;
+eC ¬ code;
+eW ¬ which;
+problems ¬ TRUE;
+d.out.PutF["\n=> Error: %g (\"%g\")\n",
+[rope[ExposeErrorCode[eC, LOOPHOLE[eW]]]],
+[rope[XNSCHName.RopeFromName[pat]]]];
+CONTINUE;
+}];
+IF MaintainMisc.EnumIndividuals[cb] THEN
+XNSCH.Enumerate[c, pat, user, AddNameToFullList
+! XNSCH.Error => {
+nDomainProblems ¬ nDomainProblems+1;
+eC ¬ code;
+eW ¬ which;
+problems ¬ TRUE;
+d.out.PutF["\n=> Error: %g (\"%g\")\n",
+[rope[ExposeErrorCode[eC, LOOPHOLE[eW]]]],
+[rope[XNSCHName.RopeFromName[pat]]]];
+CONTINUE;
+}];
+};
+fullNameList ¬ ReverseList[fullNameList];
+IF cb.what = matches AND prop = addressList
+THEN host ¬ HostAddressFromSelection[d];
+FOR thisName: NameList ¬ fullNameList, thisName.rest UNTIL (thisName = NIL OR d.stop) DO
+IF cb.what = matches THEN {
+name: Name ¬ thisName.first­;
+IF prop # addressList OR host = XNS.unknownHost OR MatchHostAddressForObject[host, name] THEN {
+IF ~d.firstTime
+THEN d.out.PutRope[", "]
+ELSE d.firstTime ¬ FALSE;
+d.out.PutF1["\"%g\"", [rope[XNSCHName.RopeFromName[name]]]];
+};
+LOOP;
+};
+IF firstObjectInDomain THEN {
+IF d.verbose THEN d.out.PutChar['\n];
+firstObjectInDomain ¬ FALSE;
+};
+DoCommand[d, cb, XNSCHName.RopeFromName[thisName.first­], args];
+ENDLOOP;
+ENDLOOP;
+ENDLOOP;
+IF nNames > 1 OR nDomains > 1 OR nOrganizations > 1 THEN {
+d.out.PutF["\n(%g %g", [cardinal[nNames]], [rope[MaintainMisc.Plural["name", "names", nNames]]]];
+IF nDomains > 1 OR nOrganizations > 1 THEN
+d.out.PutF[" in %g %g", [cardinal[nDomains]], [rope[MaintainMisc.Plural["domain", "domains", nDomains]]]];
+IF nOrganizations > 1 THEN
+d.out.PutF[" in %g %g", [cardinal[nOrganizations]], [rope[MaintainMisc.Plural["organization", "organizations", nOrganizations]]]];
+d.out.PutRope[" enumerated."];
+IF nDomainProblems > 0 OR nOrganizationProblems > 0 THEN {
+d.out.PutRope["  Problems with "];
+d.out.PutF["%g %g and", [cardinal[nDomainProblems]], [rope[MaintainMisc.Plural["domain", "domains", nDomainProblems]]]];
+d.out.PutF[" %g %g.)", [cardinal[nOrganizationProblems]], [rope[MaintainMisc.Plural["organization", "organizations", nOrganizationProblems]]]];
+}
+ELSE d.out.PutChar[')];
+};
+IF d.verbose THEN d.out.PutF["\n[Start: %g, Stop: %g]", [rope[Convert.RopeFromTime[startTime]]], [rope[Convert.RopeFromTime[BasicTime.Now[]]]]];
+};
+c: XNSCH.Conversation ¬ XNSCH.InitiateConversation[d.identity, d.conversationAddress];
+nNames, nDomains, nOrganizations: CARD ¬ 0;
+nDomainProblems, nOrganizationProblems: CARD ¬ 0;
+Enumerate[d, cb, pattern, args];
+XNSCH.TerminateConversation[c];
+};
+
+DoForEachArgument: PROC [d: MyData, c: XNSCH.Conversation, proc: PROC[Name, ROPE, Name, ROPE, BOOL], check: BOOL ¬ TRUE, doDisting: BOOL ¬ TRUE, leader: ROPE ¬ "\n"] = {
+FOR argList: LIST OF ROPE ¬ d.argList, argList.rest WHILE argList # NIL DO
+name, distingName: Name;
+nameRope, distingNameRope, thisArg: ROPE;
+problems: BOOL;
+thisArg ¬ argList.first;
+name ¬ XNSCHName.NameFromRope[thisArg
+! XNSCHName.FieldTooLong => RESUME];
+nameRope ¬ XNSCHName.RopeFromName[name];
+IF doDisting
+THEN [distingName, problems, , ] ¬ DistinguishedName[name, c]
+ELSE problems ¬ TRUE;
+IF ~problems THEN distingNameRope ¬ XNSCHName.RopeFromName[distingName];
+IF check AND ~CheckName[name] THEN {
+IF MaintainMisc.Verify[d] THEN {
+d.out.PutF1["\n\"%g\" is NOT a valid name.", [rope[nameRope]]];
+RETURN;
+};
+d.out.PutF["%g(\"%g\" is an invalid name) ... ", [rope[leader]], [rope[nameRope]]];
+};
+proc[name, nameRope, distingName, distingNameRope, ~problems];
+ENDLOOP;
+};
+
+DoUpdateCommand: PROC [d: MyData, cb: MaintainDefs.CmdButton, name, args: ROPE] = {
+UpdatePassword: PROC = {
+SELECT cb.cmd FROM
+set => {
+type: ROPE ¬ IF cb.what = password THEN "strong" ELSE "simple";
+idName, dIdName, dParmName: Name;
+sameName: BOOL;
+dIdNameRope, dParmNameRope: ROPE;
+idName ¬ XNSAuth.GetIdentityDetails[d.identity].name;
+[dIdName, problems, , ] ¬ DistinguishedName[idName, c];
+dIdNameRope ¬ XNSCHName.RopeFromName[dIdName];
+IF problems THEN {
+d.out.PutF1["\nSorry, unable to discern logged-in user: \"%g\"?  Password not changed.", [rope[dIdNameRope]]];
+RETURN;
+};
+[dParmName, problems, , ] ¬ DistinguishedName[nsName, c];
+dParmNameRope ¬ XNSCHName.RopeFromName[dParmName];
+IF problems THEN {
+d.out.PutF1["\nSorry, unable to distinguish name: \"%g\".  Password not changed.", [rope[dParmNameRope]]];
+RETURN;
+};
+sameName ¬  Rope.Equal[dIdNameRope, dParmNameRope, FALSE];
+SELECT TRUE FROM
+sameName, d.level = normal, d.level = owner => {
+IF ~sameName THEN {
+d.out.PutF["\nSorry, in Normal and Owner level the provided name must be the same as the logged in user (\"%g\" # \"%g\").  Password not changed.", [rope[dParmNameRope]], [rope[dIdNameRope]]];
+RETURN;
+};
+d.out.PutF["\nChanging my (%g) password (%g) ...", [rope[type]], [rope[dIdNameRope]]];
+[] ¬ XNSAuth.ChangeMyPasswords[d.identity, args, cb.what = password, cb.what = simple
+! XNSAuth.AuthenticationError => {
+d.out.PutF1[" Error: %g.", [rope[ExposeAuthProblem[problem]]]];
+problems ¬ TRUE;
+CONTINUE
+};
+XNSAuth.CallError => {
+d.out.PutF1[" Error: %g.", [rope[ExposeAuthCallProblem[problem]]]];
+problems ¬ TRUE;
+CONTINUE
+};
+];
+};
+ENDCASE => {
+d.out.PutF["\nChanging (%g) password for \"%g\" ...", [rope[type]], [rope[name]]];
+d.out.PutF1[" deleting existing %g key ...", [rope[type]]];
+IF cb.what = password
+THEN [] ¬ XNSAuth.DeleteStrongKey[d.identity, nsName
+! XNSAuth.AuthenticationError => {
+d.out.PutF1[" %g ...", [rope[ExposeAuthProblem[problem]]]];
+problems ¬ TRUE;
+CONTINUE
+};
+XNSAuth.CallError => {
+d.out.PutF1[" %g ...", [rope[ExposeAuthCallProblem[problem]]]];
+problems ¬ TRUE;
+CONTINUE
+};
+]
+ELSE [] ¬ XNSAuth.DeleteSimpleKey[d.identity, nsName
+! XNSAuth.AuthenticationError => {
+d.out.PutF1[" %g ...", [rope[ExposeAuthProblem[problem]]]];
+problems ¬ TRUE;
+CONTINUE
+};
+XNSAuth.CallError => {
+d.out.PutF1[" %g ...", [rope[ExposeAuthCallProblem[problem]]]];
+problems ¬ TRUE;
+CONTINUE
+};
+];
+problems ¬ FALSE;
+d.out.PutF1[" creating new %g key ...", [rope[type]]];
+IF cb.what = password
+THEN [] ¬ XNSAuth.CreateStrongKey[d.identity, nsName, XNSAuth.StrongKeyFromPassword[args]
+! XNSAuth.AuthenticationError => {
+d.out.PutF1[" %g ...", [rope[ExposeAuthProblem[problem]]]];
+problems ¬ TRUE;
+CONTINUE
+};
+XNSAuth.CallError => {
+d.out.PutF1[" %g ...", [rope[ExposeAuthCallProblem[problem]]]];
+problems ¬ TRUE;
+CONTINUE
+};
+]
+ELSE [] ¬ XNSAuth.CreateSimpleKey[d.identity, nsName, XNSAuth.SimpleKeyFromPassword[args]
+! XNSAuth.AuthenticationError => {
+d.out.PutF1[" %g ...", [rope[ExposeAuthProblem[problem]]]];
+problems ¬ TRUE;
+CONTINUE
+};
+XNSAuth.CallError => {
+d.out.PutF1[" %g ...", [rope[ExposeAuthCallProblem[problem]]]];
+problems ¬ TRUE;
+CONTINUE
+};
+];
+};
+IF ~problems
+THEN d.out.PutRope[" ok."]
+ELSE d.out.PutRope[" errors."];
+};
+ENDCASE =>  NotImplementedYet[d];
+};
+UpdateAlias: PROC = {
+UpdateOneAlias: PROC [thisName: Name, thisNameRope: ROPE, distingName: Name, distingNameRope: ROPE, disting: BOOL] = {
+SELECT cb.cmd FROM
+add => {
+IF disting THEN
+d.out.PutF1["\nSorry, that alias/name (%g) is already taken.", [rope[thisNameRope]]]
+ELSE {
+d.out.PutF["\nAdding alias \"%g\" for \"%g\" ...", [rope[thisNameRope]], [rope[name]]];
+[] ¬ XNSCH.AddAlias[c, nsName, thisName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+};
+remove => {
+IF ~disting THEN
+d.out.PutF1["\nSorry, that alias (%g) is not currently assigned.", [rope[thisNameRope]]]
+ELSE {
+d.out.PutF1["\nRemoving alias \"%g\" ...", [rope[thisNameRope]]];
+[] ¬ XNSCH.DeleteAlias[c, thisName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+};
+ENDCASE => NotImplementedYet[d];
+IF problems THEN {
+d.out.PutF1[" Error => %g", [rope[ExposeErrorCode[eC, LOOPHOLE[eW]]]]];
+problems ¬ FALSE;
+}
+ELSE d.out.PutRope[" ok."];
+};
+DoForEachArgument[d, c, UpdateOneAlias, FALSE, TRUE];
+};
+
+RemoveProperty: PROC [prop: Property] = {
+d.out.PutF["\nRemoving %g property from \"%g\" ...", [rope[ExposePropertyCode[prop]]], [rope[name]]];
+[] ¬ XNSCH.DeleteProperty[c, nsName, prop
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+
+UpdateRemark: PROC = {
+SELECT cb.what FROM
+individualRemark => {
+d.out.PutF["\nSetting remark for \"%g\" to \"%g\" ...", [rope[name]], [rope[args]]];
+[] ¬ XNSCH.ChangeItemProperty[c, nsName, user, XNSCHItemOps.ItemFromRope[args].newItem
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+groupRemark => {
+d.out.PutF["\nSetting remark for \"%g\" to \"%g\" ...", [rope[name]], [rope[args]]];
+[] ¬ XNSCH.ChangeItemProperty[c, nsName, userGroup, XNSCHItemOps.ItemFromRope[args].newItem
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+ENDCASE => NotImplementedYet[d];
+IF problems THEN {
+d.out.PutF1[" Error => %g", [rope[ExposeErrorCode[eC, LOOPHOLE[eW]]]]];
+problems ¬ FALSE;
+}
+ELSE {
+d.out.PutRope[" ok."];
+};
+};
+UpdateProperties: PROC = {
+atom: ATOM ¬ NARROW[d.cmdData];
+SetRopeProperty: PROC [prop: Property, type, value: ROPE] = {
+d.out.PutF["\nSetting %g for \"%g\" to \"%g\" ...", [rope[type]], [rope[name]], [rope[value]]];
+problems ¬ FALSE;
+[] ¬ XNSCH.AddItemProperty[c, nsName, prop, XNSCHItemOps.ItemFromRope[value].newItem
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+IF problems THEN {
+problems ¬ FALSE;
+[] ¬ XNSCH.ChangeItemProperty[c, nsName, prop, XNSCHItemOps.ItemFromRope[value].newItem
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+};
+SetNamePropertyFromRope: PROC [prop: Property, type, value: ROPE] = {
+item: Item;
+thisName: Name;
+d.out.PutF["\nSetting %g for \"%g\" to \"%g\" ...", [rope[type]], [rope[name]], [rope[value]]];
+thisName ¬ XNSCHName.NameFromRope[value
+! XNSCHName.FieldTooLong => {RESUME}];
+item ¬ XNSCHItemOps.ItemFromName[thisName].newItem;
+problems ¬ FALSE;
+[] ¬ XNSCH.AddItemProperty[c, nsName, prop, item
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+IF problems THEN {
+problems ¬ FALSE;
+[] ¬ XNSCH.ChangeItemProperty[c, nsName, prop, item
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+};
+SetListOfCard16PropertyFromRope: PROC [prop: Property, type, value: ROPE] = {
+item: Item ¬ ItemFromListOfCard16Rope[value];
+problems ¬ FALSE;
+IF item = NIL THEN {
+d.out.PutF1["\n\"%g\" is not a valid list of CARD16.", [rope[value]]];
+RETURN;
+};
+d.out.PutF["\nSetting %g for \"%g\" to \"%g\" ...", [rope[type]], [rope[name]], [rope[value]]];
+[] ¬ XNSCH.AddItemProperty[c, nsName, prop, item
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+IF problems THEN {
+problems ¬ FALSE;
+[] ¬ XNSCH.ChangeItemProperty[c, nsName, prop, item
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+};
+SELECT atom FROM
+$UserFileService => NotImplementedYet[d];
+$AddressList => {
+addresses: LIST OF XNS.Address;
+addresses ¬ AddressListFromRopeList[args
+! Convert.Error => {problems ¬ TRUE; CONTINUE}];
+IF problems THEN {
+d.out.PutF1["\nSorry, but you have given an invalid address: \"%g\"", [rope[args]]];
+GOTO someProblems;
+};
+d.out.PutRope["\nSetting the Address List property to: "];
+PutAddressList[d, addresses];
+d.out.PutRope[" ..."];
+problems ¬ FALSE;
+[] ¬ XNSCH.ChangeItemProperty[c, nsName, addressList, XNSCHItemOps.ItemFromAddressList[addresses].newItem
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+IF problems THEN {
+problems ¬ FALSE;
+[] ¬ XNSCH.AddItemProperty[c, nsName, addressList, XNSCHItemOps.ItemFromAddressList[addresses].newItem
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+d.out.PutF1[" %g.", [rope[IF ~problems THEN "ok" ELSE "errors"]]];
+EXITS
+someProblems => NULL;
+};
+$PrintService => SetRopeProperty[printService, "print service remark", args];
+$FileSerivce => SetRopeProperty[fileService, "file service remark", args];
+$CHService => SetRopeProperty[clearinghouseService, "clearingHouse service remark", args];
+$UserRemark => SetRopeProperty[user, "user remark", args];
+$GroupRemark => SetRopeProperty[userGroup, "group remark", args];
+$AssociatedWorkstation => SetNamePropertyFromRope[associatedWorkstation, "Associated Workstation name", args];
+$RopePropFromSelection => SetRopeProperty[PropertyFromSelection[d], ExposePropertyCode[PropertyFromSelection[d]], args];
+$NamePropFromSelection => SetNamePropertyFromRope[PropertyFromSelection[d], ExposePropertyCode[PropertyFromSelection[d]], args];
+$ListOfCard16PropFromSelection => SetListOfCard16PropertyFromRope[PropertyFromSelection[d], ExposePropertyCode[PropertyFromSelection[d]], args];
+ENDCASE => NotImplementedYet[d];
+IF problems THEN {
+d.out.PutF1[" Error => %g", [rope[ExposeErrorCode[eC, LOOPHOLE[eW]]]]];
+problems ¬ FALSE;
+}
+ELSE {
+d.out.PutRope[" ok."];
+};
+};
+UpdateMember: PROC = {
+UpdateOneMember: PROC [thisName: Name, thisNameRope: ROPE, distingName: Name, distingNameRope: ROPE, disting: BOOL]= {
+myGroup: Name ¬ nsName;
+myGroupRope: ROPE ¬ name;
+changed: BOOL ¬ FALSE;
+IF d.level IN [normal..owner] THEN
+[myGroup, myGroupRope, changed] ¬ GetPossibleSubList[nsName];
+SELECT cb.cmd FROM
+add => {
+IF disting THEN {
+d.out.PutF["\nAdding member \"%g\" to \"%g\" ...", [rope[distingNameRope]], [rope[name]]];
+IF changed THEN d.out.PutF1[" split-list, using \"%g\" sub-list ...", [rope[myGroupRope]]];
+[] ¬ XNSCH.AddMember[c, myGroup, prop, distingName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+}
+ELSE {
+d.out.PutF["\nAdding (possibly not distinguished) member \"%g\" to \"%g\" ...", [rope[thisNameRope]], [rope[name]]];
+IF changed THEN d.out.PutF1[" split-list, using \"%g\" sub-list ...", [rope[myGroupRope]]];
+[] ¬ XNSCH.AddMember[c, myGroup, prop, thisName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+};
+remove => {
+d.out.PutF["\nRemoving member \"%g\" from \"%g\" ...", [rope[thisNameRope]], [rope[name]]];
+IF changed THEN d.out.PutF1[" split-list, using \"%g\" sub-list ...", [rope[myGroupRope]]];
+[] ¬ XNSCH.DeleteMember[c, myGroup, prop, thisName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+IF problems THEN {
+[distingName, problems, , ] ¬ DistinguishedName[thisName, c];
+IF ~problems THEN {
+distingNameRope ¬ XNSCHName.RopeFromName[distingName];
+d.out.PutF1[" trying distinguished name \"%g\" ...", [rope[distingNameRope]]];
+[] ¬ XNSCH.DeleteMember[c, myGroup, prop, distingName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+};
+};
+ENDCASE => NotImplementedYet[d];
+IF problems THEN {
+d.out.PutF1[" Error => %g", [rope[ExposeErrorCode[eC, LOOPHOLE[eW]]]]];
+problems ¬ FALSE;
+}
+ELSE d.out.PutRope[" ok."];
+};
+DoForEachArgument[d, c, UpdateOneMember, cb.cmd = add, cb.cmd = add];
+};
+UpdateOwner: PROC = {
+UpdateOneOwner: PROC [thisName: Name, thisNameRope: ROPE, distingName: Name, distingNameRope: ROPE, disting: BOOL]= {
+SELECT cb.cmd FROM
+add => {
+IF disting THEN {
+d.out.PutF["\nAdding owner (administrator) \"%g\" to \"%g\" ...", [rope[distingNameRope]], [rope[name]]];
+[] ¬ XNSCHACL.AddMemberToPropertyACL[c, nsName, members, administrators, distingName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+}
+ELSE {
+d.out.PutF["\nAdding (possibly not distinguished) owner (administrator) \"%g\" to \"%g\" ...", [rope[thisNameRope]], [rope[name]]];
+[] ¬ XNSCHACL.AddMemberToPropertyACL[c, nsName, members, administrators, thisName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+};
+remove => {
+d.out.PutF["\nRemoving owner (administrator) \"%g\" from \"%g\" ...", [rope[thisNameRope]], [rope[name]]];
+[] ¬ XNSCHACL.DeleteMemberFromPropertyACL[c, nsName, members, administrators, thisName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+IF problems THEN {
+[distingName, problems, , ] ¬ DistinguishedName[thisName, c];
+IF ~problems THEN {
+d.out.PutF1[" trying distinguished name \"%g\" ...", [rope[distingNameRope]]];
+[] ¬ XNSCHACL.DeleteMemberFromPropertyACL[c, nsName, members, administrators, distingName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+};
+};
+ENDCASE => NotImplementedYet[d];
+IF problems THEN {
+d.out.PutF1[" Error => %g", [rope[ExposeErrorCode[eC, LOOPHOLE[eW]]]]];
+problems ¬ FALSE;
+}
+ELSE d.out.PutRope[" ok."];
+};
+DoForEachArgument[d, c, UpdateOneOwner, cb.cmd = add, cb.cmd = add];
+};
+UpdateFriend: PROC = {
+UpdateOneFriend: PROC [thisName: Name, thisNameRope: ROPE, distingName: Name, distingNameRope: ROPE, disting: BOOL]= {
+SELECT cb.cmd FROM
+add => {
+IF disting THEN {
+d.out.PutF["\nAdding friend (self-controller) \"%g\" to \"%g\" ...", [rope[distingNameRope]], [rope[name]]];
+[] ¬ XNSCHACL.AddMemberToPropertyACL[c, nsName, members, selfControl, distingName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+}
+ELSE {
+d.out.PutF["\nAdding (possibly not distinguished) friend (self-controller) \"%g\" to \"%g\" ...", [rope[thisNameRope]], [rope[name]]];
+[] ¬ XNSCHACL.AddMemberToPropertyACL[c, nsName, members, selfControl, thisName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+};
+remove => {
+d.out.PutF["\nRemoving friend (self-controller) \"%g\" from \"%g\" ...", [rope[thisNameRope]], [rope[name]]];
+[] ¬ XNSCHACL.DeleteMemberFromPropertyACL[c, nsName, members, selfControl, thisName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+IF problems THEN {
+[distingName, problems, , ] ¬ DistinguishedName[thisName, c];
+IF ~problems THEN {
+d.out.PutF1[" trying distinguished name \"%g\" ...", [rope[distingNameRope]]];
+[] ¬ XNSCHACL.DeleteMemberFromPropertyACL[c, nsName, members, selfControl, distingName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+};
+};
+ENDCASE => NotImplementedYet[d];
+IF problems THEN {
+d.out.PutF1[" Error => %g", [rope[ExposeErrorCode[eC, LOOPHOLE[eW]]]]];
+problems ¬ FALSE;
+}
+ELSE d.out.PutRope[" ok."];
+};
+DoForEachArgument[d, c, UpdateOneFriend, FALSE, cb.cmd = add];
+};
+UpdateSelf: PROC = {
+myGroup: Name;
+myGroupRope: ROPE;
+changed: BOOL ¬ FALSE;
+[myGroup, myGroupRope, changed] ¬ GetPossibleSubList[nsName];
+SELECT cb.cmd FROM
+add => {
+d.out.PutF1["\nAdding self to \"%g\" ...", [rope[name]]];
+IF changed THEN d.out.PutF1[" split-list, using \"%g\" sub-list ...", [rope[myGroupRope]]];
+[] ¬ XNSCH.AddSelf[c, myGroup, members
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+remove => {
+d.out.PutF1["\nRemoving self from \"%g\" ...", [rope[name]]];
+IF changed THEN d.out.PutF1[" split-list, using \"%g\" sub-list ...", [rope[myGroupRope]]];
+[] ¬ XNSCH.DeleteSelf[c, myGroup, members
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+ENDCASE => NotImplementedYet[d];
+IF problems THEN {
+d.out.PutF1[" Error => %g", [rope[ExposeErrorCode[eC, LOOPHOLE[eW]]]]];
+problems ¬ FALSE;
+}
+ELSE {
+d.out.PutRope[" ok."];
+};
+};
+UpdateOccurrences: PROC = {
+SELECT cb.cmd FROM
+add => NotImplementedYet[d];
+remove => NotImplementedYet[d];
+ENDCASE => NotImplementedYet[d];
+};
+UpdateMailbox: PROC = {
+properties: XNSCH.Properties ¬ GetProperties[nsName, c];
+item: Item;
+mbl: LIST OF ROPE  ¬ NIL;
+existingMailboxes: LIST OF ROPE ¬ NIL;
+IF HasProperty[mailboxes, properties]
+THEN existingMailboxes ¬ GetExistingMailboxes[nsName, c]
+ELSE {
+d.out.PutRope[" creating mailboxes property ..."];
+[] ¬ XNSCH.AddItemProperty[c, nsName, mailboxes, MailboxItemFromList[NIL]
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+FOR l: LIST OF ROPE ¬ d.argList, l.rest WHILE l # NIL DO
+distingName: Name;
+problems: BOOL;
+[distingName, problems, , ] ¬ DistinguishedNameFromRope[l.first];
+IF problems THEN
+distingName ¬ XNSCHName.NameFromRope[l.first];
+mbl ¬ CONS[XNSCHName.RopeFromName[distingName], mbl];
+ENDLOOP;
+SELECT cb.cmd FROM
+add => {
+existingMailboxes ¬ AddRopesToList[existingMailboxes, mbl];
+};
+remove => {
+existingMailboxes ¬ RemoveRopesFromList[existingMailboxes, d.argList];
+existingMailboxes ¬ RemoveRopesFromList[existingMailboxes, mbl];
+};
+ENDCASE => {
+NotImplementedYet[d];
+RETURN;
+};
+IF existingMailboxes = NIL THEN {
+d.out.PutRope[" no more mailboxes, deleting mailboxes property ..."];
+[] ¬ XNSCH.DeleteProperty[c, nsName, mailboxes
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+}
+ELSE {
+d.out.PutRope[" changing mailboxes property to: "];
+PutRopeList[d, existingMailboxes];
+d.out.PutRope[" ..."];
+item ¬ MailboxItemFromList[existingMailboxes];
+[] ¬ XNSCH.ChangeItemProperty[c, nsName, mailboxes, item
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+};
+UpdateForwarding: PROC = {
+DoNothingEnumeratorProc: PROC [XNSCH.ElementStreamProc] = {RETURN};
+GetProperties: PROC [name: Name] RETURNS [XNSCH.Properties] = {
+[, properties] ¬ XNSCH.GetProperties[c, name
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+RETURN[properties];
+};
+HasAtLeastOneMember: PROC [group: Name] RETURNS[BOOL] = {
+BumpCount: PROC [name: Name] = {
+count ¬ count + 1;
+};
+count: CARD ¬ 0;
+[] ¬ XNSCH.ListMembers[c, group, members, BumpCount
+! XNSCH.Error => {CONTINUE}];
+RETURN[count > 0];
+};
+properties: XNSCH.Properties ¬ GetProperties[nsName];
+d.out.PutF[" %g forwarding %g \"%g\"...",
+[rope[SELECT cb.cmd FROM
+add => "adding",
+remove => "removing",
+ENDCASE => "???"]],
+[rope[SELECT cb.cmd FROM
+add => "to",
+remove => "from",
+ENDCASE => "???"]],
+[rope[name]]];
+IF ~HasProperty[user, properties] THEN {
+d.out.PutRope[" must be a user."];
+RETURN;
+};
+SELECT cb.cmd FROM
+add => {
+IF HasProperty[mailboxes, properties] THEN {
+d.out.PutRope[" This user presently has Mailboxes, they should be removed ..."];
+};
+IF HasProperty[userGroup, properties]
+THEN d.out.PutRope[" group property already exists ..."]
+ELSE {
+d.out.PutRope[" adding group property ..."];
+[] ¬ XNSCH.AddItemProperty[c, nsName, userGroup, XNSCHItemOps.ItemFromRope[args].newItem
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+IF HasProperty[members, properties]
+THEN d.out.PutRope[" members property already exists ..."]
+ELSE {
+d.out.PutRope[" adding members property ..."];
+[] ¬ XNSCH.AddGroupProperty[c, nsName, members, DoNothingEnumeratorProc
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+d.out.PutRope["\n(Note: use Add Member to actually add names to the \"forwarding\" list.)"];
+};
+remove => {
+IF ~HasProperty[members, properties]
+THEN d.out.PutRope[" no members property to remove ..."]
+ELSE {
+IF HasAtLeastOneMember[nsName]
+THEN {
+d.out.PutRope[" still forwarding to at least one member, remove members first ..."];
+RETURN;
+}
+ELSE {
+d.out.PutRope[" removing members property ..."];
+[] ¬ XNSCH.DeleteProperty[c, nsName, members
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+};
+IF ~HasProperty[userGroup, properties]
+THEN d.out.PutRope[" no group property to remove ..."]
+ELSE {
+d.out.PutRope[" removing group property ..."];
+[] ¬ XNSCH.DeleteProperty[c, nsName, userGroup
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+d.out.PutRope["\n(Note: use Remove Member to actually remove names from the \"forwarding\" list.)"];
+};
+ENDCASE => NotImplementedYet[d];
+};
+UpdateCreate: PROC = {
+CreateUserData: PROC [name: Name] = {
+fsName: Name ¬ [name.organization, name.domain, "UNKNOWN"];
+item: Item ¬ XNSCHItemOps.ItemFromCard16[Rope.FindBackward[name.object, " "]+1].newItem;
+[] ¬ XNSCHItemOps.NameIntoItem[item, fsName, 1];
+[] ¬ XNSCH.AddItemProperty[c, name, userData, item
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+SELECT cb.what FROM
+createIndividual => {
+atom: ATOM ¬ NARROW[d.cmdData];
+SELECT atom FROM
+$CreateCHS => {
+address: XNS.Address;
+address ¬ Convert.XNSAddressFromRope[args
+! Convert.Error => {problems ¬ TRUE; CONTINUE}];
+IF problems THEN {
+d.out.PutF1["\nYou must provide a valid address; \"%g\" is invalid.", [rope[args]]];
+GOTO someProblems;
+};
+address.socket ¬ XNS.unknownSocket;
+nsName ¬ [object: nsName.object, domain: "CHServers", organization: "CHServers"];
+name ¬ XNSCHName.RopeFromName[nsName];
+d.out.PutF1["\nCreating CHS entry for \"%g\" ...", [rope[name]]];
+[] ¬ XNSCH.Add[c, nsName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+IF problems THEN GOTO someProblems;
+d.out.PutF1[" adding address = %g ...", [rope[Convert.RopeFromXNSAddress[address]]]];
+[] ¬ XNSCH.AddItemProperty[c, nsName, addressList, XNSCHItemOps.ItemFromAddressList[LIST[address]].newItem
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+IF problems THEN GOTO someProblems;
+d.out.PutRope[" adding mailboxes property ..."];
+[] ¬ XNSCH.AddItemProperty[c, nsName, mailboxes, MailboxItemFromList[LIST[name]]
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+IF problems THEN GOTO someProblems;
+d.out.PutRope[" adding clearinghouseService property ..."];
+[] ¬ XNSCH.AddItemProperty[c, nsName, clearinghouseService, NEW[CHOpsP2V3.ItemObject[0]]
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+d.out.PutF1[" %g.", [rope[IF ~problems THEN "ok" ELSE "errors"]]];
+EXITS
+someProblems => NULL;
+};
+$CreateObject => {
+d.out.PutF1["\nCreating object \"%g\" ...", [rope[name]]];
+[] ¬ XNSCH.Add[c, nsName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+ENDCASE => {
+d.out.PutF1["\nCreating individual \"%g\" ...", [rope[name]]];
+[] ¬ XNSCH.Add[c, nsName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+IF ~problems THEN [] ¬ XNSCH.AddItemProperty[c, nsName, user, XNSCHItemOps.ItemFromRope[args].newItem
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+IF ~problems THEN CreateUserData[nsName];
+};
+};
+createGroup => {
+DoNothingEnumeratorProc: PROC [XNSCH.ElementStreamProc] = {RETURN};
+d.out.PutF1["\nCreating group \"%g\" ...", [rope[name]]];
+[] ¬ XNSCH.Add[c, nsName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+IF ~problems THEN [] ¬ XNSCH.AddItemProperty[c, nsName, userGroup, XNSCHItemOps.ItemFromRope[args].newItem
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+IF ~problems THEN [] ¬ XNSCH.AddGroupProperty[c, nsName, members, DoNothingEnumeratorProc
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+};
+ENDCASE => NotImplementedYet[d];
+IF problems THEN {
+d.out.PutF1[" Error => %g", [rope[ExposeErrorCode[eC, LOOPHOLE[eW]]]]];
+problems ¬ FALSE;
+}
+ELSE {
+d.out.PutRope[" ok."];
+};
+};
+UpdateDelete: PROC = {
+d.out.PutF1["\nDeleting object \"%g\" ...", [rope[name]]];
+[] ¬ XNSCH.Delete[c, nsName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+IF problems THEN {
+d.out.PutF1[" Error => %g", [rope[ExposeErrorCode[eC, LOOPHOLE[eW]]]]];
+problems ¬ FALSE;
+}
+ELSE {
+d.out.PutRope[" ok."];
+};
+};
+c: XNSCH.Conversation ¬ XNSCH.InitiateConversation[d.identity, d.conversationAddress];
+eC: XNSCH.ErrorCode;
+eW: XNSCH.Which;
+problems: BOOL ¬ FALSE;
+nsName, argAsName: Name;
+prop: Property;
+atom: ATOM;
+IF ISTYPE[d.cmdData, ATOM] THEN {
+atom ¬ NARROW[d.cmdData];
+prop ¬ PropertyFromAtom[atom, d];
+};
+nsName ¬ XNSCHName.NameFromRope[name
+! XNSCHName.FieldTooLong => {RESUME;}];
+argAsName ¬ XNSCHName.NameFromRope[args
+! XNSCHName.FieldTooLong => {RESUME;}];
+IF cb.what # createIndividual AND cb.what # createGroup AND ~CheckName[nsName, c] THEN {
+d.out.PutF1["\"%g\" is an invalid name.", [rope[XNSCHName.RopeFromName[nsName]]]];
+XNSCH.TerminateConversation[c];
+RETURN;
+};
+SELECT cb.what FROM
+password, simple => UpdatePassword[];
+alias => {
+IF cb.cmd = remove
+THEN {
+IF atom = $RemoveAlias
+THEN UpdateAlias[]
+ELSE RemoveProperty[PropertyFromSelection[d]];
+}
+ELSE UpdateAlias[];
+};
+self => UpdateSelf[];
+individualRemark, groupRemark => UpdateRemark[];
+fileService => UpdateProperties[];
+member => UpdateMember[];
+owner => UpdateOwner[];
+friend => UpdateFriend[];
+mailbox => UpdateMailbox[];
+forwarding => UpdateForwarding[];
+occurrences => UpdateOccurrences[];
+createIndividual, createGroup => UpdateCreate[];
+delete => UpdateDelete[];
+ENDCASE => NotImplementedYet[d];
+XNSCH.TerminateConversation[c];
+};
+
+HasProperty: PROC [prop: Property, properties: XNSCH.Properties] RETURNS [BOOL] = {
+FOR pi: CARDINAL IN [0..properties.length) DO
+IF properties[pi] = prop THEN RETURN[TRUE];
+ENDLOOP;
+RETURN[FALSE];
+};
+
+DoTypeCommand: PROC [d: MyData, cb: MaintainDefs.CmdButton, name, args: ROPE] = {
+PutOneFink: PROC [fink: Name, allDownList: LIST OF ROPE, c: XNSCH.Conversation, doDelete: BOOL ¬ FALSE, group: Name ¬ [NIL, NIL, NIL]] RETURNS [LIST OF ROPE] = {
+RopeInList: PROC [r: ROPE, l: LIST OF ROPE] RETURNS [BOOL] = {
+FOR l ¬ l, l.rest WHILE l # NIL DO
+IF Rope.Equal[r, l.first, FALSE] THEN RETURN[TRUE];
+ENDLOOP;
+RETURN[FALSE];
+};
+deleteThisFink: BOOL ¬ FALSE;
+nr: ROPE = XNSCHName.RopeFromName[fink];
+IF d.verbose THEN {
+problems: BOOL ¬ FALSE;
+eC: XNSCH.ErrorCode;
+eW: XNSCH.Which;
+properties: XNSCH.Properties;
+domainOrganization: ROPE ¬ Rope.Cat[fink.domain, ":", fink.organization];
+IF RopeInList[domainOrganization, allDownList]
+THEN {eC ¬ allDown; problems ¬ TRUE}
+ELSE [, properties] ¬ XNSCH.GetProperties[c, fink
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+SELECT TRUE FROM
+problems => SELECT eC FROM
+illegalPropertyID, illegalOrganizationName, illegalDomainName,
+illegalObjectName, noSuchOrganization, noSuchDomain, noSuchObject => {
+IF ExternalMailName[fink, c]
+THEN {
+d.out.PutF1["\n  \"%g\" => possible external mail name",
+[rope[nr]]];
+}
+ELSE {
+d.out.PutF["\n  \"%g\" => %g",
+[rope[nr]],
+[rope[ExposeErrorCode[eC, LOOPHOLE[eW]]]]];
+deleteThisFink ¬ TRUE;
+};
+};
+ENDCASE => {
+IF eC = allDown THEN
+IF ~RopeInList[domainOrganization, allDownList] THEN allDownList ¬ CONS[domainOrganization, allDownList];
+d.out.PutF["\n  \"%g\" => %g",
+[rope[nr]],
+[rope[ExposeErrorCode[eC, LOOPHOLE[eW]]]]];
+};
+(~HasProperty[mailboxes, properties]
+AND ~HasProperty[members, properties]) =>
+d.out.PutF1["\n  \"%g\" => no mailbox or members.", [rope[nr]]];
+ENDCASE;
+};
+IF deleteThisFink AND doDelete THEN DO {
+problems ¬ FALSE;
+d.out.PutRope[" => Deleting ..."];
+[] ¬ XNSCH.DeleteMember[c, group, members, fink
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+IF problems THEN {
+d.out.PutF1[" Error => %g", [rope[ExposeErrorCode[eC, LOOPHOLE[eW]]]]];
+IF eC = overflowOfDataBase THEN {
+d.out.PutRope["; Pausing for 5 minutes and then I'll try again ..."];
+FOR i: CARD IN [0..(5*60)) WHILE ~d.stop DO
+Process.Pause[Process.SecondsToTicks[1]];
+ENDLOOP;
+IF d.stop THEN EXIT;
+LOOP;
+};
+}
+ELSE d.out.PutRope[" deleted."];
+EXIT;
+} ENDLOOP;
+count ¬ SUCC[count];
+RETURN[allDownList];
+};
+PutOneName: PROC [name: Name] = {
+IF ~firstName OR (cb.what = matches AND ~d.firstTime)
+THEN d.out.PutRope[", "]
+ELSE {firstName ¬ FALSE; d.firstTime ¬ FALSE};
+count ¬ SUCC[count];
+d.out.PutF1["\"%g\"", [rope[XNSCHName.RopeFromName[name]]]];
+};
+PutOneDomainName: PROC [name: Name] = {
+IF firstName
+THEN firstName ¬ FALSE
+ELSE d.out.PutRope[", "];
+count ¬ SUCC[count];
+d.out.PutF["\"%g:%g\"", [rope[name.domain]], [rope[name.organization]]];
+};
+PutOneOrganizationName: PROC [name: Name] = {
+IF firstName
+THEN firstName ¬ FALSE
+ELSE d.out.PutRope[", "];
+count ¬ SUCC[count];
+d.out.PutF1["\"%g\"", [rope[name.organization]]];
+};
+PutItemAsRope: PROC [item: Item] = {
+rope: ROPE ¬ XNSCH.RopeFromItem[item];
+d.out.PutF1["\"%g\"", [rope[rope]]];
+};
+PutItemAsName: PROC [item: Item, offset: INT ¬ 0] = {
+name: Name ¬ XNSCHItemOps.NameFromItem[item, offset].name;
+rope: ROPE ¬ XNSCHName.RopeFromName[name];
+d.out.PutF1["\"%g\"", [rope[rope]]];
+};
+PutItemAsItem: PROC [item: Item, full: BOOL ¬ FALSE] = {
+d.out.PutF1["length = %g", [cardinal[item.length]]];
+IF ~full OR item.length = 0 THEN RETURN;
+d.out.PutRope[":  "];
+FOR i: CARDINAL IN [0..item.length) DO
+IF i # 0 THEN d.out.PutRope[", "];
+d.out.PutF["%g (%g)", [cardinal[item[i]]], [rope[Convert.RopeFromCard[item[i], 8]]]];
+ENDLOOP;
+};
+MaybePutItemAsRope: PROC [item: Item, full: BOOL ¬ FALSE] = {
+IF item # NIL AND item.length > 0 AND item.length = LOOPHOLE[1 + (item[0]+1)/2, CARDINAL]
+THEN PutItemAsRope[item]
+ELSE PutItemAsItem[item, full];
+};
+PutUserDataInfo: PROC [item: Item, user: ROPE, details: BOOL, leadingSpace: ROPE ¬ ""] = {
+name: Name;
+IF details THEN d.out.PutF["\n%gLast Name: \"%g\"",
+[rope[leadingSpace]],
+[rope[IF item.length <= 0 OR item[0] > Rope.Length[user]
+THEN "(Invalid Index)"
+ELSE Rope.Substr[user, item[0]]]]];
+name ¬ XNSCHItemOps.NameFromItem[item, 1].name;
+d.out.PutF["\n%gUsers's File Service: \"%g\"", [rope[leadingSpace]], [rope[XNSCHName.RopeFromName[name]]]];
+};
+PutMailboxInfo: PROC [item: Item, leadingSpace: ROPE ¬ "", printTime: BOOL] = {
+ENABLE
+XNSCHItemOps.Error => {
+d.out.PutRope["\nMailboxes: malformed property!"];
+GOTO OutOfHere;
+};
+pos: INT ¬ 3;
+mailboxList: LIST OF Name;
+IF printTime THEN d.out.PutF["\n%gTime: %g", [rope[leadingSpace]], [rope[Convert.RopeFromTime[BasicTime.FromNSTime[NSTimeFromItem[item]]]]]];
+d.out.PutF1["\n%gMailboxes: ", [rope[leadingSpace]]];
+mailboxList ¬ XNSCHItemOps.NameListFromItem[item, 2].names;
+WHILE mailboxList # NIL DO
+d.out.PutF1["\"%g\"", [rope[XNSCHName.RopeFromName[mailboxList.first]]]];
+IF mailboxList.rest # NIL THEN d.out.PutRope[", "];
+mailboxList ¬ mailboxList.rest;
+ENDLOOP;
+EXITS
+OutOfHere => RETURN;
+};
+PutItemAsAddressList: PROC [item: Item] = {
+addresses: LIST OF XNS.Address;
+addresses ¬ XNSCHItemOps.AddressListFromItem[item
+! XNSCHItemOps.Error => {addresses ¬ NIL; CONTINUE}].addresses;
+PutAddressList[d, addresses];
+};
+PutItemAsAuthenticationLevel: PROC [item: Item] = {
+ENABLE
+XNSCHItemOps.Error => {
+d.out.PutRope["I don't understand: "];
+PutItemAsItem[item, d.verbose];
+GOTO OutOfHere;
+};
+simpleSupported: BOOL = XNSCHItemOps.BoolFromItem[item, 0].bool;
+strongSupported: BOOL = XNSCHItemOps.BoolFromItem[item, 1].bool;
+IF simpleSupported THEN d.out.PutRope["simpleSupported"];
+IF strongSupported THEN d.out.PutF1["%gstrongSupported",
+[rope[IF simpleSupported THEN ", " ELSE ""]]];
+EXITS
+OutOfHere => RETURN;
+};
+CountMembers: PROC [group: Name, prop: Property] RETURNS[CARD] = {
+BumpCount: PROC [name: Name] = {
+count ¬ count + 1;
+};
+count: CARD ¬ 0;
+[] ¬ XNSCH.ListMembers[c, group, prop, BumpCount
+! XNSCH.Error => {CONTINUE}];
+RETURN[count];
+};
+
+GiveNSInfo: PROC [level: What] = {
+OPEN CHEntriesP0V0;
+giveDetails: BOOL ¬ FALSE;
+properties: XNSCH.Properties ¬ NIL;
+[distingName , properties] ¬ XNSCH.GetProperties[c, pattern
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+IF d.stop THEN RETURN;
+IF problems THEN SELECT eC FROM
+noSuchObject, allDown, wasUpNowDown => RETURN;
+ENDCASE => IF ExternalMailName[pattern, c] THEN NULL ELSE RETURN;
+IF d.firstTime
+THEN d.firstTime ¬ FALSE
+ELSE d.out.PutChar['\n];
+IF problems THEN {
+d.out.PutF1["\nName: \"%g\"", [rope[name]]];
+d.out.PutF["\nThe domain \"%g:%g\" appears to be connected via an External Mail Gateway.  (An External Mail Gateway is a \"controlled\" gateway that passes mail only -- it does not allow access to file servers, clearinghouses, etc.)  The name \"%g\" may or may not be valid in that domain -- it is impossible to determine that from here.  Individuals within such a domain are most likely not Xerox employes.  Caution should be exercised when sending sensitive data to this name or before adding such a name to a DL.", [rope[pattern.domain]], [rope[pattern.organization]], [rope[pattern.object]]];
+problems ¬ FALSE;
+RETURN;
+};
+d.out.PutF1["\nDistinguished name: \"%g\"", [rope[XNSCHName.RopeFromName[distingName]]]];
+IF d.stop OR NARROW[d.cmdData, ATOM] = $DistingOnly THEN RETURN;
+d.out.PutRope["\nAliases: "];
+[] ¬ XNSCH.ListAliases[c, pattern, PutOneName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; CONTINUE}];
+IF count = 0 THEN d.out.PutRope["(none)"];
+IF d.stop THEN RETURN;
+giveDetails ¬ cb.what = details;
+FOR pi: CARDINAL IN [0..properties.length) DO
+clProc: MaintainProcs.ChangeLooksProc ¬ LOOPHOLE[MaintainDefs.RetrieveProc[d.flavor, $ChangeLooks]];
+unknown: BOOL;
+propInfo: PropertyInfoObject;
+propType: PropType;
+prop: Property ¬ properties.body[pi];
+IF d.stop THEN RETURN;
+propInfo ¬ GetPropertyInfo[prop];
+unknown ¬ propInfo.codeLabel = NIL;
+IF (unknown AND ~giveDetails) OR propInfo.detailed AND ~giveDetails THEN LOOP;
+IF ~propInfo.subLabels THEN d.out.PutF1["\n%g: ",
+[rope[IF unknown
+THEN Rope.Concat["Property ", propInfo.label]
+ELSE propInfo.label]]];
+propType ¬ propInfo.propType;
+SELECT propType FROM
+group => {
+atom: ATOM = NARROW[d.cmdData, ATOM];
+firstName ¬ TRUE;
+IF d.verbose
+THEN [] ¬ XNSCH.ListMembers[c, pattern, prop, PutOneName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}]
+ELSE d.out.PutF1["%g", [cardinal[CountMembers[pattern, prop]]]];
+IF atom # $NoACLInfo THEN {
+FOR acl: AccessList IN [readAccess..selfControl] DO
+n: CARD ¬ count;
+IF d.stop THEN RETURN;
+IF clProc # NIL THEN
+clProc[d, 'i];
+SELECT acl FROM
+readAccess => {d.out.PutRope["\nReaders: "];};
+administrators => {d.out.PutRope["\nAdministrators: "];};
+selfControl => {d.out.PutRope["\nSelfControllers: "];};
+ENDCASE => LOOP;
+IF clProc # NIL THEN
+clProc[d, ' ];
+firstName ¬ TRUE;
+[] ¬ XNSCHACL.ListMembersOfPropertyACL[c, pattern, prop, acl, PutOneName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+IF n = count THEN d.out.PutRope["(none)"];
+ENDLOOP;
+};
+};
+ENDCASE => {
+item: Item;
+[, item] ¬ XNSCH.LookupItemProperty[c, pattern, prop
+! XNSCH.Error => {CONTINUE}];
+IF item # NIL THEN SELECT propType FROM
+unknown => MaybePutItemAsRope[item, d.verbose];
+rope => PutItemAsRope[item];
+name => PutItemAsName[item];
+authenticationLevel => PutItemAsAuthenticationLevel[item];
+addressList => PutItemAsAddressList[item];
+userData => PutUserDataInfo[item, distingName.object, giveDetails, ""];
+mailboxInfo => PutMailboxInfo[item, "", giveDetails];
+ENDCASE => d.out.PutRope["???"];
+};
+ENDLOOP;
+};
+c: XNSCH.Conversation ¬ XNSCH.InitiateConversation[d.identity, d.conversationAddress];
+pattern: Name ¬ XNSCHName.NameFromRope[name
+! XNSCHName.FieldTooLong => {RESUME;}];
+distingName: Name;
+fullName: ROPE;
+problems: BOOL ¬ FALSE;
+firstName: BOOL ¬ TRUE;
+count: CARD ¬ 0;
+eC: XNSCH.ErrorCode;
+eW: XNSCH.Which;
+fullName ¬ XNSCHName.RopeFromName[pattern];
+SELECT cb.what FROM
+members => {
+prop: Property;
+atom: ATOM ¬ NARROW[d.cmdData];
+prop ¬ PropertyFromAtom[atom, d];
+IF ~d.firstTime THEN d.out.PutChar['\n];
+d.out.PutF1["\nMembers of \"%g\":\n", [rope[fullName]]];
+[] ¬ XNSCH.ListMembers[c, pattern, prop, PutOneName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+IF ~problems THEN d.out.PutF["\n(%g %g)", [cardinal[count]], [rope[MaintainMisc.Plural["member", "members", count]]]];
+};
+finks => {
+start, finish: BasicTime.GMT;
+startThisFink, finishThisFink: BasicTime.Pulses;
+membersList: LIST OF Name;
+allDownList: LIST OF ROPE;
+AddNameToList: PROC [name: Name] = {
+membersList ¬ CONS[name, membersList];
+count ¬ count + 1;
+};
+ReverseList: PROC [original: LIST OF Name] RETURNS[newList: LIST OF Name]= {
+FOR list: LIST OF Name ¬ original, list.rest UNTIL list = NIL DO
+newList ¬ CONS[list.first, newList];
+ENDLOOP;
+};
+IF d.firstTime
+THEN d.firstTime ¬ FALSE
+ELSE d.out.PutChar['\n];
+d.out.PutF1["\nFinks in group \"%g\":", [rope[fullName]]];
+start ¬ BasicTime.Now[];
+IF d.debugSwitch THEN
+d.out.PutF1[" [%g]", [time[BasicTime.Now[]]]];
+[] ¬ XNSCH.ListMembers[c, pattern, members, AddNameToList
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+d.out.PutF[" (%g %g)", [cardinal[count]], [rope[MaintainMisc.Plural["member", "members", count]]]];
+IF ~problems THEN {
+membersList ¬ ReverseList[membersList];
+FOR m: LIST OF Name ¬ membersList, m.rest WHILE m # NIL AND ~d.stop DO
+IF d.debugSwitch THEN
+d.out.PutF["\n  ... \"%g\" [%g] ...",
+[rope[XNSCHName.RopeFromName[m.first]]],
+[time[BasicTime.Now[]]]];
+startThisFink ¬ BasicTime.GetClockPulses[];
+allDownList¬ PutOneFink[m.first, allDownList, c, d.autoDelete, pattern];
+finishThisFink ¬ BasicTime.GetClockPulses[];
+IF d.debugSwitch THEN
+d.out.PutF1[" (took: %g)", [rope[RealSecsToRope[BasicTime.PulsesToSeconds[finishThisFink-startThisFink]]]]];
+ENDLOOP;
+finish ¬ BasicTime.Now[];
+IF d.debugSwitch THEN
+d.out.PutF1["\n  (Total: %g)", [rope[PeriodToRope[BasicTime.Period[start, finish]]]]];
+};
+};
+matches => PutOneName[pattern];
+summary => GiveNSInfo[summary];
+details => GiveNSInfo[details];
+domains =>  {
+orgNotProvided: ROPE = "orgNotProvided";
+pattern ¬ XNSCHName.NameFromRope[name, orgNotProvided
+! XNSCHName.FieldTooLong => {RESUME;}];
+IF ~Rope.Equal[pattern.domain, orgNotProvided] THEN pattern.organization ¬ pattern.domain;
+pattern.domain ¬ pattern.object;
+pattern.object ¬ NIL;
+d.out.PutF1["\nDomains matching \"%g\": ", [rope[name]]];
+XNSCH.EnumerateDomains[c, pattern, PutOneDomainName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+IF ~problems THEN d.out.PutF["\n(%g %g)", [cardinal[count]], [rope[MaintainMisc.Plural["match", "matches", count]]]];
+};
+organizations =>  {
+pattern.organization ¬ pattern.object;
+pattern.domain ¬ NIL;
+pattern.object ¬ NIL;
+XNSCH.EnumerateOrganizations[c, pattern, PutOneOrganizationName
+! XNSCH.Error => {eC ¬ code; eW ¬ which; problems ¬ TRUE; CONTINUE}];
+IF ~problems THEN d.out.PutF["\n(%g %g)", [cardinal[count]], [rope[MaintainMisc.Plural["match", "matches", count]]]];
+};
+domainsServed =>  {
+n: CARD ¬ 0;
+ce: GluePruneHacks.CacheEntry;
+d.out.PutF1["\n\nDomains served by \"%g\": ", [rope[name]]];
+ce ¬ GluePruneHacks.DomainsForServer[name];
+d.out.PutF1["\nKey: \"%g\"", [rope[ce.key]]];
+d.out.PutF1[", ok: %g", [rope[IF ce.ok THEN "TRUE" ELSE "FALSE"]]];
+IF ~ce.ok THEN d.out.PutF1[", reason = %g", [rope[GluePruneHacks.ExposeErrorCode[ce.reason]]]];
+d.out.PutRope["\nValue: "];
+FOR rl: GluePruneHacks.RopeList ¬ ce.value, rl.rest WHILE rl # NIL DO
+d.out.PutF["%g\"%g\"", [rope[IF n = 0 THEN "" ELSE ", "]], [rope[rl.first]]];
+n ¬ n + 1;
+ENDLOOP;
+d.out.PutF1["\nTotal Domains served: %g", [cardinal[n]]];
+};
+direct, occurrences =>  {
+FOR argList: LIST OF ROPE ¬ d.argList, argList.rest WHILE argList # NIL DO
+memberRopeToCheck: ROPE ¬ argList.first;
+memberToCheck: Name;
+yes: BOOL ¬ FALSE;
+memberToCheck ¬ XNSCHName.NameFromRope[memberRopeToCheck
+! XNSCHName.FieldTooLong => {RESUME;}];
+problems ¬ FALSE;
+[ , yes] ¬ XNSCH.IsMember[c, pattern, members, memberToCheck
+! XNSCH.Error => {CONTINUE}];
+IF ~problems THEN {
+IF cb.what = direct
+THEN d.out.PutF["\n\"%g\" IS%g a direct member of \"%g\".",
+[rope[memberRopeToCheck]],
+IF yes THEN [rope[""]] ELSE [rope[" NOT"]],
+[rope[XNSCHName.RopeFromName[pattern]]]]
+ELSE IF yes THEN {
+IF d.firstTime
+THEN d.firstTime ¬ FALSE
+ELSE d.out.PutRope[", "];
+d.out.PutF1["\"%g\"", [rope[name]]];
+};
+};
+ENDLOOP;
+
+};
+extended =>  {
+FOR argList: LIST OF ROPE ¬ d.argList, argList.rest WHILE argList # NIL DO
+memberRopeToCheck: ROPE ¬ argList.first;
+memberToCheck: Name;
+yes: BOOL ¬ FALSE;
+memberToCheck ¬ XNSCHName.NameFromRope[memberRopeToCheck
+! XNSCHName.FieldTooLong => {RESUME;}];
+problems ¬ FALSE;
+[ , yes] ¬ XNSCH.IsMemberClosure[c, pattern, members, memberToCheck
+! XNSCH.Error => {CONTINUE}];
+IF ~problems THEN
+d.out.PutF["\n\"%g\" IS%g a member of \"%g\".", [rope[memberRopeToCheck]], IF yes THEN [rope[""]] ELSE [rope[" NOT"]], [rope[XNSCHName.RopeFromName[pattern]]]];
+ENDLOOP;
+};
+ENDCASE => NotImplementedYet[d];
+IF problems THEN {
+d.out.PutF1["\nError: %g", [rope[ExposeErrorCode[eC, LOOPHOLE[eW]]]]];
+};
+XNSCH.TerminateConversation[c];
+IF d.stop THEN { IO.PutRope[d.out, "\nStopping...\n"]};
+};
+
+NSTimeFromItem: PROC [item: Item, index: CARD ¬ 0] RETURNS [CARD] = {
+RETURN[
+XNSCHItemOps.Card32FromItem[item, index
+! XNSCHItemOps.Error => {GOTO OutOfHere}].card
+];
+EXITS
+OutOfHere => RETURN[BasicTime.ToNSTime[BasicTime.Now[]]];
+};
+
+GetProperties: PROC [name: Name, c: XNSCH.Conversation ¬ NIL] RETURNS [XNSCH.Properties] = {
+newConversation: BOOL ¬ c = NIL;
+properties: XNSCH.Properties;
+IF newConversation THEN c ¬ XNSCH.InitiateConversation[];
+[, properties] ¬ XNSCH.GetProperties[c, name
+! XNSCH.Error => {CONTINUE}];
+IF newConversation THEN XNSCH.TerminateConversation[c];
+RETURN[properties];
+};
+
+GetExistingMailboxes: PROC [name: Name, c: XNSCH.Conversation ¬ NIL] RETURNS [ropes: LIST OF ROPE] = {
+newConversation: BOOL ¬ c = NIL;
+lastRope: LIST OF ROPE;
+names: LIST OF Name;
+item: Item;
+IF newConversation THEN c ¬ XNSCH.InitiateConversation[];
+[, item] ¬ XNSCH.LookupItemProperty[c, name, mailboxes
+! XNSCH.Error => {CONTINUE}];
+names ¬ XNSCHItemOps.NameListFromItem[item, 2
+! XNSCHItemOps.Error => {
+IF newConversation THEN XNSCH.TerminateConversation[c];
+GOTO OutOfHere;
+}].names;
+WHILE names # NIL DO
+IF ropes = NIL
+THEN lastRope ¬ ropes ¬ LIST[XNSCHName.RopeFromName[name]]
+ELSE lastRope ¬ lastRope.rest ¬ LIST[XNSCHName.RopeFromName[name]];
+names ¬ names.rest;
+ENDLOOP;
+IF newConversation THEN XNSCH.TerminateConversation[c];
+EXITS
+OutOfHere => RETURN[NIL];
+};
+
+MailboxItemFromList: PROC [list: LIST OF ROPE, time: CARD ¬ BasicTime.ToNSTime[BasicTime.Now[]]] RETURNS [item: Item] = {
+names: CARD16 ¬ 0;
+thisName: Name;
+pos: CARD ¬ 3;
+FOR l: LIST OF ROPE ¬ list, l.rest WHILE l # NIL DO
+thisName ¬ XNSCHName.NameFromRope[l.first];
+[item, pos] ¬ XNSCHItemOps.ItemFromName[thisName, pos, item];
+names ¬ names + 1;
+ENDLOOP;
+[] ¬ XNSCHItemOps.Card32IntoItem[item, time, 0];
+[] ¬ XNSCHItemOps.Card16IntoItem[item, names, 2];
+};
+
+ItemFromListOfCard16Rope: PROC [list: ROPE] RETURNS [item: Item] = {
+count: INT ¬ 0;
+number: CARD16;
+errors: BOOL ¬ FALSE;
+BumpCount: PROC [r: ROPE] = {
+number ¬ Convert.CardFromRope[r
+! Convert.Error => {errors ¬ TRUE; CONTINUE}];
+count ¬ count+1;
+};
+FillInItem: PROC [r: ROPE] = {
+number ¬ Convert.CardFromRope[r];
+item[count] ¬ number;
+count ¬ count+1;
+};
+MaintainMisc.CallForItems[NEW[MyDataObject], list, BumpCount];
+IF errors THEN RETURN[NIL];
+item ¬ XNSCHItemOps.CreateNewItem[count];
+count ¬ 0;
+MaintainMisc.CallForItems[NEW[MyDataObject], list, FillInItem];
+RETURN[item];
+};
+
+AddressListFromRopeList: PROC [list: ROPE] RETURNS [addresses: LIST OF XNS.Address] = {
+lastAddress: LIST OF XNS.Address;
+AddAddress: PROC [r: ROPE] = {
+address: XNS.Address ¬ Convert.XNSAddressFromRope[r];
+IF addresses = NIL
+THEN lastAddress ¬ addresses ¬ LIST[address]
+ELSE lastAddress ¬ lastAddress.rest ¬ LIST[address];
+};
+MaintainMisc.CallForItems[NEW[MyDataObject], list, AddAddress];
+};
+
+AddRopesToList: PROC [a, b: LIST OF ROPE] RETURNS [LIST OF ROPE] = {
+new: LIST OF ROPE;
+FOR a ¬ a, a.rest WHILE a # NIL DO
+new ¬ CONS[a.first, new];
+ENDLOOP;
+FOR b ¬ b, b.rest WHILE b # NIL DO
+new ¬ CONS[b.first, new];
+ENDLOOP;
+RETURN[new];
+};
+
+RemoveRopesFromList: PROC [a, b: LIST OF ROPE] RETURNS [LIST OF ROPE] = {
+new: LIST OF ROPE;
+FOR a ¬ a, a.rest WHILE a # NIL DO
+IF ~RopeInList[a.first, b] THEN new ¬ CONS[a.first, new];
+ENDLOOP;
+RETURN[new];
+};
+
+PutRopeList: PROC [d: MyData, l: LIST OF ROPE] = {
+first: BOOL ¬ TRUE;
+FOR l ¬ l, l.rest WHILE l # NIL DO
+IF first
+THEN first ¬ FALSE
+ELSE d.out.PutRope[", "];
+d.out.PutF1["%g", [rope[l.first]]];
+ENDLOOP;
+};
+
+PutAddressList: PROC [d: MyData, addressList: LIST OF XNS.Address] = {
+first: BOOL ¬ TRUE;
+WHILE addressList # NIL DO
+d.out.PutF["%g%g", [rope[IF first THEN "" ELSE ", "]], [rope[Convert.RopeFromXNSAddress[addressList.first]]]];
+first ¬ FALSE;
+addressList ¬ addressList.rest;
+ENDLOOP;
+};
+
+RopeInList: PROC [r: ROPE, l: LIST OF ROPE] RETURNS [BOOL] = {
+FOR l ¬ l, l.rest WHILE l # NIL DO
+IF Rope.Equal[r, l.first, FALSE] THEN RETURN[TRUE];
+ENDLOOP;
+RETURN[FALSE];
+};
+
+DoSetServer: PUBLIC PROC [d: MyData, name: ROPE] = {
+tryCHS: BOOL ¬ FALSE;
+adr: XNS.Address ¬ XNS.unknownAddress;
+IF name = NIL OR Rope.Length[name] <= 1 THEN {
+d.out.PutRope["\nSetting NS server to ALL servers ... ok.\n"];
+d.conversationAddress ¬ XNS.unknownAddress;
+RETURN;
+};
+d.out.PutF1["\nSetting NS server to: %g ... ", [rope[name]]];
+adr ¬ Convert.XNSAddressFromRope[name
+! Convert.Error => {tryCHS ¬ TRUE; CONTINUE}];
+IF tryCHS THEN [, adr] ¬ XNSCH.LookupAddressFromRope[name];
+d.out.PutF1[" (%g) ok.\n", [rope[Convert.RopeFromXNSAddress[adr]]]];
+d.conversationAddress ¬ adr;
+};
+
+DistinguishedNameFromRope: PROC [name: ROPE, c: XNSCH.Conversation ¬ NIL] RETURNS [distingName: Name, problems: BOOL, errorCode: XNSCH.ErrorCode, which: XNSCH.Which, tooLong: BOOL] = {
+[distingName, problems, errorCode, which] ¬ DistinguishedName[XNSCHName.NameFromRope[name
+! XNSCHName.FieldTooLong => {tooLong ¬ TRUE; RESUME;}], c];
+RETURN;
+};
+
+DistinguishedName: PROC [name: Name, c: XNSCH.Conversation ¬ NIL] RETURNS [distingName: Name ¬ [NIL, NIL, NIL], problems: BOOL ¬ FALSE, errorCode: XNSCH.ErrorCode ¬ unknown, which: XNSCH.Which ¬ first] = {
+newConversation: BOOL ¬ c = NIL;
+IF newConversation THEN c ¬ XNSCH.InitiateConversation[];
+distingName ¬ XNSCH.Lookup[c, name
+! XNSCH.Error => {errorCode ¬ code; which ¬ which; problems ¬ TRUE; CONTINUE}];
+IF newConversation THEN XNSCH.TerminateConversation[c];
+};
+
+ExternalMailName: PROC [name: Name, c: XNSCH.Conversation ¬ NIL] RETURNS [BOOL] = {
+errorCode: XNSCH.ErrorCode;
+problems: BOOL ¬ FALSE;
+newConversation: BOOL ¬ c = NIL;
+dots: ROPE = "...";
+obj: ROPE = Rope.Concat[name.domain, name.organization];
+IF Rope.Length[obj] > 40 THEN RETURN[FALSE];
+IF newConversation THEN c ¬ XNSCH.InitiateConversation[];
+[] ¬ XNSCH.Lookup[c, [dots, dots, obj]
+! XNSCH.Error => {errorCode ¬ code; problems ¬ TRUE; CONTINUE}];
+IF newConversation THEN XNSCH.TerminateConversation[c];
+RETURN[~(problems AND errorCode = noSuchObject)];
+};
+
+IsGVName: PROC [name: ROPE] RETURNS[BOOLEAN] = {
+RETURN[name # NIL AND (Rope.Find[name, "@"] < 0)];
+};
+
+IsNsName: PROC [name: ROPE] RETURNS [BOOL] = {
+RETURN[name # NIL];
+};
+
+GetPossibleSubList: PROC [dl: Name] RETURNS [name: Name, nameRope: ROPE, changed: BOOL] = {
+changed ¬ FALSE;
+nameRope ¬ XNSCHName.RopeFromName[dl];
+RETURN[dl, nameRope, changed];
+};
+
+NeedsQuotes: PROC [r: ROPE] RETURNS [BOOL] ~ {
+IF Rope.Length[r] = 0 OR (Rope.Find[r, "\""] < 0 AND Rope.Find[r, " "] >= 0) THEN RETURN [TRUE];
+RETURN[FALSE];
+};
+
+QuoteIfNeeded: PROC [r: ROPE] RETURNS [ROPE] ~ {
+IF NeedsQuotes[r] THEN RETURN [Rope.Cat["\"", r, "\""]];
+RETURN[r];
+};
+
+EndsWith: PROC [a, b: ROPE] RETURNS [BOOL] = {
+bLength: INT = Rope.Length[b];
+aLength: INT = Rope.Length[a];
+IF aLength < bLength THEN RETURN[FALSE];
+RETURN[Rope.Equal[Rope.Substr[a, aLength - bLength, bLength], b, FALSE]];
+};
+
+CheckName: PROC [name: Name, c: XNSCH.Conversation ¬ NIL] RETURNS[BOOL] = {
+ok: BOOL ¬ TRUE;
+checkForeign: BOOL ¬ FALSE;
+newConversation: BOOL ¬ c = NIL;
+IF newConversation THEN c ¬ XNSCH.InitiateConversation[];
+[] ¬ XNSCH.Lookup[c, name
+! XNSCH.Error => {
+SELECT code FROM
+illegalOrganizationName, illegalDomainName, illegalObjectName, noSuchObject => ok ¬ FALSE;
+noSuchOrganization, noSuchDomain => checkForeign ¬ TRUE;
+ENDCASE;
+CONTINUE}];
+IF checkForeign
+THEN ok ¬ ExternalMailName[name, c];
+IF newConversation THEN XNSCH.TerminateConversation[c];
+RETURN[ok];
+};
+
+CheckNameRope: PROC [name: ROPE, c: XNSCH.Conversation ¬ NIL] RETURNS[BOOL] = {
+RETURN[CheckName[XNSCHName.NameFromRope[name
+! XNSCHName.FieldTooLong => {RESUME;}], c]];
+};
+
+PropertyInfoList: TYPE = LIST OF PropertyInfoObject;
+PropertyInfoObject: TYPE = RECORD [
+prop: Property,
+label: ROPE,
+shortLabel: ROPE,
+codeLabel: ROPE,
+propType: PropType ¬ unknown,
+subLabels: BOOL ¬ FALSE,
+detailed: BOOL ¬ FALSE
+]; 
+
+all: Property = 0;
+alias: Property = 1;
+aliases: Property = 2;
+simpleKey: Property = 7;
+server: Property = 10024;
+nullProperty: Property = 37777777777B;
+
+propertyInfoList: PropertyInfoList ¬ LIST[
+[addressList, "Address List", "AddressList", "addressList", addressList],
+[adobeService, "Adobe Service", "Adobe", "adobeService"],
+[alias, "Alias", "Alias", "alias"],
+[aliases, "Aliases", "Aliases", "aliases"],
+[all, "Any Object", "Any", "all"],
+[associatedWorkstation, "Associated Workstation", "AWKS", "associatedWorkstation", name],
+[authenticationLevel, "Authentication Level", "AuthLevel", "authenticationLevel", authenticationLevel, FALSE, TRUE],
+[authenticationService, "Authentication Service", "Auth", "authenticationService"],
+[authKeys, "Auth Keys", "AuthKeys", "authKeys", unknown, FALSE, TRUE],
+[clearinghouseService, "Clearinghouse Service", "CHS", "clearinghouseService"],
+[communicationsInterfaceUnit, "Communications Interface Unit", "CIU", "communicationsInterfaceUnit"],
+[externalCommunicationsService, "External Communications Service", "ECS", "externalCommunicationsService"],
+[fetchService, "Fetch Service", "Fetch", "fetchService"],
+[fileService, "File Service", "FS", "fileService", rope],
+[foreignMailSystemName, "Foreign Mail System Name", "ForeignMailSystemName", "foreignMailSystemName", name],
+[gatewayService, "Gateway Service", "GWS", "gatewayService"],
+[interactiveTerminalService, "Interactive Terminal Service", "ITS", "interactiveTerminalService"],
+[internetworkRoutingService, "Internetwork Routing Service", "IRS", "interactiveTerminalService"],
+[librarianService, "Librarian Service", "Librarian", "librarianService"],
+[mailboxes, "Mailboxes", "MBX", "mailboxes", mailboxInfo, TRUE],
+[mailGateway, "Mail Gateway", "MGW", "mailGateway", rope],
+[mailGatewayRouteData, "Mail Gateway Route Data", "MailGatewayRouteData", "mailGatewayRouteData", group],
+[mailService, "Mail Service", "MS", "mailService"],
+[members, "Members", "Members", "members", group],
+[network, "Network", "Net", "network"],
+[networkServers, "Network Servers", "NetworkServers", "networkServers"],
+[nullProperty, "Null Property", "NullProperty", "nullProperty"],
+[printService, "Print Service", "PS", "printService"],
+[remoteBatchService, "Remote Batch Service", "RBS", "remoteBatchService"],
+[rs232CData, "RS232CData", "RS232CData", "rs232CData"],
+[rs232CPort, "RS232CPort", "RS232CPort", "rs232CPort"],
+[server, "Server", "Server", "server"],
+[services, "Services", "Services", "services"],
+[simpleKey, "Simple Key", "SimpleKey", "simpleKey", unknown, FALSE, TRUE],
+[user, "User Remark", "User", "user", rope],
+[userData, "User Data", "UserData", "userData", userData, TRUE],
+[userGroup, "Group Remark", "Group", "userGroup", rope],
+[userPassword, "User Password", "Password", "userPassword", rope, FALSE, TRUE],
+[workstation, "Workstation", "Workstation", "workstation"]
+];
+
+
+HostAddressFromRope: PROC [r: ROPE] RETURNS[XNS.Host] = {
+RETURN[Convert.XNSHostFromRope[r ! Convert.Error => CONTINUE]];
+RETURN[Convert.XNSAddressFromRope[r ! Convert.Error => CONTINUE].host];
+RETURN[XNS.unknownHost];
+};
+
+HostAddressFromSelection: PROC [d: MyData] RETURNS[XNS.Host] = {
+sel: ROPE ¬ NARROW[d.moreData];
+RETURN[HostAddressFromRope[sel]];
+};
+
+MatchHostAddressForObject: PROC [host: XNS.Host, obj: Name] RETURNS[BOOL] = {
+item: Item;
+addresses: LIST OF XNS.Address;
+error: BOOL ¬ FALSE;
+c: XNSCH.Conversation ¬ XNSCH.InitiateConversation[];
+[, item] ¬ XNSCH.LookupItemProperty[c, obj, addressList
+! XNSCH.Error => {error ¬ TRUE; CONTINUE}];
+XNSCH.TerminateConversation[c];
+IF error THEN RETURN[FALSE];
+IF item.length > 0 THEN addresses ¬ XNSCHItemOps.AddressListFromItem[item
+! XNSCHItemOps.Error => {error ¬ TRUE; CONTINUE}].addresses;
+IF error THEN RETURN[FALSE];
+FOR addresses ¬ addresses, addresses.rest WHILE addresses # NIL DO
+IF host = addresses.first.host THEN RETURN[TRUE];
+ENDLOOP;
+RETURN[FALSE];
+};
+
+PropertyFromRope: PROC [r: ROPE] RETURNS[Property] = {
+prop: Property;
+isNumber: BOOL ¬ TRUE;
+prop ¬ Convert.CardFromRope[r
+! Convert.Error => {isNumber ¬ FALSE; CONTINUE}];
+IF isNumber THEN RETURN[prop];
+IF HostAddressFromRope[r] # XNS.unknownHost THEN RETURN[addressList];
+FOR pi: PropertyInfoList ¬ propertyInfoList, pi.rest WHILE pi # NIL DO
+IF Rope.Equal[pi.first.label, r, FALSE]
+OR Rope.Equal[pi.first.shortLabel, r, FALSE]
+OR Rope.Equal[pi.first.codeLabel, r, FALSE]
+THEN RETURN[pi.first.prop];
+ENDLOOP;
+r ¬ ReplaceThisRope[r, " ", ""];
+r ¬ Rope.Substr[r, 0, Rope.Index[r, 0, "serv", FALSE]];
+FOR pi: PropertyInfoList ¬ propertyInfoList, pi.rest WHILE pi # NIL DO
+IF Rope.Find[pi.first.label, r, 0, FALSE] # -1
+OR Rope.Find[pi.first.codeLabel, r, 0, FALSE] # -1
+THEN RETURN[pi.first.prop];
+ENDLOOP;
+RETURN[nullProperty];
+};
+
+PropertyFromSelection: PROC [d: MyData] RETURNS[Property] = {
+sel: ROPE ¬ NARROW[d.moreData];
+RETURN[PropertyFromRope[sel]];
+};
+
+PropertyFromAtom: PROC [atom: ATOM, d: MyData] RETURNS[Property] = {
+IF atom = $FromSelection THEN RETURN[PropertyFromSelection[d]];
+RETURN[PropertyFromRope[Atom.GetPName[atom]]];
+};
+
+GetPropertyInfo: PROC [prop: Property] RETURNS [PropertyInfoObject] = {
+FOR pi: PropertyInfoList ¬ propertyInfoList, pi.rest WHILE pi # NIL DO
+IF prop = pi.first.prop THEN RETURN[pi.first];
+ENDLOOP;
+RETURN[[prop, Convert.RopeFromCard[prop], Convert.RopeFromCard[prop], NIL, unknown, FALSE, FALSE]];
+};
+
+ExposePropertyCode: PROC [prop: Property] RETURNS [ROPE] = {
+pi: PropertyInfoObject ¬ GetPropertyInfo[prop];
+IF pi.codeLabel # NIL
+THEN RETURN[pi.codeLabel]
+ELSE RETURN[Rope.Concat["property", pi.shortLabel]];
+};
+
+ExposeAuthCallProblem: PROC [problem: AuthenticationP14V2.CallProblem] RETURNS[ROPE] = {
+RETURN[SELECT problem FROM
+tooBusy => "tooBusy",
+accessRightsInsufficient => "accessRightsInsufficient",
+keysUnavailable => "keysUnavailable",
+strongKeyDoesNotExist => "strongKeyDoesNotExist",
+simpleKeyDoesNotExist => "simpleKeyDoesNotExist",
+strongKeyAlreadyRegistered => "strongKeyAlreadyRegistered",
+simpleKeyAlreadyRegistered => "simpleKeyAlreadyRegistered",
+domainForNewKeyUnavailable => "domainForNewKeyUnavailable",
+domainForNewKeyUnknown => "domainForNewKeyUnknown",
+badKey => "badKey",
+badName => "badName",
+databaseFull => "databaseFull",
+other => "other",
+ENDCASE => "UNKNOWN"
+];
+};
+
+ExposeAuthProblem: PROC [problem: AuthenticationP14V2.Problem] RETURNS[ROPE] = {
+RETURN[SELECT problem FROM
+credentialsInvalid => "credentialsInvalid",
+verifierInvalid => "verifierInvalid",
+verifierExpired => "verifierExpired",
+verifierReused => "verifierReused",
+credentialsExpired => "credentialsExpired",
+inappropriateCredentials => "inappropriateCredentials",
+ENDCASE => "UNKNOWN"
+];
+};
+
+ExposeErrorCode: PROC [arg: XNSCH.ErrorCode, level: NAT] RETURNS [res: ROPE] ~ {
+SELECT arg FROM
+notAllowed => res ¬ "notAllowed";
+allDown => res ¬ "allDown";
+wasUpNowDown => res ¬ "wasUpNowDown";
+protocolError => res ¬ "protocolError";
+cantConnectToServer => res ¬ "cantConnectToServer";
+communicationFailure => res ¬ "communicationFailure";
+serverTooBusy => res ¬ "serverTooBusy";
+serviceNotExported => res ¬ "serviceNotExported";
+illegalPropertyID => res ¬ "illegalPropertyID";
+illegalOrganizationName => res ¬ "illegalOrganizationName";
+illegalDomainName => res ¬ "illegalDomainName";
+illegalObjectName => res ¬ "illegalObjectName";
+noSuchOrganization => res ¬ "noSuchOrganization";
+noSuchDomain => res ¬ "noSuchDomain";
+noSuchObject => res ¬ "noSuchObject";
+propertyIDNotFound => res ¬ "propertyIDNotFound";
+wrongPropertyType => res ¬ "wrongPropertyType";
+noChange => res ¬ "noChange";
+outOfDate => res ¬ "outOfDate";
+overflowOfName => res ¬ "overflowOfName";
+overflowOfDataBase => res ¬ "overflowOfDataBase";
+credentialsInvalid => res ¬ "credentialsInvalid";
+credentialsTooWeak => res ¬ "credentialsTooWeak";
+inappropriateConversation => res ¬ "inappropriateConversation";
+unknown => res ¬ "unknown";
+ENDCASE => ERROR
+};
+
+ExposeWhich: PROC [arg: XNSCH.Which, level: NAT] RETURNS [res: ROPE] ~ {
+SELECT arg FROM
+first => res ¬ "first";
+second => res ¬ "second";
+ENDCASE => ERROR
+};
+
+ReplaceThisRope: PROC [r, d, n: ROPE, all: BOOL ¬ TRUE, case: BOOL ¬ TRUE, pos: INT ¬ 0] RETURNS [ROPE] = {
+ld: INT ¬ Rope.Length[d];
+ln: INT ¬ Rope.Length[n];
+DO
+l: INT ¬ Rope.Length[r];
+fi: INT ¬ Rope.Find[r, d, pos, case];
+IF fi = -1 THEN EXIT;
+r ¬ Rope.Replace[r, fi, ld, n];
+pos ¬ fi + ln;
+IF ~all THEN EXIT;
+ENDLOOP;
+RETURN[r];
+};
+
+NotImplementedYet: PROC [d: MyData] = {
+d.out.PutRope["\nSorry, that function not implemented yet..."];
+};
+
+RealSecsToRope: PROC [seconds: REAL] RETURNS [r: ROPE] = {
+intSeconds: INT ¬ Real.Fix[seconds];
+mSecs: INT ¬ Real.Fix[(seconds - REAL[intSeconds]) * 1000];
+r ¬ PeriodToRope[intSeconds];
+r ¬ Rope.Cat[
+r,
+", ",
+Convert.RopeFromInt[mSecs],
+MaintainMisc.Plural[" mSec", " mSecs", mSecs]];
+};
+
+PeriodToRope: PROC [period: INT] RETURNS [r: ROPE] = {
+up: BasicTime.UnpackedPeriod ¬ BasicTime.UnpackPeriod[period];
+IF up.hours > 0 THEN
+r ¬ Rope.Concat[
+Convert.RopeFromInt[up.hours],
+MaintainMisc.Plural[" hour,", " hours,", up.hours]];
+IF up.hours > 0 OR up.minutes > 0 THEN
+r ¬ Rope.Cat[
+r, 
+" ",
+Convert.RopeFromInt[up.minutes],
+MaintainMisc.Plural[" minute,", " minutes,", up.minutes]];
+r ¬ Rope.Cat[
+r, 
+" ",
+Convert.RopeFromInt[up.seconds],
+MaintainMisc.Plural[" second", " seconds", up.seconds]];
+};
+
+}. 
+   V  MaintainNSImpl.mesa -- From MaintainImpl.mesa
+Copyright Ó 1987, 1989, 1990, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Wes Irish, July 21, 1989 12:13:18 pm PDT
+Bill Jackson (bj) January 22, 1990 6:30:11 pm PST
+Bryan Lyles,  November 8, 1990 1:03 pm PST
+Philip James, September 12, 1991 11:36 am PDT
+Willie-s, January 7, 1992 4:48 pm PST
+Michael Plass, March 11, 1992 1:50 pm PST
+Doug Wyatt, May 15, 1992 1:08 pm PDT
+
+******** Enquiry operations ******** --
+This is the simple case, no wildcards
+Wildcards present, enumerate all names...
+-- we set check to FALSE because friends should be able to be things like "*:*:Xerox"
+Notice that we don't automatically distinguish the name...
+Notice that we don't automatically distinguish the name...
+Returns FALSE iff the name could not possibly be a valid ExternalMailName.  In other words, a returned value of TRUE does not guarantee that the name is a valid ExternalMailName.
+IF ~EndsWith[dl.object, "-NS"] THEN {
+tempName: Name _ dl;
+tempName.object _ Rope.Cat[dl.object, "-NS"];
+IF CheckName[tempName] THEN {
+dl _ tempName;
+changed _ TRUE;
+};
+};
+ÊGµ  •NewlineDelimiter
+–(cedarcode) style˜ codešœÏc™-Kšœ	ÏeœH™TKšœ(™(K™1K™*K™-K™%K™)K™$K™ —šÏk	˜	KšœŸœ˜KšœŸœ˜2Kšœ
+ŸœŸœQ˜Kšœ˜Kšœ
+Ÿœ˜KšœŸœz˜‡KšœŸœ;˜OKšŸœŸœ"˜*KšœŸœ?˜QKšœŸœ˜'KšœŸœ>˜PKšœ˜KšœŸœ˜%KšœŸœ˜KšœŸœBŸœ˜[KšŸœŸœ>˜GKšœŸœÅ˜ÒKšŸœŸœÔ˜ßKšŸœŸœ]˜kKšœŸœÙ˜ëKšœ
+Ÿœ,˜;—K˜ š
+ÏnœŸœŸœŸœŸœ
+˜5KšŸœ+Ÿœ<ŸœŸœ˜˜KšŸœ˜KšŸœ˜KšŸœŸœŸœ˜K˜ Kšœ#˜#Kšœ/˜/Kšœ˜K˜ KšœŸœŸœ˜Kšœ	ŸœŸœ˜Kšœ
+ŸœŸœŸœ	˜!K˜ KšœŸœŸœ˜KšœŸœŸœ˜'Kšœ
+Ÿœ˜"K˜ Kšœ
+ŸœY˜gK˜ Kšœ
+ŸœŸœ˜—K˜ Kšœ%™'˜ š 	œŸœŸœ5Ÿœ˜TšŸœŸ˜Kšœ3˜3Kšœ=˜=KšŸœŸœ˜—K˜K˜ —š œŸœŸœ8Ÿœ˜YšÐbn	œŸœ8Ÿœ˜Pš¡œŸœ˜'KšœŸœ˜KšœŸœ˜$KšœŸœ˜&KšŸœŸœ˜$Kšœ˜—š¡œŸœ˜*KšœŸœ˜KšœŸœ˜*KšœŸœ˜KšŸœŸœ˜$Kšœ˜—š¡œŸœ˜(KšœŸœ˜KšœŸœ˜&Kšœ	Ÿœ	˜Kšœ˜—š¡œŸœŸœ˜DšŸœ&ŸœŸœŸ˜<Kšœ
+Ÿœ˜$KšŸœ˜—Kšœ˜—KšœŸœ˜Kšœ˜KšœPŸœ˜UKšœ6Ÿœ˜:KšœŸœ˜KšœŸœ˜Kšœ
+ŸœŸœ˜KšœŸœŸœ˜˜,Kšœ,ŸœŸœ˜<—K˜;K˜;K˜GKšœ&ŸœŸœ˜TKšœ%™%šŸœŸœŸœ˜3Kšœ ˜ KšŸœ˜K˜—Kšœ)™)K˜K˜KšŸœŸœG˜XšŸœ˜KšŸœ˜šŸœ˜šŸœ0˜5šœŸœ˜K˜
+K˜KšœŸœ˜šœ'˜'KšœŸœ˜*Kšœ%˜%—KšŸœ˜	Kšœ˜——K˜'K˜——š	Ÿœ/ŸœŸœŸœ	Ÿ˜TKšœŸœ˜K˜.K˜ KšŸœŸœ:˜KšŸœ˜KšŸœ˜šŸœ˜šŸœ-˜2šœŸœ˜K˜0K˜
+K˜KšœŸœ˜šœ'˜'KšœŸœ˜*Kšœ%˜%—KšŸœ˜	Kšœ˜——K˜-K˜——š	Ÿœ8ŸœŸœŸœ	Ÿ˜`KšœŸœŸœ˜!Kšœ˜KšœŸœ˜KšœŸœ˜KšŸœŸœŸœ˜3KšœŸœ˜K˜1K˜%K˜ KšŸœŸœU˜fKšŸœŸœ"˜;šŸœŸœ˜/šŸœ˜K˜MšŸœ*˜/šœŸœ˜K˜$K˜
+K˜KšœŸœ˜šœ'˜'KšœŸœ˜*Kšœ%˜%—KšŸœ˜	Kšœ˜——K˜—šŸœ˜KšŸœŸ˜#šŸœ/˜4šœŸœ˜K˜$K˜
+K˜KšœŸœ˜šœ'˜'KšœŸœ˜*Kšœ%˜%—KšŸœ˜	Kšœ˜——šŸœ"Ÿ˜(šŸœ*˜/šœŸœ˜K˜$K˜
+K˜KšœŸœ˜šœ'˜'KšœŸœ˜*Kšœ%˜%—KšŸœ˜	Kšœ˜———K˜——K˜)šŸœŸœ˜+KšŸœ$˜(—š	Ÿœ2ŸœŸœŸœ	Ÿ˜XšŸœŸœ˜K˜š
+ŸœŸœŸœŸœ'Ÿœ˜_šŸœ˜KšŸœ˜KšŸœŸœ˜—K˜<K˜—KšŸœ˜Kšœ˜—šŸœŸœ˜KšŸœŸœ˜%KšœŸœ˜K˜—K˜@KšŸœ˜—KšŸœ˜—KšŸœ˜—šŸœŸœŸœŸœ˜:Kšœa˜ašŸœŸœŸ˜*Kšœj˜j—šŸœŸ˜Kšœ‚˜‚—K˜šŸœŸœŸœ˜:K˜"Kšœx˜xKšœ˜K˜KšŸœ˜—K˜—KšŸœŸœ˜K˜——KšœŸœŸœ9˜VKšœ"Ÿœ˜+Kšœ(Ÿœ˜1Kšœ ˜ KšŸœ˜šœ˜K˜ —š¡œŸœŸœŸœŸœŸœŸœ
+ŸœŸœŸœŸœ
+Ÿœ˜©šŸœ
+ŸœŸœŸœŸœŸœŸ˜JKšœ˜Kšœ$Ÿœ˜)Kšœ
+Ÿœ˜K˜˜%KšœŸœ˜$—K˜(šŸœ
+˜KšŸœ9˜=KšŸœŸœ˜—KšŸœŸœ7˜HšŸœŸœŸœ˜$šŸœŸœ˜ K˜?KšŸœ˜Kšœ˜—K˜SKšœ˜—Kšœ>˜>KšŸœ˜—K˜—K˜ š œŸœ5Ÿœ˜Sš œŸœ˜šŸœŸ˜˜Kš	œŸœŸœŸœ
+Ÿœ
+˜?Kšœ!˜!Kšœ
+Ÿœ˜KšœŸœ˜!K˜5K˜7K˜.šŸœ
+Ÿœ˜K˜nKšŸœ˜K˜—K˜9K˜2šŸœ
+Ÿœ˜K˜jKšŸœ˜K˜—Kšœ3Ÿœ˜:šŸœŸœŸ˜šœ0˜0šŸœŸœ˜KšœÀ˜ÀKšŸœ˜K˜—KšœV˜V˜Ušœ"˜"K˜?KšœŸœ˜KšŸ˜Kšœ˜—šœ˜K˜CKšœŸœ˜KšŸ˜Kšœ˜—Kšœ˜—K˜—šŸœ˜K˜RK˜;šŸœ˜šŸœ0˜4šœ"˜"K˜;KšœŸœ˜KšŸ˜Kšœ˜—šœ˜K˜?KšœŸœ˜KšŸ˜Kšœ˜—Kšœ˜—šŸœ0˜4šœ"˜"K˜;KšœŸœ˜KšŸ˜Kšœ˜—šœ˜K˜?KšœŸœ˜KšŸ˜Kšœ˜—K˜——KšœŸœ˜K˜6šŸœ˜šŸœU˜Yšœ"˜"K˜;KšœŸœ˜KšŸ˜Kšœ˜—šœ˜K˜?KšœŸœ˜KšŸ˜Kšœ˜—K˜—šŸœU˜Yšœ"˜"K˜;KšœŸœ˜KšŸ˜Kšœ˜—šœ˜K˜?KšœŸœ˜KšŸ˜Kšœ˜—K˜——K˜——šŸœ
+˜KšŸœ˜KšŸœ˜—K˜—KšŸœ˜!—K˜—š œŸœ˜š
+ œŸœ Ÿœ&ŸœŸœ˜všŸœŸ˜˜šŸœ	Ÿ˜K˜T—šŸœ˜KšœW˜WšœŸœ˜'KšœŸœ-ŸœŸœ˜E—K˜—K˜—˜šŸœ
+Ÿ˜K˜X—šŸœ˜K˜AšœŸœ˜"KšœŸœ-ŸœŸœ˜E—K˜—K˜—KšŸœ˜ —šŸœ
+Ÿœ˜Kšœ6Ÿœ	˜GKšœŸœ˜K˜—KšŸœ˜K˜—Kšœ(ŸœŸœ˜5K˜K˜ —š¡œŸœ˜)Kšœe˜ešœŸœ˜)KšœŸœ-ŸœŸœ˜E—K˜K˜ —š¡œŸœ˜šŸœ	Ÿ˜šœ˜KšœT˜TšœŸœL˜VKšœŸœ-ŸœŸœ˜E—K˜—šœ˜KšœT˜TšœŸœQ˜[KšœŸœ-ŸœŸœ˜E—K˜—KšŸœ˜ —šŸœ
+Ÿœ˜Kšœ6Ÿœ	˜GKšœŸœ˜K˜—šŸœ˜K˜K˜—K˜—š¡œŸœ˜KšœŸœŸœ˜š¡œŸœŸœ˜=Kšœ_˜_KšœŸœ˜šœŸœJ˜TKšœŸœ-ŸœŸœ˜E—šŸœ
+Ÿœ˜KšœŸœ˜šœŸœM˜WKšœŸœ-ŸœŸœ˜E—K˜—K˜—š¡œŸœŸœ˜EKšœ˜K˜Kšœ_˜_˜'KšœŸœ˜&—K˜3KšœŸœ˜šœŸœ&˜0KšœŸœ-ŸœŸœ˜E—šŸœ
+Ÿœ˜KšœŸœ˜šœŸœ)˜3KšœŸœ-ŸœŸœ˜E—K˜—K˜—š¡ ¡œŸœŸœ˜MK˜-KšœŸœ˜šŸœŸœŸœ˜K˜FKšŸœ˜K˜—Kšœ_˜_šœŸœ&˜0KšœŸœ-ŸœŸœ˜E—šŸœ
+Ÿœ˜KšœŸœ˜šœŸœ)˜3KšœŸœ-ŸœŸœ˜E—K˜—K˜—šŸœŸ˜Kšœ)˜)˜KšœŸœŸœŸœ	˜˜(KšœŸœŸœ˜0—šŸœ
+Ÿœ˜K˜TKšŸœ˜Kšœ˜—K˜:Kšœ˜K˜KšœŸœ˜šœŸœ_˜iKšœŸœ-ŸœŸœ˜E—šŸœ
+Ÿœ˜KšœŸœ˜šœŸœ\˜fKšœŸœ-ŸœŸœ˜E—K˜—KšœŸœŸœŸœ˜BšŸ˜KšœŸœ˜—K˜—K˜MK˜JK˜ZK˜:K˜AKšœn˜nKšœx˜xKšœ€˜€Kšœ˜KšŸœ˜ —šŸœ
+Ÿœ˜Kšœ6Ÿœ	˜GKšœŸœ˜K˜—šŸœ˜K˜K˜—K˜—š¡œŸœ˜š
+¡œŸœ Ÿœ&ŸœŸœ˜vK˜KšœŸœ˜Kšœ	ŸœŸœ˜šŸœ	ŸœŸ˜"K˜=—šŸœŸ˜˜šŸœ	Ÿœ˜KšœZ˜ZKšŸœ	ŸœL˜[šœŸœ(˜2KšœŸœ-ŸœŸœ˜E—K˜—šŸœ˜Kšœt˜tKšŸœ	ŸœL˜[šœŸœ%˜/KšœŸœ-ŸœŸœ˜E—K˜—K˜—˜Kšœ[˜[KšŸœ	ŸœL˜[šœŸœ(˜2KšœŸœ-ŸœŸœ˜E—šŸœ
+Ÿœ˜K˜=šŸœŸœ˜K˜6K˜NšœŸœ+˜5KšœŸœ-ŸœŸœ˜E—K˜—K˜—K˜—KšŸœ˜ —šŸœ
+Ÿœ˜Kšœ6Ÿœ	˜GKšœŸœ˜K˜—KšŸœ˜K˜—KšœE˜EK˜—š¡œŸœ˜š
+¡œŸœ Ÿœ&ŸœŸœ˜ušŸœŸ˜˜šŸœ	Ÿœ˜Kšœi˜išœŸœG˜TKšœŸœ-ŸœŸœ˜E—K˜—šŸœ˜Kšœƒ˜ƒšœŸœD˜QKšœŸœ-ŸœŸœ˜E—K˜—K˜—˜Kšœj˜jšœŸœI˜VKšœŸœ-ŸœŸœ˜E—šŸœ
+Ÿœ˜K˜=šŸœŸœ˜K˜NšœŸœL˜YKšœŸœ-ŸœŸœ˜E—K˜—K˜—K˜—KšŸœ˜ —šŸœ
+Ÿœ˜Kšœ6Ÿœ	˜GKšœŸœ˜K˜—KšŸœ˜K˜—KšœD˜DK˜—š¡œŸœ˜š
+¡œŸœ Ÿœ&ŸœŸœ˜všŸœŸ˜˜šŸœ	Ÿœ˜Kšœl˜lšœŸœD˜QKšœŸœ-ŸœŸœ˜E—K˜—šŸœ˜Kšœ†˜†šœŸœA˜NKšœŸœ-ŸœŸœ˜E—K˜—K˜—˜Kšœm˜mšœŸœF˜SKšœŸœ-ŸœŸœ˜E—šŸœ
+Ÿœ˜K˜=šŸœŸœ˜K˜NšœŸœI˜VKšœŸœ-ŸœŸœ˜E—K˜—K˜—K˜—KšŸœ˜ —šŸœ
+Ÿœ˜Kšœ6Ÿœ	˜GKšœŸœ˜K˜—KšŸœ˜K˜—KšÐcs=™UKšœ)Ÿœ˜>K˜—š¡
+œŸœ˜Kšœ˜KšœŸœ˜Kšœ	ŸœŸœ˜K˜=šŸœŸ˜˜K˜9KšŸœ	ŸœL˜[šœŸœ˜&KšœŸœ-ŸœŸœ˜E—K˜—˜K˜=KšŸœ	ŸœL˜[šœŸœ˜)KšœŸœ-ŸœŸœ˜E—K˜—KšŸœ˜ —šŸœ
+Ÿœ˜Kšœ6Ÿœ	˜GKšœŸœ˜K˜—šŸœ˜K˜K˜—K˜—š¡œŸœ˜šŸœŸ˜Kšœ˜Kšœ˜KšŸœ˜ —K˜—š¡œŸœ˜KšœŸœ'˜8Kšœ˜Kš	œŸœŸœŸœŸœ˜Kš	œŸœŸœŸœŸœ˜&šŸœ#˜%KšŸœ4˜8—šŸœ˜K˜2šœŸœ;Ÿœ˜IKšœŸœ-ŸœŸœ˜E—K˜—šŸœŸœŸœŸœŸœŸœŸ˜8Kšœ˜Kšœ
+Ÿœ˜K˜AšŸœ
+Ÿ˜K˜.—KšœŸœ+˜5KšŸœ˜—šŸœŸ˜šœ˜K˜;Kšœ˜—šœ˜K˜FK˜@K˜—šŸœ˜Kšœ˜KšŸœ˜K˜——šŸœŸœŸœ˜!K˜EšœŸœ$˜.KšœŸœ-ŸœŸœ˜EK˜——šŸœ˜K˜3Kšœ"˜"K˜K˜.šœŸœ.˜8KšœŸœ-ŸœŸœ˜E—K˜—K˜—š¡œŸœ˜Kš œŸœŸœŸœ˜Cš œŸœŸœŸœ˜?šœŸœ˜,KšœŸœ-ŸœŸœ˜E—KšŸœ˜K˜—š¡œŸœŸœŸœ˜9š¡	œŸœ˜ K˜Kšœ˜—KšœŸœ˜šœŸœ)˜3KšœŸœŸœ˜—KšŸœ˜Kšœ˜—KšœŸœ$˜5šœ)˜)šœŸœŸ˜Kšœ˜K˜KšŸœ˜—šœŸœŸ˜Kšœ˜K˜KšŸœ˜—Kšœ˜—šŸœ Ÿœ˜(K˜"KšŸœ˜K˜—šŸœŸ˜šœ˜šŸœ$Ÿœ˜,K˜PKšœ˜—šŸœ#˜%KšŸœ4˜8—šŸœ˜K˜,šœŸœN˜XKšœŸœ-ŸœŸœ˜E—Kšœ˜—šŸœ!˜#KšŸœ6˜:—šŸœ˜K˜.šœŸœ=˜GKšœŸœ-ŸœŸœ˜E—K˜—K˜\Kšœ˜—šœ˜šŸœ"˜$KšŸœ4˜8šŸœ˜šŸœ˜šŸœ˜K˜TKšŸœ˜K˜—šŸœ˜K˜0šœŸœ"˜,KšœŸœ-ŸœŸœ˜E—Kšœ˜—K˜———šŸœ$˜&KšŸœ2˜6šŸœ˜K˜.šœŸœ$˜.KšœŸœ-ŸœŸœ˜E—Kšœ˜——K˜dKšœ˜—KšŸœ˜ —K˜—š¡œŸœ˜š¡œŸœ˜%K˜;K˜XK˜0šœŸœ(˜2KšœŸœ-ŸœŸœ˜E—K˜—šŸœ	Ÿ˜šœ˜KšœŸœŸœ˜šŸœŸ˜˜Kšœ	Ÿœ	˜˜)KšœŸœŸœ˜0—šŸœ
+Ÿœ˜K˜TKšŸœ˜Kšœ˜—KšœŸœ˜#K˜QK˜&K˜AšœŸœ˜KšœŸœ-ŸœŸœ˜E—KšŸœ
+ŸœŸœ˜#K˜UšœŸœJŸœ˜jKšœŸœ-ŸœŸœ˜E—KšŸœ
+ŸœŸœ˜#K˜0šœŸœ;Ÿœ˜PKšœŸœ-ŸœŸœ˜E—KšŸœ
+ŸœŸœ˜#K˜;šœŸœ2Ÿœ˜XKšœŸœ-ŸœŸœ˜E—KšœŸœŸœŸœ˜BšŸ˜KšœŸœ˜—K˜—šœ˜K˜:šœŸœ˜KšœŸœ-ŸœŸœ˜E—K˜—šŸœ˜K˜>šœŸœ˜KšœŸœ-ŸœŸœ˜E—šŸœŸœŸœI˜eKšœŸœ-ŸœŸœ˜E—KšŸœŸœ˜)K˜——K˜—˜Kš œŸœŸœŸœ˜CK˜9šœŸœ˜KšœŸœ-ŸœŸœ˜E—šŸœŸœŸœN˜jKšœŸœ-ŸœŸœ˜E—šŸœŸœŸœ=˜YKšœŸœ-ŸœŸœ˜E—K˜—KšŸœ˜ —šŸœ
+Ÿœ˜Kšœ6Ÿœ	˜GKšœŸœ˜K˜—šŸœ˜K˜K˜—K˜—š¡œŸœ˜K˜:šœŸœ˜KšœŸœ-ŸœŸœ˜E—šŸœ
+Ÿœ˜Kšœ6Ÿœ	˜GKšœŸœ˜K˜—šŸœ˜K˜K˜—K˜—KšœŸœŸœ9˜VKšœŸœ˜KšœŸœ˜Kšœ
+ŸœŸœ˜Kšœ˜K˜KšœŸœ˜šŸœŸœŸœŸœ˜!KšœŸœ˜K˜!K˜—˜$KšœŸœ˜'—˜'KšœŸœ˜'—šŸœŸœŸœŸœ˜XK˜RKšŸœ˜KšŸœ˜Kšœ˜—šŸœ	Ÿ˜K˜%˜
+šŸœ˜šŸœ˜šŸœ˜KšŸœ˜KšŸœ*˜.—K˜—KšŸœ˜—K˜—K˜Kšœ0˜0Kšœ"˜"K˜K˜K˜Kšœ˜Kšœ!˜!Kšœ#˜#Kšœ0˜0K˜KšŸœ˜ —KšŸœ˜K˜K˜ —š
+¡œŸœŸœŸœŸœ˜SšŸœŸœŸœŸ˜-KšŸœŸœŸœŸœ˜+KšŸœ˜—KšŸœŸœ˜K˜K˜ —š œŸœ5Ÿœ˜Qš 
+œŸœŸœŸœŸœŸœŸœŸœŸœŸœŸœŸœŸœŸœŸœ˜¡š¡
+œŸœŸœŸœŸœŸœŸœŸœ˜>šŸœŸœŸœŸ˜"Kš
+ŸœŸœŸœŸœŸœ˜3KšŸœ˜—KšŸœŸœ˜Kšœ˜—KšœŸœŸœ˜KšœŸœ ˜(šŸœŸœ˜Kšœ
+ŸœŸœ˜KšœŸœ˜KšœŸœ˜KšœŸœ˜KšœŸœ1˜IšŸœ,˜.KšŸœŸœ˜$šŸœŸœ˜1KšœŸœ-ŸœŸœ˜E——šŸœŸœŸ˜šœŸœŸ˜K˜>˜FšŸœ˜šŸœ˜˜8Kšœ˜—K˜—šŸœ˜šœ˜Kšœ˜KšœŸœ	˜+—KšœŸœ˜K˜——K˜—šŸœ˜šŸœŸ˜KšŸœ.ŸœŸœ"˜i—šœ˜Kšœ˜KšœŸœ	˜+—K˜——šœ$˜$šŸœ&˜)K˜@——KšŸœ˜—K˜—šŸœŸœ
+ŸœŸœ˜(KšœŸœ˜K˜"šœŸœ%˜/KšœŸœ-ŸœŸœ˜E—šŸœ
+Ÿœ˜Kšœ6Ÿœ	˜GšŸœŸœ˜!K˜Eš	ŸœŸœŸœŸœ	Ÿ˜+Kšœ)˜)KšŸœ˜—KšŸœŸœŸœ˜KšŸœ˜Kšœ˜—Kšœ˜KšŸœ˜ —KšŸœ˜KšœŸœ˜
+—KšœŸœ˜KšŸœ˜Kšœ˜—š 
+œŸœ˜!šŸœŸœŸœ˜5KšŸœ˜KšŸœŸœŸœ˜.—KšœŸœ˜K˜<Kšœ˜—š œŸœ˜'šŸœ
+˜KšŸœŸ˜KšŸœ˜—KšœŸœ˜KšœH˜HKšœ˜—š œŸœ˜-šŸœ
+˜KšŸœŸ˜KšŸœ˜—KšœŸœ˜K˜1Kšœ˜—š¡œŸœ˜$KšœŸœŸœ˜&K˜$Kšœ˜—š¡œŸœŸœ	˜5K˜:KšœŸœ ˜*K˜$Kšœ˜—š¡œŸœŸœŸœ˜8K˜4KšŸœŸœŸœŸœ˜(K˜šŸœŸœŸœŸ˜&KšŸœŸœ˜"KšœU˜UKšŸœ˜—Kšœ˜—š¡œŸœŸœŸœ˜=šŸœŸœŸœŸœŸœŸœ˜YKšŸœ˜KšŸœ˜—Kšœ˜—š
+¡œŸœŸœŸœŸœ
+˜ZK˜šŸœ	Ÿœ$˜3Kšœ˜šœŸœŸœ˜8KšŸœ˜KšŸœ˜#——K˜/Kšœk˜kKšœ˜—š¡œŸœŸœŸœ˜OšŸ˜Kšœ˜K˜2KšŸœ˜Kšœ˜—KšœŸœ˜KšœŸœŸœ˜KšŸœŸœ|˜K˜5K˜;šŸœŸœŸ˜K˜IKšŸœŸœŸœ˜3K˜KšŸœ˜—šŸ˜KšœŸœ˜—Kšœ˜—š¡œŸœ˜+KšœŸœŸœŸœ	˜˜1Kšœ%ŸœŸœ˜?—Kšœ˜Kšœ˜—š¡œŸœ˜3šŸ˜Kšœ˜K˜&Kšœ˜KšŸœ˜K˜—KšœŸœ+˜@KšœŸœ+˜@KšŸœŸœ"˜9šŸœŸœ!˜8KšœŸœŸœŸœ˜.—šŸ˜KšœŸœ˜—Kšœ˜—š¡œŸœŸœŸœ˜Bš¡	œŸœ˜ K˜Kšœ˜—KšœŸœ˜šœŸœ&˜0KšœŸœŸœ˜—KšŸœ˜Kšœ˜K˜ —š¡
+œŸœ˜"KšŸœ˜KšœŸœŸœ˜KšœŸœŸœ˜#šœŸœ˜;KšœŸœ-ŸœŸœ˜E—KšŸœŸœŸœ˜šŸœ
+ŸœŸœŸ˜Kšœ'Ÿœ˜.KšŸœŸœŸœŸœŸœŸœ˜A—šŸœ˜KšŸœŸ˜KšŸœ˜—šŸœ
+Ÿœ˜K˜,KšœÔ˜ÔKšœŸœ˜KšŸœ˜K˜—K˜YKšŸœŸœŸœŸœŸœŸœ˜@K˜šœŸœ#˜-KšœŸœ"Ÿœ˜4—KšŸœŸœ˜*KšŸœŸœŸœ˜K˜ šŸœŸœŸœŸ˜-Kšœ(Ÿœ4˜dKšœ	Ÿœ˜Kšœ˜K˜K˜%KšŸœŸœŸœ˜K˜!KšœŸœ˜#KšŸœ
+ŸœŸœŸœŸœŸœ˜NšŸœŸœ˜1šœŸœ˜KšŸœ)˜-KšŸœ˜——K˜šŸœ
+Ÿ˜šœ
+˜
+KšœŸœŸœŸœ˜%KšœŸœ˜šŸœ
+˜šŸœŸœ)˜8KšœŸœ-ŸœŸœ˜D—KšŸœ<˜@—šŸœŸœ˜šŸœŸœŸ˜3KšœŸœ	˜KšŸœŸœŸœ˜šŸœ
+ŸœŸ˜K˜—šŸœŸ˜K˜.K˜9K˜7KšŸœŸœ˜—šŸœ
+ŸœŸ˜K˜—KšœŸœ˜šœŸœ;˜HKšœŸœ-ŸœŸœ˜E—KšŸœŸœ˜*KšŸœ˜K˜——Kšœ˜—šŸœ˜Kšœ˜šœŸœ$˜4KšœŸœŸœ˜—š	ŸœŸœŸœŸœ
+Ÿ˜'Kšœ/˜/Kšœ˜Kšœ˜Kšœ:˜:Kšœ*˜*KšœG˜GKšœ5˜5KšŸœ˜ —K˜——KšŸœ˜—Kšœ˜—KšœŸœŸœ9˜V˜+KšœŸœ˜'—Kšœ˜Kšœ
+Ÿœ˜Kšœ
+ŸœŸœ˜KšœŸœŸœ˜KšœŸœ˜KšœŸœ˜KšœŸœ˜K˜+šŸœ	Ÿ˜šœ˜K˜KšœŸœŸœ˜K˜!KšŸœŸœ˜(K˜8šœŸœ)˜3KšœŸœ-ŸœŸœ˜E—KšŸœŸœe˜vKšœ˜—šœ
+˜
+KšœŸœ˜Kšœ0˜0KšœŸœŸœ˜KšœŸœŸœŸœ˜š¡œŸœ˜$KšœŸœ˜&K˜K˜—š¡œŸœŸœŸœŸœ
+ŸœŸœ	˜LšŸœŸœŸœŸœŸœŸ˜@Kšœ
+Ÿœ˜$KšŸœ˜—Kšœ˜—šŸœ˜KšŸœŸ˜KšŸœ˜—K˜:K˜šŸœŸ˜K˜.—šœŸœ/˜9KšœŸœ-ŸœŸœ˜E—Kšœc˜cšŸœŸœ˜K˜'šŸœŸœŸœŸœŸœŸœ	Ÿ˜FšŸœŸ˜šœ%˜%Kšœ(˜(Kšœ˜——K˜+K˜HK˜,šŸœŸ˜K˜l—KšŸœ˜—K˜šŸœŸ˜K˜V—K˜—Kšœ˜—Kšœ˜Kšœ˜Kšœ˜šœ˜KšœŸœ˜(˜5KšœŸœ˜'—KšŸœ-Ÿœ'˜ZK˜ KšœŸœ˜K˜9šŸœ.˜3KšœŸœ-ŸœŸœ˜E—KšŸœŸœd˜uK˜—šœ˜K˜&KšœŸœ˜KšœŸœ˜šŸœ:˜?KšœŸœ-ŸœŸœ˜E—KšŸœŸœd˜uK˜—˜KšœŸœ˜Kšœ˜K˜<K˜+K˜-KšœŸœŸœŸœ˜CKšŸœŸœQ˜_K˜šŸœ1ŸœŸœŸ˜EKšœŸœŸœŸœ˜MK˜
+KšŸœ˜—K˜9K˜—šœ˜šŸœ
+ŸœŸœŸœŸœŸœŸ˜JKšœŸœ˜(Kšœ˜KšœŸœŸœ˜Kšœ:™:˜8KšœŸœ˜'—KšœŸœ˜šœŸœ,˜<KšœŸœŸœ˜—šŸœŸœ˜šŸœ˜šŸœ7˜;Kšœ˜KšŸœŸœŸœ˜+Kšœ(˜(—šŸœŸœŸœ˜šŸœ˜KšŸœŸ˜KšŸœ˜—K˜$K˜——K˜—KšŸœ˜—K˜ K˜—šœ˜šŸœ
+ŸœŸœŸœŸœŸœŸ˜JKšœŸœ˜(Kšœ˜KšœŸœŸœ˜Kšœ:™:˜8KšœŸœ˜'—KšœŸœ˜šœŸœ3˜CKšœŸœŸœ˜—šŸœŸ˜KšœKŸœŸœŸœ:˜ —KšŸœ˜—K˜—KšŸœ˜ —šŸœ
+Ÿœ˜Kšœ5Ÿœ	˜FK˜—KšŸœ˜KšŸœŸœŸœ$˜7Kšœ˜K˜ —š
+¡œŸœŸœŸœŸœ˜EšŸœ˜šœ'˜'KšœŸœ˜.—Kšœ˜—šŸ˜KšœŸœ&˜9—K˜K˜ —š œŸœŸœŸœŸœŸœ˜\KšœŸœŸœ˜ KšœŸœ˜KšŸœŸœŸœ˜9šœŸœ˜,KšœŸœŸœ˜—KšŸœŸœŸœ˜7KšŸœ˜K˜K˜ —š¡œŸœŸœŸœŸœ	ŸœŸœŸœ˜fKšœŸœŸœ˜ Kšœ
+ŸœŸœŸœ˜KšœŸœŸœ˜Kšœ˜KšŸœŸœŸœ˜9šœŸœ&˜6KšœŸœŸœ˜—˜-šœ˜KšŸœŸœŸœ˜7KšŸœ˜Kšœ	˜	——šŸœ	ŸœŸ˜šŸœ	Ÿ˜KšŸœŸœ˜:KšŸœŸœ˜C—K˜KšŸœ˜—KšŸœŸœŸœ˜7šŸ˜KšœŸœŸœ˜—Kšœ˜K˜ —š¡œŸœŸœŸœŸœŸœ(Ÿœ˜yKšœŸœ˜K˜KšœŸœ˜šŸœŸœŸœŸœŸœŸœŸ˜3K˜+K˜=K˜KšŸœ˜—K˜0K˜1Kšœ˜K˜ —š	¡ œŸœŸœŸœ˜DKšœŸœ˜KšœŸœ˜KšœŸœŸœ˜š¡	œŸœŸœ˜˜KšœŸœŸœ˜.—K˜K˜—š¡
+œŸœŸœ˜K˜!K˜K˜K˜—KšœŸœ!˜>KšŸœŸœŸœŸœ˜K˜)K˜
+KšœŸœ"˜?KšŸœ˜Kšœ˜K˜ —š¡œŸœŸœŸœŸœŸœŸœ˜WKšœŸœŸœŸœ	˜!š¡
+œŸœŸœ˜Kšœ	Ÿœ)˜5šŸœŸ˜KšŸœŸœ	˜,KšŸœ"Ÿœ
+˜4—K˜—KšœŸœ"˜?Kšœ˜K˜ —š¡œŸœŸœŸœŸœŸœŸœŸœŸœ˜DKšœŸœŸœŸœ˜šŸœŸœŸœŸ˜"KšœŸœ˜KšŸœ˜—šŸœŸœŸœŸ˜"KšœŸœ˜KšŸœ˜—KšŸœ˜Kšœ˜K˜ —š¡œŸœŸœŸœŸœŸœŸœŸœŸœ˜IKšœŸœŸœŸœ˜šŸœŸœŸœŸ˜"KšŸœŸœŸœ˜9KšŸœ˜—KšŸœ˜Kšœ˜K˜ —š
+¡œŸœŸœŸœŸœ˜2KšœŸœŸœ˜šŸœŸœŸœŸ˜"šŸœ˜KšŸœ	Ÿ˜KšŸœ˜—K˜#KšŸœ˜—Kšœ˜K˜ —š
+¡œŸœŸœŸœŸœ˜FKšœŸœŸœ˜šŸœŸœŸ˜KšœŸœŸœŸœ@˜nKšœŸœ˜K˜KšŸœ˜—Kšœ˜K˜ —š¡
+œŸœŸœŸœŸœŸœŸœŸœ˜>šŸœŸœŸœŸ˜"Kš
+ŸœŸœŸœŸœŸœ˜3KšŸœ˜—KšŸœŸœ˜Kšœ˜K˜ —š œŸœŸœŸœ˜4KšœŸœŸœ˜KšœŸœŸœ˜&šŸœŸœŸœŸœ˜.K˜>KšœŸœ˜+KšŸœ˜K˜—K˜=˜%KšœŸœŸœ˜.—KšŸœŸœŸœ˜;K˜DK˜Kšœ˜K˜ —š¡œŸœŸœŸœŸœŸœŸœŸœŸœŸœ˜¸˜YKšœ'ŸœŸœ˜;—KšŸœ˜Kšœ˜K˜ —š¡œŸœŸœŸœŸœŸœŸœŸœŸœŸœŸœŸœ˜ÍKšœŸœŸœ˜ KšŸœŸœŸœ˜9šœŸœ˜"KšœŸœ7ŸœŸœ˜O—KšŸœŸœŸœ˜7Kšœ˜K˜ —š¡œŸœŸœŸœŸœŸœ˜SKšœŸœcŸœ
+Ïb	œ+™²KšœŸœ˜Kšœ
+ŸœŸœ˜KšœŸœŸœ˜ KšœŸœ	˜KšœŸœ/˜8KšŸœŸœŸœŸœ˜,KšŸœŸœŸœ˜9šœŸœ˜&KšœŸœ(ŸœŸœ˜@—KšŸœŸœŸœ˜7KšŸœŸœ˜1Kšœ˜K˜ —š
+ œŸœŸœŸœŸœ˜0KšŸœŸœŸœ˜2Kšœ˜K˜ —š
+ œŸœŸœŸœŸœ˜.KšŸœŸœ˜Kšœ˜K˜ —š
+¡œŸœŸœŸœŸœ˜[Kšœ
+Ÿœ˜šŸœŸœ™%Kšœ™Kšœ-™-šŸœŸœ™Kšœ™Kšœ
+Ÿœ™K™—Kšœ™—K˜&KšŸœ˜Kšœ˜K˜ —š
+ œŸœŸœŸœŸœ˜.KšŸœŸœŸœŸœŸœŸœ˜`KšŸœŸœ˜Kšœ˜K˜ —š
+ œŸœŸœŸœŸœ˜0KšŸœŸœŸœ˜8KšŸœ˜
+Kšœ˜K˜ —š
+ œŸœŸœŸœŸœ˜.Kšœ	Ÿœ˜Kšœ	Ÿœ˜KšŸœŸœŸœŸœ˜(KšŸœ;Ÿœ˜IKšœ˜K˜ —š¡	œŸœŸœŸœŸœŸœ˜KKšœŸœŸœ˜KšœŸœŸœ˜KšœŸœŸœ˜ KšŸœŸœŸœ˜9šœŸœ˜šœŸœ˜šŸœŸ˜KšœTŸœ˜ZKšœ3Ÿœ˜8KšŸœ˜—KšŸœ˜——šŸœ˜KšŸœ ˜$—KšŸœŸœŸœ˜7KšŸœ˜Kšœ˜K˜ —š¡œŸœŸœŸœŸœŸœŸœ˜OšŸœ&˜,KšœŸœ	˜,—Kšœ˜K˜ —KšœŸœŸœŸœ˜4šœŸœŸœ˜#Kšœ˜KšœŸœ˜KšœŸœ˜KšœŸœ˜K˜KšœŸœŸœ˜Kšœ
+ŸœŸ˜Kšœ˜—K˜ Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ&˜&K˜ šœ%Ÿœ˜*KšœI˜IKšœ9˜9Kšœ#˜#Kšœ+˜+Kšœ"˜"KšœY˜YKšœgŸœŸœ˜tKšœS˜SKšœ9ŸœŸœ˜FKšœO˜OKšœe˜eKšœk˜kKšœ9˜9Kšœ9˜9Kšœl˜lKšœ=˜=Kšœb˜bKšœb˜bKšœI˜IKšœ:Ÿœ˜@Kšœ:˜:Kšœi˜iKšœ3˜3Kšœ2˜2Kšœ'˜'KšœH˜HKšœ@˜@Kšœ6˜6KšœJ˜JKšœ7˜7Kšœ7˜7Kšœ'˜'Kšœ/˜/Kšœ=ŸœŸœ˜JKšœ,˜,Kšœ:Ÿœ˜@Kšœ8˜8KšœBŸœŸœ˜OKšœ:˜:K˜K˜ —K˜ š
+¡œŸœŸœŸœŸœ
+˜9KšŸœ.Ÿœ˜?KšŸœ1Ÿœ˜GKšŸœŸœ˜Kšœ˜K˜ —š¡œŸœŸœŸœ
+˜@KšœŸœŸœ˜KšŸœ˜!Kšœ˜—K˜ š
+ œŸœŸœŸœŸœ˜MKšœ˜KšœŸœŸœŸœ	˜KšœŸœŸœ˜KšœŸœŸœ˜5šœŸœ'˜7KšœŸœŸœŸœ˜+—KšŸœ˜KšŸœŸœŸœŸœ˜šŸœŸœ2˜IKšœ!ŸœŸœ˜<—KšŸœŸœŸœŸœ˜šŸœ'ŸœŸœŸ˜BKšŸœŸœŸœŸœ˜1KšŸœ˜—KšŸœŸœ˜Kšœ˜K˜ —š¡œŸœŸœŸœ˜6Kšœ˜Kšœ
+ŸœŸœ˜˜KšœŸœŸœ˜1—KšŸœ
+ŸœŸœ˜KšŸœŸœŸœŸœ˜EšŸœ2ŸœŸœŸ˜FšŸœŸœ˜'KšŸœ$Ÿœ˜,KšŸœ#Ÿœ˜+KšŸœŸœ˜—KšŸœ˜—K˜ Kšœ/Ÿœ˜7šŸœ2ŸœŸœŸ˜FšŸœ!Ÿœ˜.KšŸœ%Ÿœ˜2KšŸœŸœ˜—KšŸœ˜—KšŸœ˜Kšœ˜K˜ —š¡œŸœŸœ˜=KšœŸœŸœ˜KšŸœ˜Kšœ˜K˜ —š¡œŸœŸœŸœ˜DKšŸœŸœŸœ˜?KšŸœ(˜.Kšœ˜K˜ —š¡œŸœŸœ˜GšŸœ2ŸœŸœŸ˜FKšŸœŸœŸœ˜.KšŸœ˜—KšŸœ@ŸœŸœŸœ˜cKšœ˜K˜ —š¡œŸœŸœŸœ˜<K˜/šŸœŸ˜KšŸœŸœ˜KšŸœŸœ)˜4—Kšœ˜K˜ —š¡œŸœ,ŸœŸœ˜XšŸœŸœ	Ÿ˜Kšœ˜Kšœ7˜7Kšœ%˜%Kšœ1˜1Kšœ1˜1Kšœ;˜;Kšœ;˜;Kšœ;˜;Kšœ3˜3Kšœ˜Kšœ˜Kšœ˜Kšœ˜KšŸœ˜K˜—Kšœ˜K˜ —š¡œŸœ(ŸœŸœ˜PšŸœŸœ	Ÿ˜Kšœ+˜+Kšœ%˜%Kšœ%˜%Kšœ#˜#Kšœ+˜+Kšœ7˜7KšŸœ˜K˜—Kšœ˜K˜ —š œŸœŸœŸœŸœŸœ˜PšŸœŸ˜K˜!K˜K˜%K˜'K˜3K˜5K˜'K˜1K˜/K˜;K˜/K˜/K˜1K˜%K˜%K˜1K˜/K˜K˜K˜)K˜1K˜1K˜1K˜?K˜KšŸœŸ˜—K˜K˜ —š œŸœŸœŸœŸœŸœ˜HšŸœŸ˜K˜K˜KšŸœŸ˜—K˜K˜ —š¡œŸœŸœŸœŸœŸœŸœŸœŸœŸœ˜kKšœŸœ˜KšœŸœ˜šŸ˜KšœŸœ˜KšœŸœ˜%KšŸœ	ŸœŸœ˜K˜K˜KšŸœŸœŸœ˜KšŸœ˜—KšŸœ˜
+Kšœ˜K˜ —š¡œŸœ˜'K˜?Kšœ˜K˜ —š
+¡œŸœŸœŸœŸœ˜:KšœŸœ˜$KšœŸœŸœ˜;K˜˜K˜K˜Kšœ˜Kšœ/˜/—Kšœ˜K˜ —š
+¡œŸœ
+ŸœŸœŸœ˜6K˜>šŸœŸ˜˜Kšœ˜Kšœ4˜4——šŸœŸœŸ˜&˜K˜K˜Kšœ ˜ Kšœ:˜:——˜K˜K˜Kšœ ˜ Kšœ8˜8—Kšœ˜K˜ ——Kšœ˜— …—    ² Q½ 

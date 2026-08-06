@@ -1,0 +1,610 @@
+
+DIRECTORY
+Commander USING [CommandProc, Register, Handle],
+CommanderOps USING [DoCommand, GetCmdToken, Token],
+Convert USING [RopeFromInt, RopeFromRope],
+Args USING [Arg, ArgRope, Error, GetRope, NArgs],
+IO,
+Random USING [Create, RandomStream, NextInt],
+Rope,
+SimpleFeedback USING [Append],
+UserProfile USING [Boolean, CallWhenProfileChanges, Line, ListOfTokens, ProfileChangedProc, Token];
+
+
+StandardMMCmds: CEDAR PROGRAM
+IMPORTS Args, Commander, CommanderOps, Convert, IO, Random, Rope, SimpleFeedback, UserProfile
+	~ BEGIN
+
+ROPE: TYPE ~ Rope.ROPE;
+RopeList: TYPE ~ LIST OF ROPE;
+
+randomStream: Random.RandomStream ~ Random.Create[seed: -1];
+
+CmdArgs: TYPE ~ REF CmdArgsRep;
+CmdArgsRep: TYPE ~ RECORD [
+shortName: ROPE ¨ NIL,
+localDir: ROPE ¨ NIL,
+userSwitches: ROPE ¨ NIL,
+cSwitches: ROPE ¨ "-c -g",
+lSwitches: ROPE,
+libraries: ROPE,
+machClass: ROPE ¨ NIL,
+machClassSw: ROPE ¨ NIL,
+auxFileList: RopeList ¨ NIL,
+rauxFileList: RopeList ¨ NIL,
+clean: BOOL ¨ FALSE
+];
+
+CommandSyntaxError: ERROR ~ CODE;
+Pair: TYPE = RECORD [match, replace: ROPE, literal, word, ignoreCase, addBounds: BOOL ¨ FALSE];
+PairList: TYPE = LIST OF Pair;
+RopeMap: TYPE = REF RopeMapRep;
+RopeMapRep: TYPE = RECORD [Map: PROC [REF ANY, ROPE] RETURNS [ROPE], data: REF ANY ¨ NIL];
+PairMapper: PROC [data: REF ANY, rope: ROPE] RETURNS [ROPE] ~ {
+pairList: PairList ~ NARROW[data];
+start: INT ¨ 0;
+Alpha: PROC [i: INT] RETURNS [BOOL] ~ {
+IF i < 0 OR i >= rope.Size THEN RETURN [FALSE];
+SELECT rope.Fetch[i] FROM
+IN ['a..'z] => RETURN [TRUE];
+IN ['A..'Z] => RETURN [TRUE];
+IN ['0..'9] => RETURN [TRUE];
+ENDCASE => RETURN [FALSE];
+};
+WHILE start < Rope.Size[rope] DO
+match: PairList ¨ NIL;
+matchIndex: INT ¨ LAST[INT];
+tryAgain: BOOL;
+FOR tail: PairList ¨ pairList, tail.rest UNTIL tail = NIL DO
+i: INT ~ Rope.Index[rope, start, tail.first.match, NOT tail.first.ignoreCase];
+IF tail.first.word AND (Alpha[i-1] OR Alpha[i+tail.first.match.Size]) AND i < rope.Size THEN {tryAgain ¨ TRUE; LOOP};
+SELECT i FROM
+< matchIndex => {match ¨ tail; matchIndex ¨ i};
+= matchIndex => {IF match = NIL OR tail.first.match.Size > match.first.match.Size THEN {
+match ¨ tail; matchIndex ¨ i
+}};
+ENDCASE;
+ENDLOOP;
+IF matchIndex < Rope.Size[rope]
+THEN {
+rope ¨ Rope.Replace[base: rope, start: matchIndex, len: match.first.match.Size, with: match.first.replace];
+start ¨ start + match.first.replace.Size;
+}
+ELSE {IF tryAgain THEN start ¨ start + 1 ELSE EXIT};
+ENDLOOP;
+RETURN [rope]
+};
+
+RopeMapFromPairs: PROC [pairList: PairList] RETURNS [RopeMap] ~ {
+FOR tail: PairList ¨ pairList, tail.rest UNTIL tail = NIL DO
+IF NOT tail.first.literal THEN ERROR; -- patterns not supported.
+IF tail.first.addBounds THEN ERROR; -- not supported.
+ENDLOOP;
+RETURN [NEW[RopeMapRep ¨ [PairMapper, pairList]]];
+};
+
+Apply: PROC [s: RopeMap, r: ROPE] RETURNS [mapped: ROPE] ~ INLINE {
+mapped ¨ s.Map[s.data, r];
+};
+
+Q: PROC [rope:ROPE] RETURNS [ROPE] ~ {
+IF rope.Equal[NIL] THEN RETURN [NIL];
+RETURN [Convert.RopeFromRope[rope]];
+};
+TranslateToLineSep: PROC [old: CHAR] RETURNS [new: CHAR] ~ {
+IF old = '\012 THEN new ¨ '\n ELSE new ¨ old;
+};
+
+preMsCc: ROPE ~ "set dir = `arch`
+${cpp} ${sname}.c2c.c > ${sname}.E
+${awk} 'BEGIN {mesaSource = 0} \\
+	/^#/ {if (mesaSource == 0) \\
+		{if ($2 >= 123000 && $3 == ""\\""${sname}.mesa\\"""") \\
+			mesaSource = 1} \\
+		else if ($3 == ""\\""${sname}.c2c.c\\"""") continue} \\
+	{print}' ${sname}.E > ${sname}.E.c
+${ccom} -Xg ${sname}.E.c > ${sname}.s
+${msScript} -mob ${sname}.mob -as ${sname}.s -out ${sname}.mob.s
+${cc} -c -o ${dir}/${sname}.c2c.o ${sname}.mob.s
+${rm} -f ${sname}.E.c";
+
+preMsCcFront: ROPE ~ "set dir = `arch`
+${cpp} ${sname}.c2c.c > ${sname}.E
+${awk} 'BEGIN {mesaSource = 0} \\
+	/^#/ {if (mesaSource == 0) \\
+		{if ($2 >= 123000 && $3 == ""\\""${sname}.mesa\\"""") \\
+			mesaSource = 1} \\
+		else if ($3 == ""\\""${sname}.c2c.c\\"""") continue} \\
+	{print}' ${sname}.E > ${sname}.E.c
+${ccom} -Xg ${sname}.E.c > ${dir}/${sname}.s
+#${msScript} -mob ${sname}.mob -as ${dir}/${sname}.s -out ${dir}/${sname}.mob.s
+${rm} -f ${sname}.E.c ${sname}.E";
+
+
+preMsCcBack: ROPE ~ "set dir = `arch`
+${cc} -c -o ${dir}/${sname}.c2c.o ${dir}/${sname}.mob.s
+#${rm} -f ${dir}/${sname}.mob.s ${dir}/${sname}.s";
+
+msCc: ROPE;
+msCcBack: ROPE;
+msCcFront: ROPE;
+
+TmpName: PROC [] RETURNS [name: ROPE] ~ {
+name ¨ Rope.Cat["/tmp/msCc", Convert.RopeFromInt[randomStream.NextInt[]], ".o"];
+RETURN [name];
+};
+RopeFromRopeList: PROC [list: RopeList] RETURNS [quoted: ROPE] ~ {
+quoted ¨ "";
+FOR rem: RopeList ¨ list, rem.rest WHILE rem # NIL DO
+rope: ROPE ~ rem.first;
+quoted ¨ quoted.Cat[rope, " "];
+ENDLOOP;
+};
+
+ProcessArgs: PROC [cmd: Commander.Handle, lSwitches: ROPE] RETURNS [cmds: CmdArgs] ~ {
+nArgs: INT32 ~ Args.NArgs[cmd];
+i: NAT;
+<<cmds ¨  NEW [CmdArgsRep ¨ [lSwitches: lSwitches, libraries: UserProfile.Token[key: "MakeDo.Libraries", default: "-lxrc /usr/lib/libm.a"]]];>>
+cmds ¨  NEW [CmdArgsRep ¨ [lSwitches: lSwitches, libraries: UserProfile.Token[key: "MakeDo.Libraries", default: ""]]];
+
+FOR i ¨ 0, i.SUCC WHILE ( i < nArgs ) DO
+NextRope: PROC RETURNS [ r: ROPE ] ~ {
+ropeArg: Args.Arg ~ Args.ArgRope[cmd, i.SUCC];
+r ¨ ropeArg.rope;
+i ¨ i.SUCC;
+};
+NextList: PROC RETURNS [ l: RopeList ¨ NIL ] ~ {
+FOR j: INT32 ¨ i.SUCC, j.SUCC WHILE ( j < nArgs ) DO
+anArg: ROPE ~ Args.GetRope[cmd, j];
+IF ( anArg.Fetch[0] = '- ) THEN { i ¨ j.PRED; EXIT} ;
+l ¨ CONS[anArg, l];
+REPEAT
+FINISHED => { i ¨ nArgs }
+ENDLOOP;
+};
+SplitSwitches: PROC [mSwitches: ROPE] ~ {
+IF mSwitches.Equal[NIL] THEN RETURN;
+{ stream: IO.STREAM ~ IO.RIS[mSwitches];
+SELECT stream.PeekChar[] FROM
+': => {
+DO
+sel: ROPE;
+IF stream.GetChar[] # ': THEN
+ERROR CommandSyntaxError;
+sel ¨ stream.GetTokenRope[].token;
+IF stream.GetChar[] # ': THEN
+ERROR CommandSyntaxError;
+SELECT TRUE FROM
+sel.Equal["cSwitch", FALSE] => cmds.cSwitches ¨ IO.GetRopeLiteral[stream];
+sel.Equal["lSwitch", FALSE] => cmds.lSwitches ¨ IO.GetRopeLiteral[stream];
+sel.Equal["lib", FALSE] => cmds.libraries ¨ IO.GetRopeLiteral[stream];
+ENDCASE => ERROR CommandSyntaxError;
+[] ¨ stream.SkipWhitespace[];
+IF stream.EndOf[] THEN EXIT
+ENDLOOP;
+};
+'" => cmds.cSwitches ¨ IO.GetRopeLiteral[stream];
+ENDCASE => cmds.cSwitches ¨ mSwitches;
+}
+};
+anArg: ROPE ~ Args.GetRope[cmd, i];
+SELECT TRUE FROM
+anArg.Equal[s2: "-name", case: FALSE] => { cmds.shortName ¨ NextRope[] };
+anArg.Equal[s2: "-dir", case: FALSE] => { cmds.localDir ¨ NextRope[] };
+anArg.Equal[s2: "-usw", case: FALSE] => { cmds.userSwitches ¨ NextRope[] };
+anArg.Equal[s2: "-msw", case: FALSE] => SplitSwitches[NextRope[]];
+anArg.Equal[s2: "-class", case: FALSE] => { cmds.machClass ¨ NextRope[] };
+anArg.Equal[s2: "-aux", case: FALSE] => { cmds.auxFileList ¨ NextList[] };
+anArg.Equal[s2: "-raux", case: FALSE] => { cmds.rauxFileList ¨ NextList[] };
+anArg.Equal[s2: "+clean", case: FALSE] => { cmds.clean ¨ TRUE };
+anArg.Equal[s2: "-clean", case: FALSE] => { cmds.clean ¨ FALSE };
+ENDCASE => ERROR CommandSyntaxError;
+ENDLOOP; 
+cmds.machClassSw ¨ IF cmds.machClass # NIL
+THEN Rope.Concat[" -class ", cmds.machClass]
+ELSE NIL; 
+cmds.cSwitches ¨ Q[cmds.cSwitches];
+cmds.lSwitches ¨ Q[cmds.lSwitches];
+cmds.libraries ¨ Q[cmds.libraries];
+cmds.userSwitches ¨ Q[cmds.userSwitches];
+};
+
+MMCcMesa: ROPE ~ "MMCcMesa";
+MMCcMesaDoc: ROPE ~ "MMCcMesa - interceptor layer: Switches are:
+  -name <shortname>
+  -dir <localdirectory>
+  -usw <userprovided switches>
+  -msw <mimosa suggested switches>
+  -class <machine class>";
+MMCcMesaUsage: ROPE ~ Rope.Concat["Usage: MMCcMesa", MMCcMesaDoc];
+MMCcMesaProc: Commander.CommandProc ~ {
+ENABLE {
+Args.Error => { msg ¨ MMCcMesaUsage; GOTO Failed };
+CommandSyntaxError => { msg ¨ MMCcMesaUsage; GOTO Failed };
+};
+
+command: ROPE;
+cmdArgs: CmdArgs ~ ProcessArgs[cmd, NIL];
+cSwitches: ROPE ~ cmdArgs.cSwitches;
+lSwitches: ROPE ~ cmdArgs.lSwitches;
+dbxDebug: BOOL = UserProfile.Boolean[key: "MakeDo.dbxDebug", default: FALSE] AND cmdArgs.cSwitches.Find["-O"] = -1;
+shortName: ROPE ~ cmdArgs.shortName;
+localDir: ROPE ~ cmdArgs.localDir;
+machClassSw: ROPE ~ cmdArgs.machClassSw;
+pairs: PairList ~ LIST[
+[match: "${msCc}", replace: Q[msCc], literal: TRUE],
+[match: "${msCcFront}", replace: Q[msCcFront], literal: TRUE],
+[match: "${msCcBack}", replace: Q[msCcBack], literal: TRUE],
+[match: "${ldir}", replace: localDir, literal: TRUE],
+[match: "${sname}", replace: shortName, literal: TRUE],
+[match: "${mclass}", replace: machClassSw, literal: TRUE],
+[match: "${tmpFile}", replace: TmpName[], literal: TRUE],
+[match: "${cswitch}", replace: cSwitches, literal: TRUE],
+[match: "${lswitch}", replace: lSwitches, literal: TRUE]
+];
+ropeMap: RopeMap ~ RopeMapFromPairs[pairs];
+
+IF dbxDebug THEN {
+msLocal: BOOL ~ UserProfile.Boolean[key: "MS.local", default: TRUE];
+IF NOT msLocal
+THEN {
+template: ROPE ~ "ComplexRsh -cmd ${msCc} -binOut ${ldir}${sname}.c2c.o -srcIn ${sname}.c2c.c ${sname}.mesa -binIn ${sname}.mob ${mclass}";
+command ¨ Apply[ropeMap, template];
+}
+ELSE {
+template: ROPE ~ "ComplexRsh -cmd ${msCcFront} -srcOut ${ldir}${sname}.s -srcIn ${sname}.c2c.c ${mclass} ; MS -mob ${sname}.mob -as ${ldir}${sname}.s -out ${ldir}${sname}.mob.s ; ComplexRsh -cmd ${msCcBack} -binOut ${ldir}${sname}.c2c.o -srcIn ${sname}.mob.s ${mclass}";
+command ¨ Apply[ropeMap, template];
+}
+}
+ELSE {
+template: ROPE ~ Rope.Concat[
+"ComplexCc -out ${ldir}${sname}.c2c.o -in ${sname}.c2c.c ${mclass} -cSwitch ${cswitch}",
+IF Rope.Equal[lSwitches, NIL] THEN NIL ELSE " -rload -lSwitch ${lswitch}"
+];
+command ¨ Apply[ropeMap, template];
+};
+result ¨ CommanderOps.DoCommand[commandLine: command, parent: cmd];
+EXITS
+Failed => result ¨ $Failure;
+};
+
+MMCcConfig: ROPE ~ "MMCcConfig";
+MMCcConfigDoc: ROPE ~ "MMCcConfig - interceptor layer: Switches are:
+  -name <shortname>
+  -dir <localdirectory>
+  -usw <userprovided switches>
+  -msw <mimosa suggested switches>
+  -class <machine class>
+  -raux <load file list>
+  (+|-)clean";
+MMCcConfigUsage: ROPE ~ Rope.Concat["Usage: MMCcConfig", MMCcConfigDoc];
+MMCcConfigProc: Commander.CommandProc ~ {
+ENABLE {
+Args.Error => { msg ¨ MMCcMesaUsage; GOTO Failed };
+CommandSyntaxError => { msg ¨ MMCcMesaUsage; GOTO Failed };
+};
+ToSlash: PROC [old: CHAR] RETURNS [new: CHAR] ~ {
+IF old = '> THEN new ¨ '/ ELSE new ¨ old;
+};
+ropeMap: RopeMap;
+template: ROPE;
+command: ROPE;
+cmdArgs: CmdArgs ~ ProcessArgs[cmd, NIL];
+localDirSlash: ROPE ~ Rope.Translate[base: cmdArgs.localDir, translator: ToSlash];
+pairs: PairList;
+IF cmdArgs.lSwitches = NIL THEN cmdArgs.lSwitches ¨ CheckForConfigSwitch[cmdArgs];
+pairs ¨ LIST[
+[match: "${ldir}", replace: cmdArgs.localDir, literal: TRUE],
+[match: "${ldir2}", replace: localDirSlash, literal: TRUE],
+[match: "${sname}", replace: cmdArgs.shortName, literal: TRUE],
+[match: "${mclass}", replace: cmdArgs.machClassSw, literal: TRUE],
+[match: "${cswitch}", replace: cmdArgs.cSwitches, literal: TRUE],
+[match: "${lswitch}", replace: cmdArgs.lSwitches, literal: TRUE],
+[match: "${libs}", replace: cmdArgs.libraries, literal: TRUE],
+[match: "${rauxlist}", replace: RopeFromRopeList[cmdArgs.rauxFileList], literal: TRUE]
+];
+template ¨ Rope.Concat[
+"ComplexCc -out ${ldir}${sname}.c2c.o -in ${sname}.c2c.c -rload ${rauxlist} ${mclass} -cSwitch ${cswitch} -lSwitch ${lswitch} -lib ${libs}",
+IF cmdArgs.clean THEN "; ComplexRsh ${mclass} -binOut  ${ldir}${sname}.c2c.o -binIn ${ldir}${sname}.c2c.o -cmd ""/project/cedar10.1/bin/FixPackage ${ldir2}${sname}.c2c.o ${sname}""" ELSE NIL
+];
+ropeMap ¨ RopeMapFromPairs[pairs];
+command ¨ Apply[ropeMap, template];
+
+IF cmdArgs.auxFileList#NIL THEN RETURN [$Failure, "-aux no longer supported, you should be using -raux instead"];
+
+result ¨ CommanderOps.DoCommand[commandLine: command, parent: cmd];
+EXITS
+Failed => result ¨ $Failure;
+};
+
+CheckForConfigSwitch: PROC[cmdArgs: CmdArgs] RETURNS[lsw: ROPE ¨ "-r"]~ {
+FOR uL: UserList ¨ userLswList, uL.rest UNTIL uL = NIL DO
+IF  Rope.Equal[uL.first.class, cmdArgs.machClass] THEN RETURN[uL.first.lsw];
+ENDLOOP;
+};
+
+UserList: TYPE = LIST OF UserLsw;
+UserLsw: TYPE = RECORD[class, lsw: ROPE];
+userLswList: UserList ¨ NIL;
+
+MMCcC: ROPE ~ "MMCcC";
+MMCcCDoc: ROPE ~ "MMCcC - interceptor layer: Switches are:
+  -name <shortname>
+  -dir <localdirectory>
+  -usw <userprovided switches>
+  -msw <mimosa suggested switches>
+  -class <machine class>
+  -aux <transfer file list>";
+MMCcCUsage: ROPE ~ Rope.Concat["Usage: MMCcC", MMCcCDoc];
+MMCcCProc: Commander.CommandProc ~ {
+ENABLE {
+Args.Error => { msg ¨ MMCcMesaUsage; GOTO Failed };
+CommandSyntaxError => { msg ¨ MMCcMesaUsage; GOTO Failed };
+};
+cmdArgs: CmdArgs ~ ProcessArgs[cmd, NIL];
+pairs: PairList ~ LIST [
+[match: "${ldir}", replace: cmdArgs.localDir, literal: TRUE],
+[match: "${sname}", replace: cmdArgs.shortName, literal: TRUE],
+[match: "${mclass}", replace: cmdArgs.machClassSw, literal: TRUE],
+[match: "${cswitch}", replace: cmdArgs.cSwitches, literal: TRUE],
+[match: "${lswitch}", replace: cmdArgs.lSwitches, literal: TRUE],
+[match: "${auxList}", replace: RopeFromRopeList[cmdArgs.auxFileList], literal: TRUE]
+];
+ropeMap: RopeMap ~ RopeMapFromPairs[pairs];
+template: ROPE ~ Rope.Concat[
+"ComplexCc -out ${ldir}${sname}.o -in ${sname}.c -int ${auxList} ${mclass} -cSwitch ${cswitch}",
+IF Rope.Equal[cmdArgs.lSwitches, NIL] THEN NIL ELSE " -load -lSwitch ${lswitch}"
+];
+command: ROPE ~ Apply[ropeMap, template];
+
+result ¨ CommanderOps.DoCommand[commandLine: command, parent: cmd];
+EXITS
+Failed => result ¨ $Failure;
+};
+
+CompileCmd: PROC [cmd: Commander.Handle] RETURNS [result: REF ANY ¨ NIL, msg: ROPE ¨ NIL] ~ {
+args: IO.STREAM ~ IO.RIS[cmd.commandLine];
+mimArgStrm: IO.STREAM ~ IO.ROS[];
+opt: INT ¨ 2;
+mods, modsTail: RopeList ¨ NIL;
+path, mimArgs, mimCmd, ccCmd: ROPE ¨ NIL;
+DO
+arg: CommanderOps.Token ~ CommanderOps.GetCmdToken[args];
+IF arg.literal.Length[] = 0 THEN EXIT;
+SELECT TRUE FROM
+arg.value.Equal["-path"] => {
+pathStrm: IO.STREAM ~ IO.ROS[];
+some: BOOL ¨ FALSE;
+IF path#NIL THEN RETURN [$Failure, "two path specifications given to the Compile command"];
+DO
+elt: CommanderOps.Token ~ CommanderOps.GetCmdToken[args];
+IF elt.literal.Length[] = 0 THEN RETURN [$Failure, "path specification not finished on command line"];
+IF elt.value.Equal["htap-"] THEN {
+IF NOT some THEN RETURN [$Failure, "empty path specified"];
+EXIT};
+pathStrm.PutChar[' ];
+pathStrm.PutRope[elt.literal];
+some ¨ TRUE;
+ENDLOOP;
+path ¨ pathStrm.RopeFromROS[];
+};
+arg.value.Length[]=3 AND arg.value.EqualSubstrs[0, 2, "-O"] => {
+d: CHAR ~ arg.value.Fetch[2];
+SELECT d FROM
+IN ['0..'3] => opt ¨ d-'0;
+ENDCASE => RETURN [$Failure, Rope.Cat["optimization spec ", arg.value, " has invalid level"]];
+};
+arg.value.Length[]>1 AND arg.value.Fetch[0]='- => {
+mimArgStrm.PutRope[" "];
+mimArgStrm.PutRope[arg.literal];
+};
+ENDCASE => {
+this: RopeList ¨ LIST[arg.value];
+IF mods=NIL THEN mods ¨ this ELSE modsTail.rest ¨ this;
+modsTail ¨ this;
+};
+ENDLOOP;
+IF mods=NIL THEN RETURN;
+mimArgs ¨ IO.RopeFromROS[mimArgStrm];
+FOR ml: RopeList ¨ mods, ml.rest WHILE ml#NIL DO
+mimCmd ¨ Rope.Cat["Mimosa -kc ", mimArgs, " ", ml.first];
+IF path#NIL THEN mimCmd ¨ Rope.Cat["InPath ", path, " DO ", mimCmd];
+result ¨ CommanderOps.DoCommand[mimCmd, cmd];
+SELECT result FROM
+$Failure => RETURN [result, "Mimosa failed"];
+$Definition => NULL;
+$Implementation => {
+IF opt=0
+THEN ccCmd ¨ "-c -g -fsingle"
+ELSE ccCmd ¨ IO.PutFR1["-c -O%g -fsingle", [integer[opt]] ];
+ccCmd ¨ IO.PutFR["MMCCMesa -class sun4 -name %g -dir sun4/ -msw \"%g\"", [rope[ml.first]], [rope[ccCmd]] ];
+result ¨ CommanderOps.DoCommand[ccCmd, cmd];
+IF result=$Failure THEN RETURN [result, "cc failed"];
+};
+ENDCASE => RETURN [$Failure, IO.PutFR["unexpected result %g from Mimosa %g", [refAny[result]], [rope[ml.first]] ]];
+ENDLOOP;
+result ¨ $Success;
+RETURN};
+GetToken: PROC [in: IO.STREAM] RETURNS [token: ROPE] ~ {
+[] ¨ in.SkipWhitespace[];
+token ¨ SELECT in.PeekChar[] FROM
+'" => in.GetRopeLiteral[],
+ENDCASE => in.GetTokenRope[MyBreak].token;
+};
+
+MyBreak: PROC [char: CHAR] RETURNS [IO.CharClass] --IO.BreakProc-- ~ {
+RETURN [SELECT char FROM
+IN [0C .. ' ] => sepr,
+ENDCASE => other];
+};
+
+NoteUserProfile: UserProfile.ProfileChangedProc ~ {
+langDir: ROPE ~ UserProfile.Line[key: "MakeDo.UnixCommandsSubstitutions", default: "defaults"];
+in: IO.STREAM ~ IO.RIS[langDir];
+head, tail: PairList ¨ NIL;
+pList: LIST OF ROPE _ UserProfile.ListOfTokens["MakeDo.UserClasses", NIL];
+userLswList ¨ NIL;
+FOR list: LIST OF ROPE _ pList, list.rest UNTIL list = NIL DO
+this: ROPE _ UserProfile.Token[Rope.Cat["StandardMMCmds.", list.first,".lSwitchForConfig" ]];
+IF this # NIL THEN userLswList ¨ CONS[[list.first, this], userLswList];
+ENDLOOP;
+
+DO
+ENABLE IO.EndOfStream => {
+SimpleFeedback.Append[$StandardMMCmds, oneLiner, $info, "Syntax error in MakeDo.UnixCommandsSubstitutions profile entry"];
+EXIT};
+[] ¨ in.SkipWhitespace[];
+IF in.EndOf[] THEN EXIT;
+{find: ROPE ~ GetToken[in];
+this: PairList;
+IF find.Equal["defaults", FALSE] THEN {
+this ¨ LIST[
+[match: "${cpp}", replace: "/lib/cpp", literal: TRUE],
+[match: "${awk}", replace: "/bin/awk", literal: TRUE],
+[match: "${ccom}", replace: "/lib/ccom", literal: TRUE],
+[match: "${msScript}", replace: "/project/cedar10.1/bin/msScript", literal: TRUE],
+[match: "${cc}", replace: "/bin/cc", literal: TRUE],
+[match: "${ld}", replace: "/bin/ld", literal: TRUE],
+[match: "${rm}", replace: "/bin/rm", literal: TRUE]
+];
+}
+ELSE {
+this ¨ LIST[[match: find, replace: GetToken[in], literal: TRUE]];
+};
+IF tail = NIL THEN head ¨ this ELSE tail.rest ¨ this;
+FOR tail ¨ this, tail.rest WHILE tail.rest # NIL DO NULL ENDLOOP;
+tail ¨ tail}
+ENDLOOP;
+{
+ropeMap: RopeMap ~ RopeMapFromPairs[head];
+msCc ¨ Rope.Translate[base: Apply[ropeMap, preMsCc], translator: TranslateToLineSep];
+msCcBack ¨ Rope.Translate[base: Apply[ropeMap, preMsCcBack], translator: TranslateToLineSep];
+msCcFront ¨ Rope.Translate[base: Apply[ropeMap, preMsCcFront], translator: TranslateToLineSep];
+}
+};
+
+Init: PROC ~ {
+UserProfile.CallWhenProfileChanges[NoteUserProfile];
+Commander.Register[key: MMCcMesa, proc: MMCcMesaProc, doc: MMCcMesaDoc];
+Commander.Register[key: MMCcConfig, proc: MMCcConfigProc, doc: MMCcConfigDoc];
+Commander.Register[key: MMCcC, proc: MMCcCProc, doc: MMCcCDoc];
+Commander.Register[key: "Compile", proc: CompileCmd, doc: "[-path <dir>+ htap-] [-O(0|1|2|3)] <Mimosa argument>* --- invokes Mimosa and MMCCMesa to effect a complete Mesa compilation"];
+};
+
+Init[];
+END.
+
+
+
+
+  	  
+StandardMMCmds.mesa
+Copyright ” 1988, 1990, 1991, 1992, 1993 by Xerox Corporation.  All rights reserved.
+Eduardo Pelegri-Llopart, January 9, 1990 3:24:31 pm PST
+Local buffering layer for clients to change easily
+JKF May 29, 1990 7:37:05 am PDT
+Spreitze, May 29, 1992 11:20 am PDT
+Willie-s, April 29, 1993 12:14 pm PDT
+Foote, January 10, 1991 5:15 pm PST
+Michael Plass, September 30, 1991 3:11 pm PDT
+StandardMMCmds registers three commands: MMMimosa, MMCCMesa, and MMCCConfig, which are then called by MakeDo and then call ComplexCc in various variations.  This layer provides a place where to easily replace one or more of these commands to tailor the local behavior. This file provides the standard behavior and is part of MakeDo.df; if your package requires some other behavior, you should include the files defining that behavior as part of the package. 
+
+TextReplace stuff (simplified)
+This is here to skip having to load the dependency-rich implementation of TextReplace.
+Pair: TYPE = TextReplace.Pair;
+RopeMapRep: TYPE = TextReplace.RopeMapRep;
+This is a fairly horrible algorithm.  Fix it someday.
+String-Processing Actions
+Actions for Rsh
+Variables are ${sname} and ${tmpFile}
+
+preMsCc: ROPE ~ "set dir = `arch`
+${cpp} ${sname}.c2c.c > ${sname}.E
+${awk} 'BEGIN {mesaSource = 0} \\
+	/^#/ {if (mesaSource == 0) \\
+		{if ($2 >= 123000 && $3 == ""\\""${sname}.mesa\\"""") \\
+			mesaSource = 1} \\
+		else if ($3 == ""\\""${sname}.c2c.c\\"""") continue} \\
+	{print}' ${sname}.E > ${sname}.E.c
+${ccom} -Xg ${sname}.E.c > ${sname}.s
+${msScript} -mob ${sname}.mob -as ${sname}.s -out ${sname}.mob.s
+${cc} -c -o ${tmpFile} ${sname}.mob.s
+${ld} -r -o ${dir}/${sname}.c2c.o ${tmpFile}
+${rm} -f ${tmpFile} ${sname}.E.c";
+preMsCcBack: ROPE ~ "set dir = `arch`
+${cc} -c -o ${tmpFile} ${dir}/${sname}.mob.s
+${ld} -r -o ${dir}/${sname}.c2c.o ${tmpFile}
+#${rm} -f ${tmpFile} ${dir}/${sname}.mob.s ${dir}/${sname}.s";
+These variables are assigned in NoteUserProfile
+tmpFileHead: ROPE ~ IF pCedar THEN Rope.Cat[SystemNames.LocalDir["Temp"], "msCc"] ELSE "/tmp/msCc";
+Auxiliary Procs
+SideEffects cmds.{cSwitches,lSwitches,libraries}
+Command Procs
+No longer force fsingle switch for mimosa-generated code (i.e., always use single-precision floating point operations when all arguments are single-precision), since not all c compilers accept this switch
+The Simple Compile Command
+the fsingle below won't work in some compilers
+Initialization
+PROC [reason: ProfileChangeReason]
+Simplified version, you can specify the directory for the language tools
+ù S  ñ(cedarcode) styleïNewlineDelimiter
+ô codeöúôKöú
+œeúIôTKöú7ô7Köú2ô2KöúôKô#Kô%Köú#ô#Kô-Kò Köú ô Kô óöœk	ò	Köú
+ûú!ò0Köúûú!ò3Köúûúò*Köúûú'ò1KöûúòKöúûú!ò-KòKöúûú
+òKöúûúRòcóKò Kò Kö–lnúûòKöûú)ûú+ò]öúûòKò KöûúûúûúòKö	ú
+ûúûúûúûúòKò Kò<Kò Köú	ûúûúòöúûúûúòKöúûúûúòKöú
+ûúûúòKöúûúûúòKöúûúòKöúûúòKöúûúòKöúûúûúòKöúûúûúòKöúûúûúòKöúûúûúòKöúûúûòKòóKò Köœnúûúûúò!óheadö†úôKôVKöúûúôKöúûúûúûú(ûúûúò_Köú
+ûúûúûúòKöú	ûúûúòKöúûúô*Köúûúûú†úûúûúûúûúûúûú	ûúûúûúòZö†
+úûúûúûúûúûúûúò?Kô5Köúûúò"Köúûúòö
+†úûúûúûúûúò'Kö
+ûúûúûúûúûúò/öûúûòKöûúûúûúòKöûúûúûúòKöûúûúûúòKöûúûúûúòóKòóöûúûò KöúûúòKöúûúûúûúòKöú
+ûúòöûú&ûúûúûò<Köúûú-ûúòNKöûúûúûú!ûúûúûúûúòuöûúûòKöú/ò/ö	úûú	ûúûú0ûúòXKöúòKöúòóKöûúòóKöûúòóöûúòöûúòKöúkòkKöú)ò)KöúòóKö
+ûúûú
+ûúûúûúò4óKöûúòóKöûúòKöúòKò óö†úûúûúòAöûú&ûúûúûò<Kö	ûúûúûúûúœcò@Köûúûúûú°ò5KöûúòóKöûúûú'ò2KöúòKò óö†úûúûúûú
+ûúûúòCKöúòKöúòóKò óôö
+†úûúûúûúûúò&Kö
+ûúûúûúûúûúò%Köûúò$Köúòóóôö
+†úûúûúûúûúò<Köûúûúûúò-KòKò óKöú%ô%Kô Kö%ú	ûúùú	ùúgùú=ùú%ùúùúùúùúùú	ùúùúù
+úùúùúù
+ú
+ù
+úùúôëKöú	ûúùú	ùúgùú=ùú%ùúùúùúùúùú	ùúùúùúùúùúò‰Kò Köú.ùú	ùúgùú=ùú%ùúùúùúùúùúùúùúùúùúòŸKò Köú2ù
+úùúùúù
+úù
+úùúùúôæKò Kö	ú9ùúùúùúùúòëKò Kô/KöúûúòKöú
+ûúòKöúûúòKò ö†úûúûúûúò)Kö	úûúûúûú0ûúôcKöúPòPKöûúòKòóóôö
+†úûúûúûú
+ûúòBKöú	ûúòö	ûúûúûúûúûò5KöúûúòKòKöûúòóKòKò óö†úûú$ûúûúòVIcedaröúûúòKöúûúòKöú
+ûúÇòèKöúûúkòvKò öûú
+ûúûúûò(ö†úûúûúûúò&Köú(ûúò.KöúòKöúûúòKòóö
+†úûúûúûúûúò0öûúûúûúûúûúûò4Köúûúò#Köûúûú	ûúûúò5KöúûúòöûòKöûúòóKöûúòóKòóö†úûúûúò)Köú0ô0Köûúûúûúûúò$ö	ú
+ûúûúûúûúò(öûúûòöúòöûòKöúûúò
+öûúûòKöûúòóKöúûúò"öûúûòKöûúòóöûúûúûòKöúûúûúòJKöúûúûúòJKöúûúûúòFKöûúûúò$óKöúòKöûúûúûòKöûúòóKòóKöúûúò1Köûúò&óKòóKòóKöúûúò#öûúûúûòKöúûú%òIKöúûú$òGKöúûú(òKKöúûúòBKöú ûú%òJKöúûú'òJKöúûú(òLKöú ûúûúò@Köú ûúûúòAKöûúûúò$óKöûúò	óöúûúûò*Köûú(ò,Köûúûúò
+óKöú#ò#Köú#ò#Köú#ò#Köú)ò)KòKò óóôKö†úòKö†úæò…Kö†ú5òBö†úò'öûúòKöú%ûú
+ò3Köú-ûú
+ò;KöúòKò óKöú	ûúòKöú$ûúò)öúûúò$Köú
+°¬ôÃóKöúûúò$Köú
+ûú8ûúûú#òsKöúûúò$Köú
+ûúò"Köúûúò(Köúûúãò°Köú+ò+Kò öûú
+ûúòKöú	ûú1ûúòDöûúûúòöûúòKöú
+ûú}òãKöúûúò#KòóöûúòKöú
+ûúÄòéKöúûúò#KòóóKöúòóöûòöú
+ûúòKöúXòXKö
+ûúûúûúûúûúòIKöúòóKöú#ò#KòóKòCöûòKöúòóKòKò óKö†
+úò Kö†úÊòÛKö†ú9òHö†úò)öûúòKöú%ûú
+ò3Köú-ûú
+ò;Köúòóö
+†úûúûúûúûúò1Köûú
+ûú
+ûúò)KòóKòKöú
+ûúòKöú	ûúòKöú$ûúò)Köúûú?òRKòKöûúûúûú3òRKöúûú9ûú8ûú<ûú?ûú>ûú>ûú;ûúTûúòßòKöúåòåKöûúûú°ûúûòæKöúòóKò"Kò#Kò KöûúûúûúûúKòqKò KòCöûòKöúòóKòKò óö†úûúûúûúòIöûú%ûúûúûò9Köûúú.ûúûúòLKöûúòóKòKò óKöú
+ûúûúûú	ò!Köú	ûúûúûúò)öúûúòKò óKö†úûúòKö†úûú—òﬂKö†
+úûú)ò9ö–bnœb¢úò$öûúòKöú%ûú
+ò3Köú-ûú
+ò;KöúòóKöú$ûúò)KöúûúüòµKöú+ò+öú
+ûúòKöú`ò`Kö
+ûúûúûúûúûúòPKöúòóKöú	ûúò)Kò KòCöûòKöúòóòKò óóóôö†
+úûúûú
+ûúûúûúûúûúò]Kö	úûúûúûúûúò*Kö	úûúûúûúûúò!KöúûúòKöúûúòKöúûúûúò)öûòKò9Köûúûúûúò&öûúûúûòòKö	ú
+ûúûúûúûúòKöúûúûúòKöûúûúûúûúDò[öûòKò9Köûúûúûú?òföûúûúò"Köûúûúûúûú$ò;KöûúòóKòKòKöúûúòKöûúòóKòKòóöúûú(ò@KöúûúòöûúûòKöûúòKöûúûúMò^óKòóöúûúò3KòKò KòóöûúòKöúûúò!Köûúûúûúûúò7KòKòóóKöûúòóKöûúûúûúûúòKöú
+ûúò%öûúûúûúûò0Kò9Köûúûúûú4òDKò-öûúûòKöúûúò-KöúûúòòKô.öûúòKöûúòKöûú	ûú-ò<óKöúûúaòkKò,Köûúûúûúò5KòóKöûúûúûúTòsóKöûúòóKòKöûúòóóôö†úûúûúûúûú	ûúò8Kòöúûúûò!KòKöûú#ò*óKòóKò ö†úûúûúûúûú°úòFöûúûúûòKöûúòKöûúòóKòKò óö†ú$ò3Köûúô"KôHKöú	ûúRò_Kö	úûúûúûúûú
+ò KöúûúòKö	úûúûúûú2ûúòJKöúûúòöûúûúûúûúûúûúûò=KöúûúSò]Köûúûúûúûú"òGKöûúòóKò öûòöûúûúòKöúzòzKöûúòóKòKöûúûúûúòKöúûúòKöúòöûúûúûúò'Köúûú2ûú3ûú5ûúOûú1ûú1ûú1ûúòßKòóöûúòKöúûú/ûúòAKòóKöûúûúûúûúò5KöûúûúûúûúûúûúòAKöúòKöûúòóöúòKöú*ò*KöúUòUKöú]ò]Köú_ò_KòóKòKò óö†úûúòKïStartOfExpansionx[key: ROPE, proc: Commander.CommandProc, doc: ROPE _ NIL, clientData: REF ANY _ NIL, interpreted: BOOL _ TRUE]ò4KòHKñx[key: ROPE, proc: Commander.CommandProc, doc: ROPE _ NIL, clientData: REF ANY _ NIL, interpreted: BOOL _ TRUE]òNKñx[key: ROPE, proc: Commander.CommandProc, doc: ROPE _ NIL, clientData: REF ANY _ NIL, interpreted: BOOL _ TRUE]ò?Kñx[key: ROPE, proc: Commander.CommandProc, doc: ROPE _ NIL, clientData: REF ANY _ NIL, interpreted: BOOL _ TRUE]òπKòóKò KòóKöûúòKò Kò Kò Kò ó Öó    FÙ  g7  

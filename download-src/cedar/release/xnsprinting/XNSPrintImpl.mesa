@@ -1,0 +1,812 @@
+DIRECTORY
+BasicTime USING [GMT, nullGMT, ToNSTime],
+CHNameP2V0 USING [],
+CrRPC USING [BulkDataXferProc, CreateClientHandle, DestroyClientHandle, Error, Handle],
+Finalize,
+FS USING [Error, FileInfo, StreamOpen],
+IO USING [Close, EndOf, GetBlock, PutBlock, STREAM],
+Process USING [Detach, Seconds, SecondsToTicks, SetTimeout],
+RedBlackTree USING [Compare, Create, DuplicateKey, EachNode, EnumerateDecreasing, GetKey, Insert, Lookup, Table, UserData],
+RefText USING [ObtainScratch, ReleaseScratch],
+Rope USING [Compare, Equal, Match, ROPE, Size],
+SystemNames USING [UserName],
+UserProfile USING [Boolean, Line, Number, Token],
+XNS USING [Address, Socket, unknownAddress, unknownSocket],
+XNSCH USING [LookupAddressFromRope],
+XNSCHName USING [Name, RopeFromName],
+PrintingP4V3,
+PrintingP4V3Aux,
+XNSPrint,
+XNSPrintExtras;
+
+XNSPrintImpl: CEDAR MONITOR
+IMPORTS BasicTime, CrRPC, Finalize, FS, IO, PrintingP4V3, PrintingP4V3Aux, Process, RedBlackTree, RefText, Rope, SystemNames, UserProfile, XNSCH, XNSCHName
+EXPORTS XNSPrint, XNSPrintExtras ~ {
+OPEN Printing: PrintingP4V3, PrintingAux: PrintingP4V3Aux, XNSPrint;
+ROPE: TYPE ~ Rope.ROPE;
+
+
+BANNER: ROPE ~	"Hardcopy.Banner";
+COPYCOUNT: ROPE ~	"Hardcopy.CopyCount";
+FAX: ROPE ~	"Hardcopy.FaxPhoneNumber";
+IPPRINTER: ROPE ~	"Hardcopy.InterpressPrinter";
+KEY: ROPE ~	"Hardcopy.Key";
+MEDIUM: ROPE ~	"Hardcopy.Medium";
+PIGEONHOLE: ROPE ~	"Hardcopy.PigeonHole";
+PAGEFIRST: ROPE ~	"Hardcopy.PageFirst";
+PAGELAST: ROPE ~	"Hardcopy.PageLast";
+PRIORITY: ROPE ~	"Hardcopy.Priority";
+STAPLED: ROPE ~	"Hardcopy.Stapled";
+TWOSIDED: ROPE ~	"Hardcopy.TwoSided";
+pendingPrintRequests: PrintRequestList ¨ NIL;
+QUANTUS: Process.Seconds ¨ 30;
+HACK: BOOL ¨ TRUE;
+extensions: LIST OF ContextExtension = LIST[NIL]; -- list head
+
+ContextExtension: TYPE = REF ContextExtensionRep;
+ContextExtensionRep: TYPE = RECORD [
+contextHandle: Finalize.Handle,
+useStapling: BOOL ¨ TRUE,
+usePlex: BOOL ¨ TRUE
+];
+
+fq: Finalize.FinalizationQueue = Finalize.NewFQ[];
+
+WithExtension: ENTRY PROC [context: Context, inner: PROC [ContextExtension]] = {
+e: ContextExtension ¨ NIL;
+UNTIL Finalize.FQEmpty[fq] DO
+h: Finalize.Handle = Finalize.FQNext[fq];
+FOR tail: LIST OF ContextExtension ¨ extensions, tail.rest UNTIL tail.rest = NIL DO
+IF tail.rest.first.contextHandle = h THEN {tail.rest ¨ tail.rest.rest; EXIT};
+ENDLOOP;
+ENDLOOP;
+FOR tail: LIST OF ContextExtension ¨ extensions.rest, tail.rest UNTIL tail = NIL DO
+IF Finalize.HandleToObject[tail.first.contextHandle] = context THEN {
+e ¨ tail.first;
+EXIT;
+};
+ENDLOOP;
+IF e = NIL THEN {
+e ¨ NEW[ContextExtensionRep ¨ [contextHandle: Finalize.EnableFinalization[context, fq]]];
+extensions.rest ¨ CONS[e, extensions.rest];
+};
+inner[e];
+};
+
+GetStapling: PUBLIC PROC [context: Context] RETURNS [result: XNSPrintExtras.Stapling ¨ default] = {
+Inner: PROC [x: ContextExtension] = {
+result ¨ IF x.useStapling THEN (IF context.stapled THEN $stapled ELSE $unstapled) ELSE $default
+};
+WithExtension[context, Inner];
+};
+
+SetStapling: PUBLIC PROC [context: Context, stapling: XNSPrintExtras.Stapling] = {
+Inner: PROC [x: ContextExtension] = {
+x.useStapling ¨ stapling # $default;
+context.stapled ¨ stapling = $stapled;
+};
+WithExtension[context, Inner];
+};
+
+GetPlex: PUBLIC PROC [context: Context] RETURNS [result: XNSPrintExtras.Plex ¨ default] = {
+Inner: PROC [x: ContextExtension] = {
+result ¨ IF x.usePlex THEN (IF context.twoSided THEN $duplex ELSE $simplex) ELSE $default
+};
+WithExtension[context, Inner];
+};
+
+SetPlex: PUBLIC PROC [context: Context, plex: XNSPrintExtras.Plex] = {
+Inner: PROC [x: ContextExtension] = {
+x.usePlex ¨ plex # $default;
+context.twoSided ¨ plex = $duplex;
+};
+WithExtension[context, Inner];
+};
+
+WatcherListChanged: PUBLIC CONDITION;
+RequestListChanged: PUBLIC CONDITION;
+
+RegisterPrintRequest: PUBLIC ENTRY PROC [request: PrintRequest, update: StatusChangedProc ¨ NIL, clientData: REF ¨ NIL] ~ {
+ENABLE { UNWIND => NULL };
+IF (clientData # NIL) THEN request.clientData ¨ clientData;
+request.update ¨ update;
+pendingPrintRequests ¨ CONS[request, pendingPrintRequests];
+BROADCAST RequestListChanged;
+};
+
+UnRegisterPrintRequest: PUBLIC ENTRY PROC [request: PrintRequest] ~ {
+ENABLE { UNWIND => NULL };
+SELECT TRUE FROM
+( pendingPrintRequests = NIL ) => {
+RETURN
+};
+( pendingPrintRequests.first = request ) => {
+pendingPrintRequests ¨ pendingPrintRequests.rest;
+};
+ENDCASE => {
+FOR tail: PrintRequestList ¨ pendingPrintRequests, tail.rest WHILE ( tail.rest # NIL ) DO
+IF ( tail.rest.first = request ) THEN { tail.rest ¨ tail.rest.rest; EXIT };
+ENDLOOP;
+};
+BROADCAST RequestListChanged;
+};
+
+GetPrintRequestList: PUBLIC ENTRY PROC RETURNS [list: PrintRequestList] ~ {
+ENABLE { UNWIND => NULL };
+list ¨ pendingPrintRequests;
+};
+
+WaitTilRequestListChanged: ENTRY PROC ~ {
+ENABLE { UNWIND => NULL };
+WAIT RequestListChanged;
+};
+
+WatchRequestList: PROC ~ {
+msg: ROPE;
+oldStatus: InterpressMasterStatus; -- defined here to avoid the extra {}
+DO  -- Forever
+WaitTilRequestListChanged[];
+IF ( pendingPrintRequests = NIL ) THEN LOOP;
+FOR tail: PrintRequestList ¨ pendingPrintRequests, tail.rest WHILE ( tail # NIL ) DO {
+ENABLE {
+UNWIND => NULL;
+Error => {msg ¨ explanation; GOTO CleanUp};
+};
+oldStatus ¨ tail.first.lastStatus.status;
+SELECT TRUE FROM
+( tail.first.update = NIL ) => {
+UnRegisterPrintRequest[tail.first];
+}
+ENDCASE => {
+tail.first.lastStatus ¨ GetPrintRequestStatus[tail.first];
+IF ( oldStatus # tail.first.lastStatus.status ) THEN {
+tail.first.update[tail.first, tail.first.clientData];
+};
+};
+EXITS
+CleanUp => {
+tail.first.lastStatus ¨ [unknown, msg];
+tail.first.update[tail.first, tail.first.clientData];
+UnRegisterPrintRequest[tail.first];
+};
+} ENDLOOP;
+ENDLOOP;  -- Forever
+};
+Error: PUBLIC ERROR [problem: Problem, explanation: ROPE] ~ CODE;
+FIREWALL: PUBLIC ERROR ~ CODE; -- nobody should see and/or catch this one!
+GetPrinterProperties: PUBLIC PROC [printer: ROPE]
+RETURNS [service: ROPE, answer: Properties] ~ {
+ENABLE {
+Printing.ServiceUnavailable => {
+ERROR Error[service, "Service Unavailable"];
+};
+Printing.SystemError => {
+ERROR Error[service, "System Error"];
+};
+Printing.Undefined => {
+ERROR Error[service, "Undefined"];
+};
+CrRPC.Error => {
+SELECT errorReason FROM
+courierVersionMismatch, rejectedNoSuchProgram, rejectedNoSuchVersion, cantConnectToRemote, communicationFailure => {
+ERROR Error[connection, text];
+};
+rejectedNoSuchProcedure, rejectedInvalidArgument, argsError, resultsError, bulkDataError, protocolError, notImplemented, unknownOperation => {
+ERROR Error[protocol, text];
+};
+rejectedUnspecified, remoteError, remoteClose => {
+ERROR Error[connection, text]; };
+ENDCASE  => {
+ERROR Error[unknown, text];
+};
+};
+};
+distingName: XNSCHName.Name; h: CrRPC.Handle ¨ NIL;
+realAnswer: Printing.PrinterProperties;
+[h, distingName] ¨ CrHandleFromRope[printer, HACK];
+realAnswer ¨ Printing.GetPrinterProperties[h];
+CrRPC.DestroyClientHandle[h];
+answer ¨ MungeProperties[realAnswer];
+service ¨ XNSCHName.RopeFromName[distingName];
+};
+
+GetPrinterStatus: PUBLIC PROC [printer: ROPE]
+RETURNS [service: ROPE, answer: PrinterStatus] ~ {
+ENABLE {
+Printing.ServiceUnavailable => {
+ERROR Error[service, "Service Unavailable"];
+};
+Printing.SystemError => {
+ERROR Error[service, "System Error"];
+};
+Printing.Undefined => {
+ERROR Error[service, "Undefined"];
+};
+CrRPC.Error => {
+SELECT errorReason FROM
+courierVersionMismatch, rejectedNoSuchProgram, rejectedNoSuchVersion, cantConnectToRemote, communicationFailure => {
+ERROR Error[connection, text];
+};
+rejectedNoSuchProcedure, rejectedInvalidArgument, argsError, resultsError, bulkDataError, protocolError, notImplemented, unknownOperation => {
+ERROR Error[protocol, text];
+};
+rejectedUnspecified, remoteError, remoteClose => {
+ERROR Error[connection, text]; };
+ENDCASE  => {
+ERROR Error[unknown, text];
+};
+};
+};
+distingName: XNSCHName.Name; h: CrRPC.Handle ¨ NIL;
+realAnswer: Printing.PrinterStatus;
+[h, distingName] ¨ CrHandleFromRope[printer, HACK];
+realAnswer ¨ Printing.GetPrinterStatus[h];
+CrRPC.DestroyClientHandle[h];
+answer ¨ MungePrinterStatus[realAnswer];
+service ¨ XNSCHName.RopeFromName[distingName];
+};
+
+GetPrintRequestStatus: PUBLIC PROC [request: PrintRequest]
+RETURNS [status: RequestStatus] ~ {
+ENABLE {
+Printing.ServiceUnavailable => {
+ERROR Error[service, "Service Unavailable"];
+};
+Printing.SystemError => {
+ERROR Error[service, "System Error"];
+};
+Printing.Undefined => {
+ERROR Error[service, "Undefined"];
+};
+CrRPC.Error => {
+SELECT errorReason FROM
+courierVersionMismatch, rejectedNoSuchProgram, rejectedNoSuchVersion, cantConnectToRemote, communicationFailure => {
+ERROR Error[connection, text];
+};
+rejectedNoSuchProcedure, rejectedInvalidArgument, argsError, resultsError, bulkDataError, protocolError, notImplemented, unknownOperation => {
+ERROR Error[protocol, text];
+};
+rejectedUnspecified, remoteError, remoteClose => {
+ERROR Error[connection, text]; };
+ENDCASE  => {
+ERROR Error[unknown, text];
+};
+};
+};
+h: CrRPC.Handle ¨ CrHandleFromRope[request.context.printerName, HACK].h;
+realStatus: Printing.RequestStatus ¨ Printing.GetPrintRequestStatus[h, request.requestID];
+CrRPC.DestroyClientHandle[h];
+status ¨ MungeRequestStatus[realStatus];
+};
+
+PrintFromFile: PUBLIC PROC [file: ROPE, context: Context, update: StatusChangedProc ¨ NIL, clientData: REF ¨ NIL] RETURNS [request: PrintRequest] ~ {
+ENABLE {
+FS.Error => {
+ERROR Error[file, error.explanation];
+};
+Printing.Busy => {
+ERROR Error[connection, "Busy"];
+};
+Printing.ConnectionError => {
+ERROR Error[connection, "Connection Error"];
+};
+Printing.InsufficientSpoolSpace => {
+ERROR Error[service, "Insufficient Spool Space"];
+};
+Printing.InvalidPrintParameters => {
+ERROR Error[service, "Invalid Print Parameters"];
+};
+Printing.MasterTooLarge => {
+ERROR Error[service, "Master Too Large"];
+};
+Printing.MediumUnavailable => {
+ERROR Error[service, "Medium Unavailable"];
+};
+Printing.ServiceUnavailable => {
+ERROR Error[connection, "Service Unavailable"];
+};
+Printing.SpoolingDisabled => {
+ERROR Error[service, "Spooling Disabled"];
+};
+Printing.SpoolingQueueFull => {
+ERROR Error[service, "Spooling Queue Full"];
+};
+Printing.SystemError => {
+ERROR Error[service, "System Error"];
+};
+Printing.TooManyClients => {
+ERROR Error[service, "Too Many Clients"];
+};
+Printing.TransferError => {
+ERROR Error[service, "Transfer Error"];
+};
+Printing.Undefined => {
+ERROR Error[service, "Undefined"];
+};
+CrRPC.Error => {
+SELECT errorReason FROM
+courierVersionMismatch, rejectedNoSuchProgram, rejectedNoSuchVersion, cantConnectToRemote, communicationFailure => {
+ERROR Error[connection, text];
+};
+rejectedNoSuchProcedure, rejectedInvalidArgument, argsError, resultsError, bulkDataError, protocolError, notImplemented, unknownOperation => {
+ERROR Error[protocol, text];
+};
+rejectedUnspecified, remoteError, remoteClose => {
+ERROR Error[connection, text]; };
+ENDCASE  => {
+ERROR Error[unknown, text];
+};
+};
+};
+distingName: XNSCHName.Name; h: CrRPC.Handle ¨ NIL;
+ctx: Context ¨ CopyContext[context];
+[h, distingName] ¨ CrHandleFromRope[ctx.printerName, HACK];
+IF ( ctx.printObjectCreateDate = BasicTime.nullGMT )
+THEN ctx.printObjectCreateDate ¨ FS.FileInfo[file].created;
+IF ( ctx.printObjectName = NIL ) THEN ctx.printObjectName ¨ file;
+request ¨ CreatePrintRequest[ctx, FALSE];
+request.clientData ¨ clientData;
+request.distinguishedName ¨ XNSCHName.RopeFromName[distingName];
+request.fileName ¨ file;
+request.ipMasterStream ¨ FS.StreamOpen[file];
+h.clientData ¨ request;
+request.requestID ¨ Printing.Print[h, Xfer, request.attributes, request.options
+];
+CrRPC.DestroyClientHandle[h];
+IF ( request.ipMasterStream # NIL ) THEN IO.Close[request.ipMasterStream];
+IF ( update # NIL ) THEN RegisterPrintRequest[request, update];
+};
+
+Xfer: CrRPC.BulkDataXferProc ~ {
+bufSize: NAT ~ 1024;
+buf: REF TEXT ~ RefText.ObtainScratch[bufSize];
+request: PrintRequest ¨ NARROW [h.clientData];
+abort ¨ FALSE;
+DO
+IF ( IO.EndOf[request.ipMasterStream] ) THEN EXIT;
+IF ( abort ¨ checkAbort[h] ) THEN EXIT;
+[] ¨ IO.GetBlock[request.ipMasterStream, buf];
+IO.PutBlock[s, buf];
+ENDLOOP;
+RefText.ReleaseScratch[buf];
+};
+
+
+mediaTable: RedBlackTree.Table; -- all values in this table are PaperInfo
+unknownMedium: Printing.Medium; -- value from Init!
+
+PaperInfo: TYPE ~ REF PaperInfoRep;	
+PaperInfoRep: TYPE ~ RECORD [
+kind: ROPE,
+medium: Printing.Medium,
+size: PaperDimensions
+];
+
+GetPaperDimensions: PUBLIC PROC [s: AvailableKind]
+RETURNS [size: Printing.PaperDimensions ¨ [0, 0]] ~ {
+val: RedBlackTree.UserData ~ RedBlackTree.Lookup[mediaTable, s];
+IF ( val # NIL ) THEN {
+info: PaperInfo ~ NARROW [val, PaperInfo];
+size ¨ info.size;
+};
+};
+
+ListAvailableKinds: PUBLIC PROC []
+RETURNS [list: Media ¨ NIL] ~ {
+Append: RedBlackTree.EachNode ~ {
+info: PaperInfo ~ NARROW[data];
+list ¨ CONS[info.kind, list];
+};
+RedBlackTree.EnumerateDecreasing[mediaTable, Append];
+};
+
+Insert: PUBLIC PROC [key: ROPE, medium: Printing.Medium, size: Printing.PaperDimensions] ~ {
+ENABLE {
+RedBlackTree.DuplicateKey => CONTINUE;
+};
+info: PaperInfo ~ NEW [PaperInfoRep ¨ [key, medium, size]];
+[] ¨ RedBlackTree.Insert[mediaTable, info, key];
+};
+
+CreateAvailableKind: PUBLIC PROC [s: Printing.KnownPaperSize]
+RETURNS [kind: AvailableKind] ~ {
+kind ¨  PrintingAux.ExposeKnownPaperSize[s, 0];
+};
+
+CreateAvailableKindOther: PUBLIC PROC [size: Printing.PaperDimensions]
+RETURNS [kind: AvailableKind] ~ {
+kind ¨  PrintingAux.ExposePaperDimensions[size, 0];
+};
+
+CreateMedium: PUBLIC PROC [s: AvailableKind] RETURNS [medium: Printing.Medium] ~ {
+val: RedBlackTree.UserData ~ RedBlackTree.Lookup[mediaTable, s];
+IF ( val # NIL )
+THEN {
+info: PaperInfo ~ NARROW [val, PaperInfo];
+medium ¨ info.medium;
+}
+ELSE {
+medium ¨ unknownMedium;
+};
+};
+
+MungeMedia: PUBLIC PROC [s: Printing.Media] RETURNS [media: Media] ~ {
+FOR i: CARD16 IN [0..s.length) DO
+medium: ROPE;
+WITH s[i]≠ SELECT FROM
+mk: Printing.MediumObject.paper=> {
+WITH mk.paper≠ SELECT FROM
+m: Printing.PaperObject.unknown => {
+medium ¨ "unknown";
+};
+m: Printing.PaperObject.knownSize => {
+medium ¨ CreateAvailableKind[m.knownSize];
+};
+m: Printing.PaperObject.otherSize => {
+medium ¨ CreateAvailableKindOther[m.otherSize];
+Insert[medium, s[i], m.otherSize];
+};
+ENDCASE => ERROR FIREWALL;
+};
+ENDCASE => ERROR FIREWALL;
+media ¨ CONS [medium, media];
+ENDLOOP;
+};
+
+
+GetDefaults: PUBLIC PROC [context: Context] RETURNS [Context] ~ {
+IF ( context = NIL ) THEN context ¨ NEW[ContextObject];
+GetDefaultsFromProfile[context];
+RETURN [context]
+};
+
+CreateAttributes: PUBLIC PROC [context: Context] RETURNS [attributes: Printing.PrintAttributes] ~ {
+attributes ¨ NEW[ Printing.PrintAttributesObject[3] ];
+attributes.body[0] ¨ NEW [Printing.AttributeObject.printObjectName ¨
+[printObjectName[context.printObjectName]]];
+attributes.body[1] ¨ NEW [Printing.AttributeObject.printObjectCreateDate ¨
+[printObjectCreateDate[BasicTime.ToNSTime[context.printObjectCreateDate]]]];
+attributes.body[2] ¨ NEW [Printing.AttributeObject.senderName ¨
+[senderName[context.senderName]]];
+};
+
+CreateOptions: PUBLIC PROC [context: Context] RETURNS [Printing.PrintOptions] ~ {
+result: Printing.PrintOptions ¨ NIL;
+medium: Printing.Medium ¨ CreateMedium[context.mediumHint];
+opt: ARRAY Printing.OptionKind OF Printing.Option ¨ ALL[NIL];
+CountOpt: PROC RETURNS [n: NAT ¨ 0] = {
+FOR o: Printing.OptionKind IN Printing.OptionKind DO
+IF opt[o] # NIL THEN n ¨ n+1;
+ENDLOOP;
+};
+PlugOpt: PROC [options: Printing.PrintOptions] RETURNS [Printing.PrintOptions] = {
+i: NAT ¨ 0;
+FOR o: Printing.OptionKind IN Printing.OptionKind DO
+IF opt[o] # NIL THEN { options[i] ¨ opt[o]; i ¨ i+1 };
+ENDLOOP;
+RETURN [options]
+};
+IF context.recipientName # NIL THEN {
+opt[recipientName] ¨ NEW [Printing.OptionObject.recipientName ¨
+[recipientName[context.recipientName]]];
+};
+IF context.message.Size # 0 THEN {
+opt[message] ¨ NEW [Printing.OptionObject.message ¨
+[message[context.message]]];
+};
+IF context.copyCount # 0 THEN {
+opt[copyCount] ¨ NEW [Printing.OptionObject.copyCount ¨
+[copyCount[context.copyCount]]];
+};
+IF context.pageFirst # 1 OR context.pageLast # 177777B THEN {
+opt[pagesToPrint] ¨ NEW [Printing.OptionObject.pagesToPrint ¨
+[pagesToPrint[[context.pageFirst, context.pageLast]]]];
+};
+SELECT GetStapling[context] FROM
+$default => {};
+$unstapled => {
+opt[staple] ¨ NEW [Printing.OptionObject.staple ¨ [staple[FALSE]]];
+};
+$stapled => {
+opt[staple] ¨ NEW [Printing.OptionObject.staple ¨ [staple[TRUE]]];
+};
+ENDCASE => ERROR;
+SELECT GetPlex[context] FROM
+$default => {};
+$simplex => {
+opt[twoSided] ¨ NEW [Printing.OptionObject.twoSided ¨ [twoSided[FALSE]]];
+};
+$duplex => {
+opt[twoSided] ¨ NEW [Printing.OptionObject.twoSided ¨ [twoSided[TRUE]]];
+};
+ENDCASE => ERROR;
+IF medium # unknownMedium THEN {
+opt[mediumHint] ¨ NEW [Printing.OptionObject.mediumHint ¨ [mediumHint[medium]]];
+};
+IF context.printObjectSize # 0 THEN {
+opt[printObjectSize] ¨ NEW [Printing.OptionObject.printObjectSize ¨
+[printObjectSize[context.printObjectSize]]];
+};
+IF context.priorityHint # NIL THEN {
+priorityNames: ARRAY Printing.Priority OF ROPE = [
+low: "low", normal: "normal", high: "high"
+];
+FOR p: Printing.Priority IN Printing.Priority DO
+IF Rope.Equal[context.priorityHint, priorityNames[p], FALSE] THEN {
+opt[priorityHint] ¨ NEW [Printing.OptionObject.priorityHint ¨
+[priorityHint[p]]];
+};
+ENDLOOP;
+};
+IF context.releaseKey # 0 THEN {
+opt[releaseKey] ¨ NEW [Printing.OptionObject.releaseKey ¨
+[releaseKey[context.releaseKey]]];
+};
+result ¨ PlugOpt[NEW[Printing.PrintOptionsObject[CountOpt[]]]];
+RETURN [result]
+};
+
+CopyContext: PROC [context: Context] RETURNS [new: Context] = {
+new ¨ NEW [ContextObject ¨ context≠];
+SetStapling[new, GetStapling[context]];
+SetPlex[new, GetPlex[context]];
+};
+
+CreatePrintRequest: PUBLIC PROC [context: Context, copyContext: BOOL ¨ TRUE] RETURNS [request: PrintRequest] ~ {
+privateContext: Context ¨ IF ( copyContext ) THEN CopyContext[context] ELSE context;
+request ¨ NEW[PrintRequestObject];
+request.context ¨ privateContext;
+request.update ¨ NIL;
+request.distinguishedName ¨ NIL;
+request.requestID ¨ ALL[0];
+request.lastStatus ¨ [unknown, "uninitialized lastStatus"];
+request.attributes ¨ CreateAttributes[context];
+request.options ¨ CreateOptions[context];
+request.ipMasterStream ¨ NIL;
+};
+
+MungeProperties: PUBLIC PROC [s: Printing.PrinterProperties]
+RETURNS [properties: Properties] ~ {
+FOR i: CARD16 IN [0 .. s.length) DO
+WITH s.body[i]≠ SELECT FROM
+v: ppmedia Printing.PropertyObject => { properties.media ¨ MungeMedia[v.ppmedia]; };
+v: ppstaple Printing.PropertyObject => { properties.staple ¨ v.ppstaple; };
+v: pptwoSided Printing.PropertyObject => { properties.twoSided ¨ v.pptwoSided; };
+ENDCASE => { ERROR FIREWALL };
+ENDLOOP;
+};
+
+MungePrinterStatus: PUBLIC PROC [s: Printing.PrinterStatus]
+RETURNS [printerstatus: PrinterStatus] ~ {
+FOR i: CARD16 IN [0 .. s.length) DO
+WITH s.body[i]≠ SELECT FROM
+v: spooler Printing.ServiceStatusObject => { printerstatus.spooler ¨ v.spooler; };
+v: formatter Printing.ServiceStatusObject => { printerstatus.formatter ¨ v.formatter; };
+v: printer Printing.ServiceStatusObject => { printerstatus.printer ¨ v.printer; };
+v: media Printing.ServiceStatusObject => {
+printerstatus.media ¨ MungeMedia[v.media];
+};
+ENDCASE => { ERROR FIREWALL };
+ENDLOOP;
+};
+
+MungeRequestStatus: PUBLIC PROC [s: Printing.RequestStatus]
+RETURNS [requeststatus: RequestStatus] ~ {
+FOR i: CARD16 IN [0 .. s.length) DO
+WITH s.body[i]≠ SELECT FROM
+v: status Printing.JobStatusObject => { requeststatus.status ¨ v.status; };
+v: statusMessage Printing.JobStatusObject => {
+requeststatus.statusMessage ¨ v.statusMessage;
+};
+ENDCASE => { ERROR FIREWALL };
+ENDLOOP;
+};
+
+CrHandleFromRope: PROC [pattern: ROPE, smash: BOOL ¨ FALSE, socket: XNS.Socket ¨ XNS.unknownSocket] RETURNS [h: CrRPC.Handle, name: XNSCHName.Name] ~ {
+addr: XNS.Address;
+[name, addr] ¨ XNSCH.LookupAddressFromRope[pattern];
+IF ( addr = XNS.unknownAddress ) THEN ERROR Error[name, "Address not found"];
+IF ( ( addr.socket # XNS.unknownSocket ) AND ( smash ) ) THEN addr.socket ¨ socket;
+h ¨ CrRPC.CreateClientHandle[$CMUX, NEW[XNS.Address ¨ addr]];
+};
+
+GetDefaultsFromProfile: PROC [context: Context] ~ {
+me: ROPE ~ SystemNames.UserName[];
+context ¨ IF ( context = NIL ) THEN NEW [ContextObject] ELSE context;
+
+context.copyCount ¨ UserProfile.Number[COPYCOUNT, 1];
+context.mediumHint ¨ UserProfile.Line[MEDIUM, "usLetter"];
+context.message ¨ UserProfile.Line[BANNER, ""];
+context.pageFirst ¨ UserProfile.Number[PAGEFIRST, 1];
+context.pageLast ¨ UserProfile.Number[PAGELAST, 177777B];
+context.printerName ¨ UserProfile.Line[IPPRINTER, "Huh? -- no printer!"];
+context.printObjectCreateDate ¨ BasicTime.nullGMT;
+context.printObjectName ¨ NIL; --UserProfile.Line[SILLYNAME];
+context.printObjectSize ¨ 0; --UserProfile.Number[SIZE];
+context.priorityHint ¨ UserProfile.Line[PRIORITY, "normal"];
+context.recipientName ¨ UserProfile.Line[PIGEONHOLE, me];
+context.releaseKey ¨ UserProfile.Number[KEY, 0];
+context.senderName ¨ me;
+SetStapling[context, SELECT TRUE FROM
+Rope.Match["*default*", UserProfile.Token[STAPLED, NIL], FALSE] => $default,
+ENDCASE => IF UserProfile.Boolean[STAPLED, FALSE] THEN $stapled ELSE $unstapled
+];
+context.telephone ¨ UserProfile.Line[FAX, ""];
+SetPlex[context, SELECT TRUE FROM
+Rope.Match["*default*", UserProfile.Token[TWOSIDED, NIL], FALSE] => $default,
+ENDCASE => IF UserProfile.Boolean[TWOSIDED, TRUE] THEN $duplex ELSE $simplex
+];
+context.twoSided ¨ UserProfile.Boolean[TWOSIDED, TRUE];
+};
+
+
+GetKey: RedBlackTree.GetKey ~ {
+info: PaperInfo ~ NARROW[data];
+RETURN[info.kind];
+};
+
+Compare: RedBlackTree.Compare ~ {
+info: PaperInfo ~ NARROW[data];
+thisKey: ROPE ~ NARROW[k];
+RETURN[Rope.Compare[info.kind, thisKey, FALSE]];
+};
+
+InitializeMediaTable: PROC [] ~ {
+AddKnown: PROC [k: Printing.KnownPaperSize, size: Printing.PaperDimensions] ~ {
+key: ROPE ~ CreateAvailableKind[k];
+paper: Printing.Paper ~ NEW [Printing.PaperObject ¨ [knownSize[k]]];
+medium: Printing.Medium ~ NEW [Printing.MediumObject ¨ [paper[paper]]];
+Insert[key, medium, size]
+};
+
+mediaTable ¨ RedBlackTree.Create[GetKey, Compare];
+
+AddKnown[usLetter,	[ 216,  279]];
+AddKnown[usLegal,	[ 216,  356]];
+AddKnown[a0,	[ 841, 1189]];
+AddKnown[a1,	[ 594,  841]];
+AddKnown[a2,	[ 420,  594]];
+AddKnown[a3,	[ 297,  420]];
+AddKnown[a4,	[ 210,  297]];
+AddKnown[a5,	[ 148,  210]];
+AddKnown[a6,	[ 105,  148]];
+AddKnown[a7,	[  74,  105]];
+AddKnown[a8,	[  52,   74]];
+AddKnown[a9,	[  37,   52]];
+AddKnown[a10,	[  26,   37]];
+
+AddKnown[isoB0,	[1000, 1414]];
+AddKnown[isoB1,	[ 707, 1000]];
+AddKnown[isoB2,	[ 500,  707]];
+AddKnown[isoB3,	[ 353,  500]];
+AddKnown[isoB4,	[ 250,  353]];
+AddKnown[isoB5,	[ 176,  250]];
+AddKnown[isoB6,	[ 125,  176]];
+AddKnown[isoB7,	[  88,  125]];
+AddKnown[isoB8,	[  62,   88]];
+AddKnown[isoB9,	[  44,   62]];
+AddKnown[isoB10,	[  31,   44]];
+
+AddKnown[jisB0,	[1030, 1456]];
+AddKnown[jisB1,	[ 728, 1030]];
+AddKnown[jisB2,	[ 515,  728]];
+AddKnown[jisB3,	[ 364,  515]];
+AddKnown[jisB4,	[ 257,  364]];
+AddKnown[jisB5,	[ 182,  257]];
+AddKnown[jisB6,	[ 128,  182]];
+AddKnown[jisB7,	[  91,  128]];
+AddKnown[jisB8,	[  64,   91]];
+AddKnown[jisB9,	[  45,   64]];
+AddKnown[jisB10,	[  32,   45]];
+};
+
+Init: ENTRY PROC ~ {
+ENABLE { UNWIND => NULL };
+TRUSTED {
+Process.SetTimeout[@RequestListChanged, Process.SecondsToTicks[QUANTUS]];
+Process.Detach[FORK WatchRequestList];
+};
+{
+paper: Printing.Paper ~ NEW [Printing.PaperObject ¨ [unknown[NULL]]];
+unknownMedium ¨ NEW [Printing.MediumObject ¨ [paper[paper]]];
+}
+};
+
+Init[];
+InitializeMediaTable[];
+
+}...
+
+  
+"  
+XNSPrintImpl.mesa
+Copyright ” 1985, 1986, 1987, 1992, 1993 by Xerox Corporation.  All rights reserved.
+Bill Jackson (bj) April 9, 1987 1:16:54 am PDT
+Tim Diebert: February 9, 1987 11:08:15 am PST
+Russ Atkinson (RRA) April 9, 1987 11:43:00 am PDT
+Jean-Marc Frailong April 21, 1987 2:53:24 pm PDT
+Michael Plass, June 2, 1993 3:13 pm PDT
+Foote, February 10, 1992 4:20 pm PST
+Willie-s, April 2, 1992 2:21 pm PST
+
+UserProfile Tags
+
+Global State (atomically altered under the monitor)
+
+Extensions
+StatusWatcher Procs
+
+
+Request Manager Procs
+
+
+Watcher process
+( oldStatus IN [rejected..canceled] ) => {
+UnRegisterPrintRequest[tail.first];
+}
+Reschedule this guy?
+
+Errors
+
+
+Print Service Interaction
+
+REPORTS [ServiceUnavailable, SystemError, Undefined]
+REPORTS [ServiceUnavailable, SystemError, Undefined]
+REPORTS [ServiceUnavailable, SystemError, Undefined]
+REPORTS [Busy, ConnectionError, InsufficientSpoolSpace, InvalidPrintParameters, MasterTooLarge, MediumUnavailable, ServiceUnavailable, SpoolingDisabled, SpoolingQueueFull, SystemError, TooManyClients, TransferError, Undefined]
+An abstract representation of "Media"
+
+General comments:
+A RedBlackTree keeps track of the association ROPE -> (medium, size). It is initialized with all the known paper sizes. For otherSize papers, an entry in the table is created each time a media description is returned by a printer. This ensures that (legally) only the names in the RedBlackTree are recognizable by printer, and therefore, only these may be quoted by the user.
+The unknown medium raises a problem. This medium is sent back by a printer when it cannot determine the size of the paper. The reference says that in that case, it is the only medium description returned (i.e. media are either the single unknown medium, or a sequence of decent media). The solution used here is to never enter unknown in the table. This implies that there is an asymmetry here in that users could see "unknown", and if a user selects "unknown", we won't have a table entry, and will use some special value (=  unknown), in which case the user will get whatever medium the printer wants, and will get a size info of [0, 0]. Too bad for him...
+Return the size of this medium in millimeters.
+A length of 0 means roll paper (indefinite length).
+A width of 0 will be returned if the medium is not (currently) known.
+When converting to a medium, a unknown is returned if the entry is not found.
+Insert[medium, s[i], [x, x]]; -- guaranteed to be in table (well known sizes).
+Context Procs
+Internal Procs
+
+Initialization
+
+sizes are from Printing Protocol XSIS 118404
+ù -ö  ñ(cedarcode) styleïNewlineDelimiter
+ô ôIcodeöú
+œeúIôTKöú.ô.Köú*œkô-Kô1Kô0Kô'Kô$Kô#Jô óöû	ò	Köú
+ûúûúò)KöúûúòKöúûúLòWKò	Köûúûúò'Köûúûú$ûúò4Köúûú/ò<Köúûúiò{Köúûú!ò.Köúûúûúò/KöúûúòKöúûú ò1Köûúûú2ò;Köûúûúò$Köú
+ûúò%KöúòKöúòKöú	ò	KòóKò öœnúûúûòKöûúûúûúaûúòõKöûúò$KöûúüúüúòDKöûúûúûúòKò öúôKò Kö–bkúûúœbú°úò!Kö†	úûú°ú°	úò'Kö†úûú°úò&Kö†	úûú°úò/Kö†úûú°ú°úòKö†úûú°ú°úò!Kö†
+úûú°ú°
+úò)Kö†	úûú°ú°	úò'Kö†úûú°ú°úò%Kö†úûú°ú°úò%Kö†úûú°ú°úò#Kö†úûú°ú°úò%Kô óô3Kô Köú)ûúò-Kö†úòKö†úûúûúòKö
+úûúûúûúûúœcò>Kò óô
+Köúûúûúò1öúûúûúò$KòKöúûúûúòKöú	ûúûòKöúòKò óò2Kò óöüúûúûúûúòPKöúûúòöûúûòKò)öûúûúûú*ûúûúûòSKöûú#ûúûúòMKöûúòóKöûúòóöûúûúûú/ûúûúûòSöûú=ûúòEKòKöûúòKöúòóKöûúòóöûúûúûúòKöúûúRòYKöúûúò+KöúòóKò	KòKò óöüúûúûúûú0òcöüúûúò%Köú	ûúûúûúûú
+ûúûú	ò_KöúòóKòKòKò óöüúûúûú:òRöüúûúò%Kò$Kò&KöúòóKòKòKò óöüúûúûúûú,ò[öüúûúò%Köú	ûúûúûúûú	ûúûú	òYKöúòóKòKòKò óöüúûúûú2òFöüúûúò%KòKò"KöúòóKòKòKò óóöúôKô Köüúûúû	úò%Kô óôKô Köüúûúû	úò%Kò öüúûúûúûú5ûúûúûúò{KöûúûúûúòKöûúûúûú!ò;KòKöúûú ò;Köû	úòKöúòKò óöüúûúûúûúòEKöûúûúûúòöûúûúûòöúûúò#KöûòKöúòóöú-ò-Kò1Köúòóöûúòöûú:ûúûúûòYKöûúûúûúòKKöûúòóKöúòóóKöû	úòKöúòKò óö
+üúûúûúûúûúòKKöûúûúûúòKòKöúòóKô óôKò öüúûúûúò)KöûúûúûúòKöûúòKöúòKò óöüúûúòKöúûúò
+Köú#¢%òHöûú¢
+òKöúòöûúûúûúûúò,öûú:ûú
+ûúûúòVöûúòKöûúûúòKöúûú
+ò+KöúòóKò)öûúûúûòöúûúò Köú#ò#Kòóöúûúô*Köú#ô#KôóöûúòKò:Köúôöûú.ûúò6Köú5ò5KòóKöúòóóöûòòKò'Köú5ò5Köú#ò#KòóKöúûúò
+óóóKöûú¢
+òóKöúòóKô óôKô Kö
+üúûúûú!ûúûúòAKö	†úûúûúûú¢+òJKô óôKô öüúûúûúûúûúûúòaJöûú-ô4öûúòöú ò Köûú'ò,KöúòóöúòKöûú ò%KöúòóöúòKöûúò"KöúòóöúòöûúûòöútòtKöûúòKöúòóöúéòéKöûúòKöúòóöú2ò2Köûúò!óöûúòKöûúòKöúòóóKòóKöúòóKöú/ûúò3Köú'ò'Köú-†úò3Kò.KöúòKò%Kò.KöúòKò óöüúûúûúûúûúûúò`Jöûú-ô4öûúòöú ò Köûú'ò,KöúòóöúòKöûú ò%KöúòóöúòKöûúò"KöúòóöúòöûúûòöútòtKöûúòKöúòóöúéòéKöûúòKöúòóöú2ò2Köûúò!óöûúòKöûúòKöúòóóKòóKöúòóKöú/ûúò3Köú#ò#Köú-†úò3Kò*KöúòKò(Kò.òKò óóöüúûúûúûúò^Jöûú-ô4öûúòöú ò Köûú'ò,KöúòóöúòKöûú ò%KöúòóöúòKöûúò"KöúòóöúòöûúûòöútòtKöûúòKöúòóöúéòéKöûúòKöúòóöú2ò2Köûúò!óöûúòKöûúòKöúòóóKòóKöúòóKöú@†úòHKòZKöúòKò(KöúòKò óöüúûúûúûú0ûúûúûúûúòïJöûú€ô‚öûúòöûúòKöûú ò%KòóöúòKöûúò KöúòóöúòKöûú'ò,Köúòóöú$ò$Köûú,ò1Köúòóöú$ò$Köûú,ò1KöúòóöúòKöûú$ò)KöúòóöúòKöûú&ò+Köúòóöú ò Köûú*ò/KöúòóöúòKöûú%ò*KöúòóöúòKöûú'ò,KöúòóöúòKöûú ò%KöúòóöúòKöûú$ò)KöúòóöúòKöûú"ò'KöúòóöúòKöûúò"KöúòóöúòöûúûòöútòtKöûúòKöúòóöúéòéKöûúòKöúòóöú2ò2Köûúò!óöûúòKöûúòKöúòóóKòóKöúòóKöú/ûúò3Kò$Köú5†úò;öûú2ò4Köûúûúò;óKöûúûúûúòAKöú"ûúò)Kò Kò@KòKöúûúò-KòòOKöúòóKöúòKöûúûúûúûúòJKöûúûúûú'ò?KöúòKò óöüúò Köú	ûúòKöúûúûú"ò/Köúûúò.KöúûúòöûòKöûúûú!ûúûúò2Köûúûúûúò'Köúûú'ò.KöûúòKöûúòóKöúòKòóKò óô%Kô ôKöú.ûú≈ô˜Köú°úº°úU°úËôíóKò Kö°
+ú¢)òIKö°ú¢ò3Kò Köúûúûúò$öúûúûúòKöúûúòKöúòKöúòöúòKò óóöüúûúûúûú.òhKô.Kô3KôEKöú1°
+úò@öûú	ûúûúòKöúûúò*KòKöúòóKöúòKò óö
+üúûúûúûúûúòBöüúò!Kñ%clearTabStops 25 sp flushLeft tabStopöúûúòKöúûúòKöúòóKöú!°
+ú
+ò5KöúòKò óöüúûúûúûú>ò\öûúòKöúûúò&KöúòóKöúûú&ò;Köú°
+úò0KòKò óöüúûúûúûúò_Köú-œtúò/KöúòKò óöüúûúûú"ûúòhKöú1£úò3KöúòóKò öüúûúûúûúòRKöú°ú'ôMKöú1°
+úò@öûú	ûúòöûúòKöúûúò*KòKöúòóöûúòKöú	°úòKòóóKöúòKò óöü
+úûúûúûúòFöûúûúûúûò!Köúûúòöûúûúûòöú#ò#öûúûúûòöú$ò$KòKòóöú&ò&Kò*KöúNôNKöúòóöú&ò&Kò/Köú"ò"KöúòóKöûúûúûúòóKöúòóKöûúûúûúòóKöúûúòKöûúòóKöúòKò óóöúôKò öüúûúûúûúòAKöûúûúûúûúò7Kò Köûú
+òKòKò óöüúûúûúûú+òcKöúûú&ò6KöúûúYòqKöúûúòóKöúûúJòbKòKò óöüúûúûúûúòQKöú ûúò$Kò;Kö	úûúûúûúûúò=öüúûúûúûú	ò'öûúûúûò4Köûú
+ûúûú	òKöûúòóKöúòóöüúûú"ûúòRKöúûúòöûúûúûò4Köûú
+ûúûú"ò6KöûúòóKöûú
+òKòóöûúûúûúò%KöúûúPòhKöúòóöûúûúò"Köúûú>òPKöúòóöûúûúòKöúûúDòXKòóöûúûúûúò=Köúûú^òuKòóöûúûò KòòKöúûú)ûúòCKòóòKöúûú)ûúòBKòóKöûúûúòóöûúûòKòòKöúûú-ûúòIKòóòKöúûú-ûúòHKòóKöûúûúòóöûú
+°úûúò Köúûú;òPKòóöûúûúò%KöúûúVòpKöúòóöûúûúûúò$öúûúûúûúò2Kò*Köúòóöûúûúûò0öûú4ûúûúòCKöúûú:òQKöúòóKöûúòóKöúòóöûúûúò KöúûúGò\KöúòóKöúûú+ò?Köûú	òKòKò óöüúûúûúò?Köúûúò%Kò'KòKöúòKò óöüúûúûú!ûúûúûúòpKöúûúûúûú	òTKöú
+ûúò"Kò!KöúûúòKöúûúò KöúûúòKò;Kò/Kò)KöúûúòKòóKò öüúûúûú!ûúòaöûúûúûúûò#öûúûúûòKòTKòKKòQKöûúûú†úòóKöûúòóKöúòKò óöüúûúûúûú#òföûúûúûúûò#öûúûúûòKòRKòXKòRöú*ò*Kò*KöúòóKöûúûú†úòóKöûúòóKöúòKò óöüúûúûúûú#òföûúûúûúûò#öûúûúûòKòKöú.ò.Kò.KöúòóKöûúûú†úòóKöûúòóKöúòóKò óöúôKô öüúûúûú	ûúûú
+ûú
+ûúûú,òóKöúûú	òKöúûú ò4Köûú
+ûúûúûú"òMKöûúûúûúûúòSKöú$ûúûúò=KòKò óöüúûúò3Köúûúò"Köú
+ûúûúûúûúûú	òEKò Köú'†	úò5Köú&†úò:Köú#†úò/Köú'†	úò5Köú&†úò9Köú'†	úòIKò2Köúûú¢–bc	¢ò=Köú¢§¢ò8Köú(†úò<Köú)†
+úò9Köú(†úò0Kòöúûúûúûò%Köú*†úûúûúòLKöûúûú†úûúûú
+ûúòOKòóKöú%†úò.öúûúûúûò!Köú*†úûúûúòMKöûúûú†úûúûú	ûú	òLKòóKöú'†úûúò7KòóKò óöúôKò ñ%clearTabStops 25 sp flushLeft tabStopïpostfix%clearTabStops 30 sp flushLeft tabStopöüúòKñ%clearTabStops 25 sp flushLeft tabStopöúûúòKñ%clearTabStops 25 sp flushLeft tabStopöûúòKñ%clearTabStops 25 sp flushLeft tabStopöúòKñ%clearTabStops 25 sp flushLeft tabStopò óñ%clearTabStops 30 sp flushLeft tabStopñ%clearTabStops 25 sp flushLeft tabStopöüúò!Kñ%clearTabStops 25 sp flushLeft tabStopöúûúòKñ%clearTabStops 25 sp flushLeft tabStopöú	ûúûúòKñ%clearTabStops 25 sp flushLeft tabStopöûú"ûúò0Kñ%clearTabStops 25 sp flushLeft tabStopöúòóKñ%clearTabStops 25 sp flushLeft tabStopò ñ%clearTabStops 25 sp flushLeft tabStopöüúûúò!ñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöüúûúAòOKñ%clearTabStops 25 sp flushLeft tabStopöúûúò#Köúûú)òDKñ%clearTabStops 25 sp flushLeft tabStopöúûú*òGKñ%clearTabStops 25 sp flushLeft tabStopöúòKñ%clearTabStops 25 sp flushLeft tabStopöúòKñ%clearTabStops 25 sp flushLeft tabStopò óKñ%clearTabStops 25 sp flushLeft tabStopö°
+ú(ò2Kñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopô Kñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú,ô,Kñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopò Kñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£úò!Kñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£úò Kñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopò Kñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopò Kñ%clearTabStops 25 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopöú£ú£úòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopòKñ%clearTabStops 25 sp flushLeft tabStopñ%clearTabStops 30 sp flushLeft tabStopò óöüúûúûúòKöûúûúûúòöûúò	Köú?†úòIKöúûúò&KöúòóöúòKöúûú"ûúòEKö°úûú*ò=KöúòóKòóóKò KòKöúòKò KöúòKò óó Öó    Zˆ  í≤  

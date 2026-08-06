@@ -1,0 +1,462 @@
+
+DIRECTORY
+Alloc USING [Base, Notifier],
+Basics USING [LowHalf],
+IntCodeDefs USING [ApplyNode, Location, LocationRep, Node, NodeList, Var],
+MimCode USING [BitAddress, BitCount, CodeList, CodePassInconsistency, RegisterNotifier],
+MimData USING [bitsToAlignment, stopping, worstAlignment],
+MimP5 USING [Exp, ProcLabelForBti, SCatchPhrase, ZoneOpSelector],
+MimP5S USING [ExtendValue, Temporize],
+MimP5Stuff USING [IsSimpleVar],
+MimP5U USING [Address, ApplyOp, Assign, AssignRC, BitsForType, CedarOpNode, Deref, MakeBlock, MakeConstInt, MakeNodeList, MakeNodeList2, MakeTemp, MakeVar, MaybeBlock, MesaOpNode, MoreCode, NewCodeList, NilConst, NodeForType, OperandType, ProcessSafens, Simplify, TakeField, ZeroExtend],
+MimZones USING [permZone],
+SymbolOps USING [ArgCtx, DecodeBti, FirstCtxSe, NextSe, own, ToType, TransferTypes, TypeRoot, XferMode],
+Symbols USING [Base, bodyType, CBTIndex, CBTNull, ContextLevel, CSEIndex, CTXIndex, CTXNull, ISEIndex, ISENull, lL, RecordSEIndex, SEIndex, seType, Type],
+Target: TYPE MachineParms USING [bitsPerProc, bitsPerProcess, bitsPerRef, bitsPerSignal, bitsPerWord],
+Tree USING [Base, Index, Link, Null, treeType],
+TreeOps USING [GetTag, ScanList];
+MimCalls: PROGRAM
+IMPORTS Basics, MimCode, MimData, MimP5, MimP5S, MimP5Stuff, MimP5U, MimZones, SymbolOps, TreeOps 
+EXPORTS MimP5, MimP5S = {
+OPEN IntCodeDefs, MimCode, Target;
+
+bitsPerPtr: NAT = Target.bitsPerRef;
+bitsPerProcess: NAT = Target.bitsPerProcess;
+bitsPerMaxSimpleArgRec: NAT ¨ 14*Target.bitsPerWord;
+
+ZoneOpSelector: TYPE = MimP5.ZoneOpSelector;
+BitAddress: TYPE = MimCode.BitAddress;
+BitCount: TYPE = MimCode.BitCount;
+Node: TYPE = IntCodeDefs.Node;
+NodeList: TYPE = IntCodeDefs.NodeList;
+Var: TYPE = IntCodeDefs.Var;
+
+CBTIndex: TYPE = Symbols.CBTIndex;
+CBTNull: CBTIndex = Symbols.CBTNull;
+ContextLevel: TYPE = Symbols.ContextLevel;
+CSEIndex: TYPE = Symbols.CSEIndex;
+CTXIndex: TYPE = Symbols.CTXIndex;
+CTXNull: CTXIndex = Symbols.CTXNull;
+ISEIndex: TYPE = Symbols.ISEIndex;
+ISENull: ISEIndex = Symbols.ISENull;
+lL: ContextLevel = Symbols.lL;
+RecordSEIndex: TYPE = Symbols.RecordSEIndex;
+SEIndex: TYPE = Symbols.SEIndex;
+Type: TYPE = Symbols.Type;
+SysError: PUBLIC PROC RETURNS [Node] = {
+RETURN [MimP5U.ApplyOp[
+oper: MimP5U.MesaOpNode[op: error],
+args: MimP5U.MakeNodeList[
+MimP5U.MesaOpNode[op: unnamedError, bits: bitsPerSignal]]]];
+};
+
+SysErrExp: PUBLIC PROC [node: Tree.Index] RETURNS [Node] = {
+sex: Symbols.SEIndex = LOOPHOLE[tb[node].info];
+new: Node ¨ SysError[];
+new.bits ¨ MimP5U.BitsForType[sex];
+RETURN [new];
+};
+
+Create: PUBLIC PROC [node: Tree.Index] RETURNS [Node] = {
+mod: Node ¨ MimP5.Exp[tb[node].son[1]];
+l: ApplyNode ¨ NARROW[MimP5U.ApplyOp[
+oper: MimP5U.MesaOpNode[copyGlobal],
+args: MimP5U.MakeNodeList[mod],
+bits: bitsPerPtr]];
+IF tb[node].nSons > 2 THEN l.handler ¨ MimP5.SCatchPhrase[tb[node].son[3]];
+RETURN [l];
+};
+
+Start: PUBLIC PROC [node: Tree.Index] RETURNS [Node] = {
+psei: CSEIndex = MimP5U.OperandType[tb[node].son[1]];
+gf: Node = MimP5.Exp[tb[node].son[1]];
+applyToReturnOfAnotherProc: BOOL = tb[node].attr1;
+bits: BitCount = MimP5U.BitsForType[SymbolOps.TransferTypes[SymbolOps.own, psei].typeOut];
+t2: Tree.Link = tb[node].son[2];
+cl: CodeList = MimP5U.NewCodeList[];
+args: NodeList = GenArgList[t2, psei, cl, applyToReturnOfAnotherProc];
+app: ApplyNode = NARROW[MimP5U.ApplyOp[
+oper: MimP5U.MesaOpNode[startGlobal],
+args: MimP5U.MakeNodeList[gf, args],
+bits: bits]];
+IF tb[node].nSons > 2 THEN app.handler ¨ MimP5.SCatchPhrase[tb[node].son[3]];
+RETURN [MimP5U.MaybeBlock[cl, app]];
+};
+
+Restart: PUBLIC PROC [node: Tree.Index] RETURNS [Node] = {
+gf: Node ¨ MimP5.Exp[tb[node].son[1]];
+app: ApplyNode ¨ NARROW[MimP5U.ApplyOp[
+oper: MimP5U.MesaOpNode[restartGlobal],
+args: MimP5U.MakeNodeList[gf]]];
+IF tb[node].nSons > 2 THEN app.handler ¨ MimP5.SCatchPhrase[tb[node].son[3]];
+RETURN [app];
+};
+
+Stop: PUBLIC PROC [node: Tree.Index] RETURNS [Node] = {
+IF ~MimData.stopping THEN SIGNAL MimCode.CodePassInconsistency;
+RETURN [MimP5U.ApplyOp[oper: MimP5U.MesaOpNode[stopGlobal], args: NIL]];
+};
+
+CallableNode: PROC [t: Tree.Link] RETURNS [Node ¨ NIL] = {
+WITH e: t SELECT TreeOps.GetTag[t] FROM
+symbol => {
+sei: ISEIndex = e.index;
+IF seb[sei].constant THEN 
+SELECT SymbolOps.XferMode[SymbolOps.own, seb[sei].idType] FROM
+proc =>
+IF NOT seb[sei].extended THEN {
+bti: CBTIndex = SymbolOps.DecodeBti[seb[sei].idInfo];
+IF bb[bti].level <= lL THEN RETURN [MimP5.ProcLabelForBti[bti]];
+};
+ENDCASE;
+};
+ENDCASE;
+RETURN [MimP5.Exp[t]];
+};
+
+Call: PUBLIC PROC [node: Tree.Index] RETURNS [Node] = {
+cl: CodeList ¨ MimP5U.NewCodeList[];
+son1: Tree.Link = tb[node].son[1];
+psei: CSEIndex = MimP5U.OperandType[son1];
+proc: Node ¨ NIL;
+applyToReturnOfAnotherProc: BOOL = tb[node].attr1;
+t2: Tree.Link = MimP5U.ProcessSafens[cl, tb[node].son[2]];
+args: NodeList ¨ GenArgList[t2, psei, cl, applyToReturnOfAnotherProc];
+nonConstant: BOOL ¨ TRUE;
+{
+WITH e: son1 SELECT TreeOps.GetTag[son1] FROM
+symbol => {
+sei: ISEIndex = e.index;
+IF seb[sei].constant THEN 
+SELECT SymbolOps.XferMode[SymbolOps.own, seb[sei].idType] FROM
+proc =>
+IF NOT seb[sei].extended THEN {
+bti: CBTIndex = SymbolOps.DecodeBti[seb[sei].idInfo];
+bitsIn: BitCount ¨ MimP5U.BitsForType[
+SymbolOps.TransferTypes[SymbolOps.own, psei].typeIn];
+nonConstant ¨ FALSE;
+IF bb[bti].level <= lL THEN {
+proc ¨ MimP5.ProcLabelForBti[bti];
+GO TO found;
+};
+IF bitsIn < bitsPerMaxSimpleArgRec THEN {
+desc: NodeList ¨ MimP5U.MakeNodeList[MimP5.Exp[son1]];
+proc ¨ MimP5.ProcLabelForBti[bti];
+IF args = NIL
+THEN args ¨ desc
+ELSE FOR each: NodeList ¨ args, each.rest DO
+IF each.rest = NIL THEN {each.rest ¨ desc; EXIT};
+ENDLOOP;
+GO TO found;
+};
+};
+ENDCASE;
+};
+ENDCASE;
+proc ¨ MimP5.Exp[son1];
+EXITS found => {};
+};
+{
+bitsOut: BitCount ¨ MimP5U.BitsForType[
+SymbolOps.TransferTypes[SymbolOps.own, psei].typeOut];
+app: ApplyNode ¨ NARROW[MimP5U.ApplyOp[oper: proc, args: args, bits: bitsOut]];
+IF tb[node].nSons > 2 THEN app.handler ¨ MimP5.SCatchPhrase[tb[node].son[3]];
+IF nonConstant THEN {
+count: NAT ¨ IF bitsOut > bitsPerWord THEN 1 ELSE 0;
+bigArgs: NAT ¨ 0;
+simple: BOOL ¨ FALSE;
+FOR each: NodeList ¨ args, each.rest WHILE each # NIL DO
+count ¨ count + 1;
+IF each.first.bits > bitsPerWord THEN bigArgs ¨ bigArgs + 1;
+ENDLOOP;
+IF bigArgs = 0
+THEN {
+IF count > CallStatsArrayIndex.LAST THEN count ¨ CallStatsArrayIndex.LAST;
+singles[count] ¨ singles[count] + 1; 
+}
+ELSE {
+IF count > CallStatsArrayIndex.LAST THEN count ¨ CallStatsArrayIndex.LAST;
+multis[count] ¨ multis[count] + 1; 
+};
+};
+RETURN [MimP5U.MaybeBlock[cl, app]];
+};
+};
+
+SigErr: PUBLIC PROC [node: Tree.Index, error: BOOL, stmt: BOOL] RETURNS [Node] = {
+psei: CSEIndex = MimP5U.OperandType[tb[node].son[1]];
+cl: CodeList = MimP5U.NewCodeList[];
+sig: Node = MimP5.Exp[tb[node].son[1]];
+applyToReturnOfAnotherProc: BOOL = tb[node].attr1;
+bits: BitCount = SELECT TRUE FROM
+stmt => 0,
+error => MimP5U.BitsForType[SymbolOps.ToType[tb[node].info]],
+ENDCASE =>
+MimP5U.BitsForType[SymbolOps.TransferTypes[SymbolOps.own, psei].typeOut];
+t2: Tree.Link = MimP5U.ProcessSafens[cl, tb[node].son[2]];
+args: NodeList = GenArgList[t2, psei, cl, applyToReturnOfAnotherProc];
+app: ApplyNode = NARROW[MimP5U.ApplyOp[
+oper: MimP5U.MesaOpNode[IF error THEN error ELSE signal],
+args: MimP5U.MakeNodeList[sig, args],
+bits: bits]];
+IF tb[node].nSons > 2 THEN app.handler ¨ MimP5.SCatchPhrase[tb[node].son[3]];
+RETURN [MimP5U.MaybeBlock[cl, app]];
+};
+
+ForkExp: PUBLIC PROC [node: Tree.Index] RETURNS [Node] = {
+cl: CodeList ¨ MimP5U.NewCodeList[];
+applyToReturnOfAnotherProc: BOOL = tb[node].attr1;
+procType: CSEIndex = MimP5U.OperandType[tb[node].son[1]];
+typeOut: RecordSEIndex = SymbolOps.TransferTypes[SymbolOps.own, procType].typeOut;
+bitsOut: INT = MimP5U.BitsForType[typeOut];
+proc: Node = MimP5.Exp[tb[node].son[1]];
+t2: Tree.Link = MimP5U.ProcessSafens[cl, tb[node].son[2]];
+args: NodeList = GenArgList[t2, procType, cl, applyToReturnOfAnotherProc];
+app: ApplyNode = NARROW[MimP5U.ApplyOp[
+oper: MimP5U.MesaOpNode[fork],
+args: MimP5U.MakeNodeList[proc,
+MimP5U.MakeNodeList[MimP5U.MakeConstInt[bitsOut], args]],
+bits: bitsPerProcess]];
+IF tb[node].nSons > 2 THEN app.handler ¨ MimP5.SCatchPhrase[tb[node].son[3]];
+RETURN [MimP5U.MaybeBlock[cl, app]];
+};
+
+Join: PUBLIC PROC [node: Tree.Index] RETURNS [Node] = {
+procType: CSEIndex = MimP5U.OperandType[tb[node].son[1]];
+typeOut: RecordSEIndex = SymbolOps.TransferTypes[SymbolOps.own, procType].typeOut;
+bits: BitCount = MimP5U.BitsForType[typeOut];
+process: Node ¨ MimP5.Exp[tb[node].son[1]];
+apply: ApplyNode ¨ NARROW[MimP5U.ApplyOp[
+oper: MimP5U.MesaOpNode[join],
+args: MimP5U.MakeNodeList[process],
+bits: bits]];
+IF tb[node].nSons > 2 THEN apply.handler ¨ MimP5.SCatchPhrase[tb[node].son[3]];
+RETURN [apply];
+};
+
+Unlock: PUBLIC PROC [node: Tree.Index] RETURNS [l: Node ¨ NIL] = {
+mlock: Tree.Link = tb[node].son[1];
+IF mlock # Tree.Null THEN { 
+ln: Node = MimP5.Exp[mlock];
+l ¨ MimP5U.ApplyOp[
+oper: MimP5U.MesaOpNode[monitorExit],
+args: MimP5U.MakeNodeList[MimP5U.Address[ln]]];
+};
+};
+
+ProcCheck: PUBLIC PROC [node: Tree.Index] RETURNS [Node] = {
+son1: Tree.Link = tb[node].son[1];
+type: Type = MimP5U.OperandType[son1];
+proc: Node ¨ MimP5.Exp[son1];
+SELECT SymbolOps.XferMode[SymbolOps.own, type] FROM
+proc => IF proc.bits # Target.bitsPerProc THEN ERROR;
+ENDCASE => RETURN [proc]; 
+RETURN [NARROW[MimP5U.ApplyOp[
+oper: MimP5U.CedarOpNode[procCheck],
+args: MimP5U.MakeNodeList[proc],
+bits: proc.bits]]];
+};
+
+Free: PUBLIC PROC [node: Tree.Index] RETURNS [Node] = {
+countedVar: BOOL = tb[node].attr1;
+counted: BOOL = tb[node].attr3;
+zoneLink: Tree.Link = tb[node].son[1];
+varLink: Tree.Link = tb[node].son[2];
+varType: CSEIndex = MimP5U.OperandType[varLink];
+nil: Node = MimP5U.NilConst[varType];
+catch: Tree.Link = IF tb[node].nSons > 3 THEN tb[node].son[4] ELSE Tree.Null;
+cl: CodeList ¨ MimP5U.NewCodeList[];
+zoneExp: Node ¨ IF zoneLink = Tree.Null THEN NIL ELSE MimP5.Exp[zoneLink];
+temp: Var ¨ NIL;
+exp: Node ¨ MimP5.Exp[varLink];
+var: Var ¨ IF MimP5Stuff.IsSimpleVar[exp] THEN NARROW[exp] ELSE NIL;
+IF var = NIL THEN {
+addr: Node ¨ MimP5U.Address[exp];
+addr ¨ MimP5U.MakeTemp[cl, addr.bits, addr].var;
+var ¨ MimP5U.Deref[addr, exp.bits, MimData.bitsToAlignment[exp.bits]];
+};
+IF zoneExp # NIL THEN {
+IF NOT MimP5Stuff.IsSimpleVar[zoneExp] THEN {
+zoneExp ¨ MimP5U.MakeTemp[cl, zoneExp.bits, zoneExp].var;
+};
+temp ¨ MimP5U.MakeTemp[cl, var.bits, var, varType].var;
+};
+IF countedVar
+THEN MimP5U.MoreCode[cl, MimP5U.AssignRC[lhs: var, rhs: nil, type: varType]]
+ELSE MimP5U.MoreCode[cl, MimP5U.Assign[lhs: var, rhs: nil]];
+IF zoneExp # NIL THEN
+MimP5U.MoreCode[cl, ZoneOp[zoneExp, free, MimP5U.MakeNodeList[temp], catch]];
+RETURN [MimP5U.MakeBlock[cl]];
+};
+
+ZoneOp: PUBLIC PROC
+[zone: Node, which: ZoneOpSelector, args: NodeList, catch: Tree.Link]
+RETURNS [Node] = {
+cl: CodeList ¨ MimP5U.NewCodeList[];
+zVar: Node ¨ MimP5U.Simplify[cl, zone];
+procOffset: NAT = SELECT which FROM
+alloc => 0, free => bitsPerProc, ENDCASE => ERROR;
+zup: Node ¨ MimP5U.Deref[
+n: zVar, bits: procOffset+bitsPerProc, align: MimData.worstAlignment];
+proc: Node ¨ MimP5U.TakeField[zup, procOffset, bitsPerProc];
+l: ApplyNode ¨ NARROW[
+MimP5U.ApplyOp[oper: proc, args: MimP5U.MakeNodeList[zVar, args]]];
+IF catch # Tree.Null THEN l.handler ¨ MimP5.SCatchPhrase[catch];
+IF which = alloc THEN l.bits ¨ bitsPerRef;
+RETURN [MimP5U.MaybeBlock[cl, l]];
+};
+
+CountedAllocate: PUBLIC PROC [zone: Node, type: SEIndex, catch: Tree.Link, size: Node]
+RETURNS [Node] = {
+typeNode: Node ¨ MimP5U.NodeForType[SymbolOps.TypeRoot[SymbolOps.own, type]];
+IF zone = NIL
+THEN {
+args: NodeList ¨ MimP5U.MakeNodeList2[
+MimP5U.ZeroExtend[typeNode],
+MimP5U.ZeroExtend[size]];
+applyNode: ApplyNode ¨ NARROW[MimP5U.ApplyOp[
+oper: MimP5U.CedarOpNode[new],
+args: args,
+bits: bitsPerRef]];
+IF catch # Tree.Null THEN applyNode.handler ¨ MimP5.SCatchPhrase[catch];
+RETURN [applyNode];
+}
+ELSE {
+args: NodeList ¨ MimP5U.MakeNodeList2[
+MimP5U.ZeroExtend[size],
+MimP5U.ZeroExtend[typeNode]];
+RETURN [ZoneOp[zone, alloc, args, catch]];
+};
+};
+
+GenArgList: PROC [argTree: Tree.Link, psei: CSEIndex, cl: CodeList, applyToRet: BOOL]
+RETURNS [NodeList] = {
+argSei: RecordSEIndex = SymbolOps.TransferTypes[SymbolOps.own, psei].typeIn;
+argCtx: CTXIndex = SymbolOps.ArgCtx[SymbolOps.own, argSei];
+head: NodeList ¨ NIL;
+tail: NodeList ¨ NIL;
+AppendArg: PROC [n: Node] = {
+new: NodeList ¨ MimP5U.MakeNodeList[n];
+IF tail = NIL THEN head ¨ new ELSE tail.rest ¨ new;
+tail ¨ new;
+};
+IF applyToRet THEN {
+firstSei: ISEIndex = SymbolOps.FirstCtxSe[SymbolOps.own, argCtx];
+nextSei: ISEIndex = IF firstSei = ISENull THEN ISENull ELSE SymbolOps.NextSe[SymbolOps.own, firstSei];
+IF nextSei # ISENull THEN {
+temp: Var = MimP5S.Temporize[cl, MimP5.Exp[argTree], argSei];
+eachSei: ISEIndex ¨ firstSei;
+offset: BitAddress ¨ 0;
+WHILE eachSei # ISENull DO
+type: Type = seb[eachSei].idType;
+bits: BitCount ¨ MimP5U.BitsForType[type] + (Target.bitsPerWord-1);
+bits ¨ bits - (Basics.LowHalf[bits] MOD bitsPerWord);
+AppendArg[MimP5U.TakeField[temp, offset, bits]];
+offset ¨ offset + bits;
+eachSei ¨ SymbolOps.NextSe[SymbolOps.own, eachSei];
+ENDLOOP;
+RETURN [head];
+};
+RETURN [MimP5U.MakeNodeList[MimP5.Exp[argTree]]];
+};
+IF argCtx # Symbols.CTXNull THEN {
+EachArg: PROC [t: Tree.Link] = {
+type: Type = seb[eachSei].idType;
+bits: BitCount ¨ MimP5U.BitsForType[type] + (Target.bitsPerWord-1);
+bits ¨ bits - (Basics.LowHalf[bits] MOD bitsPerWord);
+IF t = Tree.Null
+THEN {
+dummyVar: Var ¨ MimP5U.MakeVar[bits: bits, loc: dummyLoc];
+AppendArg[dummyVar];
+}
+ELSE {
+srcType: Type = MimP5U.OperandType[t];
+srcExpr: Node ¨ MimP5.Exp[t];
+SELECT srcExpr.bits FROM
+> bits => ERROR;
+< bits => srcExpr ¨ MimP5S.ExtendValue[srcExpr, type, srcType, bits];
+ENDCASE;
+AppendArg[srcExpr];
+};
+eachSei ¨ SymbolOps.NextSe[SymbolOps.own, eachSei];
+};
+eachSei: ISEIndex ¨ SymbolOps.FirstCtxSe[SymbolOps.own, argCtx];
+TreeOps.ScanList[argTree, EachArg];
+};
+RETURN [head];
+};
+CallStatsArray: TYPE = ARRAY CallStatsArrayIndex OF INT;
+CallStatsArrayIndex: TYPE = [0..7];
+singles: REF CallStatsArray ¨ MimZones.permZone.NEW[CallStatsArray];
+multis: REF CallStatsArray ¨ MimZones.permZone.NEW[CallStatsArray];
+ResetCallStats: PROC = {
+singles≠ ¨ ALL[0];
+multis≠ ¨ ALL[0];
+};
+tb: Tree.Base ¨ NIL;		-- tree base (local copy)
+seb: Symbols.Base ¨ NIL;	-- semantic entry base (local copy)
+bb: Symbols.Base ¨ NIL;	-- body entry base (local copy)
+
+CallsNotify: Alloc.Notifier = {
+seb ¨ base[Symbols.seType];
+bb ¨ base[Symbols.bodyType];
+tb ¨ base[Tree.treeType];
+};
+
+dummyLoc: Location ¨ MimZones.permZone.NEW[LocationRep.dummy ¨ [dummy[]] ];
+
+MimCode.RegisterNotifier[CallsNotify];
+ResetCallStats[];
+
+}.
+
+  >  
+MimCalls.mesa
+Copyright ” 1985, 1986, 1987, 1988, 1989, 1991 by Xerox Corporation.  All rights reserved.
+Sweet, May 27, 1986 5:15:28 pm PDT
+Satterthwaite, March 27, 1986 9:31:07 am PST
+Russ Atkinson (RRA) December 3, 1989 11:51:03 am PST
+Willie-s, September 24, 1991 4:51 pm PDT
+Governs an optimization in Call; must be small enough to allow an extra bitsPerPtr to allow for IntCodeTwigImpl processing.  See IntCodeTargetImpl.maxBitsArgumentRecord for the official definition.  This should become part of Target definitions!
+Imported definitions
+Operations
+generate code for NEW (of program, not zone allocation)
+RRA: tb[node].attr1 => NEW of self, but we ignore this!
+generates code for procedure start statement
+generates code for RESTART
+generates code for procedure call statement
+Global procedure
+No multi-word arguments
+At least one multi-word argument
+generates code for procedure signal/error statement
+Not really a proc, but might want a check some day
+The zone needs to be put into a temporary
+Allocate generates code for space allocation from counted zones.  The node returned is for the application of the allocate operator.
+Note: opposite order of arguments from explicit zone
+Note: opposite order of arguments from implicit zone
+We need a temporary since there is more than one argument!  This is motivated by the need to keep an exact correspondence between C formals and Cedar formals in both size and number.
+This results from TRASH or NULL
+This just should not happen!
+Does this happen?
+Stats for calls
+Bases & notifier
+called by allocator whenever table area is repacked
+ ù X  ñ(cedarcode) styleïNewlineDelimiter
+ô headôIcodeöú
+œeúOôZLöœy"ô"Löû,ô,Lô4Lô(óò öœk	ò	LöúüúòLöúüúòLöúüú9òJLöúüúKòXLöúüú-ò:Löúüú6òALöúüúò&LöúüúòLöúüúìòüLöú	üúòLöú
+üúYòhLöúüúçòöLöúüúüúGòfLöúüú%ò/Löúüúò!óóöœnúüòLöüú[òbLöüúòLöüúò"Lò Löúüúò$Löúüúò,öúüúò4LöúıôıóLò Löúüúò,óôLöúüúò&Löú
+üúò"LöúüúòLöú
+üúò&LöúüúòLò Löú
+üúò"Lò$Löúüúò*Löú
+üúò"öú
+üúò"Löú$ò$óöú
+üúò"Löú$ò$óLòLöúüúò,Löú	üúò Löúüúòóô
+ö†úüúüúüúò(öüúòLöú#ò#öúòLöú<ò<óóLòLò óö†	úüúüúüúò<Löúüúò/LöúòLöú#ò#LöüúòLòLò óö†úüúüúüúò9ô7Löüúüúô7óLò'Löúüúiò~Löüúüú1òKLöüúòLòLò óö†úüúüúüúò8Lô,Lò5Lò&Löúüúò2LòZLò Löú$ò$LöúFòFLöúüúiòÄLöüúüú3òMLöüúò$LòLò óö†úüúüúüúò:LöúüôLò&LöúüúYòpLöüúüú3òMLöüúòLòLò óö†úüúüúüúò7Löüúüúüúò?Löüú<üúòHLòLò óö†úüúüú	üúò:öüúüúüò'òLòöüúüúòöüú4üò>òöüúüúüúòLò5Löüúüúüúò@LòóóLöüúòóóLòóLöüúòóLöüúòLòLò óö†úüúüúüúò7Lô+Lò$Lò"Lò*LöúüúòLöúüúò2Lò:LöúFòFLöúüúüúòòöüú	üúüò-òLòöüúüúòöüú4üò>òöüúüúüúòLò5Lò\LöúüúòöüúüúòLôLöú"ò"LöüúüúòLòóöüú!üúò)Löú6ò6Löú"ò"öüúüòLöüúòöüúüú"üò,Löüúüúüúüúò1LöüúòóóLöüúüúòLòóLòóóLöüúòóóLòóLöüúòóLöúòLöüúòLòóöúòLò^Löúüú8òOLöüúüú3òMöüúüúòLö	úüúüúüúüúò4Löú	üúòLöúüúüúòöüú"üúüúüò8LòLöüúüúò<LöüúòóöüúòöüúòLôLöüúüúüúüúòJLöú%ò%LöúòóöüúòLô LöüúüúüúüúòJLöú#ò#LöúüòóóLòóLöüúò$LòóLòLò óö†úüúüúüúüúüúòRLô3Lò5Lò$Lò'Löúüúò2öúüúüúüò!Löú
+ò
+Löú=ò=öüúò
+LöúIòIóóLò:LöúFòFLö	úüú)üúüúüú=òïLöüúüú3òMLöüúò$LòLò óö†úüúüúüúò:Lò$Löúüúò2Löú9ò9LöúRòRLöú	üúò+Lò(Lò:LöúJòJöúüúò'LöúòLöúYòYLöúòóLöüúüú3òMLöüúò$LòLò óö†úüúüúüúò7Löú9ò9LöúRòRLöú-ò-Lò+LöúüúaòzLöüúüú5òOLöüú	òLòLò óö
+†úüúüúüúüúòBLò#öüúüúòLòLöúiòiLòóLòLò óö†	úüúüúüúò<Löú"ò"Löú&ò&Löúòöüú)üò3Löúüú üúüúò5öüúüú	òLô2óóLöüúüújòxLòLò óö†úüúüúüúò7Löúüúò"Löú	üúòLò&Lò%Löú0ò0Löú%ò%LöúüúüúüúòMLò$Lö	úüúüúüúüúòJLöúüúòLöúòLöúüúüúüúüúüúòDöüúüúüúòLöú!ò!Löú0ò0LöúFòFLòóöüúüúüúòöüúüú!üúò-Lô)Löú9ò9LòóLöú7ò7LòóöüúòLöüúHòLLöüú8ò<óöüúüúüòLöúMòMóLöüúòLòLò óö†úüúüúFüúòlLò$Löú'ò'öúüúüúüò#Löú!üúüúò2óLöú`ò`Lò<LöúüúEòZLöüúüú'ò@Löüúüúò*Löüúò"LòLò óö†úüúüú;üúòiLôÑLöúMòMöüúüòöüúòöú]ò]Lô4óöúüúò-LòLöúòLòóLöüúüú/òHLöüúòLòóöüúòöú]ò]Lô4óLöüú$ò*LòóóLòLò óö†
+úüú@üúüúòlLöúLòLLöú;ò;LöúüúòLöúüúòö†	úüúòLöú'ò'Löüúüúüúüúò3LòLòóöüúüúòLöúAòALöúüúüú	üú+òföüúüúòLöú∂ô∂Löú=ò=LöúòLöúòöüúüòLöú!ò!LöúCòCLöú$üúò5Löú0ò0LöúòLöú3ò3LöüúòóLöüúòLòóLöüú+ò1Lòóöüúüúò"ö†úüúò Löú!ò!LöúCòCLöú$üúò5öüúòöüúòLöúüúüôLöú:ò:LöúòLòóöüúòLò&Löúòöüúüòöú
+üúòLôóöúEòELôóLöüúòóLöúòLòóóLöú3ò3LòóLöú@ò@Löú#ò#LòóLöüúòLòóóôLö	úüúüúüúüúò8Löúüú
+ò#Löú	üú$üúòDLöúüú$üúòCö†úüúòLöúüúòLöú
+üúòLòóóôLöúüúœcò/Löúüú°#ò<Löúüú°ò7Lò òLô3LòLòLòLòLò óöú'üú!òKLò óLò&öúòLò óóòLò óó Öó    8Œ  Md  

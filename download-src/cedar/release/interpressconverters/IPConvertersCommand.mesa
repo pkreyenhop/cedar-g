@@ -1,0 +1,453 @@
+
+
+DIRECTORY Commander, Convert, CountedVM, FileNames, FS, ImagerBrick, Imager, ImagerBackdoor, ImagerError, ImagerFontFilter, ImagerInterpress, ImagerPixel, ImagerPixelArray, ImagerPrintContext, ImagerSample, ImagerTransformation, InterpressInterpreter, IO, IPConverters, IPConvertersPrivate, PFS, PrintColor, Process, Real, RealFns, Rope, RuntimeError, SF, XeroxCompress;
+
+IPConvertersCommand: CEDAR PROGRAM
+IMPORTS Commander, Convert, FileNames, FS, ImagerBackdoor, ImagerBrick, Imager, ImagerError, ImagerPrintContext, ImagerInterpress, ImagerPixel, ImagerPixelArray, ImagerSample, ImagerTransformation, InterpressInterpreter, IO, PFS, Process, Real, RealFns, Rope, RuntimeError, XeroxCompress
+EXPORTS IPConverters, IPConvertersPrivate 
+~ BEGIN OPEN IPConverters;
+ROPE: TYPE ~ Rope.ROPE;
+Transformation: TYPE ~ ImagerTransformation.Transformation;
+inch: REAL = 0.0254; -- inches->meters conversion factor
+ravenPPI: REAL = 300.0; -- pixels per inch on a Raven printer for compression
+ravenScanMode: ImagerTransformation.ScanMode = [slow: right, fast: up];
+defaultPageWidth: REAL ¬ 8.5*inch; -- for normal sized paper
+defaultPageHeight: REAL ¬ 11*inch; -- for normal sized paper
+aisMargin: REAL ¬ 0.25*inch; -- offset of AIS images on regular-sized paper
+headerSampled: ROPE ¬ "Interpress/Xerox/3.0 "; -- IP header for sampled images
+aisCaptionFont: ROPE ¬ "xerox/pressfonts/helvetica-mir"; -- to put caption in AIS files
+aisCaptionLoc: Imager.VEC ¬ [72, 9]; -- where the caption should be in AIS files
+xcFontBase: Rope.ROPE ¬ "Xerox/xc1-2-2/"; -- prefix to be used for Xerox product fonts
+BrickValue: TYPE ~ ARRAY [0..4) OF PACKED ARRAY [0..4) OF [0..16);
+coarseBrickValues: BrickValue ¬ [ -- for compressed IP masters
+[00, 01, 13, 14],
+[08, 02, 03, 15],
+[09, 10, 04, 05],
+[07, 11, 12, 06]
+];
+
+MakeSimpleBrick: PROC [t: BrickValue] RETURNS [ImagerBrick.Brick] ~ {
+b: ImagerSample.SampleMap ¬ ImagerSample.NewSampleMap[box: [max: [4, 4]], bitsPerSample: 8];
+FOR s: NAT IN [0..4) DO
+FOR f: NAT IN [0..4) DO
+ImagerSample.Put[b, [s, f], t[s][f]];
+ENDLOOP;
+ENDLOOP;
+RETURN [[maxSample: 15, sampleMap: b, phase: 0]]
+};
+
+InterpressToCompressedIP: PUBLIC PROC [inputName: Rope.ROPE, interpress: ImagerInterpress.Ref, beginPage, endPage: ProgressProc, msg: IO.STREAM, pageWidth, pageHeight: REAL, screen: Screen ¬ dot] RETURNS [failed: BOOL ¬ FALSE] ~ {
+RETURN [NewInterpressToCompressedIP[inputName, interpress, beginPage, endPage, msg, pageWidth, pageHeight, screen]]
+};
+
+tonerUniverse: PrintColor.TonerUniverse
+~ [black: TRUE, cyan: FALSE, magenta: FALSE, yellow: FALSE];
+
+
+xerox300spot: ImagerBrick.FilterProc ~ {
+shape: REAL ~ 0.45;
+tx: REAL ¬ RealFns.CosDeg[x*180+0.314156];
+ty: REAL ¬ RealFns.CosDeg[y*180+0.271828];
+sym: REAL ¬ 0.5 - 0.25 * (tx + ty);
+asym: REAL ¬ 0.5 - 0.25 * (shape*tx + (1.0-shape)*ty);
+mix: REAL ¬ (4 * sym * (1.0-sym)) ** 2;
+result: REAL ¬ mix * asym + (1.0-mix) * sym;
+RETURN [-result]
+};
+
+MakeDotBrick: PROC [pixelsPerDot: REAL, degrees: REAL, allowedRelativeError: REAL ¬ 0.05, minLevels: CARD ¬ 16] RETURNS [ImagerBrick.Brick] = {
+m: Transformation ~ ImagerTransformation.Cat[ImagerTransformation.Scale[pixelsPerDot*0.5], ImagerTransformation.Rotate[degrees]];
+brickSpec: ImagerBrick.BrickSpec ~ ImagerBrick.BrickSpecFromTransformedRectangle[2, 2, m, allowedRelativeError, minLevels];
+brick: ImagerBrick.Brick = ImagerBrick.BrickFromFilter[brickSpec: brickSpec, filter: xerox300spot];
+RETURN [brick]
+};
+
+NewInterpressToCompressedIP: PROC [
+inputName: ROPE,
+interpress: ImagerInterpress.Ref,
+beginPage, endPage: ProgressProc,
+msg: IO.STREAM,
+pageWidth, pageHeight: REAL,
+screen: Screen ¬ dot,
+dotsPerInch: REAL ¬ 0.0, -- default causes pixelsPerDot ¬ 5.525
+screenAngleInDegrees: REAL ¬ 45.0,
+ppi: REAL ¬ ravenPPI,
+scanMode: ImagerTransformation.ScanMode ¬ ravenScanMode]
+RETURNS [failed: BOOL ¬ FALSE]
+~ {
+pixelsPerDot: REAL ¬ IF dotsPerInch = 0.0 THEN 5.525 ELSE ppi/dotsPerInch;
+ppm: REAL ¬ ppi/inch;
+Log: InterpressInterpreter.LogProc ~
+{ IPReadLog[msg, class, ImagerError.AtomFromErrorCode[code], explanation] };
+input: InterpressInterpreter.Master = InterpressInterpreter.Open[FileNames.ResolveRelativePath[inputName], Log];
+sIn: REAL = SELECT scanMode.slow FROM up, down => pageHeight, ENDCASE => pageWidth;
+fIn: REAL = SELECT scanMode.fast FROM up, down => pageHeight, ENDCASE => pageWidth;
+size: SF.Vec = [s: Real.Round[sIn*ppm], f: Real.Round[fIn*ppm]];
+bitmap: ImagerSample.RasterSampleMap = ImagerSample.ObtainScratchMap[[max: size]];
+bitmapAsPixelArray: ImagerPixelArray.PixelArray = ImagerPixelArray.FromPixelMap[pixelMap: ImagerPixel.MakePixelMap[bitmap], box: ImagerSample.GetBox[bitmap], scanMode: [slow: right, fast: up], immutable: FALSE];
+halftoneProperties: PrintColor.HalftoneProperties ~ IF screen = line
+THEN (
+LIST[[type: $linescreen, toner: black, brick: MakeSimpleBrick[coarseBrickValues]]]
+)
+ELSE (
+LIST[[type: $dotscreen, toner: black, brick: MakeDotBrick[pixelsPerDot: pixelsPerDot, degrees: screenAngleInDegrees, allowedRelativeError: 0.1, minLevels: 60]]]
+);
+bitmapContext: Imager.Context = ImagerPrintContext.Create[deviceSpaceSize: size, scanMode: scanMode, surfaceUnitsPerInch: [ppi, ppi], logicalDevice: 0, halftoneProperties: halftoneProperties];
+pixelsToMeters: Transformation = ImagerBackdoor.GetTransformation[context: bitmapContext, from: device, to: client];
+ImagerPrintContext.SetBitmap[context: bitmapContext, bitmap: bitmap];
+ImagerPrintContext.SetSeparation[bitmapContext, black];
+FOR i: INT IN [1..input.pages] DO
+PageAction: PROC [context: Imager.Context] ~ {
+Imager.ConcatT[context, pixelsToMeters];
+Imager.SetPriorityImportant[context, FALSE];
+Imager.MaskPixel[context: context, pa: XeroxCompress.CompressPixelArray[bitmapAsPixelArray]]
+};
+Process.CheckForAbort[];
+failed ¬ beginPage[i, input.pages];
+IF failed THEN EXIT;
+ImagerSample.Clear[bitmap];
+InterpressInterpreter.DoPage[master: input, page: i, context: bitmapContext, log: Log];
+Process.CheckForAbort[];
+ImagerInterpress.DoPage[interpress, PageAction, 1];
+Process.CheckForAbort[];
+failed ¬ endPage[i, input.pages];
+IF failed THEN EXIT;
+ENDLOOP;
+ImagerSample.ReleaseScratchMap[bitmap];
+};
+
+IPReadError: PUBLIC ERROR [class: INT, code: ATOM, explanation: Rope.ROPE] ~ CODE;
+IPReadLog: PROC [msg: IO.STREAM, class: INT, code: ATOM, explanation: ROPE] ~ {
+IF msg=NIL THEN {
+SELECT class FROM
+InterpressInterpreter.classMasterError, InterpressInterpreter.classAppearanceError => ERROR IPReadError[class, code, explanation];
+InterpressInterpreter.classMasterWarning, InterpressInterpreter.classAppearanceWarning, InterpressInterpreter.classComment => NULL; -- ignore those
+ENDCASE => ERROR IPReadError[class, code, explanation];
+}
+ELSE {
+msg.PutRope[
+SELECT class FROM
+InterpressInterpreter.classMasterError => "Master Error: ",
+InterpressInterpreter.classMasterWarning => "Master Warning: ",
+InterpressInterpreter.classAppearanceError => "Appearance Error: ",
+InterpressInterpreter.classAppearanceWarning => "Appearance Warning: ",
+InterpressInterpreter.classComment => "Comment: ",
+ENDCASE => Rope.Cat["Class ", Convert.RopeFromInt[class], " Error: "]
+];
+msg.PutRope[explanation];
+msg.PutRope[" . . . "];
+};
+};
+
+CH: PROC [char: CHAR] RETURNS [WORD] ~ INLINE {RETURN [ORD[char]]};
+
+XC: PROC [set: [0..256), code: [0..256)] RETURNS [WORD] ~ {RETURN [set*256+code]};
+
+C1: PROC [c: CHAR, set: [0..256), code: [0..256)] RETURNS [ImagerFontFilter.CharRangeMap] ~ {
+RETURN [[bc: CH[c], ec: CH[c], newbc: XC[set, code]]]
+};
+
+classicModernEtAl: LIST OF ROPE ¬ LIST["Classic", "Modern"];
+timesRomanEtAl: LIST OF LIST OF ROPE ¬ LIST[
+LIST["TimesRoman", "Classic"],
+LIST["Helvetica", "Modern"],
+LIST["Gacha", "XeroxBook"],
+LIST["Tioga", "Classic"],
+LIST["Laurel", "Classic"]];
+
+mrrEtAl: LIST OF ROPE ¬ LIST["-mrr", "-mir-italic", "-bir-bold-italic", "-brr-bold"];
+
+alphaMap: ImagerFontFilter.CharacterCodeMap ~ LIST [
+[bc: CH[' ], ec: CH['~], newbc: CH[' ]]
+];
+
+mathMap: ImagerFontFilter.CharacterCodeMap ¬ LIST [
+C1['c, 0, 323B],
+C1['r, 0, 322B]
+];
+
+oisMap: ImagerFontFilter.CharacterCodeMap ¬ LIST [
+[bc: CH['a], ec: CH['~], newbc: CH['a]],
+[bc: CH['.], ec: CH[']], newbc: CH['.]],
+[bc: CH['%], ec: CH[',], newbc: CH['%]],
+[bc: CH['-], ec: CH['-], newbc: XC[357B, 42B]],
+[bc: CH[' ], ec: CH['!], newbc: CH[' ]],
+[bc: CH['\"], ec: CH['\"], newbc: XC[0, 271B]],
+[bc: CH['#], ec: CH['#], newbc: CH['#]],
+[bc: CH['$], ec: CH['$], newbc: XC[0, 244B]],
+[bc: CH['^], ec: CH['^], newbc: XC[0, 255B]],
+[bc: CH['_], ec: CH['_], newbc: XC[0, 254B]],
+C1['\030, 357B, 45B],
+C1['\267, 357B, 146B],
+C1['\265, 41B, 172B],
+C1['\140, 0, 140B],
+C1[', 357B, 064B],
+C1[', 357B, 065B],
+];
+
+xc1Map: ImagerFontFilter.FontMap ¬ MakeXC1map[];
+
+MakeXC1map: PROC RETURNS [f: ImagerFontFilter.FontMap] ~ {
+Enter: PROC [e: ImagerFontFilter.FontMapEntry] ~ {f ¬ CONS[e, f]};
+FOR family: LIST OF ROPE ¬ classicModernEtAl, family.rest UNTIL family = NIL DO
+FOR face: LIST OF ROPE ¬ mrrEtAl, face.rest UNTIL face = NIL DO
+Enter[[
+inputName: Rope.Cat["Xerox/Pressfonts/", family.first, face.first.Substr[0, 4]],
+output: LIST[[newName: Rope.Cat[xcFontBase, family.first, face.first.Substr[4]], charMap: oisMap]]
+]];
+ENDLOOP;
+ENDLOOP;
+FOR family: LIST OF LIST OF ROPE ¬ timesRomanEtAl, family.rest UNTIL family = NIL DO
+FOR face: LIST OF ROPE ¬ mrrEtAl, face.rest UNTIL face = NIL DO
+Enter[[
+inputName: Rope.Cat["Xerox/Pressfonts/", family.first.first, face.first.Substr[0, 4]],
+output: LIST[[newName: Rope.Cat[xcFontBase, family.first.rest.first, face.first.Substr[4]], charMap: oisMap]],
+warn: TRUE
+]];
+ENDLOOP;
+ENDLOOP;
+Enter[[
+inputName: "Xerox/Pressfonts/Logo-mrr",
+output: LIST[[newName: Rope.Concat[xcFontBase, "Logotypes-Xerox"], charMap: alphaMap]]
+]];
+Enter[[
+inputName: "Xerox/Pressfonts/Math-mrr",
+output: LIST[[newName: Rope.Concat[xcFontBase, "Modern"], charMap: mathMap]]
+]];
+Enter[[
+inputName: "Xerox/Pressfonts/Math-mir",
+output: LIST[[newName: Rope.Concat[xcFontBase, "Modern-italic"], charMap: mathMap]]
+]];
+};
+
+InterpressToCompressedIPAction: PUBLIC ActionProc ~ {
+BeginPage: ProgressProc ~ {cmd.out.PutF1["[%g", IO.int[pageNumber]]};
+EndPage: ProgressProc ~ {cmd.out.PutRope["] "]};
+output: ImagerInterpress.Ref ~ ImagerInterpress.Create[outputName, "Interpress/Xerox/2.0 "];
+stream: IO.STREAM ¬ IO.RIS[cmd.commandLine];
+ppi: REAL ¬ ravenPPI;
+scanMode: ImagerTransformation.ScanMode ¬ ravenScanMode;
+screen: Screen ¬ dot;
+screenAngle: REAL ¬ 45.0;
+dotsPerInch: REAL ¬ 0.0;
+FOR tok: ROPE ¬ GetFileNameToken[stream], GetFileNameToken[stream] UNTIL tok = NIL DO
+SELECT TRUE FROM
+Rope.Equal[tok, "-ppi", FALSE] => {ppi ¬ IO.GetReal[stream]};
+Rope.Equal[tok, "-portrait", FALSE] => {scanMode ¬ [slow: down, fast: right]};
+Rope.Equal[tok, "-landscape", FALSE] => {scanMode ¬ [slow: right, fast: up]};
+Rope.Equal[tok, "-lineScreen", FALSE] => {screen ¬ line};
+Rope.Equal[tok, "-dotScreen", FALSE] => {screen ¬ dot};
+Rope.Equal[tok, "-screenAngle", FALSE] => screenAngle ¬ IO.GetReal[stream];
+Rope.Equal[tok, "-dotsPerInch", FALSE] => dotsPerInch ¬ IO.GetReal[stream];
+ENDCASE => NULL;
+ENDLOOP;
+[] ¬ NewInterpressToCompressedIP[inputName, output, BeginPage, EndPage, cmd.out, defaultPageWidth, defaultPageHeight, screen, dotsPerInch, screenAngle, ppi, scanMode];
+ImagerInterpress.Close[output];
+};
+
+FindFullName: PROC [inputName: ROPE] RETURNS [ROPE] ~ {
+fullFName: ROPE ¬ NIL;
+fullFName ¬ FS.FileInfo[inputName].fullFName;
+RETURN [fullFName]
+};
+
+GetCmdToken: PROC [stream: IO.STREAM] RETURNS [rope: ROPE ¬ NIL] = {
+CmdTokenBreak: PROC [char: CHAR] RETURNS [IO.CharClass] = {
+IF char = '_ OR char = '[ OR char = '] THEN RETURN [break];
+IF char = '  OR char = '\t OR char = ', OR char = '; OR char = '\n THEN RETURN [sepr];
+RETURN [other];
+};
+rope ¬ stream.GetTokenRope[CmdTokenBreak ! IO.EndOfStream => CONTINUE].token;
+};
+
+GetFileNameToken: PROC [stream: IO.STREAM] RETURNS [rope: ROPE ¬ NIL] = {
+FileNameTokenBreak: PROC [char: CHAR] RETURNS [IO.CharClass] = {
+IF char = '_ THEN RETURN [break];
+IF char = '  OR char = '\t OR char = ', OR char = '; OR char = '\n THEN RETURN [sepr];
+RETURN [other];
+};
+rope ¬ stream.GetTokenRope[FileNameTokenBreak ! IO.EndOfStream => CONTINUE].token;
+};
+
+RealFromRope: PROC [rope: ROPE] RETURNS [real: REAL] = {
+oops: BOOL ¬ FALSE;
+real ¬ Convert.RealFromRope[rope ! Convert.Error => {oops ¬ TRUE; CONTINUE}];
+IF oops THEN {oops ¬ FALSE; real ¬ Convert.IntFromRope[rope ! Convert.Error => {oops ¬ TRUE; CONTINUE}]};
+IF oops THEN Complain[Rope.Concat["Number expected: ", rope]];
+};
+
+Complain: PUBLIC ERROR [complaint: ROPE] ~ CODE;
+
+MakeOutputName: PROC [inputName: ROPE, doc: ROPE] RETURNS [ROPE] ~ {
+start: INT ¬ Rope.Index[s1: doc, s2: " to "]+4;
+end: INT ¬ Rope.SkipTo[s: doc, pos: start, skip: " \n\t"];
+cp: FS.ComponentPositions;
+isAIS: BOOL ¬ Rope.Equal[Rope.Substr[doc, start, end-start], "ais", FALSE];
+[inputName, cp] ¬ FS.ExpandName[inputName];
+RETURN [Rope.Cat[
+Rope.Substr[inputName, cp.base.start, cp.base.length],
+IF isAIS THEN NIL ELSE ".",
+IF isAIS THEN NIL ELSE Rope.Substr[doc, start, end-start]
+]]
+};
+
+Command: PUBLIC Commander.CommandProc ~ {
+refAction: REF ActionProc ~ NARROW[cmd.procData.clientData];
+stream: IO.STREAM ¬ IO.RIS[cmd.commandLine];
+firstToken: ROPE ¬ GetFileNameToken[stream];
+quiet: BOOL ¬ Rope.Equal[firstToken, "-q", FALSE];
+outputName: ROPE ¬
+FileNames.ResolveRelativePath[IF quiet THEN GetFileNameToken[stream] ELSE firstToken];
+secondTokenIndex: INT ¬ IO.GetIndex[stream];
+gets: ROPE ¬ GetFileNameToken[stream];
+inputName: ROPE ¬ NIL;
+IF NOT ( gets.Equal["¬"] OR gets.Equal["_"] ) THEN {
+inputName ¬ outputName;
+outputName ¬ NIL;
+stream.SetIndex[secondTokenIndex];
+}
+ELSE {inputName ¬ FileNames.ResolveRelativePath[GetFileNameToken[stream]]};
+IF inputName = NIL THEN RETURN[result: $Failure, msg: cmd.procData.doc];
+inputName ¬ FindFullName[inputName ! FS.Error => {
+IF error.group = user THEN {result ¬ $Failure; msg ¬ error.explanation; GOTO Quit}
+}];
+IF outputName = NIL THEN outputName ¬ MakeOutputName[inputName, cmd.procData.doc];
+cmd.out.PutRope["Reading "];
+cmd.out.PutRope[inputName];
+cmd.out.PutRope[" . . . "];
+IF quiet THEN cmd.commandLine ¬ NIL;
+refAction­[inputName, outputName, cmd, stream !
+Complain => {result ¬ $Failure; msg ¬ complaint; GOTO Quit};
+FS.Error => {
+IF error.group = user THEN {result ¬ $Failure; msg ¬ error.explanation; GOTO Quit}
+}
+];
+outputName ¬ FindFullName[outputName ! FS.Error => {
+outputName ¬ "Output file(s)"; CONTINUE};
+];
+cmd.out.PutRope[outputName];
+cmd.out.PutRope[" written.\n"];
+EXITS Quit => NULL
+};
+Bound: TYPE ~ RECORD [first, last: INT];
+int: Bound ~ [INT.FIRST, INT.LAST];
+nat: Bound ~ [NAT.FIRST, NAT.LAST];
+RealToNum: PROC [real: REAL, bounds: Bound ¬ int, name: ROPE ¬ NIL] RETURNS [number: INT ¬ 0] ~ {
+IF name=NIL THEN name ¬ "Value";
+number ¬ Real.Round[real ! RuntimeError.UNCAUGHT => CONTINUE];
+IF real#number THEN Complain[IO.PutFR[format: "%g (%g) should be integral.", v1: [rope [name]], v2: [real [real]]]];
+IF number NOT IN [bounds.first .. bounds.last] THEN Complain[IO.PutFR[format: "Value (%g) should be in range [%g .. %g]", v1: [rope [name]], v2: [integer [bounds.first]], v3: [integer [bounds.last]]]];
+};
+
+xStar: ROPE ~ FS.ExpandName["*"].fullFName;
+regDir: ROPE ~ Rope.Substr[xStar, 0, Rope.Size[xStar]-1];
+wDirList: LIST OF ROPE ¬ LIST[NIL, regDir];
+
+FileContents: PROC [base, ext: ROPE] RETURNS [ROPE] ~ {
+FOR each: LIST OF ROPE ¬ wDirList, each.rest UNTIL each = NIL DO
+name: ROPE ~ FS.ExpandName[name: Rope.Concat[base, ext], wDir: each.first].fullFName;
+RETURN [PFS.RopeOpen[fileName: PFS.PathFromRope[name], includeFormatting: FALSE ! PFS.Error => {IF error.group = user THEN CONTINUE}].rope];
+ENDLOOP;
+Complain[IO.PutFR1["Device type %g undefined.", [rope [base]]]];
+};
+Require: PROC [stream: IO.STREAM, rope: ROPE, case: BOOLEAN ¬ FALSE] ~ {
+IF NOT Rope.Equal[s1: rope, s2: GetCmdToken[stream], case: case] THEN Complain[Rope.Cat["Expected \"", rope, "\"."]];
+};
+usage: ROPE ~
+"Convert Interpress file to IP master of compressed page bitmaps (output _ input) <switch> ...
+	switches are:
+	-lineScreen			to use line screen for halftones
+	-dotScreen			to use dot screen for halftones (default)
+	-portrait   			for short-edge-feed printers
+	-landscape			for long-edge-feed printers (default)
+	-ppi <r>    			to use a resolution of r pixels per inch (default -ppi 300)
+	-angle <degrees>	half tone screen angle (default 45)
+	-dotsPerInch <d>	use d dots per inch
+";
+
+action: REF ANY ¬ NEW[ActionProc ¬ InterpressToCompressedIPAction];
+
+FOR l: LIST OF ROPE ¬ LIST["InterpressToCompressedInterpress",
+							  "InterpressToCompressedIP",
+							  "IPToCompressedInterpress",
+							  "IPToCompressedIP",
+							  "IPToCIP"], l.rest WHILE l # NIL DO
+Commander.Register[l.first, Command, usage, action];
+ENDLOOP;
+
+
+END.
+
+
+  Ä  IPConvertersCommand.mesa
+Copyright Ó 1984, 1985, 1986, 1989, 1992, 1993 by Xerox Corporation.  All rights reserved.
+Michael Plass, June 29, 1993 11:12 am PDT
+Tim Diebert: February 18, 1986 10:36:06 am PST
+Pier, September 21, 1987 5:29:33 pm PDT
+Eric Nickell February 19, 1986 2:56:26 pm PST
+Doug Wyatt, July 22, 1986 6:28:45 pm PDT
+Maureen Stone, January 8, 1988 5:21:44 pm PST
+Jean-Marc Frailong January 20, 1988 12:18:56 pm PST
+Bloomenthal, July 23, 1991 2:38 pm PDT
+Beretta:PARC:Xerox (8*923-4484) August 31, 1989 4:31:06 pm PDT
+Last tweaked by Mike Spreitzer on April 17, 1990 11:22:01 am PDT
+Willie-s, June 28, 1993 2:04 pm PDT
+Types
+Constants
+Client interface to Interpress files
+Generate a compressed master. IP master should be version 2.0 (otherwise why compress it ?). Errors are printed on msg if non-NIL, else raise errors. pageWidth and pageHeight (in meters) should be given as there is no way of recovering them from the source IP master (????).
+Client interface from Interpress files
+Raised in all procs that read IP masters and have no message stream when the error is not trivial (# classMasterWarning, classAppearanceWarning, classComment)
+
+Log the error in clear if msg stream is present otherwise convert into an error.
+XC Font translation
+This is what all this section is about...
+Command level
+Relying on doc, and having the install files register commands seems unsafe.   Jules
+Not used anywhere (but not removed in case...)
+Command Registration
+Ê  •NewlineDelimiter
+–(cedarcode) style˜ codešœ™Kšœ
+ÏeœO™ZK™)K™.K™'K™-K™(K™-K™3K™&K™>K™@K™#—K˜ Kš
+Ïk	œ+žœÆžœ%žœ:žœ˜òK˜ KšÐblœžœž˜"Kšžœ žœ´žœžœ;˜ŸKšžœ"˜*Kšœžœž˜head™Kšžœžœžœ˜Kšœžœ'˜;—™	KšœžœÏc#˜8Kšœ
+žœ
+ 5˜MKšœG˜GKšœžœ ˜<Kšœžœ ˜<Kšœžœ .˜KKšœžœ ˜NKšœžœ% ˜WKšœžœ +˜PKšœžœ ,˜V—™$Kšœžœžœžœžœžœžœ	˜Bšœ" ˜>Kšœ˜Kšœ˜Kšœ˜Kšœ˜K˜K˜ —šÏnœžœžœ˜EK˜\šžœžœžœž˜šžœžœžœž˜Kšœ%˜%Kšžœ˜—Kšžœ˜—Kšžœ*˜0Kšœ˜K˜ —š¡œžœžœžœKžœžœžœžœ
+žœžœ˜æKšžœm˜sKšœ˜K˜ —Kš	œ2žœžœžœ
+žœ˜d˜ K˜ —˜(Kšœžœ˜Kšœžœ"˜*Kšœžœ"˜*Kšœžœ˜#Kšœžœ,˜6Kšœžœ˜'Kšœžœ ˜,Kšžœ
+˜K˜K˜ —š¡œžœžœžœžœžœžœ˜K˜K˜{K˜cKšžœ˜K˜K˜ —š¡œžœ˜#Kšœžœ˜Kšœ!˜!Kšœ!˜!Kšœžœžœ˜Kšœžœ˜K˜Kšœžœ œ ˜?Kšœžœ˜"Kšœžœ˜K˜8Kšžœ
+žœžœ˜Kšœ˜Kšœ’™’Kš	œžœžœžœžœ˜JKšœžœ˜š¡œ!˜$KšœL˜L—Kšœp˜pKš	œžœžœžœžœ˜SKš	œžœžœžœžœ˜SKšœžœ8˜@KšœR˜RK•StartOfExpansionw[pixelMap: ImagerPixel.PixelMap, box: SF.Box, scanMode: ImagerTransformation.ScanMode, immutable: BOOL _ FALSE]šœÌžœ˜Ó–Æ[deviceSpaceSize: SF.Vec, scanMode: ImagerTransformation.ScanMode, surfaceUnitsPerInch: VEC, pixelUnits: BOOL _ FALSE, fontCacheName: ATOM _ NIL, fontTuner: ImagerDevice.FontTuner _ NIL]šœ4žœ˜Dšžœ˜KšžœN˜RK˜—šžœ˜Kšžœœ˜ K˜——K˜ÀK–[[context: Imager.Context, from: ImagerBackdoor.CoordSys, to: ImagerBackdoor.CoordSys]šœt˜tK˜EK˜7šžœžœžœž˜!š¡
+œžœ˜.Kšœ(˜(Kšœ%žœ˜,K–>[context: Imager.Context, pa: ImagerPixelArray.PixelArray]šœ\˜\Kšœ˜—K˜K˜#Kšžœžœžœ˜Kšœ˜KšœW˜WK˜Kšœ3˜3K˜K˜!Kšžœžœžœ˜Kšžœ˜—Kšœ'˜'K˜K˜ ——™&š¡œžœžœ	žœžœžœžœ˜RKšœž™žK™ —š¡	œžœžœžœ	žœžœžœ˜OK™Pšžœžœžœ˜šžœž˜KšœVžœ'˜‚Kšœ~žœ ˜“Kšžœžœ'˜7—K˜—šžœ˜šœ˜šžœž˜Kšœ;˜;Kšœ?˜?KšœC˜CKšœG˜GKšœ2˜2Kšžœ>˜E—K˜—Kšœ˜Kšœ˜Kšœ˜—Kšœ˜K˜ ——™šžœžœžœžœžœžœžœžœ	˜CK˜ —š
+žœžœ!žœžœžœ˜RK˜ —šžœžœžœ!žœ$˜]Kšžœžœ	žœžœ˜5Kšœ˜K˜ —Kš	œžœžœžœžœ˜<šœžœžœžœžœžœžœ˜,Kšžœ˜Kšžœ˜Kšžœ˜Kšžœ˜šžœ˜K˜ ——š	œ	žœžœžœžœ9˜UK˜ —šœ.žœ˜4Kšœžœ
+žœžœ˜'Kšœ˜K˜ —šœ-žœ˜3KšžœÏmœ˜Kšžœ¢œ
+˜Kšœ˜K˜ —šœ,žœ˜2Kšœžœ
+žœžœ˜(Kšœžœ
+žœžœ˜(Kšœžœ
+žœžœ˜(Kšœžœ
+žœžœ˜/Kšœžœ
+žœžœ˜(Kšœžœžœžœ˜/Kšœžœ
+žœžœ˜(Kšœžœ
+žœžœ˜-Kšœžœ
+žœžœ˜-Kšœžœ
+žœžœ˜-Kšžœ˜Kšžœ˜Kšžœ˜Kšžœ˜Kšžœ˜Kšžœ˜Kšœ˜K˜ —˜0K™)K˜ —š¡
+œžœžœ"˜:Kš¡œžœ+žœ˜Bšžœ	žœžœžœ"žœ
+žœž˜Ošžœžœžœžœžœžœž˜?šœ˜KšœP˜PKšœžœV˜bKšœ˜—Kšžœ˜—Kšžœ˜—šžœ	žœžœžœžœžœžœ
+žœž˜Tšžœžœžœžœžœžœž˜?šœ˜KšœV˜VKšœžœb˜nKšœž˜
+Kšœ˜—Kšžœ˜—Kšžœ˜—šœ˜Kšœ'˜'KšœžœJ˜VKšœ˜—šœ˜Kšœ'˜'Kšœžœ@˜LKšœ˜—šœ˜Kšœ'˜'KšœžœG˜SKšœ˜—Kšœ˜K˜ ——™š¡œžœ˜5Kš¡	œ'žœ˜EKš¡œ)˜0Kšœ\˜\Kš	œžœžœžœžœ˜,Kšœžœ˜K˜8K˜Kšœžœ˜Kšœžœ˜š	žœžœ6žœžœž˜Ušžœžœž˜Kšœžœžœ˜=Kšœžœ,˜NKšœžœ*˜MKšœžœ˜9Kšœžœ˜7Kšœ žœžœ˜KKšœ žœžœ˜KKšžœžœ˜—Kšžœ˜—K˜§Kšœ˜Kšœ˜K˜ —š
+¡œžœžœžœžœ˜7Kšœžœžœ˜Kšœžœ˜-Kšžœ˜Kšœ˜K˜ —–"cedar" styleš¡œžœ
+žœžœžœžœžœ˜D–"cedar" styleš
+¡œžœžœžœžœ˜;Kš
+žœžœžœžœžœ	˜;Kšžœžœžœžœžœžœžœ˜VKšžœ	˜Kšœ˜—K–"cedar" stylešœ+žœžœ˜MKšœ˜K˜ —–"cedar" styleš¡œžœ
+žœžœžœžœžœ˜I–"cedar" styleš
+¡œžœžœžœžœ˜@Kšžœžœžœ	˜!Kšžœžœžœžœžœžœžœ˜VKšžœ	˜Kšœ˜—K–"cedar" stylešœ0žœžœ˜RKšœ˜K˜ —–"cedar" styleš
+¡œžœžœžœžœ˜8K–"cedar" stylešœžœžœ˜K–"cedar" stylešœ<žœžœ˜MK–"cedar" styleš
+žœžœ	žœ=žœžœ˜iK–"cedar" stylešžœžœ2˜>Kšœ˜K˜ —š
+¡œžœžœžœžœ˜0K˜ —š¡œžœžœžœžœžœ˜DKšœN ™TKšœžœ%˜/Kšœžœ2˜:Kšœžœ˜Kšœžœ9žœ˜KKšœžœ˜+šžœ˜Kšœ6˜6Kšžœžœžœžœ˜Kšžœžœžœžœ#˜9Kšœ˜—Kšœ˜K˜ —š¡œžœ˜)Kšœžœžœ˜<Kš	œžœžœžœžœ˜,Kšœžœ˜,Kšœžœ žœ˜2šœžœ˜Kšœžœžœžœ˜V—Kšœžœžœ˜,Kšœžœ˜&Kšœžœžœ˜šžœžœžœžœ˜4K˜Kšœžœ˜Kšœ"˜"Kšœ˜—KšžœG˜KKšžœžœžœžœ*˜Hšœ%žœ˜2Kšžœžœ.žœ˜RKšœ˜—Kšžœžœžœ:˜RKšœ˜Kšœ˜Kšœ˜Kšžœžœžœ˜$˜/Kšœ1žœ˜<šžœ˜Kšžœžœ.žœ˜RKšœ˜—Kšœ˜—šœ'žœ˜4Kšœžœ˜)Kšœ˜—Kšœ˜Kšœ˜Kšžœ	ž˜Kšœ˜——™.Kšœžœžœžœ˜(Kš	œžœžœžœžœ˜#Kš	œžœžœžœžœ˜#code2š¡	œžœžœžœžœžœ
+žœ	˜aKšžœžœžœ˜ Kšœ(žœžœ˜>K–[format: ROPE _ NIL, v1: IO.Value _ [null[]], v2: IO.Value _ [null[]], v3: IO.Value _ [null[]], v4: IO.Value _ [null[]], v5: IO.Value _ [null[]]]šžœžœ
+žœU˜tK–[format: ROPE _ NIL, v1: IO.Value _ [null[]], v2: IO.Value _ [null[]], v3: IO.Value _ [null[]], v4: IO.Value _ [null[]], v5: IO.Value _ [null[]]]š
+žœžœžœžœ
+žœŠ˜ÉK˜K˜ —Kšœžœžœ˜+Kšœžœ-˜9–"[name: ROPE, wDir: ROPE _ NIL]šœ
+žœžœžœžœžœ
+˜+K˜ —š
+¡œžœžœžœžœ˜7šžœžœžœžœžœžœž˜@KšœžœžœF˜UKšžœžœžœ(žœžœžœžœžœ	˜ŒKšžœ˜—Kšœ	žœ5˜@Kšœ˜—š¡œžœ
+žœžœžœžœžœ˜HKšžœžœ;žœ0˜uK˜——™šœžœžœÃ˜ïK˜ —šœžœžœžœ.˜CK˜ —š
+žœžœžœžœžœ$˜>Kšœ$˜$Kšœ$˜$Kšœ˜Kšœžœžœž˜,Kšœ+žœ˜4Kšžœ˜K˜ —K˜ —Kšžœ˜K˜ K˜ — …—    A   \ö  

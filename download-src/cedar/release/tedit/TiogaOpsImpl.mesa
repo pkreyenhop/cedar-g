@@ -1,0 +1,496 @@
+DIRECTORY
+Atom USING [GetPName, MakeAtom],
+EditSpan USING [CompareNodeOrder],
+NodeAddrs USING [GetTextAddr, MapTextAddrs, PutTextAddr, RemTextAddr, TextAddrNotFound],
+NodeStyleOps USING [StyleNameForNode],
+Rope USING [IsEmpty, ROPE, Size],
+TEditDocument USING [Selection, SelectionGrain, SelectionId, TEditDocumentData],
+TEditInput USING [Cancel, CurrentEvent, MakePointSelection, Repeat, RestoreSelectionA, RestoreSelectionB, SaveSelectionA, SaveSelectionB],
+TEditInputOps USING [BackSpace, BackWord, Break, Capitalise, ChangeCaretLooks, ChangeLooks, Copy, CopyLooks, CopyFormat, Delete, DeleteNextChar, DeleteNextWord, ExpandAbbreviation, GetFormat, GoToNextChar, GoToNextNode, GoToNextWord, GoToPreviousChar, GoToPreviousNode, GoToPreviousWord, InsertBrackets, InsertChar, InsertLineBreak, InsertRope, InsertTime, Join, MakeControlCharacter, MakeOctalCharacter, Nest, Paste, RegisterAbbrevFailedProc, SaveForPaste, SaveSpanForPaste, SetCommentProp, SetStyleName, SetFormat, SetFormatName, Transpose, UnMakeControlCharacter, UnMakeOctalCharacter, UnNest],
+TEditLocks USING [Lock, Unlock],
+TEditMesaOps USING [SetMesaLooksOp],
+TEditOps USING [CaretLoc, GetSelContents, RegisterFileNameProc],
+TEditSelection USING [Alloc, CaretAfterSelection, CaretBeforeSelection, Deselect, DoFind, FindWhere, Free, fSel, GrowSelection, GrowSelectionToBlanks, GrowSelectionToSomething, LockSel, MakeSelection, pSel, SelectionRoot, SetSelLooks, sSel, UnlockSel],
+TextEdit USING [ChangeStyle, GetFormat, PutFormat, FetchLooks, PutProp, Size],
+TextLooks USING [allLooks, Looks, LooksToRope, noLooks, RopeToLooks],
+TextNode USING [BadArgs, Location, LocOffset, LocRelative, NarrowToTextNode, NodeItself, Ref, RefTextNode, Root, StepForward],
+TiogaExtraOps USING [],
+TiogaOps USING [FirstChild, GetRope, LastChild, LastWithin, SearchDir, SelectionErrorCode, ViewerDoc, WhichLooks],
+TiogaOpsDefs USING [Location, Ref, SelectionGrain, WhichNodes, WhichSelection],
+ViewerClasses USING [Viewer];
+
+TiogaOpsImpl: CEDAR MONITOR
+IMPORTS Atom, EditSpan, NodeAddrs, NodeStyleOps, Rope, TEditInput, TEditInputOps, TEditLocks, TEditMesaOps, TEditOps, TEditSelection, TextEdit, TextLooks, TextNode, TiogaOps
+EXPORTS TiogaOps, TiogaExtraOps =
+BEGIN OPEN TiogaOps, TiogaOpsDefs;
+
+ROPE: TYPE = Rope.ROPE;
+Viewer: TYPE = ViewerClasses.Viewer;
+Offset: TYPE = INT;
+CallWithLocks: PUBLIC PROC [proc: PROC [root: Ref], root: Ref ¨ NIL] = {
+lockedSel, lockedDoc: BOOL ¨ FALSE;
+Cleanup: PROC = {
+IF lockedSel THEN { UnlockSel; lockedSel ¨ FALSE };
+IF lockedDoc THEN { Unlock[root]; lockedDoc ¨ FALSE };
+};
+{ ENABLE UNWIND => Cleanup;
+LockSel; lockedSel ¨ TRUE;
+IF root=NIL AND (root ¨ SelectionRoot[])=NIL THEN {
+Cleanup; ERROR NoSelection };
+Lock[root]; lockedDoc ¨ TRUE;
+proc[root] };
+Cleanup };
+
+NoSelection: PUBLIC ERROR = CODE; -- raised by CallWithLocks when there is no selection
+
+Lock: PUBLIC PROC [root: Ref] = { [] ¨ TEditLocks.Lock[root, "TiogaOpsClient"] };
+
+Unlock: PUBLIC PROC [root: Ref] = { TEditLocks.Unlock[root] };
+
+GetSelectionId: PROC [which: WhichSelection] RETURNS [TEditDocument.SelectionId] ~ INLINE { RETURN[which] };
+
+LockSel: PUBLIC PROC [which: WhichSelection ¨ primary] = {
+TEditSelection.LockSel[GetSelectionId[which], "TiogaOpsClient"] };
+
+UnlockSel: PUBLIC PROC [which: WhichSelection ¨ primary] = {
+TEditSelection.UnlockSel[GetSelectionId[which]] };
+DocGran: PROC [granularity: SelectionGrain] RETURNS [TEditDocument.SelectionGrain] ~ INLINE { RETURN[granularity] };
+
+MyGran: PROC [granularity: TEditDocument.SelectionGrain] RETURNS [SelectionGrain] ~ INLINE { RETURN[granularity] };
+
+DocLoc: PROC [loc: Location] RETURNS [TextNode.Location] ~ INLINE { RETURN[loc] };
+
+MyLoc: PROC [loc: TextNode.Location] RETURNS [Location] ~ INLINE { RETURN[loc] };
+
+GetSelection: PUBLIC PROC [which: WhichSelection ¨ primary] RETURNS [
+viewer: Viewer, start, end: Location, level: SelectionGrain,
+caretBefore: BOOL, pendingDelete: BOOL] = {
+sel: TEditDocument.Selection = SELECT which FROM
+primary => TEditSelection.pSel,
+secondary => TEditSelection.sSel,
+feedback => TEditSelection.fSel,
+ENDCASE => ERROR;
+RETURN [sel.viewer, MyLoc[sel.start.pos], MyLoc[sel.end.pos], MyGran[sel.granularity],
+sel.insertion=before, sel.pendingDelete] };
+
+SelectionRoot: PUBLIC PROC [which: WhichSelection ¨ primary] RETURNS [root: Ref] = {
+RETURN [TextNode.NarrowToTextNode[
+TEditSelection.SelectionRoot[
+SELECT which FROM
+primary => TEditSelection.pSel,
+secondary => TEditSelection.sSel,
+feedback => TEditSelection.fSel,
+ENDCASE => ERROR]]] };
+
+SelectionError: PUBLIC ERROR [ec: SelectionErrorCode] = CODE;
+
+CheckSelection: PROC [sel: TEditDocument.Selection] = {
+root, first, last: TextNode.Ref;
+t1, t2: TextNode.RefTextNode;
+tdd: TEditDocument.TEditDocumentData;
+IF sel.viewer=NIL OR sel.viewer.destroyed OR (tdd ¨ NARROW[sel.viewer.data])=NIL OR (root ¨ tdd.text)=NIL
+THEN ERROR SelectionError[IllegalViewer];
+IF (first ¨ sel.start.pos.node)=NIL OR (last ¨ sel.end.pos.node)=NIL
+THEN ERROR SelectionError[IllegalNode];
+IF TextNode.Root[first] # root THEN ERROR SelectionError[WrongDoc];
+IF first # last THEN -- make sure nodes in same tree and right order
+IF EditSpan.CompareNodeOrder[first,last] # before
+THEN ERROR SelectionError[WrongOrder];
+IF sel.start.pos.where # TextNode.NodeItself THEN -- make sure start index is ok
+IF (t1 ¨ TextNode.NarrowToTextNode[first])=NIL OR
+sel.start.pos.where NOT IN [0..TextEdit.Size[t1]]
+THEN ERROR SelectionError[BadStartOffset];
+IF sel.end.pos.where # TextNode.NodeItself THEN -- make sure end index is ok
+IF (t2 ¨ TextNode.NarrowToTextNode[last])=NIL OR
+sel.end.pos.where NOT IN [0..TextEdit.Size[t2]]
+THEN ERROR SelectionError[BadEndOffset];
+IF t1 # NIL AND t1 = t2 THEN -- make sure start is not after end
+IF sel.start.pos.where > sel.end.pos.where
+THEN ERROR SelectionError[BadEndOffset];
+};
+
+SetSelection: PUBLIC PROC [viewer: Viewer, start, end: Location,
+level: SelectionGrain ¨ char, caretBefore: BOOL ¨ TRUE,
+pendingDelete: BOOL ¨ FALSE, which: WhichSelection ¨ primary] = {
+ENABLE UNWIND => NULL;
+tempSel: TEditDocument.Selection ¨ TEditSelection.Alloc[];
+tempSel≠ ¨ SELECT which FROM
+primary => TEditSelection.pSel≠,
+secondary => TEditSelection.sSel≠,
+feedback => TEditSelection.fSel≠,
+ENDCASE => ERROR;
+tempSel.viewer ¨ viewer;
+tempSel.data ¨ NARROW[viewer.data];
+tempSel.start.pos ¨ DocLoc[start];
+tempSel.end.pos ¨ DocLoc[end];
+tempSel.granularity ¨ DocGran[level];
+tempSel.insertion ¨ IF caretBefore OR tempSel.granularity=point THEN before ELSE after;
+tempSel.pendingDelete ¨ pendingDelete;
+CheckSelection[tempSel];
+TEditSelection.MakeSelection[tempSel, SELECT which FROM
+primary => primary,
+secondary => secondary,
+feedback => feedback,
+ENDCASE => ERROR];
+TEditSelection.Free[tempSel] };
+
+SelectNodes: PUBLIC PROC [viewer: Viewer, start, end: Ref,
+level: SelectionGrain ¨ node, caretBefore: BOOL ¨ TRUE,
+pendingDelete: BOOL ¨ FALSE, which: WhichSelection ¨ primary] = {
+SetSelection[viewer, [start,0], [end, MAX[Rope.Size[GetRope[end]],1]-1],
+level, caretBefore, pendingDelete, which] };
+
+SelectBranches: PUBLIC PROC [viewer: Viewer, start, end: Ref,
+level: SelectionGrain ¨ node, caretBefore: BOOL ¨ TRUE,
+pendingDelete: BOOL ¨ FALSE, which: WhichSelection ¨ primary] = {
+SelectNodes[viewer, start, LastWithin[end],
+level, caretBefore, pendingDelete, which] };
+
+SelectDocument: PUBLIC PROC [viewer: Viewer,
+level: SelectionGrain ¨ node, caretBefore: BOOL ¨ TRUE,
+pendingDelete: BOOL ¨ FALSE, which: WhichSelection ¨ primary] = {
+tdd: TEditDocument.TEditDocumentData ¨ NARROW[viewer.data];
+root: Ref ¨ ViewerDoc[viewer];
+SelectBranches[viewer, FirstChild[root], LastChild[root],
+level, caretBefore, pendingDelete, which] };
+
+CancelSelection: PUBLIC PROC [which: WhichSelection ¨ primary] = {
+TEditSelection.Deselect[GetSelectionId[which]] };
+
+SaveSelA: PUBLIC PROC = { [] ¨ TEditInput.SaveSelectionA[] };
+
+RestoreSelA: PUBLIC PROC = { [] ¨ TEditInput.RestoreSelectionA[] };
+
+SaveSelB: PUBLIC PROC = { [] ¨ TEditInput.SaveSelectionB[] };
+
+RestoreSelB: PUBLIC PROC = { [] ¨ TEditInput.RestoreSelectionB[] };
+
+GrowSelection: PUBLIC PROC = { TEditSelection.GrowSelection[] };
+
+GrowSelectionToBlanks: PUBLIC PROC = { TEditSelection.GrowSelectionToBlanks[] };
+
+GrowSelectionToSomething: PUBLIC PROC [left, right: PROC [CHAR]
+RETURNS [BOOLEAN]] = { TEditSelection.GrowSelectionToSomething[left, right] };
+SearchWhere: PROC [whichDir: SearchDir] RETURNS [TEditSelection.FindWhere] = {
+RETURN [SELECT whichDir FROM
+forwards => forwards,
+backwards => backwards,
+anywhere => anywhere,
+ENDCASE => ERROR] };
+
+FindText: PUBLIC PROC [viewer: Viewer, rope: ROPE ¨ NIL, whichDir: SearchDir ¨ forwards,
+which: WhichSelection ¨ primary,
+case: BOOL ¨ TRUE -- case => case of characters is significant -- ]
+RETURNS [found: BOOL] = {
+IF rope=NIL THEN rope ¨ TEditOps.GetSelContents[];
+RETURN [TEditSelection.DoFind[
+viewer: viewer, rope: rope, id: GetSelectionId[which],
+case: case, findWhere: SearchWhere[whichDir]]] }; 
+
+FindWord: PUBLIC PROC [viewer: Viewer, rope: ROPE ¨ NIL, whichDir: SearchDir ¨ forwards,
+which: WhichSelection ¨ primary,
+case: BOOL ¨ TRUE -- case => case of characters is significant -- ]
+RETURNS [found: BOOL] = {
+IF rope=NIL THEN rope ¨ TEditOps.GetSelContents[];
+RETURN [TEditSelection.DoFind[viewer: viewer,
+rope: rope, case: case, id: GetSelectionId[which],
+findWhere: SearchWhere[whichDir], word: TRUE]] };
+
+FindDef: PUBLIC PROC [viewer: Viewer, rope: ROPE ¨ NIL, whichDir: SearchDir ¨ forwards,
+which: WhichSelection ¨ primary,
+case: BOOL ¨ TRUE -- case => case of characters is significant -- ]
+RETURNS [found: BOOL] = {
+IF rope=NIL THEN rope ¨ TEditOps.GetSelContents[];
+RETURN [TEditSelection.DoFind[viewer: viewer,
+rope: rope, case: case, id: GetSelectionId[which],
+findWhere: SearchWhere[whichDir], word: TRUE, def: TRUE]] };
+LocRelative: PUBLIC PROC [location: Location, count: Offset,
+break: NAT ¨ 1, skipCommentNodes: BOOL ¨ FALSE]
+RETURNS [Location] = {
+RETURN [MyLoc[TextNode.LocRelative[DocLoc[location], count, break, skipCommentNodes]]];
+};
+
+LocOffset: PUBLIC PROC [loc1, loc2: Location,
+break: NAT ¨ 1, skipCommentNodes: BOOL ¨ FALSE]
+RETURNS [count: Offset] = {
+count ¨ TextNode.LocOffset[DocLoc[loc1], DocLoc[loc2], break, skipCommentNodes !
+TextNode.BadArgs => ERROR BadArgs];
+};
+
+BadArgs: PUBLIC ERROR=CODE;
+GetCaret: PUBLIC PROC RETURNS [loc: Location] = { RETURN [MyLoc[TEditOps.CaretLoc[]]] };
+
+CaretBefore: PUBLIC PROC = { TEditSelection.CaretBeforeSelection[] };
+
+CaretAfter: PUBLIC PROC = { TEditSelection.CaretAfterSelection[] };
+
+CaretOnly: PUBLIC PROC = { [] ¨ TEditInput.MakePointSelection[] };
+
+GoToNextCharacter: PUBLIC PROC [n: INT ¨ 1] = { TEditInputOps.GoToNextChar[n] };
+
+GoToNextWord: PUBLIC PROC [n: INT ¨ 1] = { TEditInputOps.GoToNextWord[n] };
+
+GoToNextNode: PUBLIC PROC [n: INT ¨ 1] = { TEditInputOps.GoToNextNode[n] };
+
+GoToPreviousCharacter: PUBLIC PROC [n: INT ¨ 1] = { TEditInputOps.GoToPreviousChar[n] };
+
+GoToPreviousWord: PUBLIC PROC [n: INT ¨ 1] = { TEditInputOps.GoToPreviousWord[n] };
+
+GoToPreviousNode: PUBLIC PROC [n: INT ¨ 1] = { TEditInputOps.GoToPreviousNode[n] };
+ToPrimary: PUBLIC PROC = { TEditInputOps.Copy[primary] };
+
+ToSecondary: PUBLIC PROC = { TEditInputOps.Copy[secondary] };
+
+Transpose: PUBLIC PROC = { TEditInputOps.Transpose[] };
+InsertRope: PUBLIC PROC [rope: ROPE] = { TEditInputOps.InsertRope[rope] };
+
+InsertChar: PUBLIC PROC [char: CHAR] = { TEditInputOps.InsertChar[char] };
+
+InsertLineBreak: PUBLIC PROC = { TEditInputOps.InsertLineBreak[] };
+
+BackSpace: PUBLIC PROC [n: INT ¨ 1] = { TEditInputOps.BackSpace[n] };
+
+BackWord: PUBLIC PROC [n: INT ¨ 1] = { TEditInputOps.BackWord[n] };
+
+DeleteNextCharacter: PUBLIC PROC [n: INT ¨ 1] = { TEditInputOps.DeleteNextChar[n] };
+
+DeleteNextWord: PUBLIC PROC [n: INT ¨ 1] = { TEditInputOps.DeleteNextWord[n] };
+
+InsertTime: PUBLIC PROC = { TEditInputOps.InsertTime[] };
+
+InsertBrackets: PUBLIC PROC [left, right: CHAR] = {
+TEditInputOps.InsertBrackets[left, right] };
+
+MakeControlCharacter: PUBLIC PROC = { TEditInputOps.MakeControlCharacter[] };
+
+UnMakeControlCharacter: PUBLIC PROC = { TEditInputOps.UnMakeControlCharacter[] };
+
+MakeOctalCharacter: PUBLIC PROC = { TEditInputOps.MakeOctalCharacter[] };
+
+UnMakeOctalCharacter: PUBLIC PROC = { TEditInputOps.UnMakeOctalCharacter[] };
+
+ExpandAbbreviation: PUBLIC PROC = { TEditInputOps.ExpandAbbreviation[] };
+
+Delete: PUBLIC PROC = { TEditInputOps.Delete[] };
+
+Paste: PUBLIC PROC = { TEditInputOps.Paste[] };
+
+SaveForPaste: PUBLIC PROC = { TEditInputOps.SaveForPaste[] };
+
+SaveSpanForPaste: PUBLIC PROC [startLoc, endLoc: Location, grain: SelectionGrain ¨ char] = {
+TEditInputOps.SaveSpanForPaste[DocLoc[startLoc], DocLoc[endLoc], DocGran[grain]] };
+AllLower: PUBLIC PROC = { TEditInputOps.Capitalise[allLower] };
+
+AllCaps: PUBLIC PROC = { TEditInputOps.Capitalise[allCaps] };
+
+InitialCaps: PUBLIC PROC = { TEditInputOps.Capitalise[initCaps] };
+
+FirstCap: PUBLIC PROC = { TEditInputOps.Capitalise[firstCap] };
+
+MesaFormatting: PUBLIC PROC = { [] ¨ TEditMesaOps.SetMesaLooksOp[] };
+
+Repeat: PUBLIC PROC = { [] ¨ TEditInput.Repeat[] };
+
+Undo: PUBLIC PROC = { [] ¨ TEditInput.Cancel[] };
+Break: PUBLIC PROC = { TEditInputOps.Break[] };
+
+Join: PUBLIC PROC = { TEditInputOps.Join[] };
+
+Nest: PUBLIC PROC = { TEditInputOps.Nest[] };
+
+UnNest: PUBLIC PROC = { TEditInputOps.UnNest[] };
+SetSelectionLooks: PUBLIC PROC [which: WhichSelection ¨ primary] = {
+TEditSelection.SetSelLooks[SELECT which FROM
+primary => TEditSelection.pSel,
+secondary => TEditSelection.sSel,
+feedback => TEditSelection.fSel,
+ENDCASE => ERROR] };
+FetchLooks: PUBLIC PROC [node: Ref, index: Offset] RETURNS [ROPE] = {
+RETURN [TextLooks.LooksToRope[TextEdit.FetchLooks[TextNode.NarrowToTextNode[node],index]]] };
+
+SetLooks: PUBLIC PROC [looks: ROPE, which: WhichLooks ¨ selection] = {
+lks: TextLooks.Looks = TextLooks.RopeToLooks[looks];
+IF which=selection THEN
+TEditInputOps.ChangeLooks[add: lks, remove: TextLooks.allLooks]
+ELSE TEditInputOps.ChangeCaretLooks[add: lks, remove: TextLooks.allLooks] };
+
+AddLooks: PUBLIC PROC [looks: ROPE, which: WhichLooks ¨ selection] = {
+lks: TextLooks.Looks = TextLooks.RopeToLooks[looks];
+IF which=selection THEN
+TEditInputOps.ChangeLooks[add: lks, remove: TextLooks.noLooks]
+ELSE TEditInputOps.ChangeCaretLooks[add: lks, remove: TextLooks.noLooks] };
+
+SubtractLooks: PUBLIC PROC [looks: ROPE, which: WhichLooks ¨ selection] = {
+lks: TextLooks.Looks = TextLooks.RopeToLooks[looks];
+IF which=selection THEN
+TEditInputOps.ChangeLooks[add: TextLooks.noLooks, remove: lks]
+ELSE TEditInputOps.ChangeCaretLooks[add: TextLooks.noLooks, remove: lks] };
+
+ClearLooks: PUBLIC PROC [which: WhichLooks ¨ selection] = {
+IF which=selection THEN
+TEditInputOps.ChangeLooks[add: TextLooks.noLooks, remove: TextLooks.allLooks]
+ELSE
+TEditInputOps.ChangeCaretLooks[add: TextLooks.noLooks, remove: TextLooks.allLooks] };
+
+CopyLooks: PUBLIC PROC = { TEditInputOps.CopyLooks[] };
+GetFormat: PUBLIC PROC [node: Ref] RETURNS [ROPE] = {
+name: ATOM = TextEdit.GetFormat[node];
+RETURN [IF name=NIL THEN "default" ELSE Atom.GetPName[name]];
+};
+
+ForEachNode: PROC [which: WhichNodes, proc: PROC [TextNode.Ref]] = {
+pSel: TEditDocument.Selection = TEditSelection.pSel;
+SELECT which FROM
+root => proc[TextNode.Root[pSel.start.pos.node]];
+selection =>
+FOR node: TextNode.Ref ¨ pSel.start.pos.node, TextNode.StepForward[node] DO
+proc[node];
+IF node = pSel.end.pos.node THEN EXIT;
+ENDLOOP;
+ENDCASE => ERROR };
+
+SetFormat: PUBLIC PROC [format: ROPE, which: WhichNodes ¨ selection] = {
+Set: PROC [ref: TextNode.Ref] = { TEditInputOps.SetFormatName[format, ref] };
+ForEachNode[which, Set] };
+
+SetNodeFormat: PUBLIC PROC [format: ROPE, node: Ref] = {
+root: TextNode.Ref;
+formatName: ATOM ¨ IF format.IsEmpty THEN NIL ELSE Atom.MakeAtom[format];
+root ¨ TextNode.Root[node];
+[] ¨ TEditLocks.Lock[root, "TiogaOpsSetNodeFormat"];
+TextEdit.PutFormat[node, formatName];
+TEditLocks.Unlock[root] };
+
+SetNodeStyle: PUBLIC PROC [style: ROPE, node: Ref] = {
+root: TextNode.Ref ¨ TextNode.Root[node];
+[] ¨ TEditLocks.Lock[root, "TiogaOpsSetNodeStyle"];
+TextEdit.ChangeStyle[node, style];
+TEditLocks.Unlock[root] };
+
+CaretNodeFormat: PUBLIC PROC = { TEditInputOps.SetFormat[] };
+
+InsertFormat: PUBLIC PROC = { TEditInputOps.GetFormat[] };
+
+CopyFormat: PUBLIC PROC = { TEditInputOps.CopyFormat[] };
+GetStyle: PUBLIC PROC [node: Ref] RETURNS [ROPE] = {
+name: ATOM ~ NodeStyleOps.StyleNameForNode[node];
+RETURN [IF name=NIL THEN "default" ELSE Atom.GetPName[name]] };
+
+SetStyle: PUBLIC PROC [style: ROPE, which: WhichNodes ¨ selection] = {
+Set: PROC [ref: TextNode.Ref] = { TEditInputOps.SetStyleName[style, ref] };
+ForEachNode[which, Set] };
+IsComment: PUBLIC PROC [node: Ref] RETURNS [BOOL] = {
+txt: TextNode.RefTextNode = TextNode.NarrowToTextNode[node];
+RETURN [txt # NIL AND txt.comment] };
+
+SetComment: PUBLIC PROC = { TEditInputOps.SetCommentProp[TRUE] };
+
+SetNotComment: PUBLIC PROC = { TEditInputOps.SetCommentProp[FALSE] }; 
+SetProp: PUBLIC PROC [name: ATOM, value: REF, which: WhichNodes ¨ selection] = {
+Put: PROC [node: TextNode.Ref] = {
+TextEdit.PutProp[node, name, value, TEditInput.CurrentEvent[]] };
+ForEachNode[which, Put] };
+RegisterAbbrevFailedProc: PUBLIC PROC [proc: PROC RETURNS [BOOL]] = {
+TEditInputOps.RegisterAbbrevFailedProc[proc] };
+RegisterFileNameProc: PUBLIC PROC [
+proc: PROC [ROPE, Viewer] RETURNS [fileName: ROPE, search: ROPE]
+] = {
+TEditOps.RegisterFileNameProc[proc] };
+PutTextKey: PUBLIC PROC [node: Ref, where: Offset, key: REF] = {
+NodeAddrs.PutTextAddr[TextNode.NarrowToTextNode[node], key, where] };
+
+GetTextKey: PUBLIC PROC [node: Ref, key: REF] RETURNS [loc: Location] = {
+where: Offset;
+n: TextNode.RefTextNode;
+[n, where] ¨ NodeAddrs.GetTextAddr[TextNode.NarrowToTextNode[node], key !
+NodeAddrs.TextAddrNotFound => GOTO Error];
+RETURN [[n, where]];
+EXITS Error => ERROR TextKeyNotFound };
+
+TextKeyNotFound: PUBLIC ERROR = CODE;
+
+RemoveTextKey: PUBLIC PROC [node: Ref, key: REF] = {
+NodeAddrs.RemTextAddr[TextNode.NarrowToTextNode[node], key] };
+
+MapTextKeys: PUBLIC PROC [node: Ref,
+proc: PROC [key: REF, where: Offset] RETURNS [BOOLEAN]]
+RETURNS [BOOLEAN] = {
+Do: PROC [addr: REF, location: Offset] RETURNS [BOOLEAN] = {
+RETURN [proc[addr, location]] };
+RETURN [NodeAddrs.MapTextAddrs[TextNode.NarrowToTextNode[node], Do]];
+};
+
+END.
+
+
+ 
+  p  
+TiogaOpsImpl.mesa
+Copyright ” 1985, 1991, 1992 by Xerox Corporation.  All rights reserved.
+written by Bill Paxton. June 1982
+last written by Paxton. December 28, 1982 12:38 pm
+Last Edited by: Paxton, January 10, 1983 4:14 pm
+Last Edited by: Maxwell, January 19, 1983 12:31 pm
+Last Edited by: Plass, March 29, 1985 3:52:36 pm PST
+Michael Plass, March 13, 1989 10:19:47 am PST
+Rick Beach, March 28, 1985 10:14:40 am PST
+Doug Wyatt, July 9, 1992 3:00 pm PDT
+
+Document Locks
+Selections
+Find
+Location procedures
+Caret (for primary selection)
+Edits requiring secondary selections
+Editing applying to primary selection
+
+Node Editing
+Looks
+sets the selection looks from the looks of the character next to the caret
+
+Formats
+Styles
+Comment Property
+Node Property Lists
+Miscellaneous call-back procedures 
+
+Text keys: persistent "addresses" for characters in text nodes
+Associates the key with the given offset in the text node.  Key moves with the text as edits take place in the node.  Key doesn't move to new node.  May use same key with different nodes without interference.
+Tells you where the key is in the node at the current time.
+ù ˆ  ïNewlineDelimiter
+ñ(cedarcode) styleô codeöúôKöú	œeú<ôHKöœc!ô!Köû2ô2Köúûúô0Kô2Kô4Kô-Kô*Kô$Kô óöœk	ò	Köúüúò Köú	üúò"Köú
+üúIòXKöúüúò&Köúüúüúò!Köúüú=òPKöúüúzòäKöúüú¬ò’Köúüúò Köúüúò$Köú	üú2ò@KöúüúËò¸Köú	üú@òNKöú
+üú6òEKöú	üúpò~KöúüúòKöú	üúdòrKöúüú=òOKöúüú
+òóKò KöœnúüúüòKöüú¶ò≠Köüúò!öüúüúò"Kò KöüúüúüúòKöúüúò$Köúüúüúòóheadöúôö
+†úüúüúüúüúòHKöúüúüúò#ö†úüúòKöüúüúüúò3Köüúüúüúò6KöúòóöúüúüúòKöúüúòö
+üúüúüúüúüúò3Köú	üúòóKöúüúòKòóKò
+óKò Kö	†úüúüúüúû5òWKò Kö†úüúüú@òQKò Kö†úüúüú+ò>Kò Kö†úüúüúúüúüú
+òlKò ö†úüúüú&ò:KöúBòBóKò ö†	úüúüú&ò<Köú2ò2óóöú
+ô
+ö†úüúüú úüúüúòtKò óö†úüú-üúúüúüúòsKò óö
+†úüúüúüúüúòRKò óö†úüúüúúüúüúòQKò óö†úüúüú#üúMüúüúòÆöúüúüò0KöúòKöú!ò!Köú ò KöüúüúòóöüúPòVKöú+ò+óKò óö†úüúüú#üúòTöüúò"öúòöüúüòKöúòKöú!ò!Köú ò KöüúüúòóóóóKò Kö†úüúüúüúò=Kò ö†úüú#ò7Kò KòKöú%ò%öüúüúüúüúüúüúüúüòiKöüúüúò)óöüúüúüúüòDKöüúüúò'óKöüúüúüúòCöüúüúû/òDöüú/ò1Köüúüúò&óóöüú+üúûòPöüú)üúüò1öúüúüúò1Köüúüú ò*óóóöüú)üúûòLöüú(üúüò0öúüúüúò/Köüúüúò(óóóö	üúüúüú	üúû#ò@öüú(ò*Köüúüúò(óóKòKò óö†úüúüúSüúüúüúüú&ò∫KöüúüúüúòKöú:ò:öúüúüòKöú ò Köú"ò"Köú!ò!KöüúüúòóKòKöúüúò#Kò"KòKò%Kö	úüúüúüúüúòWKò&Kòöú&üúüò7KöúòKöúòKöúòKöüúüúòóKöúòKò óö†úüúüúNüúüúüúüú&ò¥öú&üúòHKò,Kò óóö†úüúüúNüúüúüúüú&ò∑ò+Kò,Kò óóö†úüúüú=üúüúüúüú&ò¶Köú'üúò;Kòò9Kò,óóKò ö†úüúüú&òBKöú1ò1Kò óKö†úüúüú(ò=Kò Kö†úüúüú+òCKò Kö†úüúüú(ò=Kò Kö†úüúüú+òCKò Kö†úüúüú&ò@Kò Kö†úüúüú.òPKò Kö†úüúüúüúüúüúüú>òéóöúôö†úüúüúòNöüúüú
+üòKöúòKöúòKöúòKöüúüúòKò óóö†úüúüúüúüú üú'üúüúû,úüú	üúò◊Köüúüúüú"ò2öüúòKöú6ò6Köú2ò2óKò óö†úüúüúüúüú üú'üúüúû,úüú	üúò◊Köüúüúüú"ò2öüú'ò-Köú2ò2Köú(üúò1Kò óóö†úüúüúüúüú üú'üúüúû,úüú	üúò÷Köüúüúüú"ò2öüú'ò-Köú2ò2Köú(üúüúò<óóóöúôö†úüú,üúüúüúüúòÉKöüúQòWKöúòKò óö†	úüúüúüúüúüúòyöúPòPKöúüú
+ò#óKöúòKò óKöú	üúüúüúòóöúôKö
+†úüúüúüúüú òXKò Kö†úüúüú-òEKò Kö†
+úüúüú,òCKò Kö†	úüúüú,òBKò Kö†úüúüúüú*òPKò Kö†úüúüúüú*òKKò Kö†úüúüúüú*òKKò Kö†úüúüúüú.òXKò Kö†úüúüúüú.òSKò Kö†úüúüúüú.òSóöú$ô$Kö†	úüúüú#ò9Kò Kö†úüúüú%ò=Kò Kö†	úüúüú!ò7óöú%ô%Kö†
+úüúüúüú'òJKò Kö†
+úüúüúüú'òJKò Kö†úüúüú'òCKò Kö†	úüúüúüú'òEKò Kö†úüúüúüú&òCKò Kö†úüúüúüú,òTKò Kö†úüúüúüú,òOKò Kö†
+úüúüú"ò9Kò ö†úüúüúüúò3Kò,Kò óKö†úüúüú,òMKò Kö†úüúüú.òQKò Kö†úüúüú*òIKò Kö†úüúüú,òMKò Kö†úüúüú*òIKò Kö†úüúüúò1Kò Kö†úüúüúò/Kò Kö†úüúüú$ò=Kò ö†úüúüú?ò\KòSKô óKö†úüúüú*ò?Kò Kö†úüúüú)ò=Kò Kö†úüúüú*òBKò Kö†úüúüú*ò?Kò Kö†úüúüú*òEKò Kö†úüúüú ò3Kò Kö†úüúüú ò1óöúôKö†úüúüúò/Kò Kö†úüúüúò-Kò Kö†úüúüúò-Kò Kö†úüúüúò1óöúôö†úüúüú&òDKöúJôJöúüúüò,KöúòKöú!ò!Köú ò KöüúüúòóKô óö
+†
+úüúüúüúüúòEKöüúWò]Kò óö†úüúüú	üú$òFKöú4ò4öüúüòKò?óKöüúHòLKò óö†úüúüú	üú$òFKöú4ò4öüúüòKò>óKöüúGòKKò óö†úüúüú	üú$òKKöú4ò4öüúüòKò>óKöüúGòKKò óö†
+úüúüú$ò;öüúüòKòMóöüòKòUKò óóKö†	úüúüú!ò7óöúôö
+†	úüúüúüúüúò5Köúüúò&Kö
+üúüúüúüúüúò=öúòKò óóö†úüúüúòDKò4öüúüòKò1òöüúFüòKKòKöüúüúüúò&KöüúòóóKöüúüúòKò óóö†	úüúüú
+üú$òHKö†úüúDòMKòKò óö†úüúüú
+üúò8KòKöúüúüúüúüúüúòIKòKò4Köú%ò%KöúòóKò ö†úüúüú	üúò6Kò)Kò3Köú"ò"KöúòóKò Kö†úüúüú!ò=Kò Kö†úüúüú!ò:Kò Kö†
+úüúüú"ò9óöúôö
+†úüúüúüúüúò4Köúüú'ò1ö
+üúüúüúüúüúò?Kò óóö†úüúüú	üú$òFKö†úüúBòKKòóóöúôö
+†	úüúüúüúüúò5Kò<Köüúüúüúò%Kò óKö†
+úüúüú"üúòAKò Kö†úüúüú"üúòFóöúôö
+†úüúüúüú	üú$òPö†úüúò"KòAóKòóóöú#ô#ö
+†úüúüúüúüúòEKöú/ò/óKô ö†úüú	üúüú	üúüú
+üúòjKöú&ò&óóöú>ô>ö†
+úüú!üúò@Köú–ô–KöúEòEóKò ö†
+úüúüúüúòIKô;KòKòòIKöúüúò*óKöüúòKöüú
+üúò'óKò Köúüúüúüúò%Kò ö†úüúüúò4Köú>ò>óKò ö†úüúüúüúüúüúüúüúòrö	úüúüúüúüúò<Köüúò óKöüú?òEKöúòóóKò KöüúòKò Kò Kòó Öó    G0  ^ñ  

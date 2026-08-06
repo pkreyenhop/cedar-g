@@ -1,0 +1,644 @@
+
+DIRECTORY
+BasicTime USING [GMT, Now],
+Commander USING [CommandProc, Handle, Register],
+CommanderOps USING [NextArgument],
+Convert USING [Error, IntFromRope],
+FS,
+IO,
+Process USING [Detach],
+RefTab USING [EachPairAction, Ref, Val, Create, Fetch, Store, Pairs],
+Rope,
+UserProfile USING [Token],
+ViewerClasses USING [Viewer],
+ViewerIO USING [CreateViewerStreams],
+ViewerOps USING [FindViewer, OpenIcon],
+WalnutDefs USING [CheckReportProc, Error, WalnutOpsHandle],
+WalnutKernelDefs USING [LogEntry],
+WalnutOps USING [CreateWalnutOpsHandle, GetHandleForRootfile],
+WalnutLog USING [LogLength, OpenLogStreams, ForgetLogStreams, ShutdownLog],
+WalnutLogExpunge  -- using almost everything -- ,
+WalnutRegistry USING [CurrentWalnutState],
+WalnutRoot USING [CommitAndContinue, GetStreamsForExpunge, Open, RegisterStatsProc, Shutdown, StartTransaction, SwapLogs, UnregisterStatsProc],
+WalnutStream USING [FindNextEntry, Open, PeekEntry, ReadEntry, WriteEntry];
+
+WalnutRescueImpl: CEDAR PROGRAM
+
+IMPORTS
+-- Atom, -- BasicTime, Commander, CommanderOps, Convert, FS, IO, Process, RefTab, Rope,
+UserProfile, ViewerIO, ViewerOps,
+WalnutDefs, WalnutOps, WalnutLog, WalnutLogExpunge, WalnutRegistry, WalnutRoot, WalnutStream
+EXPORTS WalnutDefs
+
+= BEGIN
+
+ROPE: TYPE = Rope.ROPE;
+STREAM: TYPE = IO.STREAM;
+WalnutOpsHandle: TYPE = WalnutDefs.WalnutOpsHandle;
+ExpungeHandle: TYPE = WalnutLogExpunge.ExpungeHandle;
+ExpungeHandleRec: PUBLIC TYPE = WalnutLogExpunge.ExpungeHandleRec;
+
+
+tsOut, tsOutLogStrm: STREAM ¬ NIL;
+debugging: BOOL ¬ FALSE;
+Xyz: TYPE = REF ValueObject;
+ValueObject: TYPE = RECORD[num, bytes: INT ¬ 0];
+starsRope: PUBLIC ROPE ¬
+"\n\n************************************************************\n";
+noEntry: ROPE = "\n ***** No entry found at %g, backing up to prevPos: %g\n";
+bad: ROPE = "\tBad entry had ident $%g, length %g; next entry was %g bytes later\n";
+nextValid: ROPE = "\n\tNext valid entry found at %g - continuing\n\n";
+noInputFile: ROPE =
+"\nNo input file specified & no Walnut.WalnutRootFile entry in profile - quitting\n";
+noRootFile: ROPE =
+"\nNo rootFile file specified & no Walnut.WalnutRootFile entry in profile - quitting\n";
+eosR: ROPE =
+"\n\n **** EndOfStream encountered at pos %g, when trying for pos %g\n";
+endS: ROPE = "Bad entry had ident %g, length %g, end was %g bytes later\n";
+eachOrphan: ROPE = "\n\t%g orphan bytes, starting at pos: %g\n\n";
+
+TSStream: PUBLIC PROC[name, tsLogFile, wDir: ROPE] RETURNS [out, tsLogStrm, in: STREAM] = {
+this: ROPE = IF name # NIL THEN name ELSE "Walnut Rescue";
+logFile: ROPE = IF tsLogFile # NIL THEN tsLogFile ELSE "/tmp/WalnutRescue.log";
+v: ViewerClasses.Viewer ¬ ViewerOps.FindViewer[this];
+[in, out] ¬ ViewerIO.CreateViewerStreams[this, v, NIL, FALSE];
+tsLogStrm ¬ FS.StreamOpen[fileName: logFile, accessOptions: $create, wDir: wDir];
+IF v # NIL THEN IF v.iconic THEN ViewerOps.OpenIcon[v];
+tsOut ¬ out;
+tsOutLogStrm ¬ tsLogStrm;
+};
+
+SetupScan: PROC[cmd: Commander.Handle, wDir: ROPE] = {
+logFile: ROPE = CommanderOps.NextArgument[cmd];
+startPosRope: ROPE = CommanderOps.NextArgument[cmd];
+startPos: INT ¬ 0;
+IF startPosRope # NIL THEN startPos ¬ Convert.IntFromRope[startPosRope ! Convert.Error => CONTINUE];
+TRUSTED { Process.Detach[FORK Scan[logFile, wDir, startPos] ]};
+};
+
+Scan: PROC[logFile, wDir: ROPE, startPos: INT] = {
+strm: STREAM;
+logLength: INT;
+fullLogName: ROPE;
+scanStart: ROPE = "\t\t Scan Log for Entries, started @ %g\n";
+scan: ROPE = "Scanning the logfile: %g, starting at pos: %g:\n\n";
+now: BasicTime.GMT = BasicTime.Now[];
+
+[tsOut, tsOutLogStrm, ] ¬ TSStream[NIL, NIL, NIL];
+Report[NIL, starsRope];
+Report[NIL, scanStart, [time[now]] ];
+IF logFile = NIL THEN {
+[logFile, strm] ¬ TryUsingRootFileName[];
+IF logFile = NIL THEN {
+Report[NIL, noInputFile];
+tsOutLogStrm.Close[];
+RETURN;
+};
+};
+fullLogName ¬ FS.ExpandName[logFile, wDir].fullFName;
+
+IF strm = NIL THEN
+strm ¬ WalnutStream.Open[name: fullLogName, readOnly: TRUE ! FS.Error => CONTINUE];
+IF strm = NIL THEN {
+Report[NIL, "\n***Could not open %g\n", [rope[fullLogName]] ];
+tsOutLogStrm.Close[];
+RETURN
+};
+IF (logLength ¬ strm.GetLength[]) = 0 THEN {
+empty: ROPE = "The log file %g is empty\n";
+Report[NIL, empty, [rope[fullLogName]] ];
+strm.Close[ ! IO.Error, FS.Error => CONTINUE];
+tsOutLogStrm.Close[];
+RETURN
+};
+Report[NIL, scan, [rope[fullLogName]], [integer[startPos]] ];
+
+BEGIN ENABLE {
+IO.Error => {
+ioErr: ROPE = "\n\n\t\t*** IO.Error: %g, @ %g, logPos %g - quitting\n";
+Report[NIL, ioErr, [rope[msg]], [time[BasicTime.Now[]]], [integer[strm.GetIndex[]]] ];
+GOTO error;
+};
+UNWIND => NULL;
+};
+tsOut.PutRope["(0)"];
+DoScan[strm, startPos, logLength];
+EXITS
+error => NULL;
+END;
+strm.Close[ ! IO.Error, FS.Error => CONTINUE];
+tsOutLogStrm.Close[]
+};
+
+TryUsingRootFileName: PROC RETURNS[logFile: ROPE, strm: STREAM] = {
+rootFile: ROPE ¬ UserProfile.Token[key: "Walnut.WalnutRootFile", default: ""];
+cp: FS.ComponentPositions;
+IF rootFile.Length[] = 0 THEN RETURN[NIL, NIL];
+cp ¬ FS.ExpandName[rootFile].cp;
+logFile ¬ Rope.Concat[Rope.Substr[rootFile, 0, cp.ext.start], "LogX"];	-- try logX
+strm ¬ WalnutStream.Open[name: logFile, readOnly: TRUE ! FS.Error => CONTINUE];
+IF strm = NIL THEN RETURN[logFile, NIL];
+IF strm.GetLength[] # 0 THEN RETURN;
+strm.Close[];		-- try the other log
+strm ¬ NIL;
+logFile ¬ Rope.Concat[Rope.Substr[rootFile, 0, cp.ext.start], "LogY"];	-- try logY
+};
+
+FixWalnutLog: PROC[rootFile, wDir: ROPE, toBeIgnored: LIST OF ATOM] = {
+opsH: WalnutOpsHandle;
+badBitsStrm: STREAM;
+serverAndDir: ROPE;
+BEGIN
+previousAt, at: INT ¬ -1;
+ident: ATOM;
+logLength, newLen: INT;
+expungeID: INT;
+num, numSinceFlush: INT ¬ 0;
+bytesBetweenFlushes: INT = 50 * 8096;	-- guess
+msgID: ROPE;
+startFix: ROPE = "\t\tFix Log, started at %g\n";
+fixWho: ROPE = "\tFixing the rootfile: %g\n";
+DumpBadBits: PROC[startPos, endPos: INT] = {
+numBad: INT ¬ endPos - startPos;
+IF badBitsStrm = NIL THEN {
+orphan: ROPE ¬ Rope.Concat[wDir, "WalnutRescue.orphanBytesLog"];
+
+Report[NIL, eachOrphan, [rope[orphan]], [integer[startPos]] ];
+badBitsStrm ¬ FS.StreamOpen[fileName: orphan, accessOptions: $create];
+badBitsStrm.SetIndex[0];
+badBitsStrm.PutF["\nOrphaned bits from fixing %g, started at %g\n\n",
+[rope[rootFile]], [time[BasicTime.Now[]]] ];
+badBitsStrm.Flush[];
+};
+badBitsStrm.PutRope[starsRope];
+badBitsStrm.PutF["\n\t%g orphan bytes, starting at pos: %g\n",
+		[integer[numBad]], [integer[startPos]] ];
+WalnutLogExpunge.SetIndex[opsH, startPos];
+WalnutLogExpunge.CopyBytes[opsH, badBitsStrm, numBad];
+badBitsStrm.Flush[];
+};
+
+[tsOut, tsOutLogStrm, ] ¬ TSStream[NIL, NIL, NIL];
+Report[NIL, starsRope];
+Report[NIL, startFix, [time[BasicTime.Now[]]] ];
+
+IF rootFile = NIL THEN {
+rootFile ¬ UserProfile.Token[key: "Walnut.WalnutRootFile", default: ""];
+IF rootFile.Length[] = 0 THEN {
+Report[NIL, noRootFile];
+tsOutLogStrm.Close[];
+RETURN;
+};
+};
+Report[NIL, fixWho, [rope[rootFile]] ];
+
+IF toBeIgnored = NIL THEN
+Report[NIL, "\n  No entries except invalid ones will be deleted\n"]
+ELSE {
+Report[NIL, "\n Deleting the following entries: "];
+FOR ignore: LIST OF ATOM ¬ toBeIgnored, ignore.rest UNTIL ignore = NIL DO
+Report[NIL, " %g,", [atom[ignore.first]]];
+ENDLOOP;
+Report[NIL, "\n"];
+};
+
+opsH ¬ WalnutOps.GetHandleForRootfile[rootFile];
+IF opsH = NIL THEN opsH ¬ WalnutOps.CreateWalnutOpsHandle[rootFile];
+WalnutRoot.RegisterStatsProc[opsH, Report];
+BEGIN ENABLE {
+WalnutDefs.Error => {
+ec: ROPE = "\n *** WalnutDefs Error: code:  %g, info: %g @ %g\n quitting ...\n";
+Report[opsH, ec, [atom[code]], [rope[explanation]], [time[BasicTime.Now[]]] ];
+GOTO error;
+};
+UNWIND => GOTO error;
+};
+
+[] ¬ WalnutRoot.Open[opsH, FALSE];
+IF opsH.readOnly THEN {
+Report[opsH, "\n %g is readOnly - can't Fix\n", [rope[rootFile]]];
+WalnutRoot.UnregisterStatsProc[opsH, Report];
+WalnutRoot.Shutdown[opsH];
+RETURN;
+};
+
+[] ¬ WalnutRoot.StartTransaction[opsH, FALSE];
+[] ¬ WalnutLog.OpenLogStreams[opsH];
+logLength _ WalnutLog.LogLength[opsH];
+WalnutLog.ForgetLogStreams[opsH];
+expungeID ¬ WalnutLogExpunge.StartExpunge[opsH, 0];
+
+[] ¬ WalnutLogExpunge.SetPosition[opsH, 0];
+
+[ident, msgID, at] ¬ WalnutLogExpunge.PeekEntry[opsH];
+
+DO
+bytesThisCopy, newPos: INT;
+doSkip: BOOL ¬ FALSE;
+nextIdent: ATOM;
+nextMsgID: ROPE;
+nextAt: INT;
+thisStatus: WalnutLogExpunge.EntryStatus;
+atEnd: BOOL ¬ FALSE;
+
+thisStatus ¬ WalnutLogExpunge.ExamineThisEntry[opsH];  -- advances log if valid entry
+IF thisStatus = EndOfStream THEN {
+eosR: ROPE = "\n***** EndOfStream encountered at pos %g, last entry was at pos %g\n";
+badE: ROPE = "\t\tBad entry had ident %g, end was %g bytes later\n";
+IF at = logLength THEN EXIT;		-- at the end so ok
+Report[NIL, eosR, [integer[logLength]], [integer[at]]];
+Report[NIL, badE, [atom[ident]], [integer[logLength - at]] ];
+DumpBadBits[at, logLength];
+EXIT
+};
+
+[nextIdent, nextMsgID, nextAt] ¬ WalnutLogExpunge.PeekEntry[opsH !
+		WalnutDefs.Error => { nextIdent ¬ NIL; CONTINUE } ]; 
+IF nextIdent = NIL THEN {
+curPos: INT ¬ WalnutLogExpunge.GetIndex[opsH];
+IF curPos = logLength THEN atEnd ¬ TRUE	-- need to dump the last entry
+ELSE {		--  we have a problem
+Report[opsH, noEntry, [integer[curPos]], [integer[at]] ];
+nextAt ¬ at + WalnutLogExpunge.SetPosition[opsH, at+1] + 1;
+IF nextAt = at THEN {
+Report[opsH, "No more entries found\n"];
+DumpBadBits[at, logLength];
+EXIT
+};
+IF nextAt <= curPos THEN {		-- previous entry is not ok
+Report[opsH, bad, [atom[ident]], [integer[curPos - at]], [integer[nextAt - at]] ];
+IF msgID # NIL THEN {
+id: ROPE = "\t The msgID was: \"%g\"\n";
+Report[opsH, id, [rope[msgID]] ];
+};
+Report[opsH, nextValid, [integer[nextAt]] ];
+DumpBadBits[at, nextAt];
+WalnutLogExpunge.SetIndex[opsH, nextAt];
+[ident, msgID, at] ¬ WalnutLogExpunge.PeekEntry[opsH];
+LOOP; 
+};
+};
+};
+WalnutLogExpunge.SetIndex[opsH, at];
+IF at = previousAt THEN {		-- probably transAbort
+[] ¬ WalnutLogExpunge.SkipEntry[opsH];
+Report[opsH, "\n At pos %g a second time\n", [integer[at]]];
+ident ¬ nextIdent;
+msgID ¬ nextMsgID;
+at ¬ nextAt;
+LOOP;
+};
+
+FOR ignore: LIST OF ATOM ¬ toBeIgnored, ignore.rest UNTIL ignore = NIL DO
+IF ident = ignore.first THEN
+{ doSkip ¬ TRUE; EXIT; };
+ENDLOOP;
+
+IF doSkip OR ~ValidIdent[ident, at, TRUE] THEN [] ¬ WalnutLogExpunge.SkipEntry[opsH]
+ELSE
+SELECT ident FROM
+$LogFileInfo,
+$ExpungeMsgs,
+$WriteExpungeLog => [] ¬ WalnutLogExpunge.SkipEntry[opsH];
+
+$DestroyMsgSet => {	-- be very careful
+now: INT = WalnutLogExpunge.GetIndex[opsH];
+le: WalnutKernelDefs.LogEntry ¬ WalnutStream.ReadEntry[opsH.expungeHandle.rStrm, TRUE].le;
+Report[NIL, "\n Re-writing DestroyMsgSet entry at %g\n", [integer[now]] ];
+[] ¬ WalnutStream.WriteEntry[opsH.expungeHandle.eStrm, le]; -- write correctly
+WalnutLogExpunge.SetIndex[opsH, now];
+[] ¬ WalnutLogExpunge.SkipEntry[opsH];	-- skip bad one
+};
+$CreateMsg => {
+[newPos, bytesThisCopy] ¬ WalnutLogExpunge.CopyEntry[opsH];
+num ¬ IncrementCount[opsH, num];
+};
+ENDCASE => [newPos, bytesThisCopy] ¬ WalnutLogExpunge.CopyEntry[opsH];
+
+numSinceFlush ¬ numSinceFlush + bytesThisCopy;
+IF numSinceFlush >= bytesBetweenFlushes THEN {
+[] ¬ WalnutLogExpunge.GetExpungeProgress[opsH];
+WalnutRoot.CommitAndContinue[opsH];
+numSinceFlush ¬ 0;
+};
+IF atEnd THEN EXIT;
+
+IF nextIdent = NIL THEN {  -- previous entry not followed by a valid entry; go find it
+curPos: INT = WalnutLogExpunge.GetIndex[opsH];
+noEntry: ROPE = "\nNo entry found at pos %g; next valid entry was %g bytes later";
+next: INT = curPos + WalnutLogExpunge.SetPosition[opsH, curPos];
+IF next = -1 THEN {
+Report[opsH, "No more entries found\n"];
+DumpBadBits[curPos, logLength];
+EXIT
+};
+Report[opsH, noEntry, [integer[curPos]], [integer[next - curPos]]];
+DumpBadBits[curPos, next];
+WalnutLogExpunge.SetIndex[opsH, next];
+[ident, msgID, at] ¬ WalnutLogExpunge.PeekEntry[opsH];
+LOOP;
+};
+
+ident ¬ nextIdent;
+msgID ¬ nextMsgID;
+at ¬ nextAt;
+
+ENDLOOP;
+
+[] ¬ WalnutLogExpunge.GetExpungeProgress[opsH];
+WalnutLogExpunge.EndExpunge[opsH];
+WalnutRoot.CommitAndContinue[opsH];
+
+[] ¬ WalnutRoot.GetStreamsForExpunge[opsH: opsH, starting: FALSE, pagesWanted: -1];
+newLen ¬ WalnutRoot.SwapLogs[opsH, expungeID, BasicTime.Now[]];
+WalnutRoot.UnregisterStatsProc[opsH, Report];
+WalnutRoot.Shutdown[opsH];
+
+BEGIN
+old: ROPE = "\n The old log was %g bytes, the new log is %g bytes";
+had: ROPE = "\n The log file contains %g messages\n";
+Report[opsH, old, [integer[logLength]], [integer[newLen]]];
+Report[opsH, had, [integer[num]]];
+tsOutLogStrm.Close[];
+IF badBitsStrm # NIL THEN badBitsStrm.Close[];
+END;
+
+EXITS
+error => {
+WalnutLogExpunge.EndExpunge[opsH];
+WalnutRoot.UnregisterStatsProc[opsH, Report];
+WalnutLog.ShutdownLog[opsH];
+WalnutRoot.Shutdown[opsH];
+IF badBitsStrm # NIL THEN badBitsStrm.Close[];
+tsOutLogStrm.Close[];
+};
+END;
+END;
+};
+
+orphanRope: ROPE = "\n*** Writing the orphan bytes on %g\n";
+orphanStart: ROPE = "\nOrphaned bits from fixing %g, started at %g\n\n";
+
+ValidIdent: PROC[ident: ATOM, at: INT, doReport: BOOL] RETURNS[valid: BOOL] = {
+SELECT ident FROM
+$LogFileInfo => RETURN[TRUE];
+$CreateMsg => RETURN[TRUE];
+$ExpungeMsgs => RETURN[TRUE];
+$WriteExpungeLog => RETURN[TRUE];
+$CreateMsgSet => RETURN[TRUE];
+$DestroyMsgSet => RETURN[TRUE];
+$EndOfLog => RETURN[TRUE];
+$EmptyMsgSet => RETURN[TRUE];
+$HasBeenRead => RETURN[TRUE];
+$AddMsg => RETURN[TRUE];
+$RemoveMsg => RETURN[TRUE];
+$MoveMsg => RETURN[TRUE];
+$RecordNewMailInfo => RETURN[TRUE];
+$StartCopyNewMail => RETURN[TRUE];
+$EndCopyNewMailInfo => RETURN[TRUE];
+$AcceptNewMail => RETURN[TRUE];
+$StartReadArchiveFile => RETURN[TRUE];
+$EndReadArchiveFile => RETURN[TRUE];
+$StartCopyReadArchive => RETURN[TRUE];
+$EndCopyReadArchiveInfo => RETURN[TRUE];
+ENDCASE => NULL;
+IF doReport THEN {
+inv: ROPE = "\n~~~~ Invalid Entry with identifier $%g at log pos %g\n";
+Report[NIL, inv, [atom[ident]], [integer[at]] ];
+};
+RETURN[FALSE]
+};
+
+DoScan: PROC[strm: STREAM, startPos, logLength: INT] = {
+ident: ATOM;
+msgID: ROPE;
+length, previousAt: INT;
+validTable: RefTab.Ref ¬ RefTab.Create[];
+invalidTable: RefTab.Ref ¬ RefTab.Create[];
+table: RefTab.Ref;
+found: BOOL;
+val: RefTab.Val;
+validCount, invalidCount, count: INT ¬ 0;
+at: INT ¬ startPos;
+oneKBytes, twoKBytes, onePointTwoKBytes: INT ¬ 0;
+oneKNum, onePointTwoKNum, twoKNum: INT ¬ 0;
+logInfoSeqNo: INT ¬ 0;
+
+ForPrinting: RefTab.EachPairAction = {
+ident: ATOM ¬ NARROW[key];
+this: Xyz ¬ NARROW[val];
+pr: ROPE = "Ident: %g, num: %g, bytes: %g\n";
+Report[NIL, pr, [atom[ident]], [integer[this.num]], [integer[this.bytes]] ];
+RETURN[FALSE];		-- don't quit
+};
+strm.SetIndex[startPos];
+IF startPos # 0 THEN at ¬ WalnutStream.FindNextEntry[strm];
+previousAt ¬ at;
+
+DO
+this: Xyz;
+previousIdent: ATOM ¬ ident;
+previousMsgID: ROPE ¬ msgID;
+[ident, msgID, length] ¬ WalnutStream.PeekEntry[strm, TRUE];
+IF ident = $EndOfLog THEN EXIT;
+IF ident = NIL THEN {
+curPos: INT ¬ strm.GetIndex[];
+IF curPos = logLength THEN EXIT;
+Report[NIL, noEntry, [integer[curPos]], [integer[previousAt]] ];
+strm.SetIndex[previousAt+1];
+at ¬ WalnutStream.FindNextEntry[strm];
+IF at = -1 THEN {
+Report[NIL, "No more entries found\n"];
+EXIT
+};
+Report[NIL, bad,
+[atom[previousIdent]], [integer[curPos - previousAt]], [integer[at - previousAt]] ];
+IF previousMsgID # NIL THEN
+Report[NIL, "\t The msgID was: \"%g\"\n", [rope[previousMsgID]] ];
+Report[NIL, nextValid, [integer[at]] ];
+LOOP;
+};
+previousAt ¬ at;
+SELECT ident FROM
+$LogFileInfo => {
+wle: WalnutKernelDefs.LogEntry;
+wle ¬ WalnutStream.ReadEntry[strm, FALSE].le;	-- waiting at the entry
+TRUSTED {
+WITH le: wle SELECT FROM
+LogFileInfo => logInfoSeqNo ¬ le.logSeqNo;
+ENDCASE => NULL;
+};
+};
+$CreateMsg => {
+IF length > 1000 THEN {
+oneKBytes ¬ oneKBytes + length;
+oneKNum ¬ oneKNum + 1;
+};
+IF length > 1200 THEN {
+onePointTwoKBytes ¬ onePointTwoKBytes + length;
+onePointTwoKNum ¬ onePointTwoKNum + 1;
+};
+IF length > 2000 THEN {
+twoKBytes ¬ twoKBytes + length;
+twoKNum ¬ twoKNum + 1;
+};
+};
+ENDCASE => NULL;
+
+strm.SetIndex[at ¬ at + length ! IO.EndOfStream => {
+curPos: INT = strm.GetLength[];
+lastLen: INT = curPos - previousAt;
+eosR: ROPE =
+"\n\n **** EndOfStream encountered at pos %g, when trying for pos %g\n";
+endS: ROPE = "Bad entry had ident %g, length %g, end was %g bytes later\n";
+Report[NIL, eosR, [integer[curPos]], [integer[at]]];
+Report[NIL, endS, [atom[ident]], [integer[length]], [integer[lastLen]] ];
+IF msgID # NIL THEN
+Report[NIL, "\t The msgID was: \"%g\"\n", [rope[msgID]] ];
+strm.SetIndex[curPos];
+CONTINUE;
+} ];
+IF ValidIdent[ident, at, FALSE] THEN {
+table ¬ validTable;
+validCount ¬ validCount + 1;
+}
+ELSE {
+table ¬ invalidTable;
+invalidCount ¬ invalidCount + 1;
+};
+[found, val] ¬ RefTab.Fetch[table, ident];
+IF found THEN {
+this ¬ NARROW[val];
+this.num ¬ this.num + 1;
+this.bytes ¬ this.bytes + length;
+}
+ELSE this ¬ NEW[ValueObject ¬ [1, length]];
+
+[] ¬ RefTab.Store[table, ident, this];
+count ¬ IncrementCount[NIL, count];
+ENDLOOP;
+
+IF count = 0 THEN {
+Report[NIL, "\n\t\tThe log (%g bytes) contained no entries\n", [integer[logLength]] ];
+RETURN
+};
+BEGIN
+Report[NIL, "\n"];
+IF logInfoSeqNo = -1 THEN
+Report[NIL, "\n*****You'll have to do a FixWalnutLog and Scavenge - the log sequence number is incorrect\n"];
+Report[NIL, "\n\tThe log (%g bytes) contained the following entries:\n", [integer[logLength]]];
+IF validCount # 0 THEN {
+Report[NIL, "\n\tThe table of valid entries (%g) is:\n", [integer[validCount]]];
+[] ¬ RefTab.Pairs[validTable, ForPrinting];
+};
+IF invalidCount # 0 THEN {
+Report[NIL, "\n\tThe table of invalid entries (%g) is:\n", [integer[invalidCount]]];
+[] ¬ RefTab.Pairs[invalidTable, ForPrinting];
+};
+IF oneKBytes > 0 THEN
+tsOut.PutF["\n %g msgs (%g bytes) with more than 1000 chars\n",
+[integer[oneKNum]], [integer[oneKBytes]] ];
+IF onePointTwoKBytes > 0 THEN
+tsOut.PutF[" %g msgs (%g bytes) with more than 1200 chars\n",
+[integer[onePointTwoKNum]], [integer[onePointTwoKBytes]] ];
+IF twoKBytes > 0 THEN
+tsOut.PutF[" %g msgs (%g bytes) with more than 2000 chars\n",
+[integer[twoKNum]], [integer[twoKBytes]] ];
+END;
+};
+
+IncrementCount: PUBLIC PROC[opsH: WalnutOpsHandle, count: INT] RETURNS[new: INT] = {
+IF (new ¬ count+1) MOD 100 = 0 THEN
+IF new MOD 1000 = 0 THEN Report[NIL, " (%g)", [integer[new]] ]
+ELSE Report[NIL, "~"];
+};
+
+Report: PUBLIC WalnutDefs.CheckReportProc = {
+tsOut.PutF[format, v1, v2, v3];
+tsOutLogStrm.PutF[format, v1, v2, v3];
+};
+
+CmdScan: Commander.CommandProc = {
+wDir: ROPE = FS.GetWDir[];
+IF WalnutIsActive[cmd.out] THEN RETURN;
+SetupScan[cmd, wDir];
+};
+
+WalnutIsActive: PUBLIC PROC[out: STREAM] RETURNS[BOOL] = {
+IF WalnutRegistry.CurrentWalnutState[] = active THEN {
+out.PutRope["*** You must quit out of Walnut first\n"];
+RETURN[TRUE];
+};
+RETURN[FALSE]
+};
+
+Commander.Register["WalnutScanLog", CmdScan,
+"Summarizes a Walnut log; syntax is \"ScanWalnutLog logFile {startpos}\""];
+
+
+
+END.
+
+CmdFix: Commander.CommandProc = {
+wDir: ROPE = FS.GetWDir[];
+rootFile: ROPE;
+entriesToIgnore, lastToIgnore: LIST OF ATOM;
+IF WalnutIsActive[cmd.out] THEN RETURN;
+rootFile ¬ CommanderOps.NextArgument[cmd];
+DO
+this: ATOM;
+temp: ROPE = CommanderOps.NextArgument[cmd];
+IF temp = NIL THEN EXIT;
+this ¬ Atom.MakeAtom[temp];
+IF entriesToIgnore = NIL THEN entriesToIgnore ¬ lastToIgnore ¬ LIST[this]
+ELSE { lastToIgnore.rest ¬ LIST[this]; lastToIgnore ¬ lastToIgnore.rest; };
+ENDLOOP;
+TRUSTED { Process.Detach[FORK FixWalnutLog[rootFile, wDir, entriesToIgnore] ] };
+};
+
+Commander.Register["FixWalnutLog", CmdFix,
+"Remove entries from a Walnut log; syntax is \"FixWalnutLog rootFile {AtomNames of entries to remove}\""];
+
+  |  
+WalnutRescueImpl.mesa
+Copyright Ó 1985, 1987, 1988, 1993 by Xerox Corporation.  All rights reserved.
+Last Edited by: Willie-Sue, November 30, 1989 12:38:28 pm PST
+Willie-s, August 12, 1993 12:39 pm PDT
+Atom USING [MakeAtom],
+see if this is a well-formed entry
+
+back up to the good entry
+this changes whenever WalnutKernelDefs.LogEntry changes
+* * * * * * * * * * * * * * *
+Ê\  •NewlineDelimiter
+–"cedarcode" style™ codešÏb™Kšœ
+ÏeœC™NKšœ=™=K™&—K˜ šÏk	˜	KšœŸœ™Kšœ
+ŸœŸœ˜Kšœ
+Ÿœ!˜0KšœŸœ˜"KšœŸœ˜#KšŸœ˜KšŸœ˜KšœŸœ
+˜KšœŸœ9˜EKšœ˜KšœŸœ	˜KšœŸœ
+˜Kšœ	Ÿœ˜%Kšœ
+Ÿœ˜'KšœŸœ+˜;KšœŸœ˜"Kšœ
+Ÿœ/˜>Kšœ
+Ÿœ<˜KKšœÏcœ˜1KšœŸœ˜*KšœŸœ˜KšœŸœ9˜K—K˜ šÏnœŸœŸ˜K˜ šŸ˜Kšœ9ŸœŸœ˜WKšœ!˜!K˜\—KšŸœ˜K˜ KšœŸ˜K˜ KšŸœŸœŸœ˜KšŸœŸœŸœŸœ˜KšœŸœ˜3KšœŸœ"˜5KšœŸœŸœ%˜BK˜ K˜ KšœŸœŸœ˜"KšœŸœŸœ˜KšœŸœŸœ˜KšœŸœŸœŸœ˜0šœŸœŸœ˜KšœE˜E—Kšœ	Ÿœ@˜MKšœŸœK˜TKšœŸœ7˜FšœŸœ˜KšœU˜U—šœŸœ˜KšœX˜X—šœŸœ˜KšœH˜H—KšœŸœA˜KKšœŸœ2˜BK˜ —š¡œŸœŸœŸœŸœŸœ˜[KšœŸœŸœŸœŸœŸœ˜:Kšœ	ŸœŸœŸœŸœŸœ˜OK˜5Kšœ2ŸœŸœ˜>KšœŸœC˜QKš
+ŸœŸœŸœŸœ
+Ÿœ˜7K˜K˜Kšœ˜—K˜ š¡	œŸœŸœ˜6Kšœ	Ÿœ"˜/KšœŸœ"˜4Kšœ
+ŸœŸ˜KšŸœŸœŸœ@Ÿœ˜dKšŸœŸœ"˜?K˜—K˜ š¡œŸœŸœŸœ˜2KšœŸœ˜KšœŸœ˜KšœŸœ˜KšœŸœ/˜>KšœŸœ8˜BKšœŸœ˜%K˜ Kšœ#ŸœŸœŸœ˜2KšœŸœ˜KšœŸœ˜%šŸœŸœŸœ˜K˜)šŸœŸœŸœ˜KšœŸœ˜Kšœ˜KšŸœ˜K˜—K˜—KšœŸœ%˜5K˜ šŸœŸœŸ˜Kšœ6ŸœŸœ
+Ÿœ˜S—šŸœŸœŸœ˜KšœŸœ4˜>Kšœ˜KšŸ˜K˜—šŸœ$Ÿœ˜,KšœŸœ ˜+KšœŸœ˜)KšœŸœŸœ
+Ÿœ˜.Kšœ˜KšŸ˜K˜—KšœŸœ3˜=K˜ šŸœŸœ˜šŸœ˜KšœŸœ<˜GKšœŸœL˜VKšŸœ˜K˜—KšŸœŸœ˜K˜K˜˜"šŸ˜Kšœ	Ÿœ˜——KšŸœ˜—KšœŸœŸœ
+Ÿœ˜.Kšœ˜K˜—K˜ š
+¡œŸœŸœ
+ŸœŸœ˜CKšœ
+Ÿœ@˜NKšœŸœ˜Kš
+ŸœŸœŸœŸœŸœ˜/KšœŸœ˜ KšœG ˜RKšœ2ŸœŸœ
+Ÿœ˜OKš
+ŸœŸœŸœŸœ
+Ÿœ˜(KšŸœŸœŸœ˜$Kšœ ˜#KšœŸœ˜KšœG ˜RK˜—K˜ š¡œŸœŸœŸœŸœŸœ˜GKšœ˜KšœŸœ˜KšœŸœ˜KšŸ˜KšœŸœ˜KšœŸœ˜KšœŸœ˜KšœŸœ˜KšœŸœ˜KšœŸœ ˜.KšœŸœ˜Kšœ
+Ÿœ"˜0KšœŸœ!˜-š¡œŸœŸœ˜,KšœŸœ˜ šŸœŸœŸœ˜KšœŸœ4˜@K˜ KšœŸœ4˜>KšœŸœ6˜FKšœ˜šœE˜EKšœ,˜,—Kšœ˜K˜—Kšœ˜šœ>˜>Kšœ+˜+—Kšœ*˜*Kšœ6˜6Kšœ˜K˜—K˜ Kšœ#ŸœŸœŸœ˜2KšœŸœ˜KšœŸœ&˜0K˜ šŸœŸœŸœ˜K˜HšŸœŸœ˜KšœŸœ˜Kšœ˜KšŸœ˜K˜—K˜—KšœŸœ˜'K˜ šŸœŸœŸ˜KšœŸœ9˜CšŸœ˜KšœŸœ)˜3šŸœ	ŸœŸœŸœŸœ
+ŸœŸ˜IKšœŸœ ˜*KšŸœ˜—KšœŸœ˜K˜——K˜ K˜0KšŸœŸœŸœ2˜DKšœ+˜+šŸœŸœ˜šœ˜KšœŸœH˜PKšœN˜NKšŸœ˜K˜—KšŸœŸœ˜K˜—K˜ KšœŸœ˜"šŸœŸœ˜KšœB˜BKšœ-˜-Kšœ˜KšŸœ˜K˜—K˜ Kšœ'Ÿœ˜.K˜$K˜&Kšœ!˜!K˜3K˜ K˜+K˜ K˜6K˜ šŸ˜KšœŸœ˜KšœŸœŸœ˜KšœŸœ˜KšœŸœ˜KšœŸœ˜Kšœ)˜)KšœŸœŸœ˜K˜ Kšœ"™"Kšœ7 ˜UšŸœŸœ˜"KšœŸœK˜UKšœŸœ:˜DKšŸœŸœŸœ ˜1KšœŸœ-˜7KšœŸœ3˜=Kšœ˜KšŸ˜K˜—K˜ ˜BKšœ$ŸœŸœ˜7—šŸœŸœŸœ˜KšœŸœ#˜.šŸœŸœ	Ÿœ ˜FšŸœ ˜Kšœ9˜9K˜;šŸœŸœ˜Kšœ(˜(Kšœ˜KšŸ˜Kšœ˜—šŸœŸœ ˜7KšœR˜RšŸœ	ŸœŸœ˜KšœŸœ ˜(Kšœ!˜!K˜—Kšœ,˜,Kšœ˜Kšœ(˜(K˜6KšŸœ˜K˜—K˜——K˜—K™ Kšœ™Kšœ$˜$šŸœŸœ ˜1K˜&Kšœ<˜<K˜K˜K˜KšŸœ˜K˜—K˜ šŸœ	ŸœŸœŸœŸœ
+ŸœŸ˜IšŸœŸ˜KšœŸœŸœ˜—KšŸœ˜—K˜ šŸœŸœŸœŸœ&˜TšŸ˜šŸœŸ˜Kšœ˜Kšœ˜K˜:K˜ šœ ˜&KšœŸœ#˜+KšœQŸœ˜ZKšœŸœ@˜JKšœ< ˜NKšœ%˜%Kšœ' ˜6K˜—šœ˜K˜;K˜ K˜—KšŸœ?˜F—K˜ K˜.šŸœ&Ÿœ˜.K˜/K˜#K˜K˜———KšŸœŸœŸœ˜K˜ šŸœŸœŸœ ;˜VKšœŸœ#˜.Kšœ	ŸœE˜RKšœŸœ7˜@šŸœŸœ˜Kšœ(˜(Kšœ˜KšŸ˜Kšœ˜—KšœC˜CKšœ˜Kšœ&˜&K˜6KšŸœ˜K˜K˜ —K˜K˜K˜K˜ KšŸœ˜—K˜ K˜/Kšœ"˜"Kšœ#˜#K˜ Kšœ;Ÿœ˜SK˜?Kšœ-˜-Kšœ˜K˜ šŸ˜KšœŸœ:˜CKšœŸœ,˜5Kšœ;˜;Kšœ"˜"Kšœ˜KšŸœŸœŸœ˜.KšŸœ˜K˜ šŸ˜˜
+Kšœ"˜"Kšœ-˜-Kšœ˜Kšœ˜KšŸœŸœŸœ˜.Kšœ˜K˜——KšŸœ˜KšŸœ˜—K˜—K˜ KšœŸœ,˜<KšœŸœ7˜HK˜ š¡
+œŸœŸœŸœŸœŸœŸœ˜OKšœ7™7šŸœŸ˜KšœŸœŸœ˜KšœŸœŸœ˜KšœŸœŸœ˜KšœŸœŸœ˜!KšœŸœŸœ˜KšœŸœŸœ˜KšœŸœŸœ˜KšœŸœŸœ˜KšœŸœŸœ˜KšœŸœŸœ˜KšœŸœŸœ˜KšœŸœŸœ˜KšœŸœŸœ˜#KšœŸœŸœ˜"KšœŸœŸœ˜$KšœŸœŸœ˜KšœŸœŸœ˜&KšœŸœŸœ˜$KšœŸœŸœ˜&KšœŸœŸœ˜(KšŸœŸœ˜—šŸœ
+Ÿœ˜KšœŸœ>˜GKšœŸœ&˜0K˜—KšŸœŸœ˜K˜—K˜ š¡œŸœŸœŸœ˜8KšœŸœ˜KšœŸœ˜KšœŸœ˜K˜)K˜+K˜KšœŸœ˜K˜Kšœ!Ÿœ˜)KšœŸœ˜Kšœ)Ÿœ˜1Kšœ#Ÿœ˜+KšœŸœ˜K˜ š¡œ˜&KšœŸœŸœ˜KšœŸœ˜KšœŸœ%˜-KšœŸœB˜LKšŸœŸœ ˜K˜—Kšœ˜KšŸœŸœ'˜;K˜K˜ šŸ˜K˜
+KšœŸœ	˜KšœŸœ	˜Kšœ6Ÿœ˜<KšŸœŸœŸœ˜šŸœ	ŸœŸœ˜KšœŸœ˜KšŸœŸœŸœ˜ KšœŸœ6˜@K˜K˜&šŸœ	Ÿœ˜KšœŸœ˜'KšŸ˜Kšœ˜—šœŸœ˜KšœT˜T—šŸœŸœŸ˜KšœŸœ8˜B—KšœŸœ˜'KšŸœ˜K˜—K˜šŸœŸ˜šœ˜K˜Kšœ#Ÿœ ˜EšŸœ˜	šŸœ	ŸœŸ˜K˜*KšŸœŸœ˜—K˜—K˜—šœ˜šŸœŸœ˜K˜K˜K˜—šŸœŸœ˜K˜/K˜&K˜—šŸœŸœ˜K˜K˜K˜—K˜—šŸœŸœ˜K˜ ——šœ!Ÿœ˜4KšœŸœ˜Kšœ	Ÿœ˜#šœŸœ˜KšœH˜H—KšœŸœA˜KKšœŸœ*˜4KšœŸœ?˜IšŸœ	ŸœŸ˜KšœŸœ0˜:—Kšœ˜KšŸœ˜	K˜—šŸœŸœŸœ˜&K˜K˜Kšœ˜šŸœ˜K˜K˜ K˜——K˜*šŸœŸœ˜KšœŸœ˜K˜K˜!K˜—KšŸœŸœ˜+K˜ K˜&KšœŸœ	˜#KšŸœ˜—K˜ šŸœŸœ˜KšœŸœL˜VKšŸ˜K˜—šŸ˜KšœŸœ˜šŸœŸ˜KšœŸœc˜m—KšœŸœU˜_šŸœŸœ˜KšœŸœF˜PK˜+K˜—šŸœŸœ˜KšœŸœJ˜TK˜-K˜—šŸœŸ˜šœ?˜?Kšœ+˜+——šŸœŸ˜šœ=˜=Kšœ;˜;——šŸœŸ˜šœ=˜=Kšœ+˜+——KšŸœ˜—K˜K˜ —š¡œŸœŸœŸœŸœŸœ˜TšŸœŸœ	Ÿ˜#šŸœŸœ
+ŸœŸœ˜>KšŸœŸœ˜——K˜—K˜ š¡œŸœ˜-Kšœ˜Kšœ&˜&Kšœ˜—K˜ š¡œ˜"KšœŸœŸœ˜KšŸœŸœŸœ˜'K˜K˜—K˜ š¡œŸœŸœŸœŸœŸœ˜:šŸœ.Ÿœ˜6K˜7KšŸœŸœ˜K˜—KšŸœŸœ˜K˜K˜ —K™˜,K˜K—K˜ K˜ K˜ KšŸœ˜K˜ š¡œ˜!KšœŸœŸœ˜Kšœ
+Ÿœ˜KšœŸœŸœŸœ˜,KšŸœŸœŸœ˜'K˜*šŸ˜KšœŸœ˜KšœŸœ"˜,KšŸœŸœŸœŸœ˜K˜šŸœŸœŸœ"Ÿœ˜IKšŸœŸœ,˜K—KšŸœ˜—KšŸœŸœ3˜PK˜K˜ —˜*K˜j—K˜ — …—    K   bø  

@@ -1,0 +1,435 @@
+DIRECTORY
+Ascii USING [CR, LF], 
+CharOps USING [Blank], 
+EditNotify USING [AddNotifyProc, Change, ChangeSet], 
+NodeProps USING [Is],
+Rope USING [Fetch, ROPE], 
+RopeReader USING [GetRopeReader, FreeRopeReader, Get, Ref, SetPosition], 
+TEditDisplay USING [], 
+TEditDocument USING [GetViewerForRoot, LineTable, maxClip, TEditDocumentData], 
+TEditInput USING [currentEvent], 
+TEditSelection USING [ComputePosLine, ComputeSpanLines, CannotFindIt], 
+TextEdit USING [Size], 
+TextNode USING [FirstChild, Forward, ForwardClipped, LastLocWithin, LastWithin, Level, Next, Parent, Root, StepForward], 
+Tioga USING [Node, Location, Span], 
+UndoEvent USING [Note, Event, EventRep, SubEvent], 
+ViewerClasses USING [Viewer], 
+ViewerOps USING [SetNewVersion];
+TEditDisplay2Impl: CEDAR MONITOR
+IMPORTS CharOps, EditNotify, NodeProps, Rope, RopeReader, TEditDocument, TEditInput, TEditSelection, TextEdit, TextNode, UndoEvent, ViewerOps
+EXPORTS TEditDisplay, Tioga
+= BEGIN
+Node: TYPE ~ Tioga.Node;
+Viewer: TYPE ~ ViewerClasses.Viewer;
+Change: TYPE ~ EditNotify.Change;
+Event: TYPE ~ UndoEvent.Event;
+EventRep: PUBLIC TYPE ~ UndoEvent.EventRep;
+
+SetNewVersion: PROC [viewer: Viewer] = {
+IF viewer # NIL THEN WITH viewer.data SELECT FROM
+tdd: TEditDocument.TEditDocumentData => {
+IF tdd.tsInfo = NIL THEN ViewerOps.SetNewVersion[viewer];
+};
+ENDCASE => NULL;
+};
+
+EstablishLine: PUBLIC ENTRY PROC [tdd: TEditDocument.TEditDocumentData, newLine: Tioga.Location, position: INTEGER ¨ 0] = {
+lines: TEditDocument.LineTable = tdd.lineTable;
+IF lines # NIL THEN {
+lines[position].pos ¨ newLine;
+lines[position].valid ¨ FALSE;
+};
+};
+
+UndoChangeViewer: PROC [undoRef: REF Change, currentEvent: Event] = {
+WITH undoRef SELECT FROM
+x: REF Change.ChangingView => {
+v: Viewer ¨ NARROW[x.view];
+IF v # NIL THEN
+WITH v.data SELECT FROM
+tdd: TEditDocument.TEditDocumentData => {
+IF NOT AlreadySaved[v] THEN {
+lines: TEditDocument.LineTable = tdd.lineTable;
+IF lines # NIL THEN
+SaveViewerPos[v, tdd.lineTable[0].pos];
+};
+[] ¨ EstablishLine[tdd, x.old] 
+};
+ENDCASE;
+};
+ENDCASE;
+};
+
+maxSearchDepth: NAT ¨ 20;
+AlreadySaved: PROC [v: Viewer] RETURNS [BOOL] = {
+k: NAT ¨ maxSearchDepth;
+IF TEditInput.currentEvent = NIL THEN RETURN [TRUE];
+FOR l: UndoEvent.SubEvent ¨ TEditInput.currentEvent.subevents, l.next UNTIL l=NIL DO
+WITH l.undoRef SELECT FROM
+x: REF Change.ChangingView => IF x.view = v THEN RETURN[TRUE];
+ENDCASE;
+IF (k ¨ k-1) = 0 THEN EXIT;
+ENDLOOP;
+RETURN [FALSE] 
+};
+
+SaveViewerPos: PROC [viewer: Viewer, oldLine: Tioga.Location] = {
+notify: REF Change.ChangingView ¨ NEW[Change.ChangingView];
+notify≠ ¨ [ChangingView[viewer, oldLine]];
+UndoEvent.Note[TEditInput.currentEvent, UndoChangeViewer, notify] 
+};
+
+UpdateAfterTextEdit: PROC [viewer: Viewer, text: Node, start, newlen, oldlen: INT, oldrope: Rope.ROPE] = {
+
+delta: INT = newlen-oldlen;
+end: INT = start+oldlen;
+Update: PROC [v: Viewer] = {
+tdd: TEditDocument.TEditDocumentData = NARROW[v.data];
+lines: TEditDocument.LineTable = tdd.lineTable;
+IF tdd = NIL THEN RETURN;
+SetNewVersion[v];
+IF NOT AlreadySaved[v] THEN SaveViewerPos[v, lines[0].pos]; -- record viewer start pos
+FOR n: INTEGER DECREASING IN [0..lines.lastLine] DO
+IF lines[n].pos.node = text THEN {
+where: INT ~ lines[n].pos.where;
+IF lines[n].valid AND MAX[where, start] <= MIN[where+lines[n].nChars, end] THEN lines[n].valid ¨ FALSE;
+SELECT where FROM
+<= start => {
+IF n > 0
+AND lines[n-1].pos.node=text
+AND lines[n-1].valid
+AND NOT lines[n].valid
+AND NOT (SELECT Rope.Fetch[text.rope, where-1] FROM
+Ascii.CR, Ascii.LF => TRUE, ENDCASE => FALSE)
+AND NOT LineContainsPreviousBlank[n, lines] THEN {
+lines[n-1].valid ¨ FALSE;
+};
+};
+>= end => lines[n].pos.where ¨ where+delta;
+ENDCASE => {
+IF n=0 THEN {
+lines[0].pos.where ¨ MIN[where, start+newlen];
+tdd.fixStart ¨ TRUE 
+};
+};
+};
+ENDLOOP;
+};
+LineContainsPreviousBlank: PROC [n: INTEGER, lines: TEditDocument.LineTable] RETURNS [yes: BOOL] = {
+rdr: RopeReader.Ref;
+lineStart: INT = lines[n].pos.where;
+searchEnd: INT = MIN[lineStart+lines[n].nChars, start];
+IF lineStart>=start THEN RETURN [FALSE];
+rdr ¨ RopeReader.GetRopeReader[];
+yes ¨ FALSE;
+RopeReader.SetPosition[rdr, text.rope, lineStart];
+FOR i: INT ¨ lineStart, i+1 UNTIL i=searchEnd DO
+IF CharOps.Blank[RopeReader.Get[rdr]] THEN { yes ¨ TRUE; EXIT };
+ENDLOOP;
+RopeReader.FreeRopeReader[rdr] 
+};
+Update[viewer];
+FOR v: Viewer ¨ viewer.link, v.link UNTIL v = NIL OR v=viewer DO
+Update[v];
+ENDLOOP;
+};
+
+InvalidateSpan: PUBLIC PROC [viewer: Viewer, span: Tioga.Span, errorFlag: BOOL ¨ TRUE, movingOut, unnesting: BOOL ¨ FALSE] = {
+InvalidateLinesInSpan: PROC [v: Viewer] = {
+start, end: INTEGER;
+startClipped, endClipped: BOOL;
+tdd: TEditDocument.TEditDocumentData = NARROW[v.data];
+lines: TEditDocument.LineTable = tdd.lineTable;
+IF tdd.movedOut AND tdd.movedIn THEN {
+start ¨ 0; end ¨ LAST[INTEGER];
+startClipped ¨ endClipped ¨ FALSE 
+}
+ELSE [start, end, startClipped, endClipped] ¨ TEditSelection.ComputeSpanLines[v, span ! 
+TEditSelection.CannotFindIt => {
+end ¨ LAST[INTEGER];
+startClipped ¨ endClipped ¨ FALSE;
+start ¨ IF errorFlag THEN 0 --invalidate all-- ELSE LAST[INTEGER] --invalidate none--;
+CONTINUE 
+} ];
+IF end < 0 THEN RETURN; -- off screen
+IF start = LAST[INTEGER] THEN
+IF (unnesting AND tdd.clipLevel < TEditDocument.maxClip) OR
+(lines[lines.lastLine].pos.node = span.start.node AND
+lines[lines.lastLine].pos.where+lines[lines.lastLine].nChars = span.start.where)
+THEN start ¨ lines.lastLine -- may be visible now
+ELSE RETURN;
+IF start < 0 THEN start ¨ 0; -- begins above screen
+IF end = LAST[INTEGER] THEN end ¨ tdd.lineTable.lastLine -- ends below screen
+ELSE IF endClipped AND (end > start OR NOT unnesting) THEN end ¨ end-1;
+FOR n: INTEGER IN [start..end] DO
+tdd.lineTable.lines[n].valid ¨ FALSE;
+ENDLOOP;
+IF movingOut THEN tdd.movedOut ¨ TRUE 
+};
+InvalidateLinesInSpan[viewer];
+FOR v: Viewer ¨ viewer.link, v.link UNTIL v = NIL OR v=viewer DO
+InvalidateLinesInSpan[v];
+ENDLOOP 
+};
+
+InvalidateChildren: PUBLIC PROC [viewer: Viewer, node: Node] = {
+child: Node;
+span: Tioga.Span;
+IF (child ¨ TextNode.FirstChild[node])=NIL THEN RETURN;
+span ¨ [[child, 0], TextNode.LastLocWithin[node]];
+InvalidateSpan[viewer, span] 
+};
+
+InvalidateBranch: PUBLIC PROC [viewer: Viewer, node: Node] = {
+span: Tioga.Span ¨ [[node, 0], TextNode.LastLocWithin[node]];
+InvalidateSpan[viewer, span] 
+};
+
+InvalidateBranchAndNext: PROC [viewer: Viewer, node: Node] = {
+last: Node = TextNode.LastWithin[node];
+next: Node = TextNode.Forward[last].nx;
+end: Node = IF next=NIL THEN last ELSE next;
+span: Tioga.Span ¨ [[node, 0], [end, TextEdit.Size[end]]];
+InvalidateSpan[viewer, span] 
+};
+
+UpdateStartPos: PROC [viewer: Viewer, first, last: Node] = {
+next: Node ¨ TextNode.StepForward[last];
+UpdateViewerStartPos: PROC [v: Viewer] = {
+tdd: TEditDocument.TEditDocumentData = NARROW[v.data];
+lines: TEditDocument.LineTable;
+IF tdd = NIL THEN RETURN;
+lines ¨ tdd.lineTable;
+IF lines[0].pos.node # next THEN RETURN;
+IF NOT AlreadySaved[v] THEN SaveViewerPos[v, lines[0].pos]; -- record viewer start pos
+lines[0].pos ¨ [first, 0];
+lines[0].valid ¨ FALSE 
+};
+UpdateViewerStartPos[viewer];
+FOR v: Viewer ¨ viewer.link, v.link UNTIL v = NIL OR v=viewer DO
+UpdateViewerStartPos[v];
+ENDLOOP;
+};
+
+InvalidateDest: PROC [viewer: Viewer, node: Node, movingIn, afterDest: BOOL] = {
+InvalidateDestLine: PROC [v: Viewer, dest: Tioga.Location] = {
+line: INTEGER;
+clipped,  failed: BOOL ¨ FALSE;
+WITH v.data SELECT FROM
+tdd: TEditDocument.TEditDocumentData => {
+IF movingIn THEN tdd.movedIn ¨ TRUE; -- remember that have moved nodes into this doc
+[line, clipped] ¨  TEditSelection.ComputePosLine[v, dest ! 
+TEditSelection.CannotFindIt => { failed ¨ TRUE; CONTINUE } ];
+IF failed AND tdd.clipLevel < TEditDocument.maxClip THEN {
+n: Node ¨ dest.node;
+delta: INTEGER ¨  TextNode.Level[n]-tdd.clipLevel;
+IF delta > 0 THEN {
+FOR i: INTEGER IN [0..delta) DO n ¨ TextNode.Parent[n]; ENDLOOP;
+n ¨ TextNode.ForwardClipped[n, tdd.clipLevel].nx;
+IF n # NIL THEN {
+dest ¨ [n, 0];
+afterDest ¨ failed ¨ FALSE;
+[line, clipped] ¨  TEditSelection.ComputePosLine[v, dest
+! TEditSelection.CannotFindIt => { failed ¨ TRUE; CONTINUE } ] 
+}
+}
+};
+IF failed OR line < 0 THEN RETURN; -- not visible
+IF line = LAST[INTEGER] THEN -- beyond last thing on viewer
+IF tdd.clipLevel < TEditDocument.maxClip THEN line ¨ tdd.lineTable.lastLine
+ELSE RETURN;
+IF afterDest AND NOT clipped AND line < tdd.lineTable.lastLine THEN line ¨ line+1;
+tdd.lineTable[line].valid ¨ FALSE;
+};
+ENDCASE;
+};
+pos: Tioga.Location = [node, 
+IF afterDest THEN TextEdit.Size[node] ELSE 0];
+InvalidateDestLine[viewer, pos];
+FOR v: Viewer ¨ viewer.link, v.link UNTIL v = NIL OR v=viewer DO
+InvalidateDestLine[v, pos];
+ENDLOOP ;
+};
+
+FirstLevelParent: PROC [node: Node] RETURNS [Node] = {
+prev1, prev2: Node;
+UNTIL node=NIL DO
+prev2 ¨ prev1;
+node ¨ TextNode.Parent[prev1 ¨ node];
+ENDLOOP;
+RETURN [prev2] 
+};
+
+SpanIsBranches: PROC [first, last: Node] RETURNS [BOOL] = {
+parent: Node = TextNode.Parent[first];
+n: Node ¨ last;
+IF TextNode.FirstChild[n] # NIL THEN RETURN [FALSE];
+DO
+SELECT (n ¨ TextNode.Parent[n]) FROM
+parent => RETURN [TRUE];
+NIL => EXIT;
+ENDCASE;
+IF TextNode.Next[n] # NIL THEN RETURN [TextNode.Parent[n] = parent];
+ENDLOOP;
+RETURN [FALSE] 
+};
+
+SpanFromNodes: PROC [first, last: Node] RETURNS [Tioga.Span] = {
+RETURN [[[first, 0], [last, MAX[TextEdit.Size[last], 1]-1]]] 
+};
+
+ViewerFromNode: PROC [node: Node] RETURNS [Viewer] ~ {
+IF node=NIL THEN RETURN[NIL];
+RETURN[TEditDocument.GetViewerForRoot[TextNode.Root[node]]];
+};
+
+NotifyBeforeEdit: PROC [change: REF READONLY Change] = {
+viewer: Viewer;
+span: Tioga.Span;
+WITH change SELECT FROM
+x: REF READONLY Change.NodeNesting => {
+IF (viewer ¨ ViewerFromNode[x.first])=NIL THEN RETURN;
+span ¨ SpanFromNodes[x.first, x.last];
+IF NOT SpanIsBranches[x.first, x.last] THEN
+span.end ¨ TextNode.LastLocWithin[FirstLevelParent[x.last]];
+InvalidateSpan[viewer, span, TRUE, FALSE, (x.change<0)] 
+};
+x: REF READONLY Change.MovingNodes => {
+IF (viewer ¨ ViewerFromNode[x.first]) # NIL THEN {
+branches: BOOL ¨ SpanIsBranches[x.first, x.last];
+span ¨ SpanFromNodes[x.first, x.last];
+IF NOT branches THEN span.end ¨ TextNode.LastLocWithin[FirstLevelParent[x.last]];
+InvalidateSpan[viewer, span, TRUE, TRUE];
+SetNewVersion[viewer] 
+};
+x.dest.dirty ¨ x.pred.dirty ¨ TRUE;
+IF (viewer ¨ ViewerFromNode[x.dest])=NIL THEN RETURN;
+InvalidateDest[viewer, x.dest, TRUE, x.afterDest] 
+};
+x: REF READONLY Change.ChangingProp => {
+x.node.dirty ¨ TRUE;
+IF (viewer ¨ ViewerFromNode[x.node])=NIL THEN RETURN;
+IF NodeProps.Is[x.name, $Visible] THEN {
+InvalidateBranchAndNext[viewer, x.node];
+};
+};
+ENDCASE;
+SetNewVersion[viewer];
+};
+
+NotifyAfterEdit: PROC [change: REF READONLY Change] = {
+viewer: Viewer;
+span: Tioga.Span;
+WITH change SELECT FROM
+x: REF READONLY Change.ChangingText => {
+x.text.dirty ¨ TRUE;
+IF (viewer ¨ ViewerFromNode[x.text])=NIL THEN RETURN;
+UpdateAfterTextEdit[viewer, x.text, x.start, x.newlen, x.oldlen, x.oldRope] 
+};
+x: REF READONLY Change.InsertingNode => {
+span: Tioga.Span;
+child: Node;
+x.new.new ¨ x.dest.dirty ¨ TRUE;
+IF (viewer ¨ ViewerFromNode[x.dest])=NIL THEN RETURN;
+SetNewVersion[viewer];
+InvalidateDest[viewer, x.dest, FALSE, TRUE];
+IF (child ¨ TextNode.FirstChild[x.new]) # NIL -- new inherited children of old
+THEN { -- must invalidate children too
+span ¨ [[child, 0], TextNode.LastLocWithin[x.new]];
+InvalidateSpan[viewer, span];
+UpdateStartPos[viewer, x.new, x.new] 
+}
+};
+x: REF READONLY Change.MovingNodes => {
+IF (viewer ¨ ViewerFromNode[x.dest])=NIL THEN RETURN;
+UpdateStartPos[viewer, x.first, x.last];
+IF SpanIsBranches[x.first, x.last] THEN RETURN;
+span.start ¨ [x.dest, 0];
+span.end ¨ TextNode.LastLocWithin[FirstLevelParent[x.last]];
+InvalidateSpan[viewer, span] 
+};
+ENDCASE;
+};
+
+Init: PROC = {
+beforeEditChanges: EditNotify.ChangeSet ¨ ALL[TRUE];
+afterEditChanges: EditNotify.ChangeSet ¨ ALL[FALSE];
+beforeEditChanges[ChangingText] ¨ FALSE;
+beforeEditChanges[InsertingNode] ¨ FALSE;
+EditNotify.AddNotifyProc[proc: NotifyBeforeEdit, time: before, changeSet: beforeEditChanges];
+afterEditChanges[MovingNodes] ¨ TRUE;
+afterEditChanges[InsertingNode] ¨ TRUE;
+afterEditChanges[ChangingText] ¨ TRUE;
+EditNotify.AddNotifyProc[proc: NotifyAfterEdit, time: after, changeSet: afterEditChanges];
+};
+
+Init[];
+END.
+
+
+  ∂  
+TEditDisplay2Impl.mesa
+Copyright ” 1985, 1986, 1987, 1988, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Russ Atkinson (RRA) June 13, 1985 5:32:13 pm PDT
+Michael Plass, March 2, 1987 10:39:29 pm PST
+Willie-s, February 13, 1991 6:02 pm PST
+Doug Wyatt, February 27, 1992 6:01 pm PST
+
+RRA: be careful here, just in case there is a race (one has been observed)
+Don't keep searching too long; give up and make a new event instead. - mfp
+invalidate lines containing old text and 1 line before
+update line offsets for other lines in same node that start beyond the replacement
+invalidate 1 line before start to take care of back ripple
+invalidate lines containing text from nodes in span
+cannot trust the line table anymore so invalidate everything
+we must have previously deleted either first/last node in viewer
+and span start/end node not in the viewer line table
+invalidate lines for children of node
+invalidate lines for children of node
+invalidate lines for children of node and one node beyond
+this takes care of case in which something has been inserted in front of the first node
+try adjusting for level clipping
+want span.last to be the last thing that can be influenced by the move
+this is a conservative but easy to compute span that is sure to get everything
+This is a property that can affect the appearance
+DiffCommentProps: PROC [n1, n2: Node] RETURNS [BOOL] = {
+RETURN [n1 = NIL OR n2 = NIL OR n1.comment # n2.comment] 
+};
+The following tests used to be done, but they can't be all inclusive since new Visible properties may be added.  Therefore, invalidate children unconditionally.  If this gets too expensive, we could perhaps conjure up a correct test.
+AND (x.dest.next # x.new --different levels-- OR
+x.dest.hasstyledef OR x.new.hasstyledef OR
+x.dest.hasprefix OR x.new.hasprefix OR
+x.dest.haspostfix OR x.new.haspostfix OR
+x.dest.hascharprops OR x.new.hascharprops OR
+x.dest.formatName # x.new.formatName OR 
+DiffCommentProps[x.dest, x.new])
+ù |  ïNewlineDelimiter
+ñ(cedarcode) styleô codeöúôKöú
+œeúOôZKô0Köú,ô,Kô'Köú)ô)Kô óöœk	ò	KöúûúûúûúòKöúûú
+òKöúûú%ò5Köú
+ûúòKöúûú	ûúòKöúûú9òIKöúûúòKöúûú<òOKöúûúò!Köúûú3òGKöú	ûú	òKöú	ûúkòyKöúûúò$Köú
+ûú$ò3KöúûúòKöú
+ûúò ólead2öœnúûúûò KöûúÜòçKöûúòKöúûòKöúûúòKöúûúò$Köúûúò!Köúûúòöú
+ûúûúò+Kò óöüúûúò(öûú
+ûúûúûúûúûò1öú)ò)Köûúûúûú!ò9KöúòóKöûúûúòóKöúòKò óö
+üúûúûúûúKûú	ò{Kò/öûú	ûúûúòKöúJôJKòKöúûúòKòóKòKò óöüúûúûú!òEöûú	ûúûòöúûúòKöúûú	òöûúûúûòöûúûúûòöú)ò)öûúûúûúòKò/öûú	ûúûòKöú'ò'óKòóKòKòóKöûúòóóKòóKöûúòóKòKò óKöúûúòöüúûúûúûúò1KöúûúòKö
+ûúûúûúûúûúò4öûúCûúûúûòTöûúûúûòKöúûúûúûúûúûúò>KöûúòóöûúûúûúòKôJóKöûúòóKöûúûúòKòKò óöüúûú.òAKöúûúûúò;Kò*KòBKòKò óöüúûú5ûúûúòjKöú6ô6KöúRôRKò KöúûúòKöúûúòöüúûúòKöú'ûú	ò6Kò/KöûúûúûúûúòKöúòKöûúûúûú!œcòVö	ûúûúû
+úûúûò3öûúûúò"Köúûúò KöûúûúûúûúûúûúògöûúûòöúòöûúòKöûúòKöûúòKöûúûúòöûúûúûú ûò3Köúûúûúûúûúûúò-óKöûúûú%ûúò2Köú:ô:KöúûúòKöúòóKöúòóKò+öûúòöûúûúòKöúûúò.KöúûúòKòóKöúòóóKöúòóKöûúòóKòóö
+üúûúûú"ûúûúòdKòKöúûúò$Köúûúûú#ò7Köûúûúûúûúò(Kò!KöúûúòKò2öûúûúûúûò0Köûú$ûú	ûúûúò@KöûúòóKòKòóKòö	ûú!ûúûúûú
+ûò@Kò
+KöûúòóKòKò óöüúûúûú/ûúûúûúûúò~Köú3ô3öüúûúò+KöúûúòKöúûúòKöú'ûú	ò6Kò/öûúûúûúò&Köú<ô<KöúûúûúòKöúûúò"KòóöûúTòXKò Köú@ô@Köú4ô4KöúûúûúòKöúûúò"Köúûúûú†úûúûúûú†úòVKöûúò	KòóKöûú	ûúûú†ò%Köûú	ûúûúûòKöûúûú(ûò;öú2ûò5KòPóöûú†ò1KöûúûúòóKöûúûú†ò3ö	ûúûúûúûú†òMKöûúûúûúûúûúûúòGóöûúûúûúûò!Köúûúò%KöûúòóKöûúûúûúò&KòóKòö	ûú!ûúûúûú
+ûò@KöúòKöûúòóKòKò óöüúûúûú!ò@Köú%ô%KòKòKöûú%ûúûúûúò7Kò2KòKòKò óöüúûúûú!ò>Köú%ô%Kò=KòKòKò óöüúûú!ò>Köú9ô9Kò'Kò'Kö	úûúûúûúûúò,Kò:KòKòKò óöüúûú(ò<KöúWôWKò(öüúûúò*Köú'ûú	ò6KòKöûúûúûúûúòKòKöûúûúûúò(Köûúûúûú!†òVKòKöúûúòKòóKòö	ûú!ûúûúûú
+ûò@KòKöûúòóKòKò óöüúûú3ûúòPöüúûú&ò>KöúûúòKöúûúûúòöûúûúûòKöú)ò)Köûú
+ûúûú†/òTò;Köú*ûúûúò=óöûúûú'ûúò:Köú ô KòKöúûú$ò2öûúûúòKö
+ûúûúûúûúûúò@Kò1öûúûúûúòKòKöúûúòò8Köú,ûúûúò?óKòóKòóKòóKö	ûúûú
+ûúûú†ò1Kö	ûúûúûúûú†ò;öûú'ûúòKKöûúûúòóKö
+ûúûúûú	ûúûúòRKöúûúò"KòóKöûúòKòóòKöûúûúûúò.óKò ö	ûú!ûúûúûú
+ûò@KöúòKöûúò	óKòKò óöüúûúûúò6KòöûúûúûòKòKò%KöûúòóKöûú	òKòKò óöüúûúûúûúò;Kò&KòKö
+ûúûúûúûúûúò4öûòöûúûò$Köú
+ûúûúòKöûúûúòKöûúòóKöûúûúûúûúòDKöûúòóKöûúûúòKòKò óöüúûúûúò@Köûúûúò=KòKò óöüúûúûúò6Kö
+ûúûúûúûúûúòKöûú6ò<KòKò óöüúûú
+ûúûúò8KöúòKòöûúûúûòöúûúûúò'Köûú$ûúûúûúò6Kò&Köûúûú!ûò+Kò<Köúûúûúò8Kòóöúûúûúò'öûú&ûúûúò2Köú
+ûú#ò1Kò&Köûúûú
+ûú=òQKöúFôFKöúNôNKöúûúûúò)KòKòóKöúûúò#Köûú#ûúûúûúò5Köúûúò2Kòóöúûúûúò(KöúûúòKöûú#ûúûúûúò5öûú ûúò(Köú1ô1Kò(KöúòóKòóKöûúòóKöúòKòKò óöüúûú
+ûúûúò7KöúòKòöûúûúûòöúûúûúò(KöúûúòKöûú#ûúûúûúò5KòLKòóöúûúûúò)KòKòöüúûúûúûúô8Kö
+ûúûúûúûúûúô9KôóKöúûúò Köûú#ûúûúûúò5KòKöúûúûúò,öûú(ûú† òNKôÈöûú†úûô0Köúûúûô*Köúûúûô&Köúûúûô(Köúûúûô,Köú%ûúô(Köú ô óöûú†ò&Kò3KòKò%KòóóKòóöúûúûúò'Köûú#ûúûúûúò5Kò(Köûú!ûúûúò/KòKò<KòKòóKöûúòóKòKò óöüúûúòKöú*ûúûúò4Köú)ûúûúò4Köú"ûúò(Köú#ûúò)Kò]Köú ûúò%Köú"ûúò'Köú!ûúò&KòZKòKò óKòKöûúòóKò Kò ó Öó    /¶  Gÿ  

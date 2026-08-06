@@ -1,0 +1,409 @@
+DIRECTORY Basics, Rope, RopeFile, Finalize, FinalizeOps, VM, UnixSysCallExtensions, Commander, IO;
+
+RopeFileImpl: CEDAR MONITOR
+IMPORTS Rope, Finalize, FinalizeOps, VM, UnixSysCallExtensions, Commander, IO
+EXPORTS RopeFile
+SHARES Rope
+~ BEGIN
+
+ROPE: TYPE ~ Rope.ROPE;
+ByteSequenceObject: TYPE ~ RopeFile.ByteSequenceObject;
+DeactivateResult: TYPE ~ RopeFile.DeactivateResult;
+
+Error: PUBLIC ERROR [ec: ATOM, explanation: ROPE] ~ CODE;
+
+bufferSize: NAT ~ 8192;
+
+Buffer: TYPE ~ REF BufferRep;
+BufferRep: TYPE ~ RECORD [
+byteSequenceObject: ByteSequenceObject,
+start: INT,
+end: INT,
+chars: POINTER TO Basics.RawBytes,
+interval: VM.Interval,
+rest: REF BufferRep
+];
+
+NewBuffer: PROC RETURNS [Buffer] ~ {
+interval: VM.Interval ~ VM.SimpleAllocate[VM.PagesForBytes[bufferSize]];
+buffer: Buffer ~ NEW[BufferRep];
+buffer.interval ¨ interval;
+buffer.chars ¨ LOOPHOLE[VM.AddressForPageNumber[interval.page]];
+[] ¨ FinalizeOps.EnableFinalization[buffer, finalizationQueue];
+RETURN [buffer]
+};
+
+maxSmallBlock: NAT ¨ 2*bufferSize;
+maxTextSize: NAT ~ NAT15.LAST+1-BYTES[TEXT[0]]-8;
+flatTrigger1: NAT ¨ MIN[bufferSize*4, maxTextSize];
+flatTrigger2: NAT ¨ flatTrigger1;
+
+filesMaxLimit: NAT = UnixSysCallExtensions.GetDTableSize1[std];
+filesMax: NAT ¨ MAX[filesMaxLimit/4, 1];
+
+bufferLimit: NAT ¨ filesMax;
+
+Flattery: PROC [byteSequenceObject: ByteSequenceObject, start: CARD, len: CARD] RETURNS [ROPE] = TRUSTED {
+SELECT len FROM
+<= flatTrigger1 => {
+text: Rope.Text ¨ Rope.NewText[len];
+TRUSTED {
+[] ¨ byteSequenceObject.move[byteSequenceObject, [base: LOOPHOLE[text], startIndex: BYTES[TEXT[0]], count: len], start];
+};
+RETURN [text];
+};
+ENDCASE => {
+half: INT = (len - len MOD 16) / 2;
+ret: ROPE = Flattery[byteSequenceObject, start, half];  -- preferred evaluation order
+start ¨ start + half;
+len ¨ len - half;
+RETURN [Rope.Concat[ret, Flattery[byteSequenceObject, start, len]]];
+};
+};
+
+CreateByteSequenceObject: PUBLIC PROC [
+length: [0..LAST[INT]],
+data: REF ANY,
+equal: PROC [self: ByteSequenceObject, other: ByteSequenceObject] RETURNS [BOOL],
+deactivate: PROC [self: ByteSequenceObject, final: BOOL] RETURNS [DeactivateResult],
+describe: PROC [self: ByteSequenceObject]
+	RETURNS [fileName: ROPE, created: ROPE, open: BOOL],
+move: UNSAFE PROC [self: ByteSequenceObject, block: Basics.UnsafeBlock, start: INT] RETURNS [charsMoved: INT ¨ 0]] RETURNS [ByteSequenceObject] ~ {
+byteSequenceObject: ByteSequenceObject ~ NEW[RopeFile.ByteSequenceObjectRep ¨ [length: length, data: data, equal: equal, deactivate: deactivate, describe: describe, move: move]];
+[] ¨ FinalizeOps.EnableFinalization[byteSequenceObject, finalizationQueue];
+RETURN [byteSequenceObject]
+};
+
+FromByteSequenceObject: PUBLIC PROC [byteSequenceObject: ByteSequenceObject, flatten: BOOL ¨ FALSE] RETURNS [rope: ROPE] ~ {
+length: NAT ~ byteSequenceObject.length;
+IF flatten OR length <= flatTrigger2
+THEN {
+rope ¨ Flattery[byteSequenceObject, 0, length];
+[] ¨ byteSequenceObject.deactivate[byteSequenceObject, FALSE];
+}
+ELSE {
+rope ¨ FindOld[byteSequenceObject];
+IF rope = NIL THEN {
+rope ¨ Rope.MakeRope[byteSequenceObject, byteSequenceObject.length, RopeFileFetch, RopeFileMap, RopeFileMove];
+Note[rope];
+};
+};
+};
+
+head: LIST OF Finalize.Handle ¨ LIST[NIL];
+Note: ENTRY PROC [rope: ROPE] ~ {
+handle: Finalize.Handle ~ FinalizeOps.EnableFinalization[rope, finalizationQueue];
+head.rest ¨ CONS[handle, head.rest];
+};
+
+Touch: ENTRY PROC [byteSequenceObject: ByteSequenceObject] ~ {
+prev: LIST OF Finalize.Handle ¨ head;
+FOR tail: LIST OF Finalize.Handle ¨ head.rest, tail.rest UNTIL tail = NIL DO
+WITH Finalize.HandleToObject[tail.first] SELECT FROM
+object: REF Rope.RopeRep.node.object => {
+IF object.base = byteSequenceObject THEN {
+prev.rest ¨ tail.rest;
+tail.rest ¨ head.rest;
+head.rest ¨ tail;
+RETURN
+};
+};
+ENDCASE;
+prev ¨ tail;
+ENDLOOP;
+};
+
+Remove: ENTRY PROC [handle: Finalize.Handle] ~ {
+prev: LIST OF Finalize.Handle ¨ head;
+FOR tail: LIST OF Finalize.Handle ¨ head.rest, tail.rest UNTIL tail = NIL DO
+IF tail.first = handle THEN { prev.rest ¨ tail.rest; tail.rest ¨ NIL; RETURN };
+prev ¨ tail;
+ENDLOOP;
+};
+
+FindOld: ENTRY PROC [byteSequenceObject: ByteSequenceObject] RETURNS [ROPE ¨ NIL] ~ {
+FOR tail: LIST OF Finalize.Handle ¨ head.rest, tail.rest UNTIL tail = NIL DO
+WITH Finalize.HandleToObject[tail.first] SELECT FROM
+rope: REF Rope.RopeRep.node.object => {
+IF rope.size = byteSequenceObject.length THEN {
+WITH rope.base SELECT FROM
+other: ByteSequenceObject => {
+IF byteSequenceObject.equal = other.equal AND byteSequenceObject.equal[byteSequenceObject, other] THEN RETURN [rope]
+}
+ENDCASE
+}
+}
+ENDCASE
+ENDLOOP
+};
+
+GetDeactivationTargets: ENTRY PROC [activeLimit: INT] RETURNS [list: LIST OF ByteSequenceObject ¨ NIL] ~ {
+FOR tail: LIST OF Finalize.Handle ¨ head.rest, tail.rest UNTIL tail = NIL DO
+WITH Finalize.HandleToObject[tail.first] SELECT FROM
+object: REF Rope.RopeRep.node.object => {
+WITH object.base SELECT FROM
+byteSequenceObject: ByteSequenceObject => {
+IF byteSequenceObject.describe[byteSequenceObject].open THEN {
+IF activeLimit > 0
+THEN activeLimit ¨ activeLimit - 1
+ELSE list ¨ CONS[byteSequenceObject, list];
+};
+};
+ENDCASE;
+};
+ENDCASE;
+ENDLOOP;
+};
+
+GetObjectList: ENTRY PROC RETURNS [list: LIST OF ByteSequenceObject ¨ NIL] ~ {
+FOR tail: LIST OF Finalize.Handle ¨ head.rest, tail.rest UNTIL tail = NIL DO
+WITH Finalize.HandleToObject[tail.first] SELECT FROM
+object: REF Rope.RopeRep.node.object => {
+WITH object.base SELECT FROM
+byteSequenceObject: ByteSequenceObject => {
+list ¨ CONS[byteSequenceObject, list];
+};
+ENDCASE;
+};
+ENDCASE;
+ENDLOOP;
+};
+
+LimitActive: PUBLIC PROC [activeLimit: INT] ~ {
+next: LIST OF ByteSequenceObject ¨ NIL;
+FOR list: LIST OF ByteSequenceObject ¨ GetDeactivationTargets[activeLimit], next UNTIL list = NIL DO
+byteSequenceObject: ByteSequenceObject ~ list.first;
+list.first ¨ NIL;
+next ¨ list.rest;
+list.rest ¨ NIL;
+[] ¨ byteSequenceObject.deactivate[byteSequenceObject, FALSE];
+ENDLOOP;
+};
+
+RopeFileFetch: Rope.FetchType ~ {
+byteSequenceObject: ByteSequenceObject ~ NARROW[data];
+buffer: Buffer ~ ObtainBuffer[byteSequenceObject, index];
+char: CHAR;
+TRUSTED { char ¨ VAL[buffer.chars[index-buffer.start]] };
+ReleaseBuffer[byteSequenceObject, buffer];
+RETURN [char]
+};
+
+RopeFileMap: Rope.MapType ~ {
+byteSequenceObject: ByteSequenceObject ~ NARROW[base];
+buffer: Buffer ¨ ObtainBuffer[byteSequenceObject, start];
+BEGIN ENABLE UNWIND => { ReleaseBuffer[byteSequenceObject, buffer] };
+FOR i: INT IN [start..start+len) UNTIL quit DO
+IF i >= buffer.end THEN {
+ReleaseBuffer[byteSequenceObject, buffer];
+buffer ¨ ObtainBuffer[byteSequenceObject, i];
+};
+TRUSTED { quit ¨ action[VAL[buffer.chars[i-buffer.start]]] };
+ENDLOOP;
+END;
+ReleaseBuffer[byteSequenceObject, buffer];
+};
+
+RopeFileMove: Rope.MoveType ~ UNCHECKED {
+byteSequenceObject: ByteSequenceObject ~ NARROW[data];
+MoveDataFromBuffer: UNSAFE PROC [buffer: Buffer] ~ INLINE {
+transfer: INT ~ MIN[INT[block.count], buffer.end-start];
+Basics.MoveBytes[dstBase: block.base, dstStart: block.startIndex, 
+srcBase: buffer.chars, srcStart: start-buffer.start, 
+count: transfer];
+block.startIndex ¨ block.startIndex + transfer;
+block.count ¨ block.count - transfer;
+start ¨ start + transfer;
+charsMoved ¨ charsMoved + transfer;
+ReleaseBuffer[byteSequenceObject, buffer];
+};
+IF block.count >= bufferSize THEN {
+wasAlreadyActive: BOOL ~ byteSequenceObject.describe[byteSequenceObject].open;
+buffer: Buffer ~ FindBuffer[byteSequenceObject, start, TRUE]; -- use buffered data if we happen to have it.
+IF buffer # NIL THEN { MoveDataFromBuffer[buffer] };
+UNCHECKED {
+moved: INT ¨ byteSequenceObject.move[byteSequenceObject, [base: block.base, startIndex: block.startIndex, count: block.count], start];
+block.startIndex ¨ block.startIndex + moved;
+block.count ¨ block.count - moved;
+start ¨ start + moved;
+charsMoved ¨ charsMoved + moved;
+};
+Touch[byteSequenceObject];
+IF NOT wasAlreadyActive THEN LimitActive[filesMax];
+};
+UNTIL block.count = 0 DO
+buffer: Buffer ~ ObtainBuffer[byteSequenceObject, start];
+MoveDataFromBuffer[buffer];
+ENDLOOP;
+};
+
+ObtainBuffer: PROC [byteSequenceObject: ByteSequenceObject, index: INT] RETURNS [buffer: Buffer] ~ {
+buffer ¨ FindBuffer[byteSequenceObject, index];
+IF buffer = NIL THEN buffer ¨ NewBuffer[];
+IF NOT ((buffer.byteSequenceObject = byteSequenceObject) AND (index IN [buffer.start..buffer.end))) THEN {
+wasAlreadyActive: BOOL ~ byteSequenceObject.describe[byteSequenceObject].open;
+buffer.byteSequenceObject ¨ byteSequenceObject;
+buffer.start ¨ (CARD[index] / bufferSize) * bufferSize;
+buffer.end ¨ MIN[buffer.start + bufferSize, byteSequenceObject.length];
+TRUSTED {
+moved: INT ¨ byteSequenceObject.move[byteSequenceObject, [base: buffer.chars, startIndex: 0, count: buffer.end-buffer.start], buffer.start];
+IF buffer.start+moved # buffer.end THEN Error[$BadMove, "RopeFileImpl: Failed to get expected amount of data"];
+};
+Touch[byteSequenceObject];
+IF NOT wasAlreadyActive THEN LimitActive[filesMax];
+};
+};
+
+bufferHead: Buffer ~ NEW[BufferRep];
+
+FindBuffer: ENTRY PROC [byteSequenceObject: ByteSequenceObject, index: INT, exact: BOOL ¨ FALSE] RETURNS [Buffer] ~ {
+nBuffers: INT ¨ 0;
+prev: Buffer ¨ bufferHead;
+prevPrev: Buffer ¨ NIL;
+preTarget: Buffer ¨ NIL;
+UNTIL prev.rest = NIL DO
+this: Buffer ~ prev.rest;
+IF this.byteSequenceObject = NIL THEN preTarget ¨ prev;
+IF (this.byteSequenceObject = byteSequenceObject AND index IN [this.start..this.end)) THEN {
+prev.rest ¨ prev.rest.rest;
+this.rest ¨ NIL;
+RETURN [this]
+};
+nBuffers ¨ nBuffers + 1;
+prevPrev ¨ prev;
+prev ¨ prev.rest;
+ENDLOOP;
+IF exact THEN RETURN [NIL];
+IF preTarget # NIL THEN {
+this: Buffer ~ preTarget.rest;
+preTarget.rest ¨ preTarget.rest.rest;
+this.rest ¨ NIL;
+RETURN [this]
+};
+IF nBuffers < bufferLimit OR prevPrev = NIL THEN RETURN [NIL] ELSE {
+this: Buffer ~ prev; -- least-recently used buffer.
+prevPrev.rest ¨ NIL;
+RETURN [this]
+};
+};
+
+ReleaseBuffer: ENTRY PROC [byteSequenceObject: ByteSequenceObject, buffer: Buffer] ~ {
+IF buffer.rest # NIL OR buffer.byteSequenceObject # byteSequenceObject THEN ERROR;
+buffer.rest ¨ bufferHead.rest;
+bufferHead.rest ¨ buffer;
+};
+
+finalizationQueue: FinalizeOps.CallQueue = FinalizeOps.CreateCallQueue[Finalizer];
+Finalizer: FinalizeOps.FinalizeProc ~ {
+WITH object SELECT FROM
+object: REF Rope.RopeRep.node.object => {
+Remove[handle];
+WITH object.base SELECT FROM
+byteSequenceObject: ByteSequenceObject => {
+KillBuffers[byteSequenceObject];
+[] ¨ byteSequenceObject.deactivate[byteSequenceObject, FALSE];
+}
+ENDCASE
+};
+buffer: Buffer => {
+buffer.chars ¨ NIL;
+TRUSTED { VM.Free[buffer.interval] };
+buffer.interval ¨ VM.nullInterval;
+};
+byteSequenceObject: ByteSequenceObject => {
+[] ¨ byteSequenceObject.deactivate[byteSequenceObject, TRUE];
+};
+ENDCASE;
+};
+
+KillBuffers: ENTRY PROC [byteSequenceObject: ByteSequenceObject] ~ {
+FOR buffer: Buffer ¨ bufferHead.rest, buffer.rest UNTIL buffer = NIL DO
+IF buffer.byteSequenceObject = byteSequenceObject THEN buffer.byteSequenceObject ¨ NIL;
+ENDLOOP;
+};
+
+Deactivate: PUBLIC PROC [rope: ROPE] ~ {
+WITH rope SELECT FROM
+x: REF Rope.RopeRep.node => TRUSTED {
+WITH x: x SELECT FROM
+substr => Deactivate[x.base];
+concat => { Deactivate[x.base]; Deactivate[x.rest] };
+replace => { Deactivate[x.base]; Deactivate[x.replace] };
+object => IF x.fetch = RopeFileFetch THEN {
+WITH x.base SELECT FROM
+byteSequenceObject: ByteSequenceObject => {
+[] ¨ byteSequenceObject.deactivate[byteSequenceObject, FALSE];
+};
+ENDCASE
+};
+ENDCASE
+};
+ENDCASE;
+};
+
+RopeFilesCommand: Commander.CommandProc ~ {
+FOR tail: LIST OF ByteSequenceObject ¨ GetObjectList[], tail.rest UNTIL tail = NIL DO
+byteSequenceObject: ByteSequenceObject ~ tail.first;
+P: PROC [fileName: ROPE, created: ROPE, open: BOOL] ~ {
+status: ROPE ~ IF open THEN "O" ELSE "X";
+IO.PutFL[cmd.out, "%g\n %g %9d  %g\n", LIST[[rope[fileName]], [rope[status]], [integer[byteSequenceObject.length]], [rope[created]]]];
+};
+[] ¨ APPLY [P, byteSequenceObject.describe[byteSequenceObject]];
+ENDLOOP;
+};
+
+Commander.Register["RopeFiles", RopeFilesCommand, "Lists the files currently in use as RopeFiles"];
+
+END.
+     
+RopeFileImpl.mesa
+Copyright ” 1985, 1986, 1987, 1988, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Doug Wyatt, February 6, 1987 6:01:58 pm PST
+Carl Hauser, July 14, 1988 1:31:14 pm PDT
+JKF August 29, 1988 11:36:43 am PDT
+Russ Atkinson (RRA) October 5, 1988 8:07:25 pm PDT
+Michael Plass, April 6, 1992 11:13 am PDT
+Christian Jacobi, July 24, 1992 2:43 pm PDT
+
+To disable these UnsafeGetBlock calls, set maxSmallBlock to INT.LAST.
+
+This rope should be made out of one flat piece
+This rope should be made out of flat pieces
+Moves to the front.
+Searches for an extant rope that describes the same data.
+PROC [data: REF, index: INT] RETURNS [CHAR]
+PROC [base: REF, start, len: INT, action: ActionType] 
+RETURNS [quit: BOOL ¨ FALSE]
+UNSAFE PROC [block: UnsafeBlock, data: REF, start: INT] 
+RETURNS [charsMoved: INT ¨ 0]
+Must have start IN [buffer.start..buffer.end)
+Bypass buffers on long requests.
+Gets a buffer with valid data.
+Tries to find a buffer with valid data; failing that, may return another buffer (unless exact=TRUE) or NIL.
+Found an empty buffer; use it.
+Note: since the rope might actually be passed out again after it has entered the finalization queue; we must stop short of breaking it entirely here.  We do not completely deactivate the byteSequenceObject until it is finalized.
+These should get finalized only if a client dies with a buffer checked out.
+Since we don't keep a table of FinalizeOps handles to these, we know that there are no references and we can fully deactivate.
+Invalidates buffers for a rope that has been finalized.
+ù Ê  ñ(cedarcode) styleïNewlineDelimiter
+ô codeöúôKöú
+œeúOôZKô+Kô)Kô#Kô2Kô)Kô+Kô óöœk	ú0ûú'òbKò óKöœnúûúûòKöûúûú&òMKöûú	òKöûúòöúûòKò KöûúûúûúòKöúûúò7öúûúò3Kò óöüúûúûúûúûúûúò9Kò óöúûúòKò óKöúûúûúòöúûúûúòKöú'ò'KöúûúòKöúûúò	Köúûúûúò"Köú
+ûú
+òKöúûú
+òKöúòKò óöü	úûúûúò$Köú
+ûúûúûúòHKöúûúò KöúòKöúûúûú&ò@Kò?Köûú	òKöúòKò óöúûúò"Köú<ûúûúôEKô óKöúûúûúûúûúûúò1Köúûúûúò3öúûúò!Kò óKöúûú-ò?öú
+ûúûúò(Kò óöúûúòKò óöüúûú1ûúûúûúûúûúòjöûúûòöúòKô.Köú$ò$öûúò	Köú8ûúûúûúòxKöúòóKöûúòKòóöûúòKô+Köúûúûú	ò#Köúûú/œcòUKòKòKöûú>òDKòóóKòKò óö0üúûúûúûúûú
+ûúûú	ûú7ûúûúûú#ûúûúûúûúûúûúûú	ûúûú>ûúûúûúûúòÈKöú)ûúÜò≤KòKKöûúòKöúòKò óöüúûúûú3ûúûúûúûúò|Köúûúò(öûú	ûúò$öûúòKöú/ò/Köú7ûúò>KöúòóöûúòKöú#ò#öûúûúûúòKöúnònKöúòKöúòóKöúòóóKöúòKò óKö	úûúûúûúûúò*öüúûúûúûúò!KòRKöúûúò$KöúòKò óöüúûúûú-ò>KôKöúûúûúò%öûúûúûú(ûúûúûòLöûú%ûúûò4öúûúò)öûú"ûúò*KöúòKöúòKöúòKöûòKöúòóKöúòóKöûúòóKòKöûúòóKöúòKò óöüúûúûúò0Köúûúûúò%öûúûúûú(ûúûúûòLKöûúûú&ûúûúòOKòKöûúòóKöúòKò óöüúûúûú*ûúûúûúòUKô9öûúûúûú(ûúûúûòLöûú%ûúûò4öúûúò'öûú'ûúò/öûúûúûòöúòKöûú(ûú5ûúûúòtKöúòóKöûòóKöúòóKöúòóKöûòóKöûòóKöúòKò óöüúûúûúûúûúûúûúûúòjöûúûúûú(ûúûúûòLöûú%ûúûò4öúûúò)öûúûúûòöú+ò+öûú6ûúò>öûúòKöûúò"Köûúûúò+óKöúòóKöúòóKöûúòóKöúòóKöûúòóKöûúòóKöúòKò óöüúûúûúûúûúûúûúòNöûúûúûú(ûúûúûòLöûú%ûúûò4öúûúò)öûúûúûòöú+ò+Köúûúò&KöúòóKöûúòóKöúòóKöûúòóKöûúòóKöúòKò óöüúûúûúûúò/Köúûúûúûúò'öûúûúûú@ûúûúûòdKöú4ò4KöúûúòKöúòKöúûúòKöú7ûúò>KöûúòóKöúòKò óöüúò!Kö
+ûúûú	ûúûúûúô+Köú)ûúò6Köú9ò9KöúûúòKöûú
+ûú%ò9Köú*ò*KöûúòKöúòKò óöüúòKöûúûúûúûúûúûúôSKöú)ûúò6Köú9ò9öûúûúûú2òEö	ûúûúûúûúûò.öûúûúòKöú*ò*Köú-ò-KòóKöûúûú"ò=KöûúòóKöûúòóKöú*ò*KöúòKò óöüúû	úò)Köûúûúûú	ûúûúûúôVKöú)ûúò6öüúûúûúûúò;Köúûúô-Köú
+ûúûúûú!ò8KöúäòäKöú/ò/Köú%ò%KöúòKöú#ò#Köú*ò*Köúòóöûúûúò#Kô Köúûú8òNKöú7ûú†-òkKöûú
+ûúûú ò4öû	úòKöúûú|òÜKò,Kò"KòKò KòóKòKöûúûúûúò3KòóöûúûòKöú9ò9KòKöûúòóKöúòKò óöüúûú1ûúûúòdKôKöú/ò/Köûú
+ûúûúò*ö
+ûúûú3ûúûúûúòjKöúûú8òNKöú/ò/Köúûú#ò7Köúûú7òGöûúò	KöúûúÇòåKöûú!ûúHòoKöúòóKöúòKöûúûúûúò3KöúòóKöúòKò óöúûúò$Kò óöü
+úûúûú1ûú	ûúûúûúòuKôkKöú
+ûúòKöúòKöúûúòKöúûúòöûúûúûòKöúòKöûúûúûúò7öûú/ûúûúûúò\KòKöúûúòKöûúòKöúòóKòKöúòKòKöûúòóKöûúûúûúûúòöûúûúûúòKôKöúòKöú%ò%KöúûúòKöûúòKöúòóöûúûúûúûúûúûúûúòDKöú†ò3KöúûúòKöûúòKöúòóKöúòKò óöüúûúûú=òVKö
+ûúûúûú0ûúûúòRKöúòKöúòKöúòKò óKòRöü	úò'öûúûúûòöúûúò)Köúòöûúûúûòöú+ò+Köú‰ô‰Köú ò Köú7ûúò>KöúòóKöûòóKöúòóöúòKôKKöúûúòKöûúûúò%Köúûúò"Köúòóöú+ò+Kô~Köú7ûúò=KöúòóKöûúòóKöúòKò óöüúûúûú-òDKô7öûú/ûú
+ûúûòGKöûú0ûúûúòWKöûúòóKöúòKò óöü
+úûúûúûúò(öûúûúûòöúûúûúò%öûúûúûòKöúòKöú5ò5Köú9ò9öú
+ûúûúò+öûúûúûòöú+ò+Köú7ûúò>KöúòóKöûòóKöúòóKöûòóKöúòóKöûúòóKöúòKò óöüúò+öûúûúûú1ûúûúûòUKöú4ò4ö
+üúûúûúûúûúò7Kö	úûúûúûúûúò)Köûú%ûú[òÜKöúòóKöúûú6ò@KöûúòóKöúòKò óöúcòcKò óóKöûúòó Öó    .‘  D⁄  

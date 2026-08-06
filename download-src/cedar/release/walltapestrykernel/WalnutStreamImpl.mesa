@@ -1,0 +1,828 @@
+
+DIRECTORY
+Atom USING [MakeAtomFromRefText],
+Basics USING [LongNumber],
+BasicTime USING [GMT, nullGMT, FromPupTime, Now],
+Convert USING [Error, IntFromRope, RopeFromTimeRFC822, TimeFromRope],
+FS USING [Create, Error, GetInfo, nullOpenFile, Open, OpenFile, <<SetByteCountAndCreatedTime, SetPageCount,>> StreamBufferParms, StreamFromOpenFile, StreamOpen, StreamOptions, <<ErrorFromStream,>> Close, OpenFileFromStream<<, OpenOrCreate>> ],
+IO,
+MailBasics USING [RName, Timestamp],
+MailUtils USING [GetTimeFromPostmark, IsThisAPostmark],
+SendMailParseMsg USING [MsgHeaders, ParseProc, ParseMsgFromStream],
+RefText USING[line, page, TrustTextAsRope],
+Rope,
+SendMailOps USING [RopeFromStream],
+SimpleFeedback USING [Append, PutFL],
+ThisMachine USING [Address],
+ViewerTools USING [TiogaContents],
+WalnutDefs USING [Error],
+WalnutKernelDefs USING [LogEntry, LogEntryObject, MsgLogEntry],
+WalnutStream;
+
+WalnutStreamImpl: CEDAR PROGRAM
+
+IMPORTS
+Atom, BasicTime, Convert, FS, IO, MailUtils, SendMailOps, SendMailParseMsg, RefText, Rope, SimpleFeedback, ThisMachine,
+WalnutDefs
+
+EXPORTS
+WalnutStream
+
+= BEGIN
+OPEN WalnutStream;
+
+GMT: TYPE = BasicTime.GMT;
+ROPE: TYPE = Rope.ROPE;
+STREAM: TYPE = IO.STREAM;
+LogEntry: TYPE = WalnutKernelDefs.LogEntry;
+LogEntryObject: TYPE = WalnutKernelDefs.LogEntryObject;
+MsgLogEntry: TYPE = WalnutKernelDefs.MsgLogEntry;
+entryHeaderRope: ROPE = "*entry* %10g\n";
+entryHeaderLen: INT = 19;
+
+copyBuffer: REF TEXT = NEW[TEXT[RefText.page]];
+
+field1: REF TEXT ¨ NEW[TEXT[RefText.line]];
+logInfoRef: PUBLIC LogInfoRef ¨ NEW[LogInfoArray];
+
+InitLogInfoRef: PROC = {		-- start code
+logInfoRef.logFileInfo ¨ NEW[LogFileInfo LogEntryObject];
+logInfoRef.createMsg ¨ NEW[CreateMsg LogEntryObject];
+logInfoRef.expungeMsgs ¨ NEW[ExpungeMsgs LogEntryObject];
+logInfoRef.writeExpungeLog ¨ NEW[WriteExpungeLog LogEntryObject];
+
+logInfoRef.createMsgSet ¨ NEW[CreateMsgSet LogEntryObject];
+logInfoRef.emptyMsgSet ¨ NEW[EmptyMsgSet LogEntryObject];
+logInfoRef.destroyMsgSet ¨ NEW[DestroyMsgSet LogEntryObject];
+logInfoRef.addMsg ¨ NEW[AddMsg LogEntryObject];
+logInfoRef.removeMsg ¨ NEW[RemoveMsg LogEntryObject];
+logInfoRef.moveMsg ¨ NEW[MoveMsg LogEntryObject];
+logInfoRef.hasbeenRead ¨ NEW[HasBeenRead LogEntryObject];
+
+logInfoRef.recordNewMailInfo ¨ NEW[RecordNewMailInfo LogEntryObject];
+logInfoRef.startCopyNewMail ¨ NEW[StartCopyNewMail LogEntryObject];
+logInfoRef.endCopyNewMailInfo ¨ NEW[EndCopyNewMailInfo LogEntryObject];
+logInfoRef.acceptNewMail ¨ NEW[AcceptNewMail LogEntryObject];
+
+logInfoRef.startReadArchiveFile ¨ NEW[StartReadArchiveFile LogEntryObject];
+logInfoRef.endReadArchiveFile ¨  NEW[EndReadArchiveFile LogEntryObject];
+logInfoRef.startCopyReadArchive ¨  NEW[StartCopyReadArchive LogEntryObject];
+logInfoRef.endCopyReadArchiveInfo ¨  NEW[EndCopyReadArchiveInfo LogEntryObject];
+logInfoRef.endOfLog ¨ NEW[EndOfLog LogEntryObject];
+};
+
+
+Open: PUBLIC PROC[name: ROPE, readOnly: BOOL ¨ FALSE, pages: INT ¨ 200,
+		useOldIfFound: BOOL ¨ FALSE, exclusive: BOOL ¨ FALSE]
+RETURNS [strm: STREAM] = {
+IF name.Find[".alpine]", 0, FALSE] = -1 THEN {		-- file elsewhere
+IF readOnly THEN
+strm ¨ FS.StreamOpen[ fileName: name,
+streamOptions: localStreamOptions, streamBufferParms: streamBufferOption]
+ELSE {
+openFile: FS.OpenFile ¨ FS.nullOpenFile;
+IF useOldIfFound THEN
+openFile ¨ FS.Open[name, $write ! FS.Error =>
+IF error.code = $unknownFile THEN CONTINUE ELSE REJECT];
+IF openFile = FS.nullOpenFile THEN
+openFile ¨ FS.Create[name: name, keep: 2, pages: pages];
+strm ¨ FS.StreamFromOpenFile[
+openFile: openFile,
+accessRights: $write,
+streamOptions: localStreamOptions, streamBufferParms: streamBufferOption];
+};
+}
+ELSE {		-- alpine file
+openFile: FS.OpenFile;
+
+IF readOnly THEN {
+openFile ¨ FS.Open[name: name];
+strm ¨ FS.StreamFromOpenFile[openFile: openFile, streamOptions: fileStreamOptions, streamBufferParms: streamBufferOption];
+<<}
+ELSE {
+actualPages: INT;
+openFile ¨ FS.OpenOrCreate[name: name, pages: pages];
+actualPages ¨ FS.GetInfo[openFile].pages;
+<<IF pages > actualPages THEN FS.SetPageCount[openFile, pages];>>
+
+strm ¨ FS.StreamFromOpenFile[openFile: openFile, accessRights: $write,
+initialPosition: $start, streamOptions: fileStreamOptions, streamBufferParms: streamBufferOption];>>
+};
+};
+};
+
+
+streamBufferOption: FS.StreamBufferParms = [vmPagesPerBuffer: 4, nBuffers: 4];
+fileStreamOptions: FS.StreamOptions ¨
+[  tiogaRead: FALSE,
+truncatePagesOnClose: FALSE,
+closeFSOpenFileOnClose: TRUE];
+
+localStreamOptions: FS.StreamOptions ¨
+[ tiogaRead: FALSE,
+truncatePagesOnClose: FALSE,
+closeFSOpenFileOnClose: TRUE];
+
+
+Aborted: PUBLIC PROC [strm: STREAM] RETURNS [aborted: BOOL] = {
+<<
+code: ATOM ¨ FS.ErrorFromStream[strm].code;
+aborted ¨ (code = $transAborted);
+>>
+aborted ¨ TRUE;
+};
+
+AbortStream: PUBLIC PROC[strm: STREAM] =
+{ FS.Close[FS.OpenFileFromStream[strm]] };
+
+FlushStream: PUBLIC PROC[strm: STREAM, setCreateDate: BOOL ¨ FALSE] = {
+IF setCreateDate THEN {
+of: FS.OpenFile = FS.OpenFileFromStream[strm];
+<<FS.SetByteCountAndCreatedTime[of, -1, BasicTime.Now[]];>>
+};
+strm.Flush[]
+};
+
+SetHighWaterMark: PUBLIC PROC[
+strm: STREAM, hwmBytes: INT, numPages: INT, setCreateDate: BOOL] = {
+of: FS.OpenFile = FS.OpenFileFromStream[strm];
+strm.SetLength[hwmBytes];
+strm.Flush[];		-- make it notice the SetLength
+strm.SetIndex[hwmBytes];  -- position stream there
+<<IF setCreateDate THEN FS.SetByteCountAndCreatedTime[of, -1, BasicTime.Now[]];>>
+IF numPages = -1 THEN RETURN;
+IF FS.GetInfo[of].pages <= numPages THEN RETURN;
+<<FS.SetPageCount[of, numPages];>>
+};
+
+SetPosition: PUBLIC PROC[strm: STREAM, index: INT] RETURNS[ok: BOOL] = {
+pos: INT ¨ IF index = -1 THEN strm.GetLength[] ELSE index;
+ok ¨ TRUE;
+strm.SetIndex[pos ! IO.Error, IO.EndOfStream => {ok ¨ FALSE; CONTINUE}];
+};
+
+ReadRope: PUBLIC PROC[strm: STREAM, len: INT] RETURNS[r: ROPE] = {
+r ¨ SendMailOps.RopeFromStream[strm, strm.GetIndex[], len !
+IO.EndOfStream => CONTINUE];
+};
+
+
+FindNextEntry: PUBLIC PROC[strm: STREAM] RETURNS[startPos: INT] = {
+ENABLE IO.EndOfStream => GOTO exit;
+state: INTEGER ¨ 0;
+length: INT;
+initialPos: INT = strm.GetIndex[];
+startPos ¨ -1;
+DO
+SELECT strm.GetChar[] FROM
+'* => IF state = 6 THEN state ¨ 7 ELSE state ¨ 1;
+'e => IF state = 1 THEN state ¨ 2 ELSE state ¨ 0; 
+'n => IF state = 2 THEN state ¨ 3 ELSE state ¨ 0; 
+'t => IF state = 3 THEN state ¨ 4 ELSE state ¨ 0; 
+'r => IF state = 4 THEN state ¨ 5 ELSE state ¨ 0; 
+'y => IF state = 5 THEN state ¨ 6 ELSE state ¨ 0; 
+ENDCASE => state ¨ 0;
+IF state = 7 THEN {
+strm.SetIndex[startPos ¨ strm.GetIndex[] - 7];
+length ¨ CheckForValidPrefix[strm, startPos];
+IF length # -1 THEN {
+strm.SetIndex[startPos];
+RETURN
+};
+strm.SetIndex[startPos+1];
+};
+ENDLOOP;
+
+EXITS
+exit => {startPos ¨ -1; RETURN};
+};
+
+
+ReadEntry: PUBLIC PROC[strm: STREAM, quick: BOOL]
+	RETURNS[le: LogEntry, length: INT] = {
+ENABLE IO.EndOfStream => WalnutDefs.Error[$log, $EndOfStream, "Unexpected EOS"];
+
+ident: ATOM;
+startPos: INT¨0;
+BEGIN ENABLE IO.Error =>
+IF ec = SyntaxError THEN
+WalnutDefs.Error[$log, $SyntaxError,
+IO.PutFR1["Syntax error in message starting at %g", [integer[startPos]] ] ]
+ELSE REJECT;
+
+IF (startPos ¨ strm.GetIndex[]) = strm.GetLength[] THEN {
+logInfoRef.endOfLog.length ¨ startPos;
+RETURN[logInfoRef.endOfLog, -1];
+};
+length ¨ CheckForValidPrefix[strm, startPos];
+IF length = -1 THEN RETURN;		-- not a valid entry here
+
+ident ¨ Atom.MakeAtomFromRefText[strm.GetLine[field1]];
+
+SELECT ident FROM
+
+$LogFileInfo => {
+IF startPos # 0 THEN ERROR WalnutDefs.Error[$log, $BadLog,
+IO.PutFR1["LogInfo is at pos %g instead of at 0", [integer[startPos]] ] ];
+logInfoRef.logFileInfo.key ¨ ReadLine[strm];
+logInfoRef.logFileInfo.internalFileID ¨
+Convert.IntFromRope[RefText.TrustTextAsRope[strm.GetLine[field1]] ];
+logInfoRef.logFileInfo.logSeqNo ¨
+Convert.IntFromRope[RefText.TrustTextAsRope[strm.GetLine[field1]] ];
+RETURN[logInfoRef.logFileInfo, length];
+};
+
+$CreateMsg => {
+logInfoRef.createMsg.msg ¨ MsgNameFromIdOnFile[strm];
+logInfoRef.createMsg.textLen ¨ strm.GetInt[];
+logInfoRef.createMsg.formatLen ¨ strm.GetInt[];
+[] ¨ strm.GetChar[];			-- glide over the CR after formatLen
+logInfoRef.createMsg.entryStart ¨ startPos;
+logInfoRef.createMsg.textOffset ¨ strm.GetIndex[] - startPos;
+IF quick THEN ScanForHeadersLen[strm, logInfoRef.createMsg]
+ELSE MsgEntryInfoFromStream[strm, logInfoRef.createMsg];
+strm.SetIndex[startPos+length];		-- consume entire entry
+RETURN[logInfoRef.createMsg, length];
+};
+
+$ExpungeMsgs => RETURN[logInfoRef.expungeMsgs, length];
+
+$WriteExpungeLog => RETURN[logInfoRef.writeExpungeLog, length];
+
+$CreateMsgSet => {
+logInfoRef.createMsgSet.msgSet ¨ ReadLine[strm];
+RETURN[logInfoRef.createMsgSet, length];
+};
+
+$EmptyMsgSet => {
+logInfoRef.emptyMsgSet.msgSet ¨ ReadLine[strm];
+RETURN[logInfoRef.emptyMsgSet, length];
+};
+
+$DestroyMsgSet => {
+logInfoRef.destroyMsgSet.msgSet ¨ ReadLine[strm];
+RETURN[logInfoRef.destroyMsgSet, length];
+};
+
+$AddMsg => {
+logInfoRef.addMsg.msg ¨ MsgNameFromIdOnFile[strm];
+logInfoRef.addMsg.to ¨ ReadLine[strm];
+RETURN[logInfoRef.addMsg, length];
+};
+
+$RemoveMsg => {
+logInfoRef.removeMsg.msg ¨ MsgNameFromIdOnFile[strm];
+logInfoRef.removeMsg.from ¨ ReadLine[strm];
+RETURN[logInfoRef.removeMsg, length];
+};
+
+$MoveMsg => {
+logInfoRef.moveMsg.msg ¨ MsgNameFromIdOnFile[strm];
+logInfoRef.moveMsg.from ¨ ReadLine[strm];
+logInfoRef.moveMsg.to ¨ ReadLine[strm];
+RETURN[logInfoRef.moveMsg, length];
+};
+
+$HasBeenRead => {
+logInfoRef.hasbeenRead.msg ¨ MsgNameFromIdOnFile[strm];
+RETURN[logInfoRef.hasbeenRead, length];
+};
+
+$RecordNewMailInfo => {
+logInfoRef.recordNewMailInfo.logLen ¨
+Convert.IntFromRope[RefText.TrustTextAsRope[strm.GetLine[field1]]];
+logInfoRef.recordNewMailInfo.when ¨
+Convert.TimeFromRope[RefText.TrustTextAsRope[strm.GetLine[field1]]];
+logInfoRef.recordNewMailInfo.server ¨ ReadLine[strm];
+logInfoRef.recordNewMailInfo.num ¨
+Convert.IntFromRope[RefText.TrustTextAsRope[strm.GetLine[field1]]];
+RETURN[logInfoRef.recordNewMailInfo, length]
+};
+
+$StartCopyNewMail => RETURN[logInfoRef.startCopyNewMail, length];
+
+$EndCopyNewMailInfo => {
+logInfoRef.endCopyNewMailInfo.startCopyPos ¨
+Convert.IntFromRope[RefText.TrustTextAsRope[strm.GetLine[field1]]];
+RETURN[logInfoRef.endCopyNewMailInfo, length];
+};
+
+$AcceptNewMail => RETURN[logInfoRef.acceptNewMail, length];
+
+$StartReadArchiveFile => {
+logInfoRef.startReadArchiveFile.file ¨ ReadLine[strm];
+logInfoRef.startReadArchiveFile.msgSet ¨ ReadLine[strm];
+RETURN[logInfoRef.startReadArchiveFile, length];
+};
+
+$EndReadArchiveFile => RETURN[logInfoRef.endReadArchiveFile, length];
+
+$StartCopyReadArchive => RETURN[logInfoRef.startCopyReadArchive, length];
+
+$EndCopyReadArchiveInfo => {
+logInfoRef.endCopyReadArchiveInfo.startCopyPos ¨
+Convert.IntFromRope[RefText.TrustTextAsRope[strm.GetLine[field1]]];
+RETURN[logInfoRef.endCopyReadArchiveInfo, length];
+};
+
+$EndOfLog => {
+logInfoRef.endOfLog.length ¨ strm.GetLength[];
+RETURN[logInfoRef.endOfLog, -1 ]
+};
+
+ENDCASE => WalnutDefs.Error[$log, $UnknownEntry,
+IO.PutFR["Unrecognized entry %g at startPos %g", [atom[ident]], [integer[startPos]] ]];
+END;
+};
+
+PeekEntry: PUBLIC PROC [strm: STREAM, quick: BOOL]
+	RETURNS[ident: ATOM, msgID: ROPE, length: INT] = {
+startPos: INT;
+BEGIN ENABLE IO.EndOfStream => GOTO eos;
+
+IF (startPos ¨ strm.GetIndex[]) = strm.GetLength[] THEN
+	RETURN[$EndOfLog, NIL, startPos];	-- log length NOT entry length
+length ¨ CheckForValidPrefix[strm, startPos];
+IF length = -1 THEN RETURN;		-- not a valid entry here
+
+ident ¨ Atom.MakeAtomFromRefText[strm.GetLine[field1]];
+
+IF ~quick THEN SELECT ident FROM
+$CreateMsg, $AddMsg, $RemoveMsg,
+$MoveMsg, $DestroyMsg, $HasBeenRead => msgID ¨ MsgNameFromIdOnFile[strm];
+
+ENDCASE => NULL;
+
+EXITS
+eos => length ¨ -1;		-- not a valid entry here
+END;
+strm.SetIndex[startPos];
+};
+
+WriteEntry: PUBLIC PROC[strm: STREAM, le: LogEntry, pos: INT ¨ -1]
+RETURNS[startPos: INT] = {
+
+length, extra: INT ¨ 0;
+entry: ROPE;
+msgChecking: BOOL ¨ FALSE;
+
+TRUSTED { WITH le: le SELECT FROM
+
+LogFileInfo => {
+entry ¨ IO.PutFR["LogFileInfo\n%g\n%g\n%g\n",
+IO.rope[le.key],
+IO.int[le.internalFileID],
+IO.int[le.logSeqNo]
+];
+};
+
+CreateMsg => {
+entry ¨ IO.PutFR["CreateMsg\n%g\n%10g %10g\n",
+[rope[le.msg]], 
+[integer[le.textLen]],
+[integer[le.formatLen]]
+];
+extra ¨ le.textLen + le.formatLen + 1;
+msgChecking ¨ TRUE;
+};
+
+ExpungeMsgs => entry ¨ "ExpungeMsgs\n";
+
+WriteExpungeLog => entry ¨ "WriteExpungeLog\n";
+
+CreateMsgSet =>
+entry ¨ IO.PutFR1["CreateMsgSet\n%g\n",
+[rope[le.msgSet]]
+];
+
+EmptyMsgSet =>
+entry ¨ IO.PutFR1["EmptyMsgSet\n%g\n",
+[rope[le.msgSet]]
+];
+
+DestroyMsgSet =>
+entry ¨ IO.PutFR1["DestroyMsgSet\n%g\n",
+[rope[le.msgSet]]
+];
+
+AddMsg =>
+entry ¨ IO.PutFR["AddMsg\n%g\n%g\n",
+[rope[le.msg]],
+[rope[le.to]]
+];
+
+RemoveMsg =>
+entry ¨ IO.PutFR["RemoveMsg\n%g\n%g\n",
+[rope[le.msg]],
+[rope[le.from]]
+];
+
+MoveMsg =>
+entry ¨ IO.PutFR["MoveMsg\n%g\n%g\n%g\n",
+[rope[le.msg]],
+[rope[le.from]],
+[rope[le.to]]
+];
+
+HasBeenRead =>
+entry ¨ IO.PutFR1["HasBeenRead\n%g\n",
+[rope[le.msg]]
+];
+
+RecordNewMailInfo =>
+entry ¨ IO.PutFLR["RecordNewMailInfo\n%g\n%g\n%g\n%g\n",
+LIST[[integer[le.logLen]],
+[time[le.when]],
+[rope[le.server]],
+[integer[le.num]]]
+];
+
+StartCopyNewMail => entry ¨ "StartCopyNewMail\n";
+
+EndCopyNewMailInfo => 
+entry ¨ IO.PutFR1["EndCopyNewMailInfo\n%g\n",
+[integer[le.startCopyPos]]
+];
+
+AcceptNewMail => entry ¨ "AcceptNewMail\n";
+
+StartReadArchiveFile =>
+entry ¨ IO.PutFR["StartReadArchiveFile\n%g\n%g\n",
+[rope[le.file]],
+[rope[le.msgSet]]
+];
+
+EndReadArchiveFile => entry ¨ "EndReadArchiveFile\n";
+
+StartCopyReadArchive => entry ¨ "StartCopyReadArchive\n";
+
+EndCopyReadArchiveInfo =>
+entry ¨ IO.PutFR1["EndCopyReadArchiveInfo\n%g\n",
+[integer[le.startCopyPos]]
+];
+
+ENDCASE => ERROR;
+};
+
+
+IF pos = -1 THEN startPos ¨ strm.GetIndex[] ELSE strm.SetIndex[startPos¨pos];
+length ¨ entry.Length[] + extra + entryHeaderLen;	-- extra for messages
+
+strm.PutF1[entryHeaderRope, [integer[length]] ];
+strm.PutRope[entry];
+IF pos # -1 THEN {
+logLen: INT ~ strm.GetLength[];
+strm.SetIndex[logLen];
+IF msgChecking THEN {
+IF startPos + length # logLen THEN {
+SimpleFeedback.Append[$walnut, $oneLiner, $debug, "resetting length of msg entry\n"];
+strm.SetIndex[startPos];
+strm.PutF1[entryHeaderRope, [integer[logLen-startPos]] ];
+strm.SetIndex[logLen];
+};
+};
+
+};
+};
+
+WriteMsgBody: PUBLIC PROC[strm: STREAM, body: ViewerTools.TiogaContents] = {
+strm.PutRope[body.contents];
+strm.PutRope[body.formatting];
+strm.PutChar['\n];
+};
+Overwrite: PUBLIC PROC[to, from: STREAM, startPos: INT, fromPos: INT ¨ -1] = {
+IF startPos = -1 THEN to.SetIndex[to.GetLength[]] ELSE to.SetIndex[startPos];
+IF fromPos = -1 THEN from.SetIndex[0] ELSE from.SetIndex[fromPos];
+DO
+IF from.GetBlock[copyBuffer, 0, 512] = 0 THEN EXIT;
+to.PutBlock[copyBuffer];
+ENDLOOP
+};
+
+CopyBytes: PUBLIC PROC[from, to: STREAM, num: INT] = {
+bytes: INT ¨ num;
+WHILE bytes >= 512 DO
+[] ¨ from.GetBlock[copyBuffer, 0, 512];
+to.PutBlock[copyBuffer];
+bytes ¨ bytes - 512;
+ENDLOOP;
+IF bytes # 0 THEN {
+[] ¨ from.GetBlock[copyBuffer, 0, bytes];
+to.PutBlock[copyBuffer];
+};
+};
+
+CheckForValidPrefix: PROC [strm: STREAM, startPos: INT] RETURNS [length: INT] = {
+entryRope: ROPE = "*entry* ";
+lenRope, prefix: ROPE;
+
+prefix ¨ SendMailOps.RopeFromStream[strm, startPos, entryHeaderLen];
+
+IF NOT prefix.Find[entryRope] = 0 THEN {
+strm.SetIndex[startPos];
+RETURN[-1];
+};
+IF NOT (prefix.Fetch[entryHeaderLen-1] = '\r OR prefix.Fetch[entryHeaderLen-1] = '\l) THEN {
+strm.SetIndex[startPos];
+RETURN[-1];
+};
+lenRope ¨ prefix.Substr[entryRope.Length[], 10];
+length ¨ Convert.IntFromRope[lenRope ! Convert.Error => {
+length ¨ -1;
+strm.SetIndex[startPos];
+CONTINUE }];
+};
+
+MsgEntryInfoFromStream: PUBLIC PROC[strm: STREAM, mle: MsgLogEntry] = {
+date: ROPE = "Date";
+subject: ROPE = "Subject";
+from: ROPE = "From";
+sender: ROPE = "Sender";
+to: ROPE = "To";
+cc: ROPE = "Cc";
+appTo: ROPE = "Apparently-To";
+mh: SendMailParseMsg.MsgHeaders;
+savedFrom: ROPE;
+WantThisField: SendMailParseMsg.ParseProc = {
+SELECT TRUE FROM
+fieldName.Equal[date, FALSE] => RETURN[TRUE, TRUE];
+fieldName.Equal[subject, FALSE] => RETURN[TRUE, TRUE];
+fieldName.Equal[from, FALSE] => RETURN[TRUE, TRUE];
+fieldName.Equal[sender, FALSE] => RETURN[TRUE, TRUE];
+fieldName.Equal[to, FALSE] => RETURN[TRUE, TRUE];
+fieldName.Equal[cc, FALSE] => RETURN[TRUE, TRUE];
+fieldName.Equal[appTo, FALSE] => RETURN[TRUE, TRUE];
+ENDCASE => RETURN[FALSE, TRUE];
+};
+
+-- sigh, the joys of re-using the same MsgLogEntry; must clear all entries
+mle.date ¨ BasicTime.nullGMT;
+mle.subject ¨ NIL;
+mle.sender ¨ NIL;
+mle.from ¨ NIL;
+mle.to ¨ NIL;
+mle.cc ¨ NIL;
+
+IF (strm.PeekChar[] = '\r OR strm.PeekChar[] = '\l) THEN [] ¨ strm.GetChar[]; 		-- formatting madness
+mh ¨ SendMailParseMsg.ParseMsgFromStream[strm, mle.textLen, WantThisField];
+FOR mhL: SendMailParseMsg.MsgHeaders ¨ mh, mhL.rest UNTIL mhL=NIL DO
+fieldName: ROPE = mhL.first.fieldName;
+SELECT TRUE FROM
+fieldName.Equal[date, FALSE] =>
+mle.date ¨ Convert.TimeFromRope[mhL.first.value ! Convert.Error => CONTINUE ];
+fieldName.Equal[subject, FALSE] => mle.subject ¨ mhL.first.value;
+fieldName.Equal[sender, FALSE] => {
+savedFrom ¨ mle.sender;
+mle.sender ¨ mhL.first.value;
+};
+fieldName.Equal[to, FALSE] =>
+IF mle.to = NIL THEN mle.to ¨ mhL.first.value
+ELSE mle.to ¨ Rope.Cat[mle.to, ", ", mhL.first.value];
+fieldName.Equal[appTo, FALSE] => IF mle.to = NIL THEN mle.to ¨ mhL.first.value;
+fieldName.Equal[cc, FALSE] => 
+IF mle.cc = NIL THEN mle.cc ¨ mhL.first.value
+ELSE mle.cc ¨ Rope.Cat[mle.cc, ", ", mhL.first.value];
+fieldName.Equal[from, FALSE] => {
+mle.from ¨ mhL.first.value;
+IF mle.sender = NIL THEN mle.sender ¨ mhL.first.value
+ELSE savedFrom ¨ mhL.first.value;
+};
+ENDCASE => NULL;
+ENDLOOP;
+IF mle.date = BasicTime.nullGMT THEN
+IF MailUtils.IsThisAPostmark[mle.msg] THEN
+mle.date ¨ MailUtils.GetTimeFromPostmark[mle.msg]
+ELSE mle.date ¨ BasicTime.Now[];
+IF mle.sender.Length[] = 0 THEN mle.sender ¨ mle.from;
+IF mle.sender.Length[] = 0 THEN mle.sender ¨ "UnknownSender";
+IF mle.from.Length[] = 0 THEN mle.from ¨ mle.sender;
+};
+
+ScanForHeadersLen: PROC[strm: STREAM, mle: MsgLogEntry] = {
+lastWasCR: BOOL ¨ FALSE;
+hLen: INT ¨ 0;
+WHILE hLen <= mle.textLen DO
+ch: CHAR = strm.GetChar[];
+hLen ¨ hLen + 1;
+IF (ch = '\r OR ch = '\l) THEN {
+IF lastWasCR THEN { mle.headersLen ¨ hLen; RETURN };
+lastWasCR ¨ TRUE;
+}
+ELSE lastWasCR ¨ FALSE;
+ENDLOOP;
+mle.headersLen ¨ mle.textLen;		-- not found but don't cause error
+};
+
+msgNameFormat: ROPE = "$ %b#%b@%g";
+msgNameWithSenderFormat: ROPE = "%g %g";
+
+IdOnFileWithSender: PUBLIC PROC[ts: MailBasics.Timestamp, sender: MailBasics.RName]
+	RETURNS[idOnFile: ROPE] = {
+name: ROPE ¨ sender.name;
+IF name.Fetch[0] = '" THEN {
+pos: INT = name.Find["\"", 1];
+IF pos # -1 THEN
+name ¨
+Rope.Concat[Rope.Substr[name, 1, pos - 1], Rope.Substr[name, pos+1]]; 
+};
+RETURN[IO.PutFR[msgNameWithSenderFormat, [rope[name]], [rope[ts]]] ];
+};
+
+MsgNameFromIdOnFile: PUBLIC PROC[strm: STREAM] RETURNS[msg: ROPE] = {
+startAt: INT ¨ strm.GetIndex[];
+BEGIN
+lastDollarIndex: INT ¨ 0;
+
+DO		-- find the last $ in the next line
+ch: CHAR = strm.GetChar[];
+IF (ch = '\r OR ch = '\l) THEN {
+IF lastDollarIndex = 0 THEN RETURN[CheckForEncodedMsgID[startAt, strm]];
+strm.SetIndex[lastDollarIndex-1];
+EXIT;
+};
+IF ch = '$ THEN lastDollarIndex ¨ strm.GetIndex[];
+ENDLOOP;
+
+msg ¨ IO.GetLineRope[strm];
+IF NOT MailUtils.IsThisAPostmark[msg] THEN
+SimpleFeedback.PutFL[$Walnut, $oneLiner, $info, "Could not parse msgID (%g) at log pos %g\n", LIST[[rope[msg]], [integer[startAt]]] ];
+RETURN[msg];
+
+END;
+};
+
+ReadLine: PROC[strm: STREAM] RETURNS[ROPE] = INLINE
+{ RETURN[Rope.FromRefText[strm.GetLine[field1]] ] };
+
+CreateMsgName: PUBLIC PROC RETURNS[eName: ROPE] = {
+netAndHost: ROPE = ThisMachine.Address[NIL];
+len: INT = netAndHost.Length[];
+date: ROPE = Convert.RopeFromTimeRFC822[BasicTime.Now[]];
+IF len = 0 THEN RETURN;
+RETURN[IO.PutFR["$ %g@%g", [rope[netAndHost.Substr[len: len-1]]], [rope[date]] ]];
+};
+
+Timestamp: TYPE = <<MACHINE DEPENDENT>> RECORD[
+net:  BYTE, -- the PUP net number
+host: BYTE, -- the PUP host number
+time: PackedTime];
+
+PackedTime: TYPE = CARD32;
+
+CheckForEncodedMsgID: PROC[startAt: INT, strm: STREAM] RETURNS[this: ROPE] = {
+ts: Timestamp;
+ln: Basics.LongNumber;
+msg: ROPE;
+nowAt: INT = strm.GetIndex[];
+IF ( nowAt - startAt -1 ) # 12 THEN RETURN[CreateMsgName[] ];
+strm.SetIndex[startAt];
+msg ¨ IO.GetRope[strm, 12];
+strm.SetIndex[nowAt];
+ln.hh ¨ FromHexChars[msg, 0];
+ln.hl ¨ FromHexChars[msg, 2];
+ln.lh ¨ FromHexChars[msg, 4];
+ln.ll ¨ FromHexChars[msg, 6];
+ts.time ¨ ln.lc;
+ts.net ¨ FromHexChars[msg, 8];
+ts.host ¨ FromHexChars[msg, 10];
+
+this ¨ IO.PutFR[msgNameFormat,
+[integer[ts.net]], [integer[ts.host]],
+[rope[Convert.RopeFromTimeRFC822[BasicTime.FromPupTime[ts.time]]]]
+];
+};
+
+FromHexChars: PROC[eName: ROPE, index: NAT] RETURNS[val: BYTE] = {
+Each: PROC[x: CHAR] RETURNS[NAT] = {
+SELECT x FROM
+IN ['0..'9] => RETURN[x - '0];
+IN ['a..'f] => RETURN[x - 'a + 10];
+ENDCASE => ERROR;
+};
+val ¨ Each[eName.Fetch[index]]*16;
+val ¨ val + Each[eName.Fetch[index+1]];
+};
+
+InitLogInfoRef[];
+
+END.
+
+  †  
+WalnutStreamImpl.mesa
+Copyright ” 1984, 1987, 1988, 1992 by Xerox Corporation.  All rights reserved.
+Willie-Sue, August 9, 1989 5:33:11 pm PDT
+Doug Terry, October 16, 1990 9:57 am PDT
+
+Types and procedures dealing with Walnut log streams
+
+(Changed NextEntryID to return the message id of any entry that pertains to a message)
+(Changing to use REF TEXT, do preallocation of log entry objects)
+Swinehar, April 26, 1991 8:59 am PDT
+Willie-s, August 12, 1993 11:15 am PDT
+Types
+
+
+Variables
+
+
+
+Procedures
+
+Used for general opening of files
+
+-- Opening streams
+-- Miscellaneous stream operations
+DCS, April 26, 1991, play it safe
+Reading and writing log entries
+if quick then don't return msgID (so don't have to make a rope)
+entry: the rope representation of the log entry
+write at the end of the stream unless given a pos (for fixing up CreateMsg headers)
+DCS April 26, 1991: Dangerous experiment!  If pos = -1, assume the stream is positioned properly and write without repositioning.  GetLength[] is very expensive.
+
+<<strm.SetIndex[startPos _ IF pos = -1 THEN strm.GetLength[] ELSE pos];>>
+DCS April 26, 1991: Try to enforce invariant that log is positioned at end except during a specifically-positioned write.  Danger is that it's not 100% certain that all log streams start out that way.
+IF startPos + length # logLen THEN ERROR WalnutDefs.Error[$log, $BadLog,
+IO.PutFR["msg length is %g, should be %g", [integer[logLen-startPos]], [integer[length]]] ];
+
+sender is not allowed to have zero length
+we also like the from field to be non-NIL
+undo the above encoding and just use the grapevine postmark
+netAsRope, hostAsRope: ROPE;
+netAsLC, hostAsLC: LONG CARDINAL;
+tymeAsRope: ROPE;
+IF strm.GetChar[] # ' THEN GOTO badName;  -- space
+netAsRope _ strm.GetCedarTokenRope[].token;
+IF strm.GetChar[] # '# THEN GOTO badName;		-- #
+hostAsRope _ strm.GetCedarTokenRope[].token;
+BEGIN
+ch: CHAR = strm.GetChar[];
+IF ch # '@ AND ch # '# THEN GOTO badName;	-- @ , # if from old CreateName
+END;
+BEGIN
+tyme: BasicTime.GMT;
+tyme _ strm.GetTime[
+! IO.Error => { tyme _ BasicTime.Now[]; CONTINUE} ];
+tymeAsRope _ Convert.RopeFromTimeRFC822[tyme];
+END;
+
+to cope with funny dates (e.g. with (Wed) after them
+IF strm.GetChar[] # '\n THEN
+UNTIL strm.GetChar[] =  '\n DO ENDLOOP;
+this next nonsense is necessary to be compatible with old logs - if Convert.CardFromRope sees an 8 or 9 it assumes decimal, otherwise octal!!
+netAsLC _ Convert.CardFromRope[netAsRope, 8];
+hostAsLC _ Convert.CardFromRope[hostAsRope, 8];
+RETURN[ IO.PutFR[msgNameFormat,
+	[cardinal[netAsLC]], [cardinal[hostAsLC]], [rope[tymeAsRope]] ] ];
+EXITS
+badName =>
+ERROR WalnutDefs.Error[$Log, $BadMsgID,
+IO.PutFR["Could not parse msgID at log pos %g", [integer[startAt]] ] ];
+create a grapevine uid for this machine for now - will be unique if time doesn't stop or reverse
+copied from GVBasics
+the number of seconds since midnight, January 1, 1901 GMT
+the integer's below are to perpetuate an earlier problem with msgID's
+ù    ïNewlineDelimiter
+ñ(cedarcode) styleô codeöœbôKöú
+œeúCôNKô)Kô(Kô Köú4ô4Kô KôVKôAKô$Kô&óKò öœk	ò	Köúüúò!KöúüúòKöú
+üúüúò1Köúüú8òEKöüúüúÎòÛKöüúòKöúüúò$Köú
+üú(ò7Köúüú-òCKöúüúò+KöúòKöúüúò#Köúüúò%KöúüúòKöúüúò"Köúüú	òKöúüú)ò?KöúòóKò öùúüúüòKò öüòKöúüúüúWòwKöú
+ò
+óKò öüòKòóKò öúüòKöüúòKò óöùôKô KöüúüúüúòKöüúüúüúòKöüúüúüúüúòKöú
+üúò+Köúüú#ò7Köúüú ò1Kô óöù	ô	Kô Köúüúò)KöúüúòKò Kö	úüúüúüúüúò/Kò Kö	úüúüúüúüúò+Kô Köúüúüúò2Kò öœnúüúœcò'Köúüúò9Köúüúò5Köúüúò9Köúüú!òAKò Köúüúò;Köúüúò9Köúüúò=Köúüúò/Köúüúò5Köúüúò1Köúüúò9Kò Köúüú#òEKöúüú"òCKöú üú$òGKöúüúò=Kò Köú!üú&òKKöú üú$òHKöú#üú&òLKöú$üú(òPKöúüúò3KòóKò óKô öù
+ô
+Kô Kô!óKô ôKò óö†úüúüúüúüúüú	üúüúüúüúüúüúüúòööüúüúüú°òAöüú
+üòöúüúò%KöúIòIóöüúòKöú
+üúüúò(öüúüòöúüúüú	ò-Kö
+üúüúüúüúüúò8óóöüúüúüò"Köúüú+ò8óöúüúòKöúòKöúòKöúJòJóKòóóKòóöüú°òKöú
+üú
+òKò öüú
+üúòKöúüúòKöúüúqòzKòóöüúòKöúüúòKöúüú(ò5Köúüúò)KöüúüúüúüòAKò òFKöúdòdóKòóKòóKòóKò Kò Köúüú8òNò%öúüúòKöúüúòKöúüúòóóKò öúüúò&öúüúòKöúüúòKöúüúòóóKò ô"Kò óö†úüúüúüúüúüúò?KöúòKöúüú!ò+Kò!KòKöú
+üúòKòóKò ö†úüúüúò(Köú*ò*óKò ö†úüúüúüúüúüúòGöüúüòKöú.ò.Köüú5üò;KòóKòKòóKò ö†úüúüúòKö	úüúüúüúüúòDKöú.ò.KöúòKöú°ò.Kô!Köú°ò2Köüúüúüú5üòQKöüúüúüúòKöüúüúüúüúò0Köüúüò"KòKò óö†úüúüú	üúüúüúòHKö	úüúüúüúüúò:Köúüúò
+Kö	úüúüúüúüúòHKòKò óö†úüúüúüúüúüúüúòBò;KöüúüúòóKòKò óôKò óö
+†úüúüúüúüúòCKöüúüúüúò#KöúüúòKöúüúòKöúüúò"KòöüòöüúüòKöúüúüúüúò1Köúüúüúüúò2Köúüúüúüúò2Köúüúüúüúò2Köúüúüúüúò2Köúüúüúüúò2KöüúòóöüúüúòKò.Kò-öüúüúüòKöúòKöüòKòóKöúòKòóóKöüúòKò öüòKöúüúò óòKò óKò óKö
+†	úüúüúüú	üúò1öúüúüúò'Köü	úGòPKò KöúüúòKöú
+üúòöüúüúüú	òöüúüòöú$ò$KöüúIòKóKöüúüúòóóKò öüú1üúò9Kò&Köüúò KòóKò-Köüúüúüú°ò6Kò Kò7Kò öüúüòKò òöüúüúüú ò:KöüúHòJóKò,ò'KöúDòDóò!KöúDòDóKöüú!ò'KòóKò öúòKò5Kò-Kò/Köú°$ò;Kò+Kò=öüúüú.ò;Köüú4ò8óKöú!°ò8Köüúò%KöúòóKò Köúüú!ò7Kò Köúüú%ò?Kò öúòKò0Köüú"ò(KöúòóKò öúòKò/Köüú!ò'KöúòóKò öúòKò1Köüú#ò)KöúòóKò öúòKò2Kò&Köüúò"KöúòóKò öúòKò5Kò+Köüúò%KöúòóKò öúòKò3Kò)Kò'Köüúò#KöúòóKò öúòKò7Köüú!ò'KöúòóKò öúòò%KöúCòCóò#KöúDòDóKò5ò"KöúCòCóKöüú&ò,KöúòóKò Köúüú&òAKò öúòò,KöúCòCóKöüú(ò.KòóKò Köúüú#ò;Kò öúòKò6Kò8Köüú*ò0KöúòóKò Köúüú(òEKò Köúüú*òIKò öúòò0KöúCòCóKöüú,ò2KòKò óöúüòKò.Köüúò KòóKò öüú)ò0KöüúUòWóKöüúòóKòKò óö
+†	úüúüúüú	üúò2Kö	úüúüú	üú
+üúò3Köú?ô?Köú
+üúòKöüúüúüúüúò(ò öüú1üò7Köúüúüú°òAóKò-Köüúüúüú°ò6Kò Kò7Kò öüúüúüúüò öú ò KòIóKò KöüúüúòKò óöüòKöú°ò.óKöüúòóKöúòKòKò óö†
+úüúüúüúüúüúüúò]Kò KöúüúòKöúüúòKöúüúüúòKò öüúüúüúüò!Kò òöúüú#ò-KöüúòKöüúòKöüúòKöúòóKòóKò öúòöúüú$ò.Köú°òKöúòKöúòKöúòóKò&KöúüúòKòóKò Kò'Kò Kò/Kò öúòöúüúò'KöúòKöúòóóKò òöúüúò&KöúòKöúòóKò óöúòöúüúò(KöúòKöúòóóKò öú	ò	öúüúò$KöúòKöúòKöúòóóKò öúòöúüúò'KöúòKöúòKöúòóóKò öú
+ò
+öúüúò)KöúòKöúòKöúòKöúòóóKò öúòöúüúò&KòKöúòóóKò öúòöúüú.ò8KöüúòKöúòKöúòKòKöúòóóKò Kò1Kò öúòöúüú#ò-KöúòKòóóKò Kò+Kò öúòöúüú(ò2KöúòKöúòKöúòKò óóKò5Kò Kò9Kò öúòöúüú'ò1KöúòKòóKò óKöüúüúòKòóKò Kô/KôSKò Kô°Kô Köüú
+üúüúòMKöúüú
+üúüúôIKöú2°òGKò Kò0KòKô»öüú
+üúòKöúüúòKòöüúüúòöüúüúò$KòUKòKò9KòKòóòKò óKöüúüúüú!üúZô•óKòóKòKò óö†úüúüú&òLKòKòKòKòKô óö†	úüúüúüúüúüú
+òNKöüúüúüúòMKöüúüúüúòBöüòKöüú'üúüúò3KöúòKöüòóKòKò óö†	úüúüúüúò6KöúüúòöüúüòKò'KöúòKòKöüúòóöüúüúòKò)KöúòKòóKöúòKò óö†úüúüúüúüú
+üúòQKöúüúòKöúüúòKò KòDKò öüúüúüúò(KöúòKöüúòKòóöüúüú'üú'üúò\KöúòKöüúòKòóKò0ò9KòKöúòKöüúòóKòKò óö†úüúüúüúòGKöúüú
+òKöú	üúòKöúüú
+òKöúüúòKöúüúòKöúüúòKöúüúòKöú ò Köúüúòö†ú ò-öüúüúüòKö	úüúüúüúüúò3Kö	úüúüúüúüúò6Kö	úüúüúüúüúò3Kö	úüúüúüúüúò5Kö	úüúüúüúüúò1Kö	úüúüúüúüúò1Kö	úüúüúüúüúò4KöüúüúüúüúòóKòóKò Kö°JòJKòKöúüúòKöúüúòKöúüúòKöú	üúòKöú	üúòKò Köüúüúüú°òeKòKöüú1üúüúüòDKöúüúò&öüúüúüòöúüúòKöúCüúòNóKöúüú#òAöúüúò#KòKòKòóöúüúòöüú
+üúüúò-Köüú2ò6óóKö	úüúüú
+üúüúòOöúüúòöüú
+üúüúò-Köüú2ò6óóöúüúò!Kòöüúüúüúò5Köüúò!óKòóKöüúüúòóKöüúòóöüúüò$öüú$üú2ò\Köüúò óóKöüúüúò6öüúüúò=Kô)óöüúüúò4Kô)óKòóKò ö†úüúüúò;KöúüúüúòKöúüúòöüúüòKöúüúòKòöüúüúüúò Köüúüúüúò4KöúüúòKòKöüúüúòóKöüúòóKöú°"òAKöúòóKò Köúüúò#Köúüúò(Kò ö†úüúüú4òSKöúüúüúòKöúüúòöüúüúòKöúüúòöüú
+üòòKöúFòFóóKòóKöüúüú<òEKòKò óö†úüúüúüúüúüúòEKô;Köú	üúòöüòKöúüúôKöúüúüúô!KöúüúôKöúüúòKò öüú°#ò'Köúüúòöüúüúüúò Köüúüúüú&òHKöú!ò!KöüúòKöúòóKöüú	üú"ò2KöüúòóKò Köúüúòöüúüú üò*Köú^üú$òÜóKöüúòKò Köüúüúüú°ô2Köú+ô+Köüúüúüú°ô/Köú,ô,öüôKöúüúôKö	üú	üú	üúüú
+°ôIKöüúôóöüôKöúüúôKöúüú$üúôIKöú.ô.KöüúôóKô Kô4öüúüôKöüúüúüúô'óKöúçôçKöú-ô-Köú/ô/öüúüúôKöúCôCöüôöú
+ô
+öüú"ô'KöüúEôGóóóóKöüúòóKòKò óö†úüúüúüúüúüò3Köúüú,ò4óKò ö
+†úüúüúüúüúò3Köú`ô`Köúüúüúò,KöúüúòKöúüú/ò9Köüú	üúüúòKöüúüúIòRKòKò óKôöúüúü	úüúò/Köúüú°ò!Köúüú°ò"KòKò óöúüúüúòKöú0°	ô9Kò óö†úüú
+üúüúüúüúòNKöúòKòKöúüúò
+KöúüúòKöüúüúüúò=KöúòKöúüúòKöúòKòKòKòKòKòKòKò Kò JöúEôEöúüúòKöú&ò&KöúBòBKòóKòKò óö†úüúüú	üúüúüúòBö
+†úüúüúüúüúò$öüúüòKöüúüú	òKöüúüúò#KöüúüúòóKòóKò"Kò'KòKò óKòKò KöüúòóKò ó Öó    QV  w¿  

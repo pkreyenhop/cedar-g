@@ -1,0 +1,744 @@
+
+DIRECTORY
+BasicTime USING [earliestGMT, GMT, Now, Period, Update],
+CHACLOpsP127V1 USING [ArgumentError, AuthenticationError, CallError, PropertyError, UpdateError, WrongServer],
+CHEntriesP0V0 USING [addressList, members],
+CHOpsP2V3 USING [ArgumentError, AuthenticationError, Authenticator, CallError, ListDomainsServed, PropertyError, RetrieveItem, RetrieveMembers, UpdateError, WrongServer],
+CrRPC USING [BulkDataCheckAbortProc, BulkDataValueProc, BulkDataXferProc, CreateClientHandle, DestroyClientHandle, Error, GetRope, Handle, ReadBulkDataStream],
+Process USING [Detach, PauseMsec],
+Random USING [ChooseInt],
+RefTab USING [Create, EachPairAction, EqualProc, Fetch, HashProc, Insert, Pairs, Ref, Val],
+Rope USING [Cat, Equal, Index, IsEmpty, ROPE, Substr],
+SymTab USING [Create, EachPairAction, Fetch, Pairs, Ref, Store],
+XNS USING [Address, Host, unknownAddress, unknownSocket],
+XNSAuth USING [AuthenticationError, CallError, Conversation, GetCredentials, GetNextVerifier, GetNullIdentity, Identity, Initiate, SetRecipientHostNumber, Terminate],
+XNSCH USING [AddressesFromItem, BestAddressInList, Element, Error, ErrorCode, Item, Name, Pattern, Properties, PropertyID, Which],
+XNSCHConcreteTypes USING [ConversationObject],
+XNSCHPrivate USING [GetElement, RemoteProc],
+XNSCredentials USING [GetIdentity],
+XNSRouter USING [GetHops, unreachable],
+XNSServerLocation USING [EachAddressProc, LocateServers, StopBroadcast],
+XNSWKS USING [clearinghouse]
+;
+
+XNSCHPrivateImpl: CEDAR MONITOR
+IMPORTS BasicTime, CHACLOpsP127V1, CHOpsP2V3, CrRPC, Process, Random, RefTab, Rope, SymTab, XNSAuth, XNSCH, XNSCHPrivate, XNSCredentials, XNSRouter, XNSServerLocation
+EXPORTS XNSCH, XNSCHPrivate
+~ {
+OPEN CHEntries: CHEntriesP0V0, CHOps: CHOpsP2V3, CHACLOps: CHACLOpsP127V1;
+
+chPgmNum: CARD32 ~ 2;
+chVersionNum: CARD16 ~ 3;
+
+ROPE: TYPE ~ Rope.ROPE;
+
+Name: TYPE ~ XNSCH.Name;
+Pattern: TYPE ~ XNSCH.Pattern;
+Element: TYPE ~ XNSCH.Element;
+PropertyID: TYPE ~ XNSCH.PropertyID;
+Properties: TYPE ~ XNSCH.Properties;
+Item: TYPE ~ XNSCH.Item;
+
+WrongServerError: PUBLIC ERROR [hint: Name] ¨ CHOps.WrongServer;
+
+shiftInName: ROPE ~ "CHServers";
+chServiceName: Name ~
+[organization~shiftInName, domain~shiftInName, object~"Clearinghouse Service"];
+
+
+NACacheEntry: TYPE ~ REF NACacheEntryObject;
+NACacheEntryObject: TYPE ~ RECORD [
+next: NACacheEntry,
+name, distingName: Name,
+address: XNS.Address];
+
+naCacheMaxSize: INT ¨ 8;
+naCacheSize: INT ¨ 0;
+naCache: NACacheEntry ¨ NIL; -- REF to tail of circular list of NACacheEntryObjects
+
+NACacheInsert: PUBLIC ENTRY PROC [name: Name, distingName: Name, address: XNS.Address] ~ {
+IF naCacheSize < naCacheMaxSize THEN {
+new: NACacheEntry ¨ NEW[NACacheEntryObject ¨ [address~XNS.unknownAddress]];
+IF naCache = NIL
+THEN { new.next ¨ naCache ¨ new }
+ELSE { new.next ¨ naCache.next;  naCache.next ¨ new };
+naCacheSize ¨ naCacheSize.SUCC;
+};
+naCache ¨ naCache.next;
+naCache.name ¨ name;
+naCache.distingName ¨ distingName;
+naCache.address ¨ address;
+};
+
+SameName: PROC [a, b: Name] RETURNS [same: BOOL] ~ {
+same ¨ Rope.Equal[s1~a.object, s2~b.object, case~FALSE]
+AND Rope.Equal[s1~a.domain, s2~b.domain, case~FALSE]
+AND Rope.Equal[s1~a.organization, s2~b.organization, case~FALSE];
+};
+
+NACacheLookup: PUBLIC ENTRY PROC [name: Name]
+RETURNS [found: BOOL, distingName: Name, address: XNS.Address] ~ {
+p: NACacheEntry ¨ naCache;
+THROUGH [0..naCacheSize) DO
+IF SameName[p.name, name] OR SameName[p.distingName, name]
+THEN RETURN [TRUE, p.distingName, p.address];
+p ¨ p.next;
+ENDLOOP;
+RETURN [FALSE, [NIL,NIL,NIL], XNS.unknownAddress];
+};
+
+NACacheRollback: ENTRY PROC ~ {
+p: NACacheEntry ¨ naCache;
+naCache ¨ NIL;
+naCacheSize ¨ 0;
+WHILE p # NIL DO
+nextp: NACacheEntry ~ p.next;
+p.next ¨ NIL;
+p ¨ nextp;
+ENDLOOP;
+};
+
+minutesBetweenNACacheSweeps: INT ¨ 10;
+minutesUntilNACacheSweep: INT ¨ minutesBetweenNACacheSweeps;
+
+NACacheSweep: ENTRY PROC ~ {
+IF (minutesUntilNACacheSweep ¨ minutesUntilNACacheSweep.PRED) > 0 THEN RETURN;
+minutesUntilNACacheSweep ¨ minutesBetweenNACacheSweeps;
+SELECT naCacheSize FROM
+0 => NULL;
+1 => { naCache.next ¨ NIL; naCache ¨ NIL; naCacheSize ¨ 0 };
+> 1 => { naCache.next ¨ naCache.next.next;  naCacheSize ¨ naCacheSize.PRED };
+ENDCASE => ERROR;
+};
+
+Conversation: TYPE ~ REF ConversationObject;
+ConversationObject: PUBLIC TYPE ~ XNSCHConcreteTypes.ConversationObject;
+
+InitiateConversation: PUBLIC PROC [identity: XNSAuth.Identity, server: XNS.Address]
+RETURNS [c: Conversation] ~ {
+c ¨ NEW[ ConversationObject ¨ [] ];
+IF identity = NIL THEN identity ¨ XNSCredentials.GetIdentity[];
+IF identity # NIL THEN {
+c.conversation ¨ XNSAuth.Initiate[identity, chServiceName
+! XNSAuth.AuthenticationError, XNSAuth.CallError => CONTINUE];
+};
+IF c.conversation = NIL THEN {
+identity ¨ XNSAuth.GetNullIdentity[];
+c.conversation ¨ XNSAuth.Initiate[identity, chServiceName]; -- no ERROR
+};
+IF server # XNS.unknownAddress THEN {
+c.handle ¨ CrRPC.CreateClientHandle[$CMUX, NEW[XNS.Address ¨ server]];
+c.host ¨ server.host;
+};
+};
+
+TerminateConversation: PUBLIC PROC [c: Conversation] ~ {
+IF c.handle # NIL THEN CrRPC.DestroyClientHandle[c.handle];
+XNSAuth.Terminate[c.conversation] };
+
+GetAuthenticator: PUBLIC PROC [c: Conversation, host: XNS.Host]
+RETURNS [CHOps.Authenticator] ~ {
+XNSAuth.SetRecipientHostNumber[c.conversation, host];
+RETURN [ [XNSAuth.GetCredentials[c.conversation],
+XNSAuth.GetNextVerifier[c.conversation]] ] };
+
+IsGeneric: PUBLIC PROC [c: Conversation] RETURNS [BOOL] ~ {
+RETURN [c.handle = NIL] };
+CachedServer: TYPE ~ REF CachedServerObject;
+CachedServerObject: TYPE ~ RECORD [
+address: REF XNS.Address,	-- readonly, REF to conform to CrRPC.RefAddress
+knowDomainsServed: BOOL ¨ FALSE,	-- hint, no ML
+inactiveUntil: BasicTime.GMT ¨ BasicTime.earliestGMT	-- ML
+];
+
+
+numHeaders: CARDINAL ~ 101;
+serversByAddress: RefTab.Ref ~ RefTab.Create[
+mod~numHeaders, equal~EqualAddressesIgnoringSocket, hash~HashAddress];
+
+HashAddress: RefTab.HashProc ~ {
+host: XNS.Host ¨ NARROW[key, REF XNS.Address].host;
+acc: CARDINAL ¨ ((((host.a*5+host.b)*5+host.c)*5+host.d)*5+host.e)*5+host.f;
+RETURN [acc] };
+
+EqualAddressesIgnoringSocket: RefTab.EqualProc ~ {
+ra1: REF XNS.Address ¨ NARROW[key1];
+ra2: REF XNS.Address ¨ NARROW[key2];
+RETURN [(ra1.net = ra2.net) AND (ra1.host = ra2.host)] };
+
+GetServerByAddress: PROC [ra: REF XNS.Address, makeActive: BOOL]
+RETURNS [s: CachedServer] ~ {
+ENABLE UNWIND => NULL;
+val: RefTab.Val;
+found: BOOL;
+[found, val] ¨ RefTab.Fetch[x~serversByAddress, key~ra];
+IF NOT found THEN {
+val ¨ NEW[CachedServerObject ¨ [address~ra]];
+[] ¨ RefTab.Insert[x~serversByAddress, key~ra, val~val] };
+s ¨ NARROW[val];
+IF makeActive THEN MarkServerUsable[s];
+};
+
+secondsBusy: INT ¨ 10;
+secondsDown: INT ¨ 600;
+secondsDead: INT ¨ 900;
+
+ServerIsUsableInternal: INTERNAL PROC [s: CachedServer] RETURNS [usable: BOOL] ~ {
+usable ¨ (BasicTime.Period[from: s.inactiveUntil, to: BasicTime.Now[]] >= 0) };
+MarkServerUsable: ENTRY PROC [s: CachedServer] ~ {
+ENABLE UNWIND => NULL;
+s.inactiveUntil ¨ BasicTime.earliestGMT };
+MarkServerBusy: ENTRY PROC [s: CachedServer] ~ {
+ENABLE UNWIND => NULL;
+s.inactiveUntil ¨ BasicTime.Update[BasicTime.Now[], secondsBusy] };
+MarkServerDown: ENTRY PROC [s: CachedServer] ~ {
+ENABLE UNWIND => NULL;
+s.inactiveUntil ¨ BasicTime.Update[BasicTime.Now[], secondsDown];
+s.knowDomainsServed ¨ FALSE };
+MarkServerDead: ENTRY PROC [s: CachedServer] ~ {
+ENABLE UNWIND => NULL;
+s.inactiveUntil ¨ BasicTime.Update[BasicTime.Now[], secondsDead];
+s.knowDomainsServed ¨ FALSE };
+CachedServerListHead: TYPE ~ REF CachedServerList;
+CachedServerList: TYPE ~ REF CachedServerListElement;
+CachedServerListElement: TYPE ~ RECORD [
+next: CachedServerList,	-- ML
+server: CachedServer	-- readonly
+];
+
+AddServerToList: ENTRY PROC [listHead: CachedServerListHead,
+server: CachedServer] RETURNS [new: BOOL] ~ {
+ENABLE UNWIND => NULL;
+new ¨ AddServerToListInternal[listHead, server] };
+
+AddServerToListInternal: INTERNAL PROC [listHead: CachedServerListHead,
+server: CachedServer] RETURNS [new: BOOL] ~ { 
+FOR p: CachedServerList ¨ listHead≠, p.next WHILE p # NIL DO
+IF p.server = server THEN RETURN [FALSE];
+ENDLOOP;
+listHead≠ ¨ NEW[CachedServerListElement ¨ [next~listHead≠, server~server]];
+RETURN [TRUE] };
+
+DeleteServerFromListInternal: INTERNAL PROC [listHead: CachedServerListHead,
+server: CachedServer] ~ {
+p, prev: CachedServerList ¨ NIL;
+IF listHead = NIL THEN RETURN;
+p ¨ listHead≠;
+WHILE (p # NIL) AND (p.server # server) DO prev ¨ p; p ¨ p.next ENDLOOP;
+IF p = NIL THEN RETURN;
+IF prev = NIL THEN listHead≠ ¨ p ELSE prev.next ¨ p;
+};
+
+ServerFilterProc: TYPE ~ PROC [CachedServer] RETURNS [ok: BOOL];
+
+GetBestServerFromList: ENTRY PROC [listHead: CachedServerListHead,
+filter: ServerFilterProc ¨ NIL]
+RETURNS [bestServer: CachedServer ¨ NIL] ~ {
+ENABLE UNWIND => NULL;
+bestHops: CARDINAL ¨ LAST[CARDINAL];
+serversAtBestHops: CARDINAL ¨ 0;
+IF listHead = NIL THEN RETURN [NIL];
+FOR p: CachedServerList ¨ listHead≠, p.next WHILE p # NIL DO
+server: CachedServer ~ p.server;
+hops: CARDINAL;
+IF NOT ServerIsUsableInternal[server] THEN LOOP;
+hops ¨ XNSRouter.GetHops[server.address.net];
+IF hops >= bestHops THEN LOOP;
+IF filter # NIL THEN IF NOT filter[server].ok THEN LOOP;
+IF hops=bestHops THEN {
+serversAtBestHops ¨ serversAtBestHops.SUCC;
+IF Random.ChooseInt[NIL, 1, serversAtBestHops] = 1 THEN {
+bestServer ¨ server;
+};
+}
+ELSE {
+bestServer ¨ server;
+bestHops ¨ hops;
+serversAtBestHops ¨ 1;
+};
+ENDLOOP;
+};
+
+domainServers: SymTab.Ref ~ SymTab.Create[mod~numHeaders, case~FALSE];
+
+GetServersForDomain: PROC [domain: ROPE] RETURNS [CachedServerListHead] ~ {
+RETURN [NARROW[SymTab.Fetch[domainServers, domain].val]] };
+
+AddServerForDomain: ENTRY PROC [domain: ROPE, server: CachedServer] ~ {
+ENABLE UNWIND => NULL;
+listHead: CachedServerListHead;
+listHead ¨ NARROW[SymTab.Fetch[domainServers, domain].val];
+IF listHead = NIL THEN {
+listHead ¨ NEW[CachedServerList ¨ NIL];
+[] ¨ SymTab.Store[domainServers, domain, listHead] };
+[] ¨ AddServerToListInternal[listHead, server] };
+
+DeleteServerForDomain: ENTRY PROC [domain: ROPE, server: CachedServer] ~ {
+ENABLE UNWIND => NULL;
+listHead: CachedServerListHead ~ NARROW[SymTab.Fetch[domainServers, domain].val];
+DeleteServerFromListInternal[listHead, server] };
+
+ListDomainsIKnow: ENTRY PROC RETURNS [domains: LIST OF ROPE] ~ {
+EachPair: INTERNAL SymTab.EachPairAction -- [key, val] RETURNS[BOOL] -- ~ {
+domains ¨ CONS[key, domains]; RETURN[FALSE] };
+[] ¨ SymTab.Pairs[domainServers, EachPair];
+};
+
+LearnDomainsServed: PROC [h: CrRPC.Handle, theServer: CachedServer] ~ {
+c: Conversation;
+ReadStreamOfDomainNames: CrRPC.BulkDataXferProc
+~ {
+EachDomainNameInStream: CrRPC.BulkDataValueProc
+~ {
+domPart, orgPart: ROPE;
+orgPart ¨ CrRPC.GetRope[s];
+domPart ¨ CrRPC.GetRope[s];
+AddServerForDomain[
+DomainKeyFromComponents[organization~orgPart, domain~domPart],
+theServer];
+AddServerForDomain[
+OrganizationKeyFromComponents[orgPart],
+theServer];
+};
+RETURN [CrRPC.ReadBulkDataStream[h, s, checkAbort, EachDomainNameInStream]];
+};
+IF theServer.knowDomainsServed THEN RETURN;
+c ¨ InitiateConversation[NIL, XNS.unknownAddress];
+CHOps.ListDomainsServed[h, ReadStreamOfDomainNames,
+GetAuthenticator[c, theServer.address.host]];
+theServer.knowDomainsServed ¨ TRUE;
+TerminateConversation[c];
+};
+
+DomainKeyFromComponents: PROC [organization: ROPE, domain: ROPE]
+RETURNS [key: ROPE] ~ INLINE {
+key ¨ Rope.Cat[domain, ":", organization] };
+
+OrganizationKeyFromComponents: PROC [organization: ROPE]
+RETURNS [key: ROPE] ~ INLINE {
+key ¨ Rope.Cat[organization, ":", shiftInName] };
+
+OrganizationKeyFromDomainKey: PROC [domainKey: ROPE]
+RETURNS [organizationKey: ROPE] ~ {
+pos: INT ~ Rope.Index[s1~domainKey, s2~":"] + 1;
+organizationKey ¨ OrganizationKeyFromComponents[Rope.Substr[domainKey, pos]] };
+nearbyServers: CachedServerListHead ~ NEW[CachedServerList ¨ NIL];
+
+defaultMaxHops: CARDINAL ¨ 3;
+desperationContactMaxHops: CARDINAL ¨ 5;
+desperationBroadcastMaxHops: CARDINAL ¨ 4;
+desperationBroadcastTryLimit: CARDINAL ¨ 2;
+
+desperationBroadcastPauseLimit: CARDINAL ¨ 2;
+desperationBroadcastPauseMsec: CARD ¨ 8000;
+
+BroadcastForNearbyServers: PROC [
+maxHops: CARDINAL, nWanted: CARDINAL, tryLimit: CARDINAL] ~ {
+nGot: CARDINAL ¨ 0;
+maxRetries: NAT ~ 3;
+EachAddress: XNSServerLocation.EachAddressProc -- [addr: XNS.Address] -- ~ {
+server: CachedServer;
+ra: REF XNS.Address ¨ NEW[XNS.Address ¨ [net~addr.net, host~addr.host, socket~XNS.unknownSocket]];
+server ¨ GetServerByAddress[ra~ra, makeActive~TRUE];
+IF AddServerToList[nearbyServers, server].new THEN nGot ¨ nGot.SUCC;
+IF nGot = nWanted THEN ERROR XNSServerLocation.StopBroadcast[];
+};
+FOR i: CARDINAL ¨ 0, i+1 DO
+XNSServerLocation.LocateServers[socket~XNSWKS.clearinghouse, remotePgm~chPgmNum, remotePgmVersion~chVersionNum, eachAddress~EachAddress, maxHops~maxHops, tryLimit~tryLimit];
+IF (nGot > 0) OR (i >= desperationBroadcastPauseLimit) THEN EXIT;
+Process.PauseMsec[desperationBroadcastPauseMsec];
+ENDLOOP;
+};
+
+NoticeKnownNearbyServers: PROC[
+maxHops: CARDINAL, nWanted: CARDINAL ¨ CARDINAL.LAST] ~ {
+nGot: CARDINAL ¨ 0;
+EachServer: RefTab.EachPairAction
+~ {
+s: CachedServer ¨ NARROW[val];
+IF XNSRouter.GetHops[s.address.net] > maxHops THEN RETURN [quit~FALSE];
+IF AddServerToList[nearbyServers, s].new THEN nGot ¨ nGot.SUCC;
+RETURN [quit~(nGot=nWanted)] };
+[] ¨ RefTab.Pairs[x~serversByAddress, action~EachServer];
+};
+
+GetBestKnownServer: PROC [maxHops: CARDINAL, filter: ServerFilterProc]
+RETURNS [bestServer: CachedServer ¨ NIL] ~ {
+EachServer: RefTab.EachPairAction
+~ {
+s: CachedServer ¨ NARROW[val];
+hops: CARDINAL;
+IF BasicTime.Period[from: BasicTime.Now[], to: s.inactiveUntil] > 0 THEN RETURN;
+hops ¨ XNSRouter.GetHops[s.address.net];
+IF hops > maxHops THEN RETURN;
+IF (filter # NIL) AND (NOT filter[s]) THEN RETURN;
+maxHops ¨ hops;
+bestServer ¨ s };
+[] ¨ RefTab.Pairs[x~serversByAddress, action~EachServer];
+};
+
+GetSomeServer: PROC [filter: ServerFilterProc ¨ NIL, okToBroadcast: BOOL]
+RETURNS [bestServer: CachedServer, didBroadcast: BOOL ¨ FALSE] ~ {
+bestServer ¨ GetBestServerFromList[nearbyServers, filter];
+IF bestServer = NIL THEN {
+NoticeKnownNearbyServers[maxHops~defaultMaxHops];
+bestServer ¨ GetBestServerFromList[nearbyServers, filter] };
+IF bestServer = NIL THEN {
+bestServer ¨ GetBestKnownServer[desperationContactMaxHops, filter] };
+IF (bestServer = NIL) AND okToBroadcast THEN {
+BroadcastForNearbyServers[maxHops~desperationBroadcastMaxHops, nWanted~1, tryLimit~desperationBroadcastTryLimit];
+didBroadcast ¨ TRUE;
+bestServer ¨ GetBestServerFromList[nearbyServers, filter] };
+};
+
+maxHints: CARDINAL ~ 15;
+
+ProcessHint: PROC [h: CrRPC.Handle, theServer: CachedServer, hint: Name]
+RETURNS [servers: CachedServerListHead] ~ {
+c: Conversation;
+nRead: CARDINAL;
+hints: ARRAY [1..maxHints] OF ROPE ¨ ALL[NIL];
+ReadStreamOfNames: CrRPC.BulkDataXferProc
+~ {
+EachNameInStream: CrRPC.BulkDataValueProc
+~ {
+serverName: Name ~ XNSCHPrivate.GetElement[s];
+nRead ¨ nRead + 1;
+IF nRead <= maxHints THEN { hints[nRead] ¨ serverName.object; RETURN };
+IF Random.ChooseInt[NIL, 1, nRead] > maxHints THEN RETURN;
+hints[Random.ChooseInt[NIL, 1, maxHints]] ¨ serverName.object;
+};
+RETURN [CrRPC.ReadBulkDataStream[h, s, checkAbort, EachNameInStream]];
+};
+c ¨ InitiateConversation[NIL, XNS.unknownAddress];
+nRead ¨ 0;
+[] ¨ CHOps.RetrieveMembers[h, hint, CHEntries.members, ReadStreamOfNames, GetAuthenticator[c, theServer.address.host]
+! CHOps.ArgumentError, CHOps.PropertyError, CHOps.UpdateError => CONTINUE];
+servers ¨ NEW[CachedServerList ¨ NIL];
+FOR i: CARDINAL IN [1 .. MIN[nRead, maxHints]] DO
+{
+ENABLE CHOps.ArgumentError, CHOps.PropertyError, CHOps.UpdateError =>
+CONTINUE;
+item: Item;
+addresses: LIST OF XNS.Address;
+[value~item] ¨ CHOps.RetrieveItem[h,
+[organization~shiftInName, domain~shiftInName, object~hints[i]], CHEntries.addressList, GetAuthenticator[c, theServer.address.host]];
+addresses ¨ XNSCH.AddressesFromItem[item];
+IF addresses # NIL THEN {
+addr: XNS.Address;
+ra: REF XNS.Address;
+server: CachedServer;
+addr ¨ XNSCH.BestAddressInList[addresses];
+ra ¨ NEW[XNS.Address ¨ [net~addr.net, host~addr.host, socket~XNS.unknownSocket]];
+server ¨ GetServerByAddress[ra~ra, makeActive~FALSE];
+[] ¨ AddServerToList[servers, server] };
+};
+ENDLOOP;
+TerminateConversation[c];
+};
+
+maxTries: CARDINAL ~ 15;
+triesToUse: CARDINAL ¨ 7; -- Bounds Fault if this exceeds maxTries
+
+CallRemote: PUBLIC PROC [c: Conversation, proc: XNSCHPrivate.RemoteProc,
+domain: ROPE ¨ NIL, idempotent: BOOL ¨ TRUE] ~ {
+State: TYPE ~ { dom, hint, org, nearby, none };
+state: State ¨ none;
+organization: ROPE ¨ NIL;
+theServer: CachedServer ¨ NIL;
+theHandle: CrRPC.Handle ¨ NIL;
+gotHint: BOOL;
+theHint: Name;
+hintServers: CachedServerListHead ¨ NIL;
+specific: BOOL ~ NOT IsGeneric[c];
+inClientProc: BOOL ¨ FALSE;
+didBroadcast: BOOL ¨ FALSE;
+
+nAlreadyUsed: CARDINAL ¨ 0;
+alreadyUsedCache: ARRAY [0..maxTries) OF CachedServer;
+
+NoteServerAlreadyUsed: PROC [server: CachedServer] ~ {
+alreadyUsedCache[nAlreadyUsed] ¨ server;
+nAlreadyUsed ¨ nAlreadyUsed + 1;
+};
+ServerMayBeUsed: PROC [server: CachedServer] RETURNS [BOOL] ~ {
+FOR i: CARDINAL IN [0..nAlreadyUsed) DO
+IF alreadyUsedCache[i] = server THEN RETURN [FALSE];
+ENDLOOP;
+RETURN [TRUE] };
+
+CleanUp: PROC ~ {
+IF theHandle # NIL THEN CrRPC.DestroyClientHandle[theHandle];
+theHandle ¨ NIL };
+
+GetServerCandidate: PROC ~ {
+state ¨ none;
+IF theHandle # NIL THEN { CrRPC.DestroyClientHandle[theHandle]; theHandle ¨ NIL };
+theServer ¨ NIL;
+IF NOT Rope.IsEmpty[domain] THEN {
+state ¨ dom;
+theServer ¨ GetBestServerFromList[GetServersForDomain[domain], ServerMayBeUsed];
+};
+IF theServer = NIL THEN {
+state ¨ hint;
+theServer ¨ GetBestServerFromList[hintServers, ServerMayBeUsed];
+};
+IF (theServer = NIL) AND (NOT Rope.IsEmpty[domain]) THEN {
+state ¨ org;
+IF organization = NIL THEN organization ¨ OrganizationKeyFromDomainKey[domain];
+theServer ¨ GetBestServerFromList[GetServersForDomain[organization], ServerMayBeUsed];
+};
+IF theServer = NIL THEN {
+state ¨ nearby;
+[theServer, didBroadcast] ¨ GetSomeServer[ServerMayBeUsed, (NOT didBroadcast)] };
+IF theServer = NIL THEN {
+state ¨ none;
+RETURN };
+theHandle ¨ CrRPC.CreateClientHandle[$CMUX, theServer.address];
+};
+
+
+FOR tryNo: CARDINAL IN [1..triesToUse] DO
+ENABLE {
+UNWIND => CleanUp[];
+CHOps.AuthenticationError, CHACLOps.AuthenticationError => {
+ERROR XNSCH.Error[credentialsInvalid, first]
+};
+CHOps.CallError, CHACLOps.CallError => {
+SELECT problem FROM
+accessRightsInsufficient => {
+ERROR XNSCH.Error[credentialsTooWeak, first] };
+tooBusy => {
+IF specific THEN ERROR XNSCH.Error[serverTooBusy, first];
+MarkServerBusy[theServer];
+LOOP };
+serverDown => {
+IF specific THEN ERROR XNSCH.Error[allDown, first];
+EXIT };
+ENDCASE => -- can't happen -- {
+IF specific THEN ERROR XNSCH.Error[unknown, first];
+MarkServerDead[theServer];
+LOOP };
+};
+CHOps.ArgumentError, CHACLOps.ArgumentError => {
+code: XNSCH.ErrorCode ~ (SELECT problem FROM
+illegalProperty => illegalPropertyID,
+illegalOrganizationName => illegalOrganizationName,
+illegalDomainName => illegalDomainName,
+illegalObjectName => illegalObjectName,
+noSuchOrganization => noSuchOrganization,
+noSuchDomain => noSuchDomain,
+noSuchObject => noSuchObject
+ENDCASE => unknown);
+ERROR XNSCH.Error[code, IF which = first THEN first ELSE second] };
+CHOps.PropertyError, CHACLOps.PropertyError => {
+code: XNSCH.ErrorCode ~ (SELECT problem FROM
+missing => propertyIDNotFound,
+wrongType => wrongPropertyType
+ENDCASE => unknown);
+ERROR XNSCH.Error[code, first] };
+CHOps.UpdateError, CHACLOps.UpdateError => {
+code: XNSCH.ErrorCode ~ (SELECT problem FROM
+noChange => noChange,
+outOfDate => outOfDate,
+objectOverflow => overflowOfName,
+databaseOverflow => overflowOfDataBase
+ENDCASE => unknown);
+ERROR XNSCH.Error[code, IF which = first THEN first ELSE second] };
+CrRPC.Error => {
+SELECT errorReason FROM
+courierVersionMismatch => {
+IF specific THEN ERROR XNSCH.Error[serviceNotExported, first];
+MarkServerDead[theServer];
+LOOP };
+rejectedNoSuchProgram, rejectedNoSuchVersion, rejectedNoSuchProcedure, rejectedUnspecified => {
+IF specific THEN ERROR XNSCH.Error[serviceNotExported, first];
+MarkServerDown[theServer];
+LOOP };
+rejectedInvalidArgument => {
+IF specific THEN ERROR XNSCH.Error[protocolError, first];
+MarkServerDown[theServer];
+LOOP };
+remoteError, argsError, resultsError, bulkDataError, protocolError, remoteClose, communicationFailure, cantConnectToRemote => -- can't retry, progress made -- {
+IF specific THEN ERROR XNSCH.Error[
+(SELECT errorReason FROM
+communicationFailure => communicationFailure,
+cantConnectToRemote => communicationFailure,
+ENDCASE => protocolError),
+first];
+MarkServerDown[theServer];
+IF (NOT idempotent) AND (inClientProc) THEN
+ERROR XNSCH.Error[wasUpNowDown, first];
+LOOP };
+unknown, unknownClass, notImplemented, unknownOperation, notServerHandle, notClientHandle, addressInappropriateForClass -- can't happen -- =>
+ERROR;
+ENDCASE => ERROR;
+};
+CHOps.WrongServer => {
+IF specific THEN REJECT;
+MarkServerDead[theServer];
+LOOP };
+CHACLOps.WrongServer => {
+IF specific THEN ERROR CHOps.WrongServer[hint];
+MarkServerDead[theServer];
+LOOP };
+};
+
+IF specific THEN {
+inClientProc ¨ TRUE;
+proc[c.handle, c.host];
+inClientProc ¨ FALSE;
+RETURN };
+
+GetServerCandidate[]; -- sets [theServer, theHandle, state]
+IF state = none THEN EXIT;
+IF NOT theServer.knowDomainsServed THEN
+LearnDomainsServed[theHandle, theServer];
+gotHint ¨ FALSE;
+inClientProc ¨ TRUE;
+proc[theHandle, theServer.address.host 
+! CHOps.WrongServer, CHACLOps.WrongServer => {
+theHint ¨ hint;
+gotHint ¨ TRUE;
+CONTINUE } ];
+inClientProc ¨ FALSE;
+IF gotHint THEN {
+DeleteServerForDomain[domain, theServer]; -- correct the cache
+IF tryNo >= triesToUse THEN EXIT;
+hintServers ¨ ProcessHint[theHandle, theServer, theHint];
+NoteServerAlreadyUsed[theServer];
+LOOP };
+NoteServerAlreadyUsed[theServer];
+AddServerForDomain[domain, theServer];
+CleanUp[];
+RETURN;
+ENDLOOP;
+CleanUp[];
+ERROR XNSCH.Error[allDown, first];
+};
+nNearbyServersToStart: CARDINAL ¨ 2;
+
+Daemon: PROC ~ {
+DO
+Process.PauseMsec[60000];
+NACacheSweep[];
+ENDLOOP;
+};
+
+
+
+TRUSTED { Process.Detach[FORK Daemon[]] };
+TRUSTED { Process.Detach[FORK BroadcastForNearbyServers[maxHops~defaultMaxHops, nWanted~nNearbyServersToStart, tryLimit~0]] };
+}.
+
+  	§  
+XNSCHPrivateImpl.mesa
+Copyright ” 1988, 1989, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Demers, August 3, 1988 9:44:08 am PDT
+Wes Irish, July 8, 1988 11:48:07 am PDT
+Willie-Sue, February 13, 1989 3:29:56 pm PST
+Tim Diebert: November 16, 1989 9:21:08 am PST
+Willie-s, February 14, 1992 10:54 am PST
+
+Name / Address Cache
+Cache of distinguished name / address pairs for recently looked-up names.
+Note the same name could end up in the cache more than once; this is benign.
+Periodically delete the oldest cache entry.
+Conversations
+This never raises an error, but if identity is invalid it will substitute NullIdentity, so the resulting conversation will be able to do simple queries but not updates.
+Get conversation ...
+Get Courier handle for server, if specified ...
+Server Objects
+Net and host are significant, socket is set to XNS.unknownSocket
+Lists of Servers
+IF hops >= XNSRouter.unreachable THEN LOOP;  -- removed because XNSRouter.GetHops can lie about unreachability.  
+Choose randomly among the servers at the best distance
+Cache of Servers by Domain
+For debugging.
+[h: Handle, s: IO.STREAM, checkAbort: BulkDataCheckAbortProc] RETURNS [abort: BOOL];
+[s: IO.STREAM] RETURNS [abort: BOOL _ FALSE]
+The following is present because by convention every CH that serves a domain D:O also serves the "glue" domain O:CHServers, but won't include O:CHServers in the enumeration!  I consider it BOGUS, but ... (ajd)
+e.g. "PARC:Xerox" -> "Xerox:CHServers"
+Cache of Nearby Servers
+These are necessary for machines with only 3Mb Ethernets, because it can take so long for the routing and translation caches to fill.  They should go away after improvements are made in the underlying transport.
+[key: Key, val: Val] RETURNS [quit: BOOL]
+[key: Key, val: Val] RETURNS [quit: BOOL]
+Hint Processing
+[h: Handle, s: IO.STREAM, checkAbort: BulkDataCheckAbortProc] RETURNS [abort: BOOL];
+[s: IO.STREAM] RETURNS [abort: BOOL _ FALSE]
+Invoking a remote procedure
+Precondition: NOT ServerAlreadyUsed[server]
+Body of CallRemote ...
+If this server serves the right domain and can't answer, assume no other server can answer either.  This is overly pessimistic.  Doing better would be at least a little bit hard.
+useCourier, other, 
+Mainline Code
+Rollback: Booting.RollbackProc ~ {
+TRUSTED { Process.Detach[FORK BroadcastForNearbyServers[maxHops~defaultMaxHops, nWanted~nNearbyServersToStart, tryLimit~0]] };
+NACacheRollback[];
+};
+Booting.RegisterProcs[r: Rollback];
+ù Á  ñ(cedarcode) styleïNewlineDelimiter
+ô codeôKöú
+œeúCôNKô%Kô'Kô,Kô-Kô(Kô Kò óöœk	ò	Köú
+ûúûúò8KöúûúZònKöúûúò+Köú
+ûúõò™KöúûúîòüKöúûúò"KöúûúòKò[Köúûúûú
+ò6Köúûú4ò@Köûúûú0ò9Köúûúôò¶KöûúûúwòÇKöúûúò.Köúûúò,Köúûúò#Köú
+ûúò'Köúûú1òHKöûúûúòKöúòKò óöœnúûúûòKöûú^ûú<ò¶KöûúûúòKòKöûúü	úüúüúòJKò Köú
+ûúòKöúûúòKò KöûúûúûúòKò KöúûúûúòKöú	ûúûú	òKöú	ûúûú	òKöúûúûúò$Köúûúûúò$KöúûúûúòKò Köüúûúûú"ò@Kò Köúûúò KòeKò headôKôIKôLKò Köúûúûúò,öúûúûúò#KöúòKöúòKöú	ûú
+òKò óKöúûúòKöúûúòKöúûúœc6òSKò öüúûúûú*ûúòZöûúûúò&Köúûú4òKöûúûòKöûúò!Köûú2ò6óKöúûúòKòóKòKòKò"KòKòKò óöüúûúûúûúò4Köú1ûúûú+ûúûú7ûúòÆKöúòKò óöüúûúûúûú	ûúûúòpKòöûúûòöûúûúò:Köûúûúûúò-óKòKöûúòóKöûúûúûúûúûúûúò2KòKò óöüúûúûúòKòKöú
+ûúòKòöûúûúûòKöúòKöú	ûúòKò
+KöûúòóKöúòóKò Köúûúò&Köúûúò<Kò öüúûúûúòKô+Köûú6ûúûúûúòNKò7öûúûòKöúûúò
+Köúûúûúò<KöúFûúòMKöûúûúòóKòóKò óôKöúûúûúò,öúûúûú)òHKò óöüúûúûú3ûúòqKô®Köúûúò#ôKöûúûúûú)ò?öûúûúûúòKöúnûúòxKòóöûúûúûúòKò%Köú<†òGKòóóô/öûú
+ûúûúò%Köú+ûúûúòFKòKòóóKöúòKò óöüúûúûúò8Köûúûúûú%ò;Köú$ò$Kò óö
+üúûúûúûúûúòaKò5KöûúYò_Kò óö
+ü	úûúûúûúûúò;KöûúûúòóóôKöúûúûúò,öúûúûúò#Köú	ûúûú
+†/òIKöúûúûú†ò/Köúûú†ò:KòKò óKò KöúûúòKòtKò öüúò Kö	úûúûúûúûúò3Köúûú?òLKöûú	òKò óöüúò2Köúûúûúûúò$Köúûúûúûúò$Köûúûúò9Kò óö
+üúûúûúûúûúò^Köú/ûúô@KöûúûúûúòKòKöúûúòKò8öûúûúûúòKöúûú$ò-Kò:óKöúûúòKöûúûúò'KòKò óKöúûúòKöúûúòKöúûúòKò ö
+üúûúûúûú
+ûúòRKòOóöüúû
+úò2KöûúûúûúòKò*óöüúû
+úò0KöûúûúûúòKòCóöüúû
+úò0KöûúûúûúòKòAKöúûúòóöüúû
+úò0KöûúûúûúòKòAKöúûúòóóôKöúûúûúò2Köúûúûúò5öúûúûúò(Köú†òKöú†ò KòKò óö
+üúûúûú8ûúûúòjKöûúûúûúòKò2Kò óö
+üúûúûú8ûúûúòvöûú)ûúûúûò<Köûúûúûúûúò)KöûúòóKöúûú<òKKöûúûúòKò óöüúûúûú;òfKöúûúò KöûúûúûúûúòKòKö
+ûúûúûúûúûúòHKöûúûúûúûúòKöûúûúûúûúò4KòKò óKö	úûúûúûúûúò@Kò ö
+üúû
+ú=ûúûúûúòèKöûúûúûúòKöú
+ûúûúûúò$Köúûúò Kö
+ûúûúûúûúûúò$öûú)ûúûúûò<Köú ò KöúûúòKöûúûú ûúûúò0Kò-KöûúûúûúòKöûúûúûúGôqKöûú
+ûúûúûúûúûúûúò8öûúûúòKöú&ûúò+öûúûúûúò9Kô6KòKöúòóKöúòöûúòKòKòKòKòóóKöûúòóKòKò óóôKöú?ûúòFKò öüúûú
+ûúûúòKKöûúûú-ò;Kò óöüúûúûú
+ûúòGKöûúûúûúòKöúòKöúûú*ò;öûúûúûúòKöúûúûúò'Kò5óKò1Kò óöüúûúûú
+ûúòJKöûúûúûúòKöú!ûú*òQKò1Kò óöüúûúûúûúûúûúûúò@Kôöüúûú†úòKKöú
+ûúûúûúò.óKò+KòKò óöüúûú/òGKòöüúò/Kö	úûúûú&ûú	ûúôTKòöüúò/Köúûúûúûú	ûúûúô,KöúòKöúûúòKòKòKò^Kô—KòGKöúòóKöûúFòLKöúòóKöûúûúûúò+Köúûúûúò2KòaKöúûúò#KöúòKòKò óöüúûúûú
+ûúûúûúûúò_Kò,Kò óöüúûúûúûúûúûúòWKò1Kò óö
+üúûúûúûúûúòXKô&Köúûú(ò0KòOóóôKöú&ûúûúòBKò KöúûúòKöúûúò(Köúûúò*Köúûúò+Kò Köú ûúò-öúûúò+Kô”óKò ö
+üúûúûúûúûúò_KöúûúòKöúûúòöüú$†úòLKòKöúûúûúûúûú1ûúòbKöú.ûúò4Köûú,ûúûúòDKöûúûúûú#ò?Köúòóöûúûú
+ûòKöú'ûúÄò≠Köûúûú'ûúûúòAKöú1ò1KöûúòóKòKò óöüúûúûúûúûúûúòYKöúûúòöü
+úò!Jöúûúûúô)KöúòKöúûúòKöûú,ûúûúûúòGKöûú'ûúûúò?KöûúòóKò9KòKò óö
+üúûúûúûúûúòsöü
+úò!Jöúûúûúô)KöúòKöúûúòKöúûúòKöûúBûúûúòPKò(KöûúûúûúòKöûúûúûúûúûúûúò2KòKòóKò9KòKò óöüúûúûúûúûú*ûúûúòåKò:öûúûúûúòKöú1ò1Kò<óöûúûúûúòKòEóöûúûúûúûúò.KöúqòqKöúûúòKò<óKòKò óóôKöú
+ûúòKò öüúûú8ûú$òtKòKöúûúòKöúûúûúûúûúûúò.öüúò)Kö	úûúûú&ûú	ûúôTKòöüúò)Köúûúûúûú	ûúûúô,KöúòKò.KòKöûúûú%ûúòGKöûúûúûúûúò:Köúûú$ò>KöúòóKöûú@òFKöúòóKöúûúûúò2Kò
+òuKöúAûúòKóKöú
+ûúûúò&ö	ûúûúûúûúûò1öúòöûú?òEKöûúò	óKòKöúûúûúûú	òKò™Köúûúò*öûúûúûúòKöúûú	òKöúûúûú	òKöúòKöúûúò*Köúûúûú1ûúòQKöú.ûúò5Kò(óKòóKöûúòóKöúòKòKò óóôKöú
+ûúòKöúûú†(òBKò öü
+úûúûú:ûúûúûúûúòyKöúûú$ò/KòKöúûúûúòKöúûúòKöúûúòKöú	ûúòKòKöú$ûúò(Köú
+ûúûúò"KöúûúûúòKöúûúûúòKò KöúûúòKöúûúûúò6Kò öüúûúò6Köú+ô+Kò(Kò Kòóöüúûúûúûúò?öûúûúûúûò'Köûúûúûúûúò4KöûúòóKöûúûúòóKò öüúûúòKöûúûúûú&ò=KöúûúòKò óöüúûúòKòKöûúûúûú5ûúòRKöúûúòöûúûúûúò"KòKòPKòóöûúûúûúòKòKò@Köúòóö
+ûúûúûúûúûúò:KòKöûúûúûú5òOKòVKòóöûúûúûúòKòKöú<ûúòQóöûúûúûúòKòKöûúò	óKò?KòKò óKôKò öûúûúûúûò)öûúòKöûúòöú<ò<Köûúûú!ò,Köúòóöú(ò(öûú	ûòöúòKöûúûú$ò/óöúòKöûú
+ûúûúûúò9KòKöûúòóöúòKöûú
+ûúûúûúò3Kô≤KöûúòóKöúôöûú†úòKöûú
+ûúûúûúò3KòKöûúòóóKòóò0öúûúûú	ûò,Kò%Köú3ò3Köú'ò'Köú'ò'Köú)ò)KöúòKöúòKöûúòóKö
+ûúûúûúûúûúòCóöú0ò0öúûúûú	ûò,KöúòKöúòKöûúòóKöûúûúò!óöú,ò,öúûúûú	ûò,KöúòKöúòKöú!ò!Köú&ò&KöûúòóKö
+ûúûúûúûúûúòCóòöûúûòöúòKöûú
+ûúûúûú"ò>KòKöûúòóöú_ò_Köûú
+ûúûúûú"ò>KòKöûúòóöúòKöûú
+ûúûúûúò9KòKöûúòóöú~† úò†öûú
+ûúûúûúò#öúûúûòKöú-ò-Köú,ò,KöûúòóKöúòóKòKöûúûúûúûúûúûúòSKöûúòóöúx†úòçKöûúòóKöûúûúòóKòóöúòKöûú
+ûúûúòKòKöûúòóöúòKöûú
+ûúûúò/KòKöûúòóKòKò óöûú
+ûúòKöúûúòKöúòKöúûúòKöûúò	óKò Köú†%ò;Köûúûúûúòöûúûúûò'Köú)ò)óKöú
+ûúòKöúûúòöú'ò'öú.ò.KòKöú
+ûúòKöûúòóóKöúûúòöûú	ûúòKöú*†ò>Köûúûúûúò!Kò9Kò!KöûúòóKò!Köú&ò&Kò
+KöûúòKöûúòóKò
+Köûúûúò"KòóóôKöúûúò$Kò öüúûúòöûòKòKòKöûúòóKòKò óöüúô"Köûúûúaô~KôKôóKò Kò Köûúûúò*Köûúûúaò~Köú#ô#óKòóKò ó Öó    V   y´  

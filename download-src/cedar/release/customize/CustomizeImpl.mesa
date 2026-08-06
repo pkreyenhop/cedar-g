@@ -1,0 +1,561 @@
+DIRECTORY
+Atom, Customize, CustomizeExtras, <<PFS,>> IO, PreDebug, Rope, SymTab;
+
+CustomizeImpl: CEDAR MONITOR 
+IMPORTS Atom, <<PFS,>> IO, PreDebug, Rope, SymTab 
+EXPORTS Customize, CustomizeExtras = 
+BEGIN OPEN Customize;
+
+ROPE: TYPE = Rope.ROPE;
+STREAM: TYPE = IO.STREAM;
+error: ERROR = CODE;
+Error: PROC [] = {ERROR error};
+
+DB: TYPE = REF DBRec;
+DBreadonly: TYPE = REF READONLY DBRec;
+DBRec: PUBLIC TYPE = RECORD [
+value: REF ¬ NIL, 
+identifier: SymTab.Ref ¬ NIL, -- contains following identifiers
+wildN: DB ¬ NIL, 
+wild1: DB ¬ NIL 
+];
+
+CopyDB: PUBLIC PROC [source: DBreadonly] RETURNS [copy: DB] = {
+copy ¬ CreateDB[];
+MergeDB[copy, source, FALSE];
+RETURN;
+};
+
+MergeDB: PUBLIC PROC [into: DB, from: DBreadonly, overwrite: BOOL] = {
+IF from.value#NIL THEN {
+IF overwrite OR into.value=NIL THEN into.value ¬ from.value;
+};
+IF from.wildN#NIL THEN {
+IF into.wildN=NIL THEN into.wildN ¬ CreateDB[];
+MergeDB[into.wildN, from.wildN, overwrite];
+};
+IF from.wild1#NIL THEN {
+IF into.wild1=NIL THEN into.wild1 ¬ CreateDB[];
+MergeDB[into.wild1, from.wild1, overwrite];
+};
+IF from.identifier#NIL THEN {
+MergeOneEntry: SymTab.EachPairAction = {
+WITH val SELECT FROM
+fromChild: DB => {
+Update: SymTab.UpdateAction = {
+IF found
+THEN {
+WITH val SELECT FROM
+intoChild: DB => {
+MergeDB[intoChild, fromChild, overwrite];
+op ¬ none;
+};
+ENDCASE => {}
+}
+ELSE {
+newChild: DB ¬ CreateDB[];
+MergeDB[newChild, fromChild, overwrite];
+op ¬ store; new ¬ newChild;
+};
+};
+SymTab.Update[into.identifier, key, Update]
+}
+ENDCASE => {};
+};
+IF into.identifier=NIL THEN 
+into.identifier ¬ SymTab.Create[SymTab.GetSize[from.identifier]+1];
+[] ¬ SymTab.Pairs[from.identifier, MergeOneEntry];
+};
+};
+
+freeQuery: Query ¬ NIL;
+FreeQuery: PUBLIC PROC [query: Query] = {
+old: Query ¬ freeQuery;
+IF old=NIL OR old.count<query.count THEN freeQuery ¬ query;
+};
+
+INewQuery: ENTRY PROC [reserve: NAT] RETURNS [Query] = {
+query: Query ¬ freeQuery; 
+IF query#NIL AND query.count>reserve THEN {freeQuery ¬ NIL; RETURN [query]};
+query ¬ NEW[QueryRec[reserve+1]];
+RETURN [query];
+};
+
+Token: TYPE = RECORD [
+type: {name, dot, wildN, wild1, colon, bang, error, eof, leftParen, rightParen, verticalbar},
+data: Rope.ROPE ¬ NIL --scanned name 
+];
+
+Break: IO.BreakProc = {
+RETURN[SELECT char FROM
+IN ['A..'Z], IN ['a..'z], IN ['0..'9], '-, '_ => other
+ENDCASE => sepr]
+};
+
+GetToken: PROC [stream: STREAM, buffer: REF TEXT ¬ NIL] RETURNS [t: Token] = {
+c: CHAR;
+IF IO.EndOf[stream] THEN {t.type ¬ eof; RETURN};
+[] ¬ IO.SkipWhitespace[stream];
+IF IO.EndOf[stream] THEN {t.type ¬ eof; RETURN};
+SELECT c ¬ IO.GetChar[stream] FROM
+IN ['A..'Z], IN ['a..'z], IN ['0..'9], '-, '_ => { 
+rt: REF TEXT;
+IO.Backup[stream, c];
+rt ¬ IO.GetToken[stream, Break, buffer].token;
+t.type ¬ name;
+t.data ¬ Rope.FromRefText[rt];
+};
+'.  => t.type ¬ dot;
+'* => t.type ¬ wildN;
+':  => t.type ¬ colon;
+'!  => t.type ¬ bang;
+'(  => t.type ¬ leftParen;
+')  => t.type ¬ rightParen;
+'|  => t.type ¬ verticalbar;
+'?  => t.type ¬ wild1;
+ENDCASE => {t.type ¬ error; t.data ¬ NIL};
+};
+
+emptyRope: ROPE ¬ "";
+ScanValue: PROC [stream: STREAM] RETURNS [val: ROPE ¬ emptyRope] = {
+IF IO.EndOf[stream] THEN RETURN;
+[] ¬ IO.SkipWhitespace[stream];
+IF ~IO.EndOf[stream] THEN {
+value: ROPE ¬ IO.GetLineRope[stream];
+IF value=NIL THEN value ¬ emptyRope;
+RETURN [value];
+};
+};
+
+SkipLine: PROC [stream: STREAM] = {
+c: CHAR;
+WHILE ~IO.EndOf[stream] DO
+SELECT c ¬ IO.GetChar[stream] FROM
+IO.CR, IO.LF => RETURN[];
+ENDCASE => NULL;
+ENDLOOP;
+};
+
+
+Parse: PROC [db: DB, stream: IO.STREAM, expliciteValue: REF ¬ NIL] RETURNS [errors: ROPE ¬ NIL] = {
+newEntry: BOOL ¬ TRUE;
+token: Token;
+buffer: REF TEXT ¬ NEW[TEXT[64]];
+currentRDB: DB ¬ NIL;
+
+AddId: PROC [id: Rope.ROPE] = {
+action: SymTab.UpdateAction = {
+WITH val SELECT FROM
+db: DB => currentRDB ¬ db;
+ENDCASE => {
+currentRDB ¬ CreateDB[];
+RETURN [store, currentRDB];
+};
+};
+IF currentRDB.identifier=NIL THEN currentRDB.identifier ¬ SymTab.Create[3];
+SymTab.Update[currentRDB.identifier, id, action];
+};
+
+FinishEntry: PROC [ignore: BOOL ¬ FALSE] = {
+val: REF ¬ ScanValue[stream];
+IF expliciteValue#NIL THEN val ¬ expliciteValue;
+currentRDB.value ¬ val; 
+};
+
+ParseError: PROC [message: ROPE] = {
+pos: INT ¬ IO.GetIndex[stream];
+errors ¬ IO.PutFR["%g %g at pos %g\n", IO.rope[errors], IO.rope[message], IO.int[pos]];
+SkipLine[stream];
+newEntry ¬ TRUE;
+};
+
+wasWildN: BOOL; --hack to optimize adjacent wildcards
+WHILE TRUE DO
+IF newEntry THEN {
+currentRDB ¬ db; 
+newEntry ¬ FALSE;
+wasWildN ¬ FALSE;
+};
+token ¬ GetToken[stream, buffer];
+SELECT token.type FROM
+name => {AddId[token.data]; wasWildN ¬ FALSE};
+dot => {--ignore dots; they are separators...--}; 
+colon => {FinishEntry[]; newEntry ¬ TRUE}; 
+wildN => {
+IF wasWildN THEN LOOP;
+wasWildN ¬ TRUE;
+IF currentRDB.wildN=NIL THEN currentRDB.wildN ¬ CreateDB[];
+currentRDB ¬ currentRDB.wildN;
+}; 
+wild1 => {
+IF currentRDB.wild1=NIL THEN currentRDB.wild1 ¬ CreateDB[];
+currentRDB ¬ currentRDB.wild1;
+wasWildN ¬ FALSE;
+}; 
+bang => {SkipLine[stream]; newEntry ¬ TRUE}; 
+eof => {
+IF expliciteValue#NIL THEN currentRDB.value ¬ expliciteValue; 
+RETURN []
+}; 
+ENDCASE => ParseError["Syntax error"];
+ENDLOOP;
+};
+
+
+QueryRep: PUBLIC TYPE = QueryRec; 
+QueryRec: TYPE = RECORD [
+lastDef: NAT ¬ 1, 
+atoms: SEQUENCE count: NAT OF Rope.ROPE
+]; 
+
+separator: Rope.ROPE = NIL;
+
+QueryState: PUBLIC PROC [query: REF QueryRec] RETURNS [NAT] = {
+RETURN [query.lastDef]
+};
+
+NewQuery: PUBLIC PROC [reserve: NAT ¬ 6, useMemory: REF QueryRep ¬ NIL] RETURNS [q: REF QueryRep] = {
+SELECT TRUE FROM
+useMemory#NIL AND useMemory.count>reserve =>  q ¬ useMemory;
+freeQuery#NIL => q ¬ INewQuery[reserve];
+ENDCASE => q ¬ NEW[QueryRec[reserve+1]];
+q.lastDef ¬ 1;
+q[0] ¬ q[1] ¬ separator;
+};
+
+ResetQuery: PUBLIC PROC [query: REF QueryRep, state: NAT ¬ 0] = {
+IF query=NIL THEN {IF state>1 THEN Error[] ELSE RETURN};
+state ¬ MAX[state, 1];
+IF query.lastDef<state THEN Error[];
+query[state] ¬ separator;
+query.lastDef ¬ state;
+};
+
+CopyQuery: PUBLIC PROC [query: REF QueryRep, reserve: NAT ¬ 0] RETURNS [q: REF QueryRep] = {
+IF query=NIL THEN RETURN [NewQuery[reserve]];
+q ¬ NewQuery[reserve+query.lastDef];
+q.lastDef ¬ query.lastDef;
+FOR i: NAT IN [0..q.lastDef] DO
+q[i] ¬ query[i];
+ENDLOOP;
+};
+
+AppendStepOnly: PUBLIC PROC [query: REF QueryRep] RETURNS [REF QueryRep] = {
+IF query=NIL THEN query ¬ NewQuery[6];
+BEGIN 
+next: NAT ¬ query.lastDef+1;
+IF query[next-2]=separator THEN RETURN [query]; --no empty steps
+IF next>=query.count THEN query ¬ CopyQuery[query, next/2+4];
+query[next] ¬ separator;
+query.lastDef ¬ next;
+END;
+RETURN [query];
+};
+
+AppendOptionOnly: PUBLIC PROC [query: REF QueryRep, option: AnyString] RETURNS [REF QueryRep] = {
+IF query=NIL THEN Error[];
+IF option=NIL THEN RETURN [query];
+BEGIN
+next: NAT ¬ query.lastDef+1;
+IF next>=query.count THEN query ¬ CopyQuery[query, next/2+4];
+query[next] ¬ separator;
+query[next-1] ¬ ToRope[option];
+query.lastDef ¬ next;
+END;
+RETURN [query];
+};
+ToRope: PROC [x: REF] RETURNS [Rope.ROPE] = INLINE {
+RETURN [WITH x SELECT FROM
+r: ROPE => r,
+a: ATOM => Atom.GetPName[a],
+r: REF TEXT => Rope.FromRefText[r],
+ENDCASE => ERROR error
+];
+};
+
+AppendStep: PUBLIC PROC [query: REF QueryRep, val1, val2: AnyString ¬ NIL] RETURNS [REF QueryRep] = {
+query ¬ AppendStepOnly[query];
+IF val1#NIL THEN query ¬ AppendOptionOnly[query, val1];
+IF val2#NIL THEN query ¬ AppendOptionOnly[query, val2];
+RETURN [query];
+};
+
+ParseQuery: PUBLIC PROC [string: AnyString] RETURNS [query: Query ¬ NIL] = {
+buffer: REF TEXT ¬ NEW[TEXT[64]];
+query ¬ StreamParseQuery[ToStream[string], buffer];
+};
+
+StreamParseQuery: PROC [stream: STREAM, buffer: REF TEXT] RETURNS [q: Query ¬ NewQuery[]] = {
+state: {expectStep, expectOption} ¬ expectStep;
+token: Token;
+WHILE TRUE DO
+token ¬ GetToken[stream, buffer];
+SELECT state FROM
+expectStep => {
+SELECT token.type FROM
+leftParen => {
+q ¬ AppendStepOnly[q];
+state ¬ expectOption;
+};
+name => {
+q ¬ AppendStepOnly[q];
+q ¬ AppendOptionOnly[q, token.data];
+state ¬ expectStep;
+};
+eof => RETURN; 
+ENDCASE => QueryError["( expected"];
+};
+expectOption => {
+SELECT token.type FROM
+name => {
+q ¬ AppendOptionOnly[q, token.data];
+state ¬ expectOption;
+};
+rightParen => state ¬ expectStep;
+verticalbar => state ¬ expectOption;
+ENDCASE => QueryError["| or ) or ident expected"];
+};
+ENDCASE => Error[]; -- can't happen
+ENDLOOP;
+};
+
+
+
+QueryError: PUBLIC ERROR [what: Rope.ROPE ¬ NIL] = CODE;
+
+DoQueryString: PUBLIC PROC [db: DBreadonly, string: AnyString] RETURNS [x: REF] = {
+q: Query ¬ ParseQuery[string];
+x ¬ DoQuery[db, q];
+FreeQuery[q];
+};
+
+DoQuery: PUBLIC PROC [db: DBreadonly, query: Query] RETURNS [REF ¬ NIL] = {
+xdb: DB;
+TRUSTED {xdb ¬ LOOPHOLE[db]};
+RETURN [ Follow[xdb, query, 0] ];
+};
+
+Follow: PROC [db: DB, query: REF QueryRep, sepIdx: NAT] RETURNS [REF] = {
+value: REF; 
+this: NAT ¬ sepIdx + 1; --index of first option
+next: NAT ¬ 0; --index of separator after last option
+FindNextSeparator: PROC [] = INLINE {
+FOR next ¬ this + 1, next + 1 WHILE query[next]#separator DO ENDLOOP;
+};
+IF sepIdx>=query.lastDef THEN RETURN [db.value];
+IF query[sepIdx]#separator THEN Error[];
+FindNextSeparator[];
+IF db.identifier#NIL THEN {
+FOR i: NAT IN [this..next) DO
+follow: REF ~ SymTab.Fetch[db.identifier, query[i]].val;
+IF follow#NIL THEN {
+WITH follow SELECT FROM
+db2: DB => {
+value ¬ Follow[db2, query, next];
+IF value # NIL THEN RETURN [value];
+};
+ENDCASE => {}
+};
+ENDLOOP;
+};
+IF db.wild1#NIL THEN {
+value ¬ Follow[db.wild1, query, next];
+IF value # NIL THEN RETURN [value];
+};
+IF db.wildN#NIL THEN {
+DO
+value ¬ Follow[db.wildN, query, next];
+IF value # NIL THEN RETURN [value];
+this ¬ next+1;
+IF this>=query.lastDef THEN RETURN [NIL];
+FindNextSeparator[];
+ENDLOOP;
+};
+RETURN [NIL];
+};
+
+CreateDB: PUBLIC PROC [] RETURNS [x: DB] = {
+x ¬ NEW[DBRec];
+};
+
+UpdateDB: PUBLIC PROC [db: DB, stream: STREAM] RETURNS [errors: ROPE ¬ NIL] = {
+errors ¬ Parse[db, stream, NIL];
+};
+
+ToStream: PROC [x: AnyString] RETURNS [stream: IO.STREAM] = {
+WITH x SELECT FROM
+r: ROPE => stream ¬ IO.RIS[r];
+rt: REF TEXT => stream ¬ IO.TIS[rt];
+s: STREAM => stream ¬ s;
+ENDCASE => Error[];
+};
+
+UpdateDBString: PUBLIC PROC [db: DB, string: AnyString] RETURNS [errors: ROPE ¬ NIL] = {
+stream: STREAM ¬ ToStream[string];
+errors ¬ Parse[db, stream, NIL];
+};
+
+UpdateDBExplicite: PUBLIC PROC [db: DB, key: AnyString, value: REF] RETURNS [errors: ROPE ¬ NIL] = {
+stream: STREAM  ¬ ToStream[key];
+SELECT TRUE FROM
+value=NIL => value ¬ emptyRope;
+ISTYPE[value, DB] => Error[]; --this type has internal functions
+ENDCASE => {};
+errors ¬ Parse[db, stream, value];
+};
+
+UpdateDBFromFile: PUBLIC PROC [file: REF, inputDb: DB ¬ NIL] RETURNS [db: DB, errors: ROPE ¬ NIL] = {
+IF inputDb=NIL THEN db ¬ CreateDB[] ELSE db ¬ inputDb;
+WITH file SELECT FROM
+stream: STREAM => errors ¬ UpdateDB[db, stream];
+ENDCASE => Error[];
+};
+
+ExplainQueryError: PreDebug.Explainer = {
+msg ¬ "Customize.QueryError";
+IF args=NIL THEN RETURN;
+PreDebug.Raise[signalOrError, args ! QueryError => {
+IF ~Rope.IsEmpty[what] THEN msg ¬ Rope.Cat[msg, " """, what, """"];
+CONTINUE
+}];
+};
+
+PreDebug.RegisterErrorExplainer[QueryError, ExplainQueryError];
+PreDebug.RegisterErrorExplainer[error, NIL, "Customize.error"];
+END.
+
+
+  T  
+CustomizeImpl.mesa
+Copyright Ó 1989, 1991 by Xerox Corporation.  All rights reserved.
+Goran Rydqvist and Christian Jacobi, July 24, 1989 9:20:43 pm PDT
+Simplified algorithm Christian Jacobi, November 22, 1991 3:20 pm PST
+Christian Jacobi, April 30, 1992 10:23 am PDT
+
+Small Point:
+Should xsoft take advantage of Xl and shed away from PFS; the use of PFS is not critical and could be commented out
+
+--
+copy.value ¬ source.value;
+IF source.wildN#NIL THEN copy.wildN ¬ CopyDB[source.wildN];
+IF source.wild1#NIL THEN copy.wild1 ¬ CopyDB[source.wild1];
+IF source.identifier#NIL THEN {
+<<copy.identifier ¬ COPY[source.identifier]>>
+EachEntry: SymTab.EachPairAction = {
+x: REF ¬ val;
+WITH val SELECT FROM
+db: DB => x ¬ CopyDB[db];
+ENDCASE => {};
+[] ¬ SymTab.Insert[copy.identifier, key, x];
+};
+copy.identifier ¬ SymTab.Create[SymTab.GetSize[source.identifier]+1];
+[] ¬ SymTab.Pairs[source.identifier, EachEntry];
+};
+Merges the entries of "from" into "into" 
+In case of conflict, the "from" value will overwrite the "into" value
+Memory allocations hacks
+
+Returns query for re-use.  Caller asserts that he won't modify query anymore.
+It is ok to not worry but leave query's to the garbage collector.
+
+Database Scanner
+--wild1 is represented as a question mark
+--wildN is represented as a asterix
+
+Database Parser
+
+This builds a data structure specially tailored to efficiently answering a query.  For each step in the tree representing the database, a node is generated.  A lookup table is created in each node to facilitate finding the next possible steps.
+
+Query Types
+--lastIdx: number of entries or index of last step 
+--I know: atoms[0]=separator all the time; but it is queried
+--atoms[lastIdx+1]=separator
+Returns <state> of query in construction.  Meaning of numerical value is private.  
+Creates new empty query.  Query does not yet have any steps or options.
+<reserve>: allocates enough memory for about <reserve> steps or options.
+Resets state of query to <state>. <state>=0 means reset to empty.
+Creates new copy which does not share memory with query. 
+<reserve> is a guess: allocates enough memory to append about <reserve> more steps or options.
+Appends step to <query>; The new step has no options yet.
+Returns <query> or new query if new memory allocation needed.
+Append query option to the current step of <query>. 
+<query> must not be empty.
+Returns <query> or new query if new memory allocation needed.
+
+Parses <string> into a query. 
+May raise error QueryError. 
+Query Resolver
+Conveniance procedure.
+Query the database <db> strings.
+Query the database <db> with <query>. 
+
+Database creation
+
+Creates new, empty DB.
+Parse <stream> and merge database entries into <db>.  If a specification is identical to one that already exists, the later one takes precedence. 
+Parse <string> and and merge database entries into <db>.  
+Parse <key> and add <value> as database entry into <db>.  
+Database values may be overwriten, but, they can't be removed.  
+Conveniance procedure: <inputDb> is updated and returned again.  <file> a STREAM or a string (string is interpreted as a file name).  Not found files are reported like syntax errors in the data base.
+name: ROPE => {
+BEGIN
+ENABLE PFS.Error => {
+errors _ IO.PutFR["file not opened: %g", IO.rope[error.explanation]]; 
+GOTO failed;
+};
+stream: STREAM _ PFS.StreamOpen[PFS.PathFromRope[name]];
+errors _ UpdateDB[db, stream];
+EXITS failed => {};
+END;
+};
+Êõ  •NewlineDelimiter
+–(cedarcode) style™ codešœ™Kšœ
+Ïeœ7™BKšœ>Ïk™AKšœD™DK™-K™ ™K™s—K™ —šž	˜	Kšœ$žœžœ˜FK˜ —šÐlnœžœžœ˜Kšžœžœžœ˜2Kšžœ˜%—šžœžœ˜K˜ Kšžœžœžœ˜Kšžœžœžœžœ˜Kšœžœžœ˜KšÏnœžœžœ˜K˜ Kšžœžœžœ˜Kšœžœžœžœ˜&šœžœžœžœ˜Kšœžœžœ˜KšœžœÏc!˜?Kšœžœžœ˜Kšœžœžœ˜K˜—K˜ š
+ œžœžœžœžœ˜?K˜Kšœžœ˜Kšžœ˜K™K™Kšžœžœžœ#™;Kšžœžœžœ#™;šžœžœžœ™K™-š 	œ™$Kšœžœ™šžœžœž™Kšœžœ™Kšžœ™—K™,K™—K™EK™0K™—K˜K˜ —š
+ œžœžœžœžœ˜FK™)K™Ešžœžœžœ˜Kšžœžœžœžœ˜<K˜—šžœžœžœ˜Kšžœžœžœ˜/K˜+K˜—šžœžœžœ˜Kšžœžœžœ˜/K˜+K˜—šžœžœžœ˜š œ˜(šžœžœž˜šœžœ˜š œ˜šžœ˜šžœ˜šžœžœž˜šœžœœ˜K˜)K˜
+K˜—Kšžœ˜—K˜—šžœ˜Kšœ
+žœ˜K˜(K˜K˜——K˜—K˜+K˜—Kšžœ˜—K˜—šžœžœžœ˜K˜C—K˜2K˜—K˜—K˜ —šÑael™K™ Kšœžœ˜š 	œžœžœ˜)KšœM™MKšœA™AKšœ˜Kšžœžœžœžœ˜;K˜—K˜ š
+ 	œžœžœžœžœ˜8Kšœ˜Kšžœžœžœžœžœžœ
+˜LKšœžœ˜!Kšžœ	˜Kšœ˜—K™ —š¢™K˜ šœžœžœ˜Kšœ]˜]Kšœžœžœ¡˜%˜K™)K™#——K˜ š œžœ˜šžœžœž˜Kšžœžœžœ˜6Kšžœ	˜—Kšœ˜—K˜ š œžœ
+žœ
+žœžœžœžœ˜NKšœžœ˜Kšžœžœžœžœ˜0Kšœžœ˜Kšžœžœžœžœ˜0šžœžœž˜"šžœžœžœ˜3Kšœžœžœ˜Kšžœ˜Kšœžœ'˜.K˜Kšœ˜Kšœ˜—Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšžœžœ˜*—K˜K˜ —Kšœžœ˜š
+ 	œžœ
+žœžœžœ˜DKšžœžœžœžœ˜ Kšœžœ˜šžœžœžœ˜Kšœžœžœ˜%Kšžœžœžœ˜$Kšžœ	˜K˜—K˜—K˜ š œžœ
+žœ˜#Kšœžœ˜šžœžœž˜šžœžœž˜"Kš
+žœžœžœžœžœ˜Kšžœžœ˜—Kšžœ˜—K˜K˜ —K™ —š¢™K™ K™óK˜ š œžœžœ
+žœžœžœžœžœ
+žœžœ˜cKšœ
+žœžœ˜Kšœ˜Kš	œžœžœžœžœ˜!Kšœžœžœ˜K˜ š œžœžœ˜šÏbœ˜šžœžœž˜Kšœžœ˜šžœ˜Kšœ˜Kšžœ˜K˜——K˜—Kšžœžœžœ*˜KKšœ1˜1Kšœ˜—K˜ š œžœ
+žœžœ˜,Kšœžœ˜Kšžœžœžœ˜0Kšœ˜Kšœ˜—K˜ š 
+œžœžœ˜$Kšœžœžœ˜Kš	œ	žœžœžœžœ˜WKšœ˜Kšœžœ˜Kšœ˜—K˜ Kšœ
+žœ¡%˜5šžœžœž˜šžœ
+žœ˜Kšœ˜Kšœžœ˜Kšœžœ˜K˜—Kšœ!˜!šžœž˜Kšœ'žœ˜.Kšœ¡'œ˜2Kšœ$žœ˜+˜
+Kšžœ
+žœžœ˜Kšœžœ˜Kšžœžœžœ˜;Kšœ˜Kšœ˜—˜
+Kšžœžœžœ˜;Kšœ˜Kšœžœ˜K˜—Kšœ&žœ˜-šœ˜Kšžœžœžœ$˜>Kšžœ˜	Kšœ˜—Kšžœ˜&—Kšžœ˜—K˜—K˜ K™ —š¢™K˜ Kšœ
+žœžœ˜"šœ
+žœžœ˜Kšœ	žœ˜Kšœžœžœžœž˜'Kšœ˜Kšœ3™3Kšœ<™<Kšœ™—K˜ Kšœžœžœ˜K˜ š 
+œžœžœ	žœžœžœ˜?KšœS™SKšžœ˜K˜K˜ —š œžœžœžœžœžœžœžœ˜eKšœG™GKšœH™Hšžœžœž˜Kšœ
+žœžœ+˜<Kšœ
+žœ˜(Kšžœžœ˜(—Kšœ˜Kšœ˜K˜K˜ —š
+ 
+œžœžœ	žœžœ	˜AKšœA™AKšžœžœžœžœ	žœ	žœžœ˜8Kšœžœ˜Kšžœžœ	˜$Kšœ˜Kšœ˜K˜—K˜ š 	œžœžœ	žœžœžœžœ˜\Kšœ9™9Kšœ^™^Kšžœžœžœžœ˜-Kšœ$˜$Kšœ˜šžœžœžœž˜Kšœ˜Kšžœ˜—Kšœ˜K˜ —š œžœžœ	žœžœžœ˜LKšœ9™9Kšœ=™=Kšžœžœžœ˜&šžœ˜Kšœžœ˜Kšžœžœžœ
+¡˜@Kšžœžœ$˜=Kšœ˜Kšœ˜Kšžœ˜—Kšžœ	˜K˜—K˜ š
+ œžœ	žœžœžœ˜aKšœ4™4Kšœ™Kšœ=™=Kšžœžœžœ	˜Kšžœžœžœžœ	˜"šž˜Kšœžœ˜Kšžœžœ$˜=Kšœ˜Kšœ˜Kšœ˜Kšžœ˜—Kšžœ	˜K˜K™ —š œžœžœžœžœžœ˜4šžœžœžœž˜Kšœžœ˜Kšœžœ˜Kšœžœžœ˜#Kšžœžœ˜K˜—K˜—K˜ š 
+œžœžœ	žœ#žœžœžœ˜eKšœ˜Kšžœžœžœ'˜7Kšžœžœžœ'˜7Kšžœ	˜K˜K˜ —š
+ 
+œžœžœžœžœ˜LKšœ™Kšœ™Kš	œžœžœžœžœ˜!Kšœ3˜3K˜K˜ —š œžœ
+žœ
+žœžœžœ˜]Kšœ/˜/Kšœ˜šžœžœž˜Kšœ!˜!šžœž˜šœ˜šžœž˜šœ˜Kšœ˜Kšœ˜Kšœ˜—šœ	˜	Kšœ˜Kšœ$˜$Kšœ˜Kšœ˜—Kšœžœ˜Kšžœ˜$—K˜—šœ˜šžœž˜šœ	˜	Kšœ$˜$Kšœ˜Kšœ˜—Kšœ!˜!Kšœ$˜$Kšžœ+˜2—K˜—Kšžœ¡˜#—Kšžœ˜—K˜—K˜ K˜ —š¢™K˜ Kš 
+œžœžœžœžœžœ˜8K˜ š
+ œžœžœ%žœžœ˜SKšœ™Kšœ ™ Kšœ˜Kšœ˜Kšœ˜Kšœ˜—K˜ š œžœžœ žœžœžœ˜KKšœ&™&Kšœžœ˜Kšžœžœ˜Kšžœ˜!K˜—K˜ š œžœžœ	žœžœžœžœ˜IKšœžœ˜Kšœžœ¡˜/Kšœžœ¡&˜5š œžœžœ˜%Kšžœžœžœžœ˜EK˜—Kšžœžœžœ˜0Kšžœžœ	˜(Kšœ˜šžœžœžœ˜šžœžœžœž˜Kšœžœ-˜8šžœžœžœ˜šžœžœž˜šœžœ˜Kšœ!˜!Kšžœ	žœžœžœ	˜#K˜—Kšžœ˜—K˜—Kšžœ˜—K˜—šžœ
+žœžœ˜Kšœ&˜&Kšžœ	žœžœžœ	˜#K˜—šžœ
+žœžœ˜šž˜Kšœ&˜&Kšžœ	žœžœžœ	˜#Kšœ˜Kšžœžœžœžœ˜)Kšœ˜Kšžœ˜—Kšœ˜—Kšžœžœ˜Kšœ˜—K˜ —K™ Kš¢™™ š
+ œžœžœžœžœ˜,K™Kšœžœ˜K˜K˜ —š œžœžœžœ
+žœžœ
+žœžœ˜OKšœ’™’Kšœžœ˜ K˜K˜ —š
+ œžœžœ
+žœžœ˜=šžœžœž˜Kšœžœžœžœ˜Kš	œžœžœžœžœ˜$Kšœžœ˜Kšžœ˜—K˜—K˜ š œžœžœžœžœ
+žœžœ˜XKšœ:™:Kšœžœ˜"Kšœžœ˜ K˜—K˜ š œžœžœžœžœžœ
+žœžœ˜dKšœ:™:Kšœ@™@Kšœžœ˜ šžœžœž˜Kšœžœ˜Kšžœžœ¡"˜@Kšžœ˜—Kšœ"˜"K˜K˜ —š œžœžœžœžœžœžœžœ
+žœžœ˜eKšœJžœw™ÇKšžœ	žœžœžœ˜6šžœžœž˜Kšœžœ"˜0šœžœ™šž™šžœžœ™Kšœ	žœžœ™FKšžœ™J™—Jšœžœžœžœ™8Jšœ™Kšžœ™Jšžœ™—J™—Kšžœ˜—K˜K˜ ——š œ˜)Kšœ˜Kšžœžœžœžœ˜šœ4˜4Kšžœžœ(˜CKšž˜K˜—K˜K˜ —Kšœ?˜?Kšœ'žœ˜?šžœ˜K˜ —K˜ — …—    +<  M…  

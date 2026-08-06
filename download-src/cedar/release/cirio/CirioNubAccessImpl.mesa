@@ -1,0 +1,1540 @@
+
+DIRECTORY
+Basics USING [RawBytes, RawChars],	
+CirioDeltaFace USING[SameWorldGetFileEntry, SameWorldLookupMatchingSymEntryByName, SameWorldLookupMatchingSymEntryByValue, SameWorldLookupSymEntryByID, SameWorldLookupSymEntryByName, SameWorldLookupSymEntryByValue, SameWorldPCtoInfo],
+CirioNub USING[Block16, Block32, Block32Record, Call, CallResult, Create, Destroy, Error, Handle, ProcID, PutBlock32, PutCard32, PutInt32, PutBlock8Cnt, PutBlock8Next, PutRope, ReturnCode, StartCall],
+CirioNubAccess USING[AllocatedBytes, Field, Fields, FileEntry, FileEntryBody, Handle, HandleBody, PCInfo, PCInfoBody, ProcRep, RemoteAddress, SizeList, SymEntry, SymEntryBody, ThreadInfo, Typecode, Typestring],
+CirioNubAccessPrivate USING[AllocatedItems, AllocHandleBody --, HandleBody--],
+CirioTargets,
+Convert USING[<<Error, >>RopeFromCard],
+ConvertUnsafe,
+GenericCall,
+IO,
+MesaLoadState,
+NetworkName USING [Error, AddressFromName],
+PCRMonitorDefs USING [MonitorLock, Thread, nullHolder],
+PFS USING [PathFromRope],
+PFSNames USING [PATH],
+RefText USING[InlineAppendChar, New],
+Rope,
+SafeStorage,
+SameWorldMonitoredCallOps USING [MonitoredCall]<<
+, Arpa USING[Address, nullAddress]
+, ConvertExtras USING[ArpaAddressFromRope, RopeFromArpaAddress]
+, SunYPAgent USING[Handle, Match, ObtainHandle, TextSeq, Tokenize]
+>>;
+
+CirioNubAccessImpl: CEDAR MONITOR
+LOCKS h USING h: Handle
+IMPORTS CirioDeltaFace, CirioNub, CirioTargets, Convert, ConvertUnsafe, GenericCall, IO, MesaLoadState, NetworkName, PFS, RefText, Rope, SameWorldMonitoredCallOps<<, ConvertExtras, SunYPAgent>>
+EXPORTS CirioNubAccess
+= BEGIN
+
+CirioNubBase: CirioNub.ProcID = 0;
+CedarCirioNubBase: CirioNub.ProcID = 64;
+
+Error: PUBLIC ERROR [codes: LIST OF ATOM, msg: Rope.ROPE] = CODE;
+RemoteNilFault: PUBLIC ERROR[addr: CirioNubAccess.RemoteAddress] = CODE;
+RemoteAddrFault: PUBLIC ERROR[addr: CirioNubAccess.RemoteAddress] = CODE;
+RemoteMonitorWouldBlock: PUBLIC ERROR[addr: CirioNubAccess.RemoteAddress] = CODE;
+
+Handle: TYPE = CirioNubAccess.Handle;
+HandleBody: TYPE = CirioNubAccess.HandleBody;
+
+RemoteBody: TYPE = RECORD[nub: CirioNub.Handle];
+
+CreateRemoteNub: PUBLIC PROC[debuggee: Rope.ROPE ¬ NIL, port: CARDINAL ¬ 0, timeoutMsec: INT ¬ INT.LAST] RETURNS [Handle] =
+BEGIN
+proposedVersionNumber: CARD ¬ 7;
+addrRope: Rope.ROPE ¬ NameToAddress[debuggee];
+longAddr: Rope.ROPE ¬ Rope.Cat[addrRope, ":", Convert.RopeFromCard[port]];
+nub: CirioNub.Handle ¬ CirioNub.Create[NIL, longAddr, timeoutMsec];
+h: Handle ¬ NEW[HandleBody ¬ [live: TRUE, version: 0, allocatedItems: NIL, contents: NEW[RemoteBody ¬ [nub]], target: NIL]];
+IF NOT Null[h, proposedVersionNumber !UNWIND => CirioNub.Destroy[nub]] THEN {
+CirioNub.Destroy[nub];
+h ¬ NIL;
+ERROR CirioNub.Error[$protocolVersionMismatch]};
+h.target ¬ CirioTargets.CreateTarget[h];
+RETURN[h];
+END;
+
+CreateSameWorldNub: PUBLIC PROC RETURNS [Handle] =
+BEGIN
+proposedVersionNumber: CARD ¬ 7;
+h: Handle ¬ NEW[HandleBody¬[live: TRUE, version: 0, allocatedItems: NIL, contents: NIL, target: NIL ]];
+IF NOT Null[h, proposedVersionNumber] THEN ERROR Error[LIST[$protocolMismatch], IO.PutFR1["the debuggee doesn't want to speak version %g of the DebugNub protocol", [cardinal[proposedVersionNumber]] ]];
+h.target ¬ CirioTargets.CreateTarget[h];
+RETURN[h];
+END;
+
+
+
+
+DestroyNub: PUBLIC ENTRY PROC[h: Handle] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF h.allocatedItems # NIL THEN
+FOR I: CARD IN [0..h.allocatedItems.nSlots) DO
+IF h.allocatedItems[I] # NIL THEN InnerReleaseAllocatedBytes[h, h.allocatedItems[I]]
+ENDLOOP;
+h.live ¬ FALSE;
+IF h.contents # NIL
+THEN RemoteDestroyNub[NARROW[h.contents, REF RemoteBody].nub]
+ELSE RETURN;
+END;
+
+GetProtocolVersionNumber: PUBLIC ENTRY PROC[h: Handle] RETURNS[CARD] =
+BEGIN
+ENABLE UNWIND => NULL;
+RETURN[h.version];
+END;
+
+Null: PUBLIC ENTRY PROC[h: Handle, proposedVersionNumber: CARD] RETURNS[BOOLEAN] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF proposedVersionNumber # 4 AND proposedVersionNumber # 5 AND proposedVersionNumber # 6 AND proposedVersionNumber # 7 THEN ERROR Error[LIST[$protocolMismatch], IO.PutFR1["attempt to use a non-current (<4 or >7) version of the protocol (%g)", [cardinal[proposedVersionNumber]] ]];
+
+IF h.contents # NIL
+THEN
+BEGIN
+h.version ¬ RemoteNull[NARROW[h.contents, REF RemoteBody].nub, proposedVersionNumber];
+IF h.version # 4 AND h.version # 5 AND h.version # 6 AND h.version # 7 THEN ERROR Error[LIST[$protocolMismatch], IO.PutFR1["debuggee uses a non-current (<4 or >7) version of the protocol (%g)", [cardinal[h.version]] ]];
+RETURN[TRUE]
+END
+ELSE
+BEGIN
+h.version ¬ MIN[6, proposedVersionNumber];
+RETURN[h.version = 4 OR h.version = 5 OR h.version = 6 OR h.version = 7];
+END;
+
+END;
+
+WaitSig: PUBLIC ENTRY PROC[h: Handle, timeoutMilliSec: CARD] RETURNS[gotResponse: BOOLEAN] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF h.contents # NIL
+THEN RETURN[RemoteWaitSig[NARROW[h.contents, REF RemoteBody].nub, timeoutMilliSec]]
+ELSE ERROR Error[LIST[$unimplemented, $local, $WaitSig], "CirioNubAccess.WaitSig is not implemented for local debugging"];
+END;
+
+SetDBStat: PUBLIC ENTRY PROC[h: Handle, dbStat: INT32, timeoutMilliSec: CARD] RETURNS[ok: BOOLEAN] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF h.contents # NIL
+THEN RETURN[RemoteSetDBStat[NARROW[h.contents, REF RemoteBody].nub, dbStat, timeoutMilliSec]]
+ELSE ERROR Error[LIST[$unimplemented, $local, $SetDBStat], "CirioNubAccess.SetDBStat is not implemented for local debugging"];
+END;
+
+ReadBytes: PUBLIC PROC[address: CirioNubAccess.RemoteAddress, count: INT] RETURNS[REF TEXT] =
+BEGIN
+Inner: ENTRY PROC[h: Handle] RETURNS[REF TEXT] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF address.nil THEN RemoteNilFault[address];
+IF NOT address.valid THEN RemoteAddrFault[address];
+IF NOT address.h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF address.h.contents # NIL
+THEN RETURN[RemoteReadBytes[nub: NARROW[address.h.contents, REF RemoteBody].nub, address: address, count: count]]
+ELSE RETURN[SameWorldReadBytes[address: address, count: count]];
+END;
+RETURN[Inner[address.h]];
+END;
+
+
+Read16BitsAsCardinal: PUBLIC PROC[address: CirioNubAccess.RemoteAddress] RETURNS[CARDINAL] =
+BEGIN
+Inner: ENTRY PROC[h: Handle] RETURNS[CARDINAL] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF address.nil THEN RemoteNilFault[address];
+IF NOT address.valid THEN RemoteAddrFault[address];
+IF NOT address.h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF address.h.contents # NIL
+THEN RETURN[RemoteRead16BitsAsCardinal[nub: NARROW[address.h.contents, REF RemoteBody].nub, address: address]]
+ELSE RETURN[SameWorldRead16BitsAsCardinal[address: address]];
+END;
+RETURN[Inner[address.h]];
+END;
+
+
+Read32BitsAsCard: PUBLIC PROC[address: CirioNubAccess.RemoteAddress] RETURNS[CARD] =
+BEGIN
+Inner: ENTRY PROC[h: Handle] RETURNS[CARD] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF address.nil THEN RemoteNilFault[address];
+IF NOT address.valid THEN RemoteAddrFault[address];
+IF NOT address.h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF address.h.contents # NIL
+THEN RETURN[RemoteRead32BitsAsCard[nub: NARROW[address.h.contents, REF RemoteBody].nub, address: address]]
+ELSE RETURN[SameWorldRead32BitsAsCard[address: address]];
+END;
+RETURN[Inner[address.h]];
+END;
+
+
+WriteCardAs32Bits: PUBLIC PROC[address: CirioNubAccess.RemoteAddress, card: CARD32] =
+BEGIN
+Inner: ENTRY PROC[h: Handle] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF address.nil THEN RemoteNilFault[address];
+IF NOT address.valid THEN RemoteAddrFault[address];
+IF NOT address.h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF address.h.contents # NIL
+THEN RemoteWriteCardAs32Bits[nub: NARROW[address.h.contents, REF RemoteBody].nub, address: address, card: card]
+ELSE SameWorldWriteCardAs32Bits[address: address, card: card];
+END;
+Inner[address.h];
+END;
+
+
+Read4Bytes: PUBLIC PROC[address: CirioNubAccess.RemoteAddress] RETURNS[PACKED ARRAY [0..3] OF BYTE] =
+BEGIN
+
+text: REF TEXT ¬ ReadBytes[address, 4];
+IF text.length # 4 THEN ERROR Error[LIST[$cantHappen], "ReadBytes[.., 4] returned a REF TEXT whose length wasn't 4"];
+RETURN[[ORD[text[0]], ORD[text[1]], ORD[text[2]], ORD[text[3]]]];
+
+END;
+
+Write4Bytes: PUBLIC PROC[address: CirioNubAccess.RemoteAddress, bytes: PACKED ARRAY [0..3] OF BYTE] =
+BEGIN
+Inner: ENTRY PROC[h: Handle] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF address.nil THEN RemoteNilFault[address];
+IF NOT address.valid THEN RemoteAddrFault[address];
+IF NOT address.h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF address.h.contents # NIL
+THEN RemoteWrite4Bytes[nub: NARROW[address.h.contents, REF RemoteBody].nub, address: address, bytes: bytes]
+ELSE SameWorldWrite4Bytes[address: address, bytes: bytes];
+END;
+Inner[address.h];
+END;
+
+
+GetThreads: PUBLIC ENTRY PROC[h: Handle, lowIndex, highIndex: CARD] RETURNS[LIST OF REF CirioNubAccess.ThreadInfo] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF h.contents # NIL
+THEN RETURN[RemoteGetThreads[NARROW[h.contents, REF RemoteBody].nub, lowIndex, highIndex]]
+ELSE ERROR Error[LIST[$unimplemented, $local, $GetThreads], "CirioNubAccess.GetThreads is not implemented for local debugging"];
+END;
+
+
+PCtoInfo: PUBLIC ENTRY PROC[h: Handle, pc: CARD] RETURNS[CirioNubAccess.PCInfo] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF h.contents # NIL
+THEN RETURN[RemotePCtoInfo[NARROW[h.contents, REF RemoteBody].nub, pc]]
+ELSE RETURN[CirioDeltaFace.SameWorldPCtoInfo[pc]];
+END;
+
+KillWorld: PUBLIC ENTRY PROC[h: Handle] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF h.contents # NIL
+THEN RemoteKillWorld[NARROW[h.contents, REF RemoteBody].nub]
+ELSE ERROR Error[LIST[$unimplemented, $local, $KillWorld], "CirioNubAccess.KillWorld is not implemented for local debugging"];
+END;
+
+IssueThreadCommand: PUBLIC ENTRY PROC[h: Handle, threadIndex: CARD, setFreeze: BOOL, freeze: BOOL, setMsg: BOOL, msg: INT] RETURNS[success: BOOLEAN] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF h.contents # NIL
+THEN RETURN[RemoteIssueThreadCommand[NARROW[h.contents, REF RemoteBody].nub, threadIndex, setFreeze, freeze, setMsg, msg]]
+ELSE ERROR Error[LIST[$unimplemented, $local, $IssueThreadCommand], "CirioNubAccess.IssueThreadCommand is not implemented for local debugging"];
+END;
+
+GetDBStat: PUBLIC ENTRY PROC[h: Handle, oldStat: INT32, oldExamineeIndex: INT, timeoutMsec: CARD] RETURNS[dbStab: INT32, examineeIndex: INT32] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF h.contents # NIL
+THEN
+BEGIN
+[dbStab, examineeIndex] ¬ RemoteGetDBStat[NARROW[h.contents, REF RemoteBody].nub, oldStat, oldExamineeIndex, timeoutMsec];
+RETURN;
+END
+ELSE ERROR Error[LIST[$unimplemented, $local, $GetDBStat], "CirioNubAccess.GetDBStat is not implemented for local debugging"];
+END;
+
+Call: PUBLIC PROC [h: Handle, proc: CirioNubAccess.ProcRep, formalArgSizes, formalRetSizes: CirioNubAccess.SizeList, actualArgs, actualRets: CirioNubAccess.Fields] ~ {
+IF h.contents # NIL THEN ERROR Error[LIST[$unimplemented, $remote, $Call], "CirioNubAccess.Call is not implemented for remote debugging"];
+TRUSTED {GenericCall.Call[LOOPHOLE[proc], formalArgSizes, formalRetSizes, ConvertFields[actualArgs], ConvertFields[actualRets]]};
+RETURN};
+
+ConvertFields: PROC [cfs: CirioNubAccess.Fields] RETURNS [gfs: GenericCall.Fields] ~ {
+gfs ¬ NEW [GenericCall.FieldSeq[cfs.length]];
+FOR i: NAT IN [0..gfs.length) DO
+cf: CirioNubAccess.Field ~ cfs[i];
+gfs[i] ¬ [address: cf.address, bitOffset: cf.bitOffset, bits: cf.bits];
+ENDLOOP;
+RETURN};
+
+GetFileEntry: PUBLIC ENTRY PROC[h: Handle, seqNum: CARD] RETURNS[CirioNubAccess.FileEntry] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF h.contents # NIL
+THEN SELECT h.version FROM
+0 => ERROR Error[LIST[$noVersionYet], "CirioNubAccess.GetFileEntry called on a Handle whose version has not yet been determined"];
+4 => RETURN[RemoteGetFileEntry4[NARROW[h.contents, REF RemoteBody].nub, seqNum]];
+5, 6, 7 => RETURN[RemoteGetFileEntry5[NARROW[h.contents, REF RemoteBody].nub, seqNum]]
+ENDCASE => ERROR Error[LIST[$protocolMismatch], IO.PutFR1["CirioNubAccess.GetFileEntry called on a handle whose version, %g, is not in the current range, [4..7]", [cardinal[h.version]] ]]
+
+ELSE RETURN[CirioDeltaFace.SameWorldGetFileEntry[seqNum]];
+END;
+
+LookupSymEntryByName: PUBLIC ENTRY PROC[h: Handle, sym: Rope.ROPE, caseSensitive: BOOLEAN, externOnly: BOOLEAN, numToSkip: INT] RETURNS[CirioNubAccess.SymEntry] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF h.contents # NIL
+THEN
+RETURN[RemoteLookupSymEntryByName[NARROW[h.contents, REF RemoteBody].nub, sym, caseSensitive, externOnly, numToSkip]]
+ELSE
+RETURN[CirioDeltaFace.SameWorldLookupSymEntryByName[sym, caseSensitive, externOnly, numToSkip]];
+END;
+
+LookupSymEntryByValue: PUBLIC ENTRY PROC[h: Handle, val: CARD, numToSkip: INT] RETURNS[CirioNubAccess.SymEntry] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF h.contents # NIL
+THEN
+RETURN[RemoteLookupSymEntryByValue[NARROW[h.contents, REF RemoteBody].nub, val, numToSkip]]
+ELSE
+RETURN[CirioDeltaFace.SameWorldLookupSymEntryByValue[val, numToSkip]];
+END;
+
+LookupSymEntryByID: PUBLIC ENTRY PROC[h: Handle, symID: CARD] RETURNS[CirioNubAccess.SymEntry] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF h.contents # NIL
+THEN
+RETURN[RemoteLookupSymEntryByID[NARROW[h.contents, REF RemoteBody].nub, symID]]
+ELSE
+RETURN[CirioDeltaFace.SameWorldLookupSymEntryByID[symID]];
+END;
+
+LookupFileEntryByStemName: PUBLIC PROC[h: Handle, stemName: Rope.ROPE, numToSkip: INT] RETURNS[CirioNubAccess.SymEntry] =
+BEGIN
+IF NOT h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+SELECT h.version FROM
+0 => ERROR Error[LIST[$noVersionYet], "CirioNubAccess.LookupFileEntryByStemName called on a Handle whose version has not yet been determined"];
+4, 5 =>
+BEGIN
+direction: INT ¬ IF numToSkip < 0 THEN -1 ELSE 1;
+nSkipped: INT ¬ 0;
+FOR skip: INT ¬ 0, skip + direction DO
+entry: CirioNubAccess.SymEntry ¬ LookupSymEntryByName[h, Rope.Concat[stemName, ".c2c.o"], FALSE, FALSE, skip];
+IF entry = NIL THEN RETURN[entry]; -- no such file in the load state
+IF entry.type # ModuleType AND entry.type # (ModuleType+1) THEN LOOP;
+IF nSkipped = numToSkip THEN RETURN[entry];
+nSkipped ¬ nSkipped + direction;
+ENDLOOP;
+END;
+6, 7 => RETURN[LookupMatchingSymEntryByName[h, 0, Rope.Concat[stemName, ".*"], FALSE, ModuleType, 0, numToSkip]];
+ENDCASE => ERROR Error[LIST[$protocolMismatch], IO.PutFR1["CirioNubAccess.LookupFileEntryByStemName called on a handle whose version, %g, is not in the current range, [4..7]", [cardinal[h.version]] ]]
+END;
+
+ModuleType: CARD = 1eH;
+TextType: CARD = 4;
+
+LookupMatchingSymEntryByName: PUBLIC ENTRY PROC[h: Handle, symID: CARD, pattern: Rope.ROPE, caseSensitive: BOOLEAN, wantedTypes: CARD, ignoreClasses: CARD, numToSkip: INT] RETURNS[CirioNubAccess.SymEntry] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF h.version < 6 THEN ERROR Error[LIST[$protocolMismatch], IO.PutFR1["CirioNubAccess.LookupMatchingSymEntryByName called on a Handle whose version, %g, is less than 6", [cardinal[h.version]] ]];
+IF h.contents # NIL
+THEN
+RETURN[RemoteLookupMatchingSymEntryByName[NARROW[h.contents, REF RemoteBody].nub, symID, pattern, caseSensitive, wantedTypes, ignoreClasses, numToSkip]]
+ELSE
+RETURN[CirioDeltaFace.SameWorldLookupMatchingSymEntryByName[symID, pattern, caseSensitive, wantedTypes, ignoreClasses, numToSkip]];
+END;
+
+
+LookupMatchingSymEntryByValue: PUBLIC ENTRY PROC[h: Handle, symID: CARD, val: CARD, wantedTypes: CARD, ignoreClasses: CARD, numToSkip: INT] RETURNS[CirioNubAccess.SymEntry] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF h.version < 6 THEN ERROR Error[LIST[$protocolMismatch], IO.PutFR1["CirioNubAccess.LookupMatchingSymEntryByValue called on a Handle whose version, %g, is less than 6", [cardinal[h.version]] ]];
+IF h.contents # NIL
+THEN
+RETURN[RemoteLookupMatchingSymEntryByValue[NARROW[h.contents, REF RemoteBody].nub, symID, val, wantedTypes, ignoreClasses, numToSkip]]
+ELSE
+RETURN[CirioDeltaFace.SameWorldLookupMatchingSymEntryByValue[symID, val, wantedTypes, ignoreClasses, numToSkip]];
+END;
+
+
+
+AllocHandle: TYPE = REF AllocHandleBody;
+AllocHandleBody: PUBLIC TYPE = CirioNubAccessPrivate.AllocHandleBody;
+
+AllocateBytes: PUBLIC ENTRY PROC[h: Handle, nBytes: CARD] RETURNS[CirioNubAccess.AllocatedBytes] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF h.version < 6 THEN ERROR Error[LIST[$protocolMismatch], IO.PutFR1["CirioNubAccess.AllocateBytes called on a Handle whose version, %g, is less than 6", [cardinal[h.version]] ]];
+IF h.contents # NIL
+THEN
+ERROR Error[LIST[$unimplemented, $remote, $AllocateBytes], "CirioNubAccess.AllocateBytes not implemented for remote debugging"]
+ELSE
+BEGIN
+ah: REF CirioNubAccessPrivate.AllocHandleBody ¬ GetAnAllocHandle[h];
+byteAddress: CARD;
+[ah.data, byteAddress] ¬ SameWorldAllocateBytes[nBytes];
+RETURN[[ah, [h, byteAddress, 0, FALSE, TRUE]]];
+END;
+END;
+
+GetAnAllocHandle: PROC[h: Handle] RETURNS[REF CirioNubAccessPrivate.AllocHandleBody] =
+BEGIN
+index: CARD; -- will be filled in
+IF h.allocatedItems = NIL THEN
+BEGIN
+count: CARD ¬ 100;
+new: REF CirioNubAccessPrivate.AllocatedItems ¬ NEW[CirioNubAccessPrivate.AllocatedItems[count]];
+new.earlyFreeSlots ¬ NIL;
+new.firstLateFreeSlot ¬ 0;
+FOR I: CARD IN [0..count) DO new[I] ¬ NIL ENDLOOP;
+h.allocatedItems ¬ new;
+END;
+IF h.allocatedItems.earlyFreeSlots # NIL THEN
+BEGIN
+index ¬ h.allocatedItems.earlyFreeSlots.first;
+h.allocatedItems.earlyFreeSlots ¬ h.allocatedItems.earlyFreeSlots.rest;
+END
+ELSE
+BEGIN
+IF h.allocatedItems.firstLateFreeSlot = h.allocatedItems.nSlots THEN
+BEGIN
+newCount: CARD ¬ h.allocatedItems.nSlots*2;
+new: REF CirioNubAccessPrivate.AllocatedItems ¬ NEW[CirioNubAccessPrivate.AllocatedItems[newCount]];
+new.earlyFreeSlots ¬ NIL;
+new.firstLateFreeSlot ¬ h.allocatedItems.nSlots;
+FOR I: CARD IN [0..h.allocatedItems.nSlots) DO new[I] ¬ h.allocatedItems[I] ENDLOOP;
+FOR I: CARD IN [h.allocatedItems.nSlots..newCount) DO new[I] ¬ NIL ENDLOOP;
+h.allocatedItems ¬ new;
+END;
+BEGIN
+index ¬ h.allocatedItems.firstLateFreeSlot;
+h.allocatedItems.firstLateFreeSlot ¬ h.allocatedItems.firstLateFreeSlot+1;
+END;
+END;
+BEGIN
+ah: REF AllocHandleBody ¬ NEW[CirioNubAccessPrivate.AllocHandleBody¬[h, index, NIL]];
+IF h.allocatedItems[index] # NIL THEN ERROR Error[LIST[$cantHappen], "CirioNubAccessImpl.GetAnAllocHandle computed used an index that's not free"];
+h.allocatedItems[index] ¬ ah;
+RETURN[ah];
+END;
+END;
+
+ReleaseAllocatedBytes: PUBLIC PROC[allocHandle: AllocHandle] = {
+Inner: ENTRY PROC[h: Handle] = {
+ENABLE UNWIND => NULL;
+InnerReleaseAllocatedBytes[h, allocHandle];
+RETURN};
+Inner[allocHandle.h];
+RETURN};
+
+InnerReleaseAllocatedBytes: INTERNAL PROC[h: Handle, allocHandle: AllocHandle] ~ {
+IF NOT h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF h.version < 6 THEN ERROR Error[LIST[$protocolMismatch], IO.PutFR1["CirioNubAccess.ReleaseAllocatedBytes called on a Handle whose version, %g, is less than 6", [cardinal[h.version]] ]];
+ReleaseAnAllocHandle[h, allocHandle];
+IF h.contents # NIL
+THEN
+Error[LIST[$unimplemented, $remote, $ReleaseAllocatedBytes], "CirioNubAccess.ReleaseAllocatedBytes not implemented for remote debugging"]
+ELSE
+SameWorldReleaseAllocatedBytes[allocHandle.data];
+RETURN};
+
+ReleaseAnAllocHandle: PROC[h: Handle, ah: REF CirioNubAccessPrivate.AllocHandleBody] =
+BEGIN
+IF ah.h # h THEN ERROR;
+IF h.allocatedItems[ah.index] # ah THEN ERROR Error[LIST[$cantHappen], "attempt to free a broken AllocHandle"];
+h.allocatedItems.earlyFreeSlots ¬ CONS[ah.index, h.allocatedItems.earlyFreeSlots];
+h.allocatedItems[ah.index] ¬ NIL;
+END;
+
+MonitoredCall: PUBLIC PROC[
+address: CirioNubAccess.RemoteAddress, proc: PROCEDURE [] RETURNS []] 
+RETURNS [] =
+BEGIN
+Inner: -- ENTRY -- PROC[h: Handle] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF address.nil THEN RemoteNilFault[address];
+IF NOT address.valid THEN RemoteAddrFault[address];
+IF NOT address.bitOffset = 0 THEN RemoteAddrFault[address];
+IF NOT address.h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF address.h.contents # NIL
+THEN RemoteMonitoredCall[address: address, proc: proc]
+ELSE SameWorldMonitoredCall[address: address, proc: proc];
+END;
+Inner[h: address.h];
+END;
+
+
+GetConcreteTypecode: PUBLIC PROC[h: Handle, opaque: CirioNubAccess.Typecode] RETURNS[concrete: CirioNubAccess.Typecode, whyNot: Rope.ROPE] ~ {
+IF NOT h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF h.contents#NIL THEN {
+IF h.version <7 THEN RETURN[[0], IO.PutFR1["CirioNubAccess.RemoteGetConcreteTypecode called on a Handle whose version, %g, is less than 7", [cardinal[h.version]] ]];
+concrete ¬ RemoteGetConcreteTypecode[h, opaque];
+RETURN[concrete, NIL];
+}
+ELSE {
+ans: SafeStorage.Type ~ MesaLoadState.ConcreteTypeFromAbstractType[VAL[opaque]];
+RETURN[[ans.ORD], NIL]};
+};
+
+
+GetTypestring: PUBLIC PROC[h: Handle, code: CirioNubAccess.Typecode] RETURNS[string: CirioNubAccess.Typestring, whyNot: Rope.ROPE] ~ {
+IF NOT h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF h.contents#NIL THEN {
+IF h.version <7 THEN RETURN[NIL, IO.PutFR1["CirioNubAccess.RemoteGetTypestring called on a Handle whose version, %g, is less than 7", [cardinal[h.version]] ]];
+string ¬ RemoteGetTypestring[h, code];
+RETURN[string, NIL];
+}
+ELSE {
+ts: STRING ~ MesaLoadState.TypeStringFromType[VAL[code]];
+ans: Rope.ROPE ¬ NIL;
+TRUSTED {ans ¬ ConvertUnsafe.SubStringToRope[[ts, 0, ts.length]]};
+RETURN[ans, NIL]};
+};
+
+
+GetTypecode: PUBLIC PROC[h: Handle, string: CirioNubAccess.Typestring] RETURNS [code: CirioNubAccess.Typecode, whyNot: Rope.ROPE ¬ NIL] ~ {
+IF NOT h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF h.contents#NIL THEN {
+IF h.version <7 THEN RETURN[[0], IO.PutFR1["CirioNubAccess.RemoteGetTypecode called on a Handle whose version, %g, is less than 7", [cardinal[h.version]] ]];
+code ¬ RemoteGetTypecode[h, string];
+RETURN[code, NIL];
+}
+ELSE {
+ts: REF TEXT ~ RefText.New[string.Length];
+ans: SafeStorage.Type;
+[] ¬ Rope.AppendChars[ts, string];
+ans ¬ MesaLoadState.TypeFromTypeString[LOOPHOLE[ts, STRING]];
+RETURN[[ans.ORD], NIL]};
+};
+
+GetInstructionSetAndOperatingSystem: PUBLIC ENTRY PROC [h: Handle] RETURNS[instrSet, opSys: Rope.ROPE] ~ {
+ENABLE UNWIND => NULL;
+
+GetInstrSetAndOpSys: CirioNub.ProcID = CirioNubBase + 30;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+nub: CirioNub.Handle;
+
+instrSet3:Rope.ROPE ¬ "RS6000";
+opSys3:Rope.ROPE ¬ "AIX";
+instrSet ¬ "SPARC";
+opSys ¬ "SunOS4";
+
+IF NOT h.live THEN ERROR Error[LIST[$notLive], "attempt to use a dead connection"];
+IF h.version < 7 THEN RETURN;
+
+nub ¬ NARROW[h.contents, REF RemoteBody].nub;
+CirioNub.StartCall[nub, GetInstrSetAndOpSys];
+[rc, result] ¬ CirioNub.Call[nub];
+IF rc # ok THEN ERROR Error[LIST[$something], Rope.Cat["Can't determine the InstructionSet name or OperatingSystem name of the remote target.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+IF result.count # 2 THEN ERROR Error[LIST[$something], "Can't determine the InstructionSet name or OperatingSystem name of the remote target.  Wrong number of arguments returned."];
+
+instrSet ¬ Rope.FromRefText[NARROW[result.val[0]]];
+opSys ¬ Rope.FromRefText[NARROW[result.val[1]]];
+RETURN;
+};
+
+
+
+
+RemoteDestroyNub: PROC[nub: CirioNub.Handle] =
+{CirioNub.Destroy[nub]};
+
+RemoteNull: PROC[nub: CirioNub.Handle, proposedVersionNumber: CARD] RETURNS[actualVersionNumber: CARD32] =
+BEGIN
+CirioNubNull: CirioNub.ProcID = CirioNubBase + 0;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+
+
+CirioNub.StartCall[nub, CirioNubNull];
+CirioNub.PutCard32[nub, proposedVersionNumber];
+[rc, result] ¬ CirioNub.Call[nub];
+IF rc # ok THEN ERROR Error[LIST[$something], Rope.Cat["Can't get remote DebugNub version number.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+IF result.count # 1 THEN ERROR Error[LIST[$something], "Can't get remote DebugNub version number.  Wrong number of arguments returned."];
+actualVersionNumber ¬ NARROW[result[0], REF CARD32]­;
+END;
+
+RemoteWaitSig: PROC[nub: CirioNub.Handle, timeoutMilliSec: CARD] RETURNS[gotResponse: BOOLEAN] =
+BEGIN
+CirioNubWaitSig: CirioNub.ProcID = CirioNubBase + 1;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+
+
+CirioNub.StartCall[nub, CirioNubWaitSig];
+CirioNub.PutCard32[nub, timeoutMilliSec];
+[rc, result] ¬ CirioNub.Call[nub];
+IF rc # ok THEN ERROR Error[LIST[$something], Rope.Cat["Error calling WaitSig in the remote target.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+IF result.count # 2 THEN ERROR Error[LIST[$something], "Error calling WaitSig in the remote target.  Wrong number of arguments returned."];
+gotResponse ¬ (NARROW[result.val[0], REF INT32])­ = 0;
+
+END;
+
+
+RemoteSetDBStat: PROC[nub: CirioNub.Handle, dbStat: INT32, timeoutMilliSec: CARD] RETURNS[ok: BOOLEAN] =
+BEGIN
+CirioNubSetDBStat: CirioNub.ProcID = CirioNubBase + 2;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+
+
+CirioNub.StartCall[nub, CirioNubSetDBStat];
+CirioNub.PutInt32[nub, dbStat];
+CirioNub.PutCard32[nub, timeoutMilliSec];
+[rc, result] ¬ CirioNub.Call[nub];
+IF rc # ok THEN ERROR Error[LIST[$something], Rope.Cat["Error calling SetDBStat in the remote target.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+IF result.count # 1 THEN ERROR Error[LIST[$something], "Error calling SetDBStat in the remote target.  Wrong number of arguments returned."];
+ok ¬ (NARROW[result.val[0], REF INT32])­ = 0;
+END;
+
+RemoteReadBytes: PROC[nub: CirioNub.Handle, address: CirioNubAccess.RemoteAddress, count: INT] RETURNS[REF TEXT] = {
+CirioNubGetBytes: CirioNub.ProcID = CirioNubBase + 3;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+text: REF TEXT;
+
+IF address.nil THEN RemoteNilFault[address];
+IF NOT address.valid THEN RemoteAddrFault[address];
+
+IF address.valid THEN
+BEGIN
+CirioNub.StartCall[nub, CirioNubGetBytes];
+CirioNub.PutCard32[nub, address.byteAddress+(address.bitOffset/8)];
+CirioNub.PutInt32[nub, count]; -- asking for count bytes
+[rc, result] ¬ CirioNub.Call[nub];
+IF rc # ok THEN ERROR Error[LIST[$something], Rope.Cat["Error calling GetBytes in the remote target.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+IF result.count # 1 THEN ERROR Error[LIST[$something], "Error calling GetBytes in the remote target.  Wrong number of arguments returned."];
+text ¬ NARROW[result.val[0]];
+
+RETURN[text]
+END
+ ELSE RETURN[NIL];
+};
+
+
+RemoteRead16BitsAsCardinal: PROC[nub: CirioNub.Handle, address: CirioNubAccess.RemoteAddress] RETURNS[CARDINAL] = {
+CirioNubGetWords16: CirioNub.ProcID = CirioNubBase + 5;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+block16: CirioNub.Block16;
+
+remoteByteAddress: CARD ¬ address.byteAddress+address.bitOffset/8;
+
+IF address.nil THEN RemoteNilFault[address];
+IF NOT address.valid THEN RemoteAddrFault[address];
+
+CirioNub.StartCall[nub, CirioNubGetWords16];
+CirioNub.PutCard32[nub, remoteByteAddress];
+CirioNub.PutInt32[nub, 2]; -- asking for 2 bytes
+[rc, result] ¬ CirioNub.Call[nub];
+IF rc # ok THEN ERROR Error[LIST[$something], Rope.Cat["Error calling GetWords16 in the remote target.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+IF result.count # 1 THEN ERROR Error[LIST[$something], "Error calling GetWords16 in the remote target.  Wrong number of arguments returned."];
+block16 ¬  NARROW[result.val[0]];
+
+IF block16.count # 1 THEN RemoteAddrFault[address];
+
+RETURN[block16.val[0]]
+
+};
+
+
+
+RemoteAddressRangeCheck: PROC[remoteByteAddress: CARD] RETURNS[BOOL] = {
+RETURN[remoteByteAddress > 0 AND remoteByteAddress < 1000]};
+
+
+RemoteRead32BitsAsCard: PROC[nub: CirioNub.Handle, address: CirioNubAccess.RemoteAddress] RETURNS[CARD] = {
+CirioNubGetWords32: CirioNub.ProcID = CirioNubBase + 7;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+block32: CirioNub.Block32;
+
+remoteByteAddress: CARD ¬ address.byteAddress+address.bitOffset/8;
+
+IF address.nil THEN RemoteNilFault[address];
+IF NOT address.valid THEN RemoteAddrFault[address];
+IF RemoteAddressRangeCheck[remoteByteAddress] THEN RemoteAddrFault[address];
+
+CirioNub.StartCall[nub, CirioNubGetWords32];
+CirioNub.PutCard32[nub, remoteByteAddress];
+CirioNub.PutInt32[nub, 4]; -- asking for 4 bytes
+[rc, result] ¬ CirioNub.Call[nub];
+IF rc # ok THEN ERROR Error[LIST[$something], Rope.Cat["Error calling GetWords32 in the remote target.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+IF result.count # 1 THEN ERROR Error[LIST[$something], "Error calling GetWords32 in the remote target.  Wrong number of arguments returned."];
+block32 ¬  NARROW[result.val[0]];
+
+IF block32.count # 1 THEN RemoteAddrFault[address];
+
+RETURN[block32.val[0]]
+
+};
+
+
+
+
+RemoteWriteCardAs32Bits: PROC[nub: CirioNub.Handle, address: CirioNubAccess.RemoteAddress, card: CARD32] = {
+CirioNubPutWords32: CirioNub.ProcID = CirioNubBase + 8;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+block32: CirioNub.Block32 ¬ NEW[CirioNub.Block32Record[1]];
+
+remoteByteAddress: CARD ¬ address.byteAddress+address.bitOffset/8;
+
+block32.count ¬ 1;
+block32[0] ¬ card;
+
+IF address.nil THEN RemoteNilFault[address];
+IF NOT address.valid THEN RemoteAddrFault[address];
+IF RemoteAddressRangeCheck[remoteByteAddress] THEN RemoteAddrFault[address];
+
+CirioNub.StartCall[nub, CirioNubPutWords32];
+CirioNub.PutCard32[nub, remoteByteAddress];
+CirioNub.PutBlock32[nub, block32];
+[rc, result] ¬ CirioNub.Call[nub];
+IF rc # ok THEN ERROR Error[LIST[$something], Rope.Cat["Error calling PutWords32 in the remote target.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+};
+
+
+
+RemoteWrite4Bytes: PROC[nub: CirioNub.Handle, address: CirioNubAccess.RemoteAddress, bytes: PACKED ARRAY [0..3] OF BYTE] = {
+CirioNubPutBytes: CirioNub.ProcID = CirioNubBase + 4;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+
+remoteByteAddress: CARD ¬ address.byteAddress+address.bitOffset/8;
+
+IF address.nil THEN RemoteNilFault[address];
+IF NOT address.valid THEN RemoteAddrFault[address];
+IF RemoteAddressRangeCheck[remoteByteAddress] THEN RemoteAddrFault[address];
+CirioNub.StartCall[nub, CirioNubPutBytes];
+CirioNub.PutCard32[nub, remoteByteAddress];
+CirioNub.PutBlock8Cnt[nub, 4];
+FOR I: CARDINAL IN [0..4) DO
+CirioNub.PutBlock8Next[nub, bytes[I]];
+ENDLOOP;
+
+[rc, result] ¬ CirioNub.Call[nub];
+IF rc # ok THEN ERROR Error[LIST[$something], Rope.Cat["Error calling PutBytes in the remote target.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+};
+
+
+
+RemoteGetThreads: PROC[nub: CirioNub.Handle, lowIndex, highIndex: CARD] RETURNS[LIST OF REF CirioNubAccess.ThreadInfo] =
+BEGIN
+CirioNubGetThreads: CirioNub.ProcID = CirioNubBase + 9;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+nBlocks: INTEGER;
+
+cardsPerBlock: CARD = 9;
+
+block32: CirioNub.Block32;
+
+list: LIST OF REF CirioNubAccess.ThreadInfo ¬ NIL;
+
+
+CirioNub.StartCall[nub, CirioNubGetThreads];
+CirioNub.PutCard32[nub, lowIndex];
+CirioNub.PutCard32[nub, highIndex]; 
+[rc, result] ¬ CirioNub.Call[nub];
+IF rc # ok THEN ERROR Error[LIST[$something], "something in CirioNubAccessImpl"];
+
+IF result.count # 1 THEN ERROR Error[LIST[$something], Rope.Cat["Error calling GetThreads in the remote target.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+block32 ¬  NARROW[result.val[0]];
+
+IF block32.count MOD cardsPerBlock # 0 THEN ERROR Error[LIST[$something], "something in CirioNubAccessImpl"];
+
+nBlocks ¬ block32.count/cardsPerBlock; 
+
+FOR  I: INTEGER DECREASING IN [0..nBlocks) DO
+blockX: CARD ¬ I*cardsPerBlock;
+oneThread: REF CirioNubAccess.ThreadInfo ¬ NEW[CirioNubAccess.ThreadInfo ¬[
+index: block32.val[blockX],
+gen: block32.val[blockX+1],
+schedState: block32.val[blockX+2],
+priority: block32.val[blockX+3],
+dbgMsg: LOOPHOLE[block32.val[blockX+4], INT32],
+frozen: block32.val[blockX+5] # 0,
+pc: block32.val[blockX+6],
+stackPointer: block32.val[blockX+7],
+framePointer:  block32.val[blockX+8]]];
+list ¬ CONS[oneThread, list]
+ENDLOOP;
+
+RETURN[list]
+END;
+
+
+RemotePCtoInfo: PROC[nub: CirioNub.Handle, pc: CARD] RETURNS[CirioNubAccess.PCInfo] =
+BEGIN
+CirioNubPCToInfo: CirioNub.ProcID = CirioNubBase + 10;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+info: CirioNubAccess.PCInfo ¬ NEW[CirioNubAccess.PCInfoBody];
+
+CirioNub.StartCall[nub, CirioNubPCToInfo];
+CirioNub.PutCard32[nub, pc];
+[rc, result] ¬ CirioNub.Call[nub];
+IF rc # ok THEN ERROR Error[LIST[$something], Rope.Cat["Error calling PCToInfo in the remote target.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+IF result.count # 6 THEN ERROR Error[LIST[$something], "Error calling PCToInfo in the remote target.  Wrong number of arguments returned."];
+
+info.procName ¬ Rope.FromRefText[NARROW[result.val[0]]];
+info.procSymID ¬ NARROW[result.val[1], REF CARD]­;
+info.fileName ¬ PFS.PathFromRope[ Rope.FromRefText[NARROW[result.val[2]]]];
+info.fileSeqNum ¬ NARROW[result.val[3], REF CARD]­;
+info.guessedEmbeddedFileName ¬ PFS.PathFromRope [Rope.FromRefText[NARROW[result.val[4]]]];
+info.guessedEmbeddedFileSymID ¬ NARROW[result.val[5], REF CARD]­;
+RETURN[info];
+END;
+
+
+RemoteKillWorld: PROC[nub: CirioNub.Handle] =
+BEGIN
+CirioNubKillWorld: CirioNub.ProcID = CirioNubBase + 11;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+
+CirioNub.StartCall[nub, CirioNubKillWorld];
+[rc, result] ¬ CirioNub.Call[nub];
+IF rc # ok THEN ERROR Error[LIST[$something], Rope.Cat["Error calling KillWorld in the remote target.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+IF result.count # 0 THEN ERROR Error[LIST[$something],  "Error calling KillWorld in the remote target.  Wrong number of arguments returned."];
+
+END;
+
+RemoteIssueThreadCommand: PROC[nub: CirioNub.Handle, threadIndex: CARD, setFreeze: BOOL, freeze: BOOL, setMsg: BOOL, msg: INT] RETURNS[success: BOOLEAN] =
+BEGIN
+CirioIssueThreadCommand: CirioNub.ProcID = CirioNubBase + 18;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+
+CirioNub.StartCall[nub, CirioIssueThreadCommand];
+
+CirioNub.PutCard32[nub, threadIndex];
+CirioNub.PutCard32[nub, IF setFreeze THEN 1 ELSE 0];
+CirioNub.PutCard32[nub, IF freeze THEN 1 ELSE 0];
+CirioNub.PutCard32[nub, IF setMsg THEN 1 ELSE 0];
+CirioNub.PutCard32[nub, LOOPHOLE[msg, CARD]];
+[rc, result] ¬ CirioNub.Call[nub];
+
+IF rc # ok THEN ERROR Error[LIST[$something], Rope.Cat["Error calling IssueThreadCommand in the remote target.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+IF result.count # 1 THEN ERROR Error[LIST[$something], "Error calling IssueThreadCommand in the remote target.  Wrong number of arguments returned."];
+RETURN[NARROW[result.val[0], REF INT]­ = 0]
+
+END;
+
+
+RemoteGetDBStat: PROC[nub: CirioNub.Handle, oldStat: INT32, oldExamineeIndex: INT, timeoutMsec: CARD] RETURNS[dbStab: INT32, examineeIndex: INT32] =
+BEGIN
+CirioGetDBStat: CirioNub.ProcID = CirioNubBase + 19;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+
+CirioNub.StartCall[nub, CirioGetDBStat];
+
+CirioNub.PutInt32[nub, oldStat];
+CirioNub.PutInt32[nub, oldExamineeIndex];
+CirioNub.PutCard32[nub, timeoutMsec];
+
+
+[rc, result] ¬ CirioNub.Call[nub];
+IF rc # ok THEN ERROR Error[LIST[$something], Rope.Cat["Error calling GetDBStat in the remote target.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+IF result.count # 2 THEN ERROR Error[LIST[$something], "Error calling GetDBStat in the remote target.  Wrong number of arguments returned."];
+
+RETURN[NARROW[result.val[0], REF INT]­, NARROW[result.val[1], REF INT]­]
+
+END;
+
+
+RemoteGetFileEntry4: PROC[nub: CirioNub.Handle, seqNum: CARD] RETURNS[CirioNubAccess.FileEntry] =
+BEGIN
+CirioNubGetFileEntry: CirioNub.ProcID = CirioNubBase + 20;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+entry: CirioNubAccess.FileEntry ¬ NEW[CirioNubAccess.FileEntryBody];
+
+CirioNub.StartCall[nub, CirioNubGetFileEntry];
+CirioNub.PutCard32[nub, seqNum];
+[rc, result] ¬ CirioNub.Call[nub];
+IF rc # ok THEN ERROR Error[LIST[$something], Rope.Cat["Error calling GetFileEntry in the remote target.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+IF result.count # 21 THEN ERROR Error[LIST[$something], "Error calling GetFileEntry in the remote target.  Wrong number of arguments returned."];
+
+entry.seqNum ¬ NARROW[result.val[0], REF CARD]­;
+entry.commitPoint ¬ NARROW[result.val[1], REF CARD]­ # 0;
+entry.fileName ¬ PFS.PathFromRope[ Rope.FromRefText[NARROW[result.val[2]]]];
+entry.fOffset ¬ NARROW[result.val[3], REF CARD]­;
+entry.fmagic ¬ NARROW[result.val[4], REF CARD]­;
+entry.size ¬ NARROW[result.val[5], REF CARD]­;
+entry.mtime ¬ NARROW[result.val[6], REF CARD]­;
+entry.smagic ¬ NARROW[result.val[7], REF CARD]­;
+entry.stamp ¬ Rope.FromRefText[NARROW[result.val[8]]];
+entry.readerData ¬ NARROW[result.val[9], REF CARD]­;
+entry.readerDataSize ¬ NARROW[result.val[10], REF CARD]­;
+entry.patchReloc ¬ NARROW[result.val[11], REF CARD]­;
+entry.patchSize ¬ NARROW[result.val[12], REF CARD]­;
+entry.textReloc ¬ NARROW[result.val[13], REF CARD]­;
+entry.textSize ¬ NARROW[result.val[14], REF CARD]­;
+entry.dataReloc ¬ NARROW[result.val[15], REF CARD]­;
+entry.dataSize ¬ NARROW[result.val[16], REF CARD]­;
+entry.bssReloc ¬ NARROW[result.val[17], REF CARD]­;
+entry.bssSize ¬ NARROW[result.val[18], REF CARD]­;
+entry.commonReloc ¬ NARROW[result.val[19], REF CARD]­;
+entry.commonSize ¬ NARROW[result.val[20], REF CARD]­;
+
+RETURN[entry];
+END;
+
+RemoteGetFileEntry5: PROC[nub: CirioNub.Handle, seqNum: CARD] RETURNS[CirioNubAccess.FileEntry] =
+BEGIN
+CirioNubGetFileEntry: CirioNub.ProcID = CirioNubBase + 20;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+entry: CirioNubAccess.FileEntry ¬ NEW[CirioNubAccess.FileEntryBody];
+
+stampAddr: CARD32;
+stampSize: CARD32;
+
+CirioNub.StartCall[nub, CirioNubGetFileEntry];
+CirioNub.PutCard32[nub, seqNum];
+[rc, result] ¬ CirioNub.Call[nub];
+IF rc # ok THEN ERROR Error[LIST[$something], Rope.Cat["Error calling GetFileEntry in the remote target.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+IF result.count # 22 THEN ERROR Error[LIST[$something], "Error calling GetFileEntry in the remote target.  Wrong number of arguments returned."];
+
+entry.seqNum ¬ NARROW[result.val[0], REF CARD]­;
+entry.commitPoint ¬ NARROW[result.val[1], REF CARD]­ # 0;
+entry.fileName ¬ PFS.PathFromRope[ Rope.FromRefText[NARROW[result.val[2]]]];
+entry.fOffset ¬ NARROW[result.val[3], REF CARD]­;
+entry.fmagic ¬ NARROW[result.val[4], REF CARD]­;
+entry.size ¬ NARROW[result.val[5], REF CARD]­;
+entry.mtime ¬ NARROW[result.val[6], REF CARD]­;
+entry.smagic ¬ NARROW[result.val[7], REF CARD]­;
+stampAddr ¬ NARROW[result.val[8], REF CARD]­;
+stampSize ¬ NARROW[result.val[9], REF CARD]­;
+entry.stamp ¬ NIL;
+entry.readerData ¬ NARROW[result.val[10], REF CARD]­;
+entry.readerDataSize ¬ NARROW[result.val[11], REF CARD]­;
+entry.patchReloc ¬ NARROW[result.val[12], REF CARD]­;
+entry.patchSize ¬ NARROW[result.val[13], REF CARD]­;
+entry.textReloc ¬ NARROW[result.val[14], REF CARD]­;
+entry.textSize ¬ NARROW[result.val[15], REF CARD]­;
+entry.dataReloc ¬ NARROW[result.val[16], REF CARD]­;
+entry.dataSize ¬ NARROW[result.val[17], REF CARD]­;
+entry.bssReloc ¬ NARROW[result.val[18], REF CARD]­;
+entry.bssSize ¬ NARROW[result.val[19], REF CARD]­;
+entry.commonReloc ¬ NARROW[result.val[20], REF CARD]­;
+entry.commonSize ¬ NARROW[result.val[21], REF CARD]­;
+
+RETURN[entry];
+END;
+
+RemoteLookupSymEntryByName: PROC[nub: CirioNub.Handle, sym: Rope.ROPE, caseSensitive: BOOLEAN, externOnly: BOOLEAN, numToSkip: INT] RETURNS[CirioNubAccess.SymEntry] =
+BEGIN
+CirioNubLookupSymEntryByName: CirioNub.ProcID = CirioNubBase + 21;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+
+CirioNub.StartCall[nub, CirioNubLookupSymEntryByName];
+CirioNub.PutRope[nub, sym];
+CirioNub.PutCard32[nub, IF caseSensitive THEN 1 ELSE 0];
+CirioNub.PutCard32[nub, IF externOnly THEN 1 ELSE 0];
+CirioNub.PutInt32[nub, numToSkip];
+[rc, result] ¬ CirioNub.Call[nub];
+IF rc # ok THEN ERROR Error[LIST[$something], Rope.Cat["Error calling LookupSymEntryByName in the remote target.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+
+RETURN[RemoteComputeSymEntry[result]];
+END;
+
+RemoteLookupSymEntryByValue: PROC[nub: CirioNub.Handle, val: CARD, numToSkip: INT] RETURNS[CirioNubAccess.SymEntry] =
+BEGIN
+CirioNubLookupSymEntryByValue: CirioNub.ProcID = CirioNubBase + 22;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+
+CirioNub.StartCall[nub, CirioNubLookupSymEntryByValue];
+CirioNub.PutCard32[nub, val];
+CirioNub.PutInt32[nub, numToSkip];
+[rc, result] ¬ CirioNub.Call[nub];
+IF rc # ok THEN ERROR Error[LIST[$something], Rope.Cat["Error calling LookupSymEntryByValue in the remote target.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+
+RETURN[RemoteComputeSymEntry[result]];
+END;
+
+
+RemoteLookupSymEntryByID: PROC[nub: CirioNub.Handle, symID: CARD] RETURNS[CirioNubAccess.SymEntry] =
+BEGIN
+CirioNubLookupSymEntryByID: CirioNub.ProcID = CirioNubBase + 23;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+
+CirioNub.StartCall[nub, CirioNubLookupSymEntryByID];
+CirioNub.PutCard32[nub, symID];
+[rc, result] ¬ CirioNub.Call[nub];
+IF rc # ok THEN ERROR Error[LIST[$something], Rope.Cat["Error calling LookupSymEntryByID in the remote target.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+
+RETURN[RemoteComputeSymEntry[result]];
+END;
+
+RemoteLookupMatchingSymEntryByName: PROC[nub: CirioNub.Handle, symID: CARD, sym: Rope.ROPE, caseSensitive: BOOLEAN, wantedTypes: CARD, ignoredClasses: CARD, numToSkip: INT] RETURNS[CirioNubAccess.SymEntry] =
+BEGIN
+CirioNubLookupMatchingSymEntryByName: CirioNub.ProcID = CirioNubBase + 26;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+
+
+CirioNub.StartCall[nub, CirioNubLookupMatchingSymEntryByName];
+CirioNub.PutCard32[nub, symID];
+CirioNub.PutRope[nub, sym];
+CirioNub.PutCard32[nub, IF caseSensitive THEN 1 ELSE 0];
+CirioNub.PutCard32[nub, wantedTypes];
+CirioNub.PutCard32[nub, ignoredClasses];
+CirioNub.PutInt32[nub, numToSkip];
+[rc, result] ¬ CirioNub.Call[nub];
+IF rc # ok THEN ERROR Error[LIST[$something], Rope.Cat["Error calling LookupMatchingSymEntryByName in the remote target.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+
+RETURN[RemoteComputeSymEntry[result]];
+END;
+
+
+RemoteLookupMatchingSymEntryByValue: PROC[nub: CirioNub.Handle, symID: CARD, val: CARD, wantedTypes: CARD, ignoredClasses: CARD, numToSkip: INT] RETURNS[CirioNubAccess.SymEntry] =
+BEGIN
+CirioNubLookupMatchingSymEntryByValue: CirioNub.ProcID = CirioNubBase + 27;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+
+
+CirioNub.StartCall[nub, CirioNubLookupMatchingSymEntryByValue];
+CirioNub.PutCard32[nub, symID];
+CirioNub.PutCard32[nub, val];
+CirioNub.PutCard32[nub, wantedTypes];
+CirioNub.PutCard32[nub, ignoredClasses];
+CirioNub.PutInt32[nub, numToSkip];
+[rc, result] ¬ CirioNub.Call[nub];
+IF rc # ok THEN ERROR Error[LIST[$something], Rope.Cat["Error calling LookupMatchingSymEntryByValue in the remote target.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+
+RETURN[RemoteComputeSymEntry[result]];
+END;
+
+
+RemoteComputeSymEntry: PROC[result: CirioNub.CallResult] RETURNS[CirioNubAccess.SymEntry] =
+BEGIN
+IF result.count < 1 THEN ERROR Error[LIST[$something], "something in CirioNubAccessImpl"];
+
+BEGIN
+errCode: INT32 ¬ NARROW[result.val[0], REF INT32]­;
+SELECT errCode FROM
+0 =>
+BEGIN
+entry: CirioNubAccess.SymEntry ¬ NEW[CirioNubAccess.SymEntryBody];
+IF result.count # 7 THEN ERROR Error[LIST[$something], "something in CirioNubAccessImpl"];
+entry.symID ¬ NARROW[result.val[1], REF CARD]­;
+entry.name ¬ Rope.FromRefText[NARROW[result.val[2]]];
+entry.type ¬ NARROW[result.val[3], REF CARD]­;
+entry.value ¬ NARROW[result.val[4], REF CARD]­;
+entry.size ¬ NARROW[result.val[5], REF CARD]­;
+entry.fileSeqNum ¬ NARROW[result.val[6], REF CARD]­;
+RETURN[entry];
+END;
+ENDCASE => RETURN[NIL];
+END;
+END;
+
+RemoteMonitoredCall: PROC[
+address: CirioNubAccess.RemoteAddress, proc: PROC[] RETURNS[]]
+RETURNS [] =
+BEGIN
+HolderOffset: PROCEDURE[] RETURNS [INT] ~ TRUSTED {
+sampleMonitorLock: PCRMonitorDefs.MonitorLock;
+sampleAddress: LONG POINTER TO PCRMonitorDefs.MonitorLock ~ 
+@sampleMonitorLock;
+sampleAddressCard: CARD32 ~ LOOPHOLE[sampleAddress];
+holderAddress: LONG POINTER TO PCRMonitorDefs.Thread ~ 
+@sampleMonitorLock.holder;
+holderAddressCard: CARD32 ~ LOOPHOLE[holderAddress];
+offset: INT ~ (holderAddressCard - sampleAddressCard) * BYTES[UNIT];
+
+RETURN [offset];
+};
+holderAddress: CirioNubAccess.RemoteAddress ~ [
+h: address.h, 
+byteAddress: address.byteAddress + HolderOffset[],
+bitOffset: address.bitOffset,
+nil: address.nil,
+valid: address.valid];
+holder: PCRMonitorDefs.Thread ~ LOOPHOLE[Read32BitsAsCard[address: holderAddress]];
+
+IF holder = PCRMonitorDefs.nullHolder 
+THEN {
+proc[];
+}
+ELSE {
+ERROR RemoteMonitorWouldBlock[addr: address];
+};
+ 
+END;
+
+RemoteGetConcreteTypecode: PROC[h: Handle, opaque: CirioNubAccess.Typecode] RETURNS[concrete: CirioNubAccess.Typecode] ~ {
+nub: CirioNub.Handle ~ NARROW[h.contents, REF RemoteBody].nub;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+CedarCirioNubGetConcreteTypecode: CirioNub.ProcID = CedarCirioNubBase+3;
+CirioNub.StartCall[nub, CedarCirioNubGetConcreteTypecode];
+CirioNub.PutCard32[nub, opaque];
+[rc, result] ¬ CirioNub.Call[nub];
+IF rc # ok THEN ERROR Error[LIST[$something], Rope.Cat["Error calling GetConcreteTypecode in the remote target.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+IF result.count # 1 THEN ERROR Error[LIST[$something], "Error calling GetConcreteTypecode in the remote target.  Wrong number of arguments returned."];
+concrete ¬ [NARROW[result.val[0], REF CARD32]­];
+RETURN;
+};
+
+RemoteGetTypestring: PUBLIC PROC[h: Handle, code: CirioNubAccess.Typecode] RETURNS[string: CirioNubAccess.Typestring] ~ {
+nub: CirioNub.Handle ~ NARROW[h.contents, REF RemoteBody].nub;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+CedarCirioNubGetTypestring: CirioNub.ProcID = CedarCirioNubBase+1;
+CirioNub.StartCall[nub, CedarCirioNubGetTypestring];
+CirioNub.PutCard32[nub, code];
+[rc, result] ¬ CirioNub.Call[nub];
+IF rc # ok THEN ERROR Error[LIST[$something], Rope.Cat["Error calling GetTypestring in the remote target.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+IF result.count # 1 THEN ERROR Error[LIST[$something], "Error calling GetTypestring in the remote target.  Wrong number of arguments returned."];
+string ¬ Rope.FromRefText[NARROW[result.val[0]]];
+RETURN;
+};
+
+RemoteGetTypecode: PROC[h: Handle, string: CirioNubAccess.Typestring] RETURNS[code: CirioNubAccess.Typecode] ~ {
+nub: CirioNub.Handle ~ NARROW[h.contents, REF RemoteBody].nub;
+rc: CirioNub.ReturnCode;
+result: CirioNub.CallResult;
+found: BOOL;
+CedarCirioNubGetTypecode: CirioNub.ProcID = CedarCirioNubBase+2;
+CirioNub.StartCall[nub, CedarCirioNubGetTypecode];
+CirioNub.PutCard32[nub, Rope.Length[string]];
+CirioNub.PutRope[nub, string];
+[rc, result] ¬ CirioNub.Call[nub];
+IF rc # ok THEN ERROR Error[LIST[$something], Rope.Cat["Error calling GetTypecode in the remote target.  ReturnCode is ", GetReturnCodeRope[rc], "."]];
+IF result.count # 2 THEN ERROR Error[LIST[$something], "Error calling GetTypecode in the remote target.  Wrong number of arguments returned."];
+found ¬ NARROW[result.val[0], REF CARD32]­ # 0;
+code ¬ IF found THEN [NARROW[result.val[1], REF CARD32]­] ELSE [0];
+RETURN;
+};
+
+
+
+
+CHARPtr: TYPE ~ RECORD [ptr: LONG POINTER TO Basics.RawChars ¬ NIL];
+SameWorldReadBytes: PROC[address: CirioNubAccess.RemoteAddress, count: INT] RETURNS[REF TEXT] = TRUSTED {
+bitsPerByte: CARD = BITS[BYTE];
+text: REF TEXT ¬ RefText.New[count];
+byteAddress: CHARPtr;
+
+IF address.nil THEN RemoteNilFault[address];
+IF NOT address.valid THEN RemoteAddrFault[address];
+
+IF address.valid THEN
+BEGIN
+byteAddress ¬ LOOPHOLE[address.byteAddress + address.bitOffset/bitsPerByte];
+FOR i: CARD IN [0..CARD[count]) DO 
+text ¬ RefText.InlineAppendChar[text, byteAddress[i]];
+ENDLOOP;
+RETURN[text];
+END
+ELSE RETURN[NIL];
+};
+
+
+CARD16Ptr: TYPE ~ LONG POINTER TO CARD16;
+SameWorldRead16BitsAsCardinal: PROC[address: CirioNubAccess.RemoteAddress] RETURNS[CARDINAL] = TRUSTED {
+bitsPerByte: CARD = BITS[BYTE];
+card16: CARD16;
+byteAddress: CARD16Ptr ¬ LOOPHOLE[address.byteAddress + (address.bitOffset/bitsPerByte), CARD16Ptr] ;
+
+IF address.nil THEN RemoteNilFault[address];
+IF NOT address.valid THEN RemoteAddrFault[address];
+
+card16 ¬ byteAddress­;
+
+RETURN[LOOPHOLE[card16]];
+};
+
+
+CARD32Ptr: TYPE ~ LONG POINTER TO CARD32;
+
+LocalAddressRangeCheck: PROC[byteAddress: CARD] RETURNS[BOOL] = {
+RETURN[byteAddress> 0 AND byteAddress < 1000]};
+
+SameWorldRead32BitsAsCard: PROC[address: CirioNubAccess.RemoteAddress] RETURNS[CARD] = TRUSTED {
+bitsPerByte: CARD = BITS[BYTE];
+byteAddress: CARD32Ptr ¬ LOOPHOLE[address.byteAddress + (address.bitOffset/bitsPerByte), CARD32Ptr];
+
+IF address.nil THEN RemoteNilFault[address];
+IF NOT address.valid THEN RemoteAddrFault[address];
+IF LocalAddressRangeCheck[LOOPHOLE[byteAddress, CARD]] THEN RemoteAddrFault[address];
+RETURN[LOOPHOLE[byteAddress­]];
+};
+
+
+
+
+SameWorldWriteCardAs32Bits: PROC[address: CirioNubAccess.RemoteAddress, card: CARD32] = TRUSTED {
+bitsPerByte: CARD = BITS[BYTE];
+byteAddress: CARD32Ptr ¬ LOOPHOLE[address.byteAddress + (address.bitOffset/bitsPerByte), CARD32Ptr];
+
+IF address.nil THEN RemoteNilFault[address];
+IF NOT address.valid THEN RemoteAddrFault[address];
+IF LocalAddressRangeCheck[LOOPHOLE[byteAddress, CARD]] THEN RemoteAddrFault[address];
+byteAddress­ ¬ card;
+};
+
+
+
+BYTEPtr: TYPE ~ RECORD [ptr: LONG POINTER TO Basics.RawBytes ¬ NIL];
+SameWorldWrite4Bytes: PROC[address: CirioNubAccess.RemoteAddress, bytes: PACKED ARRAY [0..3] OF BYTE] = TRUSTED {
+bitsPerByte: CARD = BITS[BYTE];
+byteAddress: BYTEPtr;
+
+IF address.nil THEN RemoteNilFault[address];
+IF NOT address.valid THEN RemoteAddrFault[address];
+
+byteAddress ¬ LOOPHOLE[address.byteAddress + address.bitOffset/bitsPerByte];
+IF LocalAddressRangeCheck[LOOPHOLE[byteAddress, CARD]] THEN RemoteAddrFault[address];
+FOR i: CARDINAL IN [0..4) DO
+byteAddress[i] ¬ bytes[i];
+ENDLOOP;
+};
+
+
+
+UntypedDataHolder: TYPE = RECORD[SEQUENCE nCard32: CARDINAL OF CARD32];
+
+SameWorldAllocateBytes: PROC[nBytes: CARD] RETURNS[data: REF ANY, byteAddr: CARD] =
+BEGIN
+stuff: REF UntypedDataHolder ¬ NEW[UntypedDataHolder[((nBytes+3)/4)+1]];
+GetByteAddress: PROC RETURNS[CARD] = TRUSTED
+{RETURN[LOOPHOLE[@stuff[0]]]};
+RETURN[stuff, GetByteAddress[]];
+END;
+
+SameWorldReleaseAllocatedBytes: PROC[data: REF ANY] =
+BEGIN
+NULL
+END;
+
+SameWorldMonitoredCall: PROC[
+address: CirioNubAccess.RemoteAddress, proc: PROC[] RETURNS []] 
+RETURNS [] = SameWorldMonitoredCallOps.MonitoredCall;
+
+
+
+NameToAddress: PUBLIC PROC [name: Rope.ROPE] RETURNS [addr: Rope.ROPE] = {
+addr ¬ NetworkName.AddressFromName[$ARPA, name, NIL, host
+! NetworkName.Error => Error[CONS[$debuggeeNameLookupError, codes], IO.PutFR["%g looking up target %g", [rope[msg]], [rope[name]] ]]
+].addr;
+<<
+{ ENABLE Convert.Error => CONTINUE;
+a: Arpa.Address ¬ ConvertExtras.ArpaAddressFromRope[name];
+IF a # Arpa.nullAddress THEN RETURN[ ConvertExtras.RopeFromArpaAddress[a] ]
+};
+{
+h: SunYPAgent.Handle ~ SunYPAgent.ObtainHandle[];
+val: REF TEXT ~ SunYPAgent.Match[h: h, map: "hosts.byname", key: name];
+textseq: SunYPAgent.TextSeq ~ SunYPAgent.Tokenize[in: val];
+RETURN[Rope.FromRefText[textseq[0]]];
+}>>
+RETURN};
+
+GetReturnCodeRope: PROC [rc: CirioNub.ReturnCode] RETURNS [rcRope: Rope.ROPE] = {
+SELECT rc FROM
+ok => rcRope ¬ "ok";
+noProc => rcRope ¬ "noProc";
+badArgs => rcRope ¬ "badArgs";
+failure => rcRope ¬ "failure";
+commError => rcRope ¬ "commError";
+protocolError => rcRope ¬ "protocolError";
+spaceError => rcRope ¬ "spaceError";
+last => rcRope ¬ "last";
+ENDCASE => rcRope ¬ "unParsed ReturnCode";
+RETURN};
+
+
+END..
+March 10, 1992 3:06:44 pm PSTMarch 10, 1992 3:06:46 pm PST
+   p  
+CirioNubAccessImpl.mesa
+Copyright Ó 1990, 1991, 1992, 1993 by Xerox Corporation.  All rights reserved.
+Sturgis, March 23, 1990 12:20 pm PST
+Last changed by Theimer on October 9, 1989 3:57:10 pm PDT
+Linda Howe January 19, 1990 10:51:15 am PST
+Last tweaked by Mike Spreitzer on January 9, 1992 4:36 pm PST
+Peter B. Kessler, July 12, 1990 11:03 am PDT
+Coolidge, July 18, 1990 9:52 am PDT
+Laurie Horton, March 10, 1992 3:08 pm PST
+Philip James, February 25, 1992 10:13 am PST
+Jas, January 6, 1993 1:04 pm PST
+Willie-s, January 22, 1993 2:29 pm PST
+remarks
+
+info used in developing this file are in CirioNubProcs.h which one can see by
+/palain-ux/jaune/xrhome/DEVELOPMENT/debugnub/INCLUDE/xr/CirioNubProcs.h
+The "sameworld" version of this interface is
+/palain-ux/jaune/xrhome/DEVELOPMENT/debugnub/INCLUDE/xr/CirioNubLocalProcs.h 
+and the "inner" interface is
+/palain-ux/jaune/xrhome/DEVELOPMENT/debugnub/INCLUDE/xr/CirioNubInnerProcs.h
+
+additional info in
+[palain-uX]<>jaune>xrhome>DEVELOPMENT>INCLUDE>xr>Threads.h
+[palain-uX]<>jaune>xrhome>DEVELOPMENT>INCLUDE>xr>ThreadsBackdoor.h
+
+This version (1) differs from the previous version (un-numbered) as follows:
+Null accepts a proposed protocol version number and returns an actual protocol number
+PCToFN is renamed PCtoInfo and returns more info  (I called it ResolveAbsPC before)
+IssueThreadCommand is added
+GetDBStat is added
+
+NOTE: Several outstanding issues
+how do I deliver a Bool  (See IssueThreadCommand)
+what are the args and results for GetDBStat (I believe Alan is changing them)
+
+I need to fix the interface file and add appropriate comments.
+
+
+procedure number blocks
+
+
+creation
+
+Handle: TYPE = REF HandleBody;
+HandleBody: PUBLIC TYPE = CirioNubAccessPrivate.HandleBody;
+
+
+The contents will either point to a RemoteBody or will be NIL.
+
+
+remote/sameWorld case selection
+assumes that creation of h set the version number
+waits for change from old values or timeout
+This is here to provide compatibility with remote nubs that are versions 4 and 5.
+eventually we will re-write to explicitly use the new version 6 operations
+These two constants come from /jaune/xrhome/DEVELOPMENT/INCLUDE/xr/IncrementalLoad.h
+don't forget that the bottom bit should be ignored, as it is the "external" bit.
+symId
+= 0, is ignored
+# 0, search starts with given symId
+
+pattern
+either a rope with no asterisk
+exact match required
+or a rope with at least one period and exactly one asterisk as the last character
+asterisk is a wild card
+
+caseSensitive
+if true, capitalization must match
+
+wantedTypes
+-1 for all types are acceptable
+t for a specific type (external bit is ignored)
+
+ignoreClasses
+0 accept all types
+1 ignore internals
+2 ignore externals
+3 ignore all types (very fast!)
+
+numToSkip
+presumed non negative
+search starts with most recent matching entry
+if 0, accept first matching entry
+if 1, skip first matching entry, look for next older matching entry
+etc.
+
+symId
+= 0, search starts with the entry with greatest value less or equal to given val.
+# 0, search starts with given symId
+
+val
+ignored if symId # 0
+
+
+wantedTypes
+(see LookupMatchingSymEntryByName)
+
+ignoreClasses
+0(see LookupMatchingSymEntryByName)
+
+numToSkip
+if zero, finds entry with greatest value less or equal to given val
+if greater than zero, searches by increasing value
+if negative, searches by decreasing value
+if several entries have same value, then think of the key as the pair <value, entry time).  These keys are ordered by value first, then by entry time.  The search key is <the given val, now>.
+allocate the firstLateFreeSlot
+
+here is where we do the construction
+making this an entry proc deadlocks Cirio when the callback proc tries to use CirioNubAccess ENTRY procedures.  Sigh.  Nothing here modifies h, so why should it be an ENTRY proc?	... peter
+IF h.contents#NIL THEN RETURN[[0], "can't get concrete typecodes remotely yet"]
+IF h.contents#NIL THEN RETURN[NIL, "can't get typestrings remotely yet"]
+IF h.contents#NIL THEN RETURN[[0], "can't get typecodes remotely yet"]
+
+Just return "SPARC", "SunOS4" target for older debugnubs (i.e.versions < 7).
+This information is checked in CirioTargets.
+
+remote procedures
+We use this to wait for a call from some thread
+This is probably not what we shall use in the future
+WaitSig actually returns a second param, DBStat, but this param is not interesting for the present application.
+
+
+Really, shouldn't this show up as rc # ok??
+a mild sanity check due to funny things happening with gnu.
+IF remoteByteAddress < 1000 THEN RemoteAddrFault[address];
+a mild sanity check due to funny things happening with gnu.
+Really, shouldn't this show up as rc # ok??
+IF remoteByteAddress < 1000 THEN RemoteAddrFault[address];
+a mild sanity check due to funny things happening with gnu.
+IF remoteByteAddress < 1000 THEN RemoteAddrFault[address];
+a mild sanity check due to funny things happening with gnu.
+
+Is this how I deliver a Bool?  Barry says 1 is true, 0 is false.
+Alan agrees.  (the comments in his dot h files of the form Return ( (success) ? 0 : -1 ) are a standard convention for system calls, they are NOT returning a Boolean.)
+waits for change from old values or timeout
+(we should read in the stamp at this point)
+Watch this!  We compute target field offsets using structures we've defined over here!
+I think this is about the grottiest code I've written, but Russ says it's the most straightforward way of doing it.	... peter
+We don't have to acquire the monitor lock, since the remote debuggee is frozen.
+We can't acquire the monitor lock, and the remote world is frozen.
+same world procedures
+CHARPtr is copied from UnixTypes.CHARPtr.
+byteAddress _ LOOPHOLE[address.byteAddress];
+byteAddress _ LOOPHOLE[byteAddress + address.bitOffset/bitsPerByte];
+a mild sanity check due to funny things happening with gnu.
+IF LOOPHOLE[byteAddress, INT] < 1000 THEN RemoteAddrFault[address];
+a mild sanity check due to funny things happening with gnu.
+
+IF LOOPHOLE[byteAddress, INT] < 1000 THEN RemoteAddrFault[address];
+a mild sanity check due to funny things happening with gnu.
+
+byteAddress _ LOOPHOLE[address.byteAddress];
+byteAddress _ LOOPHOLE[byteAddress + address.bitOffset/bitsPerByte];
+IF LOOPHOLE[byteAddress, INT] < 1000 THEN RemoteAddrFault[address];
+a mild sanity check due to funny things happening with gnu.
+
+the plus 1 is so that the subsequent @stuff[0] will not get a bounds fault due to zero length array  (i.e., stuff[0] wouldn't exist.)
+no need to do anything, it will go away when all refs to data^ go away
+
+support
+
+
+from Linda Howe
+note:
+cirioremote 13.1.101.27 4816
+works to debug menhir
+The following code enables us to connect to a debuggee even if the YP service is unavailable - ajd
+try without yellow pages
+so try with the yellow pages
+Convert the ReturnCode into a Rope.
+ Ê<­  •NewlineDelimiter
+–"cedarcode" style™ codešœ™Kšœ
+ÏeœC™NKšœ$™$K™9K™+K™=K™,K™#K™)K™,K™ K™&—K˜ šÏk	˜	Kšœžœ˜#KšœžœÖ˜êKšœ	žœº˜ÈKšœžœ¾˜ÒKšœžœ!Ïcœ˜NKšœ˜Kšœžœ˜'K˜K˜Kšžœ˜Kšœ˜Kšœžœ˜+Kšœžœ#˜7Kšžœžœ˜Kšœ	žœžœ˜Kšœžœ˜%Kšœ˜K˜Kšœžœ˜1Kšœžœ˜"Kšœžœ*˜?Kšœžœ0˜BKšœ˜K˜ —šÏnœžœž˜!Kšžœžœ
+˜KšžœNžœžœI˜ÁKšžœ˜Kšœž˜K˜ K™™ ™MK™G—™,K™M—™K™L——™ ™Kšœžœžœ™:Kšœžœžœ™BK™ —™LK™UK™SK™K™K™ šžœ™ Kšœ1™1KšœM™MK™ K™>——K™ —K™ ™K™ Kš œ˜"Kš œ˜(K˜ K™ —K™™ Kš œžœžœ	žœžœžœžœžœ˜AKš œžœžœ'žœ˜HKš œžœžœ'žœ˜IKš œžœžœ'žœ˜QK˜ Kšœžœžœ™Kšœžœžœ$™;K™ Kšœžœ˜%Kšœžœ˜-˜ K™ Kšœ>™>K™ —Kšœžœžœ˜0K˜ K™ š œžœžœžœžœžœžœžœžœžœ˜{Kšž˜Kšœžœ˜ Kšœžœ˜.Kšœžœ7˜JKšœ'žœ˜CKšœžœžœžœžœžœ˜|šžœžœ žœžœ˜MK˜Kšœžœ˜Kšžœ+˜0—K˜(Kšžœ˜
+Kšžœ˜—K˜ š œžœžœžœ˜2Kšž˜Kšœžœ˜ Kšœžœžœžœžœ
+žœ˜gKšžœžœ žœžœžœžœw˜ÉK˜(Kšžœ˜
+Kšžœ˜—K˜ K˜ K˜ —™K˜ š 
+œžœžœžœ˜*Kšž˜Kšžœžœžœ˜Kš
+žœžœžœžœžœ0˜Sšžœžœž˜š	žœ œžœžœž˜.Kšžœžœžœ3˜TKšžœ˜——Kšœ	žœ˜šžœž˜Kšžœžœžœ˜=Kšžœžœ˜—Kšžœ˜—K˜ š œžœžœžœžœžœ˜FKšž˜Kšžœžœžœ˜šžœ˜K™1—Kšžœ˜—K˜ š œžœžœžœ#žœžœžœ˜RKšž˜Kšžœžœžœ˜Kš
+žœžœžœžœžœ0˜SKšžœžœžœžœžœžœžœžœu˜˜K˜ šžœž˜šž˜Kšž˜Kšœžœžœ)˜VKšžœžœžœžœžœžœžœžœh˜ÛKšžœžœ˜Kšž˜—šž˜Kšž˜Kšœžœ˜*Kšžœžœžœžœ˜IKšžœ˜—K˜ —Kšžœ˜—K˜ š œžœžœžœžœžœžœ˜\Kšž˜Kšžœžœžœ˜Kš
+žœžœžœžœžœ0˜Sšžœž˜Kšžœžœžœžœ#˜SKšžœžœžœe˜z—Kšžœ˜K˜ —š 	œžœžœžœžœžœžœžœ˜dKšž˜Kšžœžœžœ˜Kš
+žœžœžœžœžœ0˜Sšžœž˜Kšžœžœžœžœ+˜]Kšžœžœžœi˜~—Kšžœ˜—K˜ š 	œžœžœ/žœžœžœžœ˜]Kšž˜š œžœžœžœžœžœ˜0Kšž˜Kšžœžœžœ˜Kšžœžœ˜,Kšžœžœžœ˜3Kš
+žœžœžœžœžœ0˜[šžœž˜Kšžœžœžœžœ2˜qKšžœžœ5˜@—Kšžœ˜—Kšžœ˜Kšžœ˜—K˜ K˜ š
+ œžœžœ(žœžœ˜\Kšž˜š
+ œžœžœžœžœ˜0Kšž˜Kšžœžœžœ˜Kšžœžœ˜,Kšžœžœžœ˜3Kš
+žœžœžœžœžœ0˜[šžœž˜Kšžœžœ!žœžœ$˜nKšžœžœ2˜=—Kšžœ˜—Kšžœ˜Kšžœ˜—K˜ K˜ š
+ œžœžœ(žœžœ˜TKšž˜š
+ œžœžœžœžœ˜,Kšž˜Kšžœžœžœ˜Kšžœžœ˜,Kšžœžœžœ˜3Kš
+žœžœžœžœžœ0˜[šžœž˜Kšžœžœžœžœ$˜jKšžœžœ.˜9—Kšžœ˜—Kšžœ˜Kšžœ˜K˜ —K˜ š œžœžœ.žœ˜UKšž˜š œžœžœ˜Kšž˜Kšžœžœžœ˜Kšžœžœ˜,Kšžœžœžœ˜3Kš
+žœžœžœžœžœ0˜[šžœž˜Kšžœžœžœ/˜oKšžœ:˜>—Kšžœ˜—Kšœ˜Kšžœ˜—K˜ K˜ š 
+œžœžœ(žœžœžœžœžœ˜eKšž˜˜ Kšœžœžœ˜'KšžœžœžœžœM˜uKš
+žœžœžœžœžœ˜AK˜ —Kšžœ˜K˜ —š œžœžœ/žœžœžœžœ˜eKšž˜š œžœžœ˜Kšž˜Kšžœžœžœ˜Kšžœžœ˜,Kšžœžœžœ˜3Kš
+žœžœžœžœžœ0˜[šžœž˜Kšžœžœžœ1˜kKšžœ6˜:—Kšžœ˜—Kšœ˜Kšžœ˜—K˜ K˜ š 
+œžœžœžœ!žœžœžœžœžœ˜tKšž˜Kšžœžœžœ˜Kš
+žœžœžœžœžœ0˜Sšžœž˜Kšžœžœžœžœ'˜ZKšžœžœžœk˜€—Kšžœ˜—K˜ K˜ š œžœžœžœžœžœ˜QKšž˜Kšžœžœžœ˜Kš
+žœžœžœžœžœ0˜Sšžœž˜Kšžœžœžœžœ˜GKšžœžœ'˜2—Kšžœ˜K˜ —š 	œžœžœžœ˜)Kšž˜Kšžœžœžœ˜Kš
+žœžœžœžœžœ0˜Sšžœž˜Kšžœžœžœ˜<Kšžœžœžœi˜~—Kšžœ˜—K˜ š œžœžœžœžœžœ
+žœ
+žœžœžœ
+žœ˜–Kšž˜Kšžœžœžœ˜Kš
+žœžœžœžœžœ0˜Sšžœž˜Kšžœžœžœžœ?˜zKšžœžœžœ{˜—šžœ˜K˜ K™+——š 	œžœžœžœžœžœžœžœ	žœžœ˜Kšž˜Kšžœžœžœ˜Kš
+žœžœžœžœžœ0˜Sšžœž˜šž˜Kšž˜Kšœ*žœžœ:˜zKšžœ˜Kšž˜—Kšžœžœžœi˜~—Kšžœ˜K˜ —š œžœžœ–˜§Kš
+žœžœžœžœžœa˜ŠKšžœžœ_˜Kšžœ˜K˜ š œžœžœ˜VKšœžœ$˜-šžœžœžœž˜ Kšœ"˜"K˜GKšžœ˜—Kšžœ˜—K˜ —š œžœžœžœžœžœ˜\Kšž˜Kšžœžœžœ˜Kš
+žœžœžœžœžœ0˜Sšžœž˜šžœžœž˜Kšœžœžœm˜‚Kšœžœžœžœ˜QKšœžœžœžœ˜VKšžœžœžœžœ‰˜»K˜ ——Kšžœžœ/˜:Kšžœ˜—K˜ šÐbnœžœžœžœžœžœžœžœžœ˜¢Kšž˜Kšžœžœžœ˜Kš
+žœžœžœžœžœ0˜Sšžœž˜šž˜Kšžœžœžœ=˜u—šž˜KšžœZ˜`——Kšžœ˜—K˜ š¡œžœžœžœžœžœžœ˜qKšž˜Kšžœžœžœ˜Kš
+žœžœžœžœžœ0˜Sšžœž˜šž˜Kšžœžœžœ"˜[—šž˜Kšžœ@˜F——Kšžœ˜—K˜ š¡œžœžœžœžœžœ˜`Kšž˜Kšžœžœžœ˜Kš
+žœžœžœžœžœ0˜Sšžœž˜šž˜Kšžœžœžœ˜O—šž˜Kšžœ4˜:——Kšžœ˜—˜ K™QK™J—š œžœžœžœžœžœ˜yKšž˜Kš
+žœžœžœžœžœ0˜Sšžœž˜Kšœžœžœz˜šœ˜Kšž˜Kš	œžœžœžœžœ˜1Kšœ
+žœ˜šžœžœž˜&KšœZžœžœ˜nKš	žœ	žœžœžœ	Ÿ!˜DKšžœžœžœžœ˜EKšžœžœžœ˜+K˜ Kšžœ˜—Kšžœ˜—KšœžœAžœ˜qKšžœžœžœžœ–˜È—Kšžœ˜—K˜ Kš 
+œžœ˜š œžœ˜K™TK™P—˜ ™K™K™#—K™ ™™K™—™QK™——K™ ™K™"—K™ šœ™K™K™/—K™ ™K™K™K™K™—K™ ™	K™K™-K™!K™CK™—K™ —š œžœžœžœžœžœžœžœžœžœžœ˜ÎKšž˜Kšžœžœžœ˜Kš
+žœžœžœžœžœ0˜SKš
+žœžœžœžœžœ…˜Âšžœž˜šž˜Kšžœ$žœžœX˜˜—šž˜Kšžœ}˜ƒ——šžœ˜K˜ ——˜ ™K™QK™#—K™ ™K™—K™ K™ šœ™Kšœ"™"—K™ ™Kšœ#™#—K™ ™	K™CK™2K™)K™¿——š œžœžœžœžœžœžœžœžœžœ˜®Kšž˜Kšžœžœžœ˜Kš
+žœžœžœžœžœ0˜SKš
+žœžœžœžœžœ†˜Ãšžœž˜šž˜Kšžœ%žœžœE˜†—šž˜Kšžœk˜q——Kšžœ˜—K˜ K˜ —K˜ Kšœžœžœ˜(Kšœžœžœ)˜EK˜ š œžœžœžœžœžœ!˜bKšž˜Kšžœžœžœ˜Kš
+žœžœžœžœžœ0˜SKš
+žœžœžœžœžœv˜³šžœž˜šž˜Kšžœžœo˜—šž˜Kšž˜Kšœžœ=˜DKšœžœ˜K˜8Kšžœžœžœ˜/Kšžœ˜——Kšžœ˜—K˜ š œžœžœžœ)˜VKšž˜KšœžœŸ˜!šžœžœž˜Kšž˜Kšœžœ˜Kšœžœ(žœ.˜aKšœžœ˜K˜Kšžœ œžœžœžœ
+žœžœ˜2K˜Kšžœ˜—šžœ#žœž˜-Kšž˜K˜.K˜GKšž˜—šž˜Kšž˜šžœ>ž˜DKšž˜Kšœ
+žœ˜+Kšœžœ(žœ1˜dKšœžœ˜K˜0Kšžœ œžœžœžœžœ˜TKšžœ œžœžœ%žœ
+žœžœ˜KK˜Kšžœ˜—šœ™Kšž˜K˜+K˜JKšžœ˜—Kšžœ˜—K™ šœ$™$Kšž˜Kšœžœžœ2žœ˜UKš
+žœžœžœžœžœ]˜“K˜Kšžœ˜Kšžœ˜—Kšžœ˜—K˜ š œžœžœ˜@š œžœžœ˜ Kšžœžœžœ˜Kšœ+˜+Kšžœ˜—K˜Kšžœ˜—K˜ š œžœžœ)˜RKš
+žœžœžœžœžœ0˜SKš
+žœžœžœžœžœ~˜»K˜%šžœž˜šž˜Kšœžœ˜‰—šž˜Kšœ1˜1——Kšžœ˜—K˜ š œžœžœ)˜VKšž˜Kšžœ
+žœžœ˜Kšžœ!žœžœžœ7˜oKšœ"žœ,˜RKšœžœ˜!Kšžœ˜—K˜ š œžœžœ/ž	œžœžœ˜oKšž˜š œŸœžœ˜$Kšœ]žœEžœ™¼Kšž˜Kšžœžœžœ˜Kšžœžœ˜,Kšžœžœžœ˜3Kšžœžœžœ˜;Kš
+žœžœžœžœžœ0˜[šžœž˜Kšžœ2˜6Kšžœ6˜:—Kšžœ˜—K˜Kšžœ˜—K˜ K˜ š
+ œžœžœ-žœ1žœ˜ŽKš
+žœžœžœžœžœ0˜SKšžœžœžœžœ2™Ošžœžœžœ˜Kšžœžœžœžœ‚˜¥K˜0Kšžœžœ˜K˜—šžœ˜KšœCžœ
+˜PKšžœžœžœ˜—K˜K˜ —K˜ š
+ œžœžœ+žœ1žœ˜†Kš
+žœžœžœžœžœ0˜SKš
+žœžœžœžœžœ'™Hšžœžœžœ˜Kš
+žœžœžœžœžœ|˜ŸK˜&Kšžœ	žœ˜K˜—šžœ˜Kšœžœ$žœ˜9Kšœ
+žœžœ˜Kšžœ;˜BKšžœžœ˜—K˜—K˜ K˜ š œžœžœ/žœ.žœžœ˜‹Kš
+žœžœžœžœžœ0˜SKšžœžœžœžœ)™Fšžœžœžœ˜Kšžœžœžœžœz˜K˜$Kšžœžœ˜K˜—šžœ˜Kšœžœžœ˜*K˜K˜"Kšœ'žœžœ˜=Kšžœžœžœ˜—K˜K˜ —š
+ #œžœž
+œžœžœ˜jK™ Kšžœžœžœ˜K˜ Kš œ&˜9K˜Kšœ˜Kšœ˜K˜ K™Lšœ,™,K™ Kšœžœ˜Kšœžœ	˜K˜K˜—K˜ Kš
+žœžœžœžœžœ0˜SKšžœžœžœ˜K˜ Kšœžœžœ˜-Kšœ-˜-K˜"Kšžœ	žœžœžœ˜½KšžœžœžœžœŒ˜µK˜ Kšœžœ˜3Kšœžœ˜0Kšžœ˜Kšœ˜—K˜ ™K˜ K˜ š œžœ˜.Kšœ˜—K˜ š
+ 
+œžœ.žœžœžœ˜jKšž˜Kš œ%˜1K˜Kšœ˜K˜ K˜ Kšœ&˜&Kšœ/˜/K˜"Kšžœ	žœžœžœq˜‘Kšžœžœžœžœ`˜‰Kšœžœžœžœ˜5Kšžœ˜—˜ K™/K™4—š
+ œžœ(žœžœžœ˜`Kšž˜Kš œ%˜4K˜Kšœ˜K˜ K˜ Kšœ)˜)Kšœ)˜)K˜"Kšžœ	žœžœžœs˜“Kšžœžœžœžœb˜‹Kšœžœžœžœ˜6K˜ K™oK™ Kšžœ˜K˜ —K˜ š œžœžœžœžœžœ˜hKšž˜Kš œ%˜6K˜Kšœ˜K˜ K˜ Kšœ+˜+Kšœ˜Kšœ)˜)K˜"Kšžœ	žœžœžœu˜•Kšžœžœžœžœd˜Kšœžœžœžœ˜-Kšžœ˜—K˜ š œžœEžœžœžœžœ˜tKš œ%˜5K˜Kšœ˜Kšœžœžœ˜K˜ Kšžœžœ˜,Kšžœžœžœ˜3K˜ šžœž˜Kšž˜Kšœ*˜*KšœC˜CKšœŸ˜8K˜"Kšžœ	žœžœžœt˜”Kšžœžœžœžœc˜ŒKšœžœ˜K˜ Kšžœ˜Kšž˜—Kšœžœžœžœ˜Kšœ˜K˜ K™ —K˜ š œžœ>žœžœ˜sKš œ%˜7K˜Kšœ˜K˜K˜ Kšœžœ+˜BK˜ Kšžœžœ˜,Kšžœžœžœ˜3K˜ Kšœ,˜,Kšœ+˜+KšœŸ˜0K˜"Kšžœ	žœžœžœv˜–Kšžœžœžœžœe˜ŽKšœžœ˜!K˜ šžœžœ˜3K™+K˜ —Kšžœ˜K˜ Kšœ˜—K˜ K˜ Kšœ;™;š
+ œžœžœžœžœ˜HKšžœžœ˜<—K˜ K˜ š œžœ>žœžœ˜kKš œ%˜7K˜Kšœ˜K˜K˜ Kšœžœ+˜BK˜ Kšžœžœ˜,Kšžœžœžœ˜3šžœžœ™:Kšœ;™;—Kšžœ,žœ˜LK˜ Kšœ,˜,Kšœ+˜+KšœŸ˜0K˜"Kšžœ	žœžœžœv˜–Kšžœžœžœžœe˜ŽKšœžœ˜!K˜ šžœžœ˜3K™+K˜ —Kšžœ˜K˜ šœ˜K˜ —K˜ K˜ —K˜ š œžœDžœ˜lKš œ%˜7K˜Kšœ˜Kšœžœ˜;K˜ Kšœžœ+˜BK˜ K˜K˜K˜ Kšžœžœ˜,Kšžœžœžœ˜3šžœžœ™:Kšœ;™;—Kšžœ,žœ˜LK˜ Kšœ,˜,Kšœ+˜+Kšœ"˜"K˜"Kšžœ	žœžœžœv˜–Kšœ˜K˜ K˜ —K˜ š œžœEžœžœžœžœ˜|Kš œ%˜5K˜Kšœ˜K˜ Kšœžœ+˜BK˜ Kšžœžœ˜,Kšžœžœžœ˜3šžœžœ™:Kšœ;™;—Kšžœ,žœ˜LK™ Kšœ*˜*Kšœ+˜+Kšœ˜š	žœ œžœžœž˜Kšœ&˜&Kšžœ˜—K˜ K˜"Kšžœ	žœžœžœt˜”šœ˜K˜ —K˜ —K˜ š œžœ,žœžœžœžœžœ˜xKšž˜Kš œ%˜7K˜Kšœ˜Kšœ	žœ˜K˜ Kšœžœ˜K˜ K˜K˜ Kš	œžœžœžœžœ˜2K˜ K˜ Kšœ,˜,Kšœ"˜"Kšœ$˜$K˜"Kšžœ	žœžœžœ1˜QK˜ Kšžœžœžœžœv˜ŸKšœžœ˜!K˜ Kš
+žœžœžœžœžœ1˜mK˜ K˜'K˜ šžœ œžœž
+œžœž˜-Kšœžœ˜šœžœžœ˜KKšœ˜Kšœ˜Kšœ"˜"Kšœ ˜ Kšœžœžœ˜/Kšœ"˜"Kšœ˜Kšœ$˜$Kšœ'˜'—Kšœžœ˜Kšžœ˜—K˜ Kšžœ˜Kšžœ˜—˜ K˜ —š œžœžœžœ˜UKšž˜Kš œ&˜6K˜Kšœ˜Kšœžœ˜=K˜ Kšœ*˜*Kšœ˜K˜"Kšžœ	žœžœžœt˜”Kšžœžœžœžœc˜ŒK˜ Kšœ!žœ˜8Kšœžœžœžœ˜2Kšœžœ žœ˜KKšœžœžœžœ˜3Kšœžœ žœ˜ZKšœ žœžœžœ˜AKšžœ˜Kšžœ˜K˜ —K˜ š œžœ˜-Kšž˜Kš œ&˜7K˜Kšœ˜K˜ Kšœ+˜+K˜"Kšžœ	žœžœžœu˜•Kšžœžœžœžœe˜ŽK˜ Kšžœ˜—K˜ š œžœ$žœžœ
+žœ
+žœžœžœ
+žœ˜šKšž˜Kš œ&˜=K˜Kšœ˜K˜ Kšœ1˜1K˜ Kšœ%˜%šœžœžœžœ˜4Kšœ@™@KšœŽžœ™§—Kšœžœžœžœ˜1Kšœžœžœžœ˜1Kšœžœžœ˜-K˜"K˜ Kšžœ	žœžœžœ~˜žKšžœžœžœžœm˜–Kšžœžœžœžœ˜+K˜ šžœ˜K˜ K™+——K˜ š œžœ žœžœžœžœ	žœžœ˜”šž˜Kš œ&˜4K˜Kšœ˜K˜ Kšœ(˜(K˜ Kšœ ˜ Kšœ)˜)Kšœ%˜%K˜ K˜ K˜"Kšžœ	žœžœžœu˜•Kšžœžœžœžœd˜K˜ Kšžœžœžœžœžœžœžœ˜HK˜ Kšžœ˜K˜ ——š	œ œžœžœžœ˜bKšž˜Kš œ&˜:K˜Kšœ˜Kšœ"žœ˜DK˜ Kšœ.˜.Kšœ ˜ K˜"Kšžœ	žœžœžœx˜˜Kšžœžœžœžœg˜‘K˜ Kšœžœžœžœ˜0Kšœžœžœžœ˜9Kšœžœ žœ˜LKšœžœžœžœ˜1Kšœžœžœžœ˜0Kšœžœžœžœ˜.Kšœžœžœžœ˜/Kšœžœžœžœ˜0Kšœžœ˜6Kšœžœžœžœ˜4Kšœžœžœžœ˜9Kšœžœžœžœ˜5Kšœžœžœžœ˜4Kšœžœžœžœ˜4Kšœžœžœžœ˜3Kšœžœžœžœ˜4Kšœžœžœžœ˜3Kšœžœžœžœ˜3Kšœžœžœžœ˜2Kšœžœžœžœ˜6Kšœžœžœžœ˜5K˜ Kšžœ˜Kšžœ˜—K˜ š œžœžœžœ˜aKšž˜Kš œ&˜:K˜Kšœ˜Kšœ"žœ˜DK˜ Kšœžœ˜Kšœžœ˜K˜ Kšœ.˜.Kšœ ˜ K˜"Kšžœ	žœžœžœx˜˜Kšžœžœžœžœg˜‘K˜ Kšœžœžœžœ˜0Kšœžœžœžœ˜9Kšœžœ žœ˜LKšœžœžœžœ˜1Kšœžœžœžœ˜0Kšœžœžœžœ˜.Kšœžœžœžœ˜/Kšœžœžœžœ˜0Kšœžœžœžœ˜-Kšœžœžœžœ˜-šœžœ˜K™+—Kšœžœžœžœ˜5Kšœžœžœžœ˜9Kšœžœžœžœ˜5Kšœžœžœžœ˜4Kšœžœžœžœ˜4Kšœžœžœžœ˜3Kšœžœžœžœ˜4Kšœžœžœžœ˜3Kšœžœžœžœ˜3Kšœžœžœžœ˜2Kšœžœžœžœ˜6Kšœžœžœžœ˜5K˜ Kšžœ˜Kšžœ˜—K˜ š¡œžœ!žœžœžœžœžœ˜¦Kšž˜Kš œ&˜BK˜Kšœ˜K˜ Kšœ6˜6Kšœ˜Kšœžœžœžœ˜8Kšœžœžœžœ˜5Kšœ"˜"K˜"Kšžœ	žœžœžœ€˜ K˜ Kšžœ ˜&Kšžœ˜—K˜ š
+¡œžœžœžœžœ˜uKšž˜Kš œ&˜CK˜Kšœ˜K˜ Kšœ7˜7Kšœ˜Kšœ"˜"K˜"Kšžœ	žœžœžœ˜¡K˜ Kšžœ ˜&Kšžœ˜K˜ —K˜ š¡œžœžœžœ˜dKšž˜Kš œ&˜@K˜Kšœ˜K˜ Kšœ4˜4Kšœ˜K˜"Kšžœ	žœžœžœ~˜žK˜ Kšžœ ˜&šžœ˜K˜ ——š¡"œžœžœžœžœžœžœžœžœ˜ÏKšž˜Kš $œ&˜JK˜Kšœ˜K˜ K˜ Kšœ>˜>Kšœ˜Kšœ˜Kšœžœžœžœ˜8Kšœ%˜%Kšœ(˜(Kšœ"˜"K˜"Kšžœ	žœžœžœˆ˜¨K˜ Kšžœ ˜&Kšžœ˜K˜ —K˜ š¡#œžœžœžœžœžœžœžœ˜³Kšž˜Kš %œ&˜KK˜Kšœ˜K˜ K˜ Kšœ?˜?Kšœ˜Kšœ˜Kšœ%˜%Kšœ(˜(Kšœ"˜"K˜"Kšžœ	žœžœžœ‰˜©K˜ Kšžœ ˜&Kšžœ˜—K˜ —˜ š œžœžœ˜[Kšž˜šžœžœžœžœ1˜ZK˜ Kšž˜Kš	œ	žœžœžœžœ˜3šžœ	ž˜˜Kšž˜Kšœ!žœ˜BKšžœžœžœžœ1˜ZKšœžœžœžœ˜/Kšœžœ˜5Kšœžœžœžœ˜.Kšœžœžœžœ˜/Kšœžœžœžœ˜.Kšœžœžœžœ˜4Kšžœ˜Kšžœ˜—Kšžœžœžœ˜—Kšžœ˜—Kšžœ˜—K˜ š
+ œžœ/žœžœžœ˜fKšž˜š
+ œž	œžœžœžœ˜3™VK™}—Kšœ.˜.šœžœžœžœ˜<Kšœ˜—Kšœžœžœ˜4šœžœžœžœ˜7Kšœ˜—Kšœžœžœ˜4Kšœžœ-žœžœ˜DK˜ Kšžœ
+˜K˜—šœ/˜/K˜K˜2Kšœ˜Kšœ˜K˜—Kšœ žœ+˜SK˜ šžœ$˜&šžœ˜K™OK˜K˜—šžœ˜K™BKšžœ(˜-K˜——K˜Kšžœ˜—K˜ š œžœ-žœ'˜zKšœžœžœ˜>Kšœ˜Kšœ˜Kš  œ(˜HKšœ:˜:Kšœ ˜ K˜"Kšžœ	žœžœžœ˜ŸKšžœžœžœžœn˜—Kšœžœžœžœ˜0Kšžœ˜K˜—K˜ š œžœžœ+žœ'˜yKšœžœžœ˜>Kšœ˜Kšœ˜Kš œ(˜BKšœ4˜4Kšœ˜K˜"Kšžœ	žœžœžœy˜™Kšžœžœžœžœh˜‘Kšœžœ˜1Kšžœ˜K˜—K˜ š œžœ/žœ#˜pšœžœžœ˜>Kšœ˜Kšœ˜Kšœžœ˜Kš œ(˜@Kšœ2˜2Kšœ-˜-Kšœ˜K˜"Kšžœ	žœžœžœw˜—Kšžœžœžœžœf˜Kšœžœžœžœ˜/Kšœžœžœžœžœžœžœ˜CKšžœ˜K˜——K˜ K˜ —K™˜ ˜ K™)Kšœ	žœžœžœžœžœžœ˜D—š œžœ/žœžœžœžœžœ˜iKšœžœžœžœ˜Kšœžœžœ˜$Kšœ˜K˜ Kšžœžœ˜,Kšžœžœžœ˜3K˜ šžœž˜Kšž˜Kšœžœ6˜LKšœžœ™,Kšœžœ.™Dš
+žœžœžœžœ	žœ˜#K˜6Kšžœ˜—Kšžœ˜Kšž˜—Kšžœžœžœ˜Kšœ˜K˜ —K˜ Kšœžœžœžœžœžœ˜)š
+ œžœ(žœžœžœ˜hKšœžœžœžœ˜Kšœžœ˜KšœžœD˜eK˜ Kšžœžœ˜,Kšžœžœžœ˜3K˜ K˜K˜ Kšžœžœ
+˜šœ˜K˜ ——K˜ Kšœžœžœžœžœžœ˜)K˜ Kšœ;™;š
+ œžœžœžœžœ˜AKšžœžœ˜/—K˜ š
+ œžœ(žœžœžœ˜`Kšœžœžœžœ˜KšœžœC˜dK˜ Kšžœžœ˜,Kšžœžœžœ˜3šžœžœžœ	žœ™CK™;—šžœžœžœžœ˜UK™ —Kšžœžœ˜šœ˜K˜ —K˜ —˜ K˜ —š œžœ.žœžœ˜aKšœžœžœžœ˜KšœžœC˜dK˜ Kšžœžœ˜,Kšžœžœžœ˜3šžœžœžœ	žœ™CK™;—šžœžœžœžœ˜UK™ —K˜Kšœ˜K˜ K˜ —˜ Kšœ	žœžœžœžœžœžœ˜D—š œžœ/žœžœžœžœžœ˜qKšœžœžœžœ˜Kšœ˜K˜ Kšžœžœ˜,Kšžœžœžœ˜3K˜ Kšœžœ6˜LKšœžœ™,Kšœžœ.™Dšžœžœžœ	žœ™CK™;—šžœžœžœžœ˜UK™ —šžœžœžœž˜K˜Kšžœ˜—šœ˜K˜ ——K˜ K˜ Kšœžœžœžœ
+žœžœžœ˜GK˜ š œžœ	žœžœžœžœžœ˜SKšž˜šœžœžœ&˜HKšœ…™…—š	 œžœžœžœž˜,Kšœžœžœ˜—Kšžœ˜ šžœ˜˜ K™F———š œžœžœžœ˜5Kšž˜Kšž˜Kšžœ˜—K˜ Kš
+ œžœ/žœžœžœ.˜”K˜ —K™ K™™ K™ K™˜ šœ™Kšœ™—Kšœ™—K˜ š œžœžœžœžœžœ˜JK™bšœ0žœ˜9Kšœžœ#žœ>˜„Kšœ˜—Kšœ˜šœ™Kšœžœžœ˜#K˜:Kšžœžœžœ(˜KKšœ˜—™K˜K˜1Kšœžœžœ:˜GKšœ;˜;Kšžœ˜%K˜—Kšžœ˜—K˜ š œžœžœžœ˜QJ™#šžœž˜K˜K˜K˜K˜K˜"K˜*K˜$K˜Kšžœ#˜*—Kšžœ˜—K˜ K˜ —Kšžœ˜K˜:—— …—    ËÔ  "ñ 

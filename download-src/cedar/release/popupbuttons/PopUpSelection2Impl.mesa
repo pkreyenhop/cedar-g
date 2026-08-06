@@ -1,0 +1,634 @@
+
+
+DIRECTORY
+BasicTime	USING [GMT, Now, Period, Update],
+CedarProcess USING [Priority, SetPriority],
+Cursors 	USING [SetCursor],
+Imager,
+ImagerBackdoor USING [DiscardBuffer, MakeStipple, RestoreBuffer, SaveBufferRectangle, ViewReset],
+ImagerColor,
+ImagerColorPrivate,
+ImagerFont 	USING [Extents, FontBoundingBox, RopeBoundingBox],
+InputFocus	USING [CaptureButtons, PopInputFocus, PushInputFocus, ReleaseButtons],
+MachineDependentPopping USING [maySetMouse, ScreenCoords, SetMouse, ToScreenCoords],
+PopUpButtons,
+PopUpSelection2,
+PopUpSelection2Private,
+Process 	USING [Detach, InitializeCondition, MsecToTicks, SecondsToTicks],
+Real 	USING [Fix, Round],
+Rope 	USING [IsEmpty, ROPE],
+RuntimeError USING [UNCAUGHT],
+TIPUser 	USING [InstantiateNewTIPTable, TIPScreenCoords, TIPTable],
+UserProfile 	USING [Boolean, CallWhenProfileChanges, Number, ProfileChangedProc, Token],
+VFonts 	USING [DefaultFont, EstablishFont],
+ViewerClasses USING [NotifyProc],
+ViewerLocks USING [CallUnderColumnLock, CallUnderViewerTreeLock],
+ViewerPrivate USING [CreateContext, Screen],
+ViewerSpecs USING [colorScreenHeight, colorScreenWidth, bwScreenHeight, bwScreenWidth];
+
+PopUpSelection2Impl: CEDAR MONITOR
+IMPORTS BasicTime, CedarProcess, Cursors, Imager, ImagerBackdoor, ImagerColorPrivate, ImagerFont, InputFocus, MachineDependentPopping, Process, Real, Rope, RuntimeError, TIPUser, UserProfile, VFonts, ViewerLocks, ViewerPrivate, ViewerSpecs
+EXPORTS PopUpSelection2 = 
+
+BEGIN OPEN MDP:MachineDependentPopping, PopUpSelection2;
+
+Menu: TYPE = REF MenuPrivate;
+MenuPrivate: PUBLIC TYPE = PopUpSelection2Private.MenuPrivate;
+
+RopeImage: TYPE ~ REF RopeImagePrivate;
+RopeImagePrivate: TYPE ~ PopUpButtons.RopeImagePrivate;
+
+Colors: TYPE ~ REF ColorsPrivate;
+ColorsPrivate: TYPE ~ PopUpButtons.ColorsPrivate;
+
+State: TYPE ~ {idle, preparing, selecting, recovering};
+
+
+reCheck: CONDITION;
+state: State ¨ idle;
+popDone: REF BOOL ¨ NIL;
+repositioned: BOOL ¨ FALSE;
+timedOut: BOOL ¨ FALSE;
+timeOutKey: REF BasicTime.GMT; --NIL means no time out expected; SetUpTimeOutWatcher is only writer
+gSelection: NAT ¨ 0;
+gMB: MouseButton ¨ red;
+gMouse: REF ¨ NIL;
+gHelpOn: INTEGER ¨ -1;
+gHelpMode: BOOL ¨ FALSE;
+gXOrg, gYOrg: INTEGER ¨ 0;	-- initial mouse position, relative to [mx, my], 0 at bottom
+
+
+sHeight, sWidth: INTEGER ¨ 0; -- size of screen, in pixels; [screen containing menu]
+mx, my: INTEGER ¨ 0;	-- menu position, 0 at bottom
+context: Imager.Context ¨ NIL;  -- menu context
+mOnColor: BOOL ¨ FALSE;  	-- menu [NOT cursor] on color screen 
+lastMouse: MDP.ScreenCoords;  -- at start; remember between calls is creature comfort; 0 at bottom
+NotifyConsumer: Consumer ¨ NIL;
+notifyConsumerData: REF ANY ¨ NIL;
+gm: Menu ¨ NIL;
+gDefault: NAT;
+
+
+CallerBug: ERROR = CODE;
+Bug: ERROR = CODE;
+
+bordThick: NAT = 2;
+bordSep: NAT = 2; 
+borderW: NAT = bordThick+bordSep;
+border2W: NAT = borderW+borderW;
+
+debug: BOOL ¨ FALSE;
+
+tipTable: TIPUser.TIPTable = TIPUser.InstantiateNewTIPTable["PopUpSelection2.tip"];
+font: Imager.Font ¨ NIL;
+
+
+Reason: TYPE ~ {done, reposition, allup};
+
+SetDoneAndNotify: PROC [reason: Reason, mb: MouseButton] --must only be called from the notifier process, because it passes result to NotifyConsumer-- = {
+Consume: Consumer;
+sel: INT;
+data: REF ANY;
+[Consume, sel, data] ¨ SetDone[reason, mb];
+IF Consume # NIL THEN Consume[sel, mb, data];
+RETURN};
+
+SetDone: ENTRY PROC [reason: Reason, mb: MouseButton] RETURNS [Consume: Consumer, sel: INT, data: REF ANY] = {
+ENABLE UNWIND => NULL;
+IF reason=allup AND gm.allMayBeUp THEN RETURN [NIL, -1, NIL];
+IF state#selecting THEN RETURN [NIL, INT.FIRST, NIL];
+state ¨ recovering;
+repositioned ¨ SELECT reason FROM done, allup => FALSE, reposition => TRUE, ENDCASE => ERROR;
+IF repositioned THEN Consume ¨ NIL ELSE Consume ¨ NotifyConsumer;
+sel ¨ IF timedOut THEN -1 ELSE gSelection;
+gMB ¨ mb;
+data ¨ notifyConsumerData;
+BROADCAST reCheck;
+IF Consume#NIL THEN {--wait 'till InputFocus is restored in Pop
+pd: REF BOOL ¨ popDone;
+WHILE NOT pd^ DO WAIT reCheck ENDLOOP;
+RETURN};
+RETURN};
+
+Wait: ENTRY PROC RETURNS [reposd: BOOL] = {
+ENABLE UNWIND => NULL;
+IF state#preparing THEN RETURN WITH ERROR Bug;
+state ¨ selecting;
+BROADCAST reCheck;
+WHILE state#recovering DO WAIT reCheck ENDLOOP;
+IF (reposd ¨ repositioned) THEN state ¨ preparing;
+RETURN};
+
+
+Enter: ENTRY PROC [] = {
+ENABLE UNWIND => NULL;
+WHILE state#idle DO WAIT reCheck ENDLOOP;
+state ¨ preparing;
+popDone ¨ NEW [BOOL ¨ FALSE];
+BROADCAST reCheck;
+RETURN};
+
+Leave: ENTRY PROC [] = {
+ENABLE UNWIND => NULL;
+IF state#recovering THEN RETURN WITH ERROR Bug;
+state ¨ idle;
+popDone^ ¨ TRUE;
+BROADCAST reCheck;
+RETURN};
+
+Restore: PROC [s: ATOM] = {
+ImagerBackdoor.RestoreBuffer[context, s];
+IF discard THEN ImagerBackdoor.DiscardBuffer[context, s];
+};
+discard: BOOL ¨ TRUE;
+
+SetUpTimeOutWatcher: ENTRY PROC [i: NAT] = {
+ENABLE UNWIND => NULL;
+timedOut ¨ FALSE;
+IF i<=0 OR i>10000 THEN timeOutKey ¨ NIL --upper limit to prevent overflow
+ELSE {
+timeOutKey ¨ NEW[BasicTime.GMT ¨ BasicTime.Update[BasicTime.Now[], i]];
+TRUSTED {Process.Detach[FORK TimeOutWatcherProcess[key: timeOutKey]]};
+}
+};
+
+TimeOutWatcherProcess: ENTRY PROC [key: REF BasicTime.GMT] = {
+ENABLE UNWIND => NULL;
+cond: CONDITION;
+CedarProcess.SetPriority[excited];
+TRUSTED {Process.InitializeCondition[@cond, Process.SecondsToTicks[MIN[MAX[BasicTime.Period[from: BasicTime.Now[], to: key≠], 1], 10]]]};
+WHILE timeOutKey=key AND state=selecting AND BasicTime.Period[from: BasicTime.Now[], to: key≠]>0 DO WAIT cond ENDLOOP;
+IF timeOutKey=key AND state=selecting THEN {
+state ¨ recovering;
+timedOut ¨ TRUE; 
+BROADCAST reCheck};
+};
+
+
+helpSave: ATOM ¨ NIL;
+
+Box: PROC [x, y, w, h, border: INTEGER] = {
+Imager.SetColor[context, Imager.white];
+Imager.MaskRectangleI[context, x, y, w, h];
+Imager.SetColor[context, Imager.black];
+Imager.MaskRectangleI[context, x, y, border, h];
+Imager.MaskRectangleI[context, x+w-border, y, border, h];
+Imager.MaskRectangleI[context, x, y, w, border];
+Imager.MaskRectangleI[context, x, y+h-border, w, border];
+};
+
+HelpMessage: PROC [n: INTEGER] = {
+IF n#gHelpOn THEN {
+msg: ROPE ¨ NIL;
+gHelpOn ¨ n;
+IF helpSave#NIL THEN {Restore[helpSave]; helpSave ¨ NIL};
+msg ¨ IF n = 0 THEN gm.doc ELSE IF n <= gm.choices.length AND gm.choices[n-1] # nullChoice THEN gm.choices[n-1].doc ELSE "no-op";
+IF ~Rope.IsEmpty[msg] THEN {
+bordThick: NAT ~ 2; bordDist: NAT ~ 4; below: NAT ~ 2; 
+e: ImagerFont.Extents ¨ ImagerFont.RopeBoundingBox[font, msg];
+h: INTEGER ¨ Real.Fix[MIN[e.descent+e.ascent+2*bordDist, sHeight]]; --text height
+w: INTEGER ¨ Real.Fix[MIN[e.rightExtent+e.leftExtent+2*bordDist+1, sWidth]]; --text width 
+ty: INTEGER ¨ my-h-below; --text box's lower y in upright coordinates
+tx: INTEGER ¨ MIN[MAX[mx + (gm.width - w)/2, 0], sWidth-w]; --text box's left x in screen coordinates
+IF ty<0 THEN {
+ty ¨ my+gm.height+below;
+IF ty+h>=sHeight THEN RETURN;
+};
+ImagerBackdoor.SaveBufferRectangle[context, helpSave ¨ $Help, [tx, ty, w, h]];
+Box[tx, ty, w, h, bordThick];
+Imager.SetColor[context, Imager.black];
+Imager.SetXY[context, [(tx+bordDist)+e.leftExtent, ty+bordDist+e.descent]];
+Imager.SetFont[context, font];
+Imager.ShowRope[context, msg];
+};
+}
+};
+
+MoveCursor: ENTRY PROC [x, y: INTEGER, onCol: BOOL] = {
+ENABLE UNWIND => NULL;
+row, col, sel: NAT ¨ 0;
+IF state#selecting THEN RETURN; 
+IF onCol=mOnColor THEN {
+dx: INTEGER ~ x - mx;
+dy: INTEGER ~ y - my;
+SELECT TRUE FROM
+dx IN [borderW .. gm.width-border2W) AND dy IN (gm.fullRowsBot .. gm.headerBot] => {
+sel ¨ (gm.headerBot-dy) / gm.fullRowHeight + 1;
+};
+dx IN [gm.arrayLeft .. gm.arrayRight) AND dy IN (gm.arrayBot .. gm.arrayTop] => {
+row ¨ (gm.arrayTop-dy)/gm.rowHeight;
+col ¨ (dx-gm.arrayLeft)/gm.colWidth;
+sel ¨ gm.fullRows + row*gm.cols + col + 1;
+};
+ENDCASE => {
+gHelpMode ¨ TRUE;
+HelpMessage[0];
+};
+};
+IF gSelection#sel THEN {
+ll: INTEGER ~ mx;
+by: INTEGER ~ my;
+IF gSelection#0 THEN PaintEntry[ll, by, gSelection-1, FALSE];
+gSelection ¨ sel;
+IF gSelection#0 THEN PaintEntry[ll, by, gSelection-1, TRUE];
+IF gHelpMode THEN HelpMessage[gSelection];
+};
+}; 
+
+PopUpNotify: ViewerClasses.NotifyProc = {
+
+ProtectedNotify: PROC [input: LIST OF REF ANY] = {
+IF state=selecting THEN {
+mb: MouseButton ¨ red;
+FOR list: LIST OF REF ANY ¨ input, list.rest WHILE list#NIL DO
+WITH list.first SELECT FROM
+coords: TIPUser.TIPScreenCoords => MoveCursor[coords≠.mouseX, coords≠.mouseY, coords≠.color];
+atom: ATOM => SELECT atom FROM
+$Red => mb ¨ red;
+$Yellow => mb ¨ yellow;
+$Blue => mb ¨ blue;
+$Done => SetDoneAndNotify[done, mb];
+$Reposition => SetDoneAndNotify[reposition, mb];
+$AllUp => SetDoneAndNotify[allup, mb];
+ENDCASE => ERROR;
+ENDCASE => ERROR;
+ENDLOOP
+};
+};
+
+ProtectedNotify[input ! RuntimeError.UNCAUGHT => GOTO failed];
+EXITS failed => {gSelection ¨ 0; SetDoneAndNotify[reposition, red]};
+};
+
+defaultFont: PUBLIC Imager.Font ¨ VFonts.DefaultFont[NIL];
+
+dontPaint: PUBLIC Imager.SpecialColor ¨ ImagerColorPrivate.ColorFromStipple[word: 0, function: [xor, null]];
+sparseGrey: Imager.Color ~ ImagerBackdoor.MakeStipple[stipple: 00208H];
+denseGrey: Imager.Color ~ ImagerBackdoor.MakeStipple[stipple: 0FDF7H];
+
+defaultColors: PUBLIC Colors ¨ NEW [ColorsPrivate ¨ [
+[ALL[[Imager.black, Imager.white]], ALL[[Imager.black, sparseGrey]]],
+[ALL[[Imager.white, Imager.black]], ALL[[Imager.white, denseGrey]]]
+]];
+
+inverseColors: PUBLIC Colors ¨ NEW [ColorsPrivate ¨ [
+[ALL[[Imager.white, Imager.black]], ALL[[Imager.white, denseGrey]]],
+[ALL[[Imager.black, Imager.white]], ALL[[Imager.black, sparseGrey]]]
+]];
+
+leftMargin: INTEGER ¨ 3;
+rightMargin: INTEGER ¨ 2;
+bottomMargin: INTEGER ¨ 0;
+topMargin: INTEGER ¨ 1;
+
+ImageForRope: PUBLIC PROC [rope: ROPE, colors: Colors ¨ NIL, font: Imager.Font ¨ NIL, align: Align ¨ bottomLeft] RETURNS [image: Image] = {
+IF font = NIL THEN font ¨ defaultFont;
+IF colors = NIL THEN colors ¨ defaultColors;
+{
+e: ImagerFont.Extents = ImagerFont.RopeBoundingBox[font, rope];
+f: ImagerFont.Extents = ImagerFont.FontBoundingBox[font];
+ri: RopeImage = NEW [RopeImagePrivate ¨ [
+rope,
+colors,
+font,
+align,
+[Real.Round[e.leftExtent] + leftMargin, Real.Round[f.descent]+bottomMargin]
+]];
+image ¨ NEW [ImagePrivate ¨ [
+size: [ri.org.x + Real.Round[e.rightExtent] + rightMargin, ri.org.y + Real.Round[f.ascent] + topMargin],
+Draw: DrawRope,
+data: ri]];
+}};
+
+DrawRope: PROC [image: Image, context: Imager.Context, bounds: Imager.Rectangle, state: PopUpButtons.VisibleState] --Drawer-- = {
+ri: RopeImage = NARROW[image.data];
+ybot: REAL = bounds.y + ri.org.y + (bounds.h - image.size.y)*ri.align.y;
+xbot: REAL ~ bounds.x + ri.org.x + (bounds.w - image.size.x)*ri.align.x;
+foreground, background, strike: Imager.Color;
+[foreground, background, strike] ¨ ri.colors[state.highlight][state.executing][state.guarded];
+Imager.SetColor[context, background];
+Imager.MaskRectangle[context, bounds];
+Imager.SetColor[context, foreground];
+Imager.SetXY[context, [xbot, ybot]];
+Imager.SetFont[context, ri.font];
+Imager.ShowRope[context, ri.text];
+IF state.guarded THEN {
+guardOffset: REAL = ri.font.FontBoundingBox[].ascent*(1.0/3);
+IF strike = NIL THEN strike ¨ foreground;
+Imager.SetColor[context, strike];
+Imager.MaskRectangle[context, [bounds.x, ybot+guardOffset, bounds.w, 1]];
+};
+};
+
+Sequify: PUBLIC PROC [list: ChoiceList] RETURNS [seq: ChoiceS] ~ {
+len: NAT ¨ 0;
+FOR l: ChoiceList ¨ list, l.rest WHILE l#NIL DO len ¨ len+1 ENDLOOP;
+seq ¨ NEW [ChoiceSequence[len]];
+FOR i: NAT IN [0 .. len) DO
+seq[i] ¨ [ImageForRope[list.first.key], list.first.doc];
+list ¨ list.rest;
+ENDLOOP;
+IF list#NIL THEN ERROR;
+RETURN};
+
+
+PopRopes: PUBLIC PROC
+[
+choices: ChoiceList,
+doc: ROPE,
+allMayBeUp: BOOL,
+default: NAT ¨ 0,
+header: ROPE ¨ NIL,
+left, top: Label ¨ nullLabel,
+columns: NAT ¨ 1,
+fullRows: NAT ¨ 0,
+timeOut: NAT ¨ 0,
+position: REF ¨ NIL,
+InNotifier: Consumer ¨ NIL,
+notifyData: REF ANY ¨ NIL]
+RETURNS [sel: INT, mb: MouseButton]
+~ {
+menu: Menu ~ Create[Sequify[choices], doc, allMayBeUp, IF header#NIL THEN ImageForRope[header] ELSE NIL, left, top, columns, fullRows, timeOut];
+[sel, mb] ¨ Pop[menu, default, position, InNotifier, notifyData];
+RETURN};
+
+Create: PUBLIC PROC [choices: ChoiceS, doc: ROPE, allMayBeUp: BOOL, header: Image ¨ NIL, left, top: Label ¨ nullLabel, columns: NAT ¨ 1, fullRows: NAT ¨ 0, timeOut: NAT ¨ 0] RETURNS [m: Menu] = {
+fullWidth: NAT ¨ 0;
+m ¨ NEW [MenuPrivate ¨ [
+choices: choices,
+header: header,
+doc: doc,
+allMayBeUp: allMayBeUp,
+left: left,
+top: top,
+fullRows: fullRows,
+arrayRows: (choices.length - fullRows + columns-1) / columns,
+cols: columns,
+timeOut: timeOut
+]];
+FOR i: NAT IN [0 .. fullRows) DO
+IF choices[i] # nullChoice THEN {
+m.fullRowHeight ¨ MAX[m.fullRowHeight, Ceiling[choices[i].image.size.y]];
+fullWidth ¨ MAX[fullWidth, Ceiling[choices[i].image.size.x]];
+};
+ENDLOOP;
+m.fullRowsSize ¨ m.fullRowHeight * fullRows;
+FOR i: NAT IN [fullRows .. choices.length) DO
+IF choices[i] # nullChoice THEN {
+m.rowHeight ¨ MAX[m.rowHeight, Ceiling[choices[i].image.size.y]];
+m.colWidth ¨ MAX[m.colWidth, Ceiling[choices[i].image.size.x]];
+};
+ENDLOOP;
+IF top # nullLabel THEN {
+m.colWidth ¨ MAX[m.colWidth, top.minSpacing];
+m.topLabelSize ¨ top.minWidth;
+};
+IF left # nullLabel THEN {
+m.rowHeight ¨ MAX[m.rowHeight, left.minSpacing];
+m.leftLabelSize ¨ left.minWidth;
+};
+IF header # NIL THEN {
+m.headerSize ¨ Ceiling[header.size.y];
+fullWidth ¨ MAX[fullWidth, Ceiling[header.size.x]];
+};
+m.arrayWidth ¨ m.cols * m.colWidth;
+IF fullWidth > m.arrayWidth+m.leftLabelSize THEN {
+IF m.arrayWidth # 0 THEN {
+m.colWidth ¨ Real.Round[fullWidth/REAL[m.arrayWidth+m.leftLabelSize] * m.colWidth];
+m.arrayWidth ¨ m.cols * m.colWidth;
+};
+m.leftLabelSize ¨ fullWidth - m.arrayWidth;
+};
+m.arrayHeight ¨ m.arrayRows * m.rowHeight;
+m.arrayLeft ¨ borderW + m.leftLabelSize;
+m.arrayRight ¨ m.arrayLeft + m.arrayWidth;
+m.arrayBot ¨ borderW;
+m.arrayTop ¨ m.arrayBot + m.arrayHeight;
+m.fullRowsBot ¨ m.arrayTop + m.topLabelSize;
+m.headerBot ¨ m.fullRowsBot + m.fullRowsSize;
+m.height ¨ m.headerBot + m.headerSize + borderW;
+m.width ¨ m.arrayRight + borderW;
+};
+
+Pop: PUBLIC PROC [menu: Menu, default: NAT ¨ 0, position: REF ¨ NIL, InNotifier: Consumer ¨ NIL, notifyData: REF ANY ¨ NIL] RETURNS [selection: INT ¨ 0, mouseButton: MouseButton ¨ red] = {
+thisPD: REF BOOL;
+IF InNotifier#NIL AND menu.timeOut IN (0..10000] THEN ERROR CallerBug--InNotifier can't be called from the TIP notifier in the case of a timeout--;
+Enter[];
+{ENABLE UNWIND => {NotifyConsumer ¨ NIL; Leave[]};
+reposd: BOOL ¨ FALSE;
+WithViewerLock: PROC [] = {
+saved: ATOM ¨ PrepareMenu[];
+Imager.DoSave[context, PaintMenu];
+HelpMessage[default];
+CheatMousePos[];
+SetUpTimeOutWatcher[gm.timeOut];
+reposd ¨ Wait[];
+RemoveMenu[saved];
+}; 
+thisPD ¨ popDone;
+gm ¨ menu;
+gDefault ¨ default;
+gMouse ¨ position;
+repositioned ¨ FALSE;
+NotifyConsumer ¨ InNotifier;
+notifyConsumerData ¨ notifyData;
+SELECT gSelection ¨ default FROM
+IN [1 .. menu.fullRows] => {
+gXOrg ¨ menu.width/2;
+gYOrg ¨ menu.headerBot - (gSelection-1)*menu.fullRowHeight - menu.fullRowHeight/2};
+IN (menu.fullRows .. menu.choices.length] => {
+gRow: NAT ~ (gSelection-menu.fullRows-1)/menu.cols;
+gCol: NAT ~ gSelection-menu.fullRows-1 - gRow * menu.cols;
+gXOrg ¨ menu.arrayLeft + gCol * menu.colWidth + menu.colWidth / 2;
+gYOrg  ¨ menu.arrayTop - gRow * menu.rowHeight - menu.rowHeight/2};
+ENDCASE => {
+gXOrg ¨ menu.width/2;
+gYOrg ¨ menu.headerBot + menu.headerSize/2};
+gHelpMode ¨ TRUE;
+InputFocus.PushInputFocus[];
+InputFocus.CaptureButtons[PopUpNotify, tipTable];
+Cursors.SetCursor[menu];
+DO
+ComputeMenuPosition[];
+gHelpOn ¨ -1;
+IF debug THEN WithViewerLock[]
+ELSE IF mOnColor THEN ViewerLocks.CallUnderColumnLock[WithViewerLock, color]
+ELSE ViewerLocks.CallUnderViewerTreeLock[WithViewerLock];
+IF ~reposd THEN EXIT;
+gMouse ¨ NIL;
+gSelection ¨ default;
+repositioned ¨ FALSE;
+ENDLOOP;
+InputFocus.ReleaseButtons[];
+InputFocus.PopInputFocus[];
+NotifyConsumer ¨ NIL;
+IF timedOut THEN selection ¨ -1 ELSE selection ¨ gSelection;
+mouseButton ¨ gMB;
+gMouse ¨ NIL;
+};
+Leave[];
+RETURN}; 
+
+
+ComputeMenuPosition: PROC [] = INLINE {
+lastMouse ¨ MDP.ToScreenCoords[gMouse];
+mOnColor ¨ lastMouse.color;
+};
+
+PrepareMenu: PROC [] RETURNS [saved: ATOM] = INLINE {
+IF mOnColor THEN {
+sHeight ¨ ViewerSpecs.colorScreenHeight;
+sWidth ¨ ViewerSpecs.colorScreenWidth;
+context ¨ ViewerPrivate.CreateContext[color];
+}
+ELSE {
+sHeight ¨ ViewerSpecs.bwScreenHeight;
+sWidth ¨ ViewerSpecs.bwScreenWidth;
+context ¨ ViewerPrivate.CreateContext[ViewerPrivate.Screen.FIRST];
+};
+ImagerBackdoor.ViewReset[context];
+mx ¨ MIN[MAX[0, lastMouse.x - gXOrg], sWidth-gm.width];
+my ¨ MIN[MAX[0, lastMouse.y - gYOrg], sHeight-gm.height];
+ImagerBackdoor.SaveBufferRectangle[context, saved ¨ $Menu, [mx, my, gm.width, gm.height]];
+context.SetFont[font];
+}; 
+
+RemoveMenu: PROC [saved: ATOM] = INLINE {
+IF helpSave#NIL THEN {
+Restore[helpSave]; 
+helpSave ¨ NIL
+};
+Restore[saved]; 
+}; 
+
+PaintMenu: PROC [] = {
+ll: INTEGER ~ mx;
+by: INTEGER ~ my;
+Imager.ClipRectangleI[context, ll, by, gm.width, gm.height];
+Box[ll, by, gm.width, gm.height, bordThick];
+IF gm.header # NIL THEN gm.header.Draw[gm.header, context, [ll + borderW, by + gm.headerBot, gm.width - 2*borderW, gm.headerSize], [FALSE, FALSE, FALSE]];
+IF gm.left # NIL THEN gm.left.Draw[context, [ll + gm.arrayLeft, by + gm.arrayTop], gm.arrayRows, gm.rowHeight, gm.leftLabelSize, gm.left.data];
+IF gm.top # NIL THEN gm.top.Draw[context, [ll + gm.arrayLeft, by + gm.arrayTop], gm.cols, gm.colWidth, gm.topLabelSize, gm.top.data];
+FOR i: NAT IN [0 .. gm.choices.length) DO
+PaintEntry[ll, by, i, gSelection = i+1];
+ENDLOOP;
+}; 
+
+PaintEntry: PROC [ll, by: INTEGER, i: NAT, highlight: BOOL] = {
+image: Image = IF i < gm.choices.length THEN gm.choices[i].image ELSE NIL;
+IF image # NIL THEN SELECT i FROM
+< gm.fullRows => image.Draw[image, context, [ll + borderW, by + gm.headerBot - (i+1) * gm.fullRowHeight, gm.width-border2W, gm.fullRowHeight], [highlight, FALSE, FALSE]];
+ENDCASE => {
+row: NAT ~ (i - gm.fullRows) / gm.cols;
+col: NAT ~ i - gm.fullRows - row*gm.cols;
+image.Draw[image, context, [ll + gm.arrayLeft + col * gm.colWidth, by + gm.arrayTop - (row+1) * gm.rowHeight, gm.colWidth, gm.rowHeight], [highlight, FALSE, FALSE]];
+};
+};
+
+CheatMousePos: PROC [] = {
+IF MDP.maySetMouse THEN MDP.SetMouse[[x: mx + gXOrg, y: my + gYOrg, color: mOnColor]];
+};
+
+InitFontGlobals: UserProfile.ProfileChangedProc = {
+font ¨ VFonts.EstablishFont[
+family: UserProfile.Token["PopUpSelection.FontFamily", "Helvetica"], 
+size: UserProfile.Number["PopUpSelection.FontSize", 10], 
+bold: UserProfile.Boolean["PopUpSelection.FontBold", FALSE],
+italic: UserProfile.Boolean["PopUpSelection.FontItalic", FALSE],
+defaultOnFailure: TRUE
+];
+};
+
+Ceiling: PROC [r: REAL] RETURNS [i: INTEGER] = {
+d: INT = Real.Fix[r] + 1;
+i ¨ Real.Fix[r-d]+d};
+
+Floor: PROC [r: REAL] RETURNS [i: INTEGER] = {
+d: INT = Real.Fix[r] - 1;
+i ¨ Real.Fix[r-d]+d};
+
+TRUSTED {Process.InitializeCondition[@reCheck, Process.MsecToTicks[1000]]};
+UserProfile.CallWhenProfileChanges[InitFontGlobals];
+
+END.
+
+  ,  PopUpSelection2Impl.Mesa  
+Copyright ” 1983, 1986, 1991 by Xerox Corporation.  All rights reserved.
+Created by Christian Jacobi, November 9, 1983 12:14 pm
+Last Edited by: Christian Jacobi, August 26, 1986 10:31:27 am PDT
+Last Edited by: Pier, June 23, 1986 11:39:21 am PDT
+Last tweaked by Mike Spreitzer on October 9, 1990 2:36:23 pm PDT
+Mike Spreitzer July 13, 1992 12:54 pm PDT
+Willie-s, January 7, 1992 3:55 pm PST
+--data of the basic monitor
+--data of the constructed monitor
+--unmonitored data
+--for scheduling interaction menu
+
+--Enter and Leave for scheduling module entrance
+
+-- saving and restoring screen contents
+
+
+
+--timeout nonsense
+--does not modify timeOutKey
+--never called with key=NIL
+
+--help and move 
+--Cursors.GetCursorInfo[].hotX.. is already included in x, y by window package...
+--made sequential by viewer package
+
+-- the main stuff
+-- sets variables lastMouse and mOnColor
+--must be called with DoSave; changes state
+--sets the cursor such that it points into the default field, or header
+TRUSTED {Process.Detach[FORK DebugProcess[]]};
+ù £  ñ(cedarcode) styleïNewlineDelimiter
+ò codeöúôKöú	œeú<ôHKöú6ô6KôAKô3Kô@Kô)Kô%óKò öœk	ò	Köú
+ûúûúò+Köúûúò+KöúûúòKöúòKöúûúMòaKòKòKöúûú-ò>KöúûúAòQKöúûú7òTKöúòKöúòKöúòKöú	ûú<òJKöúûúòKöúûúûúòKöúûúûúòKöúûú5òCKöúûúFòXKöúûúò+Köúûúò!Köúûú0òAKöúûúò,KöúûúFòWKò óöœbúûúûò"KöûúËòÔKöûúòóKò Köûúûúûú*ò8Kò KöúûúûúòKöúûúûú&ò>Kò Köúûúûúò'Köúûú!ò7Kò Köúûúûúò!Köúûúò1Kò Köúûú,ò7Kò KöúôKò Köú	û	úòKòKöú	ûúûúûúòKöúûúûúòKöú
+ûúûúòKöúûúûúœcDòcKöúûúòKòKöúûúûúòKöú	ûúòKöúûúûúòKöúûú†<òWKò Köú!ô!Kò Köúûú†6òTKöúûú†ò2Köúûú†ò/Köú
+ûúûú†%ò?Köúûú†DòbKöœnúûúòKöúûúûúûúò"KöúûúòKöú
+ûúòKò KöúôKò Kö°	úûúûúòKö°úûúûúòKò KöúûúòKöú	ûúòKöú	ûúò!Köú
+ûúò Kò KöúûúûúòKò KöúSòSKöúûúòKò Köú!ô!Kò Köúûúò)Kò ö°úûú#†]úòöKö°úòKöúûúò	KöúûúûúòKò+Köûúûúûúò-KöûúòKò óö°úûúûú#ûú°úûúûúûúònKöûúûúûúòKöûúûúûúûúûúûúò=Köûúûúûúûúûúûúûúò5KòKöúûúûúûúûúûúûúò]KöûúûúûúûúòAKöúûú
+ûúûúò*Kò	KòKöû	ú	òöûú	ûúûú†*ò?KöúûúûúòKö
+ûúûúûúûú	ûúò&KöûúòóKöûúòóKò ö
+°úûúûúûú
+ûúò+KöûúûúûúòKö
+ûúûúûúûúûúò.KòKöû	ú	òKöûúûúûú	ûúò/Köûúûúò2KöûúòKò óKô Köú0ô0Kò ö°úûúûúòKöûúûúûúòKöûúûúûú	ûúò)KòKöú
+ûúûúûúòKöû	ú	òKöûúòóKò ö°úûúûúòKöûúûúûúòKö
+ûúûúûúûúûúò/KòKöúûúòKöû	ú	òKöûúòóKò Kô Köú'ô'Kô ö°úûúûúòKöú)ò)Köûú	ûú*ò9KòKöú	ûúûúòóKô Jô JöúôKò ö°úûúûúûúò,KöûúûúûúòKöúûúòKö	ûúûú	ûúûú†!òJöûúòKöúûúûú)òGKöûúûú*òFKòóKöúòóKò ö
+°úûúûúûúûúò>Kö†ôKö†ôKöûúûúûúòKöúû	úòKöú"ò"Köûú<ûúûú?òâKöûúûúûú5ûúûúûúòvöûúûúûúò,KòKöúûúòKöû	ú
+òóKöúòóKò Jô JöúôKò Köú
+ûúûúòKò ö°úûúûúò+Köú'ò'Köú+ò+Köú'ò'Köú0ò0Köú9ò9Köú0ò0Köú9ò9KöúòóKò ö°úûúûúò"öûúûúòKöúûúûúòKòKöûú
+ûúûúûúò9Köúûúûúûúûúûúûúûú	òÅöûúûúòKöúûúûúûúò7Kò>Köúûúûú+†òQKöúûúûú4†òZKöúûú†+òEKöúûúûúûú'†)òeöûúûúòKòKöûúûúûúòKòóKòNKöúòKöú'ò'KöúKòKKòKöúòKòóKòóKòóKò ö
+°
+úûúûúûú	ûúò7KöûúûúûúòKöúûúòKöúQôQKöûúûúûúò öûúûúòKöúûú
+òKöúûú
+òöûúûúûòöúûú ûúûú&òTKò/Kòóöúûú!ûúûú"òQKò$Kò$Kò*KòóöûúòKöúûúòKöúòKòóóKòóöûúûúòKöúûúòKöúûúòKöûúûú"ûúò=KòKöûúûú"ûúò<Köûúûúò*KöúòóKöúòóKò ö–bnúò)Köú#ô#Kò ö°úûú	ûúûúûúûúò2öûúûúòKòöûúûúûúûúûúûúûúûò>öûúûúûòKò]öúûúûúûòKòKòKòKöú$ò$Köú0ò0Köú&ò&KöûúûúòóKöûúûúòóKöûòóKòóKöúòóKò Köú%ûúûú	ò>Köûú?òDKöúòóKò Kô Köúûú"ûúò:Kò Köúûú[òlKöúGòGKöúFòFKò öúûú
+ûúò5Köúûú ûúòEKöúûú ûúòCKöúòóKò öúûú
+ûúò5Köúûú ûúòDKöúûú ûúòDKöúòóKò KöúûúòKöúûúòKöúûúòKöúûúòKò ö°úûúûúûúûúûúûúòãKöûúûúûúò&Köûú
+ûúûúò,KöúòKöú?ò?Köú9ò9öúûúò)KöúòKöúòKöúòKòKòKKöúòóöúûúòKöúhòhKö°úòKöúòóKòKò óö°úûúe†
+úòÅKöúûúò#Köúûú>òHKöúûú>òHKöú-ò-Kò^Köú%ò%Köú&ò&Köú%ò%Köú$ò$Köú!ò!Köú"ò"öûúûúòKöúûú,ò=Köûú
+ûúûúò)Kò!KòIKòóKòKò óö°úûúûúûúòBKöúûúòKö
+ûúûúûúûúûúòDKöúûúò öûúûúûúûòKò8KòKöûúòóKöûúûúûúûúòKöûúòKò óKôKò ö°úûúûòòKöúòKöúûúò
+KöúûúòKöú	ûúòKöúûúûúòKòKöú	ûúòKöú
+ûúòKöú	ûúòKöú
+ûúûúòKö°
+úûúòKöúûúûúûúòóKöûúûúò#òKöú7ûúûúûúûúûú)òêKòAKöûúòóóKò ö°úûúûúûúûúûú)ûúûúûúûúò√KöúûúòöúûúòKòKòKò	KöúòKòKò	KòKöú=ò=KöúòKòKòóöûúûúûúûò öûúûúò!Köúûú4òIKöúûú.ò=KòóKöûúòóKò,öûúûúûúûò-öûúûúò!Köúûú0òAKöúûú/ò?KòóKöûúòóöûúûúòKöúûúò-KòKöúòóöûúûúòKöúûúò0Kò Köúòóöûú
+ûúûúòKò&Köúûú$ò3KòóKò#öûú*ûúò2öûúûúòKöú"ûú-òSKò#KöúòóKò+KòóKò*Kò(Kò*KòKò(Kò,Kò-Kò0Kò!KòóKò ö°úûúûúûúûúûú°
+úûúûúûúûúûúûú)òºKöúûúûúòKöûúûúûúûúûúûú
+†MúòìöúòKöúûúûúûúò2Köúûúûúòö°úûúòKöúûúòKöú"ò"KöúòKöúòKöú ò KòKöúòKöúòóKòKò
+KòKòKöúûúòKòKò öûúûò öûúòKòKòSóöûú,ò.Köúûú*ò3Köúûú1ò:KòBKòCóöûúòKòKò,óóKöúûúòKòKöú1ò1KöúòöûòKöúòKòKöûúûúòKöûú
+ûú7òLKöûú5ò9Köûú	ûúûúòKöú	ûúòKòKöúûúòKöûúòóKòKòKöúûúòKöûú
+ûúûúò<KòKöú	ûúòKòóKöúòKöûúò	óKò Kò ö°úûúûúò'Köú(ô(Köúûúò'KòKöúòKò óö
+°úûúûú	ûúûúò5öûú
+ûúòKò(Kò&Kò-KöúòóöûúòKò%Kò#Köú;ûúòBKòóKò"Köúûúûú+ò7Köúûúûú-ò9KòZKöúòKöúòóKò ö°
+úûú	ûúûúò)öûú
+ûúûúòKöúòKöúûòKöúòóKöúòKöúòóKò ö°	úûúòKô+KöúûúòKöúûúòKöú<ò<Köú,ò,KöûúûúûúmûúûúûúòöKöûúûúûúzòèKöûú
+ûúûúqòÖöûúûúûúûò)Köú(ò(KöûúòóKöúòKò óö
+°
+úûú
+ûúûúûúò?Kö	úûúûúûúûúòJö	ûú	ûúûúûúûò!Köúõûúûúò™öûúòKöúûúò'Köúûú!ò)Köúñûúûúò•KöúòóóKòKò óö°úûúòKöúGôGKöûúûúûúûú;òVKöúòKò óö¢ú$ò3òKöúEòEKöú9ò9Köú5ûúò<Köú9ûúò@KöúûòKöúòóKöúòóKò ö
+°úûúûúûúûúò0KöúûúòKòóKò ö
+°úûúûúûúûúò.KöúûúòKòóKò KöûúDòKKöú4ò4Köûúûúô.Kò KöûúòKò ó Öó    I~  dM  

@@ -1,0 +1,726 @@
+DIRECTORY
+Commander USING [Handle, Register],
+CommanderOps USING [Failed, ParseToList],
+Convert USING [Error, IntFromRope],
+IO,
+Process USING [Yield],
+Rope,
+StackTrace,
+StackTracePrivate,
+UXStrings USING [ToRope, CString],
+VM USING [AddressFault];
+
+StackTraceImpl: CEDAR PROGRAM
+IMPORTS Commander, CommanderOps, Convert, IO, Process, Rope, UXStrings, VM
+EXPORTS StackTrace
+~ BEGIN OPEN StackTrace;
+
+ROPE: TYPE ~ Rope.ROPE;
+NoStack: PUBLIC ERROR [message: ROPE] ~ CODE;
+Stack: TYPE ~ REF StackBody;
+StackBody: TYPE ~ RECORD [
+pc: ProgramCounter,
+sp: FramePointer,
+currentFrame: FrameData
+];
+
+FrameData: TYPE ~ REF FrameDataBody;
+FrameDataBody: TYPE ~ RECORD [
+frame: FrameInfo,
+names: Names
+];
+
+Frame: PUBLIC TYPE ~ StackTracePrivate.Frame;
+
+Instruction: PUBLIC TYPE ~ StackTracePrivate.Instruction;
+
+CirioNubThreadDataRep: TYPE ~ MACHINE DEPENDENT RECORD [ --translated from CirioNubTypes.h
+index, gen: CARD,
+sStat: CARD,
+pri: CARD,
+dbMsg: INT,
+dbFrozen: INT,
+pc, sp, fp: POINTER];
+
+sStatNone: CARD = 0; sStatFree: CARD = 1; sStatReady: CARD = 2;
+sStatRun: CARD = 3; sStatWaitML: CARD = 4; sStatWaitCV: CARD = 5;
+sStateName: ARRAY [0..5] OF ROPE ~ ["o", "f", "ry", "rn", "m", "c"];
+MySP: PROC RETURNS [sp: FramePointer] ~ TRUSTED {
+JmpBufPtr: TYPE ~ POINTER TO JmpBuf;
+JmpBuf: TYPE ~ PACKED ARRAY [0..3) OF WORD;
+SetJmp: PROC [jb: JmpBufPtr] RETURNS [INT32] ~ TRUSTED MACHINE CODE {
+"<xr/Threads.h>.XR_setjmp"
+};
+SPFromJmpBuf: PROC [jb: JmpBufPtr] RETURNS [FramePointer] ~ TRUSTED MACHINE CODE {
+"CirioNubLocalSPFromJmpBuf" -- Missing from header file.
+};
+jb: JmpBuf;
+
+Process.Yield[];
+
+IF SetJmp[@jb] # 0 THEN ERROR;
+
+sp ¬ SPFromJmpBuf[@jb];
+};
+
+LocalGetThread: UNSAFE PROC [idx: INT, buf: POINTER TO CirioNubThreadDataRep] RETURNS [INT]
+~ UNCHECKED MACHINE CODE {"<xr/CirioNubLocalProcs.h>.CirioNubLocalGetThread"};
+
+GetMaxThreads: PROC RETURNS [INT]
+~ TRUSTED MACHINE CODE {"<xr/CirioNubLocalProcs.h>.CirioNubLocalGetMaxThreads"};
+
+GetThreadsIndex: PROC [thread: POINTER] RETURNS [INT32]
+~ TRUSTED MACHINE CODE {"<xr/CirioNubLocalProcs.h>.CirioNubLocalGetThreadIndex"};
+
+GetMyIndex: PROC RETURNS [ans: INT ¬ -1] ~ {
+Thread: TYPE ~ POINTER;
+CTRep: TYPE ~ RECORD [thread: Thread, gen: CARD];
+CT: TYPE ~ POINTER TO CTRep;
+GetCurrent: PROC [result: CT]
+~ TRUSTED MACHINE CODE {"<xr/Threads.h>.XR_GetCurrent"};
+ctr: CTRep ¬ [NIL, 0];
+TRUSTED {
+GetCurrent[@ctr];
+IF ctr.thread#NIL THEN ans ¬ GetThreadsIndex[@ctr];
+};
+IF ans < 0 THEN ans _ INT.LAST;
+};
+
+GetStack: PROC [thread: CARD32] RETURNS [stack: Stack] ~ TRUSTED {
+myIndex: CARD ~ MAX[0, GetMyIndex[]];
+mySP: FramePointer ¬ NIL;
+IF thread=CARD32.LAST OR thread=myIndex THEN mySP ¬ MySP[]
+ELSE IF thread IN [0..INT.LAST] THEN {
+buf: CirioNubThreadDataRep;
+cc: INT;
+TRUSTED {cc ¬ LocalGetThread[thread, @buf]};
+IF cc#0 THEN ERROR NoStack[IO.PutFR["Got error condition code %g trying to get info for for thread %g.", [integer[cc]], [integer[thread]] ]];
+mySP ¬ buf.sp;
+}
+ELSE ERROR NoStack[IO.PutFR1["Thread index %g is invalid.", [cardinal[thread]] ]];
+{
+sp: FramePointer ~ mySP.fp;
+pc: ProgramCounter ~ mySP.callerPC;
+frame: FrameInfo ~ BuildFrameInfo[0, pc, sp];
+stack ¬ NEW[StackBody ¬ [pc, sp, NEW[FrameDataBody ¬ [frame: frame, names: GetNames[frame.pc]]]]];
+RETURN}};
+
+FirstFrame: PROC [stack: Stack] RETURNS [FrameInfo] ~ TRUSTED {
+RETURN[BuildFrameInfo[0, stack.pc, stack.sp]];
+};
+
+NextFrame: PROC [current: FrameInfo] RETURNS [FrameInfo] ~ TRUSTED {
+pc: ProgramCounter ~ current.sp.callerPC;
+sp: FramePointer ~ current.fp;
+
+IF sp = NIL THEN
+RETURN [NIL]
+ELSE
+RETURN[BuildFrameInfo[current.index + 1, pc, sp]];
+};
+
+BuildFrameInfo: PROC [index: CARD32, pc: ProgramCounter, sp: FramePointer]
+RETURNS [FrameInfo] ~ TRUSTED {
+RETURN [NEW[FrameInfoBody ¬ [index, pc, IF sp#NIL THEN sp.fp ELSE NIL, sp]]];
+};
+
+Trace: PUBLIC PROC [thread: CARD32, callback: FrameProc] ~ {
+TraceIdx[IF thread=0 THEN CARD32.LAST ELSE thread, callback];
+};
+
+TraceIdx: PROC [thread: CARD32, callback: FrameProc] ~ {
+stack: Stack;
+frame: FrameInfo;
+{ENABLE VM.AddressFault => ERROR NoStack["Address fault"];
+stack ¬ GetStack[thread];
+FOR frame ¬ FirstFrame[stack], NextFrame[frame] WHILE frame # NIL DO
+names: Names ¬ GetNames[frame.pc];
+ IF callback[frame, names] THEN
+EXIT;
+ENDLOOP;
+RETURN}};
+PCInfoPtr: TYPE ~ POINTER TO PCInfo;
+PCInfo: TYPE ~ MACHINE DEPENDENT RECORD [
+procName: UXStrings.CString,
+procSymID: CARD32,
+fileName: UXStrings.CString,
+fileSeqNum: CARD32,
+guessedEmbeddedFileName: UXStrings.CString,
+guessedEmbeddedFileSymID: CARD32
+];
+
+SWSymEntryPtr: TYPE ~ POINTER TO SWSymEntry;
+SWSymEntry: TYPE = MACHINE DEPENDENT RECORD [
+symID: CARD32,
+name: UXStrings.CString,
+type: CARD32,
+value: CARD32,
+size: CARD32,
+fileSeqNum: CARD32
+];
+
+SymEntry: TYPE ~ REF SymEntryBody;
+SymEntryBody: TYPE ~ RECORD [
+symID: CARD32,
+name: ROPE,
+type: CARD32,
+value: CARD32,
+size: CARD32,
+fileSeqNum: CARD32
+];
+
+SWFileEntryPtr: TYPE ~ POINTER TO SWFileEntry;
+SWFileEntry: TYPE = MACHINE DEPENDENT RECORD [
+seqNum: CARD,
+commitPoint: CARD,  -- this is a bool in the C structure; 
+fileName: UXStrings.CString,
+fOffset: CARD,
+fMagic: CARD,
+size: CARD,
+mTime: CARD,
+sMagic: CARD,
+stamp: CARD,
+stampSize: CARD,
+readerData: CARD,
+readerDataSize: CARD,
+patchReloc: CARD,
+patchSize: CARD,
+textReloc: CARD,
+textSize: CARD,
+dataReloc: CARD,
+dataSize: CARD,
+bssReloc: CARD,
+bssSize: CARD,
+commonReloc: CARD,
+commonSize: CARD];
+
+GetPCInfo: PROC [pc: ProgramCounter] RETURNS [procName, outerFileName, innerFileName: ROPE, procSymID, outerFileSeqNum, innerFileSymID: CARD32] ~ TRUSTED {
+Inner: PROC [pc: ProgramCounter, buf: PCInfoPtr] RETURNS [INT32] ~ TRUSTED MACHINE CODE  {
+"<xr/CirioNubLocalProcs.h>.CirioNubLocalPCtoInfo"
+};
+buf: PCInfo;
+
+IF Inner[pc, @buf] # 0 THEN
+ERROR;
+
+RETURN [
+procName: UXStrings.ToRope[buf.procName],
+procSymID: buf.procSymID,
+outerFileName: UXStrings.ToRope[buf.fileName],
+outerFileSeqNum: buf.fileSeqNum,
+innerFileName: UXStrings.ToRope[buf.guessedEmbeddedFileName],
+innerFileSymID: buf.guessedEmbeddedFileSymID];
+};
+
+ComputeSymEntry: PROC [buf: SWSymEntry] RETURNS [symEntry: SymEntry] ~ {
+RETURN[
+NEW[SymEntryBody ¬ [
+symID: buf.symID,
+name: UXStrings.ToRope[buf.name],
+type: buf.type,
+value: buf.value,
+size: buf.size,
+fileSeqNum: buf.fileSeqNum]]];
+};
+
+LookupSymEntryByID: PROC [symID: CARD32] RETURNS [SymEntry] ~ TRUSTED {
+Inner: PROC [symID: CARD32, buf: SWSymEntryPtr] RETURNS [INT32] ~ TRUSTED MACHINE CODE {
+"<xr/CirioNubLocalProcs.h>.CirioNubLocalLookupSymEntryByID"
+};
+buf: SWSymEntry;
+
+IF Inner[symID, @buf] = 0 THEN
+RETURN [ComputeSymEntry[buf]]
+ELSE
+RETURN [NIL];
+};
+LookupSymEntryByValue: PROC [val: CARD32, numToSkip: INT32] RETURNS [SymEntry] ~ TRUSTED {
+Inner: PROC [val: CARD32, numToSkip: INT32, buf: SWSymEntryPtr]  RETURNS [INT32] ~
+TRUSTED MACHINE CODE {
+"<xr/CirioNubLocalProcs.h>.CirioNubLocalLookupSymEntryByValue"
+};
+buf: SWSymEntry;
+
+IF Inner[val, numToSkip, @buf] = 0 THEN
+RETURN [ComputeSymEntry[buf]]
+ELSE
+RETURN [NIL];
+};
+
+GetTextReloc: PROC [fileSeqNum: CARD] RETURNS [CARD] ~ {
+GetFileEntryInner: PROC [seqNum: CARD32, buf: SWFileEntryPtr]  RETURNS [INT32]
+~ TRUSTED MACHINE CODE {"<xr/CirioNubLocalProcs.h>.CirioNubLocalGetFileEntry"};
+buf: SWFileEntry;
+result: INT;
+TRUSTED {result ¬ GetFileEntryInner[fileSeqNum, @buf]};
+IF result#0 THEN RETURN [0];
+IF buf.seqNum # fileSeqNum THEN RETURN [0];
+RETURN [buf.textReloc]};
+
+GetNames: PROC [pc: ProgramCounter] RETURNS [Names] ~ {
+moduleType: CARD32 = 1eH;
+procName, outerFileName, embeddedFileName: ROPE;
+outerFileSeqNum, innerFileSymID: CARD32;
+embeddedDotONames: LIST OF ROPE;
+loadedTextStart: CARD;
+nominalEntry: SymEntry;
+
+[procName: procName, outerFileName: outerFileName, outerFileSeqNum: outerFileSeqNum, innerFileName: embeddedFileName, innerFileSymID: innerFileSymID] ¬ GetPCInfo[pc];
+nominalEntry ¬ LookupSymEntryByID[innerFileSymID];
+
+IF nominalEntry = NIL OR innerFileSymID = 0 THEN
+RETURN[NIL];
+
+embeddedDotONames ¬ LIST[embeddedFileName];
+loadedTextStart ¬ GetTextReloc[outerFileSeqNum];
+
+FOR skip: INT ¬ -1, skip - 1 DO
+aPrevEntry: SymEntry ~ LookupSymEntryByValue[nominalEntry.value, skip];
+
+IF aPrevEntry = NIL OR aPrevEntry.value # nominalEntry.value THEN
+EXIT;
+
+IF aPrevEntry.type = moduleType OR aPrevEntry.type = moduleType + 1 THEN
+embeddedDotONames ¬ AddAName[aPrevEntry.name, embeddedDotONames];
+ENDLOOP;
+
+RETURN [NEW[NamesBody ¬ [loadedFileName: outerFileName, loadedTextStart: loadedTextStart, embeddedTextStart: nominalEntry.value, embeddedDotONames: embeddedDotONames, procName: procName]]];
+};
+
+AddAName: PROC [newName: ROPE, names: LIST OF ROPE] RETURNS [LIST OF ROPE] ~ {
+FOR nms: LIST OF ROPE ¬ names, nms.rest WHILE nms # NIL DO
+IF nms.first.Equal[newName] THEN
+RETURN[names];
+ENDLOOP;
+RETURN[CONS[newName, names]];
+};
+ModuleName: PROC [file: ROPE] RETURNS [module: ROPE] ~ {
+pos: INT;
+IF (pos ¬ file.Find[".c2c.o"]) # -1
+OR (pos ¬ file.Find[".sx.o"]) # -1
+OR (pos ¬ file.Find[".o"]) # -1 THEN 
+module ¬ file.Substr[len: pos]
+ELSE
+module ¬ file;
+};
+
+ProcName: PROC [func: ROPE] RETURNS [proc: ROPE] ~ {
+length: INT ~ Rope.Length[func];
+pos: INT;
+
+IF length = 0 THEN
+proc ¬ ">>NullProcedureName<<"
+ELSE IF length > 1 AND func.Fetch[0] = '_ THEN
+proc ¬ func.Substr[1]
+ELSE
+proc ¬ Rope.Concat["*", func];
+
+IF (pos ¬ proc.FindBackward["_"]) # -1 THEN {
+head: ROPE ~ proc.Substr[len: pos];
+tail: ROPE ~ proc.Substr[start: pos + 1];
+
+IF tail.Fetch[0] = 'P AND tail.SkipOver[skip: "P0123456789"] = tail.Length[] THEN
+proc ¬ head;
+};
+};
+listUsage: ROPE ~ "Usage: TLS [ f | ry | rn | m | c | o | me | b | sp | pc | ptrs | <n> ] ...";
+
+ThreadsListCommand: PROC [cmd: Commander.Handle] RETURNS [result: REF ANY ¬ NIL, msg: ROPE ¬ NIL] ~ {
+args: LIST OF ROPE ¬ CommanderOps.ParseToList[cmd].list;
+stateFilter: ARRAY [0..5] OF BOOL ¬ ALL[TRUE];
+filterSpecd: BOOL ¬ FALSE;
+showSP, showPC, brief: BOOL ¬ FALSE;
+SpecFilter: PROC [ss: CARD] ~ {
+IF NOT filterSpecd THEN {filterSpecd ¬ TRUE; stateFilter ¬ ALL[FALSE]};
+stateFilter[ss] ¬ TRUE};
+buf: CirioNubThreadDataRep;
+cc: INT;
+ShowState: PROC [idx: INT] ~ {
+TRUSTED {cc ¬ LocalGetThread[idx, @buf]};
+IF buf.sStat>sStatWaitCV THEN buf.sStat ¬ 0;
+IF brief THEN {
+IF cc=0 AND buf.sStat#sStatFree THEN cmd.out.PutF1["%g\t", [integer[idx]] ];
+}
+ELSE {
+IF cc#0 THEN buf ¬ [index: idx, gen: 0, sStat: sStatFree, pri: 0, dbMsg: 0, dbFrozen: 0, pc: NIL, sp: NIL, fp: NIL];
+cmd.out.PutF1["%g", [integer[idx]] ];
+ShowBuf[];
+};
+RETURN};
+ShowBuf: PROC ~ {
+IF buf.dbMsg#0 THEN cmd.out.PutChar['*];
+IF buf.dbFrozen#0 THEN cmd.out.PutChar['!];
+cmd.out.PutRope[sStateName[buf.sStat]];
+IF showSP THEN cmd.out.PutF1[",sp:%08x", [cardinal[LOOPHOLE[buf.sp]]]];
+IF showPC THEN cmd.out.PutF1[",pc:%08x", [cardinal[LOOPHOLE[buf.pc]]]];
+cmd.out.PutChar['\t];
+RETURN};
+idx: INT;
+nThreads: INT ¬ MAX[0, GetMaxThreads[]];
+specifics: LIST OF INT ¬ NIL;
+Specific: PROC [i: INT] RETURNS [BOOL] ~ {
+FOR l: LIST OF INT ¬ specifics, l.rest WHILE l#NIL DO
+IF l.first=i THEN RETURN [TRUE];
+ENDLOOP;
+RETURN[FALSE]};
+someState: BOOL;
+IF args=NIL
+THEN {stateFilter ¬ ALL[TRUE]; stateFilter[sStatFree] ¬ FALSE};
+WHILE args#NIL DO
+SELECT TRUE FROM
+args.first.Equal["f"] => SpecFilter[sStatFree];
+args.first.Equal["ry"] => SpecFilter[sStatReady];
+args.first.Equal["rn"] => SpecFilter[sStatRun];
+args.first.Equal["m"] => SpecFilter[sStatWaitML];
+args.first.Equal["c"] => SpecFilter[sStatWaitCV];
+args.first.Equal["o"] => SpecFilter[sStatNone];
+args.first.Equal["me"] => {
+myIndex: INT ~ GetMyIndex[];
+IF NOT filterSpecd THEN {filterSpecd ¬ TRUE; stateFilter ¬ ALL[FALSE]};
+IF myIndex IN [0..nThreads)
+THEN specifics ¬ CONS[myIndex, specifics]
+ELSE {
+cmd.err.PutF["Can't get a reasonable value for my thread index (got %g, which isn't < %g).\n", [cardinal[myIndex]], [integer[nThreads]] ];
+GOTO Abort};
+};
+args.first.Equal["b"] => brief ¬ TRUE;
+args.first.Equal["sp"] => showSP ¬ TRUE;
+args.first.Equal["pc"] => showPC ¬ TRUE;
+args.first.Equal["ptrs"] => showSP ¬ showPC ¬ TRUE;
+ENDCASE => {
+idx ¬ Convert.IntFromRope[args.first !Convert.Error => {
+cmd.err.PutF1["Convert.Error trying to parse \"%q\" as an INT.\n", [rope[args.first]] ];
+GOTO Abort}];
+IF NOT filterSpecd THEN {filterSpecd ¬ TRUE; stateFilter ¬ ALL[FALSE]};
+specifics ¬ CONS[idx, specifics];
+args ¬ args};
+args ¬ args.rest;
+ENDLOOP;
+someState ¬ stateFilter # ALL[FALSE];
+IF someState OR specifics#NIL THEN {
+idx ¬ 0;
+FOR idx IN [0..nThreads) DO
+want: BOOL ¬ someState OR Specific[idx];
+IF NOT want THEN LOOP;
+TRUSTED {cc ¬ LocalGetThread[idx, @buf]};
+IF cc#0 THEN LOOP;
+IF buf.sStat>sStatWaitCV THEN buf.sStat ¬ 0;
+IF stateFilter[buf.sStat] OR (IF someState THEN Specific[idx] ELSE want) THEN {
+cmd.out.PutF1["%g", [integer[idx]] ];
+IF brief THEN cmd.out.PutChar['\t] ELSE ShowBuf[]};
+ENDLOOP;
+idx ¬ 0};
+cmd.out.PutRope["\n"];
+RETURN;
+EXITS Abort => {result ¬ $Failure; msg ¬ listUsage}
+};
+
+traceUsage: ROPE ~ "Usage: StackTrace [-frames <n> | -prefix | -allFrames | -pc | -fullPc | -sp | -args | -fullProcNames | -allDotONames | -loadedFile | -verbose | [-]<n>] ...";
+
+StackTraceCommand: PROC [cmd: Commander.Handle] RETURNS [result: REF ANY ¬ NIL, msg: ROPE ¬ NIL] ~ {
+Inner: PROC [frame: FrameInfo, names: Names] RETURNS [quit: BOOL ¬ FALSE] ~ {
+cleanProcName: ROPE ~ IF names#NIL THEN ProcName[names.procName] ELSE NIL;
+usedProcName: ROPE ~
+IF showFullProcName AND names#NIL THEN names.procName ELSE cleanProcName;
+
+lastFrameEncountered ¬ frame.index;
+
+IF NOT showInitialFrames THEN
+IF cleanProcName.Equal["SignalHandler"] OR cleanProcName.Equal["Raise"] THEN {
+showInitialFrames ¬ TRUE;	-- abuse of notation
+firstFrameShown ¬ frame.index;
+cmd.out.PutRope["[some frames omitted; use \"-allFrames\"  or \"-prefix\" to see them]\n"];
+}
+ELSE
+RETURN;
+
+IF frameCount = 0 THEN 
+RETURN;
+
+lastFrameShown ¬ frame.index;
+frameCount ¬ frameCount - 1;
+
+cmd.out.PutF1["%g: ", [cardinal[frame.index]]];
+
+SELECT TRUE FROM
+names = NIL => 
+cmd.out.PutRope[">>>unreadable frame<<<"];
+names.procName.Equal["_XR_Enable"] => {
+cmd.out.PutRope[">>>Enable Clause<<<\n"];
+RETURN;
+};
+names.embeddedDotONames = NIL =>
+cmd.out.PutF1["%g (>>>file unknown<<<)", [rope[usedProcName]]];
+showAllDotONames => {
+files: ROPE ¬ names.embeddedDotONames.first;
+FOR list: LIST OF ROPE ¬ names.embeddedDotONames.rest, list.rest WHILE list # NIL DO
+files ¬ files.Cat[" or ", list.first];
+ENDLOOP;
+cmd.out.PutF["%g (from %g)", [rope[usedProcName]], [rope[files]]];
+};
+ENDCASE => {
+FOR list: LIST OF ROPE ¬ names.embeddedDotONames, list.rest DO
+IF list.rest = NIL THEN { -- use the last possible name; it seems to be the best
+cmd.out.PutF["%g.%g", [rope[ModuleName[list.first]]], [rope[usedProcName]]];
+EXIT;
+};
+ENDLOOP;
+};
+
+SELECT TRUE FROM
+NOT showFile => NULL;
+names=NIL => NULL;
+names.loadedFileName.Length>0 => cmd.out.PutF1["\n    in %g", [rope[names.loadedFileName]] ];
+ENDCASE => cmd.out.PutRope["\n    >>loaded file unknown<<"];
+
+IF showPC OR showSP THEN {
+cmd.out.PutRope[IF showFile AND names#NIL THEN "\n    " ELSE " "];
+cmd.out.PutRope["("];
+IF showPC THEN {
+pc: CARD ~ LOOPHOLE[frame.pc];
+cmd.out.PutRope["pc: "];
+IF fullPC OR names=NIL THEN cmd.out.PutF["0x%x/0x%x/", [cardinal[pc]], [cardinal[pc - (IF names#NIL THEN names.loadedTextStart ELSE 0)]] ];
+cmd.out.PutF1["0x%x", [cardinal[pc - (IF names#NIL THEN names.embeddedTextStart ELSE 0)]] ];
+IF showSP THEN
+cmd.out.PutRope[", "];
+};
+IF showSP THEN
+cmd.out.PutF1["sp: 0x%x", [cardinal[LOOPHOLE[frame.sp]]]];
+cmd.out.PutRope[")"];
+};
+
+cmd.out.PutChar['\n];
+
+IF showArgs THEN TRUSTED {
+cmd.out.PutF["     i0: 0x%08x    i1: 0x%08x    i2: 0x%08x\n",
+[cardinal[frame.sp.in[0]]], [cardinal[frame.sp.in[1]]], [cardinal[frame.sp.in[2]]]];
+cmd.out.PutF["     i3: 0x%08x    i4: 0x%08x    i5: 0x%08x\n",
+[cardinal[frame.sp.in[3]]], [cardinal[frame.sp.in[4]]], [cardinal[frame.sp.in[5]]]];
+};
+};
+showInitialFrames: BOOL ¬ FALSE;
+frameCount: CARD ¬ 20;
+firstFrameShown, lastFrameShown, lastFrameEncountered, idx: INT ¬ -1;
+showAllDotONames: BOOL ¬ FALSE;
+showFullProcName: BOOL ¬ FALSE;
+showPC, showSP, showArgs, fullPC, showFile: BOOL ¬ FALSE;
+MaxThreads: NAT = 256;
+filter: PACKED ARRAY [0..MaxThreads) OF BOOL ¬ ALL[FALSE];
+nWanted: NAT ¬ 0;
+args: LIST OF ROPE ¬ CommanderOps.ParseToList[cmd].list;
+
+WHILE args # NIL DO
+flag: ROPE ~ args.first;
+DeltaIdx: PROC [arg: ROPE, to: BOOL] ~ {
+idx ¬ Convert.IntFromRope[arg !Convert.Error => {
+cmd.err.PutF1["Convert.Error trying to parse \"%q\" as an INT.\n", [rope[arg]] ];
+CommanderOps.Failed[traceUsage]}];
+IF idx IN [0..MaxThreads) THEN {
+IF filter[idx] # to THEN {
+filter[idx] ¬ to;
+nWanted ¬ IF to THEN nWanted.SUCC ELSE nWanted.PRED};
+}
+ELSE cmd.err.PutF1["%g is an implausible thread index.\n", [integer[idx]] ];
+};
+SELECT TRUE FROM
+flag.Equal["-frames", FALSE] => {
+count: INT ¬ -1;
+args ¬ args.rest;
+count ¬ Convert.IntFromRope[args.first ! Convert.Error => CONTINUE];
+IF count <= 0 THEN 
+CommanderOps.Failed["-frames argument must be a positive integer"]
+ELSE
+frameCount ¬ count;
+};
+flag.Equal["-prefix", FALSE] => showInitialFrames ¬ TRUE;
+flag.Equal["-allFrames", FALSE] => {
+showInitialFrames ¬ TRUE;
+frameCount ¬ LAST[CARD];
+};
+flag.Equal["-pc", FALSE] => {showPC ¬ TRUE; fullPC ¬ FALSE};
+flag.Equal["-fullPc", FALSE] => showPC ¬ fullPC ¬ TRUE;
+flag.Equal["-sp", FALSE] => showSP ¬ TRUE;
+flag.Equal["-args", FALSE] => showArgs ¬ TRUE;
+flag.Equal["-fullProcNames", FALSE] => showFullProcName ¬ TRUE;
+flag.Equal["-allDotONames", FALSE] => showAllDotONames ¬ TRUE;
+flag.Equal["-loadedFile", FALSE] => showFile ¬ TRUE;
+flag.Equal["-verbose", FALSE] => {
+showInitialFrames ¬ showArgs ¬ showSP ¬ showPC ¬ fullPC ¬ TRUE;
+frameCount ¬ LAST[CARD];
+showAllDotONames ¬ showFullProcName ¬ showFile ¬ TRUE;
+};
+Rope.IsPrefix["-", flag] => DeltaIdx[flag.Substr[start: 1], FALSE];
+ENDCASE => DeltaIdx[flag, TRUE];
+
+args ¬ args.rest;
+ENDLOOP;
+
+IF nWanted>0 THEN {
+FOR idx IN [0..MaxThreads) DO
+IF filter[idx] THEN {
+IF nWanted>1 THEN cmd.out.PutF1["Thread %g:\n", [integer[idx]] ];
+lastFrameEncountered ¬ lastFrameShown ¬ -1;
+TraceIdx[idx, Inner ! NoStack => {
+cmd.err.PutF["StackTrace %g failed: %g\n", [integer[idx]], [rope[message]] ];
+LOOP}];
+IF lastFrameShown # lastFrameEncountered THEN 
+cmd.out.PutF1["[some frames omitted; use \"-allFrames\" or \"-frames %g\" to see them]\n", [cardinal[lastFrameEncountered - firstFrameShown + 1]]]
+ELSE
+cmd.out.PutRope["[end of stack]\n"];
+};
+ENDLOOP;
+}
+ELSE {
+Trace[0, Inner
+! NoStack => CommanderOps.Failed[IO.PutFR1["StackTrace failed: %g\n", [rope[message]]]]];
+
+IF lastFrameShown = -1 THEN { -- No frames shown
+showInitialFrames ¬ TRUE;
+firstFrameShown ¬ 0;
+Trace[0, Inner];
+};
+IF lastFrameShown # lastFrameEncountered THEN 
+cmd.out.PutF1["[some frames omitted; use \"-allFrames\" or \"-frames %g\" to see them]\n", [cardinal[lastFrameEncountered - firstFrameShown + 1]]]
+ELSE
+cmd.out.PutRope["[end of stack]\n"];
+};
+
+RETURN};
+
+threadsListDoc: ROPE ~ "List threads.
+	f
+		List threads in scheduler state `free'
+	ry, rn, m, or c
+		List threads in scheduler state `ready', `run', `waitingML', or `waitingCV'
+	o
+		List threads in unexpected scheduler states
+	me
+		List the thread running the command
+	b
+		List only valid thread indices, no other state info
+	sp
+		List stack pointer of hottest frame
+	pc
+		List PC of hottest frame
+	ptrs
+		List stack pointer and PC of hottest frame
+	<n>
+		List thread n";
+
+Commander.Register[key: "ThreadsList", proc: ThreadsListCommand, doc: threadsListDoc];
+Commander.Register[key: "TLS", proc: ThreadsListCommand, doc: threadsListDoc];
+
+Commander.Register[key: "StackTrace", proc: StackTraceCommand,
+doc: "Print a stack trace of the current thread.
+	-frames <n>
+		Print <n> frames; default is 20.
+	-prefix
+	    Start printing at the top of the stack; default starts with signaller's frame
+	-allFrames
+		Print all of the frames
+	-pc
+		Print the module-relative program counter for each frame
+	-fullPc
+		Print the absolute, file-, and module-relative program counter
+	-sp
+		Print the stack pointer for each frame
+	-args
+	    Print the arguments to each frame (may print too many or too few)
+	-fullProcNames
+		Print complete prcedure names; default strips \"_\" and \"_P999\"
+	-allDotONames
+		Print all guess at module name; default prints best guess
+	-loadedFile
+		Print the file loaded for each frame
+	-verbose
+		Turn on all printing options
+	<n>
+		Trace thread <n>
+	-<n>
+		Don't trace thread <n>"
+];
+
+END.
+
+
+
+
+   X  
+StackTraceImpl.mesa
+Copyright Ó 1990, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Linda Howe, February 9, 1990 3:16:36 pm PST
+Bill Jackson (bj), February 17, 1990 9:11 pm PST
+Last changed by Pavel on June 22, 1990 7:48 pm PDT
+Spreitze, September 13, 1991 6:34 pm PDT
+Michael Plass, May 4, 1992 1:52 pm PDT
+
+Errors
+Types
+From Threads.h, the values of XR_SStat:
+Stack Parsing
+Flush the stack into memory.  I wonder if this really is guaranteed to work ...
+Save the current context.
+Get the caller's SP.
+PC-to-name mapping
+overlays the CirioNubPCInfo structure of CirioNubTypes.h.
+overlays the CirioNubSymEntry structure of CirioNubTypes.h
+overlays the CirioNubFileEntryRep structure of CirioNubTypes.h
+
+from <xr/IncrementalLoad.h>
+the bottom bit should be ignored, as it is the "external" bit.
+Formatting
+Commands
+Time to start printing...
+Êã  •NewlineDelimiter
+–(cedarcode) style™ codešœ™Kšœ
+Ïeœ=™HK™+K™0K™2K™(K™&K™ —šÏk	˜	Kšœ
+žœ˜#Kšœžœ˜)Kšœžœ˜#Kšžœ˜Kšœžœ	˜K˜K˜Kšœ˜Kšœ
+žœ˜"Kšžœžœ˜K˜ —KšÏnœžœž˜Kšžœ#žœž˜JKšžœ˜Kšœžœžœ˜˜ Kšžœžœžœ˜headšœ™Kš
+Ÿœžœžœžœžœ˜-—™Kšœžœžœ˜šœžœžœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜K˜ —Kšœžœžœ˜$šœžœžœ˜Kšœ˜Kšœ˜Kšœ˜K˜ —šœžœžœ˜-K˜ —Kšœžœžœ!˜9K˜ š
+œžœžœž	œžœÏc!˜ZKšœžœ˜Kšœžœ˜Kšœžœ˜
+Kšœžœ˜Kšœ
+žœ˜Kšœžœ˜—K˜ ™'Kšœžœžœžœ˜?Kšœ
+žœžœžœ˜AKšœžœžœžœ$˜D——™šŸœžœžœžœ˜1Kšœžœžœžœ˜$Kšœžœžœžœžœžœ˜+šŸœžœžœžœžœžœžœ˜EK˜Kšœ˜—šŸœžœžœžœžœžœ˜RKšœ Ðbc ˜8Kšœ˜—Kšœ˜K˜ ™OK˜—K˜ ™Kšžœžœžœ˜—K˜ ™Kšœ˜—Kšœ˜K˜ —šŸœžœžœžœžœžœžœžœ˜[Kšœž	œžœžœ6˜N—K˜ šŸœžœžœžœ˜!Kšœžœžœžœ:˜P—K˜ š
+Ÿœžœ
+žœžœžœ˜7šœžœžœžœ;˜QK˜ ——šŸ
+œžœžœžœ
+˜,Kšœžœžœ˜Kšœžœžœžœ˜1Kšžœžœžœžœ˜šŸ
+œžœ
+žœ˜Kšœžœžœžœ"˜8—Kšœžœ˜šžœ˜	K˜Kšžœžœžœ˜3K˜—Kšžœ	žœžœžœ˜K˜—K˜ š
+Ÿœžœ
+žœžœžœ˜BKšœ	žœžœ˜%Kšœžœ˜Kš
+žœžœžœžœžœ˜:šžœžœžœžœžœžœ˜&Kšœ˜Kšœžœ˜Kšžœ%˜,Kšžœžœžœ	žœp˜K˜K˜—Kšžœžœ	žœ=˜RK˜Kšœ˜Kšœ#˜#Kšœ-˜-Kšœžœžœ>˜bKšžœ˜	K˜ —šŸ
+œžœžœžœ˜?Kšžœ(˜.Kšœ˜K˜ —šŸ	œžœžœžœ˜DKšœ)˜)Kšœ˜K˜ šžœžœž˜Kšžœžœ˜—šž˜Kšžœ,˜2—Kšœ˜K˜ —š
+Ÿœžœ	žœ(žœžœ˜jKšžœžœžœžœžœžœžœ˜MK˜K˜ —šŸœžœžœ
+žœ˜<Kšœ	žœ
+žœžœžœžœ˜=K˜K˜ —šŸœžœ
+žœ˜8Kšœ˜Kšœ˜Kšœžœžœžœ˜:Kšœ˜šžœ-žœ	žœž˜DKšœ"˜"šœžœž˜Kšžœ˜—Kšžœ˜—Kšžœ˜	——™Kšœžœžœžœ˜$š	œžœžœž	œžœ˜)Kšœ9™9Kšœ˜Kšœžœ˜Kšœ˜Kšœžœ˜Kšœ+˜+Kšœž˜ K˜K˜ —Kšœžœžœžœ˜,š	œžœžœž	œžœ˜-Kšœ:™:Kšœžœ˜Kšœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœž˜Kšœ˜K˜ —Kšœ
+žœžœ˜"šœžœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœž˜Kšœ˜K˜ —Kšœžœžœžœ˜.š	œžœžœž	œžœ˜.Kšœ>™>Kšœžœ˜Kšœžœ &˜:Kšœ˜Kšœ	žœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœ
+žœ˜Kšœžœ˜Kšœ
+žœ˜Kšœ
+žœ˜Kšœ	žœ˜Kšœžœ˜Kšœžœ˜—K˜ šŸ	œžœžœ*žœ.žœžœ˜›šŸœžœ&žœžœžœžœžœ˜ZK˜1Kšœ˜—Kšœ˜K˜ šžœž˜Kšžœ˜—K˜ šžœ˜Kšœ)˜)Kšœ˜Kšœ.˜.Kšœ ˜ Kšœ=˜=Kšœ.˜.—Kšœ˜K˜ —šŸœžœžœ˜Hšžœ˜šžœ˜Kšœ˜Kšœ!˜!Kšœ˜Kšœ˜Kšœ˜Kšœ˜——Kšœ˜K˜ —š
+Ðbnœžœ	žœžœžœ˜GšŸœžœ	žœžœžœžœžœžœ˜XK˜;Kšœ˜—Kšœ˜K˜ šžœž˜Kšžœ˜—šž˜Kšžœžœ˜—Kšœ˜K™ —š¢œžœžœžœžœžœ˜ZšŸœžœžœžœžœžœžœžœžœ˜iK˜>Kšœ˜—Kšœ˜K˜ šžœ ž˜'Kšžœ˜—šž˜Kšžœžœ˜—Kšœ˜K˜ —š
+Ÿœžœžœžœžœ˜8š
+Ÿœžœ
+žœžœžœ˜NKšœžœžœžœ9˜O—Kšœ˜Kšœžœ˜Kšžœ0˜7Kšžœ
+žœžœ˜Kšžœžœžœ˜+Kšžœ˜—K˜ šŸœžœžœ˜7šœžœ˜K™Kšœ>™>—Kšœ+žœ˜0Kšœ!žœ˜(Kšœžœžœžœ˜ Kšœžœ˜Kšœ˜K˜ Kšœ¦˜¦Kšœ2˜2K˜ šžœžœžœž˜0Kšžœžœ˜—K˜ Kšœžœ˜+Kšœ0˜0K˜ šžœžœž˜KšœG˜GK˜ šžœžœ&ž˜AKšžœ˜—K˜ šžœžœ"ž˜HKšœA˜A—Kšžœ˜—K˜ Kšžœžœ²˜½Kšœ˜K˜ —šŸœžœžœ	žœžœžœžœžœžœžœ˜Nšžœžœžœžœžœžœž˜:šžœž˜ Kšžœ˜—Kšžœ˜—Kšžœžœ˜Kšœ˜——™
+š
+Ÿ
+œžœžœžœ
+žœ˜8Kšœžœ˜	šžœ"žœ!žœžœ˜lKšœ˜—šž˜Kšœ˜—Kšœ˜K˜ —š
+Ÿœžœžœžœžœ˜4Kšœžœ˜ Kšœžœ˜	K˜ šžœž˜K˜—šžœžœžœž˜.Kšœ˜—šž˜Kšœ˜—K˜ šžœ%žœ˜-Kšœžœ˜#Kšœžœ˜)K˜ šžœžœ4ž˜QKšœ˜—Kšœ˜—Kšœ˜——šœ™KšœžœP˜_K˜ šŸœžœžœ
+žœžœžœžœžœ˜eKšœžœžœžœ&˜8Kšœžœžœžœžœžœ˜.Kšœžœžœ˜Kšœžœžœ˜$šŸ
+œžœžœ˜Kšžœžœžœžœžœžœ˜GKšœžœ˜—K˜Kšœžœ˜šŸ	œžœžœ˜Kšžœ"˜)Kšžœžœ˜,šžœžœ˜Kšžœžœžœ(˜LK˜—šžœ˜Kš
+žœžœQžœžœžœ˜tK˜%Kšœ
+˜
+K˜—Kšžœ˜—šŸœžœ˜Kšžœžœ˜(Kšžœžœ˜+K˜'Kšžœžœ%žœ˜GKšžœžœ%žœ˜GK˜Kšžœ˜—Kšœžœ˜	Kšœ
+žœžœ˜(Kš	œžœžœžœžœ˜š
+Ÿœžœžœžœžœ˜*šžœžœžœžœžœžœž˜5Kšžœžœžœžœ˜ Kšžœ˜—Kšžœžœ˜—Kšœžœ˜šžœž˜Kšžœžœžœžœ˜?—šžœžœž˜šžœžœž˜Kšœ/˜/Kšœ1˜1Kšœ/˜/Kšœ1˜1Kšœ1˜1Kšœ/˜/šœ˜Kšœ	žœ˜Kšžœžœžœžœžœžœ˜Gšžœ	žœ˜Kšžœžœ˜)—šžœ˜KšœŠ˜ŠKšžœ˜—Kšœ˜—Kšœ!žœ˜&Kšœ#žœ˜(Kšœ#žœ˜(Kšœ.žœ˜3šžœ˜šœ8˜8K˜XKšžœ	˜—Kšžœžœžœžœžœžœ˜GKšœžœ˜!Kšœ˜——K˜Kšžœ˜—Kšœžœžœ˜%šžœžœžœžœ˜$Kšœ˜šžœžœž˜Kšœžœžœ˜(Kšžœžœžœžœ˜Kšžœ"˜)Kšžœžœžœ˜Kšžœžœ˜,šžœžœžœžœžœžœ˜OK˜%Kšžœžœžœ˜3—Kšžœ˜—Kšœ	˜	—K˜Kšžœ˜Kšžœ.˜3Kšœ˜—K˜ Kšœžœ¡˜±K˜ šŸœžœžœ
+žœžœžœžœžœ˜dš
+Ÿœžœ"žœžœžœ˜MKšœžœžœžœžœžœžœ˜JKšœžœžœžœžœžœžœ˜^K˜ K˜#K˜ šžœžœž˜šžœ&žœžœ˜NK™Kšœžœ ˜.K˜Kšœ[˜[Kšœ˜—šž˜Kšžœ˜——K˜ šžœžœ˜Kšžœ˜—K˜ K˜K˜K˜ Kšœ/˜/K˜ šžœžœž˜šœžœ˜Kšœ*˜*—šœ'˜'Kšœ)˜)Kšžœ˜K˜—šœžœ˜ Kšœ?˜?—šœ˜Kšœžœ!˜,šžœžœžœžœ+žœžœž˜TKšœ&˜&Kšžœ˜—KšœB˜BKšœ˜—šžœ˜š	žœžœžœžœ&ž˜>šžœžœžœ 7˜PKšœL˜LKšžœ˜Kšœ˜—Kšžœ˜—Kšœ˜——K˜ šžœžœž˜Kšžœžœ˜Kšœžœžœ˜Kšœ]˜]Kšžœ5˜<—K˜ šžœžœžœ˜Kšœžœ
+žœžœžœ
+žœ˜BK˜šžœžœ˜Kšœžœžœ˜Kšœ˜Kšžœžœžœžœ<žœžœžœžœ˜‹Kš	œ&žœžœžœžœ˜\šžœž˜K˜—Kšœ˜—šžœž˜Kšœ$žœ˜:—K˜Kšœ˜—K˜ K˜K˜ šžœ
+žœžœ˜K˜’K˜’Kšœ˜—K˜—Kšœžœžœ˜ Kšœžœ˜Kšœ<žœ˜EKšœžœžœ˜Kšœžœžœ˜Kšœ,žœžœ˜9KšŸ
+œžœ˜Kšœžœžœžœžœžœžœ˜:Kšœ	žœ˜Kšœžœžœžœ&˜8K˜ šžœžœž˜Kšœžœ˜šŸœžœžœžœ˜(šœ1˜1KšœQ˜QK˜"—šžœžœžœ˜ šžœžœ˜Kšœ˜Kšœ
+žœžœ	žœžœ	žœ˜5—K˜—KšžœH˜LK˜—šžœžœž˜šœžœ˜!Kšœžœ˜K˜Kšœ:žœ˜Dšžœžœ˜K˜B—šž˜K˜—Kšœ˜—Kšœžœžœ˜9šœžœ˜$Kšœžœ˜Kšœžœžœ˜K˜—Kšœžœžœžœ˜<KšœÏfœžœžœ˜7Kšœžœžœ˜*Kšœžœžœ˜.Kšœžœžœ˜?Kšœžœžœ˜>Kšœ£
+œžœžœ˜4šœžœ˜"Kšœ:žœ˜?Kšœžœžœ˜Kšœ1žœ˜6Kšœ˜—Kšœ<žœ˜CKšžœžœ˜ —K˜ K˜Kšžœ˜—K˜ šžœžœ˜šžœžœž˜šžœžœ˜Kšžœžœ0˜AKšœ+˜+šœ"˜"KšœM˜MKšžœ˜—šžœ'žœ˜.Kšœ’˜’—šž˜K˜$—K˜—Kšžœ˜—K˜—šžœ˜šœ˜Kšœ!žœ6˜Y—K˜ šžœžœ ˜0Kšœžœ˜Kšœ˜Kšœ˜K˜—šžœ&žœ˜.Kšœ’˜’—šž˜K˜$—K˜—K˜ Kšžœ˜——K˜ IdefaultšœžœÃ˜×M˜ KšœV˜VKšœN˜NK˜ šœ>˜>Mšœœ˜œKšœ˜——K˜ šžœ˜K˜ K˜ K˜ —K˜ — …—    NÈ  m  

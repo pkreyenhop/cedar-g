@@ -1,0 +1,481 @@
+
+DIRECTORY
+BasicTime,
+Commander,
+DFCachingUtilities USING [CreateEnumerationCache, EnumerationCache, FileSpec, FSErrorOnDF, FullEnumerateDFContents, Miss, NestItem],
+DFUtilities,
+FileNames USING [StripVersionNumber],
+FS USING [ComponentPositions, Error, ErrorGroup, ExpandName, FileInfo, GetWDir],
+IO,
+MakeDo,
+MakeDoPorting USING [verifyAttachments],
+MakeDoPrivate USING  [NodeClassRep],
+Process USING [CheckForAbort],
+RefTab USING [Create, Erase, Fetch, Pairs, Ref, Store],
+Rope,
+RopeHash,
+SymTab USING [Create, Erase, Fetch, Insert, Pairs, Ref, Store];
+
+MakeDoCmdUtilsImpl: CEDAR PROGRAM
+IMPORTS BasicTime, DFCachingUtilities, DFUtilities, FileNames, FS, IO, MakeDo, MakeDoPorting, Process, RefTab, Rope, RopeHash, SymTab
+EXPORTS MakeDo, MakeDoPrivate
+SHARES MakeDoPrivate =
+
+BEGIN
+
+ROPE: TYPE = Rope.ROPE;
+RefTable: TYPE = MakeDo.RefTable;
+
+AnaCacheKey: TYPE ~ REF AnaCacheKeyPrivate;
+AnaCacheKeyPrivate: TYPE
+~ RECORD [wDir, fullDF: ROPE, created: BasicTime.GMT];
+
+AnaCacheEntry: TYPE ~ REF AnaCacheEntryPrivate;
+AnaCacheEntryPrivate: TYPE ~ RECORD [
+deps: ACDepList,
+verifyGoals, imports, others: MakeDo.RefTable
+];
+
+ACDepList: TYPE ~ LIST OF RECORD [dfName: ROPE, created: BasicTime.GMT];
+
+anaCache: PUBLIC RefTab.Ref ¬ RefTab.Create[hash: ACKHash, equal: ACKEqual];
+
+ACKHash: PROC [key: REF ANY] RETURNS [hash: CARDINAL] --RefTab.HashProc-- ~ {
+ack: AnaCacheKey ~ NARROW[key];
+hash ¬ LOOPHOLE[ack.created, CARD] MOD 65536;
+hash ¬ RopeHash.FromRope[rope: ack.wDir, case: TRUE, seed: hash];
+hash ¬ RopeHash.FromRope[rope: ack.fullDF, case: TRUE, seed: hash];
+RETURN};
+
+ACKEqual: PROC [key1, key2: REF ANY] RETURNS [BOOL] --RefTab.EqualProc-- ~ {
+ack1: AnaCacheKey ~ NARROW[key1];
+ack2: AnaCacheKey ~ NARROW[key2];
+IF ack1.created # ack2.created THEN RETURN [FALSE];
+IF NOT ack1.wDir.Equal[ack2.wDir] THEN RETURN [FALSE];
+IF NOT ack1.fullDF.Equal[ack2.fullDF] THEN RETURN [FALSE];
+RETURN [TRUE]};
+
+EmptyCmdUtils: PUBLIC PROC ~ {
+anaCache.Erase[];
+RETURN};
+
+AnalyzeDFFile: PUBLIC PROC [dfName: ROPE, goals, supportFiles: MakeDo.RefTable, modifiable: MakeDo.ModifiabilitySpec, doToVerifyGoals, doToOtherOwns, doToImports: MakeDo.DoToFile] = {
+ack: AnaCacheKey ¬ NEW [AnaCacheKeyPrivate ¬ [FS.GetWDir[], NIL, BasicTime.nullGMT]];
+ace: AnaCacheEntry;
+need: BOOL;
+Pass: PROC [table: MakeDo.RefTable, do: MakeDo.DoToFile] ~ {
+PassFile: PROC [key, val: REF ANY] RETURNS [stop: BOOL ¬ FALSE] ~ {
+n: MakeDo.Node ~ MakeDo.NarrowToNode[key];
+[] ¬ RefTab.Store[
+SELECT do FROM makeGoal => goals, makeModifiable => modifiable, makeSupport => supportFiles, ENDCASE => ERROR,
+n,
+$T];
+IF do=makeGoal THEN [] ¬ modifiable.Store[n, $T];
+RETURN [FALSE]};
+IF do#ignore AND table.Pairs[PassFile] THEN ERROR;
+RETURN};
+[fullFName: ack.fullDF, created: ack.created] ¬ FS.FileInfo[dfName];
+ace ¬ NARROW[anaCache.Fetch[ack].val];
+need ¬ ace=NIL;
+IF debugLog#NIL THEN debugLog.PutFL["Ana[%g, %g, %g] => %g\n", LIST[[rope[ack.wDir]], [rope[ack.fullDF]], [time[ack.created]], [boolean[ace#NIL]]]];
+IF NOT need THEN {
+FOR acds: ACDepList ¬ ace.deps, acds.rest WHILE acds#NIL AND NOT need DO
+created: BasicTime.GMT ¬ BasicTime.nullGMT;
+[created: created] ¬ FS.FileInfo[acds.first.dfName !FS.Error => CONTINUE];
+IF created # acds.first.created THEN {
+IF debugLog#NIL THEN debugLog.PutFL["Ana[%g].%g = %g # %g\n", LIST[[rope[dfName]], [rope[acds.first.dfName]], [rope[MakeDo.FmtTime[acds.first.created]]], [rope[MakeDo.FmtTime[created]]]]];
+need ¬ TRUE};
+ENDLOOP};
+IF need THEN [] ¬ anaCache.Store[ack, ace ¬ MakeACE[ack.fullDF, ack.created]];
+Pass[ace.verifyGoals, doToVerifyGoals];
+Pass[ace.imports, doToImports];
+Pass[ace.others, doToOtherOwns];
+RETURN};
+
+MakeACE: PROC [dfName: ROPE, dfCreated: BasicTime.GMT] RETURNS [ace: AnaCacheEntry] = {
+start: BasicTime.GMT ~ BasicTime.Now[];
+Do: PROC [verless: ROPE, table: RefTab.Ref] ~ {
+n: MakeDo.Node ~ MakeDo.GetNode[verless, MakeDo.fileClass, TRUE];
+[] ¬ table.Store[n, $T];
+RETURN};
+Recurse: PROC [dfName: ROPE, wanted: DFUtilities.Date, privates, imported: BOOL] ~ {
+readonly: BOOL ¬ FALSE;
+created: BasicTime.GMT ¬ wanted.gmt;
+Consume: PROC [item: REF ANY] RETURNS [stop: BOOL ¬ FALSE] ~ {
+Process.CheckForAbort[];
+WITH item SELECT FROM
+di: REF DFUtilities.DirectoryItem => readonly ¬ di.readOnly;
+fi: REF DFUtilities.FileItem => {
+table: RefTab.Ref ~ IF readonly OR imported THEN ace.imports ELSE IF fi.verifyRoot THEN ace.verifyGoals ELSE ace.others;
+Do[FileNames.StripVersionNumber[fi.name], table];
+};
+ii: REF DFUtilities.ImportsItem => SELECT ii.form FROM
+exports => IF recurseOnExports[ii.exported] THEN Recurse[VerlessShort[ii.path1], ii.date, FALSE, TRUE];
+all => Recurse[VerlessShort[ii.path1], ii.date, TRUE, TRUE];
+list => {FOR i: NAT IN [0 .. ii.list.nEntries) DO
+Do[ii.list[i].name, ace.imports];
+ENDLOOP};
+ENDCASE => ERROR;
+ii: REF DFUtilities.IncludeItem => Recurse[VerlessShort[ii.path1], ii.date, TRUE, imported];
+ci: REF DFUtilities.CommentItem => NULL;
+wi: REF DFUtilities.WhiteSpaceItem => NULL;
+ENDCASE => ERROR;
+RETURN};
+IF wanted.format#explicit THEN {
+[created: created] ¬ FS.FileInfo[dfName !FS.Error => CONTINUE];
+ace.deps ¬ CONS[[dfName, created], ace.deps]};
+DFUtilities.ParseFromFile[dfName, Consume, [filterB: IF privates THEN all ELSE public, filterC: all], created !
+DFUtilities.FileSyntaxError => {
+MakeDo.Warning[IO.PutFR["DF syntax error (%g) near %g; parsing of %g abandoned", [rope[reason]], [integer[position]], [rope[dfName]] ]];
+CONTINUE};
+FS.Error => {
+MakeDo.Warning[IO.PutFLR["FS.Error[%g, %g] while analyzing %g%g - skipping the rest of that DF", LIST[[atom[error.code]], [rope[error.explanation]], [rope[IF privates THEN IF imported THEN "" ELSE "private part of " ELSE IF imported THEN "imported part of " ELSE "none(!) of "]], [rope[dfName]]]]];
+CONTINUE}
+];
+RETURN};
+stop: BasicTime.GMT;
+ace ¬ NEW [AnaCacheEntryPrivate ¬ [
+deps: NIL,
+verifyGoals: RefTab.Create[],
+imports: RefTab.Create[],
+others: RefTab.Create[] ]];
+Recurse[dfName, [explicit, dfCreated], TRUE, FALSE];
+stop ¬ BasicTime.Now[];
+IF debugLog#NIL THEN debugLog.PutF["MakeACE[%g] took %gs\n", [rope[dfName]], [integer[BasicTime.Period[start, stop]]] ];
+RETURN};
+recurseOnExports: ARRAY BOOL OF BOOL ¬ [FALSE: TRUE, TRUE: FALSE];
+
+VerlessShort: PROC [given: ROPE] RETURNS [ROPE] ~ {
+full: ROPE;
+cp: FS.ComponentPositions;
+[full, cp, ] ¬ FS.ExpandName[given];
+RETURN full.Substr[start: cp.base.start, len: cp.ext.start+cp.ext.length-cp.base.start]};
+
+NodeClass: PUBLIC TYPE = REF NodeClassRep;
+NodeClassRep: PUBLIC TYPE = MakeDoPrivate.NodeClassRep;
+
+Verify: PUBLIC PROC [pkgList: LIST OF ROPE] ~ {
+doneDFs: SymTab.Ref ~ SymTab.Create[case: FALSE];
+dfdRels: SymTab.Ref ~ SymTab.Create[case: FALSE]; --imported with UsingForm=list
+eiRels: SymTab.Ref ~ SymTab.Create[case: FALSE]; --imported with UsingForm=exported or all
+extraRels: SymTab.Ref ~ SymTab.Create[case: FALSE];
+goals: MakeDo.RefTable ~ MakeDo.MakeRefTable[];
+modifiable: MakeDo.RefTable ~ MakeDo.MakeRefTable[];
+modRels: SymTab.Ref ~ SymTab.Create[case: FALSE];
+neededLeaves: MakeDo.RefTable ~ MakeDo.MakeRefTable[];
+hids: RefTab.Ref ~ RefTab.Create[];
+optionalLeaves: MakeDo.RefTable ~ MakeDo.MakeRefTable[];
+determinerLeaves: MakeDo.RefTable ~ MakeDo.MakeRefTable[];
+brokenGoals: MakeDo.RefTable ~ MakeDo.MakeRefTable[];
+myFileClass: NodeClass ~ MakeDo.fileClass;
+CanonizeFileName: PROC [ROPE] RETURNS [ROPE] ~ myFileClass.CanonizeName;
+wDir: ROPE ~ CanonizeFileName[FS.GetWDir[]];
+wDirLen: INT ~ wDir.Length;
+{ 
+curDir: ROPE ¬ NIL;
+readonly: BOOL ¬ FALSE;
+ownedDF: LIST OF BOOL ¬ NIL;
+ei: LIST OF BOOL ¬ NIL;
+pushOwn: BOOL;
+pushEI: BOOL;
+dfStack: LIST OF DFCachingUtilities.FileSpec ¬ NIL;
+localEIRels: SymTab.Ref ~ SymTab.Create[case:FALSE];
+localDfdRels: SymTab.Ref ~ SymTab.Create[case:FALSE];
+localModRels: SymTab.Ref ~ SymTab.Create[case:FALSE];
+pkg: ROPE;
+SeeDFContent: PROC [item: REF ANY] RETURNS [stop, clip, dontCache: BOOL ¬ FALSE] ~ {
+WITH item SELECT FROM
+x: REF DFUtilities.DirectoryItem => {readonly ¬ x.readOnly; curDir ¬ x.path1};
+x: REF DFUtilities.FileItem => {
+ownedFile: BOOL ~ ownedDF.first AND NOT readonly;
+cand: ROPE ~ CanonizeFileName[x.name];
+rel: ROPE ~ RelativeName[cand, wDirLen];
+IF ownedFile THEN {
+n: MakeDo.Node ~ MakeDo.FindNode[cand, MakeDo.fileClass];
+MakeDo.EnsureRefInTable[n, modifiable];
+[] ¬ localModRels.Insert[rel, $T];
+IF x.verifyRoot THEN MakeDo.EnsureRefInTable[n, goals];
+}
+ELSE {
+full: ROPE ~ FS.ExpandName[rel, curDir].fullFName;
+actualFull, actualAttach: ROPE;
+actualCreate: BasicTime.GMT;
+created: BasicTime.GMT ¬ IF x.date.format=explicit THEN x.date.gmt ELSE BasicTime.nullGMT;
+relsTabl: SymTab.Ref ~ IF ei.first THEN localEIRels ELSE localDfdRels;
+<<No longer needed, because we clip DFs:
+IF modRels.Fetch[rel].found THEN RETURN;
+>>
+IF dfStack=NIL THEN ERROR;
+IF NOT relsTabl.Insert[rel, dfStack] THEN MakeDo.Warning[IO.PutFR["Multiple attachments for %g (%g and %g).", [rope[rel]], [rope[FmtDfs[NARROW[relsTabl.Fetch[rel].val]]]], [rope[FmtDfs[dfStack]]] ]];
+IF created=BasicTime.nullGMT THEN created ¬ FS.FileInfo[name: full !FS.Error => {MakeDo.Warning[IO.PutFR["FS.Error[%g, %g, %g].", [rope[groupNames[error.group]]], [atom[error.code]], [rope[error.explanation]] ]]; GOTO DontCheck}].created;
+[fullFName: actualFull, attachedTo: actualAttach, created: actualCreate] ¬ FS.FileInfo[name: rel !FS.Error => {MakeDo.Warning[IO.PutFR["FS.Error[%g, %g, %g].", [rope[groupNames[error.group]]], [atom[error.code]], [rope[error.explanation]] ]]; GOTO DontCheck}];
+IF MakeDoPorting.verifyAttachments
+THEN {
+IF NOT (full.Equal[actualAttach.Substr[len: full.Length], FALSE] AND actualCreate=created) THEN MakeDo.Warning[IO.PutFLR["Bad attachment for %g (attached to %g of %g instead of %g of %g).", LIST[[rope[rel]], [rope[actualAttach]], [time[actualCreate]], [rope[full]], [time[created]]]]];
+}
+ELSE {
+IF NOT (actualCreate = created) THEN MakeDo.Warning[IO.PutFLR["Bad create date for %g (%g instead of %g, as %g).", LIST[[rope[rel]], [time[actualCreate]], [time[created]], [rope[FmtDfs[dfStack]]]]]];
+}
+EXITS DontCheck => pkg ¬ pkg};
+stop ¬ stop};
+x: REF DFUtilities.ImportsItem => {
+pushOwn ¬ FALSE;
+pushEI ¬ ei.first OR ownedDF.first AND x.form#list;
+IF x.list#NIL THEN FOR i: NAT IN [0 .. x.list.nEntries) DO
+rel: ROPE ~ RelativeName[full: CanonizeFileName[x.list[i].name], baseLen: wDirLen];
+IF x.list[i].verifyRoot THEN [] ¬ extraRels.Store[rel, $T];
+ENDLOOP;
+};
+x: REF DFUtilities.IncludeItem => {
+pushOwn ¬ ownedDF.first;
+pushEI ¬ ei.first};
+x: REF DFCachingUtilities.NestItem => SELECT x.bracket FROM
+begin => {short: ROPE ~ VerlessShort[x.df.name];
+ownedDF ¬ CONS[pushOwn, ownedDF];
+ei ¬ CONS[pushEI, ei]; dfStack ¬ CONS[x.df, dfStack];
+IF doneDFs.Fetch[short].found THEN RETURN [clip: TRUE];
+IF pushOwn THEN IF NOT doneDFs.Insert[key: short, val: $T] THEN ERROR;
+};
+end => {ownedDF ¬ ownedDF.rest; ei ¬ ei.rest; dfStack ¬ dfStack.rest};
+ENDCASE => ERROR;
+x: REF DFUtilities.CommentItem => NULL;
+x: REF DFUtilities.WhiteSpaceItem => NULL;
+ENDCASE => ERROR;
+};
+AddToSymTable: PROC [global, local: SymTab.Ref] ~ {
+InnerAdd: PROC [key: ROPE, val: REF ANY] RETURNS [BOOL] ~ {
+[] ¬ global.Store[key: key, val: val];
+RETURN [FALSE];
+};
+[] ¬ local.Pairs[InnerAdd];
+};
+dfName: ROPE; cp: FS.ComponentPositions;
+dfCache: DFCachingUtilities.EnumerationCache ~ DFCachingUtilities.CreateEnumerationCache[];
+FOR pkgRest: LIST OF ROPE ¬ pkgList, pkgRest.rest WHILE pkgRest # NIL DO
+pkg ¬ pkgRest.first;
+pushOwn ¬ TRUE;
+pushEI ¬ FALSE;
+[dfName, cp, ] ¬ FS.ExpandName[pkg];
+IF cp.ext.length=0 AND cp.ext.start=cp.base.start+cp.base.length THEN dfName ¬ dfName.Concat[".df"];
+[] ¬ DFCachingUtilities.FullEnumerateDFContents[df: [dfName], side: local, Consumer: SeeDFContent, cache: dfCache !
+DFCachingUtilities.FSErrorOnDF => {
+MakeDo.Warning[IO.PutFR["FS.Error[%g, %g, %g].", [rope[groupNames[error.group]]], [atom[error.code]], [rope[error.explanation]] ]];
+RESUME};
+DFCachingUtilities.Miss => {
+MakeDo.Warning[IO.PutFR["%g not found in %g", [rope[dataFileName]], [rope[dfFileName]] ]];
+RESUME} ];
+IF ownedDF#NIL THEN ERROR;
+IF ei#NIL THEN ERROR;
+{
+AddToSymTable[eiRels, localEIRels];
+AddToSymTable[dfdRels, localDfdRels];
+AddToSymTable[modRels, localModRels];
+localEIRels.Erase[];
+localDfdRels.Erase[];
+localModRels.Erase[];
+};
+ENDLOOP;
+};
+{actions: MakeDo.ActionList ¬ MakeDo.GetActions[goals, modifiable, toBeDone, neededLeaves, optionalLeaves, determinerLeaves, brokenGoals];
+wronglyUnlisted: RefTab.Ref ~ RefTab.Create[];
+wronglyListed: RefTab.Ref ~ RefTab.Create[];
+CheckLeafIsListed: PROC [key, val: REF ANY] RETURNS [stop: BOOL] ~ {
+n: MakeDo.Node ~ MakeDo.NarrowToNode[key];
+CheckListness[n, NIL, TRUE];
+RETURN [FALSE]};
+CheckLeafMaybeListed: PROC [key, val: REF ANY] RETURNS [stop: BOOL] ~ {
+n: MakeDo.Node ~ MakeDo.NarrowToNode[key];
+CheckListness[n, NIL, FALSE];
+RETURN [FALSE]};
+CheckHidListed: PROC [key, val: REF ANY] RETURNS [BOOL] ~ {
+n: MakeDo.Node ~ MakeDo.NarrowToNode[key];
+refs: MakeDo.ActionList ~ NARROW[val];
+CheckListness[n, refs, TRUE];
+RETURN [FALSE]};
+CheckListness: PROC [n: MakeDo.Node, refs: MakeDo.ActionList, required: BOOL] ~ {
+name: ROPE;
+class: MakeDo.NodeClass;
+[name, class] ¬ MakeDo.PublicPartsOfNode[n];
+IF class # MakeDo.fileClass THEN RETURN;
+IF NOT wDir.Equal[name.Substr[len: wDirLen], FALSE] THEN {
+MakeDo.Warning[IO.PutFR1["Dependency on %g can't be handled by DFs.", [rope[name]] ]];
+RETURN};
+required ¬ required OR hids.Fetch[n].found OR neededLeaves.Fetch[n].found;
+{rel: ROPE ~ RelativeName[full: name, baseLen: wDirLen];
+shouldBeListed: BOOL ~ required OR n.Exists[];
+isListed: BOOL ~ modifiable.Fetch[n].found OR dfdRels.Fetch[rel].found OR eiRels.Fetch[rel].found;
+IF shouldBeListed=isListed THEN RETURN;
+{wrongTable: RefTab.Ref ~ IF isListed THEN wronglyListed ELSE wronglyUnlisted;
+needs: RefTab.Ref ¬ NARROW[wrongTable.Fetch[n].val];
+NoteRef: PROC [a: MakeDo.Action, ad: MakeDo.ActionDep] ~ {
+[] ¬ needs.Store[a, $T];
+RETURN};
+IF needs=NIL THEN [] ¬ wrongTable.Store[n, needs ¬ RefTab.Create[]];
+IF refs#NIL THEN FOR refs ¬ refs, refs.rest WHILE refs#NIL DO
+NoteRef[refs.first, data]; ENDLOOP
+ELSE {
+n.EnumerateConsumers[data, NoteRef];
+n.EnumerateConsumers[cmd, NoteRef]};
+[] ¬ needs.Store[$Fmt, IF isListed
+THEN IO.PutFR1["File %g (affects %%g) doesn't exist but is in DF(s).", [rope[rel]]]
+ELSE IO.PutFR1["File %g (needed by %%g) missing from DF(s).", [rope[rel]]] ];
+RETURN}}};
+ReportWrong: PROC [key, val: REF ANY] RETURNS [BOOL] ~ {
+n: MakeDo.Node ~ MakeDo.NarrowToNode[key];
+needs: RefTab.Ref ~ NARROW[val];
+fmt, nr: ROPE ¬ NIL;
+PerAction: PROC [key, val: REF ANY] RETURNS [BOOL] ~ {
+IF key=$Fmt THEN fmt ¬ NARROW[val] ELSE {
+a: MakeDo.Action ~ MakeDo.NarrowToAction[key];
+IF nr#NIL THEN nr ¬ nr.Concat["; "];
+nr ¬ nr.Concat[MakeDo.PublicPartsOfAction[a].cmd]};
+RETURN [FALSE]};
+IF needs.Pairs[PerAction] THEN ERROR;
+MakeDo.Warning[IO.PutFR1[fmt, [rope[nr]] ]];
+RETURN [FALSE]};
+CheckDfdRel: PROC [key: ROPE, val: REF ANY] RETURNS [BOOL] ~ {
+IF extraRels.Fetch[key].found THEN RETURN [FALSE];
+{n: MakeDo.Node ~ MakeDo.FindNode[key, MakeDo.fileClass];
+IF NOT (neededLeaves.Fetch[n].found OR hids.Fetch[n].found OR optionalLeaves.Fetch[n].found OR determinerLeaves.Fetch[n].found) THEN MakeDo.Warning[IO.PutFR1["Imported file %g not needed.", [rope[key]] ]];
+RETURN [FALSE]}};
+ReportBadGoal: PROC [key, val: REF ANY] RETURNS [BOOL] ~ {
+n: MakeDo.Node ~ MakeDo.NarrowToNode[key];
+name: ROPE ~ MakeDo.PublicPartsOfNode[n].name;
+MakeDo.Warning[IO.PutFR1["Goal %g not happy.", [rope[name]] ]];
+RETURN [FALSE]};
+seen: RefTab.Ref ~ RefTab.Create[];
+toDo: LIST OF REF ANY ¬ NIL;
+StartFromGoal: PROC [key, val: REF ANY] RETURNS [stop: BOOL]
+~ {IF seen.Store[key, $T] THEN toDo ¬ CONS[key, toDo]; RETURN [FALSE]};
+IF brokenGoals.Pairs[ReportBadGoal] THEN ERROR;
+IF goals.Pairs[StartFromGoal] THEN ERROR;
+WHILE toDo#NIL DO
+this: REF ANY ~ toDo.first;
+toDo ¬ toDo.rest;
+IF MakeDo.IsNode[this] THEN {
+n: MakeDo.Node ~ MakeDo.NarrowToNode[this];
+a: MakeDo.Action ~ MakeDo.GetProducer[n];
+IF a#NIL AND seen.Store[a, $T] THEN toDo ¬ CONS[a, toDo]}
+ELSE {a: MakeDo.Action ~ MakeDo.NarrowToAction[this];
+ac: MakeDo.ActionClass ~ MakeDo.PublicPartsOfAction[a].class;
+CheckHidden: PROC [n: MakeDo.Node] ~ {
+IF (NOT modifiable.Fetch[n].found) AND n.PublicPartsOfNode[].class=MakeDo.fileClass THEN {
+refs: MakeDo.ActionList ¬ NARROW[hids.Fetch[n].val];
+refs ¬ CONS[a, refs];
+[] ¬ hids.Store[n, refs]}};
+PerSource: PROC [n: MakeDo.Node, which: MakeDo.ActionDep, optional: BOOL] ~ {
+IF modifiable.Fetch[n].found AND seen.Store[n, $T]
+THEN toDo ¬ CONS[n, toDo]};
+MakeDo.EnumerateSources[a, cmd, PerSource];
+MakeDo.EnumerateSources[a, data, PerSource];
+IF ac.EnumHiddenDeps#NIL THEN ac.EnumHiddenDeps[a, CheckHidden];
+toDo ¬ toDo};
+ENDLOOP;
+IF dfdRels.Pairs[CheckDfdRel] THEN ERROR;
+IF hids.Pairs[CheckHidListed] THEN ERROR;
+IF neededLeaves.Pairs[CheckLeafIsListed] THEN ERROR;
+IF optionalLeaves.Pairs[CheckLeafMaybeListed] THEN ERROR;
+IF determinerLeaves.Pairs[CheckLeafMaybeListed] THEN ERROR;
+IF wronglyUnlisted.Pairs[ReportWrong] THEN ERROR;
+IF wronglyListed.Pairs[ReportWrong] THEN ERROR;
+IF actions#NIL THEN {
+msg: ROPE ¬ NIL;
+FOR actions ¬ actions, actions.rest WHILE actions#NIL DO
+msg ¬ msg.Cat["\n\t", MakeDo.PublicPartsOfAction[actions.first].cmd];
+ENDLOOP;
+MakeDo.Warning[Rope.Cat["Need to:", msg, "."]];
+};
+RETURN}};
+
+FmtDfs: PROC [dfStack: LIST OF DFCachingUtilities.FileSpec] RETURNS [ans: ROPE ¬ NIL] ~ {
+FOR dfStack ¬ dfStack, dfStack.rest WHILE dfStack#NIL DO
+step: ROPE ~ dfStack.first.name;
+IF ans#NIL THEN ans ¬ ans.Cat[" in ", step] ELSE ans ¬ Rope.Concat["in ", step];
+ENDLOOP;
+RETURN};
+
+RelativeName: PROC [full: ROPE, baseLen: INT] RETURNS [rel: ROPE] ~ {
+IF full.Length>baseLen AND full.Fetch[baseLen]='< THEN baseLen ¬ baseLen.SUCC;
+rel ¬ full.Substr[start: baseLen];
+RETURN};
+
+groupNames: ARRAY FS.ErrorGroup OF ROPE ~ [
+ok: "ok",
+bug: "bug",
+environment: "environment",
+client: "client",
+user: "user"
+];
+
+MakeDoCmdUtilsImplDebug: Commander.CommandProc ~ {debugLog ¬ cmd.out};
+MakeDoCmdUtilsImplDontDebug: Commander.CommandProc ~ {debugLog ¬ NIL};
+debugLog: IO.STREAM ¬ NIL;
+
+END.
+  ¬  
+MakeDoCmdUtilsImpl.Mesa
+Copyright Ó 1991 by Xerox Corporation.  All rights reserved.
+Mike Spreitzer, February 9, 1987 2:28:06 pm PST
+Last tweaked by Mike Spreitzer on November 6, 1990 5:04 pm PST
+Eduardo Pelegri-Llopart May 22, 1989 2:34:55 pm PDT
+JKF January 11, 1989 10:33:06 am PST
+Willie-s, December 6, 1991 6:04 pm PST
+Michael Plass, November 27, 1991 10:32 am PST
+Same as modifiable, but just relative names
+wDir: ROPE ~ FS.ExpandName[FS.GetWDir[]].fullFName;
+Inner block here
+to avoid confusing messages.
+For the loop
+Commander.Register["MakeDoCmdUtilsImplDebug", MakeDoCmdUtilsImplDebug];
+Commander.Register["MakeDoCmdUtilsImplDontDebug", MakeDoCmdUtilsImplDontDebug];
+Ê2  –(cedarcode) style•NewlineDelimiter
+™ code™Kšœ
+Ïeœ1™<Kšœ,Ïk™/Kšœ>™>Kšœ3™3K™$K™&K™-—K˜ šž	˜	Kšœ
+˜
+K˜
+Kšœžœl˜„Kšœ˜Kšœ
+žœ˜%KšžœžœH˜PKšžœ˜Kšœ˜Kšœžœ˜(Kšœžœ˜$Kšœžœ˜Kšœžœ+˜7Kšœ˜K˜	Kšœžœ3˜?—K˜ šÑbnxœžœž˜!Kšžœ8žœžœ@˜…Kšžœ˜Kšžœ˜—K˜ Kšž˜K˜ Kšžœžœžœ˜K˜!K˜ Kšœžœžœ˜+šœž˜Kšœžœžœžœ˜6—K˜ Kšœžœžœ˜/šœžœžœ˜%Kšœ˜K˜-K˜—K˜ Kšœžœžœžœžœ
+žœžœ˜HK˜ Kšœ
+žœ<˜LK˜ šÏnœžœžœžœžœžœÏcœ˜MKšœžœ˜Kšœžœžœžœ˜-Kšœ/žœ˜AKšœ1žœ˜CKšžœ˜—K˜ š œžœžœžœžœžœ¡œ˜LKšœžœ˜!Kšœžœ˜!Kšžœžœžœžœ˜3Kš
+žœžœžœžœžœ˜6Kš
+žœžœ žœžœžœ˜:Kšžœžœ˜—K˜ š œžœžœ˜K˜Kšžœ˜—K˜ š œžœžœ
+žœ˜·Kšœžœžœžœ˜UKšœ˜Kšœžœ˜š œžœ2˜<š œžœžœžœžœžœžœ˜CKšœ*˜*˜KšžœžœOžœžœ˜nK˜K˜—Kšžœžœ˜1Kšžœžœ˜—Kšžœžœžœžœ˜2Kšžœ˜—Kšœ0žœ˜DKšœžœ˜&Kšœžœ˜Kš
+žœ
+žœžœ+žœIžœ˜”šžœžœžœ˜šžœ'žœžœžœžœž˜HKšœžœ˜+Kšœžœžœ
+žœ˜Jšžœžœ˜&Kšžœ
+žœžœ*žœz˜¼Kšœžœ˜—Kšžœ˜	——KšžœžœB˜NKšœ'˜'Kšœ˜Kšœ ˜ Kšžœ˜—K˜ š
+ œžœ
+žœžœžœ˜WKšœžœ˜'š œžœžœ˜/Kšœ;žœ˜AK˜Kšžœ˜—š œžœ
+žœ0žœ˜TKšœ
+žœžœ˜Kšœžœ˜$š œžœžœžœžœžœžœ˜>K˜šžœžœž˜Kšœžœ5˜<šœžœ˜!Kšœžœ
+žœ
+žœžœžœžœžœ˜xKšœ1˜1K˜—šœžœžœ	ž˜6Kš	œžœžœ*žœžœ˜gKšœ0žœžœ˜<šœ	žœžœžœž˜1Kšœ!˜!Kšžœ˜	—Kšžœžœ˜—KšœžœEžœ˜\Kšœžœžœ˜(Kšœžœžœ˜+Kšžœžœ˜—Kšžœ˜—šžœžœ˜ Kšœžœžœ
+žœ˜?Kšœžœ˜.—šœ5žœ
+žœžœ!˜ošœ ˜ Kšœžœw˜ˆKšžœ˜
+—šžœ˜KšœžœPžœ6žœ
+žœžœ
+žœžœžœžœ
+žœžœ$˜ªKšžœ˜	—Kšœ˜—Kšžœ˜—Kšœžœ˜šœžœ˜#Kšœžœ˜
+K˜K˜K˜—Kšœ'žœžœ˜4K˜Kšžœ
+žœžœd˜xKšžœ˜Kšœžœžœžœžœžœžœžœžœ˜B—K˜ š
+ œžœ	žœžœžœ˜3Kšœžœ˜Kšœžœ˜Kšœžœ˜$KšžœS˜Y—K˜ Kšœžœžœžœ˜*Kšœžœžœ˜7K˜ š œžœžœžœžœžœ˜/Kšœ*žœ˜1Kšœ*žœ¡˜PKšœ)žœ¡)˜ZKšœ,žœ˜3Kšœ/˜/Kšœ4˜4šœ*žœ˜1K™+—Kšœ6˜6Kšœ#˜#Kšœ8˜8Kšœ:˜:Kšœ5˜5Kšœ*˜*Kš
+ œžœžœžœžœ˜HKšœžœžœ˜,KšÏyÐky¢£¢$™3Kšœ	žœ˜Kšœ˜K™Kšœžœžœ˜Kšœ
+žœžœ˜Kš	œ	žœžœžœžœ˜Kš	œžœžœžœžœ˜Kšœ	žœ˜Kšœžœ˜Kšœ	žœžœžœ˜3Kšœ-žœ˜4Kšœ.žœ˜5Kšœ.žœ˜5Kšœžœ˜
+š œžœžœžœžœžœžœ˜Tšžœžœž˜KšœžœH˜Nšœžœ˜ Kšœžœžœžœ
+˜1Kšœžœ˜&Kšœžœ˜(šžœžœ˜Kšœ9˜9Kšœ'˜'K˜"Kšžœžœ#˜7K˜—šžœ˜Kšœžœžœ#˜2Kšœžœ˜Kšœžœ˜Kš	œžœžœžœžœ˜ZKšœžœ
+žœžœ˜Fšœ(˜(Kšžœžœžœ˜(Kšœ™—Kšœ˜Kšžœ	žœžœžœ˜Kš
+žœžœžœžœMžœ9˜ÇKšžœžœžœžœžœsžœ˜îKš	œKžœžœžœsžœ˜„šžœ ˜"šžœ˜Kšžœžœ4žœžœžœžœMžœ[˜K˜—šžœ˜Kš
+žœžœžœžœ=žœP˜ÇK˜——Kšžœ˜—K˜—šœžœ˜#Kšœ
+žœ˜Kšœžœžœ˜3šžœžœžœžœžœžœž˜:KšœžœJ˜SKšžœžœ˜;Kšžœ˜—K˜—šœžœ˜#Kšœ˜Kšœ˜—šœžœ žœž˜;šœžœ˜0Kšœ
+žœ˜!Kšœžœžœ˜5Kšžœžœžœžœ˜7Kšžœ	žœžœžœ%žœžœ˜FKšœ˜—KšœF˜FKšžœžœ˜—Kšœžœžœ˜'Kšœžœžœ˜*Kšžœžœ˜—K˜—š œžœ ˜3š œžœžœžœžœžœžœ˜;K˜&Kšžœžœ˜K˜—K˜K˜—Kšœžœžœ˜(Kšœ[˜[šžœ
+žœžœžœžœžœž˜HKšœ˜Kšœ
+žœ˜Kšœ	žœ˜Kšœžœ˜$Kšžœžœ+žœ˜dšœK œ ˜sšœ#˜#Kšœžœr˜ƒKšžœ˜—šœ˜KšœžœI˜ZKšžœ˜
+——Kšžœ	žœžœžœ˜Kšžœžœžœžœ˜˜K™K˜#K˜%K˜%Kšœ˜K˜K˜K˜—Kšžœ˜—Kšœ˜KšœŠ˜ŠK˜.K˜,š œžœžœžœžœžœ˜DKšœ*˜*Kšœžœžœ˜Kšžœžœ˜—š œžœžœžœžœžœ˜GKšœ*˜*Kšœžœžœ˜Kšžœžœ˜—š œžœžœžœžœžœ˜;Kšœ*˜*Kšœžœ˜&Kšœžœ˜Kšžœžœ˜—š œžœ5žœ˜QKšœžœ˜Kšœ˜Kšœ,˜,Kšžœžœžœ˜(šžœžœ'žœžœ˜:KšœžœE˜VKšžœ˜—Kšœžœžœ˜JKšœžœ.˜8Kšœžœžœ˜.Kšœ
+žœžœžœ˜bKšžœžœžœ˜'Kšœžœ
+žœžœ˜NKšœžœ˜4š œžœ-˜:K˜Kšžœ˜—Kšžœžœžœ3˜Dšžœžœžœžœžœžœž˜=Kšœž˜"—šžœ˜Kšœ$˜$Kšœ$˜$—šœžœ	˜"KšžœžœL˜SKšžœžœF˜M—Kšžœ˜
+—š œžœžœžœžœžœ˜8Kšœ*˜*Kšœžœ˜ Kšœ	žœžœ˜š 	œžœžœžœžœžœ˜6šžœ
+žœžœžœ˜)Kšœ.˜.Kšžœžœžœ˜$K˜3—Kšžœžœ˜—Kšžœžœžœ˜%Kšœžœ˜,Kšžœžœ˜—š œžœžœžœžœžœžœ˜>Kšžœžœžœžœ˜2Kšœ9˜9Kšžœžœžœžœžœ"žœžœ7˜ÍKšžœžœ˜—š œžœžœžœžœžœ˜:Kšœ*˜*Kšœžœ$˜.Kšœžœ.˜?Kšžœžœ˜—K˜#Kšœžœžœžœžœžœ˜š œžœžœžœžœžœ˜<Kšœžœžœžœžœžœ˜G—Kšžœ"žœžœ˜/Kšžœžœžœ˜)šžœžœž˜Kšœžœžœ˜K˜šžœžœ˜Kšœ+˜+K˜)Kš
+žœžœžœžœžœ
+˜9—šžœ1˜5Kšœ=˜=š œžœ˜&šžœžœžœ.žœ˜ZKšœžœ˜4Kšœžœ
+˜K˜——š 	œžœ5žœ˜Mšžœžœ˜2Kšžœžœ˜——Kšœ+˜+Kšœ,˜,Kšžœžœžœ#˜@K˜—Kšžœ˜—Kšžœžœžœ˜)Kšžœžœžœ˜)Kšžœ'žœžœ˜4Kšžœ,žœžœ˜9Kšžœ.žœžœ˜;Kšžœ$žœžœ˜1Kšžœ"žœžœ˜/šžœ	žœžœ˜Kšœžœžœ˜šžœ!žœ	žœž˜8KšœE˜EKšžœ˜—K˜/K˜—Kšžœ˜	—K˜ š œžœžœžœžœžœžœ˜Yšžœ!žœ	žœž˜8Kšœžœ˜ Kšžœžœžœžœ ˜PKšžœ˜—Kšžœ˜—K˜ š œžœžœžœžœžœ˜EKšžœžœžœžœ˜NK˜"Kšžœ˜—K˜ š	œžœžœžœžœ˜+Kšœ	˜	Kšœ˜Kšœ˜Kšœ˜Kšœ˜K˜—K˜ Kš œ/˜FKš œ&žœ˜FKšœ
+žœžœžœ˜K˜ K™GK™OKšžœ˜— …—    FF  ^$  

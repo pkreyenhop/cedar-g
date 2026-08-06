@@ -1,0 +1,489 @@
+
+
+DIRECTORY
+AbbrevExpand USING [],
+AbbrevExpandExtras USING [FindEntryProc, FindEntryVal],
+Atom USING [GetPName, MakeAtom],
+Basics USING [BITSHIFT, BITXOR],
+CharOps USING [AlphaNumeric, Blank, Punctuation, Upper, Lower],
+EditSpan USING [Copy],
+IO USING [Close, GetIndex, GetRefAny, RIS, STREAM],
+PFS USING [AbsoluteName, Error, FileInfo, nullUniqueID, PATH, PathFromRope, RopeFromPath, UniqueID],
+PFSNames USING [Equal],
+Process USING [GetCurrent],
+Prop USING [PropList],
+RefTab USING [Create, Fetch, Pairs, Ref, Store],
+Rope USING [Cat, Concat, ROPE, Size, Substr, Translate, TranslatorType],
+RopeReader USING [Backwards, CompareSubstrs, FreeRopeReader, Get, GetIndex, GetRopeReader, Peek, PeekBackwards, ReadOffEnd, Ref, SetPosition],
+RuntimeError USING [UNCAUGHT],
+SimpleFeedback USING [Append, Blink, PutF],
+TextEdit USING [ChangeLooks, ChangeCaps, GetFormat, PutFormat, DeleteText, FetchLooks, MoveText, ReplaceText, Size],
+TextEditBogus USING [GetRope],
+TextNode USING [FirstChild, LastWithin, MakeNodeLoc, MakeNodeSpan, Next, Root],
+Tioga USING [Node, Span, Looks, noLooks, Event],
+TiogaIO USING [FromFile],
+UserProfile USING [ListOfTokens];
+
+AbbrevExpandImpl: CEDAR MONITOR
+IMPORTS Atom, Basics, CharOps, EditSpan, IO, PFS, PFSNames, Process, RefTab, Rope, RopeReader, RuntimeError, SimpleFeedback, TextEdit, TextEditBogus, TextNode, TiogaIO, UserProfile
+EXPORTS AbbrevExpand, AbbrevExpandExtras
+= BEGIN
+Node: TYPE = Tioga.Node;
+MaxLen: INT = LAST[INT];
+ROPE: TYPE = Rope.ROPE;
+PATH: TYPE = PFS.PATH;
+
+dictTable: RefTab.Ref ¬ RefTab.Create[mod: 5];
+
+Entry: TYPE = REF EntryRec;
+EntryRec: TYPE = RECORD [
+next: Entry ¬ NIL,
+hash: CARDINAL ¬ 0,
+keyRope: ROPE,
+node: Node,
+commands: LIST OF REF ANY
+];
+LoadInternal: PROC [dict: ATOM, fileID: FileID] 
+RETURNS [ok: BOOL ¬ FALSE, count: NAT ¬ 0] ~ {
+rdr: RopeReader.Ref ~ RopeReader.GetRopeReader[];
+root: Node ¬ NIL;
+Locked: PROC ~ {
+[] ¬ RefTab.Store[dictTable, dict, NoDictAtom]; -- clears the dictionary
+FOR node: Node ¬ TextNode.FirstChild[root], TextNode.Next[node] UNTIL node=NIL DO
+IF node=NIL OR node.comment OR TextEdit.Size[node]=0 THEN LOOP;
+AddToDict[root, node, dict, rdr];
+count ¬ count+1;
+ENDLOOP;
+[] ¬ RefTab.Store[fileForAbbr, dict, fileID];
+};
+Empty: PROC ~ {
+[] ¬ RefTab.Store[dictTable, dict, NoDictAtom]; -- clears the dictionary
+};
+IF fileID = NIL THEN {DoLocked[Empty]; RETURN};
+SimpleFeedback.Append[$Tioga, begin, $Progress, Rope.Cat["New ", PFS.RopeFromPath[fileID.name], " . . . "]];
+[root: root] ¬ TiogaIO.FromFile[fileID.name, fileID.uid !
+PFS.Error => {
+SimpleFeedback.Append[$Tioga, end, $Error, error.explanation];
+SimpleFeedback.Blink[$Tioga, $Error];
+CONTINUE;
+};
+];
+IF root = NIL THEN RETURN;
+DoLocked[Locked];
+SimpleFeedback.PutF[$Tioga, end, $Progress, "%g entries", [integer[count]] ];
+RopeReader.FreeRopeReader[rdr];
+ok ¬ TRUE;
+};
+
+Load: PUBLIC PROC [dictName: ROPE] RETURNS [count: NAT ¬ 0] = {
+dict: ATOM = GetDictAtom[dictName];
+[count: count] ¬ LoadInternal[dict, GetFileID[dict]];
+};
+
+AddToDict: ENTRY PROC [root: Node, node: Node, dictAtom: ATOM,
+rdr: RopeReader.Ref ¬ NIL] = {
+ENABLE UNWIND => NULL;
+
+dict: Entry ¬ GetDict[dictAtom];
+keyRope: ROPE ¬ TextEditBogus.GetRope[node];
+keyStart: INT = 0;
+hash: CARDINAL;
+entry: Entry;
+keyLen: NAT;
+freeRdr: BOOL ¬ FALSE;
+resultStart: INT;
+commands: LIST OF REF ANY;
+
+IF rdr=NIL THEN { rdr ¬ RopeReader.GetRopeReader[]; freeRdr ¬ TRUE };
+keyLen ¬ FindKeyLen[keyRope,rdr];
+IF keyLen=0 THEN { IF freeRdr THEN RopeReader.FreeRopeReader[rdr]; RETURN }; -- not an entry
+hash ¬ KeyHash[keyRope,keyStart,keyLen,rdr];
+entry ¬ LookupInternal[dict,hash,keyRope,keyStart,keyLen,rdr];
+IF entry = NIL THEN { -- add new entry
+entry ¬ NEW[EntryRec];
+IF dict # NIL THEN { entry.next ¬ dict.next; dict.next ¬ entry }
+ELSE [] ¬ RefTab.Store[dictTable,dictAtom,entry] };
+entry.hash ¬ hash;
+entry.keyRope ¬ Rope.Substr[keyRope,keyStart,keyLen];
+entry.node ¬ node;
+[resultStart,commands] ¬ ParseCommands[keyRope,keyStart+keyLen,rdr];
+entry.commands ¬ commands;
+TextEdit.DeleteText[root,node,0,resultStart];
+IF freeRdr THEN RopeReader.FreeRopeReader[rdr];
+};
+
+ParseCommands: PROC [keyRope: ROPE, start: INT, rdr: RopeReader.Ref]
+RETURNS [end: INT, commands: LIST OF REF ANY] = {
+OPEN RopeReader;
+ENABLE ReadOffEnd => GOTO Bad;
+blank: BOOL;
+SetPosition[rdr, keyRope, start];
+IF CharOps.Blank[Peek[rdr]] THEN { blank ¬ TRUE; [] ¬ Get[rdr] } ELSE blank ¬ FALSE;
+IF Peek[rdr] = '( THEN { -- parse command list
+h: IO.STREAM ¬ IO.RIS[Rope.Substr[keyRope,start ¬ GetIndex[rdr]]];
+commands ¬ NARROW[IO.GetRefAny[h]];
+start ¬ start+IO.GetIndex[h];
+IO.Close[h];
+SetPosition[rdr, keyRope, start];
+IF CharOps.Blank[Peek[rdr]] THEN { blank ¬ TRUE; [] ¬ Get[rdr] } ELSE blank ¬ FALSE;
+};
+IF Peek[rdr] = '= THEN { -- check for blank
+[] ¬ Get[rdr];
+IF blank AND Peek[rdr] = '  THEN [] ¬ Get[rdr]; -- skip blank after = if there was one before
+end ¬ GetIndex[rdr];
+}
+ELSE end ¬ Rope.Size[keyRope];
+EXITS Bad => RETURN [Rope.Size[keyRope],commands];
+};
+
+Clear: PUBLIC ENTRY PROC [dictName: ROPE] = {
+ENABLE UNWIND => NULL;
+[] ¬ RefTab.Store[dictTable, GetDictAtom[dictName], NIL];
+};
+
+IllFormedDef: PUBLIC ERROR = CODE;
+
+GetDictAtom: PROC [dictName: ROPE] RETURNS [dict: ATOM] = {
+ForceLower: Rope.TranslatorType = { RETURN [CharOps.Lower[old]] };
+RETURN [Atom.MakeAtom[Rope.Translate[base~dictName, translator~ForceLower]]];
+};
+
+findEntryRegistry: Prop.PropList ¬ NIL;
+ChangeRegistry: PUBLIC PROC [change: PROC [Prop.PropList] RETURNS [Prop.PropList]] ~ {
+findEntryRegistry ¬ change[findEntryRegistry];
+};
+
+Expand: PUBLIC PROC [keyNode: Node, keyEnd: INT, dict: ROPE, event: Tioga.Event ¬ NIL]
+RETURNS [foundIt: BOOL, keyDeterminesDict: BOOL, keyStart, keyLen,
+resultLen: INT, commands: LIST OF REF ANY] = {
+registry: Prop.PropList ~ findEntryRegistry; -- take a snapshot
+dictAtom: ATOM ~ GetDictAtom[dict];
+keyRope: ROPE ¬ TextEditBogus.GetRope[keyNode];
+kLen: NAT;
+kStart: INT;
+entry: Entry ¬ NIL;
+hash: CARDINAL;
+rdr: RopeReader.Ref ~ RopeReader.GetRopeReader[];
+FindEntry: PROC [dictAtom: ATOM] RETURNS [entry: Entry ¬ NIL] ~ {
+IF registry#NIL THEN {
+key: ROPE ~ Rope.Substr[base: keyRope, start: keyStart, len: kLen];
+FOR list: Prop.PropList ¬ registry, list.rest UNTIL entry#NIL OR list=NIL DO
+WITH list.first.val SELECT FROM
+val: AbbrevExpandExtras.FindEntryVal => {
+proc: AbbrevExpandExtras.FindEntryProc ~ val­;
+kR: ROPE; node: Node; commands: LIST OF REF ANY;
+[kR, node, commands] ¬ proc[key, dictAtom, keyDeterminesDict];
+IF kR#NIL THEN entry ¬ NEW[EntryRec ¬ [
+keyRope: kR, node: node, commands: commands]];
+};
+ENDCASE;
+ENDLOOP;
+};
+IF entry=NIL THEN {
+dict: Entry ~ GetDict[dictAtom];
+IF dict#NIL THEN entry ¬ Lookup[dict,hash,keyRope,keyStart,kLen,rdr];
+};
+};
+foundIt ¬ keyDeterminesDict ¬ FALSE;
+resultLen ¬ 0;
+keyEnd ¬ MAX[0,MIN[keyEnd,Rope.Size[keyRope]]];
+kStart ¬ keyStart ¬ FindKeyStart[keyRope,keyEnd,rdr];
+kLen ¬ keyLen ¬ keyEnd-keyStart;
+hash ¬ KeyHash[keyRope,keyStart,keyEnd,rdr];
+RopeReader.SetPosition[rdr,keyRope,keyStart];
+IF keyStart > 0 AND RopeReader.Backwards[rdr]='. THEN {
+-- try to get the dictName from the key
+nameStart: INT ¬ FindKeyStart[keyRope,keyStart-1,rdr];
+IF nameStart < keyStart-1 THEN {
+dictName: ATOM ¬ Atom.MakeAtom[Rope.Substr[keyRope,nameStart,keyStart-1-nameStart]];
+entry ¬ FindEntry[dictName];
+keyDeterminesDict ¬ TRUE;
+keyLen ¬ keyEnd - (keyStart ¬ nameStart);
+};
+};
+IF entry = NIL THEN entry ¬ FindEntry[dictAtom];
+
+IF entry = NIL THEN { RopeReader.FreeRopeReader[rdr]; RETURN };
+{ -- do it
+
+CheckCaps: PROC = {
+allcaps ¬ FALSE;
+RopeReader.SetPosition[rdr,keyRope,kStart];
+initialcap ¬ RopeReader.Peek[rdr] IN ['A..'Z];
+FOR i: INT IN [0..kLen) DO
+IF RopeReader.Get[rdr] NOT IN ['A..'Z] THEN RETURN;
+ENDLOOP;
+allcaps ¬ TRUE;
+};
+
+node: Node ~ entry.node;
+child: Node ~ TextNode.FirstChild[node];
+textLen: INT ~ TextEdit.Size[node];
+root: Node ~ TextNode.Root[node];
+keyRoot: Node = TextNode.Root[keyNode];
+looks: Tioga.Looks ¬ TextEdit.FetchLooks[keyNode,kStart];
+allcaps, initialcap: BOOL ¬ FALSE;
+format: ATOM;
+CheckCaps[];
+RopeReader.FreeRopeReader[rdr];
+[,resultLen] ¬ TextEdit.ReplaceText[destRoot: keyRoot, sourceRoot: root,
+dest:keyNode, destStart:keyStart, destLen:keyLen,
+source:node, sourceStart:0, sourceLen:textLen, event:event];
+IF resultLen # textLen THEN ERROR;
+IF looks # Tioga.noLooks THEN TextEdit.ChangeLooks[root: keyRoot, text: keyNode, 
+add: looks, start: keyStart, len: textLen, event: event];
+IF allcaps THEN TextEdit.ChangeCaps[root: keyRoot, dest: keyNode, start: keyStart, len: textLen, how: allCaps, event: event]
+ELSE IF initialcap AND textLen > 0 THEN -- make first letter uppercase
+TextEdit.ChangeCaps[root: keyRoot, dest: keyNode, start: keyStart, len: 1, how: allCaps, event: event];
+SELECT format ¬ TextEdit.GetFormat[node] FROM
+NIL, TextEdit.GetFormat[keyNode] => NULL;
+ENDCASE => TextEdit.PutFormat[keyNode, format, event];
+IF child # NIL THEN { -- insert as children of keyNode
+new: Tioga.Span ¬ EditSpan.Copy[keyRoot, root, TextNode.MakeNodeLoc[keyNode], TextNode.MakeNodeSpan[child,TextNode.LastWithin[node]], after, IF textLen = 0 THEN 0 ELSE 1, event];
+last: Node ¬ new.end.node;
+IF last # NIL AND keyStart+textLen < TextEdit.Size[keyNode] THEN
+-- move text after key to end of last new node
+[] ¬ TextEdit.MoveText[
+destRoot: keyRoot, sourceRoot: keyRoot, dest: last, destLoc: MaxLen,
+source: keyNode, start: keyStart+textLen, len: MaxLen, event: event];
+};
+foundIt ¬ TRUE;
+commands ¬ entry.commands;
+};
+};
+
+KeyHash: PROC [keyRope: ROPE, keyStart, keyEnd: INT, rdr: RopeReader.Ref]
+RETURNS [h: CARDINAL] = {
+len: NAT ¬ keyEnd-keyStart;
+RopeReader.SetPosition[rdr,keyRope,keyStart];
+h ¬ 0;
+FOR i: NAT IN [1..MIN[3,len]) DO -- use the first 3 characters
+h ¬ Basics.BITXOR[Basics.BITSHIFT[h,2],
+CharOps.Upper[RopeReader.Get[rdr]]-0C];
+ENDLOOP;
+IF len >= 2 THEN { -- use the last 2 characters
+RopeReader.SetPosition[rdr,keyRope,keyEnd];
+FOR i: NAT IN [len-2..len) DO
+h ¬ Basics.BITXOR[Basics.BITSHIFT[h,2],
+CharOps.Upper[RopeReader.Backwards[rdr]]-0C];
+ENDLOOP;
+};
+};
+
+Lookup: ENTRY PROC [dict: Entry, hash: CARDINAL,
+keyRope: ROPE, keyStart: INT, keyLen: NAT, rdr1, rdr2: RopeReader.Ref ¬ NIL]
+RETURNS [entry: Entry] = {
+ENABLE UNWIND => NULL;
+RETURN [LookupInternal[dict,hash,keyRope,keyStart,keyLen,rdr1,rdr2]];
+};
+
+LookupInternal: PROC [dict: Entry, hash: CARDINAL, keyRope: ROPE, keyStart: INT, keyLen: NAT, rdr1, rdr2: RopeReader.Ref ¬ NIL]
+RETURNS [entry: Entry] = {
+FreeReaders: PROC = {
+IF free1 THEN RopeReader.FreeRopeReader[rdr1];
+IF free2 THEN RopeReader.FreeRopeReader[rdr2];
+};
+free1, free2: BOOL ¬ FALSE;
+pred: Entry ¬ NIL;
+IF keyLen=0 THEN RETURN [NIL];
+IF rdr1=NIL THEN { free1 ¬ TRUE; rdr1 ¬ RopeReader.GetRopeReader[] };
+IF rdr2=NIL THEN { free2 ¬ TRUE; rdr2 ¬ RopeReader.GetRopeReader[] };
+entry ¬ NIL; -- will stay nil if don't find key in dict
+FOR e: Entry ¬ dict, e.next UNTIL e=NIL DO
+IF e.hash = hash AND Rope.Size[e.keyRope] = keyLen THEN { -- check the ropes
+IF RopeReader.CompareSubstrs[keyRope,e.keyRope,
+keyStart,keyLen,0,keyLen,rdr1,rdr2,FALSE] = equal THEN {
+IF pred # NIL THEN { -- move entry to front
+pred.next ¬ e.next;
+e.next ¬ dict.next;
+dict.next ¬ e;
+};
+entry ¬ e;
+EXIT;
+};
+};
+pred ¬ e;
+ENDLOOP;
+FreeReaders[];
+};
+
+FindKeyLen: PROC [keyRope: ROPE, rdr: RopeReader.Ref] RETURNS [len: NAT] = {
+size: INT ¬ Rope.Size[keyRope];
+IF size=0 THEN RETURN [0];
+RopeReader.SetPosition[rdr,keyRope,0];
+IF CharOps.Punctuation[RopeReader.Peek[rdr]] THEN RETURN [1];
+len ¬ 0;
+WHILE len<size AND CharOps.AlphaNumeric[RopeReader.Get[rdr]] DO
+len ¬ len+1;
+ENDLOOP;
+};
+
+FindKeyStart: PROC [keyRope: ROPE, keyEnd: INT, rdr: RopeReader.Ref]
+RETURNS [start: INT] = {
+IF Rope.Size[keyRope] = 0 OR keyEnd = 0 THEN RETURN [0];
+RopeReader.SetPosition[rdr,keyRope,keyEnd];
+IF CharOps.Punctuation[RopeReader.PeekBackwards[rdr]] THEN RETURN [keyEnd-1];
+start ¬ keyEnd;
+WHILE start>0 AND CharOps.AlphaNumeric[RopeReader.Backwards[rdr]] DO
+start ¬ start-1;
+ENDLOOP;
+};
+
+NoDictAtom: ATOM = $NoDictionaryAvailable;
+
+GetDict: PROC [dictName: ATOM] RETURNS [entry: Entry] = {
+prop: REF ANY;
+prop ¬ RefTab.Fetch[dictTable, dictName].val;
+WITH prop SELECT FROM
+x: Entry => RETURN [x];
+x: ATOM => IF x = NoDictAtom THEN RETURN [NIL] ELSE ERROR;
+ENDCASE => { -- try to load it
+ok: BOOL ¬ FALSE;
+[ok: ok] ¬ LoadInternal[dictName, GetFileID[dictName] ! RuntimeError.UNCAUGHT => CONTINUE];
+IF ok THEN RETURN [GetDict[dictName]] ELSE RETURN [NIL];
+};
+};
+
+styleDir: ROPE ~ "/cedar/styles";
+
+defaultSearch: LIST OF ROPE ¬ LIST[styleDir];
+
+FileID: TYPE ~ REF FileIDRep;
+FileIDRep: TYPE ~ RECORD [name: PFS.PATH, uid: PFS.UniqueID];
+Same: PROC [a, b: FileID] RETURNS [BOOL] ~ {
+RETURN [a.uid = b.uid AND PFSNames.Equal[a.name, b.name, FALSE]]
+};
+GetFileID: PROC [shortName: ATOM] RETURNS [FileID] ~ {
+dirs: LIST OF ROPE ¬ UserProfile.ListOfTokens["Tioga.StyleSearchRules", defaultSearch];
+name: ROPE ~ Rope.Concat[Atom.GetPName[shortName], ".abbreviations"];
+fileNamePath: PATH ¬ NIL;
+uid: PFS.UniqueID ¬ PFS.nullUniqueID;
+WHILE fileNamePath = NIL AND dirs # NIL DO
+[fullFName: fileNamePath, uniqueID: uid] ¬ PFS.FileInfo[name: PFS.AbsoluteName[short: PFS.PathFromRope[name], wDir: PFS.PathFromRope[dirs.first] ] ! PFS.Error => CONTINUE];
+dirs ¬ dirs.rest;
+ENDLOOP;
+IF fileNamePath = NIL THEN RETURN [NIL];
+RETURN [NEW[FileIDRep ¬ [fileNamePath, uid]]];
+};
+
+abbrLockProcess: UNSAFE PROCESS ¬ NIL;
+abbrLockCount: CARDINAL ¬ 0;
+abbrLockFree: CONDITION;
+DoLocked: PUBLIC PROC [action: PROC] ~ {
+me: UNSAFE PROCESS ~ Process.GetCurrent[];
+Lock: ENTRY PROC ~ {
+UNTIL abbrLockProcess = me OR abbrLockCount = 0 DO WAIT abbrLockFree ENDLOOP;
+abbrLockProcess ¬ me; abbrLockCount ¬ abbrLockCount + 1;
+};
+Unlock: ENTRY PROC ~ {
+abbrLockCount ¬ abbrLockCount - 1;
+IF abbrLockCount = 0 THEN {abbrLockProcess ¬ NIL; NOTIFY abbrLockFree};
+};
+Lock[];
+action[ ! UNWIND => Unlock[]];
+Unlock[];
+};
+
+fileForAbbr: RefTab.Ref ~ RefTab.Create[5];
+
+ValidateAll: PUBLIC PROC RETURNS [changed: BOOL ¬ FALSE] ~ {
+Locked: PROC ~ {
+Action: PROC [key: REF, val: REF] RETURNS [quit: BOOLEAN] ~ {
+IF Validate[NARROW[key]] THEN changed ¬ TRUE;
+RETURN [FALSE]
+};
+[] ¬ RefTab.Pairs[fileForAbbr, Action];
+};
+DoLocked[Locked];
+};
+
+Validate: PUBLIC PROC [name: ATOM] RETURNS [changed: BOOL ¬ FALSE] ~ {
+Locked: PROC ~ {
+fileID: FileID ~ GetFileID[name];
+oldFileID: FileID ~ NARROW[RefTab.Fetch[fileForAbbr, name].val];
+IF oldFileID = NIL OR fileID = NIL OR Same[fileID, oldFileID]
+THEN changed ¬ FALSE
+ELSE { [] ¬ LoadInternal[name, fileID]; changed ¬ TRUE };
+};
+DoLocked[Locked];
+};
+
+
+
+END.
+  œ  
+AbbrevExpandImpl.mesa
+Copyright Ó 1985, 1986, 1987, 1989, 1991, 1992 by Xerox Corporation.  All rights reserved.
+written by Bill Paxton, May 1981
+Paxton, November 8, 1982 1:31 pm
+Russ Atkinson, September 26, 1983 1:21 pm
+Michael Plass, September 24, 1991 2:06 pm PDT
+Rick Beach, May 30, 1985 3:02:37 pm PDT
+Spreitze, July 9, 1990 4:51 pm PDT
+Willie-s, June 27, 1991 11:38 am PDT
+Doug Wyatt, March 6, 1992 2:41 pm PST
+Implements abbreviation expansion in Tioga.
+Declarations
+Operations
+-- clear the specified abbreviation dictionary
+-- force dictName lowercase before create the atom
+-- see if have <dictName> '. before <keyName>
+-- hash must be independent of case of chars
+Called from elsewhere in Tioga when something changes that may have changed any abbr.
+Does not attempt to refresh screen.
+Called from elsewhere in Tioga when something changes that may have changed an abbr.
+Does not attempt to refresh screen.
+Êc  •NewlineDelimiter
+–(cedarcode) style™ codešœ™Kšœ
+ÏeœO™ZKšÏy ™ Kšž ™ K™)K™-K™'K™"K™$K™%—K˜ Kšœ+™+K˜ šÏk	˜	KšœŸœ˜KšœŸœ˜7KšœŸœ˜ KšœŸœŸœŸœ˜ KšœŸœ2˜?Kšœ	Ÿœ˜KšŸœŸœŸœŸœ˜3KšŸœŸœ/Ÿœ(˜dKšœ	Ÿœ	˜KšœŸœ˜KšœŸœ˜KšœŸœ$˜0KšœŸœŸœ+˜HKšœŸœ~˜ŽKšœŸœŸœ˜KšœŸœ˜+Kšœ	Ÿœf˜tKšœŸœ˜Kšœ	ŸœA˜OKšœŸœ%˜0KšœŸœ˜KšœŸœ˜!—K˜ KšÏnœŸœŸ˜KšŸœ"ŸœŸœ„˜´KšŸœ!˜(KšœŸ˜headšœ™KšœŸœ˜KšœŸœŸœŸœ˜KšŸœŸœŸœ˜KšŸœŸœŸœŸœ˜K˜ K˜.K˜ KšœŸœŸœ
+˜šœ
+ŸœŸœ˜KšœŸœ˜KšœŸœ˜Kšœ	Ÿœ˜K˜Kšœ
+ŸœŸœŸœŸ˜K˜——šœ
+™
+š œŸœŸœŸœŸœŸœ	Ÿœ	˜_K˜1KšœŸœ˜š œŸœ˜Kšœ0Ïc˜HšŸœ=ŸœŸœŸ˜QKšŸœŸœŸœŸœŸœŸœ˜?K˜!K˜KšŸœ˜—Kšœ-˜-Kšœ˜—š œŸœ˜Kšœ0¡˜HKšœ˜—KšŸœ
+ŸœŸœŸœ˜/KšœAŸœ(˜lšœ9˜9šŸœ˜Kšœ>˜>Kšœ%˜%KšŸœ˜	K˜—Kšœ˜—KšŸœŸœŸœŸœ˜Kšœ˜KšœM˜MK˜KšœŸœ˜
+Kšœ˜K˜ —š œŸœŸœŸœŸœ	Ÿœ	˜?KšœŸœ˜#Kšœ5˜5K˜K˜ —š
+ 	œŸœŸœ$ŸœŸœ˜]KšŸœŸœŸœ˜K˜ K˜ Kšœ	Ÿœ˜,Kšœ
+Ÿœ˜KšœŸœ˜K˜KšœŸœ˜Kšœ	ŸœŸœ˜KšœŸœ˜Kš	œ
+ŸœŸœŸœŸœ˜K˜ KšŸœŸœŸœ/Ÿœ˜EK˜!KšŸœ
+ŸœŸœ	Ÿœ!Ÿœ¡˜\K˜,K˜>šŸœ	ŸœŸœ¡˜&KšœŸœ˜KšŸœŸœŸœ.˜@KšŸœ/˜3—K˜K˜5K˜K˜DK˜K˜-KšŸœ	Ÿœ ˜/K˜K˜ —š œŸœŸœ	ŸœŸœŸœŸœŸœŸœŸœ˜vKšŸœ˜KšŸœŸœ˜KšœŸœ˜K˜!Kš
+ŸœŸœŸœŸœ	Ÿœ˜TšŸœŸœ¡˜.Kš	œŸœŸœŸœŸœ-˜BKšœŸœŸœ˜#KšœŸœ˜KšŸœ
+˜K˜!Kš
+ŸœŸœŸœŸœ	Ÿœ˜TK˜—šŸœŸœ¡˜+K˜KšŸœŸœŸœ¡-˜]K˜K˜—KšŸœ˜KšŸœŸœ˜2K˜K˜ —š
+ œŸœŸœŸœŸœ˜-Kšœ.™.KšŸœŸœŸœ˜Kšœ4Ÿœ˜9Kšœ˜K˜ —Kš œŸœŸœŸœ˜"K˜ š
+ œŸœŸœŸœŸœ˜;Kšœ2™2Kš 
+œŸœ˜BKšŸœG˜MK˜K˜ —Kšœ#Ÿœ˜'š
+ œŸœŸœ
+ŸœŸœ˜VKšœ.˜.K˜K˜ —š œŸœŸœŸœŸœŸœŸœŸœŸœŸœŸœŸœŸœŸœ˜ÈKšœ-¡˜?Kšœ
+Ÿœ˜#Kšœ	Ÿœ"˜/KšœŸœ˜
+KšœŸœ˜KšœŸœ˜KšœŸœ˜K˜1š
+ 	œŸœŸœŸœŸœ˜AšŸœ
+ŸœŸœ˜KšœŸœ:˜CšŸœ+ŸœŸœŸœŸœŸ˜LšŸœŸœŸ˜šœ)˜)Kšœ.˜.KšœŸœŸœŸœŸœŸœ˜0Kšœ>˜>KšŸœŸœŸœ	Ÿœ<˜VKšœ˜—KšŸœ˜—KšŸœ˜—K˜—šŸœŸœŸœ˜K˜ KšŸœŸœŸœ5˜EK˜—Kšœ˜—KšœŸœ˜$K˜Kšœ	ŸœŸœ˜/K˜5K˜ K˜,Kšœ-™-K˜-šŸœŸœŸœ˜7Kš¡'˜'KšœŸœ(˜6šŸœŸœ˜ Kšœ
+ŸœF˜TK˜KšœŸœ˜K˜)K˜—K˜—KšŸœ	ŸœŸœ˜0K˜ KšŸœ	ŸœŸœ#Ÿœ˜?Kšœ¡˜
+˜ š 	œŸœ˜Kšœ
+Ÿœ˜K˜+Kšœ"Ÿœ
+˜.šŸœŸœŸœŸ˜Kš
+ŸœŸœŸœ
+ŸœŸœ˜3KšŸœ˜—Kšœ
+Ÿœ˜Kšœ˜K˜ —K˜K˜(Kšœ	Ÿœ˜#K˜!K˜'K˜9KšœŸœŸœ˜"KšœŸœ˜K˜K˜K˜·KšŸœŸœŸœ˜"KšŸœŸœn˜‹KšŸœ	Ÿœm˜|š	ŸœŸœŸœŸœ¡˜FKšœg˜g—šŸœ#Ÿ˜-KšŸœ!Ÿœ˜)KšŸœ/˜6—šŸœ	ŸœŸœ¡ ˜6KšœŸœŸœŸœ˜²K˜šŸœŸœŸœ+Ÿ˜@Kš¡.˜.K˜¢K˜——Kšœ
+Ÿœ˜K˜K˜—˜K˜ ——š œŸœŸœŸœŸœŸœ˜cKšœ,™,KšœŸœ˜K˜-K˜šŸœŸœŸœŸœ	Ÿœ¡˜>šœŸœŸœ˜'K˜'—KšŸœ˜—šŸœ
+Ÿœ¡˜/K˜+šŸœŸœŸœŸ˜šœŸœŸœ˜'K˜-—KšŸœ˜—Kšœ˜—šœ˜K˜ ——š œŸœŸœŸœŸœŸœ
+ŸœŸœŸœŸœ˜˜KšŸœŸœŸœ˜KšŸœ?˜EKšœ˜K˜ —š œŸœŸœŸœŸœ
+ŸœŸœŸœ˜šš œŸœ˜KšŸœŸœ!˜.KšŸœŸœ!˜.Kšœ˜—KšœŸœŸœ˜KšœŸœ˜KšŸœ
+ŸœŸœŸœ˜KšŸœŸœŸœŸœ&˜EKšŸœŸœŸœŸœ&˜EKšœŸœ¡*˜7šŸœŸœŸœŸ˜*šŸœŸœŸœ¡˜LšŸœQŸœ
+Ÿœ˜hšŸœŸœŸœ¡˜+K˜K˜K˜K˜—Kšœ
+˜
+KšŸœ˜Kšœ˜—Kšœ˜—K˜	KšŸœ˜—K˜K˜K˜ —š
+ 
+œŸœŸœŸœŸœ˜LKšœŸœ˜KšŸœŸœŸœ˜K˜&KšŸœ+ŸœŸœ˜=K˜šŸœ
+Ÿœ+Ÿ˜?Kšœ˜KšŸœ˜—šœ˜K˜ ——š œŸœŸœ
+ŸœŸœ	Ÿœ˜]KšŸœŸœŸœŸœ˜8K˜+KšŸœ4ŸœŸœ˜MK˜šŸœ	Ÿœ1Ÿ˜DKšœ˜KšŸœ˜—šœ˜K˜ ——KšœŸœ˜*K˜ š œŸœŸœŸœ˜9KšœŸœŸœ˜K˜-šŸœŸœŸ˜KšœŸœ˜KšœŸœŸœŸœŸœŸœŸœŸœ˜:šŸœ¡˜KšœŸœŸœ˜KšœEŸœŸœ˜[KšŸœŸœŸœŸœŸœŸœ˜8Kšœ˜——Kšœ˜K˜ —Kšœ
+Ÿœ˜!K˜ š	œŸœŸœŸœŸœ˜-K˜ —KšœŸœŸœ˜KšœŸœŸœŸœŸœŸœ˜=š œŸœŸœŸœ˜,KšŸœŸœ Ÿœ˜@Kšœ˜—š 	œŸœŸœŸœ˜6KšœŸœŸœŸœE˜WKšœŸœ;˜EKšœŸœŸœ˜KšœŸœŸœ˜%š	ŸœŸœŸœŸœŸ˜*Kšœ+ŸœŸœŸœŸœŸœ
+Ÿœ˜¬Kšœ˜KšŸœ˜—Kš
+ŸœŸœŸœŸœŸœ˜(KšŸœŸœ#˜.Kšœ˜K˜ —KšœŸœŸœ˜&KšœŸœ˜KšœŸ	œ˜š œŸœŸœ
+Ÿœ˜(KšœŸœ˜*š œŸœŸœ˜Kš
+ŸœŸœŸœŸœŸœ˜MKšœ8˜8Kšœ˜—š œŸœŸœ˜Kšœ"˜"KšŸœŸœŸœŸœ˜GKšœ˜—Kšœ˜Kšœ
+Ÿœ˜Kšœ	˜	Kšœ˜K˜ —šœ+˜+K˜ —š œŸœŸœŸœŸœŸœ˜<K™UK™#š œŸœ˜š œŸœŸœŸœŸœŸœ˜=KšŸœ
+ŸœŸœŸœ˜-KšŸœŸœ˜Kšœ˜—Kšœ'˜'Kšœ˜—Kšœ˜Kšœ˜K˜ —š œŸœŸœŸœŸœŸœŸœ˜FK™TK™#š œŸœ˜Kšœ!˜!KšœŸœ&˜@š
+ŸœŸœŸœ
+ŸœŸœ˜=KšŸœŸ˜KšŸœ.Ÿœ˜9—Kšœ˜—Kšœ˜Kšœ˜K˜ —K˜ —K˜ KšŸœ˜— …—    8j  Ni  

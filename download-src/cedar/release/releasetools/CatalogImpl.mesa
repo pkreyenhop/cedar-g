@@ -1,0 +1,613 @@
+
+DIRECTORY
+Ascii USING [Upper, Lower],
+Basics USING [Comparison],
+BasicTime USING [Now, Unpack],
+Commander USING [CommandProc, Register],
+CommanderOps USING [ArgumentVector, Parse],
+DFUtilities USING [DirectoryItem, FileItem, IncludeItem, ParseFromStream, ProcessItemProc, SyntaxError],
+EditSpan USING [Copy],
+IO USING [STREAM, BreakProc, Close, EndOf, EndOfStream, Error, GetChar, GetTokenRope, PutF, PutF1, PutFR, PutFR1, RIS, SetIndex, SkipWhitespace, int, rope, time],
+List USING [Nconc1],
+NodeProps USING [PutProp, ValueFromBool],
+PFS USING [Error, FileLookup, PATH, PathFromRope, RopeFromPath, StreamOpen],
+PFSNames USING [Component, ComponentRope, ShortName],
+Process USING [CheckForAbort],
+RedBlackTree USING [Compare, Create, DuplicateKey, EnumerateIncreasing, GetKey, Insert, UserData, Size, Table],
+Rope,
+SystemNames USING [ReleaseName, UserName],
+TextNode USING [Level, Location, MakeNodeLoc, nullLocation, nullSpan, Ref, Root, Span, StepForward],
+Tioga,
+TiogaFileOps USING [AddLooks, CreateRoot, InsertAsLastChild, InsertNode, NodeBody, SetContents, SetFormat, Store],
+TiogaIO USING [FromFile],
+UserProfile USING [Token],
+ViewerIO USING [CreateViewerStreams];
+
+CatalogImpl: CEDAR PROGRAM
+IMPORTS Ascii, BasicTime, Commander, CommanderOps, DFUtilities, EditSpan, IO, List, NodeProps, PFS, PFSNames, Process, RedBlackTree, Rope, SystemNames, TextNode, TiogaFileOps, TiogaIO, UserProfile, ViewerIO
+EXPORTS TiogaFileOps -- export NodeBody to convince Compiler we know that TiogaFileOps.Ref is really TextNode.Ref
+~ BEGIN
+ROPE: TYPE ~ Rope.ROPE;
+STREAM: TYPE ~ IO.STREAM;
+Ref: TYPE ~ Tioga.Node;
+NodeBody: PUBLIC TYPE ~ Tioga.NodeRep;
+
+CatalogCmdProc: Commander.CommandProc ~ {
+rootName: ROPE;
+catalogFileName: ROPE;
+argv: CommanderOps.ArgumentVector ¨ CommanderOps.Parse[cmd];
+quietly, releaseMessage: BOOLEAN ¨ FALSE;
+documentationWarnings: BOOLEAN ¨ TRUE;
+i: NAT ¨ 1;
+WHILE i < argv.argc DO
+IF Rope.Fetch[argv[i], 0] = '- THEN {
+SELECT Ascii.Lower[Rope.Fetch[argv[i], 1]] FROM
+'d => documentationWarnings ¨ FALSE;
+'q => quietly ¨ TRUE;
+'r => releaseMessage ¨ TRUE;
+ENDCASE => RETURN [$Failure, Rope.Concat[argv[i], " is an unrecognized option; available options are -quietly, -releaseMessage and -documentationWarnings"]];
+}
+ELSE {
+IF rootName # NIL THEN 
+RETURN [$Failure, "multiple catalog names supplied; only one allowed."];
+rootName ¨ argv[i];
+};
+i ¨ i+1;
+ENDLOOP;
+IF rootName = NIL THEN RETURN;
+
+catalogFileName ¨ Catalog[rootName, IF quietly THEN NIL ELSE cmd.out, releaseMessage, documentationWarnings];
+
+RETURN [NIL, Rope.Cat["\n", catalogFileName, " created."]];
+};
+
+BaseNameFromFileName: PROC [name: ROPE] RETURNS [ROPE] ~ {
+path: PFS.PATH ~ PFS.PathFromRope[name];
+short: ROPE ¨ PFSNames.ComponentRope[PFSNames.ShortName[path]];
+pos: INT ¨ short.Find["-"];
+IF pos = -1 THEN pos ¨ short.FindBackward["."];
+IF pos = -1 THEN RETURN[short];
+RETURN[short.Substr[0, pos]];
+};
+
+Catalog: PROC [rootName: ROPE, out: STREAM ¨ NIL, releaseMessage: BOOL ¨ FALSE, documentationWarnings: BOOL ¨ TRUE] RETURNS [catalogFileName: ROPE] ~ {
+fullRootNamePath: PFS.PATH ~ PFS.FileLookup[PFS.PathFromRope[rootName], LIST["df"]];
+rootStream: STREAM ~ PFS.StreamOpen[fullRootNamePath];
+fullRootName: ROPE ~ PFS.RopeFromPath[fullRootNamePath];
+rootBase: ROPE ~ BaseNameFromFileName[rootName]; -- e.g., "PCedar"
+catalogBase: ROPE ~ Rope.Concat[rootBase, IF releaseMessage THEN "ReleaseCatalog" ELSE "Catalog"];
+catalogName: ROPE ~ Rope.Concat[catalogBase, ".tioga"];
+logName: ROPE ~ Rope.Concat[catalogBase, ".log"];
+catalogDoc: CatalogDoc ~ InitializeCatalogDoc[rootBase, catalogName];
+ProcessItem: DFUtilities.ProcessItemProc ~ {
+WITH item SELECT FROM
+item: REF DFUtilities.IncludeItem => {
+dfName: ROPE ~ item.path1;
+packageName: ROPE ~ BaseNameFromFileName[dfName];
+Process.CheckForAbort[];
+AddCatalogEntry[doc~catalogDoc, packageName~packageName, dfFileName~dfName, releaseMessage~releaseMessage, documentationWarnings~documentationWarnings];
+};
+ENDCASE;
+};
+catalogDoc.out ¨ out;
+catalogDoc.log ¨ ViewerIO.CreateViewerStreams[
+name: logName, backingFile: logName, editedStream: FALSE].out;
+catalogDoc.log.PutF["Catalog of %g, %g\n\n", [rope[fullRootName]],
+[time[BasicTime.Now[]]] ];
+DFUtilities.ParseFromStream[rootStream, ProcessItem];
+rootStream.Close[];
+FinishCatalogDoc[catalogDoc];
+RETURN [catalogDoc.fileName]
+};
+
+CatalogDoc: TYPE ~ REF CatalogDocRec;
+CatalogDocRec: TYPE ~ RECORD[
+out: STREAM, -- for recording our progress
+log: STREAM, -- for logging errors
+fileName: ROPE,
+packageName: ROPE,
+root: Ref,
+latestLevel1Node: Ref,
+latestLevel2Node: Ref,
+latestLevel3Node: Ref,
+commandIndex: IndexTable,
+keywordIndex: IndexTable
+];
+
+Header: PROC [base: ROPE] RETURNS [ROPE] ~ {
+UpperCase: PROC [r: ROPE] RETURNS [ROPE] ~ {
+upper: PROC [old: CHAR] RETURNS [new: CHAR] ~ { new ¨ Ascii.Upper[old] };
+RETURN[Rope.Translate[base: r, translator: upper]];
+};
+RETURN[IO.PutFR1["%g PACKAGE CATALOG",
+IO.rope[UpperCase[base]]
+]];
+};
+
+Footer: PROC RETURNS [ROPE] ~ {
+RETURN[IO.PutFR1["CEDAR %g  FOR INTERNAL XEROX USE ONLY", 
+IO.rope[SystemNames.ReleaseName[]]
+]];
+};
+
+InitializeCatalogDoc: PROC [catalogName, fileName: ROPE] RETURNS [doc: CatalogDoc] ~ {
+PutPropRope: PROC [n: TextNode.Ref, name: ATOM, value: ROPE] ~ {
+NodeProps.PutProp[n: n, name: name, value: value];
+};
+doc ¨ NEW[CatalogDocRec];
+doc.commandIndex ¨ CreateIndexTable[];
+doc.keywordIndex ¨ CreateIndexTable[];
+doc.fileName ¨ fileName;
+doc.latestLevel1Node ¨ NIL;
+
+doc.root ¨ TiogaFileOps.CreateRoot[];
+
+AppendNode[level~1, doc~doc, r~doc.fileName, format~NIL];
+NodeProps.PutProp[doc.latestLevel1Node, $Comment, NodeProps.ValueFromBool[TRUE]];
+
+AppendNode[level~2, doc~doc, format~NIL, r~IO.PutFR["%g %t", IO.rope[UserProfile.Token["EditorComforts.LastEdited", SystemNames.UserName[]]], IO.time[BasicTime.Now[]]]];
+NodeProps.PutProp[doc.latestLevel2Node, $Comment, NodeProps.ValueFromBool[TRUE]];
+
+AppendNode[level~1, doc~doc, r~Header[catalogName], format~"unleaded"];
+TiogaFileOps.AddLooks[x~doc.latestLevel1Node, start~0, len~LAST[INT], look~'s, root~doc.root];
+PutPropRope[doc.latestLevel1Node, $Mark, "centerHeader"];
+
+AppendNode[level~1, doc~doc, r~Footer[], format~"unleaded"];
+TiogaFileOps.AddLooks[x~doc.latestLevel1Node, start~0, len~LAST[INT], look~'s, root~doc.root];
+PutPropRope[doc.latestLevel1Node, $Mark, "centerFooter"];
+
+AppendNode[level~1, doc~doc, r~Rope.Concat[catalogName, " Package Catalog"], format~"title"];
+
+AppendNode[level~1, doc~doc, r~IO.PutFR1["c Copyright %g by Xerox Corporation.  All rights reserved.", IO.int[BasicTime.Unpack[BasicTime.Now[]].year]], format~"abstract"];
+TiogaFileOps.AddLooks[x~doc.latestLevel1Node, start~0, len~1, look~'m, root~doc.root];
+TiogaFileOps.AddLooks[x~doc.latestLevel1Node, start~0, len~LAST[INT], look~'s, root~doc.root];
+
+AppendNode[level~1, doc~doc, r~"Abstract: This catalog is a list of interesting packages and tools.  The catalog is automatically created from the collection of maintainer-supplied entries.", format~"abstract"];
+TiogaFileOps.AddLooks[x~doc.latestLevel1Node, start~0, len~8, look~'b, root~doc.root];
+
+AppendNode[level~1, doc~doc, r~"XEROX\t\t\tXerox Corporation\n\t\t\t\tPalo Alto Research Center\n\t\t\t\t3333 Coyote Hill Road\n\t\t\t\tPalo Alto, California 94304\n\nFor Internal Xerox Use Only", format~"boilerplate"];
+TiogaFileOps.AddLooks[x~doc.latestLevel1Node, start~0, len~5, look~'q, root~doc.root];
+TiogaFileOps.AddLooks[x~doc.latestLevel1Node, start~5, len~LAST[INT], look~'o, root~doc.root];
+TiogaFileOps.AddLooks[x~doc.latestLevel1Node, start~115, len~LAST[INT], look~'b, root~doc.root];
+TiogaFileOps.AddLooks[x~doc.latestLevel1Node, start~115, len~LAST[INT], look~'x, root~doc.root];
+
+AppendNode[level~1, doc~doc, r~"Catalog Components", format~"head"];
+};
+
+FinishCatalogDoc: PROC [doc: CatalogDoc] ~ {
+Process.CheckForAbort[];
+IF NOT IsTableEmpty[doc.commandIndex] THEN AddIndex[doc, command];
+IF NOT IsTableEmpty[doc.keywordIndex] THEN AddIndex[doc, keyword];
+Process.CheckForAbort[];
+[] ¨ TiogaFileOps.Store[filename~doc.fileName, x~doc.root];
+IF doc.log#NIL THEN IO.Close[doc.log];
+};
+
+AddCatalogEntry: PROC [doc: CatalogDoc, packageName: ROPE, dfFileName: ROPE, releaseMessage: BOOL ¨ FALSE, documentationWarnings: BOOL ¨ TRUE] ~ {
+lastDirectoryPath: ROPE ¨ NIL;
+documentationDirectory: BOOL ¨ FALSE;
+packageDoc: ROPE ~ Rope.Concat[packageName, "Doc.tioga"];
+documentationFileName: ROPE ¨ NIL;
+documentationFiles: ROPE ¨ NIL;
+listOfCommands: LIST OF REF ANY ¨ NIL;
+moreDFs: LIST OF ROPE;
+TryThisDFItem: DFUtilities.ProcessItemProc ~ {
+WITH item SELECT FROM
+directory: REF DFUtilities.DirectoryItem => {
+lastDirectoryPath ¨ directory.path1;
+documentationDirectory ¨ Rope.Match["*<Documentation>", lastDirectoryPath, FALSE];
+};
+incl: REF DFUtilities.IncludeItem => {
+IF ( Rope.Find[incl.path1, "-Source.df", 0, FALSE] # -1 ) OR
+( Rope.Find[incl.path1, "-PCR.df", 0, FALSE] # -1 ) THEN {
+moreDFs ¨ CONS[incl.path1, moreDFs];
+};
+};
+file: REF DFUtilities.FileItem => {
+base, ext, shortName: ROPE ¨ NIL;
+[base, ext, shortName] ¨ ParseFileName[file.name !
+PFS.Error => IF error.group#bug THEN {
+Log[doc, IO.PutFR1["PFS.Error... %g", IO.rope[error.explanation]]];
+GOTO Fail;
+};
+];
+SELECT TRUE FROM
+Rope.Equal["command", ext, FALSE] => {
+listOfCommands ¨ List.Nconc1[listOfCommands, shortName];
+};
+Rope.Equal["cm", ext, FALSE] => {
+listOfCommands ¨ List.Nconc1[listOfCommands, shortName];
+};
+Rope.Equal["tioga", ext, FALSE] OR Rope.Equal["ip", ext, FALSE] OR Rope.Equal["intepress", ext, FALSE] OR documentationDirectory => {
+IF documentationWarnings AND documentationDirectory THEN Log[doc, IO.PutFR1["%g is in the <Documentation> directory.", IO.rope[shortName]]];
+IF documentationFiles.IsEmpty THEN documentationFiles ¨ shortName
+ELSE documentationFiles ¨ Rope.Cat[documentationFiles, ", ", shortName];
+IF Rope.Equal[shortName, packageDoc, FALSE] THEN
+documentationFileName ¨ Rope.Concat[lastDirectoryPath, file.name];
+RETURN;
+};
+ENDCASE => NULL;
+EXITS Fail => NULL;
+};
+ENDCASE => NULL;
+};
+dfStream: STREAM ¨ NIL;
+
+Process.CheckForAbort[];
+BeginPackage[doc, packageName];
+
+dfStream ¨ PFS.StreamOpen[fileName: PFS.PathFromRope[dfFileName] !
+PFS.Error => {
+Log[doc, IO.PutFR1["PFS.Error... %g", IO.rope[error.explanation]]];
+GO TO FileProblem;
+};
+];
+DFUtilities.ParseFromStream[in~dfStream, proc~TryThisDFItem, filter~[comments~FALSE, filterA~source, filterB~all, filterC~defining] !
+DFUtilities.SyntaxError => {
+Log[doc, IO.PutFR1["DFUtilities.SyntaxError... %g", IO.rope[reason]]];
+CONTINUE;
+};
+];
+dfStream.Close[];
+
+IF moreDFs # NIL THEN
+FOR dL: LIST OF ROPE ¨ moreDFs, dL.rest UNTIL dL = NIL DO
+dfs: STREAM;
+Process.CheckForAbort[];
+dfs ¨ PFS.StreamOpen[fileName: PFS.PathFromRope[dL.first] !
+PFS.Error => {
+Log[doc, IO.PutFR1["PFS.Error... %g", IO.rope[error.explanation]]];
+CONTINUE;
+};
+];
+IF dfs = NIL THEN LOOP;
+DFUtilities.ParseFromStream[in~dfs, proc~TryThisDFItem, filter~[comments~FALSE, filterA~source, filterB~all, filterC~defining] !
+DFUtilities.SyntaxError => {
+Log[doc, IO.PutFR1["DFUtilities.SyntaxError... %g", IO.rope[reason]]];
+CONTINUE;
+};
+];
+ENDLOOP;
+Process.CheckForAbort[];
+
+{ -- create the catalog entry
+author, creator, maintainer: ROPE ¨ NIL;
+abstractSpan: TextNode.Span ¨ TextNode.nullSpan;
+keywords: ROPE;
+singlePageDocument: BOOLEAN;
+IF documentationFileName.IsEmpty THEN { IF NOT Rope.Equal[doc.packageName, "Top", FALSE] THEN Log[doc, "No package documentation."] }
+ELSE {
+[abstractSpan: abstractSpan, author: author, creator: creator, maintainer: maintainer, keywords: keywords, singlePageDocument: singlePageDocument] ¨ ExtractStuffFromDocFile[doc, documentationFileName];
+IF maintainer.IsEmpty[] THEN {
+Log[doc, "No maintainer listed in documentation."]
+};
+};
+IF releaseMessage AND maintainer.IsEmpty[] AND NOT Rope.Match["*CedarChest*", dfFileName, FALSE] THEN maintainer ¨ "Maintained by: CedarSupport^.pa";
+AppendNode[level~2, doc~doc, r~Rope.Cat[packageName, ": ", dfFileName], format~"head"];
+IF (NOT releaseMessage) AND (NOT creator.IsEmpty) THEN {
+AppendNode[level~3, doc~doc, r~creator, format~"indent"];
+TiogaFileOps.AddLooks[x~doc.latestLevel3Node, start~0, len~11 --Created by:--, look~'b, root~doc.root];
+};
+IF NOT maintainer.IsEmpty THEN {
+AppendNode[level~3, doc~doc, r~maintainer, format~"indent"];
+TiogaFileOps.AddLooks[x~doc.latestLevel3Node, start~0, len~14 --Maintained by:--, look~'b, root~doc.root];
+};
+IF NOT documentationFiles.IsEmpty ANDNOT (Rope.Equal[documentationFiles, packageDoc, FALSE] AND singlePageDocument) THEN {
+AppendNode[level~3, doc~doc, r~Rope.Concat["Documentation: ", documentationFiles], format~"indent"];
+TiogaFileOps.AddLooks[x~doc.latestLevel3Node, start~0, len~14, look~'b, root~doc.root];
+};
+IF (NOT releaseMessage) AND (NOT keywords.IsEmpty) THEN {
+CommaSeparated: IO.BreakProc ~ {
+RETURN [SELECT char FROM
+', => sepr,
+ENDCASE => other]
+};
+s: STREAM ¨ IO.RIS[keywords];
+firstBlank: INT ¨ Rope.Find[keywords, " "];
+IO.SetIndex[self~s, index~firstBlank];  -- position past "Keywords:"
+[] ¨ IO.SkipWhitespace[s];
+WHILE NOT IO.EndOf[s] DO
+ENABLE IO.Error, IO.EndOfStream => EXIT;
+keyword: ROPE ¨ NIL;
+keyword ¨ IO.GetTokenRope[stream~s, breakProc~CommaSeparated].token;
+IF NOT keyword.IsEmpty THEN
+InsertIndexTerm[doc.keywordIndex, keyword, packageName];
+[] ¨ IO.GetChar[s];
+[] ¨ IO.SkipWhitespace[s];
+ENDLOOP;
+IO.Close[s];
+AppendNode[level~3, doc~doc, r~keywords, format~"indent"];
+TiogaFileOps.AddLooks[x~doc.latestLevel3Node, start~0, len~10, look~'b, root~doc.root];
+};
+{
+contents: ROPE ¨ NIL;
+FOR l: LIST OF REF ANY ¨ listOfCommands, l.rest WHILE l # NIL DO
+commandName: ROPE ¨ NARROW[l.first];
+InsertIndexTerm[doc.commandIndex, commandName, packageName];
+contents ¨ IF contents.IsEmpty
+THEN Rope.Concat["Commands: ", commandName]
+ELSE Rope.Cat[contents, ", ", commandName];
+ENDLOOP;
+IF NOT contents.IsEmpty THEN {
+AppendNode[level~3, doc~doc, r~contents, format~"indent"];
+TiogaFileOps.AddLooks[x~doc.latestLevel3Node, start~0, len~9, look~'b, root~doc.root];
+};
+};
+IF releaseMessage THEN {
+field: ROPE ~ "changes";
+size: INT ~ Rope.Size[field];
+AppendNode[level~3, doc~doc, r~field, format~"indent"];
+TiogaFileOps.AddLooks[x~doc.latestLevel3Node, start~0, len~1, look~'t, root~doc.root];
+TiogaFileOps.AddLooks[x~doc.latestLevel3Node, start~size-1, len~1, look~'t, root~doc.root];
+}
+ELSE IF abstractSpan # TextNode.nullSpan THEN {
+[] ¨ EditSpan.Copy[dest~TextNode.MakeNodeLoc[doc.latestLevel3Node], source~abstractSpan, destRoot~doc.root, sourceRoot~TextNode.Root[abstractSpan.start.node]];
+FOR node: Ref ¨ Forward[doc.latestLevel3Node], Forward[node] WHILE TextNode.Level[node] >= 3 DO
+TiogaFileOps.SetFormat[node, "indent"];
+ENDLOOP;
+};
+};
+EXITS
+FileProblem => NULL;
+};
+
+ExtractStuffFromDocFile: PROC [doc: CatalogDoc, documentationFile: ROPE] RETURNS [abstractSpan: TextNode.Span ¨ TextNode.nullSpan,
+author, creator, maintainer, keywords: ROPE ¨ NIL,
+singlePageDocument: BOOLEAN ¨ FALSE
+] ~ {
+tiogaDocRoot: Ref ~ TiogaIO.FromFile[PFS.PathFromRope[documentationFile] !
+PFS.Error => {
+Log[doc, IO.PutFR1["PFS.Error... %g", IO.rope[error.explanation]]];
+GOTO Quit;
+};
+].root;
+prev: Ref ¨ NIL;
+hasCopyright: BOOL ¨ FALSE;
+AbstractNode: PROC [node: Ref, begin: BOOL ¨ FALSE] ~ {
+nodeLoc: TextNode.Location ~ TextNode.MakeNodeLoc[node];
+IF abstractSpan.start=TextNode.nullLocation THEN {
+IF begin OR hasCopyright THEN abstractSpan.start ¨ abstractSpan.end ¨ nodeLoc;
+}
+ELSE {
+IF abstractSpan.end.node=prev THEN abstractSpan.end ¨ nodeLoc;
+};
+};
+FOR node: Ref ¨ Forward[tiogaDocRoot], Forward[prev ¨ node] WHILE node#NIL DO
+SELECT node.format FROM
+$authors => {
+IF NOT author.IsEmpty[] THEN author ¨ author.Concat["; "];
+author ¨ author.Concat[node.rope];
+};
+$abstract => {
+contents: ROPE ~ node.rope;
+shortContents: ROPE ~ contents.Substr[len: 100];
+SELECT TRUE FROM
+Rope.Match[pattern: "Copyright*", object: shortContents, case: FALSE]
+OR Rope.Match[pattern: "* Copyright *", object: shortContents, case: FALSE] => {
+hasCopyright ¨ TRUE;
+};
+Rope.Match[pattern: "Abstract*", object: shortContents, case: FALSE] => {
+AbstractNode[node, TRUE];
+};
+Rope.Match[pattern: "Created by*", object: shortContents, case: FALSE] => {
+creator ¨ contents;
+};
+Rope.Match[pattern: "Maintained by*", object: shortContents, case: FALSE] => {
+maintainer ¨ contents;
+};
+Rope.Match[pattern: "Keyword*", object: shortContents, case: FALSE] => {
+keywords ¨ contents;
+};
+ENDCASE => {
+AbstractNode[node];
+};
+};
+$boilerplate => {
+peek: Ref ~ Forward[node]; -- peek to see if there are any following nodes
+IF peek=NIL THEN singlePageDocument ¨ TRUE;
+EXIT;
+};
+ENDCASE;
+ENDLOOP;
+EXITS Quit => NULL;
+};
+
+AddIndex: PROC [doc: CatalogDoc, kindOf: {command, keyword}] ~ {
+indexTable: IndexTable ¨ IF kindOf = command THEN doc.commandIndex ELSE doc.keywordIndex;
+lastTerm: ROPE;
+PerIndexTerm: EnumerateProc ~ {
+IF NOT Rope.Equal[term, lastTerm, FALSE]
+THEN AppendNode[level~2, doc~doc, r~Rope.Cat[term, ": ", location], format~"item"]
+ELSE doc.latestLevel2Node.rope ¨ Rope.Cat[doc.latestLevel2Node.rope, ", ", location];
+lastTerm ¨ term;
+RETURN [FALSE];
+};
+AppendNode[level~1, doc~doc, r~IF kindOf = command THEN "Command Index" ELSE "Keyword Index", format~"head"];
+EnumerateIndexTerms[indexTable, PerIndexTerm];
+};
+
+ParseFileName: PROC [fileName: ROPE] RETURNS [base, ext, shortName: ROPE] ~ {
+pos: INT;
+shortName ¨ PFSNames.ComponentRope[PFSNames.ShortName[PFS.PathFromRope[fileName]] ];
+pos ¨ Rope.FindBackward[shortName, "."];
+IF pos = -1 THEN RETURN[shortName, NIL, shortName];
+base ¨ Rope.Substr[shortName, 0, pos];
+ext ¨ Rope.Substr[shortName, pos + 1];
+};
+
+AppendNode: PROC [doc: CatalogDoc, level: NAT, r: ROPE, format: ROPE] ~ {
+InnerAppendNode: PROC [subtree: Ref, latest: Ref, r: ROPE, format: ROPE] RETURNS [newNode: Ref] ~ {
+IF subtree = NIL THEN ERROR;
+newNode ¨ IF latest = NIL THEN
+TiogaFileOps.InsertNode[x~subtree, child~TRUE]
+ELSE 
+TiogaFileOps.InsertAsLastChild[x~subtree, prevLast~latest];
+TiogaFileOps.SetContents[x~newNode, txt~r];
+TiogaFileOps.SetFormat[x~newNode, format~format];
+};
+SELECT level FROM
+1 => {
+doc.latestLevel1Node ¨ InnerAppendNode[doc.root, doc.latestLevel1Node, r, format];
+doc.latestLevel2Node ¨ doc.latestLevel3Node ¨ NIL;
+};
+2 => {
+doc.latestLevel2Node ¨ InnerAppendNode[doc.latestLevel1Node, doc.latestLevel2Node, r, format];
+doc.latestLevel3Node ¨ NIL;
+};
+3 => {
+doc.latestLevel3Node ¨ InnerAppendNode[doc.latestLevel2Node, doc.latestLevel3Node, r, format];
+};
+ENDCASE;
+};
+
+Forward: PROC [node: Ref] RETURNS [next: Ref] ~ {
+RETURN [TextNode.StepForward[node]];
+};
+
+BeginPackage: PROC [doc: CatalogDoc, packageName: ROPE] ~ {
+out: STREAM ~ doc.out;
+IF out#NIL THEN out.PutF1["%g ... ", IO.rope[packageName]];
+doc.packageName ¨ packageName;
+};
+
+Log: PROC [doc: CatalogDoc, msg: ROPE] ~ {
+log: STREAM ~ doc.log;
+IF log#NIL THEN log.PutF["%g: %g\n", IO.rope[doc.packageName], IO.rope[msg]];
+};
+
+IndexTable: TYPE ~ RedBlackTree.Table;
+
+CreateIndexTable: PROC [] RETURNS [IndexTable] ~ {
+RETURN [RedBlackTree.Create[getKey: GetIndexKey, compare: CompareIndexKeys]];
+};
+
+IsTableEmpty: PROC [table: IndexTable] RETURNS [BOOLEAN] ~ {
+RETURN [RedBlackTree.Size[table] = 0];
+};
+
+Pair: TYPE ~ REF PairRec;
+PairRec: TYPE ~ RECORD[
+term: ROPE,
+location: ROPE
+];
+
+InsertIndexTerm: PROC [table: IndexTable, term: ROPE, location: ROPE] ~ {
+data: REF ¨ NEW[PairRec ¨ [term, location]];
+RedBlackTree.Insert[table, data, data ! RedBlackTree.DuplicateKey => CONTINUE];
+};
+
+GetIndexKey: RedBlackTree.GetKey ~ {
+RETURN [data];
+};
+
+CompareIndexKeys: RedBlackTree.Compare ~ {
+pair1: Pair ¨ NARROW[k];
+pair2: Pair ¨ NARROW[data];
+comparison: Basics.Comparison ¨ Rope.Compare[pair1.term, pair2.term, FALSE];
+IF comparison = equal THEN comparison ¨ Rope.Compare[pair1.location, pair2.location, FALSE];
+RETURN [comparison];
+};
+
+EnumerateProc: TYPE ~ PROC [term: ROPE, location: ROPE] RETURNS [BOOLEAN];
+
+EnumerateIndexTerms: PROC [table: IndexTable, proc: EnumerateProc] ~ {
+ApplyProc: PROC [data: RedBlackTree.UserData] RETURNS [stop: BOOL ¨ FALSE] ~ {
+pair: Pair ¨ NARROW[data];
+RETURN [proc[pair.term, pair.location]];
+};
+RedBlackTree.EnumerateIncreasing[table, ApplyProc];
+};
+
+Commander.Register[
+key~"Catalog",
+proc~CatalogCmdProc,
+doc~"Catalog [-quietly] [-documentationWarnings] [-releaseMessage] <CatalogDirectoryName>     make a catalog of software packages stored as DF files in /<ServerName>/<CatalogDirectoryName>/Top/*.DF"
+];
+
+
+END.
+   	8  CatalogImpl.mesa
+Copyright ” 1985, 1986, 1987, 1989, 1990, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Rick Beach, October 5, 1985 11:52:43 am PDT
+Bertrand Serlet July 8, 1986 3:22:10 pm PDT
+Doug Wyatt, January 30, 1987 6:26:10 pm PST
+Michael Plass, December 3, 1987 3:03:20 pm PST
+Willie-s, January 28, 1992 2:21 pm PST
+
+
+PROC [item: REF ANY] RETURNS [stop: BOOL _ FALSE];
+catalogDoc.log.PutF["**rootBase: %g\n", [rope[rootBase]] ];
+Use this to force the type of a string literal to be ROPE rather than REF TEXT.
+each component is added underneath this heading
+ProcessItemProc: TYPE = PROC [item: REF ANY] RETURNS [stop: BOOL _ FALSE];
+Log[doc, IO.PutFR[" lastDirectoryPath: %g\n", [rope[lastDirectoryPath]] ]];
+Log[doc, IO.PutFR["add %g to moreDFs\n", [rope[incl.path1]] ]];
+Log[doc, IO.PutFR["incl.path1: %g\n", [rope[incl.path1]] ]];
+command name is the name of the .Load file
+command name is the name of the .Load file
+Log[doc, IO.PutFR[" shortName: %g, packageDoc: %g\n", [rope[shortName]], [rope[packageDoc]]] ];
+AppendNode[level~3, doc~doc, r~Rope.Cat["DF file: ", packageName, ".df"], format~"indent"];
+TiogaFileOps.AddLooks[x~doc.latestLevel3Node, start~0, len~8, look~'b, root~doc.root];
+the list of documentation files either has multiple files (since its not just PackageDoc.Tioga) or points to a long document (since its not a single page document)
+IF NOT author.IsEmpty THEN {
+AppendNode[level~3, doc~doc, r~Rope.Cat["Author: ", author], format~"indent"];
+TiogaFileOps.AddLooks[x~doc.latestLevel3Node, start~0, len~7 --Author:--, look~'b, root~doc.root];
+};
+PROC [char: CHAR] RETURNS [CharClass];
+Begin with this node if it says "Abstract: ..." or we've seen the copyright notice.
+Continue the abstract if this node is contiguous.
+Documentation may contain several abstract format nodes
+The following heuristics are used to determine the span of the abstract:
+Begin the abstract if the node begins with "Abstract"
+Begin the abstract at the node following the copyright notice which is a node matching "Copyright *" or "* Copyright *"
+End the abstract if the node does not have abstract format
+End the abstract if the node begins with "Keyword", "Created by", or "Mainained by"
+collect head nodes here for cumulative table of contents
+PROC [data: UserData] RETURNS [Key]
+PROC [k: Key, data: UserData] RETURNS [Basics.Comparison]
+ù t  ïNewlineDelimiter
+ñ(cedarcode) styleò codeôKöú
+œeúUô`Kô+Kô+Kô+Kô.Kô&Kô óöœk	ò	KöúûúòKöúûúòKöú
+ûúòKöú
+ûúò(Köúûúò+KöúûúWòhKöú	ûúòKöûúûúûúbûú-ò¢Köúûú
+òKöú
+ûúò)Köûúûúûú*òLKöú	ûú'ò5KöúûúòKöúûú]òoKöúòKöúûúò*Köú	ûúVòdKòKöúûú`òrKöúûúòKöúûú	òKöú	ûúò%óKò Kö–lnúûòKöûúCûúûúlòŒKöûúœc\òqöúûòKô KöûúûúûúòKöûúûúûúûúòKöúûúòKöú
+ûúò&Kò öœnúò)Köú
+ûúòKöúûúòKò<Köúûúûúò)Köúûúûúò&Köúûúòöûúûòöûúûúò%öûú%ûò/Köúûúò$KöúûúòKöúûúòKöûúûúåòùóKöúòóöûúòöûúûúûúòKöûúBòHóKòKöúòóKòKöûúòóKöûúûúûúûúòKò Kö	ú$ûú	ûúûúûú1òmKò Köûúûú0ò;KòKò óö
+°úûúûúûúûúò:Köúûúûúûúò(Köúûú4ò?KöúûúòKöûú
+ûúò/Köûú
+ûúûúòKöûúòKòKò óö°úûúûúûúûúûúûúûúûúûúûúòóKöúûúûúûúûúûúòTKöúûúûúò6Köúûúûú ò8Köú
+ûú#†òBKö	úûúûúûúûúòbKöúûú&ò7Köú	ûú$ò1KöúEòEö°ú!ò,Köûúûúûúûúûúûúô2öûúûúûòöúûúò&KöúûúòKöúûú ò1KòKöúòòòKòóKöûúòóKòóKòKöúbûúòmKöú]ò]Köú;ô;Köú5ò5KöúòKòKöûúòKòKò óKöúûúûúò%öúûúûúòKöúûú†ò*Köúûú†ò"Köú
+ûúòKöúûúòKò
+KòKòKöúòKöúòKöúòKöúòKò óö
+°úûúûúûúûúò,ö
+°	úûúûúûúûúò,Kö	úûúûúûúûúòIKöûú-ò3Kòóöûúûúœsúò&KöûúòKöúòóKòKò óö°úûúûúûúòöûúûú	¢ú¢úò;Köûú ò"KöúòóKòKò óö°úûúûúûúòVö°úûúûú	ûúò@Köú5ûúûúûúôOKò2KòóKöúûúòKò&Kò&KòKöúûúòKò ò%Kò óöú4ûúò9KöúJûúòQKò óö	ú$ûúûúûúOûúò©KöúJûúòQKò óöúGòGKöú;ûúûúò^Köú9ò9Kò óöú<ò<Köú;ûúûúò^Köú9ò9Kò óöú]ò]Kò óöúûúFûúBò´KöúVòVKöú;ûúûúò^Kò óöú”ò”KöúVòVKò óöú€ò€KöúVòVKöú;ûúûúò^Köú=ûúûúò`Köú=ûúûúò`Kò óöúDòDKô/óKòKò óö°úûúò,KòKöûúûú ûúòBKöûúûú ûúòBKòKò;Köûú	ûúûúûúò&KòKò óö°úûú ûúûúûúûúûúûúòíKöúûúûúòKöúûúûúò%Köúûú)ò9Köúûúûúò"KöúûúûúòKöúûúûúûúûúûúò&Köú	ûúûúûúòö°ú!ò.Kö°úûúûúûúûúûúûúûúôJöûúûúûòöúûúò-Kò$KöúKûúòRKöú	ûú@ôKKöúòóöúûúò&ö
+ûú*ûú	ûú'ûú	ûúòwKöú
+ûúò$Köú	ûú4ô?KòóKöú	ûú1ô<Kòóöúûúò#Köúûúûúò!ò2öûú
+ûúûúò&Köú	ûúûúòCKöûúò
+KöúòóKöúòóöûúûúûòöúûúò&Kô*Kò8Köúòóöúûúò!Kô*Kò8KöúòóöúûúûúûúûúûúûúòÖKöûúûúúûú
+ûú3ûúòåKöûúûúûúDòäöûú#ûúûò0KòBóKöú	ûúTô_KöûúòKöúòóKöûúûúòóKöûú	ûúòKöúòóKöûúûúòóKòóKöú
+ûúûúòKò KòKöúòKò öúûúûúòBöûúòKöú	ûúûúòCKöûúûúòKöúòóKöúòóöúNûú2òÖöúòKöú	ûú)ûúòFKöûúò	KöúòóKöúòóKöúòKò öûúûúûòKöûúûúûúûúûúûúûò9KöúûúòKòöúûúûúò;öûúòKöú	ûúûúòCKöûúò	KöúòóKöúòóKöûúûúûúûúòöúIûú2òÄöúòKöú	ûú)ûúòFKöûúò	KöúòóKöúòóKöûúòóKòKò öú†òKöúûúûúò(Kò0Köú
+ûúòKöúûúòöûúûúûúûú$ûúûú(òÜöûúòKò…öûúûúòKöú2ò2KöúòóKöúòóóKöûúûúûúûú(ûúûú0òïKöúWòWöú[ô[KöúVôVóö
+ûúûúûúûúûúò8öú9ò9KöúgògóKöúòóöûúûúûúò öú<ò<KöújòjóKöúòóöûúûúûúûú-ûúûúûúò{Kô£öú,œtú+òdKöúWòWóKöúòóöûúûúûúôöú)£úôNKöúbôbóKöúôóö
+ûúûúûúûúûúò9ö°úûúò Köûúûúûúô&öûúûúûòKöúòKöûú
+òóKòóKöúûúûúûúòKöúûúò+Köûú&†òDKöúûúòöûúûúûú
+ûòKöûúûúûúûúò(Köú	ûúûúòKöúûúûú8òDöûúûúûòKöú8ò8óKöúûúòKöúûúòKöûúòóKöûú
+òöú:ò:KöúWòWóKöúòóöúòKöú
+ûúûúòöûúûúûúûúûúûúûúûò@Köúûúûú
+ò$Kò<öúûúòKöûú£úò+Köûú'ò+óKöûúòóöûúûúûúòöú:ò:KöúVòVóKöúòóKöúòóöûúûúòKöúûú£ú£úòKöúûúòöú7ò7KöúVòVKöú[ò[óKòóöûúûú"ûúò/Kòüöûú:ûúûò_Kò'KöûúòóKöúòóKöúòóöûòKöúûúòóKòKò óö°úûú'ûúûú[ûúûúûúûúò‚öú%ûú"òJöûúòKöú	ûúûúòCKöûúò
+KòóKòóKöúûúòKöúûúûúòö°úûúûúûúò7Kò8öûú*ûúò2öûúûúûú1òNKôSóKòóöûúòöûúûúò>Kô1óKòóKòóöûú9ûúûúûòMöûúûòöúòKöûúûúûúò:Kò"KòóöúòKô7ôHKô5KôwKô:KôSóKöú
+ûúòKöúûúò0öûúûúûòKöú?ûúòEöûúCûúòPKöúûúòKòóöú>ûúòIKöúûúòKòóöú@ûúòKKòKòóöúCûúòNKòKòóöú=ûúòHKòKòóöûúòKòKòóóKòóöúòKöú†/òJKöûúûúûúûúò+Kô8KöûúòKòóKöûúòóKöûúòóKöûú	ûúòKòKò óö°úûú2ò@KöúûúûúûúòYKöú
+ûúòö°úòöûúûúûúò(KöûúNòRKöûúQòUóKòKöûúûúòKòóKöúûúûúûú!òmKò.KòKò óö
+°úûúûúûúûúòMKöúûúò	Köú6ûúòTKò(Köûú
+ûúûúûúò3Kò&Kò&KòKò óö
+°
+úûúûúûú
+ûúòIö
+°úûú ûú
+ûúûúòcKöûúûúûúûúòöú
+ûú
+ûúûòKöú)ûúò.óöûúòKöú;ò;óKöú+ò+Köú1ò1KòóöûúûòöúòKòRKöú.ûúò2KöúòóöúòKò^KöúûúòKöúòóöúòKò^KöúòóKöûúòóKòKò óö°úûúûúò1Köûúò$KòKò óö°úûú ûúò;KöúûúòKöûúûúûúûúò;KòKòKò óö°úûúûúò*KöúûúòKö
+ûúûúûúûúûúòMKòKò óöúûúò&Kò óö°úûúûúò2KöûúGòMKòKò óö°úûúûúûúò<Köûú ò&KòKò óKöúûúûú	òöú	ûúûúòKöúûúòKöú
+ûòKöúòKò óö°úûúûúûúòIKöúûúûúò,KöúEûúòOKòKò óö°úò$Jöûúûúô#KöûúòKòKò óö°úò*Köûúûúô9KöúûúòKöúûúòKöúEûúòLKöûúûú;ûúò\KöûúòKòKò óöúûúûúûúûúûúûúòJKò óö°úûú-òFö
+°	úûúûúûúûúòNKöúûúòKöûú"ò(KòóKöú3ò3KòKò óòKòKòKöú∆ò∆KòKò óóKò Köûúòó Öó    O>  nÍ  

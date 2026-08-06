@@ -1,0 +1,726 @@
+DIRECTORY
+Atom USING [GetProp],
+Carets USING [ResumeCarets, SuspendCarets],
+CedarProcess USING [SetPriority],
+Icons USING [DrawIcon],
+Imager USING [black, ClipRectangleI, Color, Context, DoSaveAll, MakeGray, MaskRectangleI, Rectangle, SetColor, SetFont, SetXYI, ShowText, Trans, white],
+ImagerBackdoor USING [GetBounds, invert, MakeStipple, ViewClipRectangleI, ViewReset, ViewTranslateI],
+KeyTypes,
+KeySymsKB,
+Process USING [Detach, MsecToTicks, Pause, SecondsToTicks, Ticks],
+Real USING [Round],
+RefText USING [AppendRope, New, TrustTextAsRope],
+Rope USING [Length, ROPE, Run],
+RuntimeError USING [Uncaught],
+UserInput,
+UserInputOps,
+VFonts USING [defaultFont, Font, StringWidth],
+ViewerClasses USING [PaintRectangle, Viewer],
+ViewerErrors USING [Query],
+ViewerLocks USING [CallUnderWriteLock, Wedged],
+ViewerOps USING [ChangeColumn, FetchProp, PaintHint, SaveAllEdits, UserToScreenCoords],
+ViewerPrivate,
+ViewerSpecs,
+ViewersWorld,
+ViewersWorldInstance,
+ViewersWorldRefType,
+ViewersWorldTypes,
+ViewerTools USING [GetSelectedViewer];
+
+ViewerPaintImpl: CEDAR MONITOR
+IMPORTS Atom, Carets, CedarProcess, Icons, Imager, ImagerBackdoor, Process, Real, RefText, Rope, RuntimeError, UserInputOps, VFonts, ViewerErrors, ViewerLocks, ViewerOps, ViewerPrivate, ViewerSpecs, ViewersWorld, ViewersWorldInstance, ViewerTools
+EXPORTS ViewerOps, ViewerPrivate, ViewersWorldRefType
+SHARES ViewerClasses, ViewerErrors, ViewerLocks
+~ BEGIN OPEN ViewerClasses, ViewerOps, ViewerSpecs;
+
+ContextCreatorProc: TYPE ~ ViewerPrivate.ContextCreatorProc;
+ContextList: TYPE = ViewersWorldTypes.ContextList;
+ROPE: TYPE ~ Rope.ROPE;
+ViewersWorldObj: PUBLIC TYPE = ViewersWorldTypes.ViewersWorldObj;
+
+captionAscent: NAT ¨ 9;
+
+FormatCaption: PROC [viewer: Viewer] RETURNS [REF TEXT] ~ {
+name: ROPE ~ viewer.name;
+nameLen: INT ~ Rope.Length[name];
+file: ROPE ~ viewer.file;
+fileLen: INT ~ Rope.Length[file];
+header: REF TEXT ¨ RefText.New[MAX[nameLen, fileLen] + 12];
+header ¨ RefText.AppendRope[to: header, from: name];
+IF fileLen>nameLen AND Rope.Run[s1: name, s2: file, case: FALSE]=nameLen THEN {
+header ¨ RefText.AppendRope[to: header, from: " ("];
+header ¨ RefText.AppendRope[to: header, from: file, start: nameLen];
+header ¨ RefText.AppendRope[to: header, from: ")"];
+};
+SELECT TRUE FROM
+viewer.saveInProgress =>
+header ¨ RefText.AppendRope[to: header, from: " [Saving...]"];
+viewer.newFile =>
+header ¨ RefText.AppendRope[to: header, from: " [New File]"];
+viewer.newVersion =>
+header ¨ RefText.AppendRope[to: header, from: " [Edited]"];
+ENDCASE;
+IF viewer.link#NIL THEN
+header ¨ RefText.AppendRope[to: header, from: " [Split]"];
+RETURN [header];
+};
+
+PaintCaption: PROC [viewer: Viewer, context: Imager.Context] ~ {
+wbs: INTEGER ~ IF viewer.border THEN windowBorderSize ELSE 0;
+IF viewer.class.caption#NIL
+THEN {
+x: INTEGER ~ wbs;
+y: INTEGER ~ viewer.wh-captionHeight;
+w: INTEGER ~ viewer.ww-wbs*2;
+h: INTEGER ~ captionHeight-wbs;
+action: PROC ~ {
+Imager.SetXYI[context, x, y];
+Imager.Trans[context];
+Imager.ClipRectangleI[context, 0, 0, w, h];
+viewer.class.caption[viewer, context];
+};
+Imager.DoSaveAll[context, action];
+}
+ELSE {
+header: REF TEXT ~ FormatCaption[viewer];
+font: VFonts.Font ~ VFonts.defaultFont;
+foreground: Imager.Color ~ CaptionColor[$foreground];
+dropshadow: Imager.Color ~ CaptionColor[$dropshadow];
+background: Imager.Color ~ CaptionColor[$background];
+sidebar: Imager.Color ~ CaptionColor[$sidebar];
+wbs: INTEGER ~ IF viewer.border THEN windowBorderSize ELSE 0;
+x: INTEGER ~ wbs;
+w: INTEGER ~ viewer.ww-wbs*2;
+captionLeft: INTEGER;
+headerW: INTEGER ¨ VFonts.StringWidth[RefText.TrustTextAsRope[header], font];
+headerW ¨ MIN[headerW, viewer.ww-wbs*2];
+Imager.SetColor[context, sidebar];
+Imager.MaskRectangleI[context, x, viewer.wh, w, -captionHeight];
+captionLeft ¨ (viewer.ww-headerW)/2;
+IF background # sidebar THEN {
+Imager.SetColor[context, background];
+Imager.MaskRectangleI[context, captionLeft-2, viewer.wh, headerW+4, -captionHeight];
+};
+Imager.SetFont[context, font];
+IF dropshadow # background THEN {
+Imager.SetColor[context, dropshadow];
+Imager.SetXYI[context, captionLeft+1, viewer.wh-captionAscent];
+Imager.ShowText[context, header];
+Imager.SetXYI[context, captionLeft, viewer.wh-captionAscent-1];
+Imager.ShowText[context, header];
+};
+Imager.SetColor[context, foreground];
+Imager.SetXYI[context, captionLeft, viewer.wh-captionAscent];
+Imager.ShowText[context, header];
+};
+};
+
+CaptionColor: PROC [what: ATOM] RETURNS [Imager.Color] = {
+WITH Atom.GetProp[$ViewerCaptionColors, what] SELECT FROM
+color: Imager.Color => RETURN [color];
+ENDCASE => RETURN [IF what = $foreground THEN Imager.white ELSE Imager.black];
+};
+
+PaintDocumentHeader: PROC [viewer: Viewer, context: Imager.Context, 
+clear: BOOL, hint: PaintHint, whatChanged: REF ANY] = {
+IF hint#menu THEN PaintCaption[viewer, context];
+IF hint#caption AND viewer.menu#NIL THEN {
+wbs: INTEGER ~ IF viewer.border THEN windowBorderSize ELSE 0;
+x: INTEGER ~ wbs;
+w: INTEGER ~ viewer.ww-wbs*2;
+h: INTEGER ~ viewer.menu.linesUsed*menuHeight;
+y: INTEGER ~ viewer.wh-captionHeight-h;
+IF whatChanged=NIL THEN {
+IF NOT clear THEN {
+Imager.SetColor[context, Imager.white];
+Imager.MaskRectangleI[context, x, y, w, h];
+};
+Imager.SetColor[context, Imager.black];
+Imager.MaskRectangleI[context, x, y, w, -menuBarHeight];
+};
+ViewerPrivate.DrawMenu[viewer.menu, context, x, y+h, whatChanged];
+};
+};
+
+PaintIcon: PROC [viewer: Viewer, hint: PaintHint, whatChanged: REF ANY ¨ NIL] = {
+iconAction: PROC [context: Imager.Context] ~ {
+SELECT TRUE FROM
+viewer.icon=private => {
+[] ¨ viewer.class.paint[viewer, context, whatChanged, hint=all];
+};
+hint=all, hint=caption => {
+dirty: BOOL ~ viewer.newVersion OR viewer.newFile;
+label: ROPE ~ GetIconLabel[viewer];
+drawIcon: PROC ~ { Icons.DrawIcon[flavor: viewer.icon, context: context, label: label] };
+SELECT viewer.icon FROM
+document => IF dirty THEN viewer.icon ¨ dirtyDocument;
+dirtyDocument => IF NOT dirty THEN viewer.icon ¨ document;
+ENDCASE;
+Imager.DoSaveAll[context, drawIcon];
+IF ViewerPrivate.selectedIcon=viewer THEN {
+Imager.SetColor[context, ImagerBackdoor.invert];
+Imager.MaskRectangleI[context, 0, 0, iconWidth, iconHeight];
+};
+};
+ENDCASE;
+};
+IF viewer.parent=NIL THEN PaintWindow[viewer, iconAction];
+};
+
+GetIconLabel: PROC [viewer: Viewer] RETURNS [ROPE] = {
+IF viewer.label#NIL THEN RETURN [viewer.label];
+WITH ViewerOps.FetchProp[viewer, $IconLabel] SELECT FROM
+label: ROPE => RETURN [label];
+ENDCASE => RETURN [viewer.name];
+};
+
+InvisiblePaint: ERROR ~ CODE;
+
+RecursivelyPaintViewers: PROC [viewer: Viewer, hint: PaintHint, 
+clearClient: BOOL, clear: BOOL, rect: PaintRectangle, whatChanged: REF] = {
+quit: BOOL ¨ FALSE;
+vx, vy: INTEGER;
+bitmapY: INTEGER ¨ 0;
+
+FOR v: Viewer ¨ viewer, v.parent UNTIL v=NIL DO -- visibility test
+IF v.parent#NIL THEN {
+IF (v.wy+v.wh < 0) OR (v.wy > v.parent.ch) THEN RETURN;
+IF (v.ww+v.ww < 0) OR (v.wx > v.parent.cw) THEN RETURN;
+}
+ELSE IF v.offDeskTop THEN RETURN;
+ENDLOOP;
+
+IF hint#client THEN {
+windowAction: PROC [context: Imager.Context] ~ {
+w: INTEGER ~ viewer.ww;
+h: INTEGER ~ viewer.wh;
+IF ~viewer.visible OR viewer.destroyed THEN ERROR InvisiblePaint;
+IF clearClient AND ~clear AND hint=all THEN {
+Imager.SetColor[context, Imager.white];
+Imager.MaskRectangleI[context, 0, 0, w, h];
+clear ¨ TRUE;
+};
+IF viewer.border AND hint=all THEN {
+wbs: INTEGER ~ windowBorderSize;
+Imager.SetColor[context, Imager.black];
+Imager.MaskRectangleI[context, 0, 0, windowBorderSize, h];
+Imager.MaskRectangleI[context, w, 0, -windowBorderSize, h];
+Imager.MaskRectangleI[context, 0, 0, w, windowBorderSize];
+Imager.MaskRectangleI[context, 0, h, w, -windowBorderSize];
+};
+IF viewer.parent=NIL AND viewer.column#static THEN
+PaintDocumentHeader[viewer, context, clear, hint, whatChanged];
+};
+PaintWindow[viewer, windowAction];
+};
+
+IF hint=all OR hint=client THEN {
+clientAction: PROC [context: Imager.Context] ~ {
+IF ~viewer.visible OR viewer.destroyed THEN ERROR InvisiblePaint;
+IF rect#NIL AND viewer.class.bltH=none AND viewer.class.bltV=none THEN
+clearClient ¨ TRUE; -- if class doesn't care about blt, don't pass it a rectangle
+IF clearClient AND ~clear THEN {
+Imager.SetColor[context, Imager.white];
+Imager.MaskRectangleI[context, 0, 0, viewer.cw, viewer.ch];
+Imager.SetColor[context, Imager.black];
+IF rect#NIL THEN whatChanged ¨ NIL;
+rect ¨ NIL;
+clear ¨ TRUE;
+};
+IF viewer.class.paint#NIL THEN {
+quit ¨ viewer.class.paint[viewer, context, whatChanged, clear];
+};
+};
+PaintClient[viewer, clientAction];
+};
+
+IF quit THEN RETURN;
+IF rect#NIL AND viewer.parent=NIL THEN {  
+IF viewer.cx>=rect.x AND (viewer.cx+viewer.cw <= rect.x+rect.w)
+AND viewer.cy>=rect.y AND (viewer.cy+viewer.ch <= rect.y+rect.h) THEN RETURN;
+};
+
+IF hint=all OR hint=client OR clear THEN
+FOR v: Viewer ¨ viewer.child, v.sibling UNTIL v=NIL DO
+IF rect # NIL THEN {
+IF viewer.class.topDownCoordSys THEN
+[vx, vy] ¨ ViewerOps.UserToScreenCoords[viewer, v.wx, viewer.ch-(v.wy+v.wh)]
+ELSE [vx, vy] ¨ ViewerOps.UserToScreenCoords[viewer, v.wx, v.wy];
+IF vx >= rect.x AND (vx + v.ww <= rect.x + rect.w) AND
+vy >= rect.y AND (vy + v.wh <= rect.y + rect.h) THEN LOOP};
+RecursivelyPaintViewers[v, all, FALSE, clear, rect, whatChanged];
+ENDLOOP;
+
+};
+
+PaintViewer: PUBLIC PROC [viewer: Viewer, 
+hint: PaintHint ¨ client, clearClient: BOOL ¨ TRUE, whatChanged: REF ANY ¨ NIL] ~ {
+LocalPaintViewer: PROC ~ {
+rect: PaintRectangle ¨ NIL;
+IF (NOT viewer.visible) OR viewer.destroyed OR viewer.paintingWedged THEN RETURN;
+IF viewer.iconic THEN {
+IF ~viewer.offDeskTop THEN PaintIcon[viewer, hint, whatChanged];
+RETURN
+};
+WITH whatChanged SELECT FROM
+pr: PaintRectangle => rect ¨ pr;
+ENDCASE;
+RecursivelyPaintViewers[viewer: viewer, hint: hint, 
+clearClient: clearClient AND ~(hint=menu OR hint=caption), clear: FALSE, 
+rect: rect, whatChanged: whatChanged];
+};
+IF viewer = NIL OR viewer.destroyed OR viewer.paintingWedged THEN RETURN;
+ViewerLocks.CallUnderWriteLock[LocalPaintViewer, viewer !
+ViewerLocks.Wedged => {viewer.paintingWedged ¨ TRUE; CONTINUE};
+ABORTED => CONTINUE;
+InvisiblePaint => CONTINUE;
+RuntimeError.Uncaught => IF ViewerErrors.Query[signal].continue THEN CONTINUE;
+];
+};
+
+Screen: TYPE ~ ViewerPrivate.Screen;
+
+CreateContext: PUBLIC PROC [screen: Screen] RETURNS [context: Imager.Context] ~ {
+vWorld: ViewersWorld.Ref ¨ ViewersWorldInstance.GetWorld[];
+RETURN [vWorld.class.creator[vWorld.screenServerData, screen]];
+};
+
+AllocScreenContexts: PROC [screen: Screen, count: NAT ¨ 8] ~ {
+cl: LIST OF Imager.Context ¨ NIL;
+vWorld: ViewersWorld.Ref ¨ ViewersWorldInstance.GetWorld[];
+vWorld.contextPool[screen] ¨ NIL;
+THROUGH [0..count) DO
+context: Imager.Context ~ vWorld.class.creator[vWorld.screenServerData, screen];
+cl ¨ CONS[context, cl];
+ENDLOOP;
+vWorld.contextPool[screen] ¨ cl;
+};
+
+AllocColorContexts: INTERNAL PROC ~ {
+AllocScreenContexts[color, 4];
+};
+
+SetCreator: PUBLIC PROC [creator: ContextCreatorProc, screen: Screen ¨ main]
+RETURNS [old: ContextCreatorProc] ~ {
+inner: ENTRY PROC ~ {
+old ¨ vWorld.class.creator;
+vWorld.class.creator ¨ creator;
+AllocScreenContexts[screen, 8];
+IF colorEnabled THEN AllocColorContexts[];
+};
+vWorld: ViewersWorld.Ref ¨ ViewersWorldInstance.GetWorld[];
+DisablePainting[wait: TRUE];
+inner[];
+EnablePainting[];
+};
+
+SetCreatorScreen: PUBLIC PROC [creator: ContextCreatorProc ¨ NIL, screen: Screen] ~ {
+inner: ENTRY PROC ~ {
+vWorld.class.creator ¨ creator;
+};
+vWorld: ViewersWorld.Ref ¨ ViewersWorldInstance.GetWorld[];
+DisablePainting[wait: TRUE];
+inner[];
+AllocScreenContexts[screen, 8 ! 
+UNWIND => EnablePainting[];
+RuntimeError.Uncaught => IF ViewerErrors.Query[signal].continue THEN CONTINUE;
+];
+EnablePainting[];
+};
+
+GetCreatorScreen: PUBLIC PROC [screen: Screen] RETURNS [old: ContextCreatorProc] = {
+vWorld: ViewersWorld.Ref ¨ ViewersWorldInstance.GetWorld[];
+old ¨ vWorld.class.creator;
+};
+
+ViewerScreen: PUBLIC PROC [viewer: Viewer] RETURNS [Screen] ~ {
+RETURN [InlineViewerScreen[viewer]]
+};
+
+InlineViewerScreen: PROC [viewer: Viewer] RETURNS [Screen] ~ {
+RETURN [IF viewer.column=color AND NOT viewer.iconic THEN color ELSE main]
+};
+
+colorEnabled: BOOL ¨ FALSE;
+
+EnableColor: PUBLIC PROC [bitsPerPixel: NAT] RETURNS [ok: BOOL ¨ FALSE] ~ {
+inner: ENTRY PROC ~ {
+bounds: Imager.Rectangle ¨ [0, 0, 0, 0];
+IF colorEnabled THEN RETURN;
+-- ViewerPrivate.SetColorScreenSize[w: vWorld.terminal.colorWidth, h: vWorld.terminal.colorHeight];
+THROUGH [0..4) DO
+context: Imager.Context ~ CreateContext[color ! 
+UNWIND => GOTO oops;
+RuntimeError.Uncaught => IF ViewerErrors.Query[signal].continue THEN GOTO oops;
+];
+IF context = NIL THEN RETURN; -- something wrong; bail out now.
+vWorld.contextPool[color] ¨ CONS[context, vWorld.contextPool[color]];
+ENDLOOP;
+bounds ¨ ImagerBackdoor.GetBounds[vWorld.contextPool[color].first];
+IF bounds.w > 0 THEN ViewerPrivate.SetColorScreenSize[w: Real.Round[bounds.w], h: Real.Round[bounds.h]];
+colorEnabled ¨ ok ¨ TRUE;
+EXITS oops => {};
+};
+vWorld: ViewersWorld.Ref ¨ ViewersWorldInstance.GetWorld[];
+DisablePainting[wait: TRUE];
+inner[];
+EnablePainting[];
+IF ok THEN {
+GreyScreen[color, 0, 0, 9999, 9999];
+};
+};
+
+DisableColor: PUBLIC PROC ~ {
+inner: ENTRY PROC ~ {
+vWorld.contextPool[color] ¨ NIL;
+colorEnabled ¨ FALSE;
+};
+vWorld: ViewersWorld.Ref ¨ ViewersWorldInstance.GetWorld[];
+DisablePainting[wait: TRUE];
+inner[];
+EnablePainting[];
+};
+
+paintingCount: CARDINAL ¨ 0; -- number of paints in progress
+FinishedPainting: CONDITION; -- notified when a process finishes painting
+
+paintingLock: CARDINAL ¨ 0; -- incremented to disable painting
+PaintingEnabled: CONDITION; -- wait here for painting to be enabled
+
+DisablePainting: PUBLIC PROC [wait: BOOL ¨ TRUE] = {
+locked: ENTRY PROC ~ {
+paintingLock ¨ paintingLock+1;
+IF wait THEN WHILE paintingCount>0 DO WAIT FinishedPainting ENDLOOP;
+};
+Carets.SuspendCarets[];
+locked[];
+Carets.ResumeCarets[];
+};
+
+EnablePainting: PUBLIC ENTRY PROC ~ {
+IF paintingLock>1 
+THEN paintingLock ¨ paintingLock-1
+ELSE {paintingLock ¨ 0; BROADCAST PaintingEnabled};
+};
+
+WaitForPaintingToFinish: PUBLIC ENTRY PROC ~ {
+WHILE paintingCount>0 DO WAIT FinishedPainting ENDLOOP;
+};
+
+AcquireContext: ENTRY PROC [screen: Screen] RETURNS [Imager.Context, ContextList] ~ {
+list: ContextList;
+vWorld: ViewersWorld.Ref ¨ ViewersWorldInstance.GetWorld[];
+WHILE paintingLock>0 DO WAIT PaintingEnabled ENDLOOP;
+paintingCount ¨ paintingCount+1;
+list ¨ vWorld.contextPool[screen];
+FOR tail: ContextList ¨ list, tail.rest UNTIL tail=NIL DO
+context: Imager.Context ~ tail.first;
+IF context#NIL THEN { tail.first ¨ NIL; RETURN[context, list] };
+ENDLOOP;
+vWorld.contextPoolOverflows[screen] ¨ vWorld.contextPoolOverflows[screen]+1;
+RETURN[NIL, NIL];
+};
+
+ReleaseContext: ENTRY PROC [context: Imager.Context, contextList: ContextList] ~ {
+IF context#NIL THEN
+FOR list: ContextList ¨ contextList, list.rest UNTIL list=NIL DO
+IF list.first=NIL THEN { list.first ¨ context; EXIT };
+ENDLOOP;
+paintingCount ¨ paintingCount-1;
+IF paintingCount = 0 THEN BROADCAST FinishedPainting;
+};
+
+PaintScreen: PUBLIC PROC [screen: Screen, action: PROC [context: Imager.Context], 
+suspendCarets: BOOL ¨ TRUE] ~ {
+acquired, context: Imager.Context;
+list: ContextList;
+mustResumeCarets: BOOL ¨ FALSE;
+saveAction: PROC ~ {
+ImagerBackdoor.ViewReset[context];
+IF suspendCarets 
+THEN {
+Carets.SuspendCarets[];
+mustResumeCarets ¨ TRUE;
+action[context];
+mustResumeCarets ¨ FALSE;
+Carets.ResumeCarets[];
+}
+ELSE action[context];
+};
+[acquired, list] ¨ AcquireContext[screen];
+context ¨ acquired;
+IF context=NIL THEN context ¨ CreateContext[screen];
+IF context#NIL THEN {
+Imager.DoSaveAll[context, saveAction ! 
+UNWIND => {
+IF mustResumeCarets THEN Carets.ResumeCarets[]; 
+ReleaseContext[acquired, list];
+};
+RuntimeError.Uncaught => IF ViewerErrors.Query[signal].continue THEN CONTINUE
+];
+};
+ReleaseContext[acquired, list];
+};
+
+DoWithoutCaretsVisible: PROC
+[viewer: Viewer, action: PROC [context: Imager.Context], context: Imager.Context] ~ {
+proc: PROC ~ {action[context]};
+v: Viewer ¨ viewer;
+UNTIL v.parent = NIL DO v ¨ v.parent ENDLOOP;
+ViewerPrivate.DoWithoutCarets[v.wx, v.wy, v.ww, v.wh, InlineViewerScreen[viewer], proc];
+};
+
+PaintWindow: PUBLIC PROC [viewer: Viewer, action: PROC [context: Imager.Context]] ~ {
+windowAction: PROC [context: Imager.Context] ~ {
+IF viewer.iconic AND (viewer.wy+viewer.wh)>openBottomY THEN ClipIcon[context];
+SetView[context: context, viewer: viewer, client: FALSE];
+DoWithoutCaretsVisible[viewer, action, context];
+};
+PaintScreen[InlineViewerScreen[viewer], windowAction, FALSE];
+};
+
+PaintClient: PUBLIC PROC [viewer: Viewer, action: PROC [context: Imager.Context]] ~ {
+clientAction: PROC [context: Imager.Context] ~ {
+SetView[context: context, viewer: viewer, client: TRUE];
+DoWithoutCaretsVisible[viewer, action, context];
+};
+IF NOT viewer.iconic THEN
+PaintScreen[InlineViewerScreen[viewer], clientAction, FALSE];
+};
+
+SetView: PROC [context: Imager.Context, viewer: Viewer, client: BOOL] ~ {
+wx, wy: INTEGER;
+[wx, wy] ¨ ClipView[context, viewer, client];
+ImagerBackdoor.ViewTranslateI[context, wx, wy];
+};
+
+ClipView: PROC [context: Imager.Context, viewer: Viewer, client: BOOL]
+RETURNS [wx, wy: INTEGER] ~ {
+parent: Viewer ~ viewer.parent;
+topDown: BOOL ~ (parent#NIL AND parent.class.topDownCoordSys);
+ww: INTEGER ¨ viewer.ww;
+wh: INTEGER ¨ viewer.wh;
+wx ¨ viewer.wx;
+wy ¨ IF topDown THEN parent.ch-(viewer.wy+wh) ELSE viewer.wy;
+IF parent # NIL THEN SetView[context: context, viewer: parent, client: TRUE];
+IF client THEN {
+wx ¨ wx + viewer.cx;
+wy ¨ wy + viewer.cy;
+ww ¨ viewer.cw;
+wh ¨ viewer.ch;
+};
+ImagerBackdoor.ViewClipRectangleI[context, wx, wy, ww, wh];
+};
+
+ClipIcon: PROC [context: Imager.Context] ~ {
+y: NAT ~ ViewerSpecs.openBottomY;
+h: NAT ~ ViewerSpecs.openTopY-y;
+Exclude: PROC [x, w: NAT] ~ {
+ImagerBackdoor.ViewClipRectangleI[context: context, x: x, y: y, w: w, h: h, exclude: TRUE];
+};
+IF ViewerPrivate.rootViewerTree[left]#NIL THEN
+Exclude[ViewerSpecs.openLeftLeftX, ViewerSpecs.openLeftWidth];
+IF ViewerPrivate.rootViewerTree[right]#NIL THEN
+Exclude[ViewerSpecs.openRightLeftX, ViewerSpecs.openRightWidth];
+};
+
+desktopGrey: Imager.Color ¨ ImagerBackdoor.MakeStipple[104042B];
+uniformGrey: Imager.Color ¨ Imager.MakeGray[0.4];
+
+ColorScreen: PUBLIC PROC [screen: Screen, color: Imager.Color] = {
+colorAction: PROC [context: Imager.Context] ~ {
+Imager.SetColor[context, color];
+Imager.MaskRectangleI[context, 0, 0, 9999, 9999];
+};
+PaintScreen[screen, colorAction];
+};
+
+GreyScreen: PUBLIC PROC [screen: Screen, x, y, w, h: INTEGER] ~ {
+greyAction: PROC [context: Imager.Context] ~ {
+Imager.SetColor[context, IF screen=main THEN desktopGrey ELSE uniformGrey];
+Imager.MaskRectangleI[context, x, y, w, h];
+};
+PaintScreen[screen, greyAction];
+};
+
+GreyWindow: PUBLIC PROC [viewer: Viewer] ~ {
+screen: Screen ~ ViewerScreen[viewer];
+greyAction: PROC [context: Imager.Context] ~ {
+wx, wy: INTEGER;
+IF viewer.iconic AND (viewer.wy+viewer.wh)>openBottomY THEN ClipIcon[context];
+[wx, wy] ¨ ClipView[context: context, viewer: viewer, client: FALSE];
+Imager.SetColor[context, IF screen=main THEN desktopGrey ELSE uniformGrey];
+Imager.MaskRectangleI[context, wx, wy, viewer.ww, viewer.wh];
+};
+PaintScreen[screen, greyAction];
+};
+
+InvertForMenus: PUBLIC PROC [viewer: Viewer, x, y, w, h: INTEGER] = {
+invertAction: PROC [context: Imager.Context] ~ {
+Imager.SetColor[context, ImagerBackdoor.invert];
+Imager.MaskRectangleI[context, x, y, w, h];
+};
+PaintWindow[viewer, invertAction];
+};
+
+BlinkOnce: PROC [viewer: Viewer, duration: Process.Ticks] ~ {
+LockedBlinkOnce: PROC ~ {
+blinkAction: PROC [context: Imager.Context] ~ {
+Imager.SetColor[context, ImagerBackdoor.invert];
+Imager.MaskRectangleI[context, 0, 0, viewer.ww, viewer.wh];
+Process.Pause[duration];
+Imager.MaskRectangleI[context, 0, 0, viewer.ww, viewer.wh];
+};
+IF NOT viewer.visible OR viewer.destroyed THEN RETURN;
+PaintWindow[viewer, blinkAction];
+};
+ViewerLocks.CallUnderWriteLock[LockedBlinkOnce, viewer
+! ViewerLocks.Wedged => CONTINUE];
+};
+
+BlinkViewer: PUBLIC PROC [viewer: Viewer, milliseconds: NAT ¨ 400] ~ {
+BlinkOnce[viewer, Process.MsecToTicks[milliseconds]];
+};
+
+BlinkIcon: PUBLIC PROC [viewer: Viewer, count: INT ¨ 1, 
+secondsBetweenBlinks: NAT ¨ 2, millisecondsPerBlink: NAT ¨ 400] ~ {
+IF viewer.offDeskTop THEN ViewerOps.ChangeColumn[viewer, left];
+TRUSTED {
+Process.Detach[
+FORK BlinkProcess[viewer, count, secondsBetweenBlinks, millisecondsPerBlink]];
+};
+};
+
+BlinkProcess: PROC [viewer: Viewer, count: INT, 
+secondsBetweenBlinks, millisecondsPerBlink: NAT] ~ {
+ticksPerHalfSecond: Process.Ticks ~ Process.MsecToTicks[500];
+ticksPerBlink: Process.Ticks ~ Process.MsecToTicks[millisecondsPerBlink];
+DO
+BlinkOnce[viewer, ticksPerBlink];
+IF count = 1 THEN RETURN;
+IF count > 0 THEN count ¨ count - 1;
+FOR i: NAT IN [0..2*secondsBetweenBlinks) DO -- check every half second.
+Process.Pause[ticksPerHalfSecond];
+IF viewer.destroyed OR NOT viewer.iconic 
+OR viewer=ViewerTools.GetSelectedViewer[] THEN RETURN;
+ENDLOOP;
+ENDLOOP;
+};
+
+
+BlinkDisplay: PUBLIC PROC ~ {
+ViewersWorld.BlinkViewersWorld[ViewersWorldInstance.GetWorld[]];
+};
+
+lastKey: REF ¨ NIL;
+EmergencySaveAllEdits: PROC [key: REF] ~ {
+oneSecond: Process.Ticks ~ Process.SecondsToTicks[1];
+CedarProcess.SetPriority[foreground];
+lastKey ¨ key;
+WHILE key=lastKey DO
+vWorld: ViewersWorld.Ref;
+Process.Pause[oneSecond];
+vWorld ¨ ViewersWorldInstance.GetWorld[];
+IF vWorld # NIL THEN {
+handle: UserInput.Handle ~ ViewersWorld.GetInputHandle[vWorld];
+IF handle # NIL THEN {
+Down: PROC [keySym: KeyTypes.KeySym] RETURNS [BOOL] ~ INLINE {
+RETURN [UserInputOps.GetLatestKeySymState[handle, keySym] = down];
+};
+IF Down[KeySymsKB.LeftShift] AND Down[KeySymsKB.RightShift] AND Down[KeySymsKB.R15] THEN {
+ViewerOps.SaveAllEdits[];
+};
+};
+};
+ENDLOOP;
+};
+
+CheckForEmergencySaveAllEdits: PUBLIC PROC [] = {
+TRUSTED {Process.Detach[FORK EmergencySaveAllEdits[NEW[INT]]]};
+};
+
+END.
+  
+  
+ViewerPaintImpl.mesa
+Copyright ” 1985, 1986, 1987, 1988, 1989, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Michael Plass, March 15, 1992 5:03 pm PST
+Russ Atkinson (RRA) March 2, 1987 6:57:18 pm PST
+Doug Wyatt, June 27, 1988 1:29:35 pm PDT
+Bier, September 11, 1990 3:26 pm PDT
+Christian Jacobi, July 1, 1992 11:57 am PDT
+Willie-s, November 21, 1991 1:26 pm PST
+
+The intent of this crock is to show the file version for $Text viewers: if name is a prefix of file, show the remainder of file (presumably "!n") in parentheses
+client-painted caption
+Put a hook here for icon selection? -mfp 
+do we need to paint any of the children?
+recursively paint children
+these guys should be painted in reverse order for correct overlaps
+don't paint if it is completely within the blt 
+map to the coodinate system that rect uses
+Protective stuff that is not required to be locked
+Used to call ViewerGroupLocks.CallRootUnderWriteLock but now ViewerLocks.CallUnderWriteLock is the same ChJ
+Returns the current context creator that is being used for the named screen.
+Note that bitsPerPixel is no longer used.
+EnableScreen: PUBLIC PROC [screen: Screen] RETURNS [ok: BOOL _ FALSE] ~ {
+inner: ENTRY PROC ~ {
+bounds: Imager.Rectangle _ [0, 0, 0, 0];
+IF colorEnabled THEN RETURN; -- we need a per-screen bit here
+ViewerPrivate.SetScreenSize[w: vWorld.terminal.colorWidth, h: vWorld.terminal.colorHeight]; -- need per screen width and height
+THROUGH [0..8) DO
+context: Imager.Context ~ CreateContext[screen ! UNWIND, RuntimeError.Uncaught => ...];
+IF context = NIL THEN RETURN; -- something wrong; bail out now.
+vWorld.contextPool[screen] _ CONS[context, vWorld.contextPool[screen]];
+ENDLOOP;
+bounds _ ImagerBackdoor.GetBounds[vWorld.contextPool[screen].first];
+IF bounds.w > 0 THEN ViewerPrivate.SetScreenSize[w: Real.Round[bounds.w], h: Real.Round[bounds.h], screen];
+colorEnabled _ ok _ TRUE;
+};
+vWorld: ViewersWorld.Ref _ ViewersWorldInstance.GetWorld[];
+DisablePainting[wait: TRUE];
+inner[! UNWIND, RuntimeError.Uncaught => EnablePainting[]];
+EnablePainting[];
+IF ok THEN GreyScreen[screen, 0, 0, 9999, 9999];
+};
+
+If we did this with carets running, we would run the risk of deadlock, since we need to AcquireContext to paint the caret, and paint procs might insist on touching the caret before they finish.  Of course, we can still get in trouble if a paint proc calls PaintViewer . . .
+Caution: we assume that we have the viewer locked, yet PaintClient is exported to ViewerPrivate.  The locking is now the caller's responsibility.
+Color the entire screen with the given color.
+ ù ì  ñ"cedarcode" styleïNewlineDelimiter
+ô codeöúôKöú
+œeúUô`Kô)Kô0Kô(Kô$Kô+Kô'Kô óöœk	ò	KöúûúòKöúûúò+Köúûúò!KöúûúòKöúûúåòòKöúûúQòeKò	Köú
+ò
+Köúûú5òBKöúûú	òKöúûú$ò1Köúûú
+ûúòKöúûúòKò
+KòKöúûú"ò.Köúûúò-Köúûú	òKöúûúò/Köú
+ûúHòWKöúòKöúòKòKòKöúòKòKöúûúò&óKò ö–blúûúûòKöûúÔòˆKöûú.ò5Köûú)ò/Köúûúûú'ò3óò Köúûú$ò<Köúûú!ò2KöûúûúûúòKöúûú%òAKò óKöúûúòKò ö
+œnúûúûúûúûúò;KöúûúòKöú	ûúò!KöúûúòKöú	ûúò!Köúûúûúûúò;Köú4ò4öûúûú$ûú
+ûúòOKöú†ô†Köú4ò4KöúDòDKöú3ò3KòóöûúûúûòöúòKöú>ò>óöúòKöú=ò=óöúòKöú;ò;óKöûúòóöûúûúûòKöú:ò:óKöûú
+òKòKò óö†úûú.ò@Kö	úûúûúûúûúò=öûúûòöûúòKöúôKöúûúòKöúûúò%KöúûúòKöúûúòöúûúòKòKòKò+Kò&KöúòóKò"KöúòóöûúòKöúûúûúò)Kò'Köú5ò5Köú5ò5Köú5ò5Köú/ò/Kö	úûúûúûúûúò=KöúûúòKöúûúòKöúûúòKöú	ûú=òMKöú
+ûúò(Köú"ò"Kò@Köú$ò$öûúûúòKöú%ò%KöúTòTKöúòóKòöûúûúò!Köú%ò%Köú?ò?Köú!ò!Köú?ò?Köú!ò!KöúòóKöú%ò%Köú=ò=Köú!ò!KöúòóóKòKò óö†úûúûúûúò:öûú*ûúûò9Köúûú	ò&Kö
+ûúûúûúûúûúòNóKöúòKò óö
+†úûú3ûú ûúûúò|Köûúûúò0öûúûúûúûúò*Kö	úûúûúûúûúò=KöúûúòKöúûúòKöúûú$ò.Köúûúò'öûúûúûúòöûúûúûúòKò'Kò+KöúòóKò'Kò8KöúòóKöúBòBKòóKöúòKò óö
+†	úûú0ûúûúûúòQöúûúò.Köœtú#°ô+öûúûúûòöúòKöú@ò@KòóöúòKöúûúûúò2Köúûúò#Köú
+ûúKòYöûúûòKöúûúûúò6Köúûúûúûúò:KöûúòóKöú$ò$öûú#ûúò+Köú0ò0Kò<KöúòóKòóKöûúòóKòóKöûúûúûú!ò:KöúòóKò ö†úûúûúûúò6Köûúûúûúûúò/öûú)ûúûò8Köúûúûú	òKöûúûúò óKöúòKò óKö†úûúûúòKò ö
+†úûú1ûú	ûú%ûúòåKöúûúûúòKöúûúòKöú	ûúòKò ö	ûúûúûúûúœcòBöûú
+ûúûúòKöûúûúûúûúò7Köûúûúûúûúò7KöúòóKöûúûúûúûúò!KöûúòóKò öûúûúòöúûúò0KöúûúòKöúûúòKöûúûúûúûúòAöûúûúûú
+ûúò-Kò'Kò+KöúûúòKöúòóöûúûú
+ûúò$Köúûúò Kò'Köú:ò:Köú;ò;Köú:ò:Köú;ò;Köúòóöûúûúûúûò2Köú?ò?óKòóKò"KöúòKò óöûú
+ûúûúò!öúûúò0KöûúûúûúûúòAö	ûúûúûúûúûòFKöúûú¢=òQóöûúûúûúò Kò'Köú;ò;Kò'Köûúûúûúûúò#KöúûúòKöúûúòKöúòóöûúûúûúò Köú?ò?KòóKòóKöú"ò"KöúòKò óKöú(ô(Köûúûúûúòö
+ûúûúûúûúûúò*Köûúûú'ò?Köûúûú(ûúûúòMKöúòóKò Köúôöûú
+ûúûúûò(KöúBôBöûú%ûúûúûò6öûúûúûúòKöú/ô/Köú*ô*öûúûò$KöúLòLóKöûú=òAöûúûú ûò6Köúûú ûúûúò;óóKöú ûúòAKöûúòKò óóKöúòKò óö†úûúûú:ûúûúûúûúûúò~ö†úûúòKöúûúòKöûúûúûúûúûúûúòQöûúûúòKöûúûú&ò@KöûòKöúòóöûúûúûòKöú ò KöûúòóKöúNûúûúûú)ò•Köúòóöûú
+ûúûúûúûúûúòIKöú2ô2Köúkôkóöú9ò9Köú/ûúûúò?KöûúûúòKöúûúòKöúûú%ûúûúòNKöúòóKöúòKò óKöúûúò$Kò ö†úûúûúûúòQKò;Köûú9ò?KòKò óö†úûúûú	ò>Köúûúûúûúò!Kò;Köúûúò!öûúûòKöúPòPKöúûúòKöûúòóKöú ò KöúòKò óö†úûúûúò%KöúòKöúòKò óö†
+úûúûú6ûúòröúûúûúòKöúòKöúòKöúòKöûúûúò*KòóKò;KöúûúòKöúòKöúòKöúòKò óö†úûúûú ûúòUöúûúûúòKöúòKòóKò;KöúûúòKöúòò KöûúúòKöúûú%ûúûúòNKòóKöúòKöúòKò óö†úûúûúûúòTKôLKò;KöúòKòKò óö†úûúûúûúò?Köûúò#KöúòKò óö†úûúûúò>KöûúûúûúûúûúûúòJKöúòKò óKöúûúûúòKò ö†úûúûúûúûúûúûúòKKöú)ô)öúûúûúòKò(KöûúûúûúòKöú.–bfú£úòcöûúûòò0KöûúûúúòKöúûú%ûúûúòOKòóKö	ûúûúûúûú¢!ò?Köúûú%òEKöûúòóKöúCòCKöûúûúTòhKöúûúòKöûúòKòóKò;KöúûúòKöúòKöúòöûúûúòKöú$ò$KòóKöúòKò óö†úûúûúûúûúûúôIöúûúûúôKô(Köûúûúûú"ô=Köú\¢#ôöûúûôKôWKö	ûúûúûúûú¢!ô?Köúûú&ôGKöûúôóKöúDôDKöûúûúWôkKöúûúôKôóKöú;ô;KöúûúôKöúûûûú+ô;KöúôKöûúûú&ô0KöúôKô óö†úûúûúòöúûúûúòKöúûúò KöúûúòKòóKò;KöúûúòKöúòKöúòKöúòKò óKöúûú¢ò<Köúû	ú¢,òIKò Köúûú¢"ò>Köúû	ú¢'òCKò ö
+†úûúûúûúûúò4öúûúûúòKöúëôëKòKöûúûúûúûúûúûúòDKöúòóKöúòKöú	ò	KöúòKöúòKò óö†úûúûúûúò%öûúòKöûúò"Köûúû	úò3óKöúòKò óö†úûúûúûúò.Köûúûúûúûúò7KöúòKò óö†úûúûúûú"òUKöúòKò;Köûúûúûúûúò5Köú ò Köú"ò"öûú%ûúûúûò9Köú%ò%Kö
+ûú	ûúûúûúûúò@KöûúòóKöúLòLKöûúûúûúòKòKò óö†úûúûú8òRöûú	ûúûòöûú,ûúûúûò@Köûúûúûúûúò6KöûúòóóKöú ò Köûúûúû	úò5KòóKò ö†úûúûúûú,ûúûúòrKöú"ò"KöúòKöúûúûúòöúûúòKöú"ò"öûúòöûúòKöúòKöúûúòKòKöúûúòKöúòKöúòóKöûúòóKöúòóKöú*ò*KöúòKöûú	ûúûú!ò4öûú	ûúûúòò'öûúòKöûúûúò0KòKòóKöúûú%ûúûòMKòóKòóKöúòKòKò óö†úûúûú8òrKöúûúòKöúòKöûúûúûúûúò-KöúXòXKòKò óö†úûúûúûúòUöúûúò0Köûúûú#ûúòNKöú2ûúò9Köú0ò0KòóKöú6ûúò=KòKò óö†úûúûúûúòUKöúëôëöúûúò0Köú2ûúò8Köú0ò0KòóöûúûúûòKöú6ûúò=óKòKò óö†úûú3ûúòIKöúûúòKöú-ò-Köú/ò/KöúòKò óö
+†úûú3ûúûú
+ûúòdKòKöú	ûúûúûúò>KöúûúòKöúûúòKöúòKöúûú	ûúûúò=Köûú
+ûúûú3ûúòMöûúûúòKöúòKöúòKöúòKöúòKòóKöú;ò;KöúòKò óö†úûúò,Köúûúò!Köúûúò ö†úûúûúòKöúUûúò[Köúòóöûú$ûúûò.Köú>ò>óöûú%ûúûò/Köú@ò@óKöúòKò óKöú@ò@öú1ò1Kò óö†úûúûú*òBKô-öúûúò/Köú ò Kò1KòóKöú!ò!KòKò óö†
+úûúûúûúòAöúûúò.KöúûúûúûúòKKò+KòóKöú ò KòKò óö†
+úûúûúò,Köú&ò&öúûúò.KöúûúòKöûúûú#ûúòNKöú>ûúòEKöúûúûúûúòKKöú=ò=KòóKöú ò KòóKò ö†úûúûúûúòEöúûúò0Köú0ò0Köú+ò+KòóKò"KöúòKò óö†	úûú.ò=ö†úûúòöúûúò/Köú0ò0Kò;KöúòKò;KòóKö
+ûúûúûúûúûúò6Kò!Kòóöú6ò6Köúûúò"óKöúòKò óö†úûúûú ûúòFKöú5ò5KöúòKò óö†	úûúûúûúûúûúò|Köûúûú&ò?öûúò	öúòKöûúJòNóKöúòóKöúòKò óö†úûúûú/ûúòeKöú=ò=KöúIòIöûòKöú!ò!KöûúûúûúòKöûúûúò$ö	ûúûúûúûú¢òHKöú"ò"öûúûúûúò)Köûú(ûúûúò6óKöûúòóKöûúòóKöúòKò óKò ö†úûúûúòKò@KòKò óKöú	ûúûúòö†úûúûúò*Kò5Köú%ò%KòöûúûòKòKòKò)öûú
+ûúûúòKò?öûú
+ûúûúòö
+†úûúûúûúûúò>Köûú<òBKòóö
+ûúûúûúûúûúòZKòKòóKòóKòóKöûúòóKöúòKò óö†úûúûúò1Köûúûúûúûúò?òKò óóKöûúòó Öó    T¥  y]  

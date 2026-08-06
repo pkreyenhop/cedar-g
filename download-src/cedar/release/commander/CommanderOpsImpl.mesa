@@ -1,0 +1,862 @@
+DIRECTORY Atom, Basics, BasicTime, List, CommanderBackdoor, CommanderRegistry, CommanderOps, Commander, CommanderSys, Convert, IO, ProcessProps, RefText, Rope, UXStrings;
+CommanderOpsImpl: CEDAR MONITOR
+IMPORTS Atom, BasicTime, List, Commander, CommanderRegistry, CommanderSys, Convert, IO, ProcessProps, RefText, Rope, UXStrings
+EXPORTS CommanderOps, CommanderBackdoor
+~ BEGIN
+
+ROPE: TYPE ~ Rope.ROPE;
+ArgumentVector: TYPE ~ REF ArgumentVectorRep;
+ArgumentVectorRep: TYPE ~ CommanderOps.ArgHandleObject;
+QuoteTreatment: TYPE ~ CommanderOps.QuoteTreatment;
+CommandToolData: TYPE ~ CommanderBackdoor.CommandToolData;
+PrivateDataRep: PUBLIC TYPE ~ RECORD [
+parseRecord: REF ParseRecord ¨ NIL,
+nestedMsg: ROPE ¨ NIL -- used for inhibiting unwanted repetition of messages
+];
+doubleQuote: CHAR = '";	doubleQuoteRope: ROPE = Rope.FromChar[doubleQuote];
+openParen: CHAR = '(;	openParenRope: ROPE = Rope.FromChar[openParen];
+closeParen: CHAR = ');	closeParenRope: ROPE = Rope.FromChar[closeParen];
+Failed: PUBLIC ERROR [errorMsg: ROPE] ~ CODE;
+
+scratchRIS: IO.STREAM ¨ NIL;
+ObtainRIS: ENTRY PROC [rope: ROPE] RETURNS [ris: IO.STREAM] = {
+ris ¨ IO.RIS[rope, scratchRIS];
+scratchRIS ¨ NIL;
+};
+ReleaseRIS: ENTRY PROC [stream: IO.STREAM] = { scratchRIS ¨ stream };
+
+seprChars: REF READONLY TEXT ¨ " \t\r\l";
+breakChars: REF READONLY TEXT ¨ "\"@|(,){;}";
+CmdTokenBreak: PROC [char: CHAR] RETURNS [IO.CharClass] = {
+FOR i: NAT IN [0..breakChars.length) DO
+IF char = breakChars[i] THEN RETURN [break]
+ENDLOOP;
+FOR i: NAT IN [0..seprChars.length) DO
+IF char = seprChars[i] THEN RETURN [sepr]
+ENDLOOP;
+RETURN [other]
+};
+
+Token: TYPE ~ CommanderOps.Token;
+nullToken: Token ~ CommanderOps.nullToken;
+
+GetCmdToken: PUBLIC PROC [stream: IO.STREAM] RETURNS [token: Token ¨ nullToken] = {
+skip: INT ¨ 0;
+token.start ¨ IO.GetIndex[stream];
+[token: token.value, charsSkipped: skip] ¨ IO.GetTokenRope[stream, CmdTokenBreak ! IO.EndOfStream => CONTINUE];
+token.start ¨ token.start + skip;
+token.literal ¨ token.value;
+SELECT TRUE FROM
+Rope.Equal[token.value, doubleQuoteRope] => {
+IO.Backup[self: stream, char: doubleQuote];
+{  startIndex: INT ~ token.start ¨ IO.GetIndex[stream];
+rope: ROPE ~ IO.GetRopeLiteral[stream ! IO.Error, IO.EndOfStream => GOTO MisMatch];
+length: INT ~ IO.GetIndex[stream] - startIndex;
+token.value ¨ rope;
+IO.SetIndex[stream, startIndex];
+token.literal ¨ IO.GetRope[stream, length];
+};
+};
+Rope.Equal[token.value, openParenRope] => {
+startIndex: INT ~ token.start ¨ IO.GetIndex[stream]-1;
+DO
+subtoken: Token ~ GetCmdToken[stream];
+IF subtoken.literal = NIL THEN ERROR Failed["Unmatched parentheses in command line"];
+IF Rope.Equal[subtoken.literal, closeParenRope] THEN {
+length: INT ~ IO.GetIndex[stream] - startIndex;
+IO.SetIndex[stream, startIndex];
+token.literal ¨ IO.GetRope[stream, length];
+token.value ¨ Rope.Substr[token.literal, 1, length-2];
+EXIT;
+};
+ENDLOOP;
+};
+Rope.Equal[token.literal, "$"] => {
+IF NOT IO.EndOf[stream] THEN SELECT IO.PeekChar[stream] FROM
+doubleQuote, openParen => {
+rest: Token ~ GetCmdToken[stream];
+token.literal ¨ token.value ¨ Rope.Concat[token.literal, rest.literal];
+};
+ENDCASE;
+};
+ENDCASE => NULL;
+EXITS MisMatch => ERROR Failed["Mismatched double quotes in command line"]
+};
+
+ParseToList: PUBLIC PROC [cmd: Commander.Handle, quoteTreatment: QuoteTreatment] RETURNS [list: LIST OF ROPE, length: NAT ¨ 0] ~ {
+head: LIST OF ROPE ~ LIST[ArgN[cmd, 0, quoteTreatment]];
+last: LIST OF ROPE ¨ head;
+DO
+arg: ROPE ~ NextArgument[cmd, quoteTreatment];
+IF arg = NIL THEN EXIT;
+last ¨ last.rest ¨ LIST[arg];
+length ¨ length + 1;
+ENDLOOP;
+list ¨ head.rest;
+head.rest ¨ NIL;
+};
+
+Parse: PUBLIC PROC [cmd: Commander.Handle, quoteTreatment: QuoteTreatment] RETURNS [argv: ArgumentVector] ~ {
+n: NAT ~ NumArgs[cmd]; 
+argv ¨ NEW[ArgumentVectorRep[n]];
+argv[0] ¨ ArgN[cmd, 0, quoteTreatment];
+FOR i: NAT IN [1..n) DO
+IF (argv[i] ¨ NextArgument[cmd, quoteTreatment]) = NIL THEN ERROR;
+ENDLOOP;
+IF NextArgument[cmd, quoteTreatment] # NIL THEN ERROR;
+};
+
+ParseToTList: PROC [cmd: Commander.Handle] RETURNS [list: LIST OF Token, length: NAT ¨ 0] ~ {
+head: LIST OF Token ~ LIST[nullToken];
+last: LIST OF Token ¨ head;
+cmds: IO.STREAM ¨ ObtainRIS[cmd.commandLine];
+DO
+token: Token ~ GetCmdToken[cmds];
+IF token.value = NIL THEN EXIT;
+last ¨ last.rest ¨ LIST[token];
+length ¨ length + 1;
+ENDLOOP;
+list ¨ head.rest;
+head.rest ¨ NIL;
+ReleaseRIS[cmds];
+};
+
+ParseRecord: TYPE = RECORD [
+argumentList: LIST OF Token ¨ NIL,
+argumentPointer: INT ¨ 0,
+argumentListTail: LIST OF Token ¨ NIL,
+commandLine: ROPE
+];
+
+GetParseRecord: PROC [cmd: Commander.Handle] RETURNS [pr: REF ParseRecord] ~ {
+data: CommandToolData ¨ GetCommandToolData[cmd];
+private: REF PrivateDataRep ¨ data.private;
+pr ¨ private.parseRecord;
+IF pr = NIL OR pr.commandLine # cmd.commandLine THEN {
+pr ¨ NEW[ParseRecord ¨ []];
+pr.argumentListTail ¨ pr.argumentList ¨ ParseToTList[cmd].list;
+pr.commandLine ¨ cmd.commandLine;
+private.parseRecord ¨ pr;
+};
+};
+
+NumArgs: PUBLIC PROC [cmd: Commander.Handle] RETURNS [n: INT ¨ 1] ~ {
+pp: REF ParseRecord ¨ GetParseRecord[cmd];
+FOR tail: LIST OF Token ¨ pp.argumentList, tail.rest UNTIL tail = NIL DO n ¨ n + 1 ENDLOOP;
+};
+NextArgument: PUBLIC PROC [cmd: Commander.Handle, quoteTreatment: QuoteTreatment] RETURNS [arg: ROPE ¨ NIL] ~ {
+pp: REF ParseRecord ¨ GetParseRecord[cmd];
+IF pp.argumentListTail = NIL THEN RETURN;
+arg ¨ SELECT quoteTreatment FROM
+stripQuotes => pp.argumentListTail.first.value,
+leaveQuotes => pp.argumentListTail.first.literal,
+ENDCASE => ERROR;
+pp.argumentListTail ¨ pp.argumentListTail.rest;
+pp.argumentPointer ¨ pp.argumentPointer + 1;
+};
+ArgN: PUBLIC PROC [cmd: Commander.Handle, n: INT, quoteTreatment: QuoteTreatment] RETURNS [arg: ROPE ¨ NIL] ~ {
+pp: REF ParseRecord ¨ GetParseRecord[cmd];
+IF n = 0 THEN {
+pp.argumentListTail ¨ pp.argumentList;
+pp.argumentPointer ¨ 0;
+RETURN [cmd.command]
+};
+n ¨ n - 1;
+IF n < 0 THEN RETURN [NIL];
+IF n < pp.argumentPointer THEN {
+pp.argumentListTail ¨ pp.argumentList;
+pp.argumentPointer ¨ 0;
+};
+UNTIL n = pp.argumentPointer DO
+IF pp.argumentListTail = NIL THEN RETURN [NIL];
+pp.argumentListTail ¨ pp.argumentListTail.rest;
+pp.argumentPointer ¨ pp.argumentPointer + 1;
+ENDLOOP;
+IF pp.argumentListTail = NIL THEN RETURN [NIL];
+arg ¨ SELECT quoteTreatment FROM
+stripQuotes => pp.argumentListTail.first.value,
+leaveQuotes => pp.argumentListTail.first.literal,
+ENDCASE => ERROR;
+pp.argumentListTail ¨ pp.argumentListTail.rest;
+pp.argumentPointer ¨ pp.argumentPointer + 1;
+};
+PutProp: PUBLIC PROC [cmd: Commander.Handle, key, val: REF] ~ {
+IF cmd # NIL THEN {
+new: Atom.PropList ¨ List.PutAssoc[key: key, val: val, aList: cmd.propertyList];
+IF new # cmd.propertyList THEN ERROR Failed["PutProp failed"];
+};
+};
+
+GetProp: PUBLIC PROC [cmd: Commander.Handle, key: REF] RETURNS [value: REF] ~ {
+value ¨ CommanderRegistry.GetProp[cmd, key];
+IF value = NIL AND cmd # NIL THEN value ¨ List.Assoc[key: key, aList: cmd.propertyList];
+IF value = NIL THEN value ¨ ProcessProps.GetProp[key];
+IF value = NIL THEN WITH key SELECT FROM
+atom: ATOM => { value ¨ CommanderSys.GetEnv[Atom.GetPName[atom]] };
+ENDCASE => NULL;
+};
+
+DoSubstitutions: PROC [cmd: Commander.Handle, rope: ROPE] RETURNS [ROPE] ~ {
+size: INT ¨ Rope.Size[rope];
+index: INT ¨ FindTerminator[rope, INT.LAST, "$", 0]+1;
+length: NAT ¨ 0;
+FOR cur: INT ¨ index, FindTerminator[rope, INT.LAST, "$", index]+1 UNTIL cur >= size DO
+numeric: BOOL ¨ TRUE;
+subst: ROPE ¨ NIL;
+IF cur < size AND (SELECT Rope.Fetch[rope, cur] FROM doubleQuote, openParen => TRUE ENDCASE => FALSE)
+THEN {
+res: REF;
+commandLine: ROPE ¨ NIL; {
+ris: IO.STREAM ~ ObtainRIS[rope];
+IO.SetIndex[ris, cur];
+commandLine ¨ GetCmdToken[ris].value;
+length ¨ IO.GetIndex[ris] - cur;
+ReleaseRIS[ris];
+};
+[subst, res] ¨ DoCommandRope[commandLine: commandLine, parent: cmd];
+IF res = $Failure THEN Failed[NIL];
+subst ¨ RemoveEOL[subst];
+}
+ELSE {
+text: REF TEXT ¨ RefText.ObtainScratch[100];
+text.length ¨ 0;
+WHILE INT[cur + text.length] < size DO
+c: CHAR ~ Rope.Fetch[rope, cur + text.length];
+IF c IN ['A..'Z] OR c IN ['a..'z] OR c IN ['0..'9] OR c = '_
+THEN {
+text ¨ RefText.AppendChar[text, c];
+numeric ¨ numeric AND c IN ['0..'9];
+}
+ELSE EXIT;
+ENDLOOP;
+IF numeric
+THEN {
+i: CARD ¨ CARD.LAST;
+i ¨ Convert.CardFromRope[RefText.TrustTextAsRope[text] ! Convert.Error => CONTINUE];
+WITH GetProp[cmd, $CommandFileArgumentVector] SELECT FROM
+argv: ArgumentVector => {
+IF i+1 < argv.argc THEN {
+subst ¨ argv[i+1];
+};
+};
+ENDCASE => NULL;
+}
+ELSE {
+atom: ATOM ~ Atom.MakeAtomFromRefText[text];
+WITH GetProp[cmd, atom] SELECT FROM
+rope: ROPE => subst ¨ rope;
+ENDCASE => NULL;
+};
+length ¨ text.length;
+RefText.ReleaseScratch[text];
+};
+IF subst # NIL
+THEN {
+rope ¨ Rope.Replace[base: rope, start: cur-1, len: length+1, with: subst];
+index ¨ cur-1 + Rope.Size[subst];
+size ¨ Rope.Size[rope];
+}
+ELSE { index ¨ cur + length };
+ENDLOOP;
+RETURN [rope]
+};
+
+FindTerminator: PROC [rope: ROPE, maxNest: INT, terminators: REF TEXT, start: INT ¨ 0] RETURNS [INT] = {
+IsTerminator: PROC [c: CHAR] RETURNS [BOOL] ~ INLINE {
+FOR k: NAT IN [0..terminators.length) DO
+IF c = terminators[k] THEN RETURN [TRUE];
+ENDLOOP;
+RETURN [FALSE]
+};
+end: INT ~ Rope.Size[rope];
+i: INT ¨ start;
+state: {outside, insideQuotes} ¨ outside;
+nest: INT ¨ 0;
+WHILE i < end DO
+c: CHAR ~ rope.Fetch[i];
+SELECT state FROM
+outside => {
+SELECT c FROM
+openParen => { nest ¨ nest + 1 };
+closeParen => { nest ¨ nest - 1 };
+doubleQuote => { state ¨ insideQuotes };
+ENDCASE => IF nest <= maxNest AND IsTerminator[c] THEN EXIT;
+};
+insideQuotes => {
+IF c = '\\
+THEN { i ¨ i + 1 }
+ELSE IF c = doubleQuote THEN {
+IF end > (i + 1) AND rope.Fetch[i+1] = doubleQuote
+THEN { i ¨ i + 1 }
+ELSE { state ¨ outside };
+};
+};
+ENDCASE => ERROR;
+i ¨ i + 1;
+ENDLOOP;
+IF state = insideQuotes THEN ERROR Failed["Mismatched double quotes in command line"];
+RETURN [i]
+};
+
+GetPrivate: PROC [cmd: Commander.Handle] RETURNS [REF PrivateDataRep] ~ {
+IF cmd # NIL THEN {
+pd: CommandToolData ~ GetCommandToolData[cmd];
+IF pd # NIL THEN RETURN [pd.private];
+};
+RETURN [NIL]
+};
+
+PutMsg: PROC [cmd: Commander.Handle, rope: ROPE] ~ {
+data: CommandToolData ~ GetCommandToolData[cmd];
+private: REF PrivateDataRep ¨ GetPrivate[cmd];
+parentPrivate: REF PrivateDataRep ¨ GetPrivate[data.parentCommander];
+IF rope # NIL AND cmd # NIL AND (private=NIL OR private.nestedMsg # rope) THEN {
+len: INT ~ Rope.Size[rope];
+IO.PutRope[cmd.err, rope];
+IF len = 0 OR Rope.Fetch[rope, len-1] # '\n THEN { IO.PutRope[cmd.err, "\n"] };
+};
+IF parentPrivate # NIL THEN parentPrivate.nestedMsg ¨ rope;
+};
+
+EnsureWhitespace: PROC [rope: ROPE] RETURNS [ROPE] ~ {
+pre: ROPE ~ IF Rope.Match[" *", rope] THEN NIL ELSE " ";
+post: ROPE ~ IF Rope.Match["*\n", rope] THEN NIL ELSE "\n";
+RETURN [Rope.Cat[pre, rope, post]]
+};
+
+RemoveEOL: PROC [rope: ROPE] RETURNS [ROPE] ~ {
+IF Rope.Match["*\n", rope] THEN rope ¨ Rope.Substr[rope, 0, Rope.Size[rope]-1];
+RETURN [IF rope = NIL THEN "" ELSE rope]
+};
+
+DoCommand: PUBLIC PROC [commandLine: ROPE, parent: Commander.Handle] RETURNS [result: REF] ~ {
+cmd: Commander.Handle ~ CreateFromStreams[parentCommander: parent];
+msg: ROPE ¨ NIL;
+[result: result, msg: msg] ¨ ExecuteCommand[cmd, commandLine];
+};
+DoCommandRope: PUBLIC PROC [commandLine, in: ROPE ¨ NIL, parent: Commander.Handle]
+RETURNS [out: ROPE, result: REF] ~ {
+outStream: IO.STREAM ¨ IO.ROS[];
+cmd: Commander.Handle ~ CreateFromStreams[in: IO.RIS[in], out: outStream, parentCommander: parent];
+msg: ROPE ¨ NIL;
+[result: result, msg: msg] ¨ ExecuteCommand[cmd, commandLine];
+out ¨ IO.RopeFromROS[outStream];
+};
+ProcessPropsDiffer: PROC [cmd: Commander.Handle] RETURNS [List.AList] ~ {
+differ: List.AList ¨ NIL;
+Do: PROC [key, val: REF] ~ {
+IF ProcessProps.GetProp[key] # val THEN differ ¨ Atom.PutPropOnList[propList: differ, prop: key, val: val];
+};
+Do[$CommanderHandle, cmd];
+Do[$StdIn, cmd.in];
+Do[$StdOut, cmd.out];
+Do[$ErrOut, cmd.err];
+RETURN [differ]
+};
+
+CommandWithProcessProps: PROC [cmd: Commander.Handle] RETURNS [result: REF, msg: ROPE] ~ {
+commandToolData: CommandToolData ~ GetCommandToolData[cmd];
+differ: List.AList ¨ ProcessPropsDiffer[cmd];
+IF commandToolData = NIL OR commandToolData.verbose THEN {
+IO.PutRope[cmd.err, " *** "];
+IO.PutRope[cmd.err, cmd.command];
+IO.PutRope[cmd.err, cmd.commandLine];
+};
+IF differ = NIL
+THEN { [result: result, msg: msg] ¨ cmd.procData.proc[cmd] }
+ELSE {
+Inner: PROC ~ { [result: result, msg: msg] ¨ cmd.procData.proc[cmd] };
+ProcessProps.AddPropList[propList: differ, inner: Inner];
+};
+};
+
+ExecuteCommand: PUBLIC PROC [cmd: Commander.Handle, wholeCommandLine: ROPE]
+RETURNS [result: REF ¨ NIL, msg: ROPE ¨ NIL] ~ {
+residual: ROPE ¨ wholeCommandLine;
+data: CommandToolData ~ GetCommandToolData[cmd];
+WHILE residual # NIL DO
+data.private.nestedMsg ¨ NIL;
+BEGIN
+ENABLE {
+Failed => { msg ¨ errorMsg; GOTO Failure };
+};
+line: ROPE ~ residual;
+commandLineIndex: INT ¨ 0;
+command: ROPE ¨ NIL; {
+cmds: IO.STREAM ¨ ObtainRIS[line];
+command ¨ IO.GetTokenRope[cmds, CmdTokenBreak ! IO.EndOfStream => CONTINUE].token;
+commandLineIndex ¨ IO.GetIndex[cmds];
+ReleaseRIS[cmds];
+cmds ¨ NIL;
+};
+IF command = NIL THEN RETURN;
+residual ¨ NIL; -- in case CommandSetup raises an error
+residual ¨ CommandSetup[cmd, line, command, commandLineIndex];
+[result: result, msg: msg] ¨ CommandWithProcessProps[cmd];
+EXITS
+Failure => { result ¨ $Failure };
+END;
+PutMsg[cmd, msg];
+PutProp[cmd, $Result, result];
+PutProp[cmd, $Msg, msg];
+ENDLOOP;
+};
+DoLookup: PROC [cmd: Commander.Handle, command: ROPE] ~ {
+unabbreviated: ROPE ¨ command;
+cmd.procData ¨ Commander.Lookup[command];
+IF cmd.procData = NIL THEN {
+result: REF ¨ NIL;
+[result: result] ¨ ExecuteBasicCommand[cmd: cmd, command: "PreRegister", commandLine: command !
+Failed => ERROR Failed[Rope.Cat["Failed in PreRegister ", command, ": ", errorMsg]]
+];
+WITH result SELECT FROM
+rope: ROPE => unabbreviated ¨ rope;
+ENDCASE => NULL;
+cmd.procData ¨ Commander.Lookup[unabbreviated];
+IF cmd.procData = NIL THEN {
+ERROR Failed[Rope.Cat["PreRegister ", command, " failed to register ", unabbreviated]];
+};
+};
+cmd.command ¨ unabbreviated;
+};
+
+CommandSetup: PROC [cmd: Commander.Handle, wholeCommandLine, command: ROPE, commandLineIndex: INT] RETURNS [residual: ROPE ¨ NIL] ~ {
+DoLookup[cmd, command];
+IF NOT cmd.procData.interpreted
+THEN { cmd.commandLine ¨ EnsureWhitespace[Rope.Substr[base: wholeCommandLine, start: commandLineIndex]] }
+ELSE {
+redirectFrom: ROPE ¨ NIL;
+redirectTo: ROPE ¨ NIL;
+append: BOOL ¨ FALSE;
+skip: INT ¨ 0;
+NoteRedirection: PROC [pos: INT, in: BOOL] ~ {
+SELECT Rope.Fetch[wholeCommandLine, pos-1] FROM
+' , '\t => {
+ris: IO.STREAM ~ ObtainRIS[wholeCommandLine];
+fName: ROPE;
+IF in AND redirectFrom # NIL THEN ERROR Failed["Error: Multiple input redirection"];
+IF NOT in AND redirectTo # NIL THEN ERROR Failed["Error: Multiple output redirection"];
+IO.SetIndex[ris, pos + 1];
+IF NOT in AND NOT IO.EndOf[ris] AND IO.PeekChar[ris] = '> THEN {
+append ¨ TRUE;
+[] ¨ IO.GetChar[ris];
+};
+fName ¨ GetCmdToken[ris].literal;
+IF fName = NIL THEN ERROR Failed["Error: Invalid redirection syntax"];
+fName ¨ DoSubstitutions[cmd, fName];
+IF in THEN redirectFrom ¨ fName ELSE redirectTo ¨ fName;
+wholeCommandLine ¨ Rope.Replace[base: wholeCommandLine, start: pos, len: IO.GetIndex[ris]-pos];
+length ¨ Rope.Size[wholeCommandLine];
+ReleaseRIS[ris];
+};
+ENDCASE => { skip ¨ 1 }; -- was not a redirection because no leading whitespace
+};
+length: INT ¨ Rope.Size[wholeCommandLine];
+break: INT ¨ -1;
+pipe: BOOL ¨ FALSE;
+FOR cur: INT ¨ commandLineIndex, FindTerminator[wholeCommandLine, 0, "|;<>", cur+skip] WHILE cur < length DO
+skip ¨ 0;
+SELECT Rope.Fetch[wholeCommandLine, cur] FROM
+'; => { break ¨ cur; EXIT };
+'| => {
+break ¨ cur; pipe ¨ TRUE;
+IF redirectTo # NIL THEN ERROR Failed["Error: Multiple output redirection"];
+EXIT;
+};
+'< => { NoteRedirection[pos: cur, in: TRUE] };
+'> => { NoteRedirection[pos: cur, in: FALSE] };
+ENDCASE => { skip ¨ 1 }; -- should never happen
+ENDLOOP;
+IF break < 0 THEN break ¨ length;
+IF break < length THEN residual ¨ Rope.Substr[base: wholeCommandLine, start: break];
+IF pipe OR redirectTo # NIL OR redirectFrom # NIL
+THEN {
+DoLookup[cmd, "RedirectIO"];
+cmd.commandLine ¨ Rope.Cat[
+IF redirectFrom # NIL THEN Rope.Concat[" -from ", redirectFrom] ELSE NIL,
+IF redirectTo # NIL THEN Rope.Concat[IF append THEN " -append " ELSE " -to ", redirectTo] ELSE NIL,
+IF pipe THEN " -pipe" ELSE NIL,
+EnsureWhitespace[Rope.Substr[base: wholeCommandLine, start: 0, len: break]]];
+}
+ELSE {
+cmd.commandLine ¨ DoSubstitutions[cmd, EnsureWhitespace[Rope.Substr[base: wholeCommandLine, start: commandLineIndex, len: break-commandLineIndex]]];
+};
+};
+};
+
+ExecuteBasicCommand: PROC [cmd: Commander.Handle, command, commandLine: ROPE] RETURNS [result: REF, msg: ROPE] ~ {
+cmd.command ¨ command;
+cmd.commandLine ¨ EnsureWhitespace[commandLine];
+cmd.procData ¨ Commander.Lookup[command];
+IF cmd.procData = NIL THEN {
+ERROR Failed[Rope.Concat["Unknown command: ", command]];
+};
+[result: result, msg: msg] ¨ CommandWithProcessProps[cmd];
+IF result = $Failure THEN ERROR Failed[msg];
+};
+looksItalic: ROPE ~ "ABCDEFGHiJKLMNOPQRSTUVWXYZ";
+PutItalics: PROC [stream: IO.STREAM, rope: ROPE] ~ {
+IO.PutF[stream, "%l%g%l\n",
+[rope[looksItalic]],
+[rope[rope]],
+[rope["I"]]
+];
+};
+
+BeforeProcessing: PROC [cmd: Commander.Handle, startTime: CommanderSys.EGMT, commandLine: ROPE] ~ {
+data: CommandToolData ~ GetCommandToolData[cmd];
+IF data.recent = NIL THEN data.recent ¨ NEW[CommanderBackdoor.CommandHistoryElement];
+data.recent≠ ¨ [
+commandNumber: data.recent.commandNumber+1,
+wholeCommandLine: commandLine,
+result: NIL,
+msg: NIL,
+startTime: startTime.gmt,
+seconds: 0,
+allocations: 0,
+pageFaults: 0,
+subHistory: NIL
+];
+IF data.Before # NIL THEN data.Before[cmd];
+};
+
+AfterProcessing: PROC [cmd: Commander.Handle, startTime: CommanderSys.EGMT, result: REF, msg: ROPE] ~ {
+data: CommandToolData ~ GetCommandToolData[cmd];
+endTime: CommanderSys.EGMT ~ CommanderSys.ExtendedNow[];
+intSeconds: INT ~ BasicTime.Period[from: startTime.gmt, to: endTime.gmt];
+microseconds: INT ~ endTime.usecs - startTime.usecs;
+seconds: REAL ~ REAL[intSeconds] + REAL[microseconds]/1.0E+6;
+IF data.recent = NIL THEN data.recent ¨ NEW[CommanderBackdoor.CommandHistoryElement];
+data.recent.result ¨ result;
+data.recent.msg ¨ msg;
+data.recent.seconds ¨ seconds;
+data.recent.subHistory ¨ data.childHistory;
+IF data.keepHistory THEN {
+data.history ¨ CONS[data.recent≠, data.history];
+data.childHistory ¨ NIL;
+IF data.parentCommander # NIL THEN GetCommandToolData[data.parentCommander].childHistory ¨ data.history;
+};
+IF data.After # NIL THEN data.After[cmd];
+};
+
+ReadEvalPrintLoop: PUBLIC PROC [cmd: Commander.Handle] RETURNS [hadFailure: BOOL ¨ FALSE] ~ {
+data: CommandToolData ~ GetCommandToolData[cmd];
+REPLoop: PROC ~ {
+IF data.parentCommander # NIL THEN data.history ¨ GetCommandToolData[data.parentCommander].childHistory;
+DO
+SetProcess[cmd, CommanderSys.CurrentProcess[]];
+IF data.Prompt # NIL THEN data.Prompt[cmd];
+BEGIN
+result: REF ¨ NIL;
+msg: ROPE ¨ NIL;
+line: ROPE ¨ IO.GetLineRope[stream: cmd.in !
+IO.EndOfStream => EXIT;
+IO.Rubout => GOTO Rubout;
+];
+startTime: CommanderSys.EGMT ~ CommanderSys.ExtendedNow[];
+BeforeProcessing[cmd, startTime, line];
+[result: result, msg: msg] ¨ ExecuteCommand[cmd: cmd, wholeCommandLine: data.recent.wholeCommandLine !
+UNWIND => {
+AfterProcessing[cmd, startTime, $Failure, "Aborted"];
+};
+];
+AfterProcessing[cmd, startTime, result, msg];
+IF data.statistics THEN {
+IO.PutF[cmd.out, " %l{ %6.2f sec }%l\n",
+[rope["i"]],
+[real[data.recent.seconds]],
+[rope["I"]]
+]
+};
+IF result = $Failure THEN {
+hadFailure ¨ TRUE;
+IF data.stopOnFailure THEN EXIT;
+};
+EXITS
+Rubout => { PutItalics[cmd.err, " -- <DEL>"]; IO.Reset[cmd.in] };
+END;
+ENDLOOP;
+};
+ProcessUNCAUGHT: PROC [sig: ROPE] RETURNS [reject: BOOL] ~ {
+DO
+action: ErrorAction;
+commandLine: ROPE;
+[action, commandLine] ¨ ErrorPrompt[AdamOrEve[cmd], sig];
+SELECT action FROM
+continue => RETURN [reject: FALSE];
+reject => RETURN [reject: TRUE];
+command => [] ¨ ExecuteCommand[cmd, commandLine];
+ENDCASE => ERROR;
+ENDLOOP;
+};
+REPBase: PROC ~ {
+DO
+ok: BOOL ¨ TRUE;
+aborted: BOOL ¨ FALSE;
+ok ¨ CommanderSys.UNCAUGHTProtect[REPLoop, ProcessUNCAUGHT !
+IO.Error => {
+IF stream = cmd.in OR stream = cmd.err THEN CONTINUE
+};
+ABORTED => { SetProcess[cmd, NIL]; aborted ¨ TRUE; ok ¨ FALSE; CONTINUE }
+];
+IF ok THEN EXIT;
+IF aborted THEN { PutItalics[cmd.err, " -- Aborted"]; IO.Reset[cmd.in] };
+ENDLOOP;
+SetProcess[cmd, NIL];
+};
+Action: PROC ~ IF AlreadyProtected[cmd] THEN REPLoop ELSE REPBase;
+differ: List.AList ~ ProcessPropsDiffer[cmd];
+IF differ = NIL
+THEN Action[]
+ELSE { ProcessProps.AddPropList[propList: differ, inner: Action] };
+};
+AdamOrEve: PUBLIC PROC [cmd: Commander.Handle] RETURNS [Commander.Handle] ~ {
+THROUGH [0..1000) DO
+data: CommandToolData ~ GetCommandToolData[cmd];
+IF data = NIL OR data.parentCommander = NIL THEN RETURN [cmd];
+cmd ¨ data.parentCommander;
+ENDLOOP;
+ERROR; -- paranoia against circularities
+};
+
+AbortCommander: PUBLIC ENTRY PROC [cmd: Commander.Handle] ~ {
+ENABLE UNWIND => NULL;
+data: CommandToolData ~ GetCommandToolData[cmd];
+IF data # NIL AND data.process # NIL AND data.process≠ # NIL THEN {
+CommanderSys.AbortProcess[data.process≠];
+};
+};
+
+SetProcess: PUBLIC ENTRY PROC [cmd: Commander.Handle, process: PROCESS] ~ {
+data: CommandToolData ~ GetCommandToolData[cmd];
+IF data # NIL AND data.process # NIL THEN { data.process≠ ¨ process };
+};
+
+AlreadyProtected: ENTRY PROC [cmd: Commander.Handle] RETURNS [BOOLEAN] ~ {
+data: CommandToolData ~ GetCommandToolData[cmd];
+RETURN [data # NIL AND data.process # NIL AND data.process≠ = CommanderSys.CurrentProcess[]];
+};
+
+GetCommandToolData: PUBLIC PROC [cmd: Commander.Handle] RETURNS [CommandToolData] ~ {
+WITH GetProp[cmd, cmd] SELECT FROM
+data: CommandToolData => RETURN [data];
+ENDCASE => RETURN [NIL];
+};
+
+ErrorAction: TYPE ~ {continue, reject, command};
+ErrorPrompt: PROC [cmd: Commander.Handle, sig: ROPE] RETURNS [errorAction: ErrorAction ¨ continue, commandLine: ROPE ¨ NIL] ~ {
+ENABLE IO.Error, IO.EndOfStream, IO.Rubout => GOTO SkipIt;
+in: IO.STREAM ~ cmd.in;
+out: IO.STREAM ~ cmd.err;
+IO.PutRope[out, "\n*** Uncaught ERROR or SIGNAL: "];
+IO.PutRope[out, sig];
+WITH GetProp[cmd, "DebugUNCAUGHT"] SELECT FROM
+rope: ROPE => {
+SELECT TRUE FROM
+Rope.Equal[rope, "n", FALSE] => RETURN [continue];
+Rope.Equal[rope, "y", FALSE] => RETURN [reject];
+ENDCASE => NULL;
+};
+ENDCASE => NULL;
+IO.PutRope[out, "\n*** Do you want to try to debug this? (y, n, s <flags>, ! <command>, or ?) "];
+IO.Flush[out];
+SELECT IO.PeekChar[in] FROM
+'\r, '\n => [] ¨ IO.GetChar[in];
+ENDCASE;
+DO
+line: ROPE ~ IO.GetLineRope[in];
+c: CHAR ~ IF Rope.IsEmpty[line] THEN '? ELSE Rope.Fetch[line, 0];
+SELECT c FROM
+'n, 'N => RETURN [continue];
+'y, 'Y => RETURN [reject];
+'s, 'S => RETURN [command, Rope.Concat["StackTrace", Rope.Substr[line, 1]]];
+'! => RETURN [command, Rope.Substr[line, 1]];
+ENDCASE => IO.PutRope[out, "\n*** Type 'y' to REJECT the signal and land in the system debugger, 'n' to get back to top level, 's <flags>' to invoke the StackTrace command, '! <command>' to execute a commander command and return to the error prompt: "];
+ENDLOOP;
+EXITS
+SkipIt => RETURN [continue];
+};
+defaultPrompt: ROPE ¨ "Commander %l%% %l";
+DefaultPrompter: PROC [cmd: Commander.Handle] ~ {
+prompt: ROPE ~ WITH GetProp[cmd, $Prompt] SELECT FROM
+rope: ROPE => rope,
+ENDCASE => defaultPrompt;
+IO.PutF[cmd.err, prompt, [rope["b"]], [rope["B"]]];
+};
+
+CreateFromStreams: PUBLIC PROC [in, out, err: IO.STREAM ¨ NIL, parentCommander: Commander.Handle ¨ NIL] RETURNS [cmd: Commander.Handle] ~ {
+data: CommandToolData ¨ NEW[CommanderBackdoor.CommandToolDataRep];
+init: PROC [cmd: Commander.Handle] ¨ NIL;
+oldPropList: Atom.PropList ¨ NIL;
+data.private ¨ NEW[PrivateDataRep];
+cmd ¨ NEW[Commander.CommandObject];
+IF parentCommander = NIL
+THEN {
+data.Prompt ¨ DefaultPrompter;
+data.keepHistory ¨ TRUE;
+}
+ELSE {
+p: CommandToolData ¨ GetCommandToolData[parentCommander];
+IF in = NIL THEN in ¨ parentCommander.in;
+IF out = NIL THEN out ¨ parentCommander.out;
+IF err = NIL THEN err ¨ parentCommander.err;
+IF p # NIL THEN {
+data.Lookup ¨ p.Lookup;
+data.verbose ¨ p.verbose;
+init ¨ p.InitChild;
+data.process ¨ p.process;
+data.keepHistory ¨ p.keepHistory;
+};
+data.parentCommander ¨ parentCommander;
+oldPropList ¨ parentCommander.propertyList;
+};
+IF data.process = NIL THEN data.process ¨ NEW[PROCESS ¨ NIL];
+IF in = NIL THEN in ¨ IO.noInputStream;
+IF out = NIL THEN out ¨ IO.noWhereStream;
+IF err = NIL THEN err ¨ out;
+cmd.in ¨ in;
+cmd.out ¨ out;
+cmd.err ¨ err;
+cmd.propertyList ¨ CONS[NEW[Atom.DottedPairNode ¨ [key: cmd, val: data]], oldPropList];
+IF init # NIL THEN init[cmd];
+};
+
+XRDoCommanderCommands: PROC [commandLine: POINTER TO Basics.RawChars] RETURNS [BOOL] ~ {
+cmd: Commander.Handle ~ CreateFromStreams[in: IO.RIS[UXStrings.ToRope[commandLine]]];
+RETURN ReadEvalPrintLoop[cmd];
+};
+ExternalNames: PROC = TRUSTED MACHINE CODE {
+"^ExternalNames\n";
+"XRDoCommanderCommands XR_DoCommanderCommands\n";
+};
+ExternalNames[];
+
+
+END.
+
+¨ &v ¨ ViewerIO.CreateViewerStreams[name: "CommanderOps"];
+¨ CommanderOpsImpl.ReadEvalPrintLoop[CommanderOpsImpl.CreateFromStreams[in: &v.in, out: &v.out]]
+
+   ^  
+CommanderOpsImpl.mesa
+Copyright ” 1989, 1990, 1991 by Xerox Corporation.  All rights reserved.
+Michael Plass, July 23, 1992 10:39 am PDT
+Last changed by Pavel on April 30, 1990 1:29 pm PDT
+Swinehar, December 11, 1990 3:31 pm PST
+Willie-s, July 9, 1992 12:53 pm PDT
+
+
+Properties maintained or used by this module:
+Commander properties:
+Prompt
+Result
+Msg
+CommandFileArgumentVector
+DebugUNCAUGHT
+Process Properties:
+CommanderHandle
+StdIn
+StdOut
+ErrOut
+
+Constants
+Errors
+Tokenizing
+-- This allocates rather awfully; clean up when possible. - mfp
+Parsing (Public)
+The arguments to the command.
+position of next argument to fetch
+List of unfetched arguments
+used to check if the command line has been parsed already for the current command
+
+
+
+Properties and Substitution
+Strictly, I suppose we should register the rest of this stuff back with CommanderRegistry, but it hardly seems worth it to me - mfp
+Returns the index of the first terminator, skipping quoted strings.
+Execution
+
+
+
+Sets up cmd, including PreRegister if needed; raises Failed if there is a problem.
+Executes with a minimum of bells&whistles; raises Failed if there is a problem.
+
+Read-Eval-Print Loop
+CommanderBackdoor Procedures
+Backstop Error Catcher
+Creation
+C Language Hook
+A simple (minded?) hook for doing a command from a c program.  No frills; useful for installation code inside packaged worlds.
+ù $X  ïNewlineDelimiter
+ñ(cedarcode) styleô codeôKöú
+œeú=ôHKô)Kô3Kô'Kô#Kô óöœk	úvûú)ò™Kô óKöœnúûúûòKöûúMûú(ò~Köûú ò'öúûòKò KöûúûúûúòKöúûúûúò-Köúûú ò7Köúûúò3Köúûú%ò:öúûúûúûúò&Köúûúûúò#Köúûúûúœc6òLKöúòóóheadô-ôKôKôKôKôKôóôKôKôKôKôKô óóô	KöúûúûúòKKöúûúûúòEKöúûúûúòHóôö
+üúûúûúûúûúò-Kò óóô
+Köúûúûúûúòöü	úûúûúûúûúûúûúò?KöúûúûúòKöúûúòKöúòóö
+ü
+úûúûú
+ûúûúòEKò óKöúûúûúûúò)Köúûúûúûúò-ö
+üúûúûúûúûúò;öûúûúûúûò'Köûúûúûúò+Köûúòóöûúûúûúûò&Köûúûúûúò)KöûúòóKöûúòKòKò óKöúûúûúò!öúûú
+ò*Kò óöüúûúûú
+ûúûúûúòSKöúûúòKöúûúò"Köú+ûú&ûúûúòoKöú!ò!KöúòïStartOfExpansion6[pattern: ROPE, object: ROPE, case: BOOL _ TRUE]öûúûúûòöú-ò-Kñ[self: STREAM, char: CHAR]öûú)ò+öúûúûúò7KöúûúûúûúûúûúòSKöúûúûúò/KöúòKöûúò Köúûúò+KöúòóKöúòóöú+ò+Köúûúûúò6öûòKô?Köú&ò&Köûúûúûúûú1òUöûú.ûúò6Köúûúûúò/Köûúò Köúûúò+Köú6ò6KöûúòKöúòóKöûúòóKöúòóò#öûúûúûúûúûúûò<òKò"KòGKòóKöûúòóKöúòóKöûúûúòóKöûúûú3òJKòKò óóôöüúûúûú9ûúûúûúûú
+ûú	òÇKö	úûúûúûúûúò8KöúûúûúûúòöûòKöúûú%ò.KöûúûúûúûúòKöúûúòKòKöûúòóKöúòKöúûúòKöúòKò óöüúûúûú9ûúòmKöúûúòKöúûúò!Köú'ò'öûúûúûúûòKöûú1ûúûúûúòBKöûúòóKöûú%ûúûúûúò6KöúòKò óöüúûúûúûúûúûú	ò]Köúûúûú	ûúò&KöúûúûúòKöúûúûúò-öûòKöú!ò!KöûúûúûúûúòKöúûúòKòKöûúòóKöúòKöúûúòKöúòKöúòKò óöúûúûúòöúûúûú	ûúò"KöúôóöúûúòKöú"ô"óöúûúûú	ûúò&KôóöúûòKöúQôQóKòKò óöüúûúûúûúòNKöú0ò0Köú	ûúò+Köúòöûúûúûú"ûúò6KöúûúòKöú?ò?Köú!ò!KöúòKöúòóKöúòKò óö
+üúûúûúûúûú	òEKöúûú#ò*Köûúûúûú$ûúûúûúûúò[KöúòKô óöüúûúûú9ûúûúûúòoKöúûú#ò*Köûúûúûúûúò)öúûúûò Köú/ò/Köú1ò1KöûúûúòóKöú/ò/Köú,ò,KöúòKô óöüúûúûúûú"ûúûúûúòoKöúûú#ò*öûúûúòKöú&ò&KöúòKöûúòKöúòóKò
+Köûúûúûúûúòöûúûúò Köú&ò&KöúòKöúòóöûúûòKö
+ûúûúûúûúûúò/Köú/ò/Köú,ò,KöûúòóKö
+ûúûúûúûúûúò/öúûúûò Köú/ò/Köú1ò1KöûúûúòóKöú/ò/Köú,ò,KöúòKô óóôöüúûúûú#ûúò?ñ5[key: REF ANY, val: REF ANY, aList: List.AList]öûúûúûúòKöúPòPKöûúûúûúò>KöúòóKöúòKò óöüúûúûúûúûú	ûúòOKöú,ò,KöúÉôÉKö
+ûú	ûúûúûúûú7òXKöûú	ûúûú#ò6öûú	ûúûúûúûúûò(Köúûú9òCKöûúûúòóKöúòKò óö
+üúûúûúûúûúòLKöúûúòKöúûúûúûúò6KöúûúòöûúûúûúûúûúûòWKöú	ûúûúòKöúûúûúòöûúûúûúûúûúûúûúòeöûúòKöúûúò	öúûúûúòKöúûúûúò!KöûúòKöú%ò%Köú	ûúò KöúòKöúòóKòDKöûúûúûúò#KòKöúòóöûúòKöúûúûúò,Köúòöûúûúûò&Köúûú'ò.öûúûú
+ûúûú
+ûúûú
+ûúò<öûúòKöú#ò#Köúûúûú
+ò$KöúòóKöûúûúò
+óKöûúòóöûúò
+öûúòKöúûúûúûúòKöúJûúòTöûú*ûúûò9öúòöûúûúòKöúòKöúòóKöúòóKöûúûúòóKöúòóöûúòKöúûú"ò,öûúûúûò#KöúûúòKöûúûúòóKöúòóóKöúòKöúòKöúòóóöûú	ûòöûúòKöúJòJKöú!ò!KöúòKöúòóKöûúòóKöûúòóKöûúòKöúòKò óöüúûúûúûúûúûú	ûúûúûúòhKôCöüúûúûúûúûúûúò6öûúûúûúûò(Köûúûúûúûúò)KöûúòóKöûúûúòKöúòóKöúûúòKöúûú	òKò)Köúûúòöûú	ûòKöúûúòöûúûòöúòöûúûòKò!Kò"Kò(Kö
+ûúûúûúûúûúò<óKöúòóòöûúò
+Köûúòöûúûúûúòöûúûúò2KöûúòKöûúòóKòóóKòóKöûúûúòóKò
+KöûúòóKöûúûúûú4òVKöûúò
+KòKò óóô	öü
+úûúûúûúòIöûúûúûúòKöú.ò.Köûúûúûúûúò%KöúòóKöûúûúòKöúòKò óöüúûúûúò4Köú0ò0Köú	ûú"ò.Köúûú3òEöûúûúûúûúûú
+ûúûúûúòPKöúûúòKöûúòKöûú	ûúûúûúòOKòóKöûúûúûú ò;KöúòKò óö
+üúûúûúûúûúò6Köúûúûúûúûúûúò8Köúûúûúûúûúûúò;Köûúò"KöúòKò óö
+ü	úûúûúûúûúò/Köûúûú0òOKö
+ûúûúûúûúûúò(KöúòKò óöü	úûúûúûúûú
+ûúò^KöúCòCKöúûúûúòKöú>ò>KöúòKô óöüúûúûúûúûúûúûú
+ûúòwKö	úûúûúûúûúò Köú.ûúûú/òcKöúûúûúòKöú>ò>Kñ5[key: REF ANY, val: REF ANY, aList: List.AList]öúûúò KöúòKô óöüúûúûúòIKöúûúòöüúûúûúòKöûú!ûúDòkKöúòóKöúòKöúòKöúòKöúòKöûú	òKöúòKò óö
+üúûúûú
+ûúûúòZKöú;ò;Köú-ò-öûúûúûúûúò:KöûúòKöûúò!Köûú#ò%Köúòóöûú
+ûòKöûú8ò<öûúòKöüúûú;òFKöú9ò9KöúòóóKöúòKò óöüúûúûú+ûúûú
+ûúûúûúûúò|Köú
+ûúò"Köú0ò0öûúûúûòKöúûúòöûòöûúòKöúûúò+KöúòóKöúûúòKöúûúòöú	ûúûúòKöúûúûúò"Köú
+ûú$ûúûúòRKöúûúò%KöúòKöúûúòKöúòóKöûúûúûúûúòKöúûú†'ò7Köú>ò>Köú:ò:öûòKöú!ò!óKöûúòóKñ5[key: REF ANY, val: REF ANY, aList: List.AList]öúòKöúòKñ5[key: REF ANY, val: REF ANY, aList: List.AList]öúòKöûúòóKöúòKô óöüúûú"ûúò9KöúûúòKöú)ò)öûúûúûúòKöúûúûúòöú_ò_Köú
+ûúDòSKöúòóöûúûúûòKöúûúò#KöûúûúòóKöú/ò/öûúûúûúòKöûúRòWKöúòóKöúòóKöúòKöúòKò óöüúûú4ûúûúûúûúûúòÖJôRKöúòöûúûúòKöûúeòiöûúòKöúûúûúòKöúûúûúòKöúûúûúòKöúûúòöüúûúûúûúò.öûú%ûò/òKöúûúûúò-KöúûúòKö
+ûúûúûúûúûú-òTKöûúûúûúûúûúûú.òWKöûúòöûúûúûúûúûúûúûúûúò@Köú	ûúòKöúûúòKöúòóKöú!ò!Köûú	ûúûúûú-òFKò$Köûúûúûúò8KöúIûúò_Köú%ò%KöúòKòóKöûú†6òOóKöúòóKöúûúò*KöúûúòKöúûúûúòöûúûúKûúûòlKöú	ò	öûú#ûò-KöúûúòöúòKöúûúòKöûúûúûúûú.òLKöûúòKöúòóKöú&ûúò.Köú&ûúò/Köûú†ò/óKöûúòóKöûúûúò!Köûúûú>òTö	ûúûúûúûúûò1öûúòKöúòöúòKö
+ûúûúûú&ûúûúòIKöûúûúûúûúûúûúûúûúòcKöûúûú
+ûúûúòKöúMòMóKöúòóöûúòKöúîòîKöúòóóKöúòóóKöúòKò óöüúûú/ûúûú
+ûúûúòrKôOKöúòKöú0ò0Köú)ò)öûúûúûúòKöûú3ò8KöúòóKöú:ò:Köûúûúûúò,KöúòKô óóôKöúûú ò1ö
+ü
+úûú
+ûúûúûúò4öûúòKöúòKöúòKòKöúòóKöúòKò óöüúûú1ûúûúòcKöú0ò0Köûúûúûúûú*òUöúòKöú+ò+KöúòKöúûúòKöúûúò	KöúòKöúòKöúòKöúòKöúûòKöúòóKöûúûúûúò+KöúòKò óö
+üúûú1ûú
+ûúûúògKöú0ò0Köúûúò8Köúûú:òIKöúûú#ò4Köú	ûúûúûúò=Köûúûúûúûú*òUKöúòKöúòKöúòKöú+ò+öûúûúòKöúûúò0KöúûúòKöûúûúûúFòhKöúòóKöûúûúûúò)KöúòKò óöüúûúûúûúûúûúò]Köú0ò0öüúûúòKöûúûúûúFòhöûòKöú/ò/Köûúûúûúò+öûòKöúûúûúòKöúûúûúòöúûúûúò,KöûúûúòKöûúûúòKöúòóKöúûúò:Köú'ò'öúfòföûúòKöú5ò5KöúòóKöúòóKöú-ò-öûúûúòöûú&ò(KöúòKöúòKöúòKöúòóKöúòóöûúûúòKöúûúòKöûúûúûúò KöúòóöûòKöú.ûúòAóKöûúòóKöûúòóKöúòóö
+üúûúûúûú
+ûúò<öûòKòKöúûúòKöú9ò9öûúûòKöúûú
+ûúò#Köú
+ûú
+ûúò Köú1ò1KöûúûúòóKöûúòóKöúòóöüúûúòöûòKöúûúûúòKöú	ûúûúòò<öûúòKöûúûúûúûò4KòóKö
+ûúûúûúûúûúòIKòóKöûúûúûúòKöûú	ûú'ûúòIKöûúòóKöúûúòKòóKö
+üúûúûúûú	ûú	òBKöú-ò-öûú
+ûòKöûú	òKöûú?òCóKöúòóóôöü	úûúûúòMöûúûòKöú0ò0Köûúûúûúûúûúûúò>KöúòKöûúòóKöûú†!ò(KöúòKò óöüúûúûúûúò=KöûúûúûúòKöú0ò0öûúûúûúûúûúûúûúòCKöú)ò)KöúòóKöúòKò óö
+ü
+úûúûúûú"ûúòKKöú0ò0Kö
+ûúûúûúûúûúòFKöúòKò óö
+üúûúûúûúûúòJKöú0ò0Kö
+ûú	ûúûúûúûú0ò]KöúòKò óöüúûúûúûúòUöûúûúûò"Köúûúò'KöûúûúûúòóKöúòóKò óôKöúûúò0öüúûúûúûú4ûúûúòKö
+ûúûúûúûúûúò:Köúûúûú
+òKöúûúûúòKöûú2ò4Köûúòöûúûúûò.öúûúòöûúûúûòKöúûúûúò2Köúûúûú
+ò0KöûúûúòóKòóKöûúûúòóKöûú_òaKöûúòöûúûúûòKöúûúò KöûúòóöûòKöúûúûúò Kö	úûúûúûúûúòAöûúûòKöú
+ûúòKöú
+ûú
+òKöú
+ûú<òLKöúûú!ò-Köûúûúò˝óKöûúòóöûòKöú
+ûúòóKöúòóóôKöúûúò*öüúûúò1öúûúûúûúûò5Köúûú	òKöûúòóKöûú1ò3KöúòKò óöüúûúûúûúûúûú&ûúûúòãKöúûú'òBKöúûúûúò)Köúûúò!Köúûúò#Köúûúò#öûúûòöûúòKöúòKöúûúòKöúòóöûúòKöú9ò9Köûúûúûúò)Köûúûúûúò,Köûúûúûúò,öûúûúûúòKöúòKöúòKöúòKöúòKöú!ò!KöúòóKöú'ò'Köú+ò+KöúòóóKöûúûúûúûúûúûúò=Köûúûúûúûúò'Köûúûúûúûúò)KöûúûúûúòKöúòKöúòKöúòKöúûúûú<òWKöûúûúûúòKöúòKò óóôöüúûúûúûúûúûúòXKô~Köú.ûúûú!òUKöûúòKöúòóö
+üúûúûúûúûúò,KòKöúüúò1KòóKòò Kò óóKöûúòKò Köú:ò:Köú`ò`Kò ó Öó    a¥  ãj  

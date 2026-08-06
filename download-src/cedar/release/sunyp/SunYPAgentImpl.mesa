@@ -1,0 +1,674 @@
+
+
+DIRECTORY
+Arpa USING [Address, MyAddress, nullAddress],
+ArpaUDP USING [nullPort, Port],
+Ascii USING [CR, FF, LF, SP, TAB],
+Basics USING [HFromCard16, IsBound, LowHalf],
+BasicTime USING [earliestGMT, GMT, Now, Period, TimeNotKnown, Update],
+Convert USING [RopeFromArpaAddress],
+Process USING [Detach, PauseMsec],
+RefText USING [Append, New, ObtainScratch, ReleaseScratch],
+Rope USING [FromRefText, Length, ROPE, Substr, ToRefText],
+SunPMap USING [udpPort],
+SunRPC USING [Destroy, Error, Handle],
+SunRPCOnUDP USING [Create, SetRemote],
+SunRPCAuth USING [Conversation, Error, Initiate, Terminate],
+SunYP USING [EachMapNameProc, ResponseKeyVal, ResponseVal, Status],
+SunYPAgent USING [TextSeq, TextSeqObject],
+SunYPAgentPrivate USING [Object, ServerObject],
+SunYPClient USING [First, Maplist, Match, Next, Null],
+SunYPFind USING [Error, GetDefaultDomain, GetServerAddressAndPortForDomain],
+SymTab USING [Create, Fetch, Ref, Store, Update, UpdateAction, Val],
+ThisMachineRegistry USING [ThisMachineProcsRec, ThisMachineRef, RegisterThisMachineProcs]
+;
+
+SunYPAgentImpl: CEDAR MONITOR
+LOCKS lock USING lock: Lock
+IMPORTS Arpa, Basics, BasicTime, Convert, Process, RefText, Rope, SunRPC, SunRPCOnUDP, SunRPCAuth, SunYPClient, SunYPFind, SymTab, ThisMachineRegistry
+EXPORTS SunYPAgent
+~ {
+msecBetweenSweeps: CARD ¨ 11111;
+initialServerTTL: CARDINAL ¨ 300;
+initialCachedValueTTL: CARDINAL ¨ 300;
+
+maxCachedValues: CARDINAL ¨ 31;
+
+timeoutBase: CARD ¨ 500;
+timeoutMsecPerHop: CARD ¨ 250;
+pauseMsecPerHop: CARD ¨ 100;
+
+maxTriesForSpecifiedServer: CARDINAL ¨ 8;
+pauseMsecBetweenRetriesForSpecifiedServer: CARD ¨ 1000;
+
+pMapPort: ArpaUDP.Port ¨ Basics.HFromCard16[Basics.LowHalf[SunPMap.udpPort]];
+maxArgLength: CARDINAL ¨ 100;
+
+hostsMapName: ROPE ¨ "hosts.byaddr";
+hostNamePos: CARDINAL = 1;
+ROPE: TYPE ~ Rope.ROPE;
+
+Lock: TYPE ~ REF LockObject;
+LockObject: TYPE ~ MONITORED RECORD [];
+
+Error: PUBLIC ERROR [code: ATOM] ~ CODE;
+Server: TYPE ~ REF ServerObject;
+ServerObject: TYPE ~ SunYPAgentPrivate.ServerObject;
+
+serverTab: SymTab.Ref ¨ SymTab.Create[];
+
+serverLock: Lock ~ NEW[LockObject];
+serverList: Server ¨ NIL;
+nullServerLock: Lock ~ NEW[LockObject];
+nullServerList: Server ¨ NIL;
+
+GetServerByAddressAndPort: ENTRY PROC [address: Arpa.Address, port: ArpaUDP.Port, lock: Lock ¨ serverLock] RETURNS [server: Server] ~ {
+FOR server ¨ serverList, server.next
+WHILE (server # NIL) AND ((server.address # address) OR (server.port # port))
+DO NULL ENDLOOP;
+IF server = NIL THEN {
+server ¨ NEW[ServerObject ¨ [serverList, address, port, initialServerTTL, FALSE]];
+serverList ¨ server;
+};
+};
+
+SweepServers: ENTRY PROC [seconds: CARD, lock: Lock ¨ serverLock] ~ {
+FOR server: Server ¨ serverList, server.next WHILE server # NIL DO
+server.ttl ¨ (IF server.ttl > seconds THEN server.ttl - seconds ELSE 0);
+ENDLOOP;
+};
+
+IsNullServer: PROC [server: Server] RETURNS [BOOL] ~ INLINE {
+RETURN [server.address = Arpa.nullAddress] };
+
+GetNullServer: ENTRY PROC [lock: Lock ¨ nullServerLock] RETURNS [server: Server] ~ {
+server ¨ NEW[ServerObject ¨ [nullServerList, Arpa.nullAddress, ArpaUDP.nullPort, initialServerTTL, FALSE]];
+nullServerList ¨ server;
+};
+
+SweepNullServers: ENTRY PROC [seconds: CARD, lock: Lock ¨ nullServerLock] ~ {
+prev, server: Server;
+prev ¨ NIL; server ¨ nullServerList;
+WHILE server # NIL DO
+IF server.ttl > seconds
+THEN {
+server.ttl ¨ server.ttl - seconds;
+prev ¨ server;
+}
+ELSE {
+server.ttl ¨ 0;
+IF prev = NIL THEN nullServerList ¨ server.next ELSE prev.next ¨ server.next;
+};
+server ¨ server.next;
+ENDLOOP;
+};
+
+GetServerForDomain: PROC [domain: ROPE] RETURNS [server: Server] ~ {
+server ¨ NARROW[SymTab.Fetch[serverTab, domain].val];
+SELECT TRUE FROM
+(server = NIL) => NULL;
+(IsNullServer[server]) => IF server.ttl = 0 THEN server ¨ NIL;
+(server.down) => server ¨ NIL;
+(server.ttl = 0) AND (NOT ServerResponding[server]) => server ¨ NIL;
+ENDCASE;
+IF server # NIL THEN RETURN;
+-- IF server = NIL THEN -- {
+address: Arpa.Address ¨ Arpa.nullAddress;
+port: ArpaUDP.Port ¨ ArpaUDP.nullPort;
+[address, port] ¨ SunYPFind.GetServerAddressAndPortForDomain[domain
+! SunYPFind.Error => CONTINUE];
+IF address # Arpa.nullAddress THEN server ¨ GetServerByAddressAndPort[address, port];
+};
+IF server = NIL THEN {
+server ¨ GetNullServer[];
+};
+[] ¨ SymTab.Store[serverTab, domain, server];
+};
+
+GetServerByAddress: PROC [address: Arpa.Address, domain: ROPE]
+RETURNS [server: Server] ~ {
+errorCode: ATOM ¨ NIL;
+port: ArpaUDP.Port;
+[, port] ¨ SunYPFind.GetServerAddressAndPortForDomain[domain, address
+! SunYPFind.Error => { errorCode ¨ code; CONTINUE } ];
+IF errorCode = NIL
+THEN {
+server ¨ GetServerByAddressAndPort[address, port];
+server.down ¨ FALSE;
+server.ttl ¨ initialServerTTL;
+[] ¨ SymTab.Store[serverTab, domain, server];
+}
+ELSE {
+ERROR Error[errorCode];
+};
+};
+
+ServerResponding: PROC [server: Server] RETURNS [responding: BOOL ¨ FALSE] ~ {
+h: SunRPC.Handle;
+c: SunRPCAuth.Conversation;
+IF NOT IsNullServer[server] THEN {
+ENABLE SunRPC.Error, SunRPCAuth.Error => CONTINUE;
+h ¨ SunRPCOnUDP.Create[remoteAddress~server.address, remotePort~server.port];
+c ¨ SunRPCAuth.Initiate[];
+server.ttl ¨ initialServerTTL;
+SunYPClient.Null[h, c];
+responding ¨ TRUE;
+};
+server.down ¨ NOT responding;
+IF h # NIL THEN SunRPC.Destroy[h]; h ¨ NIL;
+IF c # NIL THEN SunRPCAuth.Terminate[c]; c ¨ NIL;
+};
+Handle: TYPE ~ REF Object;
+Object: PUBLIC TYPE ~ SunYPAgentPrivate.Object;
+
+ObtainHandle: PUBLIC PROC [domainName: ROPE, conversation: SunRPCAuth.Conversation, serverAddress: Arpa.Address] RETURNS [h: Handle] ~ {
+server: Server ¨ NIL;
+rpcHandle: SunRPC.Handle;
+serverSpecified: BOOL ¨ (serverAddress # Arpa.nullAddress);
+IF domainName = NIL THEN domainName ¨ SunYPFind.GetDefaultDomain[];
+IF serverSpecified
+THEN {
+FOR try: CARDINAL ¨ 0, try.SUCC DO
+server ¨ GetServerByAddress[serverAddress, domainName
+! Error => IF try >= maxTriesForSpecifiedServer THEN REJECT ELSE CONTINUE];
+IF server # NIL THEN EXIT;
+Process.PauseMsec[pauseMsecBetweenRetriesForSpecifiedServer];
+ENDLOOP;
+}
+ELSE {
+server ¨ GetServerForDomain[domainName];
+IF IsNullServer[server] THEN ERROR Error[$domainNotFound];
+};
+IF conversation = NIL THEN conversation ¨ SunRPCAuth.Initiate[];
+rpcHandle ¨ SunRPCOnUDP.Create[remoteAddress~server.address, remotePort~server.port];
+h ¨ NEW[Object ¨ [domain~domainName, server~server, rpcHandle~rpcHandle, conversation~conversation, serverSpecified~serverSpecified]];
+};
+
+RefreshHandle: PUBLIC PROC [h: Handle, conversation: SunRPCAuth.Conversation, serverAddress: Arpa.Address] ~ {
+server: Server;
+IF serverAddress = Arpa.nullAddress
+THEN {
+server ¨ GetServerForDomain[h.domain];
+IF IsNullServer[server] THEN ERROR Error[$domainNotFound];
+}
+ELSE {
+server ¨ GetServerByAddress[serverAddress, h.domain];
+};
+SunRPCAuth.Terminate[h.conversation];
+h.conversation ¨ IF conversation # NIL THEN conversation ELSE SunRPCAuth.Initiate[];
+IF server # h.server THEN {
+h.server ¨ server;
+h.rpcHandle ¨ SunRPCOnUDP.SetRemote[h.rpcHandle, server.address, server.port];
+};
+};
+
+ReleaseHandle: PUBLIC PROC [h: Handle] ~ {
+IF h.rpcHandle # NIL THEN { SunRPC.Destroy[h.rpcHandle]; h.rpcHandle ¨ NIL };
+h.server ¨ NIL;
+IF h.conversation # NIL THEN { SunRPCAuth.Terminate[h.conversation]; h.conversation ¨ NIL };
+};
+
+FixupForDownServer: PROC [h: Handle] RETURNS [fixed: BOOL ¨ FALSE] ~ {
+ENABLE Error => CONTINUE;
+oldServer: Server;
+IF h.serverSpecified THEN RETURN;
+oldServer ¨ h.server;
+h.server ¨ GetServerForDomain[h.domain];
+IF IsNullServer[h.server] THEN RETURN;
+IF h.server.address = oldServer.address THEN RETURN;
+IF h.server.down THEN RETURN;
+fixed ¨ TRUE;
+};
+CachedValue: TYPE ~ REF CachedValueObject;
+CachedValueObject: TYPE ~ RECORD [
+next, prev: CachedValue,
+ttl: CARDINAL ¨ initialCachedValueTTL,
+busy: CARDINAL ¨ 0,
+value: REF TEXT,
+key: ROPE,
+table: SymTab.Ref
+];
+
+cachedValueLock: Lock ~ NEW[LockObject];
+cachedValueHead, cachedValueTail: CachedValue;
+numCachedValues: CARD ¨ 0;
+cachedValueAvailable: CONDITION;
+
+tabByDomain: SymTab.Ref ~ SymTab.Create[];
+
+RemoveCachedValueFromTable: PROC [cV: CachedValue] ~ {
+value: SymTab.Val ~ cV;
+DeleteValue: SymTab.UpdateAction -- [found, val] RETURNS [op, new] -- ~ {
+IF found AND val = value
+THEN RETURN [delete, NIL]
+ELSE RETURN [none, NIL];
+};
+IF (cV.table = NIL) OR (cV.key = NIL) THEN ERROR;
+SymTab.Update[cV.table, cV.key, DeleteValue];
+};
+
+RemoveCachedValueFromList: INTERNAL PROC [cV: CachedValue] ~ {
+IF cV = cachedValueTail
+THEN cachedValueTail ¨ cV.prev
+ELSE cV.next.prev ¨ cV.prev;
+IF cV = cachedValueHead
+THEN cachedValueHead ¨ cV.next
+ELSE cV.prev.next ¨ cV.next;
+};
+
+LookupCachedValue: ENTRY PROC [domainName, mapName, key: ROPE, lock: Lock ¨ cachedValueLock] RETURNS [cV: CachedValue] ~ {
+tabByMap, tabByKey: SymTab.Ref;
+GetTabByMap: SymTab.UpdateAction -- [found, val] RETURNS [op, new] -- ~ {
+IF found
+THEN { tabByMap ¨ NARROW[val]; RETURN [none, NIL] }
+ELSE { tabByMap ¨ SymTab.Create[]; RETURN [store, tabByMap] };
+};
+GetTabByKey: SymTab.UpdateAction -- [found, val] RETURNS [op, new] -- ~ {
+IF found
+THEN { tabByKey ¨ NARROW[val]; RETURN [none, NIL] }
+ELSE { tabByKey ¨ SymTab.Create[]; RETURN [store, tabByKey] };
+};
+SymTab.Update[tabByDomain, domainName, GetTabByMap];
+SymTab.Update[tabByMap, mapName, GetTabByKey];
+cV ¨ NARROW[SymTab.Fetch[tabByKey, key].val];
+SELECT TRUE FROM
+(cV = NIL) => {
+DO
+SELECT TRUE FROM
+(numCachedValues < maxCachedValues) => {
+cV ¨ NEW[CachedValueObject];
+numCachedValues ¨ numCachedValues + 1;
+EXIT;
+};
+(cachedValueHead = NIL) => {
+WAIT cachedValueAvailable;
+LOOP;
+};
+ENDCASE => {
+cV ¨ cachedValueTail;
+RemoveCachedValueFromTable[cV];
+RemoveCachedValueFromList[cV];
+EXIT;
+};
+ENDLOOP;
+cV.ttl ¨ initialCachedValueTTL;
+cV.key ¨ key;
+cV.value ¨ NIL;
+cV.table ¨ tabByKey;
+};
+(cV.busy = 0) => {
+RemoveCachedValueFromList[cV];
+};
+ENDCASE;
+cV.busy ¨ cV.busy + 1;
+};
+
+CacheValue: ENTRY PROC [cV: CachedValue, newValue: REF TEXT ¨ NIL, lock: Lock ¨ cachedValueLock] ~ {
+IF newValue # NIL THEN {
+IF cV.busy # 1 THEN ERROR;
+cV.value ¨ newValue;
+[] ¨ SymTab.Store[cV.table, cV.key, cV];
+};
+IF (cV.busy ¨ cV.busy - 1) = 0 THEN {
+IF cachedValueHead = NIL
+THEN {
+cV.next ¨ cV.prev ¨ NIL;
+cachedValueHead ¨ cachedValueTail ¨ cV;
+NOTIFY cachedValueAvailable;
+}
+ELSE {
+cV.next ¨ cachedValueHead;
+cV.prev ¨ NIL;
+cachedValueHead.prev ¨ cV;
+cachedValueHead ¨ cV;
+};
+};
+};
+
+FreeCachedValue: INTERNAL PROC [cV: CachedValue, lock: Lock] ~ {
+cV.key ¨ NIL;
+cV.value ¨ NIL;
+cV.table ¨ NIL;
+cV.next ¨ cV.prev ¨ NIL;
+numCachedValues ¨ numCachedValues - 1;
+NOTIFY cachedValueAvailable;
+};
+
+ReleaseCacheEntry: ENTRY PROC [cV: CachedValue, lock: Lock ¨ cachedValueLock] ~ {
+IF cV.busy # 1 THEN ERROR;
+FreeCachedValue[cV, lock];
+};
+
+SweepCachedValues: ENTRY PROC [seconds: CARD, lock: Lock ¨ cachedValueLock] ~ {
+p, next: CachedValue;
+FOR p ¨ cachedValueHead, next WHILE p # NIL DO
+next ¨ p.next;
+IF p.ttl > seconds
+THEN {
+p.ttl ¨ p.ttl - seconds;
+}
+ELSE {
+IF p.busy # 0 THEN ERROR;
+RemoveCachedValueFromTable[p];
+RemoveCachedValueFromList[p];
+FreeCachedValue[p, lock];
+};
+ENDLOOP;
+};
+MapErrorCode: PROC [code: ATOM, h: Handle] RETURNS [mappedCode: ATOM] ~ {
+h.server.down ¨ TRUE;
+h.server.ttl ¨ initialServerTTL;
+mappedCode ¨ code;
+};
+
+MapErrorStatus: PROC [status: SunYP.Status, h: Handle] RETURNS [mappedCode: ATOM] ~ {
+h.server.down ¨ FALSE;
+h.server.ttl ¨ initialServerTTL;
+mappedCode ¨ (SELECT status FROM
+true => NIL,
+nomore => $noMoreEntries,
+nomap => $mapNotFound,
+nodomain => $domainNotFound,
+nokey => $keyNotFound,
+ENDCASE => $protocol);
+};
+
+Match: PUBLIC PROC [h: Handle, map: ROPE, key: ROPE] RETURNS [val: REF TEXT] ~ {
+cV: CachedValue;
+errorCode: ATOM;
+response: SunYP.ResponseVal;
+cV ¨ LookupCachedValue[h.domain, map, key];
+IF cV.value # NIL THEN {
+val ¨ cV.value;
+CacheValue[cV];
+RETURN;
+};
+{
+ENABLE SunRPC.Error => {
+errorCode ¨ MapErrorCode[code, h];
+IF FixupForDownServer[h] THEN RETRY ELSE CONTINUE;
+};
+response ¨ SunYPClient.Match[h.rpcHandle, h.conversation, [domain~h.domain, map~map, key~Rope.ToRefText[key]]];
+errorCode ¨ MapErrorStatus[response.status, h];
+};
+IF errorCode = NIL
+THEN {
+val ¨ response.val;
+CacheValue[cV, val];
+RETURN;
+}
+ELSE {
+ReleaseCacheEntry[cV];
+ERROR Error[errorCode];
+};
+};
+
+First: PUBLIC PROC [h: Handle, map: ROPE] RETURNS [key: ROPE, val: REF TEXT] ~ {
+response: SunYP.ResponseKeyVal;
+errorCode: ATOM ¨ NIL;
+{
+ENABLE SunRPC.Error => {
+errorCode ¨ MapErrorCode[code, h];
+IF FixupForDownServer[h] THEN RETRY ELSE CONTINUE;
+};
+response ¨ SunYPClient.First[h.rpcHandle, h.conversation, [domain~h.domain, map~map]];
+errorCode ¨ MapErrorStatus[response.status, h];
+};
+IF errorCode # NIL THEN ERROR Error[errorCode];
+RETURN [Rope.FromRefText[response.key], response.val];
+};
+
+Next: PUBLIC PROC [h: Handle, map: ROPE, keyBefore: ROPE]
+RETURNS [key: ROPE, val: REF TEXT] ~ {
+response: SunYP.ResponseKeyVal;
+errorCode: ATOM ¨ NIL;
+{
+ENABLE SunRPC.Error => {
+errorCode ¨ MapErrorCode[code, h];
+IF FixupForDownServer[h] THEN RETRY ELSE CONTINUE;
+};
+response ¨ SunYPClient.Next[h.rpcHandle, h.conversation, [domain~h.domain, map~map, key~Rope.ToRefText[keyBefore]]];
+errorCode ¨ MapErrorStatus[response.status, h];
+};
+IF errorCode # NIL THEN ERROR Error[errorCode];
+RETURN [Rope.FromRefText[response.key], response.val];
+};
+
+MapList: PUBLIC PROC [h: Handle, eachMap: SunYP.EachMapNameProc] ~ {
+status: SunYP.Status;
+errorCode: ATOM ¨ NIL;
+gotOne: BOOL ¨ FALSE;
+eachMapOuter: SunYP.EachMapNameProc -- [map] -- ~ {
+gotOne ¨ TRUE;
+RETURN [eachMap[map]];
+};
+{
+ENABLE SunRPC.Error => {
+errorCode ¨ MapErrorCode[code, h];
+IF (NOT gotOne) AND FixupForDownServer[h] THEN RETRY ELSE CONTINUE;
+};
+status ¨ SunYPClient.Maplist[h.rpcHandle, h.conversation, h.domain, eachMapOuter];
+errorCode ¨ MapErrorStatus[status, h];
+};
+IF errorCode # NIL THEN ERROR Error[errorCode];
+};
+ExpandTextSeq: PROC [s: SunYPAgent.TextSeq] RETURNS [new: SunYPAgent.TextSeq] ~ {
+new ¨ NEW[SunYPAgent.TextSeqObject[2*s.maxLength]];
+new.length ¨ s.length;
+FOR i: CARDINAL IN [0 .. s.length) DO
+new.refText[i] ¨ s.refText[i];
+ENDLOOP;
+};
+
+IsWhiteSpace: PROC [c: CHAR] RETURNS [isWhite: BOOL] ~ {
+OPEN Ascii;
+isWhite ¨ (SELECT c FROM
+TAB, LF, FF, CR, SP => TRUE,
+ENDCASE => FALSE);
+};
+
+TokenizeUsingSeparator: PUBLIC PROC [in: REF READONLY TEXT, sepChar: CHAR, trimLeadingSpace, trimTrailingSpace: BOOL] RETURNS [out: SunYPAgent.TextSeq]
+~ {
+i, iTo, len: CARDINAL;
+scratch: REF TEXT ¨ RefText.ObtainScratch[in.length];
+
+CountSeparators: PROC [txt: REF READONLY TEXT, sepChar: CHAR] RETURNS [ct: CARDINAL ¨ 0] = {
+   FOR k: CARDINAL IN [0..txt.length) DO
+      IF txt[k] =  sepChar THEN ct ¨ ct + 1;
+      ENDLOOP; 
+   };
+    
+len ¨ CountSeparators[in, sepChar] + 1;            
+out ¨ NEW[SunYPAgent.TextSeqObject[len]];  
+out.length ¨ 0;
+i ¨ 0;
+DO
+IF i >= in.length THEN EXIT;
+IF trimLeadingSpace AND IsWhiteSpace[in[i]] THEN { i ¨ i + 1; LOOP };
+iTo ¨ 0;
+DO
+IF (i >= in.length) OR (in[i] = sepChar) THEN EXIT;
+scratch[iTo] ¨ in[i];
+i ¨ i + 1;
+iTo ¨ iTo + 1;
+ENDLOOP;
+IF trimTrailingSpace THEN
+WHILE (iTo > 0) AND IsWhiteSpace[scratch[iTo-1]] DO iTo ¨ iTo - 1 ENDLOOP;
+scratch.length ¨ iTo;
+IF out.length >= out.maxLength THEN out ¨ ExpandTextSeq[out];
+out.refText[out.length] ¨ RefText.Append[to~RefText.New[scratch.length], from~scratch];
+out.length ¨ out.length + 1;
+i ¨ i + 1;
+ENDLOOP;
+scratch.length ¨ 0;
+FOR k: CARDINAL DECREASING IN [0..len) DO
+  IF out.refText[k] = NIL THEN {
+    out.refText[k] ¨ RefText.Append[to~RefText.New[scratch.length], from~scratch];
+  } ELSE EXIT;
+  ENDLOOP;  
+RefText.ReleaseScratch[scratch];
+out.length ¨ len;
+};
+
+Tokenize: PUBLIC PROC [in: REF READONLY TEXT]
+RETURNS [out: SunYPAgent.TextSeq]
+~ {
+i, iTo: CARDINAL;
+scratch: REF TEXT ¨ RefText.ObtainScratch[in.length];
+out ¨ NEW[SunYPAgent.TextSeqObject[8]];
+out.length ¨ 0;
+i ¨ 0;
+DO
+IF i >= in.length THEN EXIT;
+iTo ¨ 0;
+DO
+IF i >= in.length THEN EXIT;
+IF IsWhiteSpace[in[i]] THEN EXIT;
+scratch[iTo] ¨ in[i];
+i ¨ i + 1;
+iTo ¨ iTo + 1;
+ENDLOOP;
+scratch.length ¨ iTo;
+IF out.length >= out.maxLength THEN out ¨ ExpandTextSeq[out];
+out.refText[out.length] ¨ RefText.Append[to~RefText.New[scratch.length], from~scratch];
+out.length ¨ out.length + 1;
+i ¨ i + 1;
+WHILE (i < in.length) AND (IsWhiteSpace[in[i]]) DO i ¨ i + 1 ENDLOOP;
+ENDLOOP;
+RefText.ReleaseScratch[scratch];
+};
+
+lastSweepTime: BasicTime.GMT ¨ BasicTime.earliestGMT;
+
+Daemon: PROC ~ {
+DO
+thisSweepTime: BasicTime.GMT;
+secondsSinceLastSweep: INT;
+secs: CARD; -- signed/unsigned ambiguity ... bletch!
+thisSweepTime ¨ BasicTime.Now[
+! BasicTime.TimeNotKnown => {
+thisSweepTime ¨ BasicTime.Update[lastSweepTime, (msecBetweenSweeps+999)/1000];
+CONTINUE;
+}
+];
+secondsSinceLastSweep ¨ BasicTime.Period[from~lastSweepTime, to~thisSweepTime];
+IF secondsSinceLastSweep < 0 THEN ERROR;
+secs ¨ secondsSinceLastSweep;
+SweepCachedValues[secs];
+SweepServers[secs];
+SweepNullServers[secs];
+Process.PauseMsec[msecBetweenSweeps];
+ENDLOOP;
+};
+
+IPNameProc: PROC RETURNS [name: ROPE] = {
+ENABLE Error => GOTO NoYP;
+h: Handle ¨ NIL;
+addressRope, unbracketedAddressRope: ROPE;
+hostsEntry: REF TEXT;
+seq: SunYPAgent.TextSeq;
+
+h ¨ ObtainHandle[NIL, NIL, Arpa.nullAddress];
+addressRope ¨ Convert.RopeFromArpaAddress[Arpa.MyAddress[]];
+unbracketedAddressRope ¨ Rope.Substr[addressRope, 1, Rope.Length[addressRope]-2];
+hostsEntry ¨ Match[h, hostsMapName, unbracketedAddressRope];
+seq ¨ Tokenize[hostsEntry];
+IF seq.length <= hostNamePos THEN GOTO NoYP;
+name ¨ Rope.FromRefText[seq.refText[hostNamePos]];
+IF h # NIL THEN ReleaseHandle[h];
+EXITS
+NoYP => NULL;
+};
+IPAddressProc: PROC RETURNS [ROPE] = {
+RETURN[Convert.RopeFromArpaAddress[Arpa.MyAddress[]]];
+};    
+
+Init: PROC = {
+thisMachineProcs: ThisMachineRegistry.ThisMachineRef ¨
+NEW[ThisMachineRegistry.ThisMachineProcsRec ¨ [
+which: $ip,
+Name: IPNameProc,
+Address: IPAddressProc,
+ProcessorID: NIL
+]];
+IF Basics.IsBound[LOOPHOLE[ThisMachineRegistry.RegisterThisMachineProcs]] THEN
+ThisMachineRegistry.RegisterThisMachineProcs[thisMachineProcs];
+};
+
+
+TRUSTED { Process.Detach[ FORK Daemon[] ] };
+Init[];
+
+}...
+  F  SunYPAgentImpl.mesa
+Copyright ” 1989, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Demers, November 28, 1988 10:47:03 am PST
+Alan Ishigo November 29, 1988 2:24:19 pm PST
+Willie-sue, January 18, 1993 3:27 pm PST
+
+TODO: the null server stuff is baroque.
+Chauser, January 3, 1992 11:07 am PST
+Parameters
+Types
+Server Cache
+This never raises Error, may store a down server in serverTab.
+NOTE: ServerResponding[server] will set server.down appropriately.
+Raises Error if the specified server can't be contacted or doesn't serve the specified domain.
+Handles
+Match Response Cache
+Public Procedures
+Utilities
+Make sure each element of the seq is not NIL ... must have at least have a zero length rope
+Sweep Daemon and Rollback
+Rollback: Booting.RollbackProc ~ {
+SweepCachedValues[CARD.LAST];
+SweepServers[CARD.LAST];
+SweepNullServers[CARD.LAST];
+};
+
+Proc passed to ThisMachineRegistry to register the IP name proc with the ThisMachine interface
+Proc will be passed to ThisMachineRegistry to register with the ThisMachine interface.
+Mainline code
+Booting.RegisterProcs[r: Rollback];
+ù ≈  ñ(cedarcode) styleïNewlineDelimiter
+ò codeôKöú
+œeú=ôHKô)Kô,Kô(Kô Kô'Kô%Kò óöœk	ò	Köúûú#ò-KöúûúòKöúûúûúûúûúûúûúò"Köúûú!ò-Köú
+ûúûú%òFKöúûúò$Köúûúò"Köúûú.ò;Köúûúûúò:KöúûúòKöúûúò&Köúûúò&Köúûú,ò<Köúûú8òCKöúûúò*Köúûúò/Köúûú%ò6Köú
+ûú=òLKöúûú8òDKöúûú@òYKòKò óöœnúûúûòKöûúûúòKöûúèòñKöûúòKòô
+Köúûú	ò Köúûúò!Köúûúò&Kò KöúûúòKò KöúûúòKöúûúòKöúûúòKò Köúûúò)Köú+ûúò7Kò KòMKöúûúòKò Kò$KòóôKöûúûúûúòKò KöúûúûúòKöúûúû	úûúò'Kò Kö
+üúûúûúûúûúò(óôKöúûúûúò öúûú"ò4Kò óKò(Kò Köúûúò#KöúûúòKöúûúò'KöúûúòKò öüúûúûúFûúòáö
+ûú"ûúûúûúûúòrKöûúûúûúòóöûú
+ûúûúòKöú	ûú>ûúòRKöúòKòóKòKò óöüúûúûúûúòEöûú*ûú
+ûúûòBKöúûúûúûúòHKöûúòóKòKò óö
+üúûúûúûúûúò=Köûú'ò-Kò óöüúûúûúûúòTKöú	ûúWûúòkKöúòKòKò óöüúûúûúûú"òMKòKöúûúò$öûú
+ûúûòöûúòöûúòKò"KòKòóöûúòKòKöûúûúûúûúòMKòóóKòKöûúòóKòKò óöüúûú
+ûúûúòDKô>Köú	ûú&ò5öûúûúûòKöú
+ûúûúòKöúûúûú
+ûúò>Köúûúòöúûúûú'ûúòDKôBóKöûúòóKöûú
+ûúûúûúòöœcúòKò)Kò&KöúYûúòcKöûúûú3òUKòóöûú
+ûúûúòKöúòKòóKöú-ò-KòKò óöüúûú!ûúûúò[Kô^KöúûúûúòKöúòKöúoûúò|öûúûòöûúòKöú2ò2KöúûúòKòKöú-ò-KòóöûúòKöûúòKòóóKòKò óö
+üúûúûúûúûúòNKöúòKòöûúûúûúò"Köûú#ûúò2KöúMòMKòKöúòKöúòKöúûúòKòóKöúûúòKöûúûúûúûúò+Köûúûúûúûúò1KòóóôKöúûúûúòKöúûúò/Kò ö
+üúûúûúûúEûúòàKöúûúòKòKöúûú&ò;Köûúûúûú+òCöûúòöûúòöûúûú
+ûúûò"öú5ò5Köúûú#ûúûúûúûúòKóKöûú
+ûúûúûúòKöú=ò=KöûúòóKòóöûúòKöú(ò(Köûúûúûúò:KòóóKöûúûúûú&ò@KöúUòUKöúûúòÜKòKò óöüúûúûúTònKòöûú!ò#öûúòKò&Köûúûúûúò:KòóöûúòKöú5ò5KòóóKò%Kö	úûúûúûúûúòTöûúûúòKòKòNKòóKòKò óöüúûúûúò*Köûúûúûú.ûúòMKöúûúòKöûúûúûú:ûúò\KòKò óö
+üúûúûú	ûúûúòFKöûú
+ûúòKòKöûúûúûúò!KòKò(Köûúûúûúò&Köûú&ûúûúò4KöûúûúûúòKöúûúòKòóóôKöúûúûúò*öúûúûúò"KòKöúûúò&KöúûúòKöúûúûúòKöúûúò
+KòKòKò óKöúûúò(Kò.KöúûúòKöúû	úò Kò Kò*Kò öüúûúò6Köúòöüú†$úòIöûúûúòKöûúûú
+ûúòKöûúûúûúòóKòóKöûúûúûúûúûúûúò1Köú-ò-KòKò óöüúûúûúò>öûúòKöûúòKöûúòóöûúòKöûúòKöûúòóKòKò óö
+üúûúûúûúûúòzKòöüú†$úòIöûúòKöûúûúûúûúò3Köûúûúò>óKòóöüú†$úòIöûúòKöûúûúûúûúò3Köûúûúò>óKòóKò4Köú.ò.Köúûú"ò-öûúûúûòöúûúòöûòöûúûúûòöú(ò(KöúûúòKò&KöûúòKòóöúûúòKöûúòKöûúòKòóöûúòKòKòKòKöûúòKòóóKöûúòKòKòKöúûúòKöúòóKòóòKòKòóKöûúòóKöúòKòKò óöü
+úûúûúûúûúûú#òdöûúûúûúòKöûúûúûúòKòKöú(ò(Kòóöûúûúò%öûúûòöûúòKöúûúòKò'KöûúòKòóöûúòKòKöú
+ûúòKòKòKòóóKòóKòKò óöüúûúûú"ò@Köú	ûúòKöúûúòKöúûúòKöúûúòKöú&ò&KöûúòKòKò óöüúûúûú4òQKöûúûúûúòKöúòKòKò óöüúûúûúûú#òOKòöûúûúûúûò.KòöûúòöûúòKòKòóöûúòKöûúûúûúòKöúòKöúòKöúòKòóóKöûúòóKòóóôö
+üúûúûúûúûúòIKöúûúòKò KòKòKò óöüúûú#ûúûúòUKöúûúòKò öúûúûò KöúûúòKòKòKòKòKöûúòóKòKò óöüúûúûúûúûúûúûúûúòPKòKöúûúòKòKò+öûúûúûúòKòKöúòKöûúòKòóöúòöûúòKöú"ò"Kö
+ûúûúûúûúûúò2KòóKòoKöú/ò/KòóöûúûòöûúòKòKöúòKöûúòKòóöûúòKòKöûúòKòóóKòKò óöüúûúûúûúûúûúûúûúòPKòKöúûúûúòòöûúòKöú"ò"Kö
+ûúûúûúûúûúò2KòóKòVKöú/ò/KòóKöûúûúûúûúò/Köûú0ò6KòKò óöüúûúûúûúûúûúûúûúûúò`KòKöúûúûúòòöûúòKöú"ò"Kö
+ûúûúûúûúûúò2KòóKòtKöú/ò/KòóKöûúûúûúûúò/Köûú0ò6KòKò óöüúûúûú0òDKòKöúûúûúòKöúûúûúòöú$†úò3Köú	ûúòKöûúòKòóòöûúòKöú"ò"Köûúûú	ûúûúûúûúûúòCKòóKòRKöú&ò&KòóKöûúûúûúûúò/Kòóóô	öüúûúûúòQKöúûú*ò3Kòöûúûúûúûò%KòKöûúòóKòKò óö
+üúûúûúûúûúò8KöûúòöúûúûòKöûúûúûúûúûúûúòKöûúûúòóKòKò óöüúûúûúûúûúûúûú'ûúûúòóKöúòKöúûúòKöú	ûúûú$ò5Kò Köüúûúûúûúûúûúûúûú	ò\Köúûúûúûúûò(Köúûúûúò,KöúûúòKò
+Köú3ò3Köúûú"ò+KòKòöûòKöûúûúûúòKöûúûúûúûúòEKòöûòKöûúûúûúûúò3KòKò
+KòKöûúòóöûúûòKöûúûúûúûúòJóKòKöûúûúò=KòWKòKò
+KöûúòóKô[KòKö	ûúûúû
+úûú
+ûò)Köúûúûúûúò KòRKöúûúûúòKöúûúòKò KòKòKò óöüúûúûúûúûúûúûúòOKöúòKöúûúòKöú	ûúûú$ò5Köúûúò'KòKòöûòKöûúûúûúòKòöûòKöûúûúûúòKöûúûúûúò!KòKò
+KòKöûúòóKòKöûúûúò=KòWKòKò
+KöûúûúûúûúòEKöûúòóKò KòKò óóôKöúûúò5Kò öüúûúòöûòKöúûúòKöúûúòKöúûú†(ò4öúòöúòKöúNòNKöûúò	KöúòóKöúòóKöúOòOKöûúûúûúò(KöúòKöúòKòKòKöú%ò%KöûúòóKòKò óöüúô"KöúûúûúôKöúûúûúôKöúûúûúôKôKô óKô_öü
+úûúûúûúò)Köûú
+ûúòKöúûúòKöú%ûúò*KöúûúûúòöúòKò óKöúûúûúò-Köú<ò<KöúQòQKöú<ò<KöúòKöûúûúûúò,Köú2ò2Köûúûúûúò!KöûòKöúûúòKöúòóóKöúXôXöüúûúûúûúò&Köûú0ò6KöúòKò óöüúûúòKöú7ûú9üúüúüúûúò±Köûúûú0ûú@òéKòóKò ôKò óKöûúûúò,KòKöú#ô#Kò Kòóó Öó    E§  `Ø  

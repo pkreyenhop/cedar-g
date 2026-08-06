@@ -1,0 +1,982 @@
+
+DIRECTORY
+Atom USING [GetPropFromList, PutPropOnList],
+Carets USING [ResumeCarets, SuspendCarets],
+InputFocus USING [GetInputFocus, SetInputFocus],
+List USING [CompareProc, Sort],
+Menus USING [CopyMenu],
+MessageWindow USING [Append, Blink, Clear],
+MessageWindowBackdoor USING [AllocateStaticArea],
+Rope USING [ROPE],
+ViewerBLT USING [InternalPaintColumn],
+ViewerClasses USING [Column, Viewer, ViewerClass, ViewerFlavor, ViewerRec],
+ViewerEvents USING [EventProc, ProcessEvent, RegisterEventProc],
+ViewerForkers USING [ForkPaint],
+ViewerLocks USING [CallUnderColumnLock, CallUnderColumnLocks, CallUnderViewerTreeLock, CallUnderWriteLock, Wedged],
+ViewerOps USING [AddProp, BottomViewer, CloseViewer, ComputeColumn, EnumerateChildren, EnumerateViewers, EnumProc, FetchProp, FetchViewerClass, OpenIcon, PaintViewer, ViewerColumn],
+ViewerPrivate,
+ViewerSpecs,
+WindowManager USING [colorDisplayOn];
+
+ViewerOpsImplA: CEDAR MONITOR -- locks icon slot table and props field --
+IMPORTS Atom, Carets, InputFocus, List, Menus, MessageWindow, MessageWindowBackdoor, ViewerBLT, ViewerEvents, ViewerForkers, ViewerLocks, ViewerOps, ViewerPrivate, ViewerSpecs, WindowManager
+EXPORTS ViewerOps, ViewerPrivate
+SHARES Menus, ViewerClasses, ViewerEvents, ViewerOps, ViewerLocks
+= BEGIN OPEN ViewerClasses, ViewerSpecs, ViewerOps, WindowManager;
+
+fatalViewersError: ERROR = CODE;
+
+rootViewerTree: PUBLIC REF ViewerPrivate.RootViewerTreeRep ¨ NEW[ViewerPrivate.RootViewerTreeRep[VAL[4]]];
+
+AddProp: PUBLIC ENTRY PROC [viewer: Viewer, prop: ATOM, val: REF ANY] = {
+ENABLE UNWIND => NULL;
+IF viewer#NIL THEN 
+viewer.props ¨ Atom.PutPropOnList[viewer.props, prop, val]
+};
+
+FetchProp: PUBLIC PROC [viewer: Viewer, prop: ATOM] RETURNS [val: REF ANY] = {
+RETURN[Atom.GetPropFromList[viewer.props, prop]]
+};
+
+
+CreateViewer: PUBLIC PROC [flavor: ViewerFlavor, info: ViewerRec ¨ [], paint: BOOL ¨ TRUE]  
+RETURNS [new: Viewer] = { 
+ENABLE UNWIND => NULL;
+topLevel: BOOL ¨ FALSE;	-- to keep the compiler happy
+defaultPosition: BOOL ¨ FALSE;
+LockedCreateViewer: PROC = {
+class: ViewerClasses.ViewerClass = FetchViewerClass[flavor];
+IF class=NIL THEN ERROR fatalViewersError; -- class not implemented
+defaultPosition ¨ (new.wx=0) AND (new.wy=0) AND (new.ww=0) AND (new.wh=0);
+IF new.parent=NIL AND new.column#static THEN defaultPosition ¨ TRUE; -- insist
+new.class ¨ class;
+topLevel ¨ (new.parent=NIL);
+IF topLevel THEN new.border ¨ TRUE;
+IF topLevel AND new.column#static THEN new.caption ¨ TRUE;
+IF class.scroll=NIL THEN new.scrollable ¨ FALSE;
+IF class.hscroll=NIL THEN new.hscrollable ¨ FALSE;
+IF new.tipTable=NIL THEN new.tipTable ¨ class.tipTable;
+IF new.icon=unInit THEN new.icon ¨ class.icon;
+IF topLevel THEN {
+IF new.column=static THEN new.iconic ¨ FALSE;
+IF NOT iconSlotsUsed<maxIcons THEN new.iconic ¨ FALSE;
+}
+ELSE {
+new.iconic ¨ FALSE;
+new.visible ¨ new.parent.visible AND NOT new.parent.iconic;
+new.column ¨ new.parent.column;
+};
+
+IF new.column#static AND new.parent=NIL AND new.menu=NIL 
+AND new.class.menu#NIL THEN new.menu ¨ Menus.CopyMenu[new.class.menu];
+
+IF topLevel THEN LinkViewer[new, ~new.iconic] ELSE LinkChild[new.parent, new];
+IF NOT defaultPosition THEN SetViewerPosition[new, new.wx, new.wy, new.ww, new.wh];
+IF new.class.init#NIL THEN new.class.init[new];
+IF topLevel THEN IF new.iconic THEN PositionIcon[new]
+ELSE IF defaultPosition OR new.spare5<<topRow>> THEN InternalComputeColumn[new.column, paint];
+new.init ¨ TRUE;
+};
+
+new ¨ NEW[ViewerRec ¨ info];
+
+IF ViewerEvents.ProcessEvent[create, new, TRUE] THEN RETURN[NIL]; -- Gulp!!!
+
+IF ViewerPrivate.ColumnWedged[ViewerColumn[new]].wedged THEN {
+column: Column ¨ UnWedgedColumn[];
+IF column # static THEN new.column ¨ column;
+};
+
+IF new.parent=NIL
+THEN {
+column: Column ~ IF new.iconic THEN static ELSE new.column;
+ViewerLocks.CallUnderColumnLock[LockedCreateViewer, column];
+}
+ELSE ViewerLocks.CallUnderWriteLock[LockedCreateViewer, new.parent];
+
+IF paint AND (new.iconic OR NOT(topLevel AND defaultPosition)) THEN
+ViewerOps.PaintViewer[new, all];
+
+[] ¨ ViewerEvents.ProcessEvent[create, new, FALSE];
+};
+
+DestroyViewer: PUBLIC PROC [viewer: Viewer, paint: BOOL ¨ TRUE] = {
+IF viewer=NIL OR viewer.destroyed THEN RETURN; -- already destroyed; nop
+InternalDestroyViewer[viewer, paint, FALSE];
+};
+
+InternalDestroyViewer: PROC [viewer: Viewer, paint, replace: BOOL] = {
+parent: Viewer;
+x,y,w,h: INTEGER;
+onlyLink: Viewer; -- set only if the only link
+paintParent, paintColumn: BOOL ¨ FALSE;
+
+LockedDestroyViewer: PROC = {
+parent ¨ viewer.parent; -- copy parent; smashed below
+x ¨ viewer.wx; y ¨ viewer.wy; w ¨ viewer.ww; h ¨ viewer.wh;
+
+KillInputFocus[viewer];
+IF viewer.iconic THEN ViewerPrivate.GreyWindow[viewer]; -- erase the icon
+BottomUpRecursivelyDestroyViewerAndChildren[viewer];
+
+IF viewer.link#NIL THEN {
+IF viewer.link.link=viewer THEN {
+viewer.link.link ¨ NIL;
+IF viewer.link.parent=NIL THEN onlyLink ¨ viewer.link;
+}
+ELSE FOR v: Viewer ¨ viewer.link.link, v.link UNTIL v.link=viewer DO
+REPEAT FINISHED => v.link ¨ viewer.link;
+ENDLOOP;
+viewer.link ¨ NIL;
+};
+
+SELECT TRUE FROM
+parent # NIL => {
+SELECT TRUE FROM
+parent.child=viewer => parent.child ¨ viewer.sibling;
+viewer.sibling#NIL OR parent#viewer =>
+FOR test: Viewer ¨ parent.child, test.sibling UNTIL test=NIL DO
+IF test.sibling#NIL AND test.sibling=viewer THEN
+test.sibling ¨ test.sibling.sibling;
+ENDLOOP;
+ENDCASE;
+viewer.sibling ¨ NIL;
+paintParent ¨ paint;
+};
+viewer.iconic => {
+IF replace THEN RETURN;
+RemoveIcon[icon: viewer, fillSlot: TRUE];
+};
+ENDCASE => InternalComputeColumn[viewer.column, paint];
+};
+
+IF ViewerEvents.ProcessEvent[destroy, viewer, TRUE] THEN RETURN;
+
+KillInputFocus[viewer];
+IF viewer.parent=NIL
+THEN {
+column: Column ~ IF viewer.iconic THEN static ELSE viewer.column;
+ViewerLocks.CallUnderColumnLock[LockedDestroyViewer, column];
+}
+ELSE ViewerLocks.CallUnderWriteLock[LockedDestroyViewer, viewer.parent];
+
+IF paintParent THEN ViewerOps.PaintViewer[parent, all];
+
+IF onlyLink#NIL THEN ViewerOps.PaintViewer[onlyLink, caption];
+
+[] ¨ ViewerEvents.ProcessEvent[destroy, viewer, FALSE];
+};
+
+BottomUpRecursivelyDestroyViewerAndChildren: PROC [viewer: Viewer] = {
+LockedBottomUpEtc: PROC = {
+child, next: Viewer;
+viewer.visible ¨ FALSE;
+viewer.destroyed ¨ TRUE;
+IF viewer.class.destroy#NIL THEN viewer.class.destroy[viewer];
+
+child ¨ viewer.child;
+WHILE child # NIL DO
+[] ¨ ViewerEvents.ProcessEvent[destroy, child, TRUE]; -- what would abort mean?
+BottomUpRecursivelyDestroyViewerAndChildren[child];
+[] ¨ ViewerEvents.ProcessEvent[destroy, child, FALSE];
+next ¨ child.sibling;
+child.sibling ¨ NIL;
+child ¨ next;
+ENDLOOP;
+
+IF viewer.parent=NIL THEN UnlinkViewer[viewer];
+viewer.parent ¨ NIL; viewer.name ¨ NIL; viewer.file ¨ NIL;
+viewer.menu ¨ NIL; viewer.props ¨ NIL; viewer.child ¨ NIL;
+viewer.data ¨ NIL;
+};
+
+ViewerLocks.CallUnderWriteLock[LockedBottomUpEtc, viewer]; 
+};
+
+TopViewer: PUBLIC PROC [viewer: Viewer, paint: BOOL ¨ TRUE] = {
+LockedTopViewer: PROC = {
+IF viewer.parent#NIL THEN RETURN; -- top level viewers only
+SELECT viewer.column FROM
+left, right => IF (viewer.wy+viewer.wh)=ViewerSpecs.openTopY THEN RETURN;
+color => IF (viewer.wy+viewer.wh)=ViewerSpecs.colorScreenHeight THEN RETURN;
+static => NULL;
+ENDCASE => RETURN; -- not a sequenced column
+UnlinkViewer[viewer];
+LinkViewer[viewer, FALSE];
+InternalComputeColumn[viewer.column, paint];
+};
+IF viewer.offDeskTop THEN ChangeColumn[viewer, left];
+ViewerLocks.CallUnderColumnLock[LockedTopViewer, viewer.column];
+};
+
+BottomViewer: PUBLIC PROC [viewer: Viewer, paint: BOOL ¨ TRUE] = {
+LockedBottomViewer: PROC = {
+IF viewer.parent#NIL THEN RETURN; -- top level viewers only
+SELECT viewer.column FROM
+left, right => IF viewer.wy=ViewerSpecs.openBottomY THEN RETURN;
+color => IF viewer.wy=0 THEN RETURN;
+static => NULL;
+ENDCASE => RETURN; -- not a sequenced column
+UnlinkViewer[viewer];
+LinkViewer[viewer, TRUE];
+InternalComputeColumn[viewer.column, paint];
+};
+IF viewer.offDeskTop THEN ChangeColumn[viewer, left];
+ViewerLocks.CallUnderColumnLock[LockedBottomViewer, viewer.column];
+};
+
+MoveAboveViewer: PUBLIC PROC [altered, static: Viewer, paint: BOOL ¨ TRUE] = {
+LockedMoveAboveViewer: PROC = {
+IF altered.parent#NIL OR static.parent#NIL THEN RETURN;
+IF altered.column#static.column OR static.iconic THEN RETURN;
+UnlinkViewer[altered];
+altered.sibling ¨ static.sibling;
+static.sibling ¨ altered;
+InternalComputeColumn[altered.column, paint];
+};
+IF static.offDeskTop THEN ChangeColumn[static, left];
+IF altered.offDeskTop THEN ChangeColumn[altered, left];
+ViewerLocks.CallUnderColumnLock[LockedMoveAboveViewer, altered.column];
+};
+
+MoveBelowViewer: PUBLIC PROC [altered, static: Viewer, paint: BOOL ¨ TRUE] = {
+LockedMoveBelowViewer: PROC = {
+IF altered.parent#NIL OR static.parent#NIL THEN RETURN;
+IF altered.column#static.column OR static.iconic THEN RETURN;
+IF altered.destroyed OR static.destroyed THEN RETURN; -- DKW: until locking is right
+UnlinkViewer[altered];
+IF static=rootViewerTree[altered.column] THEN {
+altered.sibling ¨ static;
+rootViewerTree[altered.column] ¨ altered;
+}
+ELSE {
+inFront: Viewer;
+FOR v: Viewer ¨ rootViewerTree[altered.column], v.sibling UNTIL v.sibling=static DO
+REPEAT FINISHED => inFront ¨ v;
+ENDLOOP;
+altered.sibling ¨ static;
+inFront.sibling ¨ altered;
+};
+InternalComputeColumn[altered.column, paint];
+};
+IF static.offDeskTop THEN ChangeColumn[static, left];
+IF altered.offDeskTop THEN ChangeColumn[altered, left];
+ViewerLocks.CallUnderColumnLock[LockedMoveBelowViewer, altered.column];
+};
+
+ReplaceViewer: PUBLIC PROC [new, old: Viewer] = {
+LockedReplaceViewer: PROC = {
+IF old.parent#NIL OR new.parent#NIL OR new.column#old.column THEN
+RETURN WITH ERROR fatalViewersError; -- must be same level and column
+KillInputFocus[old];
+UnlinkViewer[new];
+new.sibling ¨ old.sibling;
+old.sibling ¨ new;
+new.iconic ¨ old.iconic;
+new.position ¨ old.position;
+new.openHeight ¨ old.openHeight;
+new.column ¨ old.column;
+new.offDeskTop ¨ old.offDeskTop;
+new.visible ¨ old.visible;
+SetViewerPosition[new, old.wx, old.wy, old.ww, old.wh];
+InternalDestroyViewer[old, FALSE, TRUE]; -- doesn't free the icon slot
+IF ~new.iconic THEN InternalComputeColumn[new.column];
+};
+KillInputFocus[old];
+IF old.offDeskTop THEN ChangeColumn[old, left];
+IF new.offDeskTop THEN ChangeColumn[new, left];
+ViewerLocks.CallUnderColumnLock[LockedReplaceViewer, ViewerColumn[old]];
+IF new.iconic THEN ViewerOps.PaintViewer[new, all];
+};
+
+
+MoveBoundary: PUBLIC PROC [newLeftWidth, newBottomY: INTEGER] = {
+LockedMoveBoundary: PROC = {
+oldBottomY: INTEGER ~ ViewerSpecs.openBottomY;
+oldLeftWidth: INTEGER ~ ViewerSpecs.openLeftWidth;
+ViewerPrivate.SetOpenLeftWidth[newLeftWidth];
+ViewerPrivate.SetOpenBottomY[newBottomY];
+IF ViewerSpecs.openLeftWidth > oldLeftWidth THEN {
+InternalComputeColumn[right, TRUE, FALSE];
+InternalComputeColumn[left, TRUE, FALSE];
+}
+ELSE {
+InternalComputeColumn[left, TRUE, FALSE];
+InternalComputeColumn[right, TRUE, FALSE];
+};
+IF ViewerSpecs.openBottomY#oldBottomY THEN { -- repaint icons
+ViewerPrivate.GreyScreen[main, 0, 0, ViewerSpecs.bwScreenWidth, ViewerSpecs.openBottomY];
+FOR v: Viewer ¨ rootViewerTree[static], v.sibling UNTIL v = NIL DO
+IF v.offDeskTop OR NOT v.iconic THEN LOOP;
+ForkPaintViewerAll[v];
+ENDLOOP;
+};
+};
+inner: PROC = {
+ViewerLocks.CallUnderViewerTreeLock[LockedMoveBoundary];
+ViewerPrivate.WaitForPaintingToFinish[];
+};
+WithCaretsOff[inner];
+};
+
+ChangeColumn: PUBLIC PROC [viewer: Viewer, newColumn: Column] = {
+oldColumn: Column;
+paint: BOOL = TRUE;
+paintIcon: BOOL ¨ FALSE;
+LockedChangeColumn: PROC = {
+SetColumn: EnumProc = {v.column ¨ viewer.column};
+oldColumn ¨ viewer.column;
+IF oldColumn = newColumn THEN RETURN;
+IF newColumn = static AND ~viewer.iconic THEN CloseViewer[viewer];
+IF viewer.iconic THEN {
+IF oldColumn # static THEN {
+RemoveIcon[viewer];
+ViewerPrivate.GreyWindow[viewer];
+}; 
+viewer.column ¨ newColumn;
+IF newColumn # static THEN {PositionIcon[viewer]; paintIcon ¨ TRUE};
+};
+IF ~viewer.iconic THEN {
+UnlinkViewer[viewer];
+viewer.column ¨ newColumn;
+LinkViewer[viewer];
+InternalComputeColumn[oldColumn, paint];
+InternalComputeColumn[newColumn, paint];
+};
+IF oldColumn = static THEN viewer.offDeskTop ¨ FALSE;
+IF newColumn = static THEN {
+SetViewerPosition[viewer, 2000, 2000, 10, 10];
+viewer.offDeskTop ¨ TRUE;
+};
+
+EnumerateChildren[viewer, SetColumn];
+};
+inner: PROC = {
+IF ViewerPrivate.ColumnWedged[newColumn].wedged THEN {
+newColumn ¨ UnWedgedColumn[];
+IF newColumn = static THEN RETURN;
+};
+ViewerLocks.CallUnderColumnLocks[LockedChangeColumn, ViewerColumn[viewer], newColumn];
+IF paintIcon THEN ViewerOps.PaintViewer[viewer, all];
+};
+IF ViewerEvents.ProcessEvent[changeColumn, viewer, TRUE].abort THEN RETURN;
+WithCaretsOff[inner];
+[] ¨ ViewerEvents.ProcessEvent[changeColumn, viewer, FALSE];
+};
+
+OpenIcon: PUBLIC PROC [icon: Viewer, 
+closeOthers: BOOL ¨ FALSE, bottom: BOOL ¨ TRUE, paint: BOOL ¨ TRUE] = {
+LockedOpenIcon: PROC = {
+ENABLE UNWIND => NULL;
+SetOpen: EnumProc = {v.visible ¨ TRUE};
+IF ~icon.iconic THEN {paint ¨ closeOthers ¨ FALSE; RETURN};
+KillInputFocus[icon];
+closeOthers ¨ (closeOthers AND (CountViewers[icon.column]#0));
+ViewerPrivate.GreyWindow[icon];
+UnlinkViewer[icon];
+icon.iconic ¨ FALSE;
+LinkViewer[icon, bottom];
+EnumerateChildren[icon, SetOpen];
+RemoveIcon[icon: icon, fillSlot: NOT closeOthers];
+icon.position ¨ 0;
+IF closeOthers THEN GrowViewer[icon, paint];
+InternalComputeColumn[icon.column, paint];
+IF paint THEN MessageWindow.Clear[]; -- flush old messages
+};
+inner: PROC = {
+IF ViewerPrivate.ColumnWedged[icon.column].wedged THEN {
+column: Column ¨ UnWedgedColumn[];
+IF column # static THEN icon.column ¨ column;
+};
+KillInputFocus[icon];
+IF icon.offDeskTop THEN ChangeColumn[icon, left];
+ViewerLocks.CallUnderColumnLocks[LockedOpenIcon, icon.column, static];
+};
+
+IF ViewerEvents.ProcessEvent[open, icon, TRUE].abort THEN RETURN;
+
+WithCaretsOff[inner ! ViewerLocks.Wedged => GO TO ignore];
+
+[] ¨ ViewerEvents.ProcessEvent[open, icon, FALSE];
+EXITS ignore => {};
+};
+
+CloseViewer: PUBLIC PROC [viewer: Viewer, paint: BOOL ¨ TRUE] = {
+ENABLE UNWIND => NULL;
+LockedCloseViewer: PROC = {
+SetClosed: EnumProc = {v.visible ¨ FALSE};
+IF viewer.iconic OR viewer.column=static THEN RETURN;
+IF NOT iconSlotsUsed<maxIcons THEN {
+MessageWindow.Append["No space for another icon!  Try deleting some viewers.", TRUE];
+MessageWindow.Blink;
+RETURN;
+};
+KillInputFocus[viewer];
+UnlinkViewer[viewer];
+viewer.iconic ¨ TRUE;
+LinkViewer[viewer];
+EnumerateChildren[viewer, SetClosed];
+PositionIcon[viewer];
+InternalComputeColumn[viewer.column, paint];
+};
+inner: PROC = {
+KillInputFocus[viewer];
+IF viewer.offDeskTop THEN ChangeColumn[viewer, left];
+ViewerLocks.CallUnderColumnLocks[LockedCloseViewer, viewer.column, static];
+IF paint THEN ViewerOps.PaintViewer[viewer, all];
+};
+
+IF ViewerEvents.ProcessEvent[close, viewer, TRUE].abort THEN RETURN;
+WithCaretsOff[inner];
+[] ¨ ViewerEvents.ProcessEvent[close, viewer, FALSE];
+};
+
+SwapIconAndViewer: PUBLIC PROC [icon, openViewer: Viewer, paint: BOOL ¨ TRUE] = {
+DO
+col: Column = openViewer.column;
+retry: BOOL ¨ FALSE;
+inner: PROC = {
+IF openViewer.column # col OR icon.column # col THEN {retry ¨ TRUE; RETURN};
+IF ~icon.iconic OR openViewer.iconic THEN RETURN;
+KillInputFocus[icon];
+KillInputFocus[openViewer];
+OpenIcon[icon: icon, paint: FALSE];
+MoveAboveViewer[icon, openViewer, FALSE];
+CloseViewer[openViewer, FALSE];
+ComputeColumn[col];
+};
+IF ~icon.iconic OR openViewer.iconic THEN RETURN;
+IF ViewerPrivate.ColumnWedged[col].wedged THEN RETURN;
+IF ViewerPrivate.ColumnWedged[icon.column].wedged THEN RETURN;
+IF icon.column#col THEN {ChangeColumn[icon, col]; LOOP};
+ViewerLocks.CallUnderColumnLocks[inner, col, static];
+IF NOT retry THEN EXIT;
+ENDLOOP;
+};
+
+GrowViewer: PUBLIC PROC [viewer: Viewer, paint: BOOL ¨ TRUE] = {
+inThisColumn: LIST OF Viewer;
+LockedComputeColumn: PROC = {InternalComputeColumn[viewer.column, paint]};
+LockedGrowViewer: PROC = {
+FOR v: Viewer ¨ rootViewerTree[viewer.column], v.sibling WHILE v # NIL DO
+IF v # viewer THEN inThisColumn ¨ CONS[v, inThisColumn];
+ENDLOOP;
+};
+inner: PROC = {
+IF viewer.offDeskTop THEN ChangeColumn[viewer, left];
+ViewerLocks.CallUnderColumnLocks[LockedGrowViewer, viewer.column, static];
+FOR v: LIST OF Viewer ¨ inThisColumn, v.rest UNTIL v = NIL DO
+ViewerOps.CloseViewer[v.first, FALSE];  -- outside the lock because of KillInputFocus
+ENDLOOP; 
+IF paint AND inThisColumn # NIL THEN {
+FOR v: LIST OF Viewer ¨ inThisColumn, v.rest UNTIL v = NIL DO
+IF v.first.iconic THEN ViewerOps.PaintViewer[v.first, all];
+ENDLOOP;
+ViewerLocks.CallUnderColumnLock[LockedComputeColumn, viewer.column];
+};
+};
+IF viewer.iconic THEN {ViewerOps.OpenIcon[viewer, TRUE, paint]; RETURN};
+IF ViewerEvents.ProcessEvent[grow, viewer, TRUE].abort THEN RETURN;
+WithCaretsOff[inner];
+[] ¨ ViewerEvents.ProcessEvent[grow, viewer, FALSE];
+};
+
+GrowExtra: ViewerEvents.EventProc = { 
+LockedGrowExtra: PROC = {
+closedViewers: LIST OF Viewer; -- closed with the last grow
+inThisColumn: LIST OF Viewer; -- viewers currently in the column
+compare: List.CompareProc = {RETURN[IF NARROW[ref1, Viewer].wy > 
+NARROW[ref2, Viewer].wy THEN less ELSE greater]};
+ListColumn: ViewerOps.EnumProc = {
+IF ~v.iconic AND v.column=viewer.column THEN
+inThisColumn ¨ CONS[v, inThisColumn];
+};
+
+IF before THEN {
+ViewerOps.EnumerateViewers[ListColumn];
+TRUSTED {inThisColumn ¨ LOOPHOLE[List.Sort[LOOPHOLE[inThisColumn], compare]]};
+ViewerOps.AddProp[viewer, $InThisColumn, inThisColumn];
+IF event = grow THEN RETURN;
+};
+  
+closedViewers ¨ NARROW[ViewerOps.FetchProp[viewer, $ClosedViewers]];
+inThisColumn ¨ NARROW[ViewerOps.FetchProp[viewer, $InThisColumn]];
+ViewerOps.AddProp[viewer, $ClosedViewers, inThisColumn];
+ViewerOps.AddProp[viewer, $InThisColumn, NIL];
+IF inThisColumn = NIL OR inThisColumn.rest # NIL THEN RETURN; -- first grow
+
+FOR v: LIST OF Viewer ¨ closedViewers, v.rest WHILE v # NIL DO
+SELECT TRUE FROM
+v.first.destroyed => {};
+v.first = viewer => ViewerOps.BottomViewer[viewer: viewer, paint: FALSE];
+v.first.iconic AND v.first.column = viewer.column =>
+ViewerOps.OpenIcon[icon: v.first, paint: FALSE];
+ENDCASE;
+ENDLOOP;
+ViewerOps.ComputeColumn[viewer.column];
+};
+inner: PROC = {
+ViewerLocks.CallUnderColumnLocks[LockedGrowExtra, viewer.column, static];
+};
+IF event = destroy AND viewer.parent # NIL THEN RETURN;
+IF event = destroy AND (viewer.iconic OR viewer.column = static) THEN RETURN;
+WithCaretsOff[inner];
+};
+
+ComputeColumn: PUBLIC PROC [column: Column, paint: BOOL ¨ TRUE] = {
+ENABLE UNWIND => NULL;
+LockedComputeColumn: PROC = {
+InternalComputeColumn[column, paint];
+};
+inner: PROC = {
+ViewerLocks.CallUnderColumnLock[LockedComputeColumn, column];
+};
+WithCaretsOff[inner];
+};
+
+InternalComputeColumn: PROC [column: Column, paint, icons: BOOL ¨ TRUE] = {
+openViewers: INTEGER = CountViewers[column];
+SELECT TRUE FROM
+(openViewers = 0) => NULL;
+(column = static) => {
+mw: Viewer ~ ViewerPrivate.messageWindow;
+IF mw # NIL THEN { -- don't do anything if the message window is not there yet.
+toplist: LIST OF Viewer ¨ NIL;
+SetViewerPosition[
+viewer: mw,
+x: 0,
+y: ViewerSpecs.bwScreenHeight-ViewerSpecs.messageWindowHeight,
+w: ViewerSpecs.bwScreenWidth,
+h: ViewerSpecs.messageWindowHeight
+];
+FOR v: Viewer ¨ rootViewerTree[column], v.sibling UNTIL v=NIL DO
+SELECT TRUE FROM
+v.offDeskTop => NULL;
+v=mw => NULL;
+v.iconic => SetIconPosition[v];
+v.spare5 => {
+toplist ¨ CONS[v, toplist];
+};
+ENDCASE => NULL;
+ENDLOOP;
+WHILE toplist # NIL DO
+v: Viewer ¨ toplist.first;
+x, y, w, h: INTEGER;
+[x, y, w, h] _ MessageWindowBackdoor.AllocateStaticArea[v.ww];
+SetViewerPosition[v, x, y, w, h];
+toplist ¨ toplist.rest;
+ENDLOOP;
+};
+};
+ENDCASE => {
+force: BOOL ¨ FALSE;
+largestViewer: Viewer;
+totalRequested, requests: INTEGER ¨ 0;
+minHeight: INTEGER ~ captionHeight;
+leftX, width, bottomY, nextY: INTEGER;
+normalHeight, extra, default, totalSpace: INTEGER ¨ 0;
+DesiredHeight: PROC [v: Viewer] RETURNS [INTEGER] = INLINE {
+RETURN[--IF v.position#0 THEN v.position ELSE-- v.openHeight];
+};
+AddUpRequests: PROC [cutoff: INTEGER]  = {
+largestHeight: INTEGER ¨ 0;
+totalRequested ¨ requests ¨ 0;
+FOR v: Viewer ¨ rootViewerTree[column], v.sibling UNTIL v=NIL DO
+IF DesiredHeight[v] > largestHeight THEN {
+largestHeight ¨ DesiredHeight[v]; largestViewer ¨ v;
+};
+IF DesiredHeight[v]#0 AND DesiredHeight[v] <= cutoff THEN {
+totalRequested ¨ totalRequested + DesiredHeight[v];
+requests ¨ requests + 1;
+};
+ENDLOOP;
+};
+[x: leftX, w: width, y: bottomY, h: totalSpace] ¨ ColumnInfo[column];
+nextY ¨ bottomY;
+normalHeight ¨ totalSpace/openViewers;
+AddUpRequests[LAST[INTEGER]/2];
+IF totalRequested+((openViewers-requests)*minHeight) > totalSpace THEN {
+force ¨ TRUE; AddUpRequests[normalHeight];
+};
+IF openViewers=requests
+THEN extra ¨ totalSpace-totalRequested 
+ELSE {
+default ¨ (totalSpace-totalRequested)/(openViewers-requests);
+extra ¨ (totalSpace-totalRequested) MOD (openViewers-requests);
+};
+FOR v: Viewer ¨ rootViewerTree[column], v.sibling UNTIL v=NIL DO
+height: INTEGER ¨ SELECT TRUE FROM
+DesiredHeight[v]=0 => default,
+force AND DesiredHeight[v] > normalHeight => default,
+ENDCASE => DesiredHeight[v];
+IF openViewers = requests AND largestViewer # NIL 
+THEN {IF v = largestViewer THEN height ¨ height + extra}
+ELSE {IF nextY=bottomY THEN height ¨ height + extra};
+SetViewerPosition[v, leftX, nextY, width, height];
+nextY ¨ nextY + v.wh;
+ENDLOOP;
+};
+IF paint THEN ViewerBLT.InternalPaintColumn[column, icons];
+};
+
+ColumnInfo: PROC[column: Column] RETURNS[x, y, w, h: INTEGER] = {
+SELECT column FROM
+left => RETURN[
+x: ViewerSpecs.openLeftLeftX, w: ViewerSpecs.openLeftWidth,
+y: ViewerSpecs.openBottomY, h: ViewerSpecs.openTopY-ViewerSpecs.openBottomY
+];
+right => RETURN[
+x: ViewerSpecs.openRightLeftX, w: ViewerSpecs.openRightWidth,
+y: ViewerSpecs.openBottomY, h: ViewerSpecs.openTopY-ViewerSpecs.openBottomY
+];
+color => RETURN[
+x: 0, w: ViewerSpecs.colorScreenWidth,
+y: 0, h: ViewerSpecs.colorScreenHeight
+];
+ENDCASE => ERROR;
+};
+
+maxIcons: NAT ~ 16*32;
+IconSlotsArray: TYPE ~ PACKED ARRAY [0..maxIcons) OF BOOL;
+
+iconSlotsArray: REF IconSlotsArray ¨ NEW[IconSlotsArray ¨ ALL[FALSE]];
+iconSlotsUsed: [0..maxIcons] ¨ 0;
+
+ClaimIconSlot: ENTRY PROC [slot: [0..maxIcons)] RETURNS [BOOL] ~ {
+ENABLE UNWIND => NULL;
+IF NOT iconSlotsArray[slot] THEN {
+iconSlotsUsed ¨ iconSlotsUsed + 1;
+iconSlotsArray[slot] ¨ TRUE;
+RETURN [TRUE]
+};
+RETURN [FALSE]
+};
+
+UpdateIconSlot: ENTRY PROC [slot: [0..maxIcons), value: BOOL] ~ {
+ENABLE UNWIND => NULL;
+IF iconSlotsArray[slot] THEN iconSlotsUsed ¨ iconSlotsUsed - 1;
+IF value THEN iconSlotsUsed ¨ iconSlotsUsed + 1;
+iconSlotsArray[slot] ¨ value;
+};
+
+RemoveIcon: PROC [icon: Viewer, fillSlot: BOOL ¨ FALSE] = {
+rows: NAT ~ ViewerSpecs.iconRows;
+columns: NAT ~ ViewerSpecs.iconColumns;
+filler: Viewer;
+slot: INTEGER ¨ 0;
+FindSlotIcon: ViewerOps.EnumProc = {
+IF v.offDeskTop THEN RETURN;
+IF v.iconic AND v.position=slot THEN { filler ¨ v; RETURN[FALSE] };
+};
+IF icon.offDeskTop THEN RETURN;
+UpdateIconSlot[icon.position, FALSE];
+IF NOT fillSlot THEN RETURN;
+FOR m: NAT DECREASING IN ((icon.position/columns)..rows) DO
+IF icon.column = right THEN FOR n: NAT DECREASING IN [0..columns) DO
+slot ¨ m*columns + n;
+IF iconSlotsArray[slot] THEN EXIT;
+ENDLOOP
+ELSE FOR n: NAT IN [0..columns) DO
+slot ¨ m*columns + n;
+IF iconSlotsArray[slot] THEN EXIT;
+ENDLOOP;
+ENDLOOP;
+IF slot = 0 OR NOT iconSlotsArray[slot] THEN RETURN;
+ViewerOps.EnumerateViewers[FindSlotIcon];
+IF filler = NIL THEN RETURN;
+ViewerPrivate.GreyWindow[filler];
+UpdateIconSlot[filler.position, FALSE];
+filler.position ¨ icon.position;
+UpdateIconSlot[filler.position, TRUE];
+SetIconPosition[filler];
+ForkPaintViewerAll[filler];
+};
+
+PositionIcon: PROC [viewer: Viewer, slot: INTEGER ¨ 0] = {
+rows: NAT ~ ViewerSpecs.iconRows;
+columns: NAT ~ ViewerSpecs.iconColumns;
+slotIcon: Viewer ¨ NIL;
+FindSlotIcon: ViewerOps.EnumProc = {
+IF v.offDeskTop THEN RETURN;
+IF v.iconic AND v.position=slot THEN {slotIcon ¨ v; RETURN[FALSE]};
+};
+FindIconSlot: PROC [side: Column] RETURNS [slot: CARDINAL] = {
+FOR m: CARDINAL IN [0..rows) DO
+IF side=right THEN FOR n: CARDINAL DECREASING IN [0..columns) DO
+slot ¨ m*columns+n;
+IF ClaimIconSlot[slot] THEN RETURN;
+ENDLOOP
+ELSE FOR n: CARDINAL IN [0..columns) DO
+slot ¨ m*columns+n;
+IF ClaimIconSlot[slot] THEN RETURN;
+ENDLOOP;
+ENDLOOP;
+};
+
+IF slot # 0 AND iconSlotsArray[slot] THEN { -- move the icon in the slot
+ViewerOps.EnumerateViewers[FindSlotIcon];
+IF slotIcon # NIL THEN {
+slotIcon.position ¨ FindIconSlot[slotIcon.column];
+SetIconPosition[slotIcon];
+};
+};
+
+viewer.position ¨ IF slot # 0 THEN slot ELSE FindIconSlot[viewer.column];
+UpdateIconSlot[viewer.position, TRUE];
+SetIconPosition[viewer];
+};
+
+SetIconPosition: PROC [icon: Viewer] = {
+columns: NAT ~ ViewerSpecs.iconColumns;
+position: NAT ~ icon.position;
+r: NAT ~ position/columns;
+c: NAT ~ position MOD columns;
+x: INTEGER ~ ViewerSpecs.iconLeftX+c*ViewerSpecs.iconColumnWidth;
+y: INTEGER ~ ViewerSpecs.iconBottomY+r*ViewerSpecs.iconRowHeight;
+SetViewerPosition[icon, x, y, iconWidth, iconHeight];
+};
+
+MoveViewer: PUBLIC PROC [viewer: Viewer, x, y, w, h: INTEGER, paint: BOOL ¨ TRUE] ~ {
+parent: Viewer ~ viewer.parent;
+LockedMoveViewer: PROC = {
+IF paint AND parent=NIL THEN ViewerPrivate.GreyWindow[viewer];
+SetViewerPosition[viewer, x, y, w, h];
+};
+inner: PROC = {
+ViewerLocks.CallUnderWriteLock[LockedMoveViewer, viewer];
+IF paint THEN ViewerOps.PaintViewer[IF parent=NIL THEN viewer ELSE parent, all];
+};
+WithCaretsOff[inner];
+};
+
+EstablishViewerPosition: PUBLIC PROC [viewer: Viewer, x, y, w, h: INTEGER] ~ {
+LockedEstablishViewerPosition: PROC = {
+SetViewerPosition[viewer, x, y, w, h];
+};
+inner: PROC = {
+ViewerLocks.CallUnderWriteLock[LockedEstablishViewerPosition, viewer];
+};
+WithCaretsOff[inner];
+};
+
+SetViewerPosition: PROC [viewer: Viewer, x, y, w, h: INTEGER] ~ {
+oldcw: INTEGER ~ viewer.cw; oldch: INTEGER ~ viewer.ch;
+IF w<0 THEN w ¨ 0; IF h<0 THEN h ¨ 0;
+viewer.wx ¨ x;
+viewer.wy ¨ y;
+viewer.ww ¨ w;
+viewer.wh ¨ h;
+IF viewer.iconic
+THEN {
+viewer.cx ¨ 0;
+viewer.cy ¨ 0;
+viewer.cw ¨ w;
+viewer.ch ¨ h;
+}
+ELSE {
+xmin: INTEGER ¨ 0; xmax: INTEGER ¨ w;
+ymin: INTEGER ¨ 0; ymax: INTEGER ¨ h;
+IF viewer.border THEN {
+size: INTEGER ~ ViewerSpecs.windowBorderSize;
+xmin ¨ xmin+size; xmax ¨ xmax-size;
+ymin ¨ ymin+size; ymax ¨ ymax-size;
+};
+IF viewer.caption THEN
+ymax ¨ h-ViewerSpecs.captionHeight;
+IF viewer.menu#NIL THEN {
+lines: NAT ~ viewer.menu.linesUsed;
+ymax ¨ ymax-lines*ViewerSpecs.menuHeight;
+ymax ¨ ymax-ViewerSpecs.menuBarHeight;
+};
+IF viewer.scrollable THEN
+xmin ¨ xmin+ViewerSpecs.scrollBarW;
+IF viewer.hscrollable THEN
+ymin ¨ ymin+ViewerSpecs.scrollBarW;
+IF xmax<xmin THEN xmin ¨ xmax ¨ 0;
+IF ymax<ymin THEN ymin ¨ ymax ¨ 0;
+viewer.cx ¨ xmin; viewer.cw ¨ xmax-xmin;
+viewer.cy ¨ ymin; viewer.ch ¨ ymax-ymin;
+};
+IF viewer.class.adjust#NIL AND (viewer.cw#oldcw OR viewer.ch#oldch) THEN
+[] ¨ viewer.class.adjust[viewer];
+};
+
+LinkViewer: PROC [new: Viewer, bottom: BOOL ¨ TRUE] = {
+column: Column ~ ViewerColumn[new];
+IF rootViewerTree[column]=NIL OR bottom
+THEN {
+new.sibling ¨ rootViewerTree[column];
+rootViewerTree[column] ¨ new;
+}
+ELSE FOR v: Viewer ¨ rootViewerTree[column], v.sibling UNTIL v.sibling=NIL DO
+REPEAT FINISHED => v.sibling ¨ new;
+ENDLOOP;
+};
+
+UnlinkViewer: PROC [old: Viewer] = {
+column: Column ~ ViewerColumn[old];
+IF old.parent = NIL
+THEN {
+root: Viewer ¨ rootViewerTree[column];
+IF old=root
+THEN rootViewerTree[column] ¨ old.sibling
+ELSE FOR v: Viewer ¨ root, v.sibling WHILE v # NIL DO
+IF v.sibling = old THEN {v.sibling ¨ old.sibling; EXIT};
+ENDLOOP;
+}
+ELSE {
+parent: Viewer ¨ old.parent;
+FOR v: Viewer ¨ parent, v.sibling WHILE v # NIL DO
+IF v.sibling = old THEN {
+IF parent.child = old THEN parent.child ¨ old.sibling;
+v.sibling ¨ old.sibling;
+EXIT};
+ENDLOOP;
+};
+old.sibling ¨ NIL;
+};
+
+LinkChild: PROC [parent, child: Viewer, bottom: BOOL ¨ TRUE] = {
+IF parent.child=NIL OR bottom THEN {
+child.sibling ¨ parent.child;
+parent.child ¨ child;
+}
+ELSE FOR v: Viewer ¨ parent.child, v.sibling UNTIL v.sibling=NIL DO
+REPEAT FINISHED => v.sibling ¨ child;
+ENDLOOP;
+};
+
+CountViewers: PROC [c: Column] RETURNS [count: INTEGER] = {
+count ¨ 0;
+FOR v: Viewer ¨ rootViewerTree[c], v.sibling UNTIL v=NIL DO
+count ¨ count+1;
+ENDLOOP;
+};
+
+KillInputFocus: PROC [viewer: Viewer] = {
+focus: Viewer ¨ InputFocus.GetInputFocus[].owner;
+WHILE focus # NIL DO
+IF focus # viewer
+THEN focus ¨ focus.parent
+ELSE {InputFocus.SetInputFocus[]; EXIT};
+ENDLOOP;
+};
+
+UnWedgedColumn: PROC RETURNS[unwedged: Column] = {
+FOR unwedged IN Column DO
+IF unwedged = static THEN LOOP; -- save the static column for last
+IF unwedged = color AND ~WindowManager.colorDisplayOn THEN LOOP;
+IF NOT ViewerPrivate.ColumnWedged[unwedged].wedged THEN RETURN;
+ENDLOOP;
+RETURN[static];
+};
+
+ForkPaintViewerAll: PROC [viewer: Viewer] = TRUSTED {
+ViewerForkers.ForkPaint[viewer, all];
+};
+
+WithCaretsOff: PROC [inner: PROC] = {
+Carets.SuspendCarets[];
+inner[ ! UNWIND => Carets.ResumeCarets[]];
+Carets.ResumeCarets[];
+};
+
+[] ¨ ViewerEvents.RegisterEventProc[GrowExtra, grow, NIL, TRUE];
+[] ¨ ViewerEvents.RegisterEventProc[GrowExtra, grow, NIL, FALSE];
+[] ¨ ViewerEvents.RegisterEventProc[GrowExtra, destroy];
+
+END.
+
+  ^  
+ViewerOpsImplA.mesa
+Copyright ” 1985, 1986, 1987, 1991 by Xerox Corporation.  All rights reserved.
+Plass, May 4, 1983 11:27 am
+Russ Atkinson (RRA) June 18, 1985 0:58:25 am PDT
+Doug Wyatt, January 19, 1987 11:59:30 pm PST
+Michael Plass, March 17, 1992 9:38 am PST
+Christian Jacobi, May 25, 1990 1:16 pm PDT
+Last tweaked by Mike Spreitzer on May 18, 1988 6:34:16 pm PDT
+Bier, January 29, 1989 3:07:02 pm PST
+Willie-s, May 24, 1991 1:46 pm PDT
+rootViewerTree[column] is the bottom viewer in the column
+not locked, but these are not ordinary times!
+used by ReplaceViewer to prevent the slot from being reused
+the following are always painted because the caller isn't likely to know to repaint them
+help out the garbage collector (.sibling handled by caller and above)
+-- iconic case
+-- non iconic case
+-- hyperspace
+not locked, but these are not ordinary times!
+[viewer: Viewer, event: ViewerEvent, before: BOOL]
+cons up a list of viewers currently in the column
+monitored access to window chain
+The static column contains the buttons in the top row of the Viewers World.  If this World has been resized, these buttons will be moved so as to stay flush right.  Note that if the Viewers World has just been shrunk, some of these buttons may end up at negative wx values (e.g., off the screen).
+If there are no requests, divide the column evenly among the viewers.
+If total requested > column height, ignore requests for more than average height.
+If total requested < column height AND requests = viewers,  put extra on largest viewer. 
+A top-level viewer, so a single chain terminated by NIL
+Child of a viewer (circular chain)
+ ù %◊  ïNewlineDelimiter
+ñ(cedarcode) styleô codeöúôKöú
+œeúCôNKôKô0Kô,Kô)Kô*Kô=Kô%Kô"óKò öœk	ò	Köúûú"ò,Köúûúò+Köúûú ò0KöúûúòKöúûúòKöúûúò+Köúûúò1KöúûúûúòKöú
+ûúò&Köúûú8òKKöúûú.ò@Köúûúò KöúûúbòsKöú
+ûú¶òµKöúòKöúòKöúûúò%óKò ö—blnúûúûúœc+òIKöûú∑òæKöûúò Köûú;òAKöúûúûú6òBóKò Köúûúûúò Kò ö	úûúûú#ûú!ûúòjKô9óKò öœnúûúûúûúûúûúûúòIKöûúûúûúòöûúûúûúòKöú:ò:óKöúòKò óö°	úûúûúûúûúûúûúòNKöûú*ò0KöúòKò óKò ö°úûúûú5ûúûúûúòwKöûúûúûúòKöú
+ûúûú†ò5Köúûúûúòö°úûúòKò<Kö	ûúûúûúûú†òCKöúûúûúûúòJKöûúûúûúûúûú†	òNKöúòKöúûúòKöûú
+ûúûúò#Köûú
+ûúûúûúò:Köûúûúûúûúò0Köûúûúûúûúò2Köûúûúûúò7Köûúûúò.öûú
+ûúòKöûúûúûúò-Köûúûúûúûúò6KòóöûúòKöúûúòKöú!ûúûúò;KòKöúòóKò ö
+ûúûúûúûú
+ûúò9Köûúûúûú+òFóKò Köûú
+ûúûúòNKöûúûúûú8òSKöûúûúûúò/Köûú
+ûúûúûúò5Kö
+ûúûúûú–bs
+úûú*ò^KöúûúòKöúòóKò KöúûúòKò Köûú(ûúûúûúûú†
+òLKò öûú6ûúò>Köú-ô-Köú"ò"Köûúûúò,KöúòKò óöûúûòöûúòKöúûúûúûúò;Köú<ò<KòóKöûú@òDóKò öûúûúûúûú
+ûúûòCKöú ò óKò Köú,ûúò3KöúòKò óö
+°úûúûúûúûúòCKöûúûúûúûúûú†òHKöú%ûúò,KöúòKò óö°úûú"ûúòFKöúòKöú	ûúòKöú†ò.Köúûúûúò'Kò ö°úûúòKöú†ò5Kò;Kò KòKöûúûú#†òIKò4Kò öûúûúûúòöûúûúò!KöúûúòKöûúûúûúò6Köúòóöûúûú&ûúûòDKöûúûúò(KöûúòóKöúûúòKöúòKò óöûúûúûòöú	ûúòöûúûúûòKöú5ò5öúûúûúò&öûú+ûúûúûò?öûúûúûúûò0Köú$ò$óKöûúòóóKöûúòóKöúûúòKöúòKòóöúòöûú	ûúûúòKöú;ô;óKöú#ûúò)KòóKöûú0ò7óKòóKò Köûú,ûúûúûúò@Kò KöúòöûúûòöûúòKöúûúûúûúòAKöú=ò=KòóKöûúDòHóKò Köûúûú$ò7Kò KöúXôXKöûú
+ûúûú*ò>Kò Köú0ûúò7KöúòKò óö°+úûúòFö°úûúòKòKöúûúòKöúûúòKöûúûúûúò>Kò Kòöûú	ûúûòKöú/ûú†òOKöú3ò3Köú/ûúò6KòKöúûúòKòKöûúòKò óKöûúûúûúò/KöúEôEKöúûúûúûúò:Köúûúûúûúò:KöúûúòKöúòKò óKöú;ò;KöúòóKò ö
+°	úûúûúûúûúò?ö°úûúòKö	ûúûúûúûú†ò;öûúûòKöúûú,ûúûúòIKöú	ûú5ûúûúòLKöú
+ûúòKöûúûú†ò,óKòKöúûúòKöú,ò,KöúòóKöûúûúò5Köú@ò@KöúòKò óö
+°úûúûúûúûúòBö°úûúòKö	ûúûúûúûú†ò;öûúûòKöúûú#ûúûúò@Köú	ûúûúûúò$Köú
+ûúòKöûúûú†ò,óKòKöúûúòKöú,ò,KöúòóKöûúûúò5KöúCòCKöúòKò óö
+°úûúûú"ûúûúòNö°úûúòKöûúûúûúûúûúûúò7Köûúûúûúûúò=KòKò!KòKò-KöúòóKöûúûúò5Köûúûúò7KöúGòGKöúòKò óö
+°úûúûú"ûúûúòNö°úûúòKöûúûúûúûúûúûúò7Köûúûúûúûúò=Kö	ûúûúûúûú†òTKòöûú'ûúò/KòKöú)ò)KöúòóöûúòKòöûú7ûúûòSKöûúûúòKöûúòóKòKòKöúòóKöú-ò-KöúòóKöûúûúò5Köûúûúò7KöúGòGKöúòKò óö°úûúûúò1ö°úûúòöûúûúûúûúûúûòAKöûúûúûú† òEóKòKòKòKòKòKòKò KòKò KòKò7Köúûúûú†òFKöûúûú#ò6KòóKòKöûúûúò/Köûúûúò/KöúHòHKöûúûú!ò3KöúòKò óKò ö°úûúûúûúòAö°úûúòKöúûúò.Köúûúò2Köú-ò-Köú)ò)öûú*ûúò2Köúûúûúò*Köúûúûúò)KöúòóöûúòKöúûúûúò)Köúûúûúò*Köúòóöûú$ûú†ò=KöúYòYöûú/ûúûúûòBKö
+ûúûúûú
+ûúûúò*KöúòKöûúòóKöúòóKòóöúûúòKöú8ò8Kò(KòóKòKöúòKò óö°úûúûú(òAKòKöúûúûúòKöúûúûúòö°úûúòKò1KòKöûúûúûúò%KöûúûúûúòBKôöûúûúòöûúûúòKöúòKöú!ò!KöúòóKöúòKöûúûú$ûúòDKöúòóKö†ôöûúûúòKòKòKòKò(Kò(KöúòóKöúôKöûúûúûúò5öûúûúòKò.KöúûúòKöúòKò óKò%Kòóöúûúòöûú.ûúò6KòKöûúûúûúò"KöúòóKöúVòVKöûúûú$ò5KòóKöûú1ûúûúûúòKKòKöú5ûúò<KöúòóKò ö°úûúûúûúûú
+ûúûú	ûúûúòmö°úûúòKöûúûúûúòKöú!ûúò'Köûúûúûúûúò;KöúòKöúûú ò>KöúòKöúòKöúûúòKòKò!Köú!ûúò2KòKöûúûúò,Köú*ò*Köûúûú†ò:Köúòóöúûúòöûú0ûúò8Köú-ô-Kò"Köûúûúò-KöúòóKöúòKöûúûúò1KöúFòFKòKò óKöûú'ûúûúûúòAKò öú,ûúûú	ò:Kò óKöú+ûúò2KöûúòKöúòKò óö
+°úûúûúûúûúòAKöûúûúûúòö°úûúòKöú#ûúò*Köûúûúûúûúò5öûúûúûúò$KöúOûúòUKòKöûúòKöúòóKöúòKòKöúûúòKòKò%KöúòKò,KòóöúûúòKòKöûúûúò5KöúKòKKöûúûú$ò1KòKò óKöûú*ûúûúûúòDKöúòKöú.ûúò5KöúòKò óö
+°úûúûú#ûúûúòQöûòKöú ò KöúûúûúòöúûúòKö
+ûúûúûú
+ûúûúòLKöûúûúûúûúò1KöúòKöúòKöúûúò#Köú"ûúò)KöúûúòKöúòKòóKöûúûúûúûúò1Köûú(ûúûúò6Köûú0ûúûúò>Köûúûúûúò8Köú5ò5KöûúûúûúûúòKöûúòóKöúòKò óö
+°
+úûúûúûúûúò@KöúûúûúòKö°úûú1òJö°úûúòöûú6ûúûúûòIKöûúûúûúò8KöûúòóKöúòóöúûúòKöûúûúò5KöúJòJöûúûúûúûúûúûò=Köúûú†-òUKöûúò	óöûúûúûúûúò&öûúûúûúûúûúûò=Köûúûú%ò;KöûúòóKöúDòDKöúòóKòóKöûúûúûú
+ûúòHKöûú)ûúûúûúòCKöúòKöú-ûúò4KöúòKò óö°	úò&Köú2ô2ö°úûúòKöúûúûú	†ò;Köúûúûú	†"ò@öúûúûúûúòAKöûúûúûúò1óöú"ò"öûúûúûò,Köúûúò%óKöúòKò óöûúûúòKöú1ô1Köú'ò'KöûúûúûúòNKöú7ò7KöûúûúûúòKöúòKöúòóKöúûú.òDKöúûú-òBKöú8ò8Köú)ûúò.Köûúûúûúûúûúûú†òKKò öûúûúûú ûúûúûò>öûúûúûòKöúòKöúBûúòIöúûú"ò4Köú)ûúò0óKöûúòóKöûúòóKöú'ò'KöúòóöúûúòKöúIòIKòóKö
+ûúûúûúûúûúò7Kö
+ûúûúûúûúûúòMKöúòKöúòóKò ö
+°úûúûúûúûúòCKöûúûúûúòö°úûúòKöú%ò%KöúòóöúûúòKöú=ò=KòóKòKöúòKò óö°úûú ûúûúòKKöú ô Köúûúò,öûúûúûòKöúûúòòKô®Kò)öûúûúûú†<òOKöú	ûúûú
+ûúòòKòKòKò>KòKò"Kòóöûú/ûúûúûò@öûúûúûòKöúûúòKöúûúòKöúòòJöú
+ûúòKöúòóKöûúûúòóKöûúòóöûúûúûòKòJöúûúòJò>Jò!KòKöûúòóKòóKòóöûúòKôEKöúQôQKöúYôYKöúûúûúòKòKöúûúò&Köúûúò#Köúûúò&Köú*ûúò6ö
+°úûúûúûúûúò<Köûú†(úò>Köúòóö°úûú
+ûúò*KöúûúòKöúòöûú/ûúûúûò@öûú"ûúò*Köú4ò4Köúòóöûúûúûúò;Kò3KòKöúòóKöûúòóKöúòóKòEKòKöú&ò&Köúûúûúòöûú@ûúòHKöúûúò*KöúòóöûúòKöûú#ò'öûúòKöú=ò=Köú$ûúò?Köúòóóöûú/ûúûúûò@öúûúûúûúûò"KöúòKöúûú,ò5Köûúòóöûúûúûúò2Köûúûúûúò8Köûúûúûúò5óKò2KòKöûúòóKòóóKöûúûú.ò;KöúòKò óö°
+úûúûúûúòAöûúûòöúûúòKöú;ò;KöúKòKKöúòóöú	ûúòKöú=ò=KöúKòKKöúòóöú	ûúòKöú&ò&Köú&ò&KöúòóKöûúûúòóKöúòóKò Köú
+ûú	òKöúûúûúûúûúûúò:Kò Kö	úûúûúûúûúòFöú!ò!Kò óö
+°úûúûúûúûúòBKöûúûúûúòöûúûúûúò"Köú"ò"KöúûúòKöûúûúòKòóKöûúûúòKöúòKò óö°úûúûúûúòAKöûúûúûúòKöûúûú#ò?Köûúûú#ò0KöúòKöúòKò óö°
+úûúûúûúò;Köúûúò!Köú	ûúò'KòKöúûúòö°úò$KöûúûúûúòKö
+ûú
+ûúûúûúûúòCKöúòóKöûúûúûúòKöúûúò%Köûúûú
+ûúûúòö	ûúûúû
+úûú!ûò;öûúûúûúûúû
+úûúûòDKöúòKöûúûúûúò"Köûòóö	ûúûúûúûúûò"KöúòKöûúûúûúò"KöûúòóKöûúòóKö
+ûú
+ûúûúûúûúò4Kò)Köûú
+ûúûúûúòKöú!ò!Köú ûúò'Köú ò Köú ûúò&KöúòKöúòKöúòKò óö°úûúûú	ò:Köúûúò!Köú	ûúò'Köúûúòö°úò$KöûúûúûúòKö
+ûú
+ûúûúûúûúòCKöúòóö°úûúûúûúò>öûúûúûúûòöûúûúûúûúû
+úûúûò@KöúòKöûúûúûúò#Köûòóö	ûúûúûúûúûò'KöúòKöûúûúûúò#KöûúòóKöûúòóKöúòóKò öûú
+ûúûú†òHKöú)ò)öûúûúûúòKò2KöúòKöúòóKöúòKò óKöúûú
+ûúûúòIKöú ûúò&KöúòKöúòKò óö°úûúò(Köú	ûúò'Köú
+ûúòKöúûúòKöúûúûú	òKöúûú7òAKöúûú7òAKöú5ò5KöúòóKò ö°
+úûúûúûú	ûúûúòUKòö°úûúòKöûúûúûúûú"ò>Köú&ò&KöúòóöúûúòKöú9ò9KöûúûúûúûúûúûúòPKòóKòKöúòKò óö°úûúûúûúòNö°úûúò'Köú&ò&KöúòóöúûúòKöúFòFKòóKòKöúòKò óö°úûúûúòAKöúûúûúò7Köûúûúûúûúò%KòKòKòKòöûúòöûúòKöúòKöúòKöúòKöúòKöúòóöûúòKöúûúûúò%Köúûúûúò%öûúûúòKöúûú ò-Köú#ò#Köú#ò#KòóöûúûòKöú#ò#óöûúûúûúòKöúûúò#Köú)ò)Kò&KòóöûúûòKöú#ò#óöûúûòKöú#ò#óKöûúûúò"Köûúûúò"Köú(ò(Köú(ò(Kòóóö	ûúûúûúûúûòHKöú!ò!óKöúòóKò ö°
+úûúûúûúò7Köú#ò#öûúûúûúò'öûúòKò%KòKöúòóö	ûúûú/ûúûúûòMKöûúûúò#KöûúòóóKöúòKò óö°úûúò$Köú#ò#öûúûòöûúòKöú4ûô7Köú&ò&öûú	òKöûú%ò)ö	ûúûúûúûúûò5Köûúûúûúò8KöûúòóóKòóöûúòKô"Köúòöûúûúûúûò2öûúûúòKöûúûúò6KöúòKöûúòóKöûúòóKòóóKöúûúòKöúòKò óö°	úûú!ûúûúò@öûúûúûúûúò$KòKòKöúòóö	ûúûú%ûúûúûòCKöûúûúò%KöûúòóKöúòóKò ö°úûúûú	ûúò;Kò
+öûú*ûúûúûò;KöúòKöûúòóKöúòKò óö°úûúò)Köú1ò1öûú	ûúûòöûúòKöûúòKöûúûúò(óKöûúòóKöúòKò óö°úûúûúò2öûú
+ûúûòKöûúûúûú†"òBKöûúûúûúûúò@Köûúûú-ûúûúò?KöûúòóKöûú	òKöúòKò óö°úûúûúò5Köú%ò%KòKò óö°úûú	ûúò%KòKöú	ûúò*KòKòKò óKöú5ûúûúò@Köú5ûúûúòAKöú8ò8Kò KöûúòKò ó Öó    pÓ  ù#  

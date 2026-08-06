@@ -1,0 +1,1169 @@
+
+
+DIRECTORY
+Atom USING[ MakeAtom ],
+Ascii,
+Commander USING [CommandProc, Register],
+CommanderOps,
+Convert,
+EditedStream,
+IO,
+Menus USING [AppendMenuEntry, ChangeNumberOfLines, CreateEntry, FindEntry, MenuEntry, MenuProc, ReplaceMenuEntry],
+MessageWindow USING [Append],
+NetworkName,
+NetworkStream,
+Process USING [Abort, Detach, EnableAborts, PauseMsec],
+Rope,
+TelnetCommands,
+TelnetOptions,
+TiogaOps USING [GetCaret, GetRope, Location],
+TIPLinking,
+TIPUser USING [InstantiateNewTIPTable, TIPTable],
+TypeScript USING [BackSpace, ChangeLooks],
+UserProfile USING [Boolean, ListOfTokens, Token],
+ViewerClasses USING [MouseButton, Viewer],
+ViewerEvents USING[ EventProc, EventRegistration, RegisterEventProc, UnRegisterEventProc],
+ViewerIO USING [CreateViewerStreams, GetViewerFromStream, Viewer],
+ViewerOps USING [AddProp, BlinkViewer, ComputeColumn, FetchProp, FetchViewerClass, PaintViewer],
+ViewerTools USING [GetSelectionContents];
+
+TelnetViewerImpl: CEDAR MONITOR
+LOCKS h USING h: Handle
+IMPORTS Atom, Commander, CommanderOps, Convert, EditedStream, IO, Menus, MessageWindow, NetworkName, NetworkStream, Process, Rope, TiogaOps, TIPLinking, TIPUser, TypeScript, <<UserCredentials,>> UserProfile, ViewerEvents, ViewerIO, ViewerOps, ViewerTools
+~ {
+
+ROPE: TYPE ~ Rope.ROPE;
+STREAM: TYPE ~ IO.STREAM;
+
+telnetPort: CARDINAL ~ <<ArpaPortRegistry.TCPPORT.telnet.ORD>> 23;
+
+toolName: ROPE = "Telnet";
+telnetProp: ATOM = Atom.MakeAtom["TelnetProp"];
+
+documentationRope: ROPE ~ "[-p port] [-l] [-d] host\nTelnet\nSwitches:\n    -p  port number\n    -l  auto login\n    -d  do not auto login";
+
+defaultEolSeq: ROPE ~ "\r\l";  -- <CR><LF>
+
+Direction: TYPE ~ IO.StreamVariety[input..output];
+Handle: TYPE ~ REF Object;
+Object: TYPE ~ MONITORED RECORD [
+keyboardStream: STREAM ¨ NIL,
+viewerStream: STREAM ¨ NIL,
+networkStream: ARRAY Direction OF STREAM ¨ ALL[NIL],
+hostName: ROPE ¨ NIL,
+state: State ¨ disconnected,
+port: CARD ¨ telnetPort,
+how: How ¨ command,
+autoLogin: BOOL ¨ FALSE,
+pusher: PROCESS ¨ NIL,
+puller: PROCESS ¨ NIL,
+optionsWatcher: PROCESS ¨ NIL,
+nvtState: NVTState,
+negotiationEvent: CONDITION,
+lineBuffered: BOOL ¨ TRUE,
+localEcho: BOOL ¨ TRUE,
+heSendsGoAheads: BOOL ¨ TRUE,
+sendGoAheads: BOOL ¨ TRUE,
+gotGA: BOOL ¨ TRUE,  -- it's not clear what to start with
+extraWills: CARD ¨ 0,
+extraDos: CARD ¨ 0,
+eolSeq: ROPE ¨ defaultEolSeq,
+typescriptBackground: PROCESS ¨ NIL,
+destructionEvent: ViewerEvents.EventRegistration,
+trace: TraceBuffer
+];
+
+TraceBuffer: TYPE ~ REF TraceBufferRep;
+TraceBufferRep: TYPE ~ RECORD [
+first: NAT,
+next: NAT,
+buf: PACKED SEQUENCE size: NAT OF TraceBufferEntry
+];
+
+TraceBufferEntry: TYPE ~ PACKED RECORD [
+side: Side,
+char: CHAR
+];
+
+Trace: ENTRY PROC [h: Handle, side: Side, char: CHAR] ~ { TraceInternal[h, side, char] };
+
+TraceInternal: INTERNAL PROC [h: Handle, side: Side, char: CHAR] ~ {
+trace: TraceBuffer ~ h.trace;
+IF trace # NIL AND trace.size > 1 THEN {
+next: NAT ¨ trace.next MOD trace.size;
+trace[next] ¨ [side, char];
+trace.next ¨ (next + 1) MOD trace.size;
+IF trace.first = trace.next THEN trace.first ¨ (trace.first + 1) MOD trace.size;
+};
+};
+
+GetTrace: ENTRY PROC [h: Handle] RETURNS [t: TraceBuffer] ~ {
+t ¨ h.trace;
+h.trace ¨ NEW[TraceBufferRep[256]];
+};
+
+NVTState: TYPE ~ ARRAY CHAR OF OptionState;
+OptionState: TYPE ~ PACKED RECORD [
+desiredOfMySide: BOOL ¨ FALSE,
+stateOfMySide: NegotiationState ¨ inactive,
+desiredOfHisSide: BOOL ¨ FALSE,
+stateOfHisSide: NegotiationState ¨ inactive
+];
+NegotiationState: TYPE ~ {inactive, requested, active};
+Side: TYPE ~ {mySide, hisSide};
+
+FuncMenuData: TYPE ~ REF FuncMenuDataObject;
+FuncMenuDataObject: TYPE ~ RECORD [
+name: ROPE,
+value: ROPE,
+handle: Handle
+];
+
+procLine: INT ¨ 0;
+funcLine: INT ¨ 1;
+
+
+pushMeansFlush: BOOL ¨ FALSE;  -- possible semantics problem with ArpaTCP.SendNow not setting the push bit (but IO.Flush waits for acks, ugh...)
+
+openTimeout: NetworkStream.Milliseconds ¨ NetworkStream.waitForever;
+
+State: TYPE ~ { disconnected, connecting, connected, disconnecting };
+How: TYPE ~ { command, connect, login, lfKey };
+Worker: TYPE ~ { none, pusher, puller };
+CloseAction: TYPE ~ { none, initiate, reply };
+
+
+TelnetMain: Commander.CommandProc
+~ {
+h: Handle;
+argv: CommanderOps.ArgumentVector;
+argv ¨ CommanderOps.Parse[cmd
+! CommanderOps.Failed => { msg ¨ errorMsg; result ¨ $Failure; CONTINUE }];
+IF argv = NIL THEN RETURN;
+h ¨ NEW[Object];
+TRUSTED {
+Process.EnableAborts[@(h.negotiationEvent)];
+};
+msg ¨ ProcessArgs[h, argv];
+IF msg # NIL THEN { result ¨ $Failure; RETURN };
+TelnetMainInternal[h];
+};
+
+TelnetMainInternal: PROC [h: Handle]
+~ {
+v: ViewerClasses.Viewer;
+[h.keyboardStream, h.viewerStream] ¨ ViewerIO.CreateViewerStreams[name~toolName, <<backingFile~Rope.Concat[toolName, ".log"],>> editedStream~FALSE];
+v ¨ ViewerIO.GetViewerFromStream[h.viewerStream];
+v.tipTable ¨ telnetTIPTable;
+EditedStream.SetEcho[h.keyboardStream, NIL];
+TypeScript.ChangeLooks[v, 'f];
+AddMenuButtons[h];
+ViewerOps.AddProp[v, telnetProp, h];
+h.destructionEvent ¨ ViewerEvents.RegisterEventProc[proc: NoteDestruction, event: destroy, filter: v, before: TRUE];
+TRUSTED {Process.Detach[h.typescriptBackground ¨ FORK TypescriptWatcher[h]]};
+IF Rope.Length[h.hostName] > 0 THEN
+TRUSTED {Process.Detach[FORK DoConnect[h]]};
+RETURN;
+};
+
+AddMenuButtons: PROC [h: Handle] ~ {
+v: ViewerClasses.Viewer;
+v ¨ ViewerIO.GetViewerFromStream[h.viewerStream];
+AddButton[h, "Another", AnotherProc, "Create another instance of this tool."];
+AddButton[h, "Disconnect", DoDisconnect, "Close connection."];
+IF UserProfile.Boolean[Rope.Concat[toolName, ".LoginButton"], TRUE] THEN
+AddButton[h, "Login", LoginProc, "Open connection to selected host and login."];
+AddButton[h, "Connect", ConnectProc, "Open connection to selected host."];
+AddButton[h, "Break", DoSendBreak, "Send a Break code"];
+AddButton[h, "Synch", DoSynch, "Telnet Synch operation"];
+AddButton[h, "Interrupt", DoInterrupt, "Telnet Interrupt operation"];
+AddButton[h, "FlushLog", FlushLogProc, "Flush the typescript log to the backing file."];
+AddButton[h, "ShowOptions", ShowOptionsProc, "Show the current options state."];
+IF AddFunctions[h]
+THEN {
+ViewerOps.ComputeColumn[v.column];
+ViewerOps.PaintViewer[v, all];
+}
+ELSE ViewerOps.PaintViewer[v, menu];
+};
+
+ProcessArgs: PROC [h: Handle, argv: CommanderOps.ArgumentVector]
+RETURNS [msg: ROPE ¨ NIL] ~ {
+i: INT ¨ 1;
+h.autoLogin ¨ UserProfile.Boolean[Rope.Concat[toolName, ".AutoLogin"], FALSE];
+WHILE i < argv.argc DO
+len: INT ~ Rope.Length[argv[i]];
+IF len = 0 THEN { msg ¨ "Null argument"; GOTO Bad };
+IF Rope.Fetch[argv[i], 0] = '-
+THEN {
+IF len = 1 THEN { msg ¨ "Bad flag"; GOTO Bad };
+SELECT Rope.Fetch[argv[i], 1] FROM
+'p => {
+i ¨ i.SUCC; IF i >= argv.argc THEN GOTO Bad;
+h.port ¨ Convert.CardFromRope[argv[i]
+! Convert.Error => {msg ¨ "Bad Port Number"; GOTO Bad;}];
+};
+'l => {
+h.autoLogin ¨ TRUE;
+};
+'d => {
+h.autoLogin ¨ FALSE;
+};
+ENDCASE => { msg ¨ "Bad flag"; GOTO Bad };
+}
+ELSE {
+IF h.hostName # NIL THEN { msg ¨ "Multiple hosts"; GOTO Bad };
+h.hostName ¨ argv[i];
+};
+i ¨ i.SUCC;
+ENDLOOP;
+EXITS
+Bad => NULL;
+};
+
+AddFunctions: PROC [h: Handle] RETURNS [someAdded: BOOL ¨ FALSE] ~ {
+v: ViewerIO.Viewer ¨ ViewerIO.GetViewerFromStream[h.viewerStream];
+fName, fValue: ROPE;
+fButtons: LIST OF ROPE ¨ UserProfile.ListOfTokens[Rope.Concat[toolName, ".FunctionButtons"]];
+IF fButtons = NIL OR fButtons.rest = NIL THEN RETURN;
+Menus.ChangeNumberOfLines[v.menu, funcLine+1];
+WHILE fButtons # NIL DO
+IF fButtons.rest = NIL THEN RETURN; -- odd number of TOKENs, not a pair
+fName ¨ fButtons.first;
+fValue ¨ fButtons.rest.first;
+IF Rope.Length[fName] = 0 THEN LOOP;  -- button has no name -> ignore it
+AddFuncButton[h, fName, fValue];
+someAdded ¨ TRUE;
+fButtons ¨ fButtons.rest.rest;
+ENDLOOP;
+};
+
+AddFuncButton: PROC [h: Handle, name, val: ROPE] ~ {
+v: ViewerIO.Viewer ¨ ViewerIO.GetViewerFromStream[h.viewerStream];
+IF v = NIL THEN RETURN;
+Menus.AppendMenuEntry[v.menu, Menus.CreateEntry[name, FunctionProc, NEW[FuncMenuDataObject ¨ [name, val, h]]], funcLine];
+};
+
+AddButton: PROC [h: Handle, name: ROPE, proc: Menus.MenuProc, doc: ROPE, fork: BOOL ¨ TRUE] ~ {
+v: ViewerIO.Viewer ¨ ViewerIO.GetViewerFromStream[h.viewerStream];
+IF v = NIL THEN ERROR;
+Menus.AppendMenuEntry[v.menu, Menus.CreateEntry[name, proc, h, doc, fork], procLine];
+};
+
+PutMsg: PROC [h: Handle, fmt: ROPE, msg: ROPE ¨ NIL] ~ {
+ENABLE IO.Error => CONTINUE;
+s: STREAM ~ h.viewerStream;
+IF (s # NIL) THEN IO.PutF1[s, fmt, IF msg # NIL THEN [rope[msg]] ELSE [null[]]];
+};
+
+SetConnecting: ENTRY PROC [h: Handle] RETURNS [ok: BOOL] ~ {
+ENABLE UNWIND => NULL;
+IF h.state = disconnected
+THEN {
+h.state ¨ connecting;
+RETURN [TRUE];
+}
+ELSE { RETURN [FALSE] };
+};
+
+SetConnected: ENTRY PROC [h: Handle] ~ {
+ENABLE UNWIND => NULL;
+v: ViewerIO.Viewer = ViewerIO.GetViewerFromStream[h.viewerStream];
+h.state ¨ connected;
+v.name ¨ Rope.Cat[toolName, ": ", h.hostName];
+ViewerOps.PaintViewer[viewer: v, hint: caption];
+};
+
+SetDisconnecting: ENTRY PROC [h: Handle] RETURNS [ok: BOOL] ~ {
+ENABLE UNWIND => NULL;
+IF h.state = connected
+THEN {
+v: ViewerIO.Viewer = ViewerIO.GetViewerFromStream[h.viewerStream];
+h.state ¨ disconnecting;
+v.name ¨ Rope.Cat[toolName, " closing connection to: ", h.hostName];
+ViewerOps.PaintViewer[viewer: v, hint: caption];
+RETURN [TRUE];
+}
+ELSE { RETURN [FALSE] };
+};
+
+SetDisconnected: ENTRY PROC [h: Handle] ~ {
+ENABLE UNWIND => NULL;
+v: ViewerIO.Viewer = ViewerIO.GetViewerFromStream[h.viewerStream];
+h.state ¨ disconnected;
+v.name ¨ toolName;
+ViewerOps.PaintViewer[viewer: v, hint: caption];
+PutMsg[h, "\n~~~~~~~~ Connection Closed ~~~~~~~~\n\n"];
+};
+
+IsSep: PROC [c: CHAR] RETURNS [BOOL] = {
+IF c IN [Ascii.NUL..Ascii.SP) OR c = Ascii.DEL THEN RETURN[TRUE];
+RETURN[FALSE];
+};
+
+FindHostName: PROC [h: Handle] RETURNS [ROPE] ~ {
+hostName: ROPE ¨ ViewerTools.GetSelectionContents[];
+SELECT h.how FROM
+command => RETURN[h.hostName];
+connect, login => RETURN[hostName];
+lfKey => RETURN[FindHostFromCaret[]];
+ENDCASE;
+RETURN[NIL];
+};
+
+FindHostFromCaret: PROC RETURNS [hostName: ROPE] ~ {
+caret: TiogaOps.Location;
+i: INT;
+caret ¨ TiogaOps.GetCaret[];
+hostName ¨ TiogaOps.GetRope[caret.node];
+i ¨ caret.where;
+WHILE i > 0 DO
+char: CHAR = Rope.Fetch[hostName, i.PRED];
+IF IsSep[char] THEN EXIT;
+i ¨ i.PRED;
+ENDLOOP;
+hostName ¨ Rope.Substr[hostName, i, (caret.where - i)];
+};
+
+NoteDestruction: ViewerEvents.EventProc = {
+h: Handle ¨ NARROW[ViewerOps.FetchProp[viewer, telnetProp]];
+IF event = destroy AND h # NIL THEN NoteDestructionInternal[h];
+};
+
+NoteDestructionInternal: PROC [h: Handle] = {
+ENABLE UNWIND => NULL;
+IF h # NIL THEN {
+TRUSTED {Process.Abort[h.typescriptBackground]};
+FinishConnection[h~h, me~none, msg~"Disconnecting.", closeAction~initiate];
+ViewerEvents.UnRegisterEventProc[h.destructionEvent, destroy];
+};
+};
+
+ReplaceAndRepaintMenuEntry: PROC [v: ViewerIO.Viewer, old: Menus.MenuEntry, new: Menus.MenuEntry] = {
+Menus.ReplaceMenuEntry[ v.menu, old, new];
+ViewerOps.PaintViewer[v, menu];
+};
+
+FunctionProc: Menus.MenuProc
+~ {
+md: FuncMenuData ¨ NARROW[clientData];
+h: Handle ¨ md.handle;
+v: ViewerIO.Viewer ¨ ViewerIO.GetViewerFromStream[h.viewerStream];
+SELECT TRUE FROM
+~shift AND ~control => InterpretAndSend[h, md.value];
+shift AND ~control => {
+me: Menus.MenuEntry;
+selection: ROPE ¨ ViewerTools.GetSelectionContents[];
+IF mouseButton # yellow AND Rope.Length[selection] = 0 THEN {
+MessageWindow.Append["Select something first.", TRUE];
+RETURN;
+};
+SELECT mouseButton FROM
+red => md.value ¨ selection;
+yellow => MessageWindow.Append[IO.PutFR["Function: \"%g\" = \"%g\"", [rope[md.name]], [rope[md.value]]], TRUE];
+blue => {
+IF Menus.FindEntry[parent.menu, selection] # NIL THEN {
+MessageWindow.Append["That name alreay in use!", TRUE];
+RETURN;
+};
+me ¨ Menus.FindEntry[parent.menu, md.name];
+md.name ¨ selection;
+TRUSTED {
+Process.Detach[FORK
+ReplaceAndRepaintMenuEntry[ parent, me, Menus.CreateEntry[md.name, FunctionProc, NEW[FuncMenuDataObject ¨ [md.name, md.value, h]]]]]};
+};
+ENDCASE;
+};
+control => {
+me: Menus.MenuEntry;
+selection: ROPE ¨ ViewerTools.GetSelectionContents[];
+IF mouseButton # yellow AND Rope.Length[selection] = 0 THEN {
+MessageWindow.Append["Select something first.", TRUE];
+RETURN;
+};
+SELECT mouseButton FROM
+red => {
+IF Rope.Length[selection] > 32 THEN {
+MessageWindow.Append["Button name too long!", TRUE];
+RETURN;
+};
+IF Menus.FindEntry[parent.menu, selection] # NIL THEN {
+MessageWindow.Append["That name alreay in use!", TRUE];
+RETURN;
+};
+Menus.AppendMenuEntry[parent.menu, Menus.CreateEntry[selection, FunctionProc, NEW[FuncMenuDataObject ¨ [selection, "", h]]], funcLine];
+MessageWindow.Append[IO.PutFR1["Added function button: \"%g\"", [rope[selection]]], TRUE];
+};
+yellow => MessageWindow.Append[IO.PutFR["Function: \"%g\" = \"%g\"", [rope[md.name]], [rope[md.value]]], TRUE];
+blue => {
+me ¨ Menus.FindEntry[parent.menu, md.name];
+MessageWindow.Append[IO.PutFR1["Deleting function button: \"%g\"", [rope[md.name]]], TRUE];
+TRUSTED {
+Process.Detach[FORK
+ReplaceAndRepaintMenuEntry[parent, me, NIL]]};
+};
+ENDCASE;
+};
+ENDCASE;
+ViewerOps.PaintViewer[v, menu];
+};
+
+ConnectProc: Menus.MenuProc
+~ {
+h: Handle ¨ NARROW[clientData];
+IF NOT SetConnecting[h] THEN {
+ViewerOps.BlinkViewer[parent];
+MessageWindow.Append["Can't connect: viewer is busy", TRUE];
+RETURN;
+};
+h.how ¨ connect;
+h.autoLogin ¨ FALSE;
+TRUSTED {Process.Detach[FORK DoConnect[h]]};
+};
+
+LoginProc: Menus.MenuProc
+~ {
+h: Handle ¨ NARROW[clientData];
+IF NOT SetConnecting[h] THEN {
+ViewerOps.BlinkViewer[parent];
+MessageWindow.Append["Can't connect: viewer is busy", TRUE];
+RETURN;
+};
+h.how ¨ login;
+h.autoLogin ¨ TRUE;
+TRUSTED {Process.Detach[FORK DoConnect[h]]};
+};
+
+TryToConnect: PROC [h: Handle, autoLogin: BOOL ¨ FALSE] = {
+IF NOT SetConnecting[h] THEN {
+MessageWindow.Append["Can't connect: viewer is busy", TRUE];
+RETURN;
+};
+h.how ¨ lfKey;
+h.autoLogin ¨ autoLogin;
+TRUSTED {Process.Detach[FORK DoConnect[h]]};
+};
+
+DoConnect: PROC [handle: Handle] = {
+v: ViewerIO.Viewer = ViewerIO.GetViewerFromStream[handle.viewerStream];
+hisName: ROPE ¨ NIL;
+hisAddress: ROPE ¨ NIL;
+openError: ROPE ¨ NIL;
+[] ¨ SetConnecting[handle];
+{
+hisName ¨ FindHostName[handle];
+IF Rope.IsEmpty[hisName] THEN {
+PutMsg[handle, "\n\nConnect: please select host name\n\n"];
+GOTO Out };
+PutMsg[handle, "\nOpening connection to "];
+PutMsg[handle, "\"%g\"", hisName];
+v.name ¨ IO.PutFR["%g opening connection to %g", [rope[toolName]], [rope[hisName]]];
+ViewerOps.PaintViewer[viewer: v, hint: caption];
+hisAddress ¨ NetworkName.AddressFromName[family: $ARPA, name: hisName, portHint: Convert.RopeFromCard[handle.port], components: hostAndPort ! NetworkName.Error => {openError ¨ msg; CONTINUE}].addr;
+IF hisAddress = NIL THEN {
+PutMsg[handle, Rope.Concat["... address lookup failure: ", openError]];
+GOTO Out };
+PutMsg[handle, " at \"%g\" ", hisAddress];
+v.name ¨ IO.PutFR["%g opening connection to %g at %g", [rope[toolName]], [rope[hisName]], [rope[hisAddress]]];
+ViewerOps.PaintViewer[viewer: v, hint: caption];
+handle.hostName ¨ hisName;
+[in: handle.networkStream[input], out: handle.networkStream[output]] ¨ NetworkStream.CreateStreams[protocolFamily: $ARPA, remote: hisAddress, transportClass: $TCP, timeout: 15000!
+NetworkStream.Error => {
+openError ¨ msg;
+CONTINUE;
+};
+NetworkStream.Timeout => {
+openError ¨ msg;
+CONTINUE;
+};
+];
+IF openError # NIL THEN {
+PutMsg[handle, "open failed: %g\n\n", openError];
+GOTO Out;
+};
+PutMsg[handle, "connected.\n\n"];
+SetConnected[handle];
+SetInitialDesiredOptions[handle];
+RunConnection[handle];
+EXITS
+Out => NULL;
+};
+SetDisconnected[handle];
+};
+
+<< WaitUntilConnected: PROC [h: Handle] RETURNS [error: ROPE] ~ {
+state: ArpaTCPOps.ConnectionState;
+tcpHandle: ArpaTCPOps.TCPHandle ¨ NARROW[h.networkStream.streamData];
+DO
+state ¨ tcpHandle.state;
+SELECT state FROM
+synSent => Process.Pause[1];
+synRcvd, established => RETURN[NIL];
+ENDCASE => RETURN["unable to establish connection"];
+ENDLOOP;
+}; >>
+
+TypescriptWatcher: PROC [h: Handle] = {
+v: ViewerClasses.Viewer ¨ ViewerIO.GetViewerFromStream[h.viewerStream];
+c: CHAR;
+{
+ENABLE {
+IO.EndOfStream, ABORTED, IO.Error => GOTO done;
+};
+DO
+DO
+IF h.state = disconnected
+THEN EXIT
+ELSE Process.PauseMsec[1500];
+ENDLOOP;
+IF IO.CharsAvail[h.keyboardStream, FALSE] = 0 THEN {
+Process.PauseMsec[250];
+LOOP;
+};
+c ¨ IO.GetChar[h.keyboardStream];
+SELECT c FROM
+Ascii.LF => TryToConnect[h, FALSE];
+Ascii.FF => TryToConnect[h, TRUE];
+Ascii.BS => TypeScript.BackSpace[v];
+ENDCASE => IO.PutChar[h.viewerStream, c];
+ENDLOOP;
+};
+EXITS
+done => NULL;
+};
+
+SetInitialDesiredOptions: ENTRY PROC [h: Handle] ~ {
+OPEN TelnetOptions;
+ENABLE UNWIND => NULL;
+h.nvtState[echo].desiredOfHisSide ¨ TRUE;
+h.nvtState[suppressGoAhead].desiredOfHisSide ¨ TRUE;
+h.nvtState[suppressGoAhead].desiredOfMySide ¨ TRUE;
+};
+
+NegotiateInitialOptions: PROC [h: Handle] ~ {
+IF NOT NegotiateOption[h, TelnetOptions.echo, hisSide] THEN {
+[] ¨ DeactivateOption[h, TelnetOptions.echo, hisSide];
+[] ¨ NegotiateOption[h, TelnetOptions.echo, mySide];
+};
+FOR option: CHAR IN [0C..377C] DO
+IF h.nvtState[option].desiredOfMySide THEN [] ¨ NegotiateOption[h, option, mySide];
+IF h.nvtState[option].desiredOfHisSide THEN [] ¨ NegotiateOption[h, option, hisSide];
+ENDLOOP;
+};
+
+RopeFromNVTState: ENTRY PROC [h: Handle] RETURNS [rope: ROPE] ~ {
+ENABLE UNWIND => NULL;
+FOR option: CHAR IN [0C..377C] DO
+optionState: OptionState ¨ h.nvtState[option];
+thisRope: ROPE;
+IF optionState.desiredOfMySide
+OR optionState.stateOfMySide # inactive
+OR optionState.desiredOfHisSide
+OR optionState.stateOfHisSide # inactive
+THEN {
+optionRope: ROPE ¨ RopeFromOption[option];
+IF optionRope # NIL
+THEN thisRope ¨ IO.PutFR["Option: %g (%g)", [rope[optionRope]], [cardinal[option-'\000]]]
+ELSE thisRope ¨ IO.PutFR1["Option: %g", [cardinal[option-'\000]]];
+thisRope ¨ Rope.Concat[thisRope, IO.PutFR["\n    mySide[desired: %g, state: %g]", [boolean[optionState.desiredOfMySide]], [rope[RopeFromNegotiationState[optionState.stateOfMySide]]]]];
+thisRope ¨ Rope.Concat[thisRope, IO.PutFR["\n    hisSide[desired: %g, state: %g]", [boolean[optionState.desiredOfHisSide]], [rope[RopeFromNegotiationState[optionState.stateOfHisSide]]]]];
+rope ¨ Rope.Cat[rope, thisRope, "\n"];
+};
+ENDLOOP;
+};
+
+RopeFromOption: PROC [option: CHAR] RETURNS [ROPE] ~ {
+OPEN TelnetOptions;
+RETURN[SELECT option FROM
+transmitBinary => "transmitBinary",
+echo => "echo",
+suppressGoAhead => "suppressGoAhead",
+status => "status",
+timingMark => "timingMark",
+terminalType => "terminalType",
+endOfRecord => "endOfRecord",
+outMrk => "outMrk",
+naws => "naws",
+terminalSpeed => "terminalSpeed",
+toggleFlowControl => "toggleFlowControl",
+extendedOptionsList => "extendedOptionsList",
+ENDCASE => NIL];
+};
+
+RopeFromNegotiationState: PROC [state: NegotiationState] RETURNS [ROPE] ~ {
+RETURN[SELECT state FROM
+inactive => "inactive",
+active => "active",
+requested => "requested",
+ENDCASE => ERROR];
+};
+
+RunConnection: PROC [h: Handle] ~ {
+TRUSTED {
+h.optionsWatcher ¨ FORK OptionsWatcher[h];
+h.pusher ¨ FORK Pusher[h];
+h.puller ¨ FORK Puller[h];
+NegotiateInitialOptions[h
+! IO.EndOfStream, IO.Error, NetworkStream.Error, NetworkStream.Timeout, ABORTED => CONTINUE];
+JOIN h.pusher; h.pusher ¨ NIL;
+JOIN h.puller; h.puller ¨ NIL;
+Process.Detach[h.optionsWatcher];
+Process.Abort[h.optionsWatcher];
+h.optionsWatcher ¨ NIL;
+};
+CloseNetworkStreams[h];
+};
+
+CloseNetworkStreams: PROC [h: Handle] ~ {
+FOR d: Direction IN Direction DO
+IO.Close[h.networkStream[d] ! IO.Error => CONTINUE];  -- probably already closed
+ENDLOOP;
+};
+
+SendEndOfMessage: PROC [s: STREAM] ~ Push;
+
+Push: PROC [s: STREAM] ~ {
+IF pushMeansFlush
+THEN IO.Flush[s]
+ELSE NetworkStream.SendSoon[s];
+};
+
+FinishConnection: PROC [h: Handle, me: Worker, msg: ROPE ¨ NIL, closeAction: CloseAction ¨ none] ~ {
+IF SetDisconnecting[h] THEN {
+IF me # pusher THEN TRUSTED { Process.Abort[h.pusher] };
+IF me # puller THEN TRUSTED { Process.Abort[h.puller] };
+IF msg # NIL THEN PutMsg[h, "\n\n~~~~~~~~ %g ~~~~~~~~\n", msg];
+SELECT closeAction FROM
+initiate, reply => CloseNetworkStreams[h];
+ENDCASE;
+};
+};
+
+SplitGvName: PUBLIC PROC[name: ROPE] RETURNS[sn, reg: ROPE] = {
+length: INT = name.Length[];
+FOR i: INT DECREASING IN [0..length) DO
+IF name.Fetch[i] = '. THEN RETURN[
+sn: name.Substr[start: 0, len: i],
+reg: name.Substr[start: i+1, len: length-(i+1)] ];
+ENDLOOP;
+RETURN[sn: name, reg: NIL];
+};
+
+
+SplitThis: PROC [rope, sep: ROPE] RETURNS [ROPE, ROPE, BOOL] = {
+lrope: INT ¨ Rope.Length[rope];
+lsep: INT ¨ Rope.Length[sep];
+fi: INT ¨ Rope.Find[rope, sep, 0, FALSE];
+IF fi = -1 THEN RETURN[rope, NIL, FALSE];
+RETURN[Rope.Substr[rope, 0, fi], Rope.Substr[rope, fi+lsep], TRUE]
+};
+
+ReplaceThisRope: PROC [r, d, n: ROPE, all: BOOL ¨ TRUE, case: BOOL ¨ FALSE, pos: INT ¨ 0] RETURNS [ROPE] = {
+ld: INT ¨ Rope.Length[d];
+ln: INT ¨ Rope.Length[n];
+DO
+l: INT ¨ Rope.Length[r];
+fi: INT ¨ Rope.Find[r, d, pos, case];
+IF fi = -1 THEN EXIT;
+r ¨ Rope.Replace[r, fi, ld, n];
+pos ¨ fi + ln;
+IF NOT all THEN EXIT;
+ENDLOOP;
+RETURN[r];
+};
+
+InterpretAndSend: ENTRY PROC [h: Handle, format: ROPE] ~ {
+ENABLE UNWIND => NULL;
+delay: BOOL ¨ FALSE;
+eomSent: BOOL;
+unixName, xnsPassword, xnsLocalName, xnsDomainName, xnsOrgName: ROPE;
+selection: ROPE ¨ ViewerTools.GetSelectionContents[];
+IF Rope.Length[format] = 0 THEN RETURN;
+unixName ¨ WITH CommanderOps.GetProp[NIL, $USER] SELECT FROM rope: ROPE => rope ENDCASE => NIL;
+format ¨ ReplaceThisRope[format, "%unixName", unixName];
+format ¨ ReplaceThisRope[format, "%xnsPassword", xnsPassword];
+format ¨ ReplaceThisRope[format, "%xnsFullName", Rope.Cat[xnsLocalName, ":", xnsDomainName, ":", xnsOrgName]];
+format ¨ ReplaceThisRope[format, "%xnsLocalName", xnsLocalName];
+format ¨ ReplaceThisRope[format, "%xnsDomainName", xnsDomainName];
+format ¨ ReplaceThisRope[format, "%xnsOrgName", xnsOrgName];
+format ¨ ReplaceThisRope[format, "%%", "%"];
+format ¨ ReplaceThisRope[format, "%currentSelection", selection];
+WHILE format # NIL DO
+sendThis: ROPE;
+eomSent ¨ FALSE;
+[sendThis, format, delay] ¨ SplitThis[format, "%d"];
+FOR i: INT IN [0..Rope.Length[sendThis]) DO
+c: CHAR ¨ Rope.Fetch[sendThis, i];
+IF h.state = connected THEN SendChar[h, c] ELSE IO.PutChar[h.viewerStream, c];
+IF c = '\n THEN {
+IF h.state = connected THEN SendEndOfMessage[h.networkStream[output]];
+eomSent ¨ TRUE;
+};
+ENDLOOP;
+IF delay THEN {
+IF sendThis # NIL AND ~eomSent THEN {
+IF h.state = connected THEN SendEndOfMessage[h.networkStream[output]];
+eomSent ¨ TRUE;
+};
+Process.PauseMsec[2000];
+};
+ENDLOOP;
+IF ~eomSent AND h.state = connected THEN SendEndOfMessage[h.networkStream[output]];
+};
+
+GetValueFromList: PROC [list: LIST OF ROPE, key: ROPE, eval: PROC [ROPE] RETURNS [ROPE] ¨ NIL] RETURNS [ROPE, BOOL] ~ {
+thisItem: ROPE;
+WHILE list # NIL DO
+IF list.rest = NIL THEN RETURN[NIL, FALSE];  -- odd number of TOKENs, not a pair
+IF eval = NIL
+THEN thisItem ¨ list.first
+ELSE thisItem ¨ eval[list.first];
+IF Rope.Equal[thisItem, key, FALSE] THEN RETURN[list.rest.first, TRUE];
+list ¨ list.rest.rest;  -- move through by pairs
+ENDLOOP;
+RETURN[NIL, FALSE];
+};
+
+GenerateLoginStuff: PROC [h: Handle] ~ {
+loginFormat: ROPE;
+formatFound: BOOL ¨ FALSE;
+specialLogins: LIST OF ROPE ¨ UserProfile.ListOfTokens[Rope.Concat[toolName, ".SpecialLogins"]];
+[loginFormat, formatFound] ¨ GetValueFromList[specialLogins, h.hostName];
+IF ~formatFound THEN loginFormat ¨ UserProfile.Token[Rope.Concat[toolName, ".DefaultLogin"], "%unixName\n%d%xnsPassword\n"];
+InterpretAndSend[h, loginFormat];
+};
+
+LockedSendEndOfMessage: ENTRY PROC [h: Handle, s: STREAM] ~ {
+ENABLE UNWIND => NULL;
+SendEndOfMessage[s];
+};
+
+LockedSendChar: ENTRY PROC [h: Handle, c: CHAR] ~ {
+ENABLE UNWIND => NULL;
+SendChar[h, c];
+};
+
+LockedPutRope: ENTRY PROC [h: Handle, r: ROPE, sendNow: BOOL ¨ FALSE] ~ {
+ENABLE UNWIND => NULL;
+IO.PutRope[h.networkStream[output], r];
+IF sendNow THEN Push[h.networkStream[output]];
+};
+
+OptionsWatcher: ENTRY PROC [h: Handle] ~ {
+OPEN TelnetOptions;
+ENABLE UNWIND => NULL;
+DO
+IF h.nvtState[echo].stateOfHisSide = active
+THEN h.localEcho ¨ h.lineBuffered ¨ FALSE
+ELSE h.localEcho ¨ h.lineBuffered ¨ TRUE;
+IF h.nvtState[suppressGoAhead].stateOfHisSide = active
+THEN h.heSendsGoAheads ¨ FALSE
+ELSE h.heSendsGoAheads ¨ TRUE;
+IF h.nvtState[suppressGoAhead].stateOfMySide = active
+THEN h.sendGoAheads ¨ FALSE
+ELSE h.sendGoAheads ¨ TRUE;
+WAIT h.negotiationEvent;
+ENDLOOP;
+};
+
+Pusher: PROC [h: Handle] ~ {
+msg: ROPE ¨ NIL;
+closeAction: CloseAction ¨ none;
+c: CHAR ¨ Ascii.NUL;
+{
+ENABLE {
+IO.EndOfStream, ABORTED => { closeAction ¨ initiate; CONTINUE };
+IO.Error => { IF stream = h.networkStream[output] OR stream = h.networkStream[input] THEN msg ¨ "Communication failure." ELSE closeAction ¨ initiate; CONTINUE };
+};
+IF h.autoLogin THEN GenerateLoginStuff[h];
+DO {
+ENABLE IO.Rubout => { SendCommand[h, TelnetCommands.ip]; CONTINUE };
+IF IO.CharsAvail[h.keyboardStream, FALSE] = 0
+AND ((NOT h.lineBuffered) OR c = Ascii.CR OR c = Ascii.LF)
+THEN LockedSendEndOfMessage[h, h.networkStream[output]];
+c ¨ IO.GetChar[h.keyboardStream];
+IF h.localEcho THEN {
+SELECT c FROM
+Ascii.BS => IO.EraseChar[h.viewerStream, '?];
+Ascii.CR, Ascii.LF => IO.PutChar[h.viewerStream, '\n];
+ENDCASE => IO.PutChar[h.viewerStream, c];
+};
+IF c = Ascii.CR OR c = Ascii.LF
+THEN GenerateEOL[h]
+ELSE LockedSendChar[h, c];
+} ENDLOOP;
+};
+FinishConnection[h, puller, msg, closeAction];
+};
+
+GenerateEOL: PROC [h: Handle] ~ {
+LockedPutRope[h, h.eolSeq];
+IF h.sendGoAheads THEN SendCommand[h, TelnetCommands.ga];
+};
+
+Puller: PROC [h: Handle] ~ {
+ch: CHAR ¨ Ascii.NUL;
+col: INTEGER ¨ 0;
+prevCh: CHAR ¨ Ascii.NUL;
+msg: ROPE ¨ NIL;
+closeAction: CloseAction ¨ none;
+{
+ENABLE {
+ABORTED => { closeAction ¨ initiate; CONTINUE };
+IO.EndOfStream => { IF stream = h.networkStream[output] THEN msg ¨ "Stream Closed" ELSE closeAction ¨ initiate; CONTINUE };
+IO.Error => { IF stream = h.networkStream[output] THEN msg ¨ "Communication failure" ELSE closeAction ¨ initiate; CONTINUE };
+NetworkStream.Timeout => { msg ¨ "Stream Timeout"; CONTINUE };
+};
+DO
+prevCh ¨ ch;
+ch ¨ IO.GetChar[h.networkStream[input]];
+Trace[h, hisSide, ch];
+SELECT ch FROM
+IN [Ascii.SP..0176C], Ascii.TAB => { IO.PutChar[h.viewerStream, ch]; col ¨ col+1 };
+Ascii.LF => IF prevCh = Ascii.CR THEN NULL ELSE { IO.PutChar[h.viewerStream, '\n]; col ¨ 0};
+Ascii.CR => IF col # 0 THEN {IO.PutChar[h.viewerStream, '\n]; col ¨ 0};
+Ascii.BS => IF col # 0 THEN { IO.EraseChar[h.viewerStream, '?]; col ¨ col-1 };
+Ascii.BEL => ViewerOps.BlinkViewer[ViewerIO.GetViewerFromStream[h.viewerStream]];
+TelnetCommands.iac => ProcessTelnetCommand[h];
+ENDCASE => NULL;
+ENDLOOP;
+};
+FinishConnection[h, puller, msg, closeAction];
+};
+
+ProcessTelnetCommand: PROC [h: Handle] ~ {
+OPEN TelnetCommands;
+command: CHAR ¨ IO.GetChar[h.networkStream[input]];
+Trace[h, hisSide, command];
+SELECT command FROM
+ayt => LockedPutRope[h, "\n<Yes, I'm here.>\n", TRUE];
+ec => IO.EraseChar[h.viewerStream, '?];
+ga => h.gotGA ¨ TRUE;
+will, wont, do, dont =>  ProcessTelnetOption[h, command];
+ENDCASE => NULL;
+};
+
+ProcessTelnetOption: ENTRY PROC [h: Handle, command: CHAR] ~ {
+OPEN TelnetCommands, TelnetOptions;
+ENABLE UNWIND => NULL;
+option: CHAR ¨ IO.GetChar[h.networkStream[input]];
+optionState: OptionState ¨ h.nvtState[option];
+TraceInternal[h, hisSide, option];
+SELECT command FROM
+will => {  -- Either an offer on his part to start performing option XXX or a positive acknowledgment of a previous DO request from me.  (state = his side)
+SELECT optionState.stateOfHisSide FROM
+active => {  -- the RFC says you shouldn't send extra/gratuitious "will"s
+h.extraWills ¨ h.extraWills.SUCC;
+};
+inactive => {  -- he's offering to do XXX...
+IF optionState.desiredOfHisSide
+THEN {
+SendOptionInternal[h, do, option];  -- ack it
+h.nvtState[option].stateOfHisSide ¨ active;
+}
+ELSE {
+SendOptionInternal[h, dont, option];  -- nack it
+};
+};
+requested => {  -- we've requested so he's acking
+h.nvtState[option].stateOfHisSide ¨ active;
+};
+ENDCASE => ERROR;
+};
+wont => {  -- Negative acknowledgment of a DO request from me.  (state = his side)
+h.nvtState[option].stateOfHisSide ¨ inactive;
+};
+do => {  -- Either he is requesting that I begin performing option XXX or a positive acknowledgment of a previous WILL offer by me.  (state = my side)
+SELECT optionState.stateOfMySide FROM
+active => {  -- the RFC says you shouldn't send extra/gratuitious "will"s
+h.extraDos ¨ h.extraDos.SUCC;
+};
+inactive => {  -- he's requesting that I do XXX...
+IF optionState.desiredOfMySide
+THEN {
+SendOptionInternal[h, will, option];  -- ack it
+h.nvtState[option].stateOfMySide ¨ active;
+}
+ELSE {
+SendOptionInternal[h, wont, option];  -- nack it
+};
+};
+requested => {  -- he's taking us up on our offer
+h.nvtState[option].stateOfMySide ¨ active;
+};
+ENDCASE => ERROR;
+};
+dont => {  -- Negative acknowledgment of a WILL offer by me.  (state = my side)
+h.nvtState[option].stateOfMySide ¨ inactive;
+};
+ENDCASE => ERROR;
+BROADCAST h.negotiationEvent;
+};
+
+NegotiateOption: ENTRY PROC [h: Handle, option: CHAR, side: Side] RETURNS [active: BOOL] ~ {
+OPEN TelnetCommands;
+ENABLE UNWIND => NULL;
+SELECT side FROM
+mySide => {
+h.nvtState[option].desiredOfMySide ¨ TRUE;
+SELECT h.nvtState[option].stateOfMySide FROM
+inactive => NULL;
+active => RETURN[TRUE];
+ENDCASE => ERROR;
+h.nvtState[option].stateOfMySide ¨ requested;
+SendOptionInternal[h, will, option];
+DO
+IF h.nvtState[option].stateOfMySide # requested THEN RETURN[h.nvtState[option].stateOfMySide = active];
+WAIT h.negotiationEvent;
+ENDLOOP;
+};
+hisSide => {
+h.nvtState[option].desiredOfHisSide ¨ TRUE;
+SELECT h.nvtState[option].stateOfHisSide FROM
+inactive => NULL;
+active => RETURN[TRUE];
+ENDCASE => ERROR;
+h.nvtState[option].stateOfHisSide ¨ requested;
+SendOptionInternal[h, do, option];
+DO
+IF h.nvtState[option].stateOfHisSide # requested THEN RETURN[h.nvtState[option].stateOfHisSide = active];
+WAIT h.negotiationEvent;
+ENDLOOP;
+};
+ENDCASE => ERROR;
+};
+
+DeactivateOption: ENTRY PROC [h: Handle, option: CHAR, side: Side] ~ {
+OPEN TelnetCommands;
+ENABLE UNWIND => NULL;
+SELECT side FROM
+mySide => {
+h.nvtState[option].desiredOfMySide ¨ FALSE;
+SELECT h.nvtState[option].stateOfMySide FROM
+inactive => RETURN;
+active => NULL;
+ENDCASE => ERROR;
+h.nvtState[option].stateOfMySide ¨ inactive;
+SendOptionInternal[h, wont, option];
+};
+hisSide => {
+h.nvtState[option].desiredOfHisSide ¨ FALSE;
+SELECT h.nvtState[option].stateOfHisSide FROM
+inactive => RETURN;
+active => NULL;
+ENDCASE => ERROR;
+h.nvtState[option].stateOfHisSide ¨ inactive;
+SendOptionInternal[h, dont, option];
+};
+ENDCASE => ERROR;
+};
+
+SendChar: INTERNAL PROC [h: Handle, char: CHAR] ~ {
+IO.PutChar[h.networkStream[output], char];
+TraceInternal[h, mySide, char];
+};
+
+SendOption: ENTRY PROC [h: Handle, command: CHAR, option: CHAR, misc: ROPE ¨ NIL] = {
+ENABLE UNWIND => NULL;
+SendOptionInternal[h, command, option, misc];
+};
+
+SendOptionInternal: INTERNAL PROC [h: Handle, command: CHAR, option: CHAR, misc: ROPE ¨ NIL] = {
+ENABLE UNWIND => NULL;
+SendChar[h, TelnetCommands.iac];
+SendChar[h, command];
+SendChar[h, option];
+FOR i: INT IN [0..Rope.Size[misc]) DO
+SendChar[h, Rope.Fetch[misc, i]];
+ENDLOOP;
+Push[h.networkStream[output]];
+};
+
+SendCommand: ENTRY PROC [h: Handle, command: CHAR, misc: ROPE ¨ NIL] = {
+ENABLE UNWIND => NULL;
+SendChar[h, TelnetCommands.iac];
+SendChar[h, command];
+FOR i: INT IN [0..Rope.Size[misc]) DO
+SendChar[h, Rope.Fetch[misc, i]];
+ENDLOOP;
+Push[h.networkStream[output]];
+};
+
+DoSendBreak: Menus.MenuProc
+~ {
+h: Handle ¨ NARROW[clientData];
+IF h.state = connected THEN SendCommand[h, TelnetCommands.brk];
+};
+
+DoSynch: Menus.MenuProc
+~ {
+h: Handle ¨ NARROW[clientData];
+IF h.state = connected THEN SendSynch[h];
+};
+
+SendSynch: ENTRY PROC [h: Handle] = {
+ENABLE UNWIND => NULL;
+SendChar[h, TelnetCommands.iac];
+NetworkStream.SendAttention[h.networkStream[output], ORD[TelnetCommands.dm]];
+
+Push[h.networkStream[output]];
+};
+
+DoInterrupt: Menus.MenuProc
+~ {
+h: Handle ¨ NARROW[clientData];
+IF h.state = connected THEN SendCommand[h, TelnetCommands.ip];
+};
+
+DoDisconnect: Menus.MenuProc
+~ {
+h: Handle ¨ NARROW[clientData];
+IF h.state = connected THEN FinishConnection[h~h, me~none, msg~"Disconnecting.", closeAction~initiate];
+};
+
+FlushLogProc: Menus.MenuProc ~ {
+h: Handle ¨ NARROW[clientData];
+IF h.viewerStream # NIL THEN h.viewerStream.Flush[];
+};
+
+ShowOptionsProc: Menus.MenuProc ~ {
+h: Handle ¨ NARROW[clientData];
+IF h = NIL THEN RETURN;
+IF control THEN {
+buf: TraceBuffer ~ GetTrace[h];
+IF buf = NIL THEN {
+IO.PutRope[h.viewerStream, "\n*** Tracing Enabled ***\n"];
+RETURN;
+};
+IO.PutRope[h.viewerStream, " ***\n*** "];
+FOR i: NAT ¨ buf.first, (i+1) MOD buf.size UNTIL i = buf.next DO
+t: TraceBufferEntry ~ buf[i];
+IO.PutF[h.viewerStream, "%L%03B %L", [rope[IF t.side = mySide THEN "oBi" ELSE "obI"]], [cardinal[ORD[t.char]]], [rope["OBI"]]];
+ENDLOOP;
+IO.PutRope[h.viewerStream, "***\n"];
+RETURN;
+};
+IF h.state # connected THEN RETURN;
+IO.PutRope[h.viewerStream, Rope.Cat["\n\n<<<< Current Options Status >>>>\n", RopeFromNVTState[h], "<<<< End of Options Status >>>>\n\n"]];
+};
+
+AnotherProc: Menus.MenuProc = {
+h: Handle ¨ NEW[Object];
+[] ¨ TelnetMainInternal[h];
+};
+
+telnetTIPTable: TIPUser.TIPTable ~ TIPUser.InstantiateNewTIPTable["TelnetViewer.tip"];
+
+[] _ TIPLinking.Append[telnetTIPTable, ViewerOps.FetchViewerClass[$Typescript].tipTable];
+
+Commander.Register["TelnetViewer", TelnetMain, documentationRope, NIL, FALSE];
+
+}...
+     
+TelnetViewerImpl.mesa
+Copyright ” 1987, 1989, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Wes Irish, October 4, 1991 4:43 pm PDT
+Michael Plass, May 20, 1992 2:47 pm PDT
+Last tweaked by Mike Spreitzer April 14, 1992 12:57 pm PDT
+Originally created by Wes Irish with the name TelnetImpl.mesa
+UserCredentials USING [Get, GetIdentity, Identity],
+[cmd: Commander.Handle] RETURNS [result: REF, msg]
+-- hack to do "connect" from command line...
+[parent, clientData, mouseButton, shift, control]
+[parent, clientData, mouseButton, shift, control]
+[parent, clientData, mouseButton, shift, control]
+IO.PutF1[handle.viewerStream, "%g ", [rope[ConvertExtras.RopeFromArpaAddress[hisAddress]]]];
+IF handle.port # telnetPort THEN IO.PutF1[handle.viewerStream, "(port %g) ", [cardinal[handle.port]]];
+IO.PutRope[handle.viewerStream, "... "];
+tcpInfo _ [
+matchForeignAddr: TRUE,
+foreignAddress: hisAddress,
+matchForeignPort: TRUE,
+foreignPort: handle.port,
+active: TRUE,
+timeout: openTimeout,
+matchLocalPort: FALSE];
+IF openError = NIL THEN openError _ WaitUntilConnected[handle];
+Yuck!  ArpaTCP.CreateTCPStream returns an "open" connection without ever hearing from the other end.  We'd like to make sure the remote end is there before telling the user "connected".
+He refuses to echo, so set expectations differently...
+identity: UserCredentials.Identity;
+xnsFullName: XNSAuth.Name;
+unixName _ UserCredentials.Get[].name;
+identity _ UserCredentials.GetIdentity[];
+[xnsFullName, xnsPassword, ] _ XNSAuth.GetIdentityDetails[identity];
+xnsLocalName ¨ xnsFullName.object;
+xnsDomainName ¨ xnsFullName.domain;
+xnsOrgName ¨ xnsFullName.organization;
+From RFC 854:  In summary, WILL XXX is sent, by either party, to indicate that party's desire (offer) to begin performing option XXX, DO XXX and DON'T XXX being its positive and negative acknowledgments; similarly, DO XXX is sent to indicate a desire (request) that the other party (i.e., the recipient of the DO) begin performing option XXX, WILL XXX and WON'T XXX being the positive and negative acknowledgments.  Since the NVT is what is left when no options are enabled, the DON'T and WON'T responses are guaranteed to leave the connection in a state which both ends can handle.  Thus, all hosts may implement their TELNET processes to be totally unaware of options that are not supported, simply returning a rejection to (i.e., refusing) any option request that cannot be understood.
+[parent, clientData, mouseButton, shift, control]
+[parent, clientData, mouseButton, shift, control]
+-- Is this right? It is a replacement for this:
+IO.PutChar[h.networkStream, TelnetCommands.iac];
+IO.PutChar[h.networkStream, TelnetCommands.dm];
+ArpaTCP.SetUrgent[h.networkStream];
+[parent, clientData, mouseButton, shift, control]
+[parent, clientData, mouseButton, shift, control]
+ ù *h  ïNewlineDelimiter
+ñ(cedarcode) styleô codeôKöú
+œeúCôNKöú&ô&Kô'Kô:Kò Köú=ô=Kò óöœk	ò	KöúûúòKöúòKöú
+ûúò(KòKöúòKöúòKöûúòKöúûúgòrKöœrúûúüúòKòKòKöúûú*ò7KöúòKöúòKöúòKöú	ûúò-KòKöúûú$ò1Köúûúò*Köúûúô3Köúûú ò1Köúûúò*KöúûúHòZKöú	ûú4òBKöú
+ûúQò`Köúûúò)Kò óöœnúûúûòKöûúûú
+òKöûú7ûú	üú®ò˛KòKò KöûúûúûúòKöûúûúûúûúòKò öúûúûúûúòBKò óKöú
+ûúòKöúûúò/Kò KöúûúuòåKò öúûúœcò*Kò óKöúûúûúò2Köúûúûúòöúûúû	úûúò!KöúûúûúòKöúûúûúòKöúûúûúûúûúûúò4Köú
+ûúûúòKòKöúûúòKòKöúûúûúòKöúûúûúòKöúûúûúòKöúûúûúòKöúòKöúû	úòKöúûúûúòKöúûúûúòKöúûúûúòKöúûúûúòKöúûúûú°$ò9KöúûúòKöú
+ûúòKöúûúòKöúûúûúò$Kò1KòKòKò óKöúûúûúò'öúûúûúòKöúûúòKöúúûúò
+Köúûúûúûúûúúúúò2KöúòKò óöúûúûúûúò(KòKöúûò
+KöúòKò óö	†úûúûúûúú òYKò óö	†úûúûúûúúòDKòöûú	ûúûúûúò(Jöúûúûúò&JòJöúûúò'Köûúûú!ûúòPKòóKöúòKò óö†úûúûúûúò=KòKöú
+ûúò#KöúòKò óKö	ú
+ûúûúûúûúò+öúûúûúûúò#KöúûúûúòKò+KöúûúûúòKò+KòóKöúûú!ò7KöúûúòKò Köúûúûúò,öúûúûúò#KöúûúòKöúûúòKöúòKòóKò Köú
+ûúòKöú
+ûúòKò Kò Köúûúûú°qòêKò KòDKò Köúûú:òEKöúûú&ò/Köúûúò(öúûúò.Kò óKò ö†
+úò!Köúûú
+ûúô2KòKöú
+ò
+Kò"òKöú>ûúòJóKöûúûúûúûúòKöúûú	òöûúò	Kò,KöúòóKòKöûúûúûúûúò0KöúòKöúòKò óö†úûúò$KòKöúòKöúQœy.úûúòîKò1KòKöú'ûúò,KöúòKòKöú$ò$KöúnûúòtKö°,ô,Köûú*ûúòMöûúûò#Köûúûúò,óKöûúòKöúòKò óö–bnúûúò$KöúòKò1KöúNòNKöú>ò>öûú<ûúûòHKöúPòPóKöúJòJKöú8ò8Köú9ò9KöúEòEKöúXòXKöúPòPöûúòöûúòKöú"ò"KöúòKöúòóKöûú ò$óKòKò óö
+†úûú0ûúûúûúò^KöúûúòKöúGûúòNöûúûòKöúûúò Köûú	ûúûúò4öûúòöûúòKöûú	ûúûúò/öûúûò"òKö	úûúûúûúûúò,ò%Köú-ûúò9óKòóòKöúûúòKòóòKöúûúòKòóKöûúûúò*óKöúòóöûúòKöûúûúûúûúò>KòKòóóKöúûúòKöûúòóöûòKöúûúòóKòKò óö
+†úûúûúûúûúòDKòBKöúûúòKöú
+ûúûúûúGò]Köûúûúûúûúûúûúò5Köú.ò.öûúûúûòKö	ûúûúûúûú°#òGKòKòKöûúûúûú°"òHKöú ò KöúûúòKòKöûúòóKòKò óö†úûúûúò4KòBKöûúûúûúûúòKöúDûú2òyKòKò óö†	úûúûúûúûúûúò_KòBKöûúûúûúûúòKöúUòUKòKò óö
+†úûúûúûúûúò8Köûúûú
+ûúòKöúûúòKöûúûúûúûúûúûúûúûúòPKòKò óö
+†úûúûúûúûúò<KöûúûúûúòöûúòöûúòKòKöûúûúòKöúòóKöûúûúûúòóKòKò óö†úûúûúò(KöûúûúûúòKöúBòBKòKò.Kò0KöúòKò óö
+†úûúûúûúûúò?KöûúûúûúòöûúòKöûúòKöúBòBKòKòDKò0KöûúûúòKöúòKöûúûúûúòóKòKò óö†úûúûúò+KöûúûúûúòKöúBòBKòKòKò0Köú7ò7KöúòKò óö
+†úûúûúûúûúò(KöûúûúûúûúûúûúûúûúûúòAKöûúûúòKòKò óö†úûúûúûúò1Köú
+ûú&ò4öûúûòKöúûúòKöúûúò#Köú	ûúò%KöûúòóKöûúûúòKöúòKò óö†úûúûúûúò4KòKöúûúòKòKò(KòöûúûòKöúûúûúò*KöûúûúûúòKöúûúòKöûúòóKò7KòKò óö£úò+Köúûú*ò<Köûúûúûúûúò?KòKò óö£úûúò-KöûúûúûúòöûúûúûúòKöûú)ò0KòKKöú>ò>KòóKòKò óö†úûúEòeKöú*ò*KöúòKòóKò ö†úòKöú1ô1KöúòKöúûúò&KòKòBöûúûúûòKöúûú+ò5öúûúòKöúòKöúûú&ò5öûúûúûúò=Köúü	úü–krüò6KöûúòKòóöûúûòKòKöúüûú"üúü
+úü§üúòoöú	ò	öûú+ûúûúò7Köúü	úü§üò7KöûúòKòóKò+Kòöûúò	öúûòKöúQûú2òÜóóKòóKöûúòóKòóòKöúòKöúûú&ò5öûúûúûúò=Köúü	úü§üò6KöûúòKòóöûúûòöúòöûúûúò%Köúü	úü§üò4KöûúòKòóöûú+ûúûúò7Köúü	úü§üò7KöûúòKòóKöúNûú6òáKö	úüûú'üú	ü§üòZKöúòóKöúüûú"üúü
+úü§üúòoöú	ò	Kò+Kö	úüûú*üúü§üò[öûúò	öúûòKöú'ûúò.óóKòóKöûúòóKòóKöûúòóKöúòKòKò óö†úòKöú1ô1KòKöúûúòöûúûúûúòKöú	üúüúüòKöü%úü§üò<KöûúòKöúòóKòKöúûúòKöûúûúò,KöúòKò óö†	úòKöú1ô1KòKöúûúòöûúûúûúòKöú	üúüúüòKöü%úü§üò<KöûúòKöúòóKòKöúûúòKöûúûúò,KöúòKò óö£úûúûúûúò;öûúûúûúòKöü%úü§üò<KöûúòKöúòóKòKòKöûúûúò,KöúòKò óö†	úûúò$KöúGòGKöú	ûúûúòKöúûúûúòIcode2öúûúûúòKòöúòKòöûúûúòKò;KöûúòóKöú+ò+Köú"ò"Köú	ûúIòTKò0Köúµûúò≈öûúûúûúòKöúGòGKöûúòóKöú*ò*Köú	ûúcònKò0KöûúZô\KöûúûúûúCôfKöûú&ô(KòöúôLöúûúôLöúôLöúûúôLöúôLöúûúôLöúôLöúûúôóò≥öúòLòLöûúò	LöúòóöúòLòLöûúò	LöúòóLöúòóJöûúûúûú(ô?öûúûúûúòKöú1ò1Köûúò	KòóKò!KöúòKöú!ò!KöúòöûòKöúûúòóKòóKöúòKòKò óö¢AòAKö¢πôπKö¢"ò"Kö¢ ú¢–ky¢òEö•òKö¢ú¢òö•¢•òKö¢òKö¢•¢•¢ò$Kö•¢•¢#ò4óKö•¢òóKö¢òóKò ö£úûúò'KòGKöúûúòòöûúòKöûúûúûú
+ûúò/KòóöûòöûòöûúòKöûúûò	KöûúòóKöûúòóöûúûúûúûúò4KöúòKöûúòKòóKöúûúò!öûúûòKöúûúûúò#Köúûúûúò"Köúûúò$Köûúûúò)óKöûúòóKòóöûòKöúûúòóKòóKò ö£úûúûúò4KöûúòKöûúûúûúòKöú$ûúò)Köú/ûúò4Köú.ûúò3KòKò óö£úûúò-öûúûú1ûúò=Jô6Kò6Kò4Köúòóöûú	ûúûúûò!Köûú$ûú)òSKöûú%ûú*òUKöûúòóKòKò óö
+†úûúûúûúûúòAKöûúûúûúòöûú	ûúûúûò!Kò.Köú
+ûúòöûúòKöûú%ò'KöûúòKöûú&ò(öûúòKöúûúò*öûúûòKöûúûúGòYKöûúûú0òBóKöú!ûúïò∏Köú!ûúòòªKò&KöúòóóKöûúòóKòKò óö
+£úûú
+ûúûúûúò6KöûúòöûúûúûòKöú#ò#KöúòKöú%ò%KöúòKöúòKöúòKöúòKöúòKöúòKöú!ò!Köú)ò)Köú-ò-KöûúûúòóKòKò óö£úûúûúûúòKöûúûúûòKòKòKòKöûúûúòóKòKò óö†úûúò#öûúò	Köúûúò*KöúûúòKöúûúòöúòKö	úûúûú4ûúûúò]óKöûúûúòKöûúûúòKò!Kò KöúûúòKöúòóKöúòKöúòKò óö†úûúò)öûúûúûò Köûúûú
+ûú°òPKöûúòóKöúòKò óö£úûúûúœbúò*Kò óö£úûúûúòöûúòKöûúûú	òKöûúòóKòKò óö†úûúûúûú&òdöûúûúòKöûúûúûúò8Köûúûúûúò8Köûúûúûú.ò?öûúûòKöú*ò*KöûúòóKòóKòóKò ö†úûúûúûúûú
+ûúò?Köúûúòö	ûúûúû
+úûúûò'öûúûúûúò"Köú"ò"Köú2ò2óKöûúòóKöûúûúòKòKò óKò ö£	úûúûúûúûúûúûúò@KöúûúòKöúûúòKöúûúûúò)Kö
+ûú	ûúûúûúûúò)Köûú7ûúòBKöúòKò óö£úûúûúûúûúûúûúûúûúûúòlKöúûúòKöúûúòöûòKöúûúòKöúûúò%Köûú	ûúûúòKòKòKöûúûúûúûúòKöûúòóKöûúò
+KöúòKò óö£úûúûúûúò:KöûúûúûúòKöúûúûúòKöú	ûúòKöú#ô#KôKöú@ûúòEKöúûú&ò5Köûúûúûúò'Köúûúûú	ûúûúûú	ûúûúò_Kô&Köú)ô)KöúDôDKô"Kô#Kô&Kò8Kò>KònKò@KòBKò<Kò,KòAöûú
+ûúûòKöú
+ûúòKöú
+ûúòKò4öûúûúûúûò+Köúûúò"KöûúûúûúûúòNöûú	ûúòKöûúûú+òFKöú
+ûúòKòóKöûúòóöûúûúòöûúûúûú
+ûúò%Köûúûú+òFKöú
+ûúòKòóKöúòKòóKöûúòóKöûú
+ûúûú+òSKòKò óö£úûúûúûúûúûúûúûúûúûúûúûúûúûúòwKöú
+ûúòöûúûúûòKöûúûúûúûúûúûú°#òPöûúûòKöûúòKöûúò!óKö
+ûúûúûúûúûúòGKöú°ò0KöûúòóKöûúûúûúòKòKò óö£úûúò(KöúûúòKöúûúûúòKöúûúûúûúEò`KòIKöûúûúhò|Köú!ò!KòKò óö	†£úûúûúûúò=KöûúûúûúòKöúòKòKò óö†úûúûúûúò3KöûúûúûúòKòKòKò óö†úûúûúûúûúûúòIKöûúûúûúòKöûú%ò'Köûú	ûúò.KòKò óö£úûúûúò*KöûúòKöûúûúûúòöûòöûú)ò+Köûú ûò)Köûú ûúò)óöûú4ò6KöûúûòKöûúûúòóöûú3ò5KöûúûòKöûúûúòóKöûúòKöûúòóKòKò óö†úûúòKöúûúûúòKò Köúûú	ûúòòöûúòKöûúûúûúò@Köûúûú"ûú!ûú ûúûúò°KòóKöûúûúò*öûúòKöûúûú0ûúòDöûúûúûúò-Köûúûúûúûúûúûúò:Köûú4ò8óKöúûúò!öûúûúòöûúûòKöúûúûúò-Köúûúûúûúò6Köûúûúò)óKòóöûúûúûúûòKöûúòKöûúòóKöúûúò
+óKòóKò.KòKò óö†úûúò!KöúòKöûúûú#ò9KòKò óö†úûúòKöúûú	ûúòKöúûúòKöúûú	ûúòKöúûúûúòKò òöûúòKöûúûúò0Kö
+ûúûú"ûúûúûúò{Kö
+ûúûú"ûúûúûúò}Köú3ûúò>KòóöûòKòKöúûú!ò(KòöûúûòKöûúûúûúûú,òSKöúûúûúûúûúûúûúûú(ò\Köúûúûú	ûúûúúúúúòGKö	úûúûú	ûúûú.òNKöúûúHòQKöú.ò.KöûúûúòóKöûúòóKòóKò.KòKò óö†úûúò*KöûúòKöú	ûúûú!ò3Kòöûú	ûòKöú0ûúò6Köúûúò'KöúûúòKò9KöûúûúòóKòKò óö†úûúûúûúò>KôîKöûúò#KöûúûúûúòKöúûúûú!ò2Kò.Kò"öûú	ûòöú°êòõöûúûò&öú°<òIKöúûúò!Kòóöú°ò,öûúòöûúòKöú$°	ò-Kò+KòóöûúòKöú&°
+ò0KòóóKòóöú°!ò1Kò+KòóKöûúûúòóKòóöú°GòRKò-Köúòóöú	°çòñöûúûò%öú°<òIKöúûúòKòóöú°#ò2öûúòöûúòKöú&°	ò/Kò*KòóöûúòKöú&°
+ò0KòóóKòóöú°!ò1Kò*KòóKöûúûúòóKöúòóöú°DòOKò,KöúòóKöûúûúòóKöû	úòKòKò óö†úûúûúûúûú
+ûúò\KöûúòKöûúûúûúòöûúûòòKöú%ûúò*öûú"ûò,KöúûúòKöú
+ûúûúòKöûúûúòóKò-Köú$ò$öûòKöûú.ûúûú,ògKöûúòKöûúòóKöúòóòKöú&ûúò+öûú#ûò-KöúûúòKöú
+ûúûúòKöûúûúòóKò.Köú"ò"öûòKöûú/ûúûú-òiKöûúòKöûúòóKòóKöûúûúòóKòKò óö†úûúûúûúòFKöûúòKöûúûúûúòöûúûòòKöú%ûúò+öûú"ûò,KöúûúòKöú
+ûúòKöûúûúòóKò,Köú$ò$KöúòóòKöú&ûúò,öûú#ûò-KöúûúòKöú
+ûúòKöûúûúòóKò-Köú$ò$KòóKöûúûúòóKòKò óö†úûúûúûúò3Köûú(ò*KòKöúòKò óö†
+úûúûúûú
+ûúûúûúòUKöûúûúûúòKöú-ò-KòóKò ö†úûúûúûú
+ûúûúûúò`KöûúûúûúòKò KòKòöûúûúûúûò%Kò!KöûúòóKöúòKòKò óö£úûúûúûúûúûúòHKöûúûúûúòKò Kòöûúûúûúûò%Kò!KöûúòóKöúòKòKò óö†úòKöú1ô1KòKöúûúòKöûúûú$ò?KòKò óö†úòKöú1ô1KòKöúûúòKöûúûúò)KòKò óö†	úûúûúò%KöûúûúûúòKöœw ò öß5–kwßòMKô/Köûú.ô0Köûú-ô/Köú#ô#óKò KöúòKòKò óö†úòKöú1ô1KòKöúûúòKöûúûú#ò>KòKò óö†úòKöú1ô1KòKöúûúòKöûúûúLògKòKò óö†£úò KöúûúòKöûúûúûúò4KòKò óö£úò#KöúûúòKöûúûúûúûúòöûú	ûúòJòöûúûúûúòKöûú8ò:KöûúòKòóKöûú'ò)ö	ûúûúûú
+ûúûò@KòKö
+ûú)ûúûúûúûúòKöûúòóKöûú"ò$KöûúòKòóKöûúûúûúò#KöûúâòãKòKò óö£úòKöúûú	òKòKòKò óKòVKò òYKò óKöúBûúûúòNKò Kòóó Öó    Å$  ∂å  

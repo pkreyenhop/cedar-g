@@ -1,0 +1,1109 @@
+
+DIRECTORY
+Alloc USING [Notifier],
+Basics USING [Comparison],
+ConstArith USING [Add, Compare, Const, FromCard, FromInt, Overflow, Sub],
+LiteralOps USING [ResetLocalStrings],
+MimData USING [bodyIndex, idBOOL, interface, switches, textIndex],
+MimosaLog USING [Error, ErrorSei, ErrorTree, WarningRope],
+MimP4 USING [AdjustBias, Assignment, Attr, AUsForType, Bias, BiasForType, BitsForType, BoolTest, BoolValue, Call, CanonicalType, CheckBlock, CommonProp, CommonRep, ConsState, DeclItem, DeclUpdate, Exp, Extract, implicit, ImplicitRecord, LayoutBlock, LayoutGlobals, LayoutInterface, LayoutLocals, MakeArgRecord, MakeTreeLiteralCard, MarkArgs, NeutralExp, NormalizeRange, nullBias, OperandType, ProcessSymLiterals, RepForType, Repr, resident, resumeRecord, returnRecord, Rhs, RValue, SetType, SideEffectFree, TreeBounds, TreeLiteral, TreeLiteralConst, tFALSE, tTRUE, VAttr, VBias, voidAttr, VPop, VProp, VRep, WordsForType],
+Pass4Parms USING [localOverheadBits],
+SourceMap USING [Loc, nullLoc, Up],
+Symbols USING [Base, BitCount, BodyInfo, bodyType, BTIndex, BTNull, CBTIndex, ContextLevel, CSEIndex, CSENull, CTXIndex, CTXNull, ctxType, ISEIndex, ISENull, lG, lL, nullType, RecordSEIndex, RecordSENull, RootBti, seType, Type, typeANY],
+SymbolOps USING [ArgRecord, Cardinality, CtxVariant, DecodeBti, DelinkBti, EqTypes, FirstCtxSe, FromBti, FromType, NextSe, NormalType, own, ToBti, TransferTypes, TypeForm, TypeLink, ToType, UnderType, XferMode],
+Target: TYPE MachineParms USING [bitsPerAU, bitsPerWord],
+Tree USING [Base, Index, Info, Link, Map, NodeName, NodePtr, Null, nullIndex, Scan, Test, treeType],
+TreeOps USING [FreeNode, FreeTree, FromCard, GetNode, GetSe, GetTag, IdentityMap, ListHead, ListLength, MakeList, MarkShared, NthSon, OpName, PopTree, PushNode, PushTree, ReverseScanList, ReverseUpdateList, ScanList, SearchList, SetAttr, SetAttrs, SetInfo, ToLoc, UpdateList];
+
+Pass4S: PROGRAM
+IMPORTS ConstArith, LiteralOps, MimData, MimosaLog, MimP4, SourceMap, SymbolOps, TreeOps
+EXPORTS MimP4 = {
+OPEN MimP4, Symbols;
+
+tb: Tree.Base;	-- tree base address (local copy)
+seb: Symbols.Base;	-- se table base address (local copy)
+ctxb: Symbols.Base;	-- ctx table base address (local copy)
+bb: Symbols.Base;	-- body table base (local copy)
+
+StmtNotify: PUBLIC Alloc.Notifier = {
+tb ¨ base[Tree.treeType];
+seb ¨ base[seType];
+ctxb ¨ base[ctxType];
+bb ¨ base[bodyType];
+};
+
+Repr: TYPE = MimP4.Repr;
+none: Repr = MimP4.Repr.none;
+
+removeDecls: BOOL = FALSE;
+eitherPrefersSigned: BOOL ¨ FALSE;
+
+bitsPerAU: NAT = Target.bitsPerAU;
+bitsPerWord: NAT = Target.bitsPerWord;
+currentLevel: PUBLIC ContextLevel ¨ Symbols.lG;
+currentBody: BTIndex ¨ BTNull;
+checked: PUBLIC BOOL ¨ FALSE;
+
+BodyList: PROC [firstBti: BTIndex] = {
+nextBti: BTIndex;
+FOR bti: BTIndex ¨ firstBti, nextBti UNTIL bti = BTNull DO
+nextBti ¨ IF bb[bti].link.which = parent THEN BTNull ELSE bb[bti].link.index;
+WITH bb[bti] SELECT FROM
+Callable =>
+IF ~inline OR (MimData.interface AND LocalBody[LOOPHOLE[bti]]) THEN
+Body[LOOPHOLE[bti, CBTIndex]]
+ELSE SymbolOps.DelinkBti[bti];
+ENDCASE => BodyList[bb[bti].firstSon];
+ENDLOOP;
+};
+
+LocalBody: PROC [bti: CBTIndex] RETURNS [BOOL] = INLINE {
+sei: ISEIndex = bb[bti].id;
+RETURN [sei = ISENull OR ctxb[seb[sei].idCtx].ctxType = simple];
+};
+
+Body: PUBLIC PROC [bti: CBTIndex] = {
+oldBodyIndex: CBTIndex = MimData.bodyIndex;
+oldLevel: ContextLevel = currentLevel;
+saveChecked: BOOL = checked;
+saveIndex: SourceMap.Loc = MimData.textIndex;
+saveCatchScope: BOOL = catchScope;
+saveRecord: RecordSEIndex = MimP4.returnRecord;
+node: Tree.Index = NARROW[bb[bti].info, BodyInfo.Internal].bodyTree;
+sei: CSEIndex = bb[bti].ioType;
+base, bound: BitCount;
+initTree: Tree.Link;
+inRecord: RecordSEIndex;
+catchScope ¨ FALSE;
+currentLevel ¨ IF bti = RootBti THEN Symbols.lG ELSE bb[bti].level;
+MimData.bodyIndex ¨ currentBody ¨ bti;
+MimData.textIndex ¨ SourceMap.Up[bb[bti].sourceIndex];
+checked ¨ tb[node].attr1;
+IF MimData.interface AND bb[bti].level > Symbols.lL THEN
+MimosaLog.ErrorSei[nonDefinition, bb[bti].id];
+[inRecord, MimP4.returnRecord] ¨ SymbolOps.TransferTypes[SymbolOps.own, bb[bti].ioType];
+IF ~bb[bti].hints.argUpdated THEN SetImmutable[inRecord, TRUE];
+[] ¨ LiteralOps.ResetLocalStrings[];
+bb[bti].hints.noStrings ¨ TRUE;	-- see MarkString, below
+IF tb[node].son[4] # Tree.Null THEN {
+tb[node].son[4] ¨ Exp[tb[node].son[4], none]; VPop[]};
+tb[node].son[1] ¨ TreeOps.UpdateList[tb[node].son[1], OpenItem];
+[init: initTree, decls: tb[node].son[2]] ¨ ScanDecls[tb[node].son[2]];
+IF bti = RootBti
+THEN {
+gfBits: CARD ¨ LayoutGlobals[bti];
+IF bb[bti].type # RecordSENull THEN seb[bb[bti].type].length ¨ gfBits;
+ProcessSymLiterals[];
+base ¨ Pass4Parms.localOverheadBits;
+}
+ELSE {
+base ¨ LayoutLocals[bti];
+IF bb[bti].type # RecordSENull THEN seb[bb[bti].type].length ¨ base;
+IF bb[bti].firstSon # BTNull THEN
+initTree ¨ Prefix[BodyInitList[bb[bti].firstSon], initTree];
+};
+IF bb[bti].type # RecordSENull THEN seb[bb[bti].type].mark4 ¨ TRUE;
+tb[node].son[3] ¨ TreeOps.UpdateList[tb[node].son[3], Stmt];
+bound ¨ AssignSubBlocks[bti, base];
+WITH bb[bti].info SELECT FROM
+Internal => {
+frameSize ¨ (bound + (bitsPerAU-1))/bitsPerAU;
+thread ¨ LiteralOps.ResetLocalStrings[]};
+ENDCASE;
+bb[bti].resident ¨ MimP4.resident;
+IF bb[bti].firstSon # BTNull THEN BodyList[bb[bti].firstSon];
+tb[node].son[1] ¨ TreeOps.ReverseUpdateList[tb[node].son[1], CloseItem];
+IF bti = RootBti THEN
+tb[node].son[2] ¨ Prefix[initTree, TreeOps.UpdateList[tb[node].son[2], DeclUpdate]];
+tb[node].son[2] ¨ Prefix[initTree, tb[node].son[2]];
+IF MimData.interface AND bti = RootBti THEN {
+n: CARDINAL = LayoutInterface[bti];
+WITH t: seb[bb[bti].ioType] SELECT FROM
+definition => t.slots ¨ n;
+ENDCASE;
+};
+SetImmutable[inRecord, FALSE];
+catchScope ¨ saveCatchScope;
+currentBody ¨ MimData.bodyIndex ¨ oldBodyIndex;
+currentLevel ¨ oldLevel;
+checked ¨ saveChecked;
+MimData.textIndex ¨ saveIndex;
+MimP4.returnRecord ¨ saveRecord;
+};
+
+MarkString: PUBLIC PROC [local: BOOL] = {
+bb[IF local THEN MimData.bodyIndex ELSE RootBti].hints.noStrings ¨ FALSE;
+};
+
+SetImmutable: PROC [rSei: RecordSEIndex, b: BOOL] = {
+IF rSei # RecordSENull THEN
+FOR sei: ISEIndex ¨ SymbolOps.FirstCtxSe[SymbolOps.own, seb[rSei].fieldCtx], SymbolOps.NextSe[SymbolOps.own, sei]
+UNTIL sei = ISENull DO
+seb[sei].immutable ¨ b;
+ENDLOOP
+};
+
+ScanDecls: PROC [t: Tree.Link] RETURNS [init, decls: Tree.Link] = {
+IF TreeOps.OpName[t] = initlist
+THEN {
+node: Tree.Index = TreeOps.GetNode[t];
+init ¨ TreeOps.UpdateList[tb[node].son[1], Stmt];
+tb[node].son[1] ¨ Tree.Null;
+decls ¨ tb[node].son[2];
+tb[node].son[2] ¨ Tree.Null;
+TreeOps.FreeNode[node];
+}
+ELSE {
+init ¨ Tree.Null;
+decls ¨ t;
+};
+TreeOps.ScanList[decls, DeclItem];
+};
+
+Prefix: PROC [first, rest: Tree.Link] RETURNS [Tree.Link] = {
+SELECT TRUE FROM
+(first = Tree.Null) => RETURN [rest];
+(rest = Tree.Null) => RETURN [first];
+ENDCASE => {TreeOps.PushTree[first]; TreeOps.PushTree[rest]; RETURN [TreeOps.MakeList[2]]}
+};
+
+BodyInitList: PROC [firstBti: BTIndex] RETURNS [Tree.Link] = {
+bti: BTIndex ¨ firstBti;
+n: CARDINAL ¨ 0;
+IF bti # BTNull THEN
+DO
+WITH body: bb[bti] SELECT FROM
+Callable =>
+IF ~body.inline THEN {
+TreeOps.PushNode[procinit, 0];
+TreeOps.SetInfo[SymbolOps.FromBti[bti]];
+n ¨ n+1;
+};
+ENDCASE;
+IF bb[bti].link.which = parent THEN EXIT;
+bti ¨ bb[bti].link.index;
+ENDLOOP;
+RETURN [TreeOps.MakeList[n]];
+};
+
+AssignSubBlocks: PROC [rootBti: BTIndex, base: BitCount] RETURNS [bound: BitCount] = {
+level: ContextLevel = bb[rootBti].level;
+bti: BTIndex;
+bound ¨ base;
+IF (bti ¨ bb[rootBti].firstSon) # BTNull THEN
+DO
+SELECT bb[bti].kind FROM
+Other =>
+IF bb[bti].level = level THEN {
+length: BitCount = AssignBlock[bti, base];
+bound ¨ MAX[length, bound]};
+ENDCASE => NULL;
+IF bb[bti].link.which = parent THEN EXIT;
+bti ¨ bb[bti].link.index;
+ENDLOOP;
+};
+
+Subst: PUBLIC PROC [node: Tree.Index] RETURNS [Tree.Link] = {
+saveRecord: RecordSEIndex = MimP4.returnRecord;
+saveChecked: BOOL = checked;
+tb[node].son[1] ¨ NeutralExp[tb[node].son[1]];
+MimP4.returnRecord ¨ SymbolOps.TransferTypes[SymbolOps.own, OperandType[tb[node].son[1]]].typeOut;
+IF ~tb[node].attr3 THEN checked ¨ tb[node].attr1;
+tb[node].son[2] ¨ TreeOps.UpdateList[tb[node].son[2], Stmt];
+checked ¨ saveChecked;
+MimP4.returnRecord ¨ saveRecord;
+RETURN [[subtree[index: node]]];
+};
+
+Scope: PROC [node: Tree.Index, item: Tree.Map] RETURNS [Tree.Link] = {
+bti: BTIndex = SymbolOps.ToBti[tb[node].info];
+saveIndex: SourceMap.Loc = MimData.textIndex;
+oldBodyIndex: BTIndex = currentBody;
+oldLevel: ContextLevel = currentLevel;
+initTree: Tree.Link;
+delta: BOOL ¨ FALSE;
+currentBody ¨ bti;
+currentLevel ¨ bb[bti].level;
+SELECT currentLevel FROM
+oldLevel => {delta ¨ FALSE};
+oldLevel.SUCC => {delta ¨ TRUE};
+ENDCASE => {
+IF warnScope THEN
+MimosaLog.WarningRope[other, "Funny scope (INLINE in catch phrase?)"];
+currentLevel ¨ bb[bti].level ¨ MAX[oldLevel.SUCC, Symbols.lL];
+};
+MimData.textIndex ¨ SourceMap.Up[bb[bti].sourceIndex];
+[init: initTree, decls: tb[node].son[1]] ¨ ScanDecls[tb[node].son[1]];
+IF bb[bti].type # RecordSENull THEN seb[bb[bti].type].mark4 ¨ TRUE;
+CheckBlock[bti];
+tb[node].son[2] ¨ TreeOps.UpdateList[tb[node].son[2], item];
+IF removeDecls
+THEN tb[node].son[1] ¨ Prefix[initTree, TreeOps.UpdateList[tb[node].son[1], DeclUpdate]]
+ELSE tb[node].son[1] ¨ Prefix[initTree, tb[node].son[1]];
+IF catchScope THEN catchBound ¨ MAX[AssignBlock[bti, catchBase], catchBound];
+currentBody ¨ oldBodyIndex;  currentLevel ¨ oldLevel;
+MimData.textIndex ¨ saveIndex;
+RETURN [[subtree[index: node]]];
+};
+warnScope: BOOL ¨ FALSE;
+
+AssignBlock: PROC [bti: BTIndex, base: BitCount] RETURNS [bound: BitCount] = {
+newBase: BitCount = LayoutBlock[bti, base];
+initTree: Tree.Link = IF bb[bti].firstSon # BTNull
+THEN BodyInitList[bb[bti].firstSon]
+ELSE Tree.Null;
+IF bb[bti].type # RecordSENull THEN seb[bb[bti].type].length ¨ newBase;
+bound ¨ AssignSubBlocks[bti, newBase];
+IF bound # 0 THEN bound ¨ (bound + (bitsPerAU-1))/bitsPerAU;
+WITH bb[bti].info SELECT FROM
+Internal => {
+frameSize ¨ bound;
+IF initTree # Tree.Null THEN {
+node: Tree.Index = bodyTree;
+tb[node].son[1] ¨ Prefix[initTree, tb[node].son[1]];
+};
+};
+ENDCASE;
+};
+
+SourceSeen: SIGNAL [index: SourceMap.Loc] = CODE;
+sourceBreak: SourceMap.Loc ¨ SourceMap.nullLoc;
+
+Stmt: PROC [stmt: Tree.Link] RETURNS [val: Tree.Link] = {
+node: Tree.Index;
+saveIndex: SourceMap.Loc = MimData.textIndex;
+val ¨ stmt;		-- the default case
+WITH stmt SELECT TreeOps.GetTag[stmt] FROM
+subtree => {
+node ¨ index;
+IF node # Tree.nullIndex THEN {
+tp: Tree.NodePtr = @tb[node];
+nSons: NAT ¨ tp.nSons;
+name: Tree.NodeName ¨ tp.name;
+fIndex: SourceMap.Loc ¨ TreeOps.ToLoc[tp.info];
+IF tp.free THEN ERROR;
+IF fIndex # SourceMap.nullLoc THEN
+SELECT name FROM
+list, block, null => fIndex ¨ SourceMap.nullLoc;
+ENDCASE => MimData.textIndex ¨ fIndex;
+IF fIndex = sourceBreak AND fIndex # SourceMap.nullLoc THEN
+SIGNAL SourceSeen[fIndex];
+
+SELECT name FROM
+
+decl => {
+DeclItem[stmt];
+};
+
+assign => {
+val ¨ Assignment[node];
+GO TO pop;
+};
+extract => {
+subNode: Tree.Index = TreeOps.GetNode[tp.son[1]];
+rType: RecordSEIndex = LOOPHOLE[
+SymbolOps.UnderType[SymbolOps.own, SymbolOps.ToType[tb[subNode].info]]];
+IF rType # Symbols.RecordSENull
+THEN {
+val ¨ Extract[node];
+GO TO pop;
+}
+ELSE {
+son2: Tree.Link ¨ tp.son[2];
+tp.son[2] ¨ Tree.Null;
+val ¨ Stmt[son2];
+WITH val SELECT TreeOps.GetTag[val] FROM
+subtree => tb[index].info ¨ tb[node].info;
+ENDCASE;
+TreeOps.FreeNode[node];
+};
+};
+
+call, portcall, signal, error, xerror, start, join => {
+val ¨ Call[node];
+GO TO pop;
+};
+subst => val ¨ Subst[node];
+
+block => {
+saveChecked: BOOL = checked;
+checked ¨ tp.attr1;
+val ¨ Scope[node, Stmt];
+checked ¨ saveChecked;
+};
+
+if => {
+son1: Tree.Link ¨ tp.son[1];
+son2: Tree.Link ¨ tp.son[2];
+son3: Tree.Link ¨ tp.son[3];
+son1 ¨ tb[node].son[1] ¨ BoolValue[son1];
+VPop[];
+IF ~TreeLiteral[son1]
+THEN {
+IF son2 # Tree.Null THEN tb[node].son[2] ¨ Stmt[son2];
+IF son3 # Tree.Null THEN tb[node].son[3] ¨ Stmt[son3];
+val ¨ Tree.Link[subtree[index: node]];
+}
+ELSE {
+IF BoolTest[son1]
+THEN {val ¨ son2; tb[node].son[2] ¨ Tree.Null}
+ELSE {val ¨ son3; tb[node].son[3] ¨ Tree.Null};
+[] ¨ KillTree[stmt];
+val ¨ Stmt[val];
+};
+};
+
+case => val ¨ CaseDriver[node, Stmt, MimP4.nullBias];
+bind => val ¨ IF tp.attr3
+THEN val ¨ BindType[node, Stmt]
+ELSE val ¨ BindCase[node, case, BindStmt];
+
+do => val ¨ DoStmt[node];
+
+return, result, resume => {
+son1: Tree.Link ¨ tp.son[1];
+type: RecordSEIndex ¨
+IF name = resume THEN MimP4.resumeRecord ELSE MimP4.returnRecord;
+tb[node].son[1] ¨ IF tp.attr3 AND type # RecordSENull
+THEN Rhs[son1, type]
+ELSE MakeArgRecord[type, son1];
+GO TO pop;
+};
+
+label => {
+son1: Tree.Link ¨ tp.son[1];
+son2: Tree.Link ¨ tp.son[2];
+tb[node].son[1] ¨ Stmt[son1];
+tb[node].son[2] ¨ TreeOps.UpdateList[son2, Stmt];
+};
+
+open => {
+son1: Tree.Link ¨ tp.son[1];
+son2: Tree.Link ¨ tp.son[2];
+son1 ¨ tb[node].son[1] ¨ TreeOps.UpdateList[son1, OpenItem];
+son2 ¨ tb[node].son[2] ¨ TreeOps.UpdateList[son2, Stmt];
+tb[node].son[1] ¨ TreeOps.ReverseUpdateList[son1, CloseItem];
+};
+
+checked => {
+saveChecked: BOOL = checked;
+checked ¨ tp.attr1;
+tb[node].son[1] ¨ Stmt[tp.son[1]];
+checked ¨ saveChecked;
+};
+
+enable => {
+CatchNest[tp.son[1]];
+tb[node].son[2] ¨ Stmt[tb[node].son[2]];
+};
+catchmark =>
+tb[node].son[1] ¨ Stmt[tp.son[1]];
+
+lock => {
+tb[node].son[1] ¨ TreeOps.UpdateList[tp.son[1], Stmt];
+tb[node].son[2] ¨ Exp[tb[node].son[2], none];
+GO TO pop;
+};
+
+notify, broadcast, unlock => {
+tb[node].son[1] ¨ Exp[tp.son[1], none];
+GO TO pop;
+};
+
+wait => {
+tb[node].son[1] ¨ Exp[tb[node].son[1], none];  VPop[];
+tb[node].son[2] ¨ Exp[tb[node].son[2], none];  VPop[];
+IF nSons > 2 THEN CatchNest[tb[node].son[3]];
+};
+
+restart => {
+tb[node].son[1] ¨ NeutralExp[tp.son[1]];
+IF nSons > 2 THEN CatchNest[tb[node].son[3]];
+};
+
+goto, exit, loop, syserror, reject, continue, retry, stop, null, apply => {
+};
+
+free => {
+vType, pType: Type;
+son1: Tree.Link ¨ tp.son[1];
+son2: Tree.Link ¨ tp.son[2];
+IF son1 # Tree.Null THEN {
+son1 ¨ tb[node].son[1] ¨ Exp[son1, none];
+VPop[];
+};
+son2 ¨ tb[node].son[2] ¨ NeutralExp[son2];
+vType ¨ OperandType[son2];
+pType ¨ DerefType[vType];
+IF TreeOps.OpName[son2] = addr
+THEN {
+subNode: Tree.Index = TreeOps.GetNode[son2];
+tb[node].son[2] ¨ tb[subNode].son[1];
+tb[subNode].son[1] ¨ Tree.Null;
+TreeOps.FreeNode[subNode];
+}
+ELSE {
+TreeOps.PushTree[son2];  TreeOps.PushNode[uparrow, 1];  SetType[pType];
+TreeOps.SetAttr[1, checked OR MimData.switches['n]];
+TreeOps.SetAttr[2, BitsForType[vType] > Target.bitsPerWord];
+tb[node].son[2] ¨ TreeOps.PopTree[];
+};
+tb[node].son[3] ¨ MakeTreeLiteralCard[AUsForType[DerefType[pType]]];
+IF tb[node].nSons > 3 THEN CatchNest[tb[node].son[4]];
+val ¨ [subtree[index: node]];
+};
+
+item => tb[node].son[2] ¨ Stmt[tp.son[2]];
+list => val ¨ TreeOps.UpdateList[stmt, Stmt];
+
+ENDCASE => MimosaLog.Error[unimplemented];
+
+EXITS pop => VPop[];
+};
+};
+ENDCASE => ERROR;
+MimData.textIndex ¨ saveIndex;
+};
+
+BindStmt: PROC [t: Tree.Link, labelBias: MimP4.Bias] RETURNS [Tree.Link] = {
+node: Tree.Index = TreeOps.GetNode[t];
+RETURN [CaseDriver[TreeOps.GetNode[t], Stmt, labelBias]];
+};
+
+BindType: PUBLIC PROC [node: Tree.Index, eval: Tree.Map] RETURNS [Tree.Link] = {
+saveImplicit: MimP4.ImplicitRecord = MimP4.implicit;
+Item: Tree.Map = {RETURN [Scope[TreeOps.GetNode[t], eval]]};
+subNode: Tree.Index ¨ TreeOps.GetNode[tb[node].son[1]];
+subSon2: Tree.Link ¨ tb[subNode].son[2];
+type: Type = OperandType[subSon2];
+subSon2 ¨ RValue[subSon2, BiasForType[type], RepForType[type]];
+TreeOps.PushTree[subSon2];
+{
+attr: Attr ¨ VAttr[];
+sef: BOOL ¨ MimP4.SideEffectFree[subSon2];
+IF attr.rep < real THEN
+[MimP4.implicit.lb, MimP4.implicit.ub] ¨ MimP4.TreeBounds[subSon2, attr.rep];
+MimP4.implicit.attr ¨ attr;
+MimP4.implicit.type ¨ type;
+MimP4.implicit.bias ¨ VBias[];
+MimP4.implicit.sef ¨ sef;
+VPop[];
+};
+tb[subNode].son[2] ¨ Tree.Null;
+TreeOps.PushTree[TreeOps.UpdateList[tb[node].son[3], Item]];
+tb[node].son[3] ¨ Tree.Null;
+TreeOps.PushTree[eval[tb[node].son[4]]];
+tb[node].son[4] ¨ Tree.Null;
+TreeOps.PushNode[tb[node].name, 3];
+TreeOps.SetInfo[tb[node].info];
+TreeOps.SetAttrs[tb[node].attr1, tb[node].attr2, FALSE];
+TreeOps.FreeNode[node];
+MimP4.implicit ¨ saveImplicit;
+RETURN [TreeOps.PopTree[]];
+};
+
+BindCase: PUBLIC PROC [
+node: Tree.Index, op: Tree.NodeName,
+eval: PROC [Tree.Link, Bias] RETURNS [Tree.Link]]
+RETURNS [val: Tree.Link] = {
+labelBias: Bias = TagBias[BoundType[tb[node].son[1]], TestCtx[TreeOps.ListHead[tb[node].son[3]]]];
+subNode: Tree.Index;
+TreeOps.PushTree[tb[node].son[2]];  tb[node].son[2] ¨ Tree.Null;
+TreeOps.PushTree[tb[node].son[3]];  tb[node].son[3] ¨ Tree.Null;
+TreeOps.PushTree[tb[node].son[4]];  tb[node].son[4] ¨ Tree.Null;
+TreeOps.PushTree[OpenItem[tb[node].son[1]]];
+tb[node].son[1] ¨ Tree.Null;
+TreeOps.PushNode[op, 4];
+TreeOps.SetInfo[tb[node].info];
+TreeOps.SetAttrs[FALSE, FALSE, tb[node].attr3];
+val ¨ eval[TreeOps.PopTree[], labelBias];
+subNode ¨ TreeOps.GetNode[val];
+tb[subNode].son[4] ¨ CloseItem[tb[subNode].son[4]];
+TreeOps.FreeNode[node];
+};
+
+BoundType: PROC [base: Tree.Link] RETURNS [Type] = INLINE {
+RETURN [DerefType[OperandType[TreeOps.NthSon[base, 2]]]];
+};
+
+TestCtx: PROC [item: Tree.Link] RETURNS [CTXIndex] = INLINE {
+RETURN [IF item = Tree.Null
+THEN CTXNull
+ELSE seb[TreeOps.GetSe[TreeOps.NthSon[TreeOps.ListHead[TreeOps.NthSon[item, 1]], 2]]].idCtx]
+};
+
+TagBias: PROC [rType: Type, testCtx: CTXIndex] RETURNS [Bias] = {
+FOR subType: Type ¨ rType, SymbolOps.TypeLink[SymbolOps.own, subType]
+WHILE subType # nullType DO
+rsei: CSEIndex = SymbolOps.UnderType[SymbolOps.own, subType];
+WITH t: seb[rsei] SELECT FROM
+record =>
+IF t.hints.variant THEN {
+sei: ISEIndex = SymbolOps.CtxVariant[t.fieldCtx];
+uType: CSEIndex = SymbolOps.UnderType[SymbolOps.own, seb[sei].idType];
+WITH u: seb[uType] SELECT FROM
+union =>
+IF u.caseCtx = testCtx OR testCtx = CTXNull THEN
+RETURN [BiasForType[seb[u.tagSei].idType]];
+ENDCASE;
+};
+ENDCASE => EXIT;
+ENDLOOP;
+ERROR;
+};
+
+useAttr2: BOOL ¨ FALSE;
+CaseDriver: PUBLIC PROC [node: Tree.Index, selection: Tree.Map, labelBias: MimP4.Bias]
+RETURNS [val: Tree.Link] = {
+saveImplicit: MimP4.ImplicitRecord = MimP4.implicit;
+son1: Tree.Link ¨ tb[node].son[1];
+type: Type = OperandType[son1];
+son1 ¨ tb[node].son[1] ¨ Exp[son1, none];
+SELECT TRUE FROM
+useAttr2 AND tb[node].attr2 => {
+EvalTest: Tree.Map = {
+subNode: Tree.Index = TreeOps.GetNode[t];
+IF tb[subNode].son[1] # Tree.Null THEN ERROR;
+tb[subNode].son[1] ¨ TreeOps.IdentityMap[son1];
+v ¨ BoolValue[t];  VPop[];
+IF BoolTest[v] THEN found ¨ TRUE;
+};
+TestItem: Tree.Test = {
+subNode: Tree.Index = TreeOps.GetNode[t];
+tb[subNode].son[1] ¨ TreeOps.UpdateList[tb[subNode].son[1], EvalTest];
+IF found THEN {val ¨ tb[subNode].son[2]; tb[subNode].son[2] ¨ Tree.Null};
+RETURN [found];
+};
+found: BOOL ¨ FALSE;
+TreeOps.SearchList[tb[node].son[2], TestItem];
+IF ~found THEN {val ¨ tb[node].son[3]; tb[node].son[3] ¨ Tree.Null};
+TreeOps.FreeNode[node];
+val ¨ selection[val];
+};
+SymbolOps.EqTypes[SymbolOps.own, type, MimData.idBOOL]
+AND tb[node].attr1 AND TreeLiteral[son1] => {
+CaseItem: Tree.Scan = {
+subNode: Tree.Index = TreeOps.GetNode[t];
+started: BOOL ¨ FALSE;
+PushTest: Tree.Scan = {
+tNode: Tree.Index = TreeOps.GetNode[t];
+TreeOps.PushTree[tb[tNode].son[2]];
+tb[tNode].son[2] ¨ Tree.Null;
+IF negate THEN {TreeOps.PushNode[not, 1]; TreeOps.SetInfo[boolInfo]};
+IF started THEN {TreeOps.PushNode[or, 2]; TreeOps.SetInfo[boolInfo]} ELSE started ¨ TRUE;
+};
+TreeOps.PushTree[tb[subNode].son[2]];
+tb[subNode].son[2] ¨ Tree.Null;
+TreeOps.ScanList[tb[subNode].son[1], PushTest];
+IF selection = Stmt
+THEN {TreeOps.PushNode[if, -3]; TreeOps.SetInfo[tb[subNode].info]}
+ELSE {TreeOps.PushNode[ifx, -3]; TreeOps.SetInfo[tb[node].info]};
+};
+boolInfo: Tree.Info = SymbolOps.FromType[MimData.idBOOL];
+negate: BOOL ¨ NOT BoolTest[
+son1 ¨ tb[node].son[1] ¨ AdjustBias[son1, VAttr[].rep, VBias[], TRUE]];
+VPop[];
+TreeOps.PushTree[tb[node].son[3]];
+tb[node].son[3] ¨ Tree.Null;
+TreeOps.ReverseScanList[tb[node].son[2], CaseItem];
+TreeOps.FreeNode[node];
+MimP4.implicit.attr ¨ voidAttr;
+MimP4.implicit.sef ¨ TRUE;
+val ¨ selection[TreeOps.PopTree[]];
+};
+ENDCASE => {
+nSons: CARDINAL = TreeOps.ListLength[tb[node].son[2]];
+minTree: Tree.Link ¨ Tree.Null;
+maxTree: Tree.Link ¨ Tree.Null;
+listNode: Tree.Index;
+switchable: BOOL ¨ FALSE;
+multiword: BOOL = MimP4.WordsForType[type] > 1;
+count: CARDINAL ¨ 0;
+constantSelector: BOOL ¨ MimP4.TreeLiteral[son1];
+inhibitCases: BOOL ¨ FALSE;
+{
+attr: Attr ¨ VAttr[];
+sef: BOOL ¨ MimP4.SideEffectFree[son1];
+IF attr.rep < real THEN
+[MimP4.implicit.lb, MimP4.implicit.ub] ¨ MimP4.TreeBounds[son1, attr.rep];
+MimP4.implicit.type ¨ type;
+MimP4.implicit.bias ¨ ConstArith.Sub[VBias[], labelBias];
+MimP4.implicit.attr ¨ attr;
+MimP4.implicit.sef ¨ sef;
+VPop[];
+};
+listNode ¨ TreeOps.GetNode[tb[node].son[2]];
+FOR i: NAT IN [1..nSons] DO
+subNode: Tree.Index = TreeOps.GetNode[tb[listNode].son[i]];
+subSon1: Tree.Link ¨ tb[subNode].son[1];
+subSon2: Tree.Link ¨ tb[subNode].son[2];
+IF inhibitCases
+THEN {
+[] ¨ KillTree[subSon1];
+tb[subNode].son[1] ¨ MimP4.tFALSE;
+tb[subNode].son[2] ¨ KillTree[subSon2];
+}
+ELSE {
+TestExp: Tree.Map = {
+IF inhibitCases THEN RETURN [MimP4.tTRUE];
+v ¨ RValue[t, MimP4.nullBias, none];
+MimP4.implicit.attr.prop ¨ CommonProp[MimP4.implicit.attr.prop, VProp[]];
+VPop[];
+SELECT TRUE FROM
+NOT TreeLiteral[v] => {testUnknown ¨ TRUE; testFalse ¨ FALSE};
+BoolTest[v] => {inhibitCases ¨ TRUE; v ¨ MimP4.tTRUE};
+testUnknown => {};
+ENDCASE => {testFalse ¨ TRUE; v ¨ MimP4.tFALSE};
+};
+testUnknown: BOOL ¨ FALSE;
+testFalse: BOOL ¨ FALSE;
+tb[subNode].son[1] ¨ TreeOps.UpdateList[subSon1, TestExp];
+SELECT TRUE FROM
+inhibitCases => {
+inhibitCases ¨ TRUE;
+tb[subNode].son[2] ¨ selection[tb[subNode].son[2]];
+};
+testFalse => {
+tb[subNode].son[1] ¨ MimP4.tFALSE;
+tb[subNode].son[2] ¨ KillTree[tb[subNode].son[2]];
+};
+ENDCASE => {
+tb[subNode].son[2] ¨ selection[tb[subNode].son[2]];
+};
+};
+ENDLOOP;
+IF inhibitCases
+THEN tb[node].son[3] ¨ KillTree[tb[node].son[3]]
+ELSE tb[node].son[3] ¨ selection[tb[node].son[3]];
+val ¨ Tree.Link[subtree[index: node]];
+};
+MimP4.implicit ¨ saveImplicit;
+};
+DoStmt: PROC [node: Tree.Index] RETURNS [val: Tree.Link] = {
+void: BOOL ¨ FALSE;
+bti: BTIndex ¨ BTNull;
+son1: Tree.Link ¨ tb[node].son[1];
+son2: Tree.Link ¨ tb[node].son[2];
+idSei: Symbols.ISEIndex ¨ Symbols.ISENull;
+oldImmutable: BOOL ¨ TRUE;
+IF son1 # Tree.Null THEN {
+[bti, void, idSei] ¨ ForClause[TreeOps.GetNode[son1]];
+IF idSei # Symbols.ISENull THEN {
+oldImmutable ¨ seb[idSei].immutable;
+seb[idSei].immutable ¨ TRUE;
+};
+};
+IF son2 # Tree.Null THEN {
+son2 ¨ tb[node].son[2] ¨ BoolValue[son2];
+IF TreeLiteral[son2] THEN
+IF BoolTest[son2]
+THEN son2 ¨ tb[node].son[2] ¨ TreeOps.FreeTree[son2]
+ELSE void ¨ TRUE;
+VPop[];
+};
+tb[node].son[3] ¨ TreeOps.UpdateList[tb[node].son[3], OpenItem];
+tb[node].son[4] ¨ TreeOps.UpdateList[tb[node].son[4], Stmt];
+IF idSei # Symbols.ISENull THEN seb[idSei].immutable ¨ oldImmutable;
+tb[node].son[5] ¨ TreeOps.UpdateList[tb[node].son[5], Stmt];
+tb[node].son[6] ¨ TreeOps.UpdateList[tb[node].son[6], Stmt];
+tb[node].son[3] ¨ TreeOps.ReverseUpdateList[tb[node].son[3], CloseItem];
+IF catchScope AND bti # BTNull THEN
+catchBound ¨ MAX[AssignBlock[bti, catchBase], catchBound];
+IF ~void
+THEN val ¨ [subtree[index: node]]
+ELSE {val ¨ tb[node].son[6]; tb[node].son[6] ¨ Tree.Null; TreeOps.FreeNode[node]};
+};
+
+LocalConvert: PROC [from: Tree.Link, srcType, dstType: Type] RETURNS [Tree.Link] = {
+TreeOps.PushTree[from];
+IF MimP4.BitsForType[srcType] < MimP4.BitsForType[dstType]
+THEN TreeOps.PushNode[lengthen, 1]
+ELSE TreeOps.PushNode[shorten, 1];
+SetType[dstType];
+RETURN [TreeOps.PopTree[]];
+};
+
+ForClause: PROC [node: Tree.Index]
+RETURNS [bti: BTIndex, void: BOOL, idSei: Symbols.ISEIndex] = {
+idVar: Tree.Link ¨ tb[node].son[1];
+idBias: Bias ¨ MimP4.nullBias;
+idRep: Repr ¨ either;
+idAttr: Attr ¨ voidAttr;
+rep: Repr ¨ either;
+idType: Type ¨ Symbols.typeANY;
+cs: ConsState ¨ $first;
+void ¨ FALSE;
+idSei ¨ Symbols.ISENull;
+bti ¨ SymbolOps.ToBti[tb[node].info];
+IF idVar # Tree.Null THEN {
+IF TreeOps.OpName[idVar] = decl THEN {
+subNode: Tree.Index ¨ TreeOps.GetNode[idVar];
+TreeOps.ScanList[idVar, DeclItem];
+idVar ¨ tb[node].son[1] ¨ tb[subNode].son[1];
+tb[subNode].son[1] ¨ Tree.Null;
+TreeOps.FreeNode[subNode];
+cs ¨ $init;
+};
+idType ¨ OperandType[idVar];
+idVar ¨ tb[node].son[1] ¨ Exp[idVar, none];
+idBias ¨ VBias[];
+idAttr ¨ VAttr[];
+idRep ¨ idAttr.rep;
+VPop[];
+};
+SELECT tb[node].name FROM
+forseq => {
+tb[node].son[2] ¨ Rhs[tb[node].son[2], idType, cs];      VPop[];
+tb[node].son[3] ¨ Rhs[tb[node].son[3], idType, $first];  VPop[];
+};
+upthru, downthru => {
+iLink: Tree.Link ¨ tb[node].son[2] ¨ NormalizeRange[tb[node].son[2]];
+iNode: Tree.Index ¨ TreeOps.GetNode[iLink];
+groundIdType: Type ¨ MimP4.CanonicalType[idType];
+loBound: Tree.Link ¨ MimP4.Rhs[tb[iNode].son[1], groundIdType, cs];
+loType: Type ¨ MimP4.OperandType[loBound];
+loRep: Repr ¨ VRep[];
+hiBound: Tree.Link ¨ MimP4.Rhs[tb[iNode].son[2], groundIdType, $first];
+hiType: Type ¨ MimP4.OperandType[hiBound];
+hiRep: Repr ¨ VRep[];
+knownNotEmpty: BOOL ¨ FALSE;
+loIsConst: BOOL ¨ MimP4.TreeLiteral[loBound];
+loVal: MimP4.Bias ¨ IF loIsConst
+THEN MimP4.TreeLiteralConst[loBound] ELSE MimP4.nullBias;
+hiIsConst: BOOL ¨ MimP4.TreeLiteral[hiBound];
+hiVal: MimP4.Bias ¨ IF hiIsConst
+THEN MimP4.TreeLiteralConst[hiBound] ELSE MimP4.nullBias;
+iName: Tree.NodeName = tb[iNode].name;
+
+IF checked AND idVar # Tree.Null THEN
+WITH v: idVar SELECT TreeOps.GetTag[idVar] FROM
+symbol => idSei ¨ v.index;
+ENDCASE;
+
+VPop[]; VPop[];
+
+IF idVar = Tree.Null THEN
+IF loRep = signed OR hiRep = signed THEN idRep ¨ signed;
+
+SELECT idRep FROM
+unsigned => tb[iNode].attr3 ¨ FALSE;
+either => tb[iNode].attr3 ¨ eitherPrefersSigned;
+ENDCASE => tb[iNode].attr3 ¨ TRUE;
+
+IF CommonRep[idRep, loRep] = none THEN {
+SELECT idRep FROM
+signed, unsigned, either =>
+SELECT loRep FROM
+idRep, either => {};
+signed, unsigned => loRep ¨ idRep;
+ENDCASE => GO TO conflict;
+ENDCASE => GO TO conflict;
+EXITS conflict => MimosaLog.ErrorTree[mixedRepresentation, iLink];
+};
+IF CommonRep[idRep, hiRep] = none THEN {
+SELECT idRep FROM
+signed, unsigned, either =>
+SELECT hiRep FROM
+idRep, either => {};
+signed, unsigned => hiRep ¨ idRep;
+ENDCASE => GO TO conflict;
+ENDCASE => GO TO conflict;
+EXITS conflict => MimosaLog.ErrorTree[mixedRepresentation, iLink];
+};
+
+tb[iNode].son[1] ¨ loBound;
+tb[iNode].son[2] ¨ hiBound;
+
+IF loIsConst AND hiIsConst THEN {
+comp: Basics.Comparison ¨ ConstArith.Compare[loVal, hiVal];
+IF comp = greater
+THEN void ¨ TRUE
+ELSE {
+SELECT iName FROM
+intCC => void ¨ FALSE;
+intCO, intOC => void ¨ comp = equal;
+intOO => {
+delta: MimP4.Bias ¨ ConstArith.Sub[hiVal, loVal];
+IF ConstArith.Compare[delta, ConstArith.FromInt[1]] # greater THEN
+void ¨ TRUE;
+};
+ENDCASE => ERROR;
+};
+knownNotEmpty ¨ NOT void;
+};
+
+SELECT TRUE FROM
+(AUsForType[idType] = 0) => MimosaLog.ErrorTree[sizeClash, tb[node].son[1]];
+(NOT IntOrCard[idType]) AND (idType # typeANY) => {
+name: Tree.NodeName = tb[iNode].name;
+range: CARD ¨ SymbolOps.Cardinality[SymbolOps.own, idType];
+IF (checked OR MimData.switches['b]) AND range # 0 THEN {
+minId, maxId, minLo, maxLo, minHi, maxHi: Bias;
+IF idRep < real AND loRep < real AND hiRep < real THEN {
+[minId, maxId] ¨ MimP4.TreeBounds[idVar, idRep];
+[minLo, maxLo] ¨ MimP4.TreeBounds[loBound, loRep];
+[minHi, maxHi] ¨ MimP4.TreeBounds[hiBound, hiRep];
+SELECT name FROM
+intOO, intOC =>
+minId ¨ ConstArith.Sub[minId, ConstArith.FromCard[1]
+! ConstArith.Overflow => CONTINUE];
+ENDCASE;
+SELECT name FROM
+intOO, intCO =>
+maxId ¨ ConstArith.Add[maxId, ConstArith.FromCard[1]
+! ConstArith.Overflow => CONTINUE];
+ENDCASE;
+IF ConstArith.Compare[maxLo, maxHi] = greater THEN maxLo ¨ maxHi;
+IF ConstArith.Compare[minHi, minLo] = less THEN minHi ¨ minLo;
+SELECT InRange[minId, maxId, minLo, maxLo] FROM
+sometimes => GO TO needsCheck;
+never => MimosaLog.ErrorTree[boundsFault, loBound];
+ENDCASE;
+SELECT InRange[minId, maxId, minHi, maxHi] FROM
+sometimes => GO TO needsCheck;
+never => MimosaLog.ErrorTree[boundsFault, hiBound];
+ENDCASE;
+EXITS needsCheck => {
+canCheck: BOOL = minId.sign # negative OR idBias.sign # zero;
+IF canCheck THEN tb[node].son[3] ¨ MimP4.MakeTreeLiteralCard[range];
+};
+};
+};
+tb[node].attr1 ¨ knownNotEmpty;
+};
+ENDCASE;
+};
+ENDCASE => ERROR;
+};
+
+InRange: PROC [minId, maxId, minBound, maxBound: Bias]
+RETURNS [InRangeResult] = {
+comp: Basics.Comparison ¨ ConstArith.Compare[maxBound, minId];
+IF comp = less THEN RETURN [never];
+comp ¨ ConstArith.Compare[minBound, maxId];
+IF comp = greater THEN RETURN [never];
+comp ¨ ConstArith.Compare[minBound, minId];
+IF comp = less THEN RETURN [sometimes];
+comp ¨ ConstArith.Compare[maxBound, maxId];
+IF comp = greater THEN RETURN [sometimes];
+RETURN [always];
+};
+InRangeResult: TYPE = {never, sometimes, always};
+
+RangeTest: PROC [t: Tree.Link, range: CARD, rep: Repr] RETURNS [{in, out, unknown}] = {
+IF rep < real THEN {
+lb, ub: ConstArith.Const;
+[lb, ub] ¨ MimP4.TreeBounds[t, rep];
+IF range # 0 AND lb.sign # negative AND ub.sign # negative THEN {
+rc: ConstArith.Const = ConstArith.FromCard[range];
+IF ConstArith.Compare[ub, rc] # greater THEN RETURN [in];
+IF ConstArith.Compare[lb, rc] = greater THEN RETURN [out];
+};
+};
+RETURN [unknown];
+};
+
+IntOrCard: PROC [type: Type] RETURNS [BOOL] = {
+SELECT SymbolOps.TypeForm[SymbolOps.own, type] FROM
+signed, unsigned => RETURN [TRUE];
+ENDCASE => RETURN [FALSE];
+};
+
+DerefType: PROC [type: Type] RETURNS [Type] = {
+subType: CSEIndex = SymbolOps.NormalType[SymbolOps.own, type];
+WITH seb[subType] SELECT FROM
+ref => RETURN [SymbolOps.UnderType[SymbolOps.own, refType]];
+ENDCASE => RETURN [type]
+};
+
+OpenItem: Tree.Map = {
+node: Tree.Index = TreeOps.GetNode[t];
+son2: Tree.Link = tb[node].son[2];
+IF TreeOps.OpName[son2] # openx
+THEN v ¨ Tree.Null
+ELSE {v ¨ NeutralExp[son2]; tb[node].son[2] ¨ Tree.Null};
+TreeOps.FreeNode[node];
+};
+
+CloseItem: Tree.Map = {
+v ¨ t;
+IF bb[currentBody].firstSon = BTNull AND TreeOps.OpName[t] = openx THEN {
+node: Tree.Index = TreeOps.GetNode[t];
+TreeOps.MarkShared[t, FALSE];
+v ¨ tb[node].son[1];
+tb[node].son[1] ¨ Tree.Null;
+TreeOps.FreeNode[node];
+};
+};
+
+catchFrameBase: CARDINAL = Pass4Parms.localOverheadBits;
+catchScope: BOOL ¨ FALSE;
+catchBase: BitCount ¨ 0;
+catchBound: BitCount ¨ 0;
+
+CatchNest: PUBLIC PROC [t: Tree.Link] = {
+CatchTest: Tree.Map = {
+TreeOps.PushTree[Tree.Null];
+TreeOps.PushTree[Exp[t, none]];
+VPop[];
+TreeOps.PushNode[relE, 2];
+SetType[MimData.idBOOL];
+RETURN [TreeOps.PopTree[]];
+};
+CatchItem: Tree.Scan = {
+node: Tree.Index = TreeOps.GetNode[t];
+type: CSEIndex = SymbolOps.UnderType[SymbolOps.own, SymbolOps.ToType[tb[node].info]];
+saveRecord: RecordSEIndex = MimP4.resumeRecord;
+tb[node].son[1] ¨ TreeOps.UpdateList[tb[node].son[1], CatchTest];
+catchBase ¨ catchFrameBase;
+IF type = CSENull
+THEN MimP4.resumeRecord ¨ RecordSENull
+ELSE
+WITH t: seb[type] SELECT FROM
+transfer => {
+MimP4.MarkArgs[type];
+{
+typeIn: RecordSEIndex = SymbolOps.ArgRecord[SymbolOps.own, t.typeIn];
+typeOut: RecordSEIndex = SymbolOps.ArgRecord[SymbolOps.own, t.typeOut];
+MimP4.resumeRecord ¨ typeOut;
+catchBase ¨ catchBase + ArgLength[typeIn] + ArgLength[typeOut];
+};
+};
+ENDCASE => ERROR;
+catchBound ¨ catchBase;
+tb[node].son[2] ¨ Stmt[tb[node].son[2]];
+bound ¨ MAX[bound, catchBound];
+MimP4.resumeRecord ¨ saveRecord;
+};
+bound: BitCount ¨ catchFrameBase + bitsPerWord;
+IF t # Tree.Null THEN {
+node: Tree.Index = TreeOps.GetNode[t];
+saveCatchScope: BOOL = catchScope;
+saveCatchBase: BitCount = catchBase;
+saveCatchBound: BitCount = catchBound;
+catchScope ¨ TRUE;
+currentLevel ¨ currentLevel + 1;
+TreeOps.ScanList[tb[node].son[1], CatchItem];
+IF tb[node].nSons > 1 THEN {
+catchBound ¨ catchBase ¨ catchFrameBase;
+tb[node].son[2] ¨ Stmt[tb[node].son[2]];
+bound ¨ MAX[bound, catchBound];
+};
+tb[node].info ¨ TreeOps.FromCard[(bound + (bitsPerWord-1))/bitsPerWord];
+catchBase ¨ saveCatchBase;
+catchBound ¨ saveCatchBound;
+currentLevel ¨ currentLevel - 1;
+catchScope ¨ saveCatchScope;
+};
+};
+
+ArgLength: PROC [rSei: RecordSEIndex] RETURNS [BitCount] = {
+RETURN [IF rSei # RecordSENull THEN seb[rSei].length ELSE 0];
+};
+
+KillTree: PUBLIC PROC [t: Tree.Link] RETURNS [Tree.Link] = {
+IF t # Tree.Null THEN
+WITH v: t SELECT TreeOps.GetTag[t] FROM
+subtree => {
+node: Tree.Index = v.index;
+tp: Tree.NodePtr = @tb[node];
+IF tp.shared OR tp.free THEN RETURN [Tree.Null];
+IF tp.name = decl THEN {
+OneId: Tree.Scan = {
+sei: ISEIndex ¨ TreeOps.GetSe[t];
+IF seb[sei].constant AND NOT seb[sei].extended THEN {
+SELECT SymbolOps.XferMode[SymbolOps.own, seb[sei].idType] FROM
+proc => {
+bti: CBTIndex = SymbolOps.DecodeBti[seb[sei].idInfo];
+bb[bti].hints.pad ¨ 1;
+};
+ENDCASE;
+};
+};
+TreeOps.ScanList[tp.son[1], OneId];
+};
+FOR i: NAT IN [1..tp.nSons] DO
+tb[node].son[i] ¨ KillTree[tb[node].son[i]];
+ENDLOOP;
+TreeOps.FreeNode[node];
+};
+ENDCASE;
+RETURN [Tree.Null];
+};
+
+}.
+
+   æ  
+Pass4S.mesa
+Copyright ” 1985, 1986, 1987, 1988, 1989, 1990, 1991 by Xerox Corporation.  All rights reserved.
+Satterthwaite, June 18, 1986 12:33:39 pm PDT
+Sweet, January 21, 1981  10:50 PM
+Russ Atkinson (RRA) March 2, 1990 12:38:12 pm PST
+Willie-s, September 24, 1991 2:02 pm PDT
+called by allocator whenever table area is repacked
+bodies and blocks
+Remove decls of globals from the init proc
+Main dispatch
+Remember to extract all fields before calling anything that could cause relocation!
+We should NEVER encounter a free node!
+info is not a valid file index
+For debugging down to the statement level
+Allowing declarations at the statement level is a useful extension, especially for declarations of formal arguments from INLINEs.  RRA: April 23, 1987.
+conditionals
+drivers for processing selections
+Be careful to evaluate in the right order, just in case subSon2 depends on the implicit attributes!
+not bind/bindx
+Either "SELECT TRUE FROM ..." or "SELECT FALSE FROM ..."
+Be careful to evaluate in the right order, just in case son1 depends on the implicit attributes!
+We never get here, since we found a TRUE test earlier in life
+We might get here
+This selection cannot occur, so kill it
+Iterative statements
+We evaluate the bounds using the groundIdType (removing subranges) since if we evaluate using the idType we may be out of bounds on open ended intervals like [K..L) or (K..L] or (K..L).
+There is no explicit control variable, so if either the low bound or the high bound is signed then force the idRep to be signed.
+Make the lo bound rep agree with the control variable type
+Make the hi bound rep agree with the control variable type
+Since both bounds are constant, we can determine if the range is empty
+The controlling variable is a subrange or enumeration that MAY need bounds checking
+May need bounds-checking
+For now we can't check certain values
+basing
+catch phrases
+May need to kill off a nested procedure declaration
+By special arrangement with MimDriver!
+ ù  _  ñ(cedarcode) styleïNewlineDelimiter
+ô headôIcodeöú
+œeúUô`Löœy,ô,Löû!ô!Lô1Lô(óò öœk	ò	LöúüúòLöúüúòLöúüú9òILöúüúò%Löúüú5òBLöú
+üú+ò:Löúüú„òÓLöúüúò%Löú
+üúò#Löúüú‡òÌLöú
+üúƒò”Löúüúüúò9LöúüúZòdöúüúáòîLò óóóöœnúüòLöüúQòXLöüú
+òLöüúòLò Löúœc!ò0Löú°%ò8Löú°&ò:Löú°ò1Lò ö†
+úüúò%Lô3LòLòLòLòLòLò óöúüúòLòLò óLöúüúüúòLöúüúüúò"Lò Löúüúò"Löúüúò&óôLöúüúò/LòLöú	üúüúüúòLò ö†úüúò&Lòöüú"üúüò:Löú
+üúüúüúòMöüú	üúüòòö	üú	üúüúüúüòCLöúüúòóLöüúòóLöüúò&óLöüúòóLòLò óö
+†	úüúüúüúüúò9LòLöüúüú(ò@LòLò óö†úüúüúò%Lò+Lò&LöúüúòLò-Löúüúò"Löú/ò/Löúüú+òDLòLòLòLòLöúüúòLöúüúüúüúòCLò&Lò6Lòöüúüúüò8Löú.ò.óLöúXòXLöüúüúüúò?Lò$Löúüú°ò8öüúüúò%Lò6óLöú@ò@LòFöüúòöüúòLöúüúò"Löüúüú#òFLòLò$LòóöüúòLòLöüúüú!òDöüúüò!Lò<óLòóóLöüúüúüúòCLöú<ò<Lò#öüúüúüòòLò.Lò)óLöüúòóLöú"ò"Löüúüúò=LöúHòHöüúüòLô*LöúTòTóLò4öüúüúüúò-Löúüúò#öüúüúüò'LöúòLöüúòóLòóLöúüúòLòLò/LòLòLòLöú ò LòLò óö†
+úüúüú	üúò)Lö	úüúüúüúüúòILòLò óö†úüúüúò5öüúüòöüúoüúüòàLòLöüòóóLòLò óö†	úüúüúòCöüúòöüúòLöú&ò&Löú1ò1LòLòLòLöúòLòóöüúòLòLò
+LòóóLöú"ò"LòLò óö†úüúüúò=öüúüúüòLöúüúò%Löúüú	ò%Löüú6üúòZóLòLò óö†úüúüúò>LòLöúüúòöüúüòöüòöüúüúüòòöüúüúòLöúòLöú(ò(LòLòóóLöüúòóLöüúüúüúò)LòLöüúòóóLöüúòLòLò óö†úüú$üúòVLò(LòLòöüú'üò-öüòöüúüòòöüúüúòLò*LöúüúòóóLöüúüúòóLöüúüúüúò)LòLöüúòóóLòLò óö†úüúüúüúò=Löú/ò/LöúüúòLöú.ò.LöúbòbLöüúüúò1Löú<ò<LòLöú ò Löüúò LòLò óö†úüú$üúòFLöú.ò.Lò-Lò$Lò&LòLöúüúüúòLòLòö—bko–bo¢òLö£¢£òLö£	¢£¢£ò ö¢£òö¢£¢òLö£FòFóLö£,¢£ò>Lö£òóóLò6LöúFòFLöüúüúüúòCLòLöú<ò<öüúòLöüúTòXLöüú5ò9óLöüúüúüú*òMLò5LòLöüúò LòLöúüúüúòLò óö†úüú üúòNLò+öúüúò2Löüúò#LöüúòóLöüúüú$òGLò&Löüúüú+ò<öüúüúüòòLòöüúüúòLòLöú4ò4LòóLòóLöüúòóLòLò óóôLö†
+úüúüúò1Lò/Lò ö†úüúüúò9LòLò-Löú°ò öüúüúüò*òLòöüúüúòöúòLôSóLöúüúòLöúòLöú/ò/öüú	üúüúòLô&óöüúüò"öüúüòöú0ò0LôóLöüúò&óóöüúüúüò;Lô)LöüúòóLò öüúüòLò öú	ò	LôóLöúòLöúòLò óöúòLöúòLöüúüúò
+LöúòóòLöú1ò1LöúüúJòiöüúòöüúòLòLöüúüúò
+LòóöüúòLòLòLòöüúüúüò(Lò*LöüúòóLöúòLòóóLòóLò ò7LòLöüúüúò
+LòóLòLò ò
+LöúüúòLòLòLòLòLò óòLòLòLòLò)LòöüúòöüúòLöüúüúò6Löüúüúò6Löú&ò&LòóöüúòöüúòLöüú*ò.Löüú+ò/óLöúòLòLòóóLòLò óLöú5ò5öúüú	òLöüúòLöüú&ò*Lò óLòLò òLòLöúüúüúüúòWöúüú
+üúò5LöüúòLöüúòóLöüúüúò
+LòóLò ò
+LòLòLòLöú1ò1LòóLò ò	LòLòLöú<ò<Löú8ò8Löú=ò=LòLò óòLöúüúòLòLò"LòLòLò óòLöúòLò(LòóòLò"óLò ò	Löú6ò6Lò-Löüúüúò
+LòLò óòLò'Löüúüúò
+LòLò óò	Lò6Lò6Löüúüúò-LòLò óòLöú(ò(Löüúüúò-LòóLò öúKòKLöúòLò óò	LòLòLòöüúüúòLöú)ò)LöúòLöúòóLöú*ò*LöúòLòöüúòöüúòLöú,ò,Löú%ò%LòLöúòLòóöüúòLöúGòGLöúüúò4Löú<ò<Löú$ò$LòóóLòDLöüúüúò6LöúòLòóLò Lò*Löú-ò-Lò Löüú#ò*óLò LöüúòLòóLòóLöüúüúòóLòLòLò óóôö†úüú'üúòLLöú&ò&Löüú3ò9LòLò óóô!ö†úüúüú$üúòPLöú4ò4Lö†úüú$ò<Löú7ò7Löú(ò(Löú"ò"Löú?ò?LöúòòLöúcôcLöúòLöúüú!ò*öüúüòLöúMòMóLöúòLöúòLöúòLöúòLòLòóLòLöú<ò<LöúòLöú(ò(LöúòLöú#ò#LöúòLöú1üúò8LöúòLöúòLöüúòLòLò óö†úüúüú.üúüúüúòãLöúbòbLòLöú@ò@Löú@ò@Löú@ò@Löú,ò,LöúòLöúòLöúòLöúüúüúò/Löú)ò)LöúòLò3LöúòLòLò óö†	úüúüú
+üúò;Löüú3ò9LòLò óö†úüúüúüúò=öüúüúòLöüúòLöüúXò\óòLò óóö†úüú"üúòAöüúCüúüòaLò=öüúüúüòò	öüúüúòLò1LòFöüúüúüòòöüúüúüò0Löüú%ò+óóLöüúòóLöúòóóLöüúüúòLöüúòóóLöüúòLòLò óLöú
+üúüúòö†
+úüúüú@üúòsLöú4ò4Lò"LòLò)öüúüúüòöú	üúò Lôö†úòLöú)ò)Löüú üúüúò-Löú/ò/LòLöüúüú	üúò!Lòóö†úòLöú)ò)LöúFòFLöüúüú<òILöüú	òLòóLöúüúüúòLöú.ò.Löüúüú6òDLöúòLòLòóöú7üúüúòdLô8ö†úòLöú)ò)Löú	üúüúòö†úòLöú'ò'Löú#ò#LòLöüúüú7òELöüú	üú6üúüúòYLòóLöú%ò%LòLöú/ò/öüúòLöüú>òBLöüú=òAóLòóLöú9ò9LöúüúüúKüúòdLòLöú"ò"LòLöú3ò3LöúòLöúòLöúüúòLöú#ò#LòóöüúòLöúüú'ò6LòLòLòLöúüúüúòLöúüú ò/LöúüúòLöúüúò1LöúüúüúòòLöú`ô`LöúòLöúüúò'öüúüòLöúJòJóLöúòLöú9ò9LöúòLöúòLöúòLòóLöú,ò,öüúüúüúüòLöú;ò;Löú(ò(Löú(ò(öüúòöüúòLöú$üúô=LöúòLöú"ò"Löú'ò'LòóöüúòLôö†úòLöüúüúüúò*Löú$ò$LöúIòILòöüúüúüòLöüú"üúüúò>Löúüúò6LöúòLöüúüúò0óLòóLöúüúüúòLöúüúüúòLöú:ò:öüúüúüòöúòLöúüúòLò3LòóöúòLô'Löú"ò"Löú2ò2LòóöüúòLò3LòóóLòóóLöüúòóöüúòLöüú,ò0Löüú.ò2óLò&LòóóLöúòLòóóôö†úüúüúò<LöúüúüúòLòLöú"ò"Löú"ò"Lò*LöúüúüúòöüúüúòLöú6ò6öüúüúò!Löú$ò$LöúüúòLòóLòóöüúüúòLöú)ò)öüúüòöüúòLöüú0ò4LöüúüúòóóLòLòóLöú@ò@Löú<ò<Löüúüú%òDLöú<ò<Löú<ò<LöúHòHöüúüúüò#Löúüú*ò:óöüúòLöüúò!LöüúNòRóLòLò óö†úüú+üúòTLöúòöüú8ò:Löüúò"Löüúò"óLòLöüúòLòLò óö†	úüúüúüúòbLöú#ò#LöúòLòLòLòLòLòLöúüúòLöúòLò%öüúüúòöüúüúò&Löú-ò-Löú"ò"Löú-ò-LòLöúòLòLòóLöúòLöú+ò+LòLöúòLöúòLòLòóöüúüòòLò@Lò@LòóòLòELöú+ò+öú1ò1LöúπôπóLöúCòCLò*LòLöúGòGLò*LòLöúüúüúòLöúüúò-Löúüúüú!üúòZLöúüúò-Löúüúüú!üúòZLò&Lò öüú	üúüò%öüú
+üúüò/LöúòLöüúòóóLò LòLò öüúüòLôÄLöüúüúüúò8Lò óöüúüòLöúüúò$Löú0ò0Löüúüúò"Lò óöüú üúò(Lô:öüúüòòöüúüòLòLöú"ò"Löüúüúüú
+òóóLöüúüúüú
+òóLöüú=òBLòóöüú üúò(Lô:öüúüòòöüúüòLòLöú"ò"Löüúüúüú
+òóóLöüúüúüú
+òóLöüú=òBLòóLò LòLòLò öüúüúüúò!LôFLöú;ò;öüúòLöüúüòöüúòöüúüòLöúüúòLöú$ò$öú
+ò
+Löú1ò1öüú<üòBLöúüúòóLòóLöüúüúòóLòóóLöúüúòLòLò óöüúüúüòLòLöúüúüúò3Löú;üúôSLò%Löúüú0ò;öüú
+üúüúüúò9LôLò/öüúüúüúüúò8Löú0ò0Löú2ò2Löú2ò2öüúüòöúòöú4ò4Löúüúò#óóLöüúòóöüúüòöúòöú4ò4Löúüúò#óóLöüúòóLöüú,üúòALöüú)üúò>öüú%üò/LöúüúüúòLò3Löüúòóöüú%üò/LöúüúüúòLò3LöüúòóöüúòLô%Löú
+üúüúò=Löüú
+üú4òDLòóLòóLòóLöúòLòóLöüúòóLòóLöüúüúòóLòLò óö†úüú*üúòRLöú>ò>Löüúüúüú	ò#Löú+ò+Löüúüúüú	ò&Löú+ò+Löüúüúüúò'Löú+ò+Löüúüúüúò*Löüú
+òLòLöúüúò1Lò óö†	úüúüúüúòWöüúüúòLòLöú$ò$öüúüúüúüúòALöú2ò2Löüú&üúüúò9Löüú&üúüúò:LòóLòóLöüúòLòLò óö†	úüúüúüúò/öüú)üò3Löúüúüúò"LöüúüúüúòóLòLò óóôö†	úüúüúò/Lò>öüúüúüòLöúüú/ò<LöüúüúòóòLò óóö†úòLöú&ò&Löú"ò"öüúòLöüúòLöüú5ò9óLöúòLòLò óö†	úòLòöüú#üúüúòILöú&ò&LöúüúòLòLòLöúòLòóLòLò óóôLöúüú ò8LöúüúüúòLòLòLò ö†	úüúüúò)ö†	úòLöúòLöúòLòLöúòLòLöüúòLòóö†	úòLöú&ò&LòULöú/ò/LöúAòALòöüúòLöüú"ò&öüòöüúüúüòòLöúòòLöúEòELöúGòGLöúòLöú?ò?LòóLòóLöüúüúòóóóLòLò(LöúüúòLöú ò LòóLò/öüúüúòLöú&ò&Löúüúò"Lò$Lò&LöúüúòLöú ò Löú-ò-öüúüúòLò(Lò(LöúüúòLöúòóLöúHòHLòLòLò LòLòóLòLò óö†	úüúüúò<Löüúüúüúüúò=LòLò óö†úüúüúò<öüúüòöüúüúüò'òLòLòLöüúüú	üúüúò0öüúüúòLô3ö†úòLò!öüúüúüúüúò5öüú4üò>ò	Löú5ò5öúòLô&óLòóLöüúòóLòóLòóLò#LòóöüúüúüúüòLöú,ò,LöüúòóLöúòLòóLöüúòóóLöüúòLòLò óóòLò óó Öó    >  ß[  

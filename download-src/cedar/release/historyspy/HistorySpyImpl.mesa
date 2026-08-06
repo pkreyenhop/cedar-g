@@ -1,0 +1,981 @@
+
+DIRECTORY BasicTime, CardTab, HistorySpy, IO, Rope, Basics, Process, RedBlackTree, SafeStorage, HistorySpyPrivate, UXProcs, UXStrings, UnixSysCalls, UnixTypes;
+
+HistorySpyImpl: MONITOR
+IMPORTS Basics, BasicTime, CardTab, IO, Rope, Process, RedBlackTree, SafeStorage, UXProcs, UXStrings, UnixSysCalls
+EXPORTS HistorySpy
+~ BEGIN OPEN HistorySpyPrivate;
+
+ROPE: TYPE ~ Rope.ROPE;
+ProgramCounter: TYPE = CARD32;
+PC: TYPE = CARD32;
+
+SpyRep: PUBLIC TYPE ~ HistorySpyPrivate.SpyRep;
+Ref: TYPE ~ REF SpyRep;
+stackLimit: NAT ~ 1024;
+
+Thread: TYPE ~ POINTER TO PerThreadObject;
+
+
+running: BOOL ¬ FALSE;
+currentSpy: Ref ¬ NIL;
+lock: PACKED ARRAY [0..4) OF BYTE ¬ ALL[0];
+missed: CARD32 ¬ 0;
+
+TestAndSet: UNSAFE PROC [f: POINTER TO PACKED ARRAY [0..4) OF BYTE] RETURNS [BYTE]
+~ UNCHECKED MACHINE CODE { "PCSpy_TestAndSet" };
+
+ObtainSpy: PROC RETURNS [Ref] ~ {
+old: BYTE ~ TestAndSet[@lock];
+RETURN [IF old = 0 THEN currentSpy ELSE NIL];
+};
+
+ReleaseSpy: PROC [spy: Ref] ~ {
+IF spy # currentSpy THEN ERROR;
+lock ¬ ALL[0];
+};
+
+ObtainThread: PROC [index: CARD] RETURNS [Thread] ~ {
+old: BYTE ~ TestAndSet[@currentSpy.threads[index].lock];
+RETURN [IF old = 0 THEN @currentSpy.threads[index] ELSE NIL];
+};
+
+ReleaseThread: PROC [thread: Thread] ~ {
+thread.lock ¬ ALL[0];
+};
+Start: PUBLIC ENTRY SAFE PROC [treeNodes: NAT ¬ 10000, events: NAT ¬ 20000, threads: NAT ¬ 120] RETURNS [BOOL] ~ TRUSTED {
+spy: Ref ¬ NIL;
+IF running THEN RETURN [FALSE];
+lock ¬ ALL[BYTE.LAST];
+spy ¬ NEW[SpyRep];
+spy.mem ¬ SafeStorage.GetUntracedZone[].NEW[MemPoolRep[treeNodes + 1]];
+spy.events ¬ SafeStorage.GetUntracedZone[].NEW[HistorySpyPrivate.EventPoolRep[events + 1]];
+spy.threads ¬ SafeStorage.GetUntracedZone[].NEW[ThreadsRep[threads]];
+spy.nAlloc ¬ 1; -- kludge to get around excessive allocation caused by putting back the first oset into a thread; wastes 1 oset per allocated block.
+spy.enAlloc ¬ 0;
+spy.limit ¬ spy.mem.size-1;
+spy.pAlloc ¬ @(spy.mem[0]);
+spy.eLimit ¬ events;
+spy.eAlloc ¬ @(spy.events[0]);
+spy.startTime ¬ BasicTime.Now[];
+spy.stopTime ¬ BasicTime.nullGMT;
+currentSpy ¬ spy;
+running ¬ TRUE;
+missed ¬ 0;
+lock ¬ ALL[0];
+IF RegisterSwitchCallback#NIL THEN RegisterSwitchCallback[ExamineNavel, NIL];
+IF RegisterSetReadyCallback#NIL THEN RegisterSetReadyCallback[NoticeThreadReady, NIL];
+IF RegisterForkCallback#NIL THEN RegisterForkCallback[NoticeFork, NIL];
+IF RegisterSwitcheeCallback#NIL THEN RegisterSwitcheeCallback[NoticeRun, NIL];
+RETURN[TRUE];
+};
+
+Stop: PUBLIC ENTRY SAFE PROC RETURNS [Ref] ~ TRUSTED {
+ENABLE UNWIND => NULL;
+IF NOT running THEN RETURN [NIL];
+IF RegisterSwitchCallback#NIL THEN RegisterSwitchCallback[NIL, NIL];
+IF RegisterSetReadyCallback#NIL THEN RegisterSetReadyCallback[NIL, NIL];
+IF RegisterForkCallback#NIL THEN RegisterForkCallback[NIL, NIL];
+IF RegisterSwitcheeCallback#NIL THEN RegisterSwitcheeCallback[NIL, NIL];
+FOR i: NAT IN [0..100) DO
+spy: Ref ~ ObtainSpy[];
+IF spy # NIL THEN {
+spy.missed ¬ missed;
+ReleaseSpy[spy];
+spy.stopTime ¬ BasicTime.Now[];
+running ¬ FALSE;
+RETURN[spy];
+};
+IF i MOD 16 = 0 THEN Process.Pause[1] ELSE Process.Yield[];
+ENDLOOP;
+currentSpy ¬ NIL;
+running ¬ FALSE;
+lock ¬ ALL[BYTE.LAST];
+RETURN [NIL];
+};
+JmpBufPtr: TYPE ~ POINTER TO JmpBuf;
+JmpBuf: TYPE ~ <<VERY>> MACHINE DEPENDENT RECORD [
+pc: PC, -- the program counter
+fp: WORD, -- Not used on SPARCs
+sp: SP -- the stack pointer
+];
+
+SP: TYPE = POINTER TO StackFrame;
+StackFrame: TYPE ~ <<VERY>> MACHINE DEPENDENT RECORD [
+local: ARRAY [0..8) OF CARD32,
+in: ARRAY [0..6) OF CARD32,
+callersSP: SP,
+callersPC: PC
+];
+
+SigtrampStackFrame: TYPE ~ <<VERY>> MACHINE DEPENDENT RECORD [
+frame: StackFrame,
+signalNumber: CARD,
+signalCode: CARD,
+sigcontextPtr: POINTER TO SigContext,
+addr: CARD
+];
+
+ForceStackToMemory: PROC [jb: JmpBufPtr]
+~ TRUSTED MACHINE CODE { "XR_ForceStackToMemory" };
+
+SigContext: TYPE ~ MACHINE <<SunOS>> DEPENDENT RECORD [
+flag: CARD32, -- on signal stack flag
+mask: CARD32, -- old signal mask
+oldSP: SP, -- old sp
+oldPC: PC, -- old pc
+oldNPC: PC, --old npc
+oldPSR: CARD32, -- old psr
+oldG1: CARD32, -- old g1
+oldO1: CARD32 -- old o0
+];
+
+ILSymEntryRep: TYPE ~ MACHINE DEPENDENT RECORD [ -- IncrementalLoad.h
+name: POINTER TO Basics.RawChars,
+type: CARD32,
+value: CARD32,
+size: CARD32,
+ilfe: POINTER TO ILFileEntryRep
+];
+
+ILFileEntryRep: TYPE ~ MACHINE DEPENDENT RECORD [ -- IncrementalLoad.h
+seqNum: CARD32,
+commitPoint: CARD,
+fName: POINTER TO Basics.RawChars
+];
+
+ILGetMatchingSymEntryByValue: PROC [ilse: POINTER TO ILSymEntryRep, val: CARD, wantedTypes: CARD, ignoredClasses: CARD, numToSkip: INT] RETURNS [POINTER TO ILSymEntryRep] ~ MACHINE CODE {
+"XR_ILGetMatchingSymEntryByValue"
+};
+
+ILGetMatchingSymEntryByName: PROC [ilse: POINTER TO ILSymEntryRep, pattern: POINTER, caseSensitive: BOOL, wantedTypes: CARD, ignoredClasses: CARD, numToSkip: INT] RETURNS [POINTER TO ILSymEntryRep] ~ MACHINE CODE {
+"XR_ILGetMatchingSymEntryByName"
+};
+
+sigtrampName: ROPE ~ "__sigtramp";
+sigtrampStart, sigtrampEnd: PC ¬ 0; -- init below
+
+setThreadReadyName: ROPE ~ "_XR_SetThreadReady";
+setThreadReadyStart, setThreadReadyEnd: PC ¬ 0; -- init below
+
+inheritName: ROPE ~ "_XR_InheritPerThreadData";
+inheritStart, inheritEnd: PC ¬ 0; -- init below
+
+InitBoundaries: PROC ~ {
+[sigtrampStart, sigtrampEnd] ¬ GetProcBoundaries[sigtrampName];
+};
+
+GetProcBoundaries: PROC [procName: ROPE] RETURNS [start, end: PC ¬ 0] ~ {
+cname: UXStrings.CString ¬ UXStrings.Create[procName];
+e1: POINTER TO ILSymEntryRep ~ ILGetMatchingSymEntryByName[
+ilse: NIL,
+pattern: cname,
+caseSensitive: TRUE,
+wantedTypes: 4, -- text
+ignoredClasses: 0,
+numToSkip: 1];
+IF e1 # NIL THEN {
+e2: POINTER TO ILSymEntryRep ~ ILGetMatchingSymEntryByValue[
+ilse: e1,
+val: 0,
+wantedTypes: 4, -- text
+ignoredClasses: 0,
+numToSkip: 1
+];
+start ¬ e1.value;
+end ¬ e2.value;
+};
+};
+
+DynamicallyBind: PROC [procName: ROPE] RETURNS [mp: UXProcs.UnsafeCedarProc] ~ {
+pc: PC ¬ GetProcBoundaries[procName].start;
+IF pc=0 THEN RETURN[LOOPHOLE[NIL]] ELSE RETURN[UXProcs.ToCedarProc[pc]];
+};
+
+debug: RECORD [
+badPCcount: CARD ¬ 0,
+badPC: CARD ¬ 0,
+badSPcount: CARD ¬ 0,
+prevSP: CARD ¬ 0,
+badSP: CARD ¬ 0,
+sigtrampCount: CARD ¬ 0,
+goodSigtrampCount: CARD ¬ 0,
+zeroSP: CARD ¬ 0
+];
+
+SpyDebugData: PROC RETURNS [POINTER] ~ {
+RETURN [@debug]
+};
+
+SpyDebugReset: PROC ~ {
+debug ¬ [];
+};
+
+ValidSP: PROC [sp: SP, prevSP: SP] RETURNS [BOOL] ~ {
+IF sp = NIL THEN RETURN [FALSE]; -- the only invalid SP we really expect to see.
+IF LOOPHOLE[sp, CARD] >= 8*1024 AND LOOPHOLE[sp, CARD] MOD 8 = 0 AND (prevSP = NIL OR LOOPHOLE[sp, CARD]-LOOPHOLE[prevSP, CARD] <=16*1024) THEN RETURN [TRUE];
+debug.badSPcount ¬ debug.badSPcount + 1;
+debug.badSP ¬ LOOPHOLE[sp];
+debug.prevSP ¬ LOOPHOLE[prevSP];
+RETURN [FALSE]
+};
+
+ValidPC: PROC [pc: PC] RETURNS [BOOL] ~ INLINE {
+RETURN [pc >= 8*1024 AND pc MOD 4 = 0]
+};
+
+GetCurrentThread: PROC [] RETURNS [XRThread] ~ TRUSTED MACHINE CODE {
+"!$XR_currThread"
+};
+
+SampleMyStack: SAFE PROC [readiedThread: XRThread, nextState: XRSStat, ignoreHottest: NAT] ~ TRUSTED {
+self: XRThread ¬ GetCurrentThread[];
+selfIndex: CARD ¬ IF self # NIL THEN self.index ELSE 0;
+selfID: CARD ~ IF self # NIL THEN (selfIndex*32768+self.gen)*4+3 ELSE 3;
+readyIndex: CARD ¬ IF readiedThread # NIL THEN readiedThread.index ELSE 0;
+readyID: CARD ~ IF readiedThread # NIL THEN (readyIndex*32768+readiedThread.gen)*4+3 ELSE 3;
+timeVal: UnixTypes.TimeVal;
+suspending: BOOL ~ nextState=waitML OR nextState=waitCV;
+jb: JmpBuf;
+k: NAT ¬ 0;
+spy: Ref;
+thread: Thread;
+IF self#NIL AND self.pri=idle THEN RETURN;
+thread ¬ ObtainThread[selfIndex];
+IF thread = NIL THEN {missed ¬ missed + 1; RETURN};
+[] ¬ UnixSysCalls.GetTimeOfDay[@timeVal, NIL];
+IF self # NIL THEN {
+e: Event ¬ thread.e;
+IF (e # NIL) THEN {
+e.wakeup ¬ timeVal.sec;
+e.wakeusec ¬ timeVal.usec;
+thread.e ¬ NIL;
+};
+};
+IF suspending OR nextState=run OR nextState=ready THEN {
+newE: Event;
+newE ¬ AllocEvent[thread];
+IF newE = NIL THEN { ReleaseThread[thread]; RETURN } ;
+newE.time ¬ timeVal.sec;
+newE.sleepusec ¬ timeVal.usec;
+newE.kind ¬ IF suspending THEN sleep ELSE IF nextState=run THEN wakeup ELSE sample;
+IF readiedThread # NIL THEN {
+e: Event ¬ currentSpy.threads[readyIndex].e;
+IF  e # NIL THEN {
+e.wakeup ¬ timeVal.sec;
+e.wakeusec ¬ timeVal.usec;
+e.waker ¬ newE;
+currentSpy.threads[readyIndex].e ¬ NIL;
+}
+ELSE IF readiedThread.sStat = free THEN {
+newE2: Event ~ AllocEvent[@currentSpy.threads[readyIndex]];
+IF newE2 = NIL THEN { ReleaseThread[thread]; RETURN } ;
+newE2.time ¬ timeVal.sec;
+newE2.sleepusec ¬ timeVal.usec;
+newE2.kind ¬ sleep;
+newE2.waker ¬ newE;
+newE2.wakeup ¬ timeVal.sec;
+newE2.wakeusec ¬ timeVal.usec;
+IF currentSpy.threads[readyIndex].tree = NIL THEN {
+oset: OSet ¬ GetAvail[@currentSpy.threads[readyIndex]];
+IF oset # NIL THEN currentSpy.threads[readyIndex].tree ¬ oset.item;
+IF currentSpy.threads[readyIndex].tree # NIL THEN currentSpy.threads[readyIndex].tree­ ¬ [children: NIL, pc: 0];
+};
+IF currentSpy.threads[readyIndex].tree # NIL THEN newE2.tree ¬ Insert[currentSpy.threads[readyIndex].tree, readyID, thread];
+};
+};
+IF thread.tree = NIL THEN {
+oset: OSet ¬ GetAvail[thread];
+IF oset # NIL THEN thread.tree ¬ oset.item;
+IF thread.tree # NIL THEN thread.tree ­ ¬ [children: NIL, pc: 0];
+};
+IF thread.tree # NIL THEN {
+t: Tree ¬ thread.tree;
+prevSP: SP ¬ NIL;
+nextSP: SP ¬ NIL;
+ForceStackToMemory[@jb];
+FOR sp: SP ¬ jb.sp, nextSP WHILE ValidSP[sp, prevSP] AND k < stackLimit DO
+pc: PC ¬ sp.callersPC;
+thread.stackBuffer[k] ¬ pc;
+k ¬ k + 1;
+nextSP ¬ sp.callersSP;
+IF pc IN [sigtrampStart..sigtrampEnd) AND ValidSP[nextSP, sp] AND ValidSP[nextSP.callersSP, nextSP] THEN {
+sf: POINTER TO SigtrampStackFrame ~ LOOPHOLE[nextSP.callersSP];
+sigcontextPtr: POINTER TO SigContext ~ sf.sigcontextPtr;
+pc: PC ¬ sigcontextPtr.oldPC;
+IF ValidPC[pc] THEN {
+debug.goodSigtrampCount ¬ debug.goodSigtrampCount + 1;
+IF k < stackLimit THEN {
+IF ignoreHottest = 3 THEN ignoreHottest ¬ k;
+thread.stackBuffer[k] ¬ pc;
+k ¬ k + 1;
+};
+nextSP ¬ sigcontextPtr.oldSP;
+} ELSE { debug.badPC ¬ pc; debug.badPCcount ¬ debug.badPCcount + 1 };
+};
+prevSP ¬ sp;
+ENDLOOP;
+IF k > 0 THEN { IF thread.stackBuffer[k-1] = 0 THEN k ¬ k - 1};
+t ¬ Insert[t, selfID, thread];
+IF t # NIL THEN {
+FOR i: NAT DECREASING IN [ignoreHottest..k) DO
+t ¬ Insert[t, thread.stackBuffer[i], thread];
+IF t = NIL THEN EXIT;
+IF i = ignoreHottest THEN { 
+newE.tree ¬ t;
+IF suspending THEN {
+thread.e ¬ newE;  
+};
+};
+ENDLOOP;
+};
+};
+};
+ReleaseThread[thread];
+};
+RegisterSwitchCallback: PROC [callback: PROC[ nextThread: XRThread, nextState: XRSStat, swStat: XRSwStat ], save: POINTER TO PROC];
+
+RegisterSetReadyCallback: PROC [callback: PROC[ readyThread: XRThread], save: POINTER TO PROC];
+
+RegisterForkCallback: PROC [callback: PROC[ currThread: XRThread, newThread: XRThread], save: POINTER TO PROC]; 
+
+RegisterSwitcheeCallback: PROC [ callback: PROC[ currThread: XRThread ], save: POINTER TO PROC];
+
+
+XRThread: TYPE ~ POINTER TO RECORD [
+errno: INT,
+errnoLock: INT,
+vpeToReschedOnMonitorExit: POINTER,
+mlNeeded: POINTER,
+index: INT,
+timeoutIndex: INT,
+gen: CARD,
+sStat: XRSStat,
+pri: XRPri
+];
+
+XRSStat: TYPE ~ MACHINE DEPENDENT { none(0), free(1), ready(2), run(3), waitML(4), waitCV(5), last(CARD.LAST) };
+XRPri: TYPE ~ MACHINE DEPENDENT { idle(0), userBackground(1), sysBackground(2), userNormal(3), userForeground(4), sysNormal(5), sysForeground(6), sysExclusive(7), last(CARD.LAST) };
+XRSwStat: TYPE ~ CARD;
+
+ExamineNavel: SAFE PROC[ nextThread: XRThread, nextState: XRSStat, swStat: XRSwStat ] ~ TRUSTED {
+SampleMyStack[readiedThread~NIL, nextState~nextState, ignoreHottest: 3];
+};
+
+NoticeThreadReady: PUBLIC SAFE PROC[ readyThread: XRThread ] ~ TRUSTED {
+SampleMyStack[readiedThread~readyThread, nextState~run, ignoreHottest: 3];
+};
+
+NoticeFork: SAFE PROC[ currThread: XRThread, newThread: XRThread ] ~ TRUSTED {
+SampleMyStack[readiedThread~newThread, nextState~run, ignoreHottest: 3];
+};
+
+VPERep: TYPE ~ RECORD [
+vpeIndex: CARD
+];
+VPE: TYPE ~ POINTER TO VPERep;
+
+GetVPE: PROC [] RETURNS [VPE] ~ TRUSTED MACHINE CODE {
+"!$XR_vpe"
+};
+
+runKind: ARRAY [0..2] OF EventKind ~ [run0, run1, run2];
+runSeq: CARD ¬ 0;
+
+NoticeRun: PROC [currThread: XRThread] ~ {
+selfIndex: CARD ¬ IF currThread # NIL THEN currThread.index ELSE 0;
+selfID: CARD ~ IF currThread # NIL THEN (selfIndex*32768+currThread.gen)*4+3 ELSE 3;
+vpe: VPE ¬ GetVPE[];
+vpID: CARD ¬ IF vpe#NIL THEN vpe.vpeIndex ELSE CARD.LAST;
+timeVal: UnixTypes.TimeVal;
+thread: Thread ;
+newE: Event;
+IF vpe=NIL OR vpID > 2 THEN RETURN;  -- shouldn't happen
+runSeq ¬ runSeq+1;
+[] ¬ UnixSysCalls.GetTimeOfDay[@timeVal, NIL];
+thread ¬ ObtainThread[selfIndex];
+IF thread = NIL THEN {missed ¬ missed + 1; RETURN};
+newE ¬ AllocEvent[thread];
+IF newE = NIL THEN { ReleaseThread[thread]; RETURN; };
+newE.time ¬ timeVal.sec;
+newE.sleepusec ¬ timeVal.usec;
+newE.wakeup ¬ runSeq;
+newE.kind ¬ runKind[vpID];
+IF thread.tree = NIL THEN {
+oset: OSet ¬ GetAvail[thread];
+IF oset # NIL THEN thread.tree ¬ oset.item;
+IF thread.tree # NIL THEN thread.tree ­ ¬ [children: NIL, pc: 0];
+};
+newE.tree ¬ Insert[thread.tree, selfID, thread];
+ReleaseThread[thread];
+}; 
+
+
+<< prevEs: ARRAY [0..2] OF Event ¬ ALL[NIL];
+prevThread: ARRAY [0..2] OF Thread ¬ ALL[NIL];
+runKind: ARRAY [0..2] OF EventKind ~ [run0, run1, run2];
+
+NoticeRun: PROC [currThread: XRThread] ~ {
+selfIndex: CARD ¬ IF currThread # NIL THEN currThread.index ELSE 0;
+selfID: CARD ~ IF currThread # NIL THEN (selfIndex*32768+currThread.gen)*4+3 ELSE 3;
+vpe: VPE ¬ GetVPE[];
+vpID: CARD ¬ IF vpe#NIL THEN vpe.vpeIndex ELSE CARD.LAST;
+timeVal: UnixTypes.TimeVal;
+thread: Thread ;
+newE: Event;
+IF vpe=NIL OR vpID > 2 THEN RETURN;  -- shouldn't happen
+[] ¬ UnixSysCalls.GetTimeOfDay[@timeVal, NIL];
+IF prevEs[vpID] # NIL THEN {
+prevEs[vpID].wakeup ¬ timeVal.sec;
+prevEs[vpID].wakeusec ¬ timeVal.usec;
+};
+IF currThread=NIL OR currThread.pri=idle THEN {
+prevThread[vpID] ¬ NIL;
+prevEs[vpID] ¬ NIL;
+RETURN;
+};
+thread ¬ ObtainThread[selfIndex];
+IF thread = NIL THEN {missed ¬ missed + 1; RETURN};
+IF prevThread[vpID]=thread 
+THEN { ReleaseThread[thread]; RETURN }
+ELSE {prevEs[vpID] ¬ NIL; prevThread[vpID] ¬ NIL};
+newE ¬ AllocEvent[thread];
+IF newE = NIL THEN { ReleaseThread[thread]; RETURN; };
+prevThread[vpID] ¬ thread;
+IF prevEs[vpID]=NIL THEN prevEs[vpID] ¬ newE; -- should be monitored : there's still a consistency race we could lose, but the test narrows its size significantly.
+newE.time ¬ timeVal.sec;
+newE.sleepusec ¬ timeVal.usec;
+newE.kind ¬ runKind[vpID];
+IF thread.tree = NIL THEN {
+oset: OSet ¬ GetAvail[thread];
+IF oset # NIL THEN thread.tree ¬ oset.item;
+IF thread.tree # NIL THEN thread.tree ­ ¬ [children: NIL, pc: 0];
+};
+newE.tree ¬ Insert[thread.tree, selfID, thread];
+ReleaseThread[thread];
+}; >>
+
+eventPoolSize: CARD ~ 32;
+AllocEvent: PROC [thread: Thread] RETURNS [e: Event ¬ NIL] = {
+IF thread.eventPool MOD eventPoolSize = 0 THEN {
+spy: Ref ¬ ObtainSpy[];
+IF spy=NIL THEN { missed ¬ missed + 1; RETURN[NIL] };
+IF spy.enAlloc + eventPoolSize > spy.eLimit THEN { ReleaseSpy[spy]; RETURN [NIL] };
+thread.eventPool ¬ spy.enAlloc;
+spy.enAlloc ¬ spy.enAlloc + eventPoolSize;
+ReleaseSpy[spy];
+};
+e ¬ @currentSpy.events[thread.eventPool];
+thread.eventPool ¬ thread.eventPool+1;
+};
+
+memPoolSize: NAT ~ 32;
+GetAvail: PROC [thread: Thread, spy: Ref ¬ NIL] RETURNS [oset: OSet ¬ NIL] = {
+IF thread.memPool MOD memPoolSize = 0 THEN {
+IF spy=NIL THEN {
+spy ¬ ObtainSpy[];
+IF spy=NIL THEN { missed ¬ missed + 1; RETURN[NIL] };
+IF spy.nAlloc + memPoolSize > spy.limit THEN { ReleaseSpy[spy]; RETURN [NIL] };
+thread.memPool ¬ spy.nAlloc;
+spy.nAlloc ¬ spy.nAlloc + memPoolSize;
+ReleaseSpy[spy];
+}
+ELSE {
+IF spy.nAlloc + memPoolSize > spy.limit THEN RETURN [NIL];
+thread.memPool ¬ spy.nAlloc;
+spy.nAlloc ¬ spy.nAlloc + memPoolSize;
+};
+};
+{
+p: POINTER TO MemUnit ~ @currentSpy.mem[thread.memPool];
+p.oSetNode.left ¬ NIL;
+p.oSetNode.item ¬ @(p.treeRep);
+p.oSetNode.right ¬ NIL;
+p.treeRep.children ¬ NIL;
+p.treeRep.pc ¬ 0;
+thread.memPool ¬ thread.memPool + 1;
+RETURN [@(p.oSetNode)]
+};
+};
+
+FreeAvail: PROC [thread: Thread, oset: OSet] = {
+p: POINTER TO MemUnit ~ @currentSpy.mem[thread.memPool - 1];
+IF @(p.oSetNode) = oset THEN {
+thread.memPool ¬ thread.memPool - 1;
+};
+};
+
+Insert: PROC [tree: Tree, pc: ProgramCounter, avail: Thread, spy: Ref ¬ NIL] RETURNS [Tree] = {
+new: OSet ¬ GetAvail[avail, spy];
+IF tree # NIL AND new # NIL THEN {
+children: OSet ¬ Splay[tree.children, pc, new];
+IF new # children THEN FreeAvail[avail, new];
+tree.children ¬ children;
+RETURN [children.item]
+};
+RETURN [NIL]
+};
+STTree: TYPE = OSet;
+Key: TYPE = ProgramCounter;
+KeyField: PROC [s: STTree] RETURNS [Key] = INLINE {RETURN [s.item.pc]};
+Splay: PROC [s: STTree, key: Key, dummy: STTree] RETURNS [STTree] ~ {
+state: {N, L, R} ¬ N;
+l: STTree ¬ dummy;
+r: STTree ¬ dummy;
+p: STTree ¬ NIL;
+dummy.left ¬ dummy.right ¬ NIL;
+UNTIL s=NIL DO
+SELECT KeyField[s] FROM
+< key => {
+SELECT state FROM
+N, R => {l.right ¬ s; p ¬ l; l ¬ s; s ¬ s.right; state ¬ L};
+L => {l.right ¬ s.left; p.right ¬ s; s.left ¬ l; p ¬ NIL; l ¬ s; s ¬ s.right; state ¬ N};
+ENDCASE;
+};
+> key => {
+SELECT state FROM
+N, L => {r.left ¬ s; p ¬ r; r ¬ s; s ¬ s.left; state ¬ R};
+R => {r.left ¬ s.right; p.left ¬ s; s.right ¬ r; p ¬ NIL; r ¬ s; s ¬ s.left; state ¬ N};
+ENDCASE;
+};
+ENDCASE => {
+l.right ¬ s.left;
+r.left ¬ s.right;
+s.left ¬ dummy.right;
+s.right ¬ dummy.left;
+RETURN[s];
+};
+ENDLOOP;
+l.right ¬ NIL;
+r.left ¬ NIL;
+{left: OSet ¬ dummy.right; right: OSet ¬ dummy.left;
+s ¬ dummy;
+s.left ¬ left;
+s.right ¬ right;
+s.item.children ¬ NIL;
+s.item.pc ¬ key;
+RETURN[s];
+};
+};
+forwardTab: CardTab.Ref;
+
+WriteTree: PUBLIC ENTRY SAFE PROC [stream: IO.STREAM, ref: Ref] ~ TRUSTED {
+indent: NAT ¬ 0;
+Inner: PROC [tree: Tree] ~ {
+nest: INT ¬ 0; -- paren nest count for this invokation of Inner.
+DO -- loop back here if this has a singleton child.
+offset: CARD ¬ 0;
+IO.PutChar[stream, '(];
+nest ¬ nest + 1;
+IF tree = NIL THEN EXIT; -- should not happen, but what the hey?
+IO.Put1[stream, [cardinal[LOOPHOLE[tree]]]];
+IO.PutChar[stream, ' ];
+offset ¬ PutPCInfo[stream, tree.pc];
+IO.PutChar[stream, ' ];
+IO.Put1[stream, [cardinal[tree.pc-offset]]];
+IO.PutChar[stream, ' ];
+IO.Put1[stream, [cardinal[offset]]];
+IF tree.children # NIL AND tree.children.left = NIL AND tree.children.right = NIL
+THEN {
+IO.PutChar[stream, ' ];
+tree ¬ tree.children.item;
+LOOP;
+}
+ELSE {
+indent ¬ indent + 1;
+IF tree.children # NIL THEN {
+[] ¬ Insert[tree, FirstKey[tree.children], @ref.threads[0], ref];
+DO
+IO.PutChar[stream, '\n];
+IO.PutRope[stream, spaces, 0, indent];
+Inner[tree.children.item];
+IF tree.children.right = NIL THEN EXIT;
+[] ¬ Insert[tree, FirstKey[tree.children.right], @ref.threads[0], ref];
+ENDLOOP;
+};
+indent ¬ indent - 1;
+EXIT;
+};
+ENDLOOP;
+UNTIL nest = 0 DO
+IO.PutChar[stream, ')];
+nest ¬ nest - 1;
+ENDLOOP;
+};
+sav: NAT ~ ref.limit;
+ref.limit ¬ ref.mem.size;
+WriteStats[stream, ref];
+forwardTab ¬ CardTab.Create[123];
+IF ref.threads[0].tree = NIL THEN {
+oset: OSet ¬ GetAvail[@ref.threads[0], ref];
+IF oset # NIL THEN ref.threads[0].tree ¬ oset.item;
+IF ref.threads[0].tree # NIL THEN ref.threads[0].tree ­ ¬ [children: NIL, pc: 0];
+};
+IF ref.threads[0].tree#NIL THEN FOR i: NAT IN [1..120) DO
+IF ref.threads[i].tree # NIL AND ref.threads[i].tree.children # NIL AND ref.threads[i].tree.children.item # NIL THEN {
+[] ¬ Insert[ref.threads[i].tree, FirstKey[ref.threads[i].tree.children], @ref.threads[0], ref];
+DO
+children: OSet ¬ ref.threads[i].tree.children.item.children;
+new: Tree ¬ Insert[ref.threads[0].tree, ref.threads[i].tree.children.item.pc, @ref.threads[0], ref];
+OOPS: SIGNAL ~ CODE;
+IF new = NIL THEN SIGNAL OOPS ELSE { 
+IF new.children#NIL THEN SIGNAL OOPS ELSE {
+new.children ¬  children;
+[] ¬ forwardTab.Insert[LOOPHOLE[ref.threads[i].tree.children.item], NEW[CARD ¬ LOOPHOLE[new]]]; 
+};
+};
+IF ref.threads[i].tree.children.right=NIL THEN EXIT;
+[] ¬ Insert[ref.threads[i].tree, FirstKey[ref.threads[i].tree.children.right], @ref.threads[0], ref];
+ENDLOOP;
+};
+ENDLOOP;
+Inner[ref.threads[0].tree];
+currentSpy ¬ NIL;
+running ¬ FALSE;
+ref.limit ¬ sav;
+WriteEvents[stream, ref];
+};
+
+FirstKey: PROC [oSet: OSet] RETURNS [PC] ~ {
+UNTIL oSet.left = NIL DO
+oSet ¬ oSet.left;
+ENDLOOP;
+RETURN [oSet.item.pc]
+};
+
+WriteStats: PROC [stream: IO.STREAM, ref: Ref] ~ {
+stream.PutF1[";;; Spy\tstart:\t%g\n", [time[ref.startTime]]];
+stream.PutF1[";;;     \tstop:\t%g\n", [time[ref.stopTime]]];
+stream.PutF1[";;;     \tran for %g s\n", [integer[BasicTime.Period[from: ref.startTime, to: ref.stopTime]]]];
+stream.PutF1[";;;     \tused %g tree nodes ", [cardinal[ref.nAlloc]]];
+stream.PutF1["(of %g)\n", [cardinal[ref.limit]]];
+stream.PutF1[";;;     \tused %g event nodes ", [cardinal[ref.enAlloc]]];
+stream.PutF1["(of %g)\n", [cardinal[ref.eLimit]]];
+IF ref.missed # 0 THEN stream.PutF1[";;;      \tmissed %g samples due to contention.\n", [cardinal[ref.missed]]];
+};
+
+GetSeq: RedBlackTree.GetKey ~ CHECKED {
+RETURN[data];
+};
+CompareSeq: RedBlackTree.Compare ~ TRUSTED {
+e1: Event ¬ LOOPHOLE[k];
+e2: Event ¬ LOOPHOLE[data];
+SELECT TRUE FROM
+e1.wakeup < e2.wakeup => RETURN[less];
+e1.wakeup > e2.wakeup => RETURN[greater];
+ENDCASE => RETURN[equal]; 
+};
+WriteEvents: INTERNAL PROC [stream: IO.STREAM, ref: Ref] ~ {
+seconds: CARD ¬ 0;
+firstUsecs: INT ¬ LAST[INT];
+firstSecs: CARD ¬ LAST[CARD];
+NormalTime: PROC [secs, usecs: INT] RETURNS [msecs: CARD] ~ {
+
+msecs ¬ (Basics.BITAND[secs, 0FFFH])*1000;
+RETURN[msecs+usecs/1000];
+};
+runTab: RedBlackTree.Table ¬ RedBlackTree.Create[GetSeq, CompareSeq];
+FOR i: NAT IN [0..ref.enAlloc) DO
+e: Event ¬ @ref.events[i];
+IF e.time # 0 THEN {
+firstSecs ¬ MIN[firstSecs, e.time];
+IF e.time=firstSecs THEN firstUsecs ¬ MIN[firstUsecs, INT[e.sleepusec]];
+};
+ENDLOOP;
+
+stream.PutF["\n;;; First event at unix time %g.%g\n", [cardinal[firstSecs]], [integer[firstUsecs]]];
+stream.PutRope[";;; Event \tsleptAt \tatNode \twokeAt \tbyEvent\n"];
+
+FOR i: NAT IN [0..ref.enAlloc) DO
+e: Event ¬ @ref.events[i];
+forward: REF CARD ¬ NARROW[forwardTab.Fetch[LOOPHOLE[e.tree]].val];
+IF forward#NIL THEN e.tree ¬ LOOPHOLE[forward­];
+SELECT e.kind FROM
+IN [run0..run2] => {
+ENABLE RedBlackTree.DuplicateKey => {
+e2: Event ¬ LOOPHOLE[runTab.Lookup[LOOPHOLE[e]]];
+e2.time ¬ MIN[ e2.time, e.time ];
+e2.kind ¬ endRun; -- don't know who's running now 
+CONTINUE;
+};
+IF e.time # 0 OR e.sleepusec # 0 THEN e.time ¬ NormalTime[e.time, e.sleepusec];
+runTab.Insert[LOOPHOLE[e], LOOPHOLE[e]];
+};
+ENDCASE => {
+IF e.time # 0 OR e.sleepusec # 0 THEN {
+e.time ¬ NormalTime[e.time, e.sleepusec];
+IF e.wakeup # 0 OR e.wakeusec # 0 THEN {
+e.wakeup ¬ NormalTime[e.wakeup, e.wakeusec];
+};
+stream.PutF["    %g %g", [cardinal[LOOPHOLE[e]]],
+[character[SELECT e.kind FROM sleep => 'S, wakeup => 'W, sample => 'R, ENDCASE => 'Z]] ];
+stream.PutF1[" \t%g", [cardinal[e.time]] ];
+stream.PutF1[" \t%g",  [cardinal[LOOPHOLE[e.tree]]] ];
+stream.PutF1[" \t%g", [cardinal[e.wakeup]]];
+stream.PutF1[" \t%g\n", [cardinal[LOOPHOLE[e.waker]]] ];
+};
+};
+ENDLOOP;
+{
+RunKind: TYPE ~ EventKind[run0..run2];
+prevEvent: ARRAY RunKind OF Event ¬ ALL[NIL];
+EachRunEvent: RedBlackTree.EachNode ~ TRUSTED {
+e: Event ¬ LOOPHOLE[data];
+TerminateAndPrint: PROC [e2: Event] ~ {
+IF e2#NIL THEN {
+IF e2.time>e.time THEN {
+e2.wakeup ¬ e2.time;
+}
+ELSE e2.wakeup ¬ e.time;
+stream.PutF["    %g %g", [cardinal[LOOPHOLE[e2]]],
+[character[SELECT e2.kind FROM run0 => 'X, run1 => 'Y, ENDCASE => 'Z]] ];
+stream.PutF1[" \t%g", [cardinal[e2.time]] ];
+stream.PutF1[" \t%g",  [cardinal[LOOPHOLE[e2.tree]]] ];
+stream.PutF1[" \t%g", [cardinal[e2.wakeup]]];
+stream.PutF1[" \t%g\n", [cardinal[LOOPHOLE[e2.waker]]] ];
+};
+};
+IF e.kind = endRun THEN {
+FOR i: RunKind IN RunKind DO
+TerminateAndPrint[prevEvent[i]];
+ENDLOOP;
+prevEvent ¬ ALL[NIL];
+}
+ELSE {
+e2: Event ¬ prevEvent[e.kind];
+prevEvent[e.kind] ¬ e;
+TerminateAndPrint[e2];
+};
+};
+runTab.EnumerateIncreasing[EachRunEvent];
+};
+runTab ¬ NIL;
+forwardTab ¬ NIL;
+};
+
+Dbl: PROC [a: ROPE] RETURNS [ROPE] ~ INLINE {RETURN[Rope.Concat[a,a]]};
+spaces: ROPE ~ Dbl[Dbl[Dbl[Dbl[Dbl["                                "]]]]];
+
+PutUXString: PROC [stream: IO.STREAM, p: POINTER TO Basics.RawChars] ~ {
+end: INT ¬ 200;
+FOR i: NAT IN [0..200) DO
+IF p[i] = VAL[0] THEN {end ¬ i; EXIT};
+ENDLOOP;
+IO.UnsafePutBlock[stream, [LOOPHOLE[p], 0, end]];
+};
+
+PutBaseUXString: PROC [stream: IO.STREAM, p: POINTER TO Basics.RawChars] ~ {
+start: INT ¬ 0;
+end: INT ¬ 0;
+FOR i: NAT IN [0..200) DO
+c: CHAR ~ p[i];
+SELECT c FROM
+'/ => start ¬ i+1;
+'. => IF end <= start THEN end ¬ i;
+VAL[0] => {
+IF end <= start THEN end ¬ i;
+EXIT;
+};
+ENDCASE;
+ENDLOOP;
+IO.UnsafePutBlock[stream, [base: LOOPHOLE[p], startIndex: start, count: end-start]];
+};
+
+CirioNubSymEntryRep: TYPE ~ MACHINE DEPENDENT RECORD [ -- CirioNubTypes.h
+symID: CARD32,
+name: POINTER TO Basics.RawChars,
+type: CARD32,
+value: CARD32,
+size: CARD32,
+fileSeqNum: CARD32
+];
+
+PutPCInfo: PROC [stream: IO.STREAM, pc: PC] RETURNS [offset: CARD ¬ 0]= {
+IO.PutChar[stream, '\"];
+IF pc MOD 4 = 3
+THEN {
+w: CARD ~ (pc-3)/4;
+g: CARD ~ w MOD 32768;
+t: CARD ~ (w - g) / 32768;
+IO.PutRope[stream, "T"];
+IO.Put1[stream, [cardinal[t]]];
+IO.PutRope[stream, ".G"];
+IO.Put1[stream, [cardinal[g]]];
+}
+ELSE {
+PCtoInfoInner: PROC [pc: CARD32, buf: POINTER TO SWPCInfo] RETURNS [INT32] ~
+MACHINE CODE  { "CirioNubLocalPCtoInfo" };
+SWPCInfo: TYPE ~ MACHINE DEPENDENT RECORD [
+procName: POINTER TO Basics.RawChars,
+procSymID: CARD32,
+fileName: POINTER TO Basics.RawChars,
+fileSeqNum: CARD32,
+guessedEmbeddedFileName: POINTER TO Basics.RawChars,
+guessedEmbeddedFileSymID: CARD32
+];
+info: SWPCInfo;
+res: INT32 ¬ PCtoInfoInner[pc, @info];
+IF res=0 THEN {
+wantAllTypes: CARD ~ CARD.LAST; -- IncrementalLoad.h
+ignoreNone: CARD ~ 0; -- IncrementalLoad.h
+CirioNubLocalLookupSymEntryByID: PROC [symID: CARD32, buf: POINTER TO CirioNubSymEntryRep] RETURNS [INT] ~ MACHINE CODE {
+"CirioNubLocalLookupSymEntryByID"
+};
+buffer: CirioNubSymEntryRep;
+res: INT32 ¬ CirioNubLocalLookupSymEntryByID[symID: info.procSymID, buf: @buffer];
+PutBaseUXString[stream, info.guessedEmbeddedFileName];
+IO.PutChar[stream, '.];
+IF res=0 THEN {
+PutUXString[stream, buffer.name];
+offset ¬ pc-buffer.value;
+};
+};
+};
+IO.PutChar[stream, '\"];
+};
+
+InitBoundaries[];
+RegisterSwitchCallback ¬ LOOPHOLE[DynamicallyBind["_XR_RegisterSwitchCallback"]];
+RegisterSetReadyCallback ¬ LOOPHOLE[DynamicallyBind["_XR_RegisterSetReadyCallback"]];
+RegisterForkCallback ¬ LOOPHOLE[DynamicallyBind["_XR_RegisterForkCallback"]];
+RegisterSwitcheeCallback ¬ LOOPHOLE[DynamicallyBind["_XR_RegisterSwitcheeCallback"]];
+
+END.
+
+  
+|  
+HistorySpyImpl.mesa
+Copyright Ó 1990, 1991 by Xerox Corporation.  All rights reserved.
+Michael Plass, May 4, 1992 1:57 pm PDT
+Chauser, March 17, 1993 12:15 pm PST
+
+This runs only with recent PCRs having the XR_RegisterSetReadyCallback.
+Types
+Global State
+Synchronization (without monitors)
+Starting and Stopping
+currentSpy ¬ NIL;
+Stack sampling
+(c.f. .../SUNSRC/lib/libc/sys/common/sparc/sigtramp.s)
+etc...
+After seeing some bogus backpointers that miraculously cure themselves by the time any kind of debugger can look at this stack, the check against prevSP was added.
+This SP looks funny; squirrel it away to look at later.
+thread that became ready without notice: timeout or missed event
+this is a new thread; create its first tree node and an event waiting on that node
+exchange newE and newE2 so they appear in the right order
+This was called by sigtramp.  But sigtramp does not return normally, so we need to poke around to find the actual pc at which the signal occured.  HIGHLY SPARC AND SunOS DEPENDENT
+(c.f. .../SUNSRC/lib/libc/sys/common/sparc/sigtramp.s)
+Args to sigfunc are (sig, code, &sigcontext, addr)
+Thread Switch Routines
+Bindings for these four procedures are established at module initialization using DynamicallyBind.
+Called when a thread is telling readyThread it can now run after ML or CV wait.
+t will be switched to if ready and highest priority
+nextState is the nextState of currentThread
+swStat has to do with handlers
+create tree node for the new thread and an event that appears to be waiting there
+calling SampleMyStack with the new thread then makes an event showing the current thread activating the new thread.
+};
+virtual processor info
+-- ...
+Returns NIL in an IOP
+vpe=NIL shouldn't happen but a little paranoia never hurts
+vpe=NIL shouldn't happen but a little paranoia never hurts
+This should be per-vp, though on a uniprocessor maybe it makes sense
+This also points out that the fields are badly named: for run events, the time/sleepusec pair is the time it started running, the wakeup/wakeusec pair is when it stopped.
+Event management
+Tree management
+
+Abstraction for Splay operation
+The Sleator-Tarjan splay-tree operation; rebalances s so that nodes nearest key are near the root.  Needs dummy as scratch.
+IF s.item = NIL THEN DieAnytimeNow;
+
+Output
+Only one child, so don't do line break or indent further.
+Uses the splay operation to enumerate the children, using a bounded stack.
+race due to non-atomicity of assigning sequence numbers and capturing the time
+The consequence is both threads look like they run over a short interval.
+Fake PC encodes a thread identifier.
+overlays the CirioNubPCInfo structure of CirioNubTypes.h.
+ Ê%6  •NewlineDelimiter
+–(cedarcode) style™ code™Kšœ
+Ïeœ7™BK™&K™$K™ K™G—K˜ KšÏk	œ!žœs˜ŸK˜ KšÐlnœž˜KšžœžœL˜rKšžœ˜šœžœžœ˜K˜ —head™Kšžœžœžœ˜Kšœžœžœ˜šžœžœžœ˜K˜ —Kšœžœžœ˜/Kšœžœžœ˜Kšœžœ˜K˜ Kšœžœžœžœ˜*˜ K˜ ——™Kšœ	žœžœ˜Kšœžœ˜Kšœžœžœžœžœžœ˜+šœžœ˜K˜ ——™"šÏn
+œžœžœžœžœžœžœžœžœžœžœ˜RKšœž	œžœžœ˜0K˜ —š 	œžœžœ
+˜!Kšœžœ˜Kš
+žœžœ	žœžœžœ˜-Kšœ˜K˜ —š 
+œžœ˜Kšžœžœžœ˜Kšœžœ˜Kšœ˜K˜ —š œžœ	žœžœ˜5Kšœžœ/˜8Kš
+žœžœ	žœžœžœ˜=Kšœ˜K˜ —š œžœ˜(Kšœžœ˜Kšœ˜——™š œžœžœžœžœžœžœžœžœžœžœ˜zKšœžœ˜Kšžœ	žœžœžœ˜Kšœžœžœžœ˜Kšœžœ	˜Kšœ(žœ˜GKšœ+žœ-˜[Kšœ,žœ˜EK˜”K˜K˜Kšœ˜K˜K˜Kšœ ˜ Kšœ!˜!Kšœ˜Kšœ
+žœ˜Kšœ˜Kšœžœ˜Kšžœžœžœ&žœ˜MKšžœžœžœ-žœ˜VKšžœžœžœ"žœ˜GKšžœžœžœ%žœ˜NKšžœžœ˜Kšœ˜K˜ —š œžœžœžœžœžœ	žœ˜6Kšžœžœžœ˜Kš
+žœžœ	žœžœžœ˜!Kš
+žœžœžœžœžœ˜DKš
+žœžœžœžœžœ˜HKš
+žœžœžœžœžœ˜@Kš
+žœžœžœžœžœ˜Hšžœžœžœ
+ž˜Kšœ˜šžœžœžœ˜Kšœ˜K˜Kšœžœ™Kšœ˜Kšœ
+žœ˜Kšžœ˜Kšœ˜—Kšžœžœžœžœ˜;Kšžœ˜—Kšœžœ˜Kšœ
+žœ˜Kšœžœžœžœ˜Kšžœžœ˜Kšœ˜——™Kšœžœžœžœ˜$š	œžœžœž	œžœ˜2KšœžœÏc˜Kšœžœ¡˜Kšœžœ¡˜Kšœ˜K˜ —Kšžœžœžœžœ˜!š	œžœžœž	œžœ˜6Kšœžœžœžœ˜Kšœžœžœžœ˜Kšœžœ˜Kšœž˜Kšœ˜K˜ —šœžœžœžœž	œžœ˜>Kšœ6™6Kšœ˜Kšœžœ˜Kšœžœ˜Kšœžœžœ˜%Kšœž˜
+Kšœ˜K˜ —š œžœ˜(Kšœžœžœžœ˜3K˜ —š	œžœžœž	œžœ˜7Kšœžœ¡˜%Kšœžœ˜ K˜K˜K˜Kšœžœ˜Kšœžœ˜Kšœžœ
+˜Kšœ˜K˜ —šœžœžœ¡Ðbc˜EKšœžœžœ˜!Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœžœ˜K˜K˜ —šœžœžœ¡¢˜FKšœžœ˜Kšœžœ˜Kšœžœžœ˜!K™K˜K˜ —š œžœžœžœžœžœžœžœžœžœžœžœžœ˜»Kšœ œ˜!Kšœ˜K˜ —š œžœžœžœžœžœžœžœžœžœžœžœžœžœ˜ÖKšœ œ˜ K˜K˜ —Kšœžœ˜"Kšœžœ¡˜1K˜ Kšœžœ˜0Kšœ(žœ¡˜=K˜ Kšœžœ˜/Kšœžœ¡˜/K˜ š œžœ˜K˜?Kšœ˜K˜ —š
+ œžœžœžœžœ	˜IK˜6šœžœžœ-˜;Kšœžœ˜
+K˜Kšœžœ˜Kšœ¡˜K˜Kšœ˜—šžœžœžœ˜šœžœžœ.˜<Kšœ	˜	Kšœ˜Kšœ¡˜Kšœ˜Kšœ˜Kšœ˜—K˜K˜Kšœ˜—K˜—K˜ š œžœžœžœ"˜PKšœžœ%˜+Kšžœžœžœžœžœžœžœ˜HK˜K˜ —šœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœ˜K˜ —š œžœžœžœ˜(Kšžœ	˜Kšœ˜K˜ —š œžœ˜Kšœ˜Kšœ˜K˜ —š œžœžœ
+žœžœžœ˜5Kšœ£™£Kšžœžœžœžœžœ¡/˜PKš"žœžœžœžœžœžœžœžœžœžœžœžœžœ	žœžœžœžœ˜žK™7Kšœ(˜(Kšœžœ˜Kšœžœ	˜ Kšžœžœ˜Kšœ˜K˜ —š œžœžœžœžœžœ˜0Kšžœžœžœ˜&Kšœ˜K˜ —š œžœžœžœžœžœ˜EK˜K˜K˜ —š
+ œžœžœ>žœžœ˜fK˜$Kšœžœžœžœžœžœ˜7Kšœžœžœžœžœ žœ˜HKšœžœžœžœžœžœ˜JKšœ	žœžœžœžœ*žœ˜\K˜Kšœžœžœ˜8Kšœ˜Kšœžœ˜K˜	K˜Kš
+žœžœžœžœžœ˜*K˜!Kšžœ
+žœžœžœ˜3Kšœ)žœ˜.šžœžœžœ˜K˜šžœžœžœ˜K™@K˜K˜Kšœžœ˜Kšœ˜—K˜—šžœžœžœžœ˜8K˜K˜Kšžœžœžœžœ˜6K˜K˜Kšœžœžœžœžœžœžœ˜Sšžœžœžœ˜K˜,šžœžœžœ˜K˜K˜K˜Kšœ#žœ˜'K˜—šžœžœžœ˜)K™RK˜;Kšžœ	žœžœžœ˜7K™9K˜K˜K˜K˜K˜K˜šžœ'žœžœ˜3K˜7Kšžœžœžœ1˜CKšžœ'žœžœ3žœ	˜pK˜—Kšžœ'žœžœK˜|Kšœ˜—Kšœ˜—šžœžœžœ˜K˜Kšžœžœžœ˜+Kšžœžœžœžœ	˜AKšœ˜—šžœžœžœ˜K˜Kšœžœžœ˜Kšœžœžœ˜Kšœ˜š	žœžœžœžœž˜JKšœžœ˜K˜Kšœ
+˜
+Kšœ˜š
+žœžœžœžœ#žœ˜jJšœ“ÏtÏb £™µKšœ6™6Kšœ2™2Kšœžœžœžœ˜?Kšœžœžœ˜8Kšœžœ˜šžœžœ˜Kšœ6˜6šžœžœ˜Kšžœžœ˜,K˜Kšœ
+˜
+Kšœ˜—Kšœ˜Kšœžœ?˜E—Kšœ˜—Kšœ˜Kšžœ˜—Kšžœžœžœžœ˜?K˜šžœžœžœ˜š	žœžœž
+œžœž˜.K˜-Kšžœžœžœžœ˜šžœžœ˜J˜šžœžœ˜K˜K˜—K˜—Kšžœ˜—Kšœ˜—Kšœ˜—K˜—K˜Kšœ˜——™K™bKš œžœžœFžœžœžœ˜ƒK˜ K™Oš œžœžœ žœžœžœ˜_K˜ —š œžœžœ4žœžœžœ˜pK˜ —Kš œžœžœ žœžœžœ˜`˜ K˜ —šœ
+žœžœ˜$Kšœžœ˜Kšœžœ˜Kšœžœ˜#Kšœ
+žœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜
+K˜K˜
+Kšœ˜K˜ —Kšœ	žœžœž	œBžœžœ˜pKšœžœžœž	œ‰žœžœ˜µKšœ
+žœžœ˜K˜ š œžœžœAžœ˜aK™3K™+K™Kšœžœ)˜HKšœ˜K˜ —š
+ œžœžœžœžœ˜HK˜JKšœ˜K˜ —š 
+œžœžœ0žœ˜N™QK™sK˜HKšœ™—Kšœ˜—K˜ K™šœžœžœ˜Kšœ
+ž˜K™Kšœ˜—Kšžœžœžœžœ˜K˜ K™š œžœžœžœžœžœžœ˜6K˜
+K˜—K˜ K˜8K˜K˜ š 	œžœ˜*Kšœžœžœžœžœžœ˜CKšœžœžœžœžœ&žœ˜TK˜K™:Kšœžœžœžœžœžœžœžœ˜9K˜K˜K˜Kšžœžœžœ
+žœžœ¡˜8K˜Kšœ)žœ˜.K˜!Kšœžœžœžœ˜3K˜Kšžœžœžœžœ˜6K˜K˜K˜K˜šžœžœžœ˜K˜Kšžœžœžœ˜+Kšžœžœžœžœ	˜AKšœ˜—K˜0K˜K˜K˜ K˜ —Kš	œžœžœ	žœžœ˜,Kš	œžœžœ
+žœžœ˜.K˜8K˜ š 	œžœ˜*Kšœžœžœžœžœžœ˜CKšœžœžœžœžœ&žœ˜TK˜K™:Kšœžœžœžœžœžœžœžœ˜9K˜K˜K˜Kšžœžœžœ
+žœžœ¡˜8Kšœ)žœ˜.šžœžœžœ˜K™DK™ªK˜"K˜%Kšœ˜—š	žœžœžœžœž˜/Kšœžœ˜Kšœžœ˜Kšžœ˜K˜—K˜!Kšœžœžœžœ˜3šžœ˜Kšžœžœ˜&Kšžœžœžœ˜2—K˜Kšžœžœžœžœ˜6K˜Kšžœžœžœ¡u˜£K˜K˜K˜šžœžœžœ˜K˜Kšžœžœžœ˜+Kšžœžœžœžœ	˜AKšœ˜—K˜0K˜K˜K˜ ——™Kšœžœ˜š 
+œžœžœžœ˜>šžœžœžœ˜0K˜Kš
+žœžœžœžœžœ˜5Kšžœ*žœžœžœ˜SK˜K˜*K˜Kšœ˜—K˜)K˜&Kšœ˜K˜ ——™Kšœžœ˜š
+ œžœžœžœžœ˜Nšžœžœžœ˜,šžœžœžœ˜K˜Kš
+žœžœžœžœžœ˜5Kšžœ&žœžœžœ˜OK˜K˜&K˜K˜—šžœ˜Kšžœ&žœžœžœ˜:K˜K˜&Kšœ˜—Kšœ˜—˜Kšœžœžœ+˜8Kšœžœ˜Kšœ˜Kšœžœ˜Kšœžœ˜Kšœ˜K˜$Kšžœ˜Kšœ˜—Kšœ˜K˜ —š 	œžœ!˜0Kšœžœžœ/˜<šžœžœ˜K˜$Kšœ˜—Kšœ˜K˜ —š œžœ<žœžœ˜_K˜!š
+žœžœžœžœžœ˜"Kšœ/˜/Kšžœžœ˜-Kšœ˜Kšžœ˜Kšœ˜—Kšžœžœ˜Kšœ˜K™ —™Kšœžœ˜Kšœžœ˜Kš
+ œžœžœ	žœžœ˜G—š œžœ&žœ˜EKšœ{™{Kšœ˜Kšœ˜Kšœ˜Kšœžœ˜Kšœžœ˜šžœžœž˜šžœž˜šœ
+˜
+šžœž˜Kšœ<˜<Kšœ5žœ!˜YKšžœ˜—Kšœ˜—šœ
+˜
+šžœž˜Kšœ:˜:Kšœ5žœ ˜XKšžœ˜—Kšœ˜—šžœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšžœ˜
+Kšœ˜——Kšžœ˜—Kšœ
+žœ˜Kšœ	žœ˜šœ4˜4Kšœ
+˜
+Kšœ˜Kšœ˜Kšžœ
+žœžœ™#Kšœžœ˜K˜Kšžœ˜
+K˜—Kšœ˜—K™ —™K˜K˜ š 	œžœžœžœžœ
+žœžœžœ˜KKšœžœ˜š œžœ˜Kšœžœ¡1˜@šžœ¡0˜3Kšœžœ˜Kšžœ˜K˜Kš	žœžœžœžœ¡'˜@Kšžœžœ
+˜,Kšžœ˜Kšœ$˜$Kšžœ˜Kšžœ*˜,Kšžœ˜Kšžœ"˜$šžœžœžœžœžœž˜Qšžœ˜J™9Kšžœ˜Kšœ˜Kšžœ˜Kšœ˜—šžœ˜Kšœ˜K™Jšžœžœžœ˜K˜Ašž˜Kšžœ˜Kšžœ$˜&Kšœ˜Kšžœžœžœžœ˜'K˜GKšžœ˜—Kšœ˜—Kšœ˜Kšžœ˜Kšœ˜——Kšžœ˜—šžœ
+ž˜Kšžœ˜K˜Kšžœ˜—Kšœ˜—Kšœžœ˜K˜Kšœ˜K˜!˜#K˜,Kšžœžœžœ!˜3Kšžœžœžœ$žœ	˜QKšœ˜—šžœžœžœžœžœžœ
+ž˜9šžœžœžœ žœžœ%žœžœ˜vK˜_šž˜K˜<K˜dKšžœžœžœ˜šžœžœžœžœžœžœ˜%šžœžœžœžœžœžœ˜+K˜Kš	œžœ%žœžœžœ	˜`—K˜—K˜Kšžœ$žœžœžœ˜4K˜eKšžœ˜—K˜—Kšžœ˜—K˜Kšœžœ˜Kšœ
+žœ˜Kšœ˜K˜Kšœ˜K˜ —š œžœžœžœ˜,šžœžœž˜Kšœ˜Kšžœ˜—Kšžœ˜Kšœ˜K˜ —š 
+œžœ
+žœžœ˜2Kšœ=˜=Kšœ<˜<Kšœm˜mKšœF˜FKšœ1˜1K˜HK˜2Kšžœžœ[˜qKšœ˜K˜ —š œžœ˜'Kšžœ˜K˜—š 
+œžœ˜,Kšœžœ˜Kšœžœ˜šžœžœž˜Kšœžœ˜&Kšœžœ
+˜)Kšžœžœ	˜—K˜—š
+ œžœžœ
+žœžœ˜<Kšœ	žœ˜Kšœžœžœžœ˜Kšœžœžœžœ˜š
+ 
+œžœžœžœ	žœ˜=K˜ Kšœžœ˜*Kšžœ˜K˜—K˜Ešžœžœžœž˜!K˜šžœžœ˜Kšœžœ˜#Kšžœžœžœžœ˜HKšœ˜—Kšžœ˜—K˜ K˜dK˜DK˜ šžœžœžœž˜!K˜Kš	œ	žœžœžœžœ˜CKšžœ	žœžœ
+žœ˜0šžœž˜šžœ˜šžœ˜%Kšœžœžœ˜1Kšœ
+žœ˜!Kšœ¡ ˜2Kšžœ˜	Kšœ˜—Kšžœžœžœ*˜OKšœžœžœ˜(K˜—šžœ˜šžœžœžœ˜'K˜)šžœžœžœ˜(K˜,Kšœ˜—Kš	œ#žœžœžœ*žœ˜‹K˜+Kšœœžœ˜6K˜,Kšœ"žœ˜8K˜—K˜——Kšžœ˜—˜Kšœ	žœ˜&Kš	œžœ	žœ	žœžœ˜-š œžœ˜/Kšœžœ˜š œžœ˜'šžœžœžœ˜˜K™NK™IK˜K˜—Kšžœ˜Kš	œ#žœžœ	žœžœ˜|K˜,Kšœ!žœ˜7K˜-Kšœ"žœ˜9K˜—K˜—šžœžœ˜šžœžœ	ž˜K˜ Kšžœ˜Kšœžœžœ˜—K˜—šžœ˜K˜K˜K˜K˜—K˜—K˜)Kšœ˜—Kšœ	žœ˜Kšœžœ˜Kšœ˜K˜ —Kš œžœžœžœžœžœžœ˜GKšœžœ?˜KK˜ š œžœ
+žœžœžœžœ˜HKšœžœ˜šžœžœžœ
+ž˜Kšžœžœžœžœ˜&Kšžœ˜—Kšžœžœ˜1Kšœ˜K˜ —š œžœ
+žœžœžœžœ˜LKšœžœ˜Kšœžœ˜šžœžœžœ
+ž˜Kšœžœ˜šžœž˜Kšœ˜Kšœžœžœ	˜#šžœ˜Kšžœžœ	˜Kšžœ˜K˜—Kšžœ˜—Kšžœ˜—Kšžœžœ+˜TKšœ˜K˜ —šœžœžœ¡¢˜IKšœžœ˜Kšœžœžœ˜!Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœž˜K˜K˜ —š 	œžœ
+žœžœžœžœ
+žœ˜IKšžœ˜šžœžœ˜šžœ˜K™$Kšœžœ˜Kšœžœžœ˜Kšœžœ˜Kšžœ˜Kšžœ˜Kšžœ˜Kšžœ˜Kšœ˜—šžœ˜Kš œžœžœžœžœžœžœžœžœ˜wš	œ
+žœžœž	œžœ˜+Kšœ9™9Kšœ
+žœžœ˜%Kšœžœ˜Kšœ
+žœžœ˜%Kšœžœ˜Kšœžœžœ˜4Kšœž˜ K˜—Kšœ˜Kšœžœ˜&šžœžœ˜Kšœžœžœžœ¢˜4Kšœžœ¢˜*š œžœ	žœžœžœžœžœžœžœ˜yKšœ!˜!Kšœ˜—Kšœ˜KšœžœH˜RKšœ6˜6Kšžœ˜šžœžœ˜Kšœ!˜!Kšœ˜Kšœ˜—Kšœ˜—Kšœ˜——Kšžœ˜Kšœ˜K˜ —K˜Kšœžœ0˜QKšœžœ2˜UKšœžœ.˜MKšœžœ2˜UK˜ —Kšžœ˜K˜ — …—    fz  –,  

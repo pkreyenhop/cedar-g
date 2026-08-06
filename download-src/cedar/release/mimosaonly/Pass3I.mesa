@@ -1,0 +1,1181 @@
+DIRECTORY
+Alloc USING [AddNotify, DropNotify, Notifier],
+MimData USING [interface, moduleCtx, nErrors, seAnon, switches, table, textIndex, typeAtomRecord],
+MimosaCopier USING [CompleteContext, Delink, SearchFileCtx],
+MimosaLog USING [ErrorHti, ErrorSei, ErrorTree, ErrorTreeOp, WarningSei],
+MimP3 USING [And, Attr, Exp, FirstId, fullAttr, InterfaceCtx, ItemType, MakeRefType, mark, MergeNP, NextKeyProc, OmittedValueProc, phraseNP, ResolveType, ResolveValue, RPop, RPush, RType, SetDefaultImport, SetType, VariantUnionType, voidAttr, VoidExp],
+MimP3S USING [currentBody, currentScope, safety],
+MimZones USING [permZone],
+Pass3Attributes USING [LongPath, LongType, MarkedType, OperandType, PermanentType, TypeForTree, VarType],
+SourceMap USING [Loc],
+SymbolOps USING [ArgCtx, ConstantId, CtxLevel, DecodeCard, DecodeTreeIndex, DecodeType, EncodeCard, EncodeTreeIndex, EnterExtension, FindExtension, FirstCtxSe, FromBti, LinkMode, NextSe, NormalType, own, RCType, RecordRoot, ReferentType, SearchContext, SetSeLink, ToType, TypeForm, TypeLink, TypeRoot, UnderType],
+Symbols USING [Base, Closure, CSEIndex, CSENull, CTXIndex, CTXNull, CTXRecord, ctxType, ExtensionType, FirstStandardCtx, HTIndex, HTNull, IncludedCTXIndex, IncludedCTXNull, ISEIndex, ISENull, LastStandardCtx, lG, lZ, MDIndex, mdType, nullType, RecordSEIndex, RecordSENull, SERecord, seType, Type, typeANY, typeTYPE],
+SymLiteralOps USING [EnterAtom, EnterType],
+Target: TYPE MachineParms USING [bitsPerPtr],
+Tree USING [Base, Index, Link, Map, Node, Null, nullIndex, Scan, Test, treeType],
+TreeOps USING [CopyTree, FreeTree, GetHash, GetNode, GetSe, GetTag, ListLength, MarkShared, NthSon, OpName, PopTree, PushTree, PushNode, ScanList, ScanSons, SearchList, SetAttr, SetInfo, ToLoc, UpdateList, UpdateLeaves];
+Pass3I: PROGRAM
+IMPORTS Alloc, MimData, MimosaCopier, MimosaLog, MimP3, MimP3S, MimZones, Pass3Attributes, SymbolOps, SymLiteralOps, TreeOps
+EXPORTS MimP3 = { 
+OPEN MimP3, Symbols, TreeOps;
+RefItem: TYPE = RECORD [kind: {seal, rhs, lhs}, sei: ISEIndex];
+RefSeal: RefItem = [kind: seal, sei: ISENull];
+
+RefSequence: TYPE = RECORD [SEQUENCE length: CARDINAL OF RefItem];
+RefStack: TYPE = REF RefSequence;
+
+refStack: RefStack ¨ NIL;
+refIndex: CARDINAL ¨ 0;
+
+AdjustRefStack: PROC [n: CARDINAL] = {
+oldStack: RefStack ¨ refStack;
+refStack ¨ MimZones.permZone.NEW[RefSequence[n]];
+FOR i: CARDINAL IN [0..refIndex) DO refStack[i] ¨ oldStack[i] ENDLOOP;
+MimZones.permZone.FREE[@oldStack];
+};
+
+RecordMention: PUBLIC PROC [sei: ISEIndex] = {
+IF MimData.switches['u]
+AND SymbolOps.DecodeCard[seb[sei].idInfo] = 0
+AND ~seb[sei].mark4
+THEN {
+IF refIndex >= refStack.length THEN AdjustRefStack[refStack.length + 8];
+refStack[refIndex] ¨ [kind: rhs, sei: sei];
+refIndex ¨ refIndex + 1;
+}
+ELSE BumpCount[sei];
+};
+
+RecordLhs: PUBLIC PROC [sei: ISEIndex] = {
+IF MimData.switches['u]
+<<AND SymbolOps.DecodeCard[seb[sei].idInfo] = 0>>
+AND ~seb[sei].mark4 THEN {
+FOR i: CARDINAL DECREASING IN [0..refIndex) DO
+each: RefItem ¨ refStack[i];
+SELECT each.kind FROM
+rhs => IF each.sei = sei THEN {refStack[i].kind ¨ lhs; EXIT};
+seal => IF each.sei = ISENull THEN EXIT;
+ENDCASE;
+ENDLOOP;
+}
+};
+
+SealRefStack: PUBLIC PROC = {
+IF refIndex >= refStack.length THEN AdjustRefStack[refStack.length + 8];
+refStack[refIndex] ¨ RefSeal;
+refIndex ¨ refIndex + 1;
+};
+
+UnsealRefStack: PUBLIC PROC = {
+ClearRefStack[];
+refIndex ¨ refIndex - 1;
+IF refStack[refIndex] # RefSeal THEN ERROR;
+};
+
+ClearRefStack: PUBLIC PROC [uvCheck: BOOL ¨ TRUE] = {
+FOR i: CARDINAL DECREASING IN [0..refIndex) UNTIL refStack[i] = RefSeal DO
+sei: ISEIndex = refStack[i].sei;
+SELECT TRUE FROM
+refStack[i].kind # rhs => {};
+ConstantInit[sei] => {};
+NOT uvCheck => {};
+NOT MimData.interface, SymbolOps.CtxLevel[SymbolOps.own, seb[sei].idCtx] # lG =>
+MimosaLog.WarningSei[uninitialized, sei];
+ENDCASE;
+BumpCount[sei];
+refIndex ¨ refIndex - 1;
+ENDLOOP;
+IF refStack.length > 16 AND refIndex <= 16 THEN AdjustRefStack[16];
+};
+
+ConstantInit: PROC [sei: ISEIndex] RETURNS [BOOL] = {
+sebp: LONG POINTER TO Symbols.SERecord.id = @seb[sei];
+IF sebp.constant THEN RETURN [TRUE];
+IF sebp.immutable THEN {
+node: Tree.Index ¨ SymbolOps.DecodeTreeIndex[sebp.idValue];
+RETURN [node # Tree.nullIndex AND OpName[tb[node].son[3]] = body];
+};
+RETURN [FALSE];
+};
+tb: Tree.Base ¨ NIL;		-- tree base
+seb: Symbols.Base ¨ NIL;	-- se table
+ctxb: Symbols.Base ¨ NIL;	-- context table
+mdb: Symbols.Base ¨ NIL;	-- module directory base
+
+IdNotify: Alloc.Notifier = {
+tb ¨ base[Tree.treeType];
+seb ¨ base[seType];
+ctxb ¨ base[ctxType];
+mdb ¨ base[mdType];
+};
+EnterType: PUBLIC PROC [type: Type, canonical: BOOL ¨ TRUE] = {
+SymLiteralOps.EnterType[type, canonical];
+CompleteRCType[SymbolOps.TypeRoot[SymbolOps.own, type]];
+};
+
+CompleteContext: PROC [ctx: CTXIndex, parent: Type ¨ nullType] = {
+WITH c: ctxb[ctx] SELECT FROM
+simple =>
+IF c.copied < $rc THEN {
+c.copied ¨ $rc;
+FOR sei: ISEIndex ¨ SymbolOps.FirstCtxSe[SymbolOps.own, ctx], SymbolOps.NextSe[SymbolOps.own, sei]
+UNTIL sei = ISENull DO
+type: Type = seb[sei].idType;
+CompleteRCType[
+IF type = typeTYPE THEN sei ELSE SymbolOps.TypeRoot[SymbolOps.own, type]];
+ENDLOOP;
+};
+included =>
+IF SymbolOps.CtxLevel[SymbolOps.own, ctx] = lZ THEN
+MimosaCopier.CompleteContext[LOOPHOLE[ctx], $rc, parent];
+ENDCASE;
+};
+
+CompleteRCType: PROC [type: Type] = {
+DO
+subType: CSEIndex = SymbolOps.UnderType[SymbolOps.own, type];
+IF SymbolOps.RCType[SymbolOps.own, subType] = none THEN EXIT;
+WITH t: seb[subType] SELECT FROM
+record => {CompleteContext[t.fieldCtx, subType]; EXIT};
+array => type ¨ SymbolOps.TypeRoot[SymbolOps.own, t.componentType];
+union => {CompleteContext[t.caseCtx, subType]; EXIT};
+sequence => type ¨ SymbolOps.TypeRoot[SymbolOps.own, t.componentType];
+ENDCASE => EXIT;
+IF enterEachLevel THEN SymLiteralOps.EnterType[subType];
+ENDLOOP;
+};
+enterEachLevel: BOOL ¨ TRUE;
+
+EnterComposite: PUBLIC PROC [type: Type, t: Tree.Link, init: BOOL] = {
+IF t # Tree.Null THEN WITH e: t SELECT GetTag[t] FROM
+subtree => {
+tp: LONG POINTER TO Tree.Node = @tb[e.index];
+SELECT tp.name FROM
+loophole, cast, safen, pad => {
+son1: Tree.Link = tp.son[1];
+EnterComposite[Pass3Attributes.OperandType[son1], son1, init];
+IF enterEachLevel THEN GO TO enterIt;
+IF SymbolOps.RCType[SymbolOps.own, type] = composite THEN GO TO enterIt;
+RETURN;
+};
+construct => {
+IF SymbolOps.RCType[SymbolOps.own, type] = composite THEN {
+son2: Tree.Link = tp.son[2];
+sei: CSEIndex = SymbolOps.UnderType[SymbolOps.own, SymbolOps.ToType[tp.info]];
+WITH se: seb[sei] SELECT FROM
+record => {
+rSei: RecordSEIndex = LOOPHOLE[sei];
+EnterFieldTypes[SymbolOps.RecordRoot[SymbolOps.own, rSei], son2, init];
+IF ~init THEN GO TO enterIt; -- in case constant-folded
+};
+ENDCASE;
+};
+RETURN;
+};
+union => {
+son1: Tree.Link = tp.son[1];
+sei: CSEIndex = SymbolOps.UnderType[SymbolOps.own, GetSe[son1]];
+WITH se: seb[sei] SELECT FROM
+record => {
+rSei: RecordSEIndex = LOOPHOLE[sei];
+EnterFieldTypes[rSei, tp.son[2], init];
+};
+ENDCASE;
+RETURN;
+};
+rowcons => {
+son2: Tree.Link = tp.son[2];
+sei: CSEIndex = SymbolOps.UnderType[SymbolOps.own, SymbolOps.ToType[tp.info]];
+WITH se: seb[sei] SELECT FROM
+array => {
+cSei: CSEIndex = SymbolOps.UnderType[SymbolOps.own, se.componentType];
+IF SymbolOps.RCType[SymbolOps.own, cSei] # none THEN {
+EnterElement: Tree.Scan = {EnterComposite[cSei, t, init]};
+ScanList[son2, EnterElement];
+IF enterEachLevel OR ~init THEN GO TO enterIt;
+};
+};
+ENDCASE;
+RETURN;
+};
+all => {
+sei: CSEIndex = SymbolOps.UnderType[SymbolOps.own, SymbolOps.ToType[tp.info]];
+WITH se: seb[sei] SELECT FROM
+array => {
+cSei: CSEIndex = SymbolOps.UnderType[SymbolOps.own, se.componentType];
+IF SymbolOps.RCType[SymbolOps.own, cSei] # none THEN {
+EnterComposite[cSei, NthSon[t, 1], FALSE];
+IF enterEachLevel OR ~init THEN GO TO enterIt;
+};
+};
+ENDCASE;
+RETURN;
+};
+ENDCASE;
+};
+ENDCASE;
+SELECT SymbolOps.TypeForm[SymbolOps.own, type] FROM
+union, sequence =>
+IF t # Tree.Null THEN MimosaLog.ErrorTree[unimplemented, t];
+ENDCASE =>
+IF SymbolOps.RCType[SymbolOps.own, type] = composite THEN GO TO enterIt;
+EXITS enterIt => EnterType[SymbolOps.UnderType[SymbolOps.own, type], TRUE];
+};
+
+EnterFieldTypes: PROC [rSei: RecordSEIndex, t: Tree.Link, init: BOOL] = {
+sei: ISEIndex ¨ SymbolOps.FirstCtxSe[SymbolOps.own, seb[rSei].fieldCtx];
+EnterField: Tree.Scan = {
+IF sei # ISENull THEN {
+subType: CSEIndex = SymbolOps.UnderType[SymbolOps.own, seb[sei].idType];
+WITH s: seb[subType] SELECT FROM
+record =>
+IF s.hints.variant
+AND SymbolOps.RCType[SymbolOps.own, subType] # none THEN
+EnterType[subType, TRUE];
+ENDCASE;
+EnterComposite[subType, t, init];
+};
+sei ¨ SymbolOps.NextSe[SymbolOps.own, sei];
+};
+IF enterEachLevel THEN EnterType[rSei];
+ScanList[t, EnterField];
+};
+Id: PUBLIC PROC [hti: HTIndex] RETURNS [val: Tree.Link] = {
+sei: ISEIndex;
+type: Type;
+ctx: CTXIndex;
+baseV: Tree.Link;
+attr: Attr ¨ voidAttr;
+indirect: BOOL;
+[sei, baseV, indirect] ¨ FindSe[hti];
+IF sei # ISENull
+THEN {
+IF baseV = Tree.Null THEN RecordMention[sei] ELSE BumpCount[sei];
+IF ~seb[sei].mark3 THEN ResolveIdType[sei];
+val ¨ [symbol[index: sei]];
+type ¨ seb[sei].idType;
+ctx ¨ seb[sei].idCtx;
+SELECT ctxb[ctx].ctxType FROM
+included => {
+attr.const ¨ SymbolOps.ConstantId[sei];
+IF baseV = Tree.Null AND (~attr.const OR ~InterfaceConst[sei]) THEN
+MimosaLog.ErrorSei[notImported, sei];
+};
+imported => {
+IF ~MimData.interface
+AND SymbolOps.TypeForm[SymbolOps.own, type] = $ref THEN
+[val, type] ¨ DeRef[val, type];
+attr.const ¨ FALSE;
+};
+ENDCASE => {
+IF ~ConstResolved[sei] THEN ResolveIdValue[sei];
+attr.const ¨ seb[sei].constant;
+};
+SELECT TRUE FROM
+baseV = Tree.Null => {
+IF ctx = MimP3S.currentBody.argCtx THEN phraseNP ¨ ref;
+IF SymbolOps.CtxLevel[SymbolOps.own, ctx] = lZ AND ~attr.const THEN
+SELECT ctx FROM
+IN [FirstStandardCtx .. LastStandardCtx], MimData.moduleCtx => {};
+ENDCASE => MimosaLog.ErrorSei[missingBase, sei];
+};
+(~attr.const AND ctxb[ctx].ctxType # imported) => {
+attr ¨ And[UpdateTreeAttr[baseV], attr];
+PushTree[CopyTree[baseV]];  PushTree[val];
+IF indirect
+THEN {
+PushNode[dot, 2];
+SetAttr[2, Pass3Attributes.LongType[Pass3Attributes.OperandType[baseV]]];
+}
+ELSE {
+PushNode[dollar, 2];
+SetAttr[2, Pass3Attributes.LongPath[baseV]];
+};
+SetType[type];
+val ¨ PopTree[];
+};
+ENDCASE;
+IF Pass3Attributes.VarType[type] THEN [val, type] ¨ DeRef[val, type, TRUE];
+IF seb[sei].extended THEN attr ¨ And[UpdateExtension[sei], attr];
+}
+ELSE {
+attr ¨ And[UpdateTreeAttr[baseV], attr];
+type ¨ Pass3Attributes.OperandType[baseV];
+IF indirect
+THEN [val, type] ¨ DeRef[CopyTree[baseV], type]
+ELSE val ¨ CopyTree[baseV];
+};
+RPush[type, attr];
+};
+
+DeRef: PROC [t: Tree.Link, type: Type, var: BOOL ¨ FALSE] RETURNS [Tree.Link, Type] = {
+rType: Type = SymbolOps.ReferentType[SymbolOps.own, type];
+PushTree[t];
+PushNode[uparrow, 1];
+SetType[rType];
+SetAttr[2, Pass3Attributes.LongType[type]];
+SetAttr[3, var];
+RETURN [PopTree[], rType];
+};
+
+UpdateExtension: PROC [sei: ISEIndex] RETURNS [attr: Attr] = {
+t: Tree.Link;
+tag: ExtensionType;
+[tag, t] ¨ SymbolOps.FindExtension[SymbolOps.own, sei];
+IF tag # value
+THEN attr ¨ fullAttr
+ELSE {attr ¨ UpdateTreeAttr[t]; attr.const ¨ TRUE};
+};
+
+FieldId: PUBLIC PROC [hti: HTIndex, type: RecordSEIndex] RETURNS [n: NAT, sei: ISEIndex] = {
+[n, sei] ¨ SearchRecord[hti, type];
+IF n # 0 THEN {
+IF ~seb[sei].mark3 THEN ResolveIdType[sei];
+IF ~ConstResolved[sei] THEN ResolveIdValue[sei];
+BumpCount[sei];
+};
+};
+
+InterfaceId: PUBLIC PROC [hti: HTIndex, ctx: CTXIndex]
+RETURNS [found: BOOL, sei: ISEIndex] = {
+[found, sei] ¨ SearchCtxList[hti, ctx];
+IF found THEN {
+SELECT ctxb[seb[sei].idCtx].ctxType FROM
+imported => NULL;
+included =>
+IF ~SymbolOps.ConstantId[sei] OR ~InterfaceConst[sei] THEN MimosaLog.ErrorSei[notImported, sei];
+ENDCASE => {
+IF ~seb[sei].mark3 THEN ResolveIdType[sei];
+IF ~ConstResolved[sei] THEN ResolveIdValue[sei]};
+BumpCount[sei];
+};
+};
+
+ClusterId: PUBLIC PROC [hti: HTIndex, ctx: CTXIndex] 
+RETURNS [found: BOOL ¨ FALSE, sei: ISEIndex ¨ ISENull] = {
+WITH c: ctxb[ctx] SELECT FROM
+simple => [found, sei] ¨ SearchCtxList[hti, ctx];
+included => {
+mdi: MDIndex = c.module;
+IF mdb[mdi].defaultImport = CTXNull
+THEN {
+IF NOT SearchCtxList[hti, ctx].found THEN RETURN;
+[found, sei] ¨ SearchCtxList[hti, DefaultImport[LOOPHOLE[ctx], FALSE]];
+}
+ELSE
+[found, sei] ¨ SearchCtxList[hti, mdb[mdi].defaultImport];
+};
+ENDCASE => RETURN;
+IF found THEN {
+IF ~seb[sei].mark3 THEN ResolveIdType[sei];
+BumpCount[sei];
+};
+};
+InterfaceConst: PROC [sei: ISEIndex] RETURNS [BOOL] = {
+SELECT SymbolOps.LinkMode[SymbolOps.own, sei] FROM
+val, ref => RETURN [FALSE];
+ENDCASE => RETURN [TRUE];
+};
+
+ConstResolved: PROC [sei: ISEIndex] RETURNS [BOOL] = {
+sebp: LONG POINTER TO Symbols.SERecord.id = @seb[sei];
+RETURN [(sebp.mark4 OR sebp.idValue = SymbolOps.EncodeTreeIndex[Tree.nullIndex])
+OR ~sebp.immutable
+OR (sebp.constant AND ~RootType[sei])];
+};
+
+RootType: PROC [sei: ISEIndex] RETURNS [BOOL] = INLINE {
+RETURN [seb[sei].idType = typeTYPE
+AND SymbolOps.TypeLink[SymbolOps.own, sei] = nullType];
+};
+
+ResolveIdType: PROC [sei: ISEIndex] = {
+declNode: Tree.Index ¨ SymbolOps.DecodeTreeIndex[seb[sei].idValue];
+IF tb[declNode].attr3 # MimP3.mark THEN ResolveType[sei];
+};
+
+ResolveIdValue: PROC [sei: ISEIndex] = {
+sebp: LONG POINTER TO Symbols.SERecord.id = @seb[sei];
+declNode: Tree.Index ¨ SymbolOps.DecodeTreeIndex[sebp.idValue];
+IF sebp.mark3 AND tb[declNode].attr2 # MimP3.mark THEN ResolveValue[sei];
+};
+
+BumpCount: PUBLIC PROC [sei: ISEIndex] = {
+sebp: LONG POINTER TO Symbols.SERecord.id = @seb[sei];
+IF sebp.idType # typeTYPE AND
+(~sebp.mark4 OR (ctxb[sebp.idCtx].ctxType = imported AND ~sebp.constant)) THEN
+sebp.idInfo ¨ SymbolOps.EncodeCard[SymbolOps.DecodeCard[sebp.idInfo] + 1]
+};
+CompleteRecord: PUBLIC PROC [rSei: RecordSEIndex, depth: Closure¨$unit] = {
+ctx: CTXIndex = seb[rSei].fieldCtx;
+WITH ctxb[ctx] SELECT FROM
+included => IF SymbolOps.CtxLevel[SymbolOps.own, ctx] = lZ THEN
+MimosaCopier.CompleteContext[LOOPHOLE[ctx], depth, rSei];
+ENDCASE
+};
+
+ArrangeKeys: PUBLIC PROC
+[expList: Tree.Link, nextKey: NextKeyProc, omittedValue: OmittedValueProc]
+RETURNS [nItems: CARDINAL ¨ 0] = {
+Pair: TYPE = RECORD[key: HTIndex, val: Tree.Link];
+PairList: TYPE = RECORD[SEQUENCE length: CARDINAL OF Pair];
+
+ListItem: Tree.Map = {
+node: Tree.Index = GetNode[t];
+hti: HTIndex = GetHash[tb[node].son[1]];
+FOR i: CARDINAL IN [0 .. n) DO
+IF hti = a[i].key THEN GO TO Duplicate;
+REPEAT
+Duplicate => {
+duplicate ¨ TRUE;
+v ¨ t;
+};
+FINISHED => {
+a[n] ¨ [key: hti, val: tb[node].son[2]];
+n ¨ n+1;
+tb[node].son[2] ¨ Tree.Null;
+v ¨ FreeTree[t];
+};
+ENDLOOP;
+};
+
+DuplicateItem: Tree.Scan = {
+IF t # Tree.Null THEN {
+node: Tree.Index = GetNode[t];
+MimosaLog.ErrorTree[duplicateKey, tb[node].son[1]];
+tb[node].son[2] ¨ MimP3.VoidExp[tb[node].son[2]]}
+};
+
+key: HTIndex;
+m: CARDINAL;
+n: NAT ¨ 0;
+a: REF PairList ¨ MimZones.permZone.NEW[PairList[ListLength[expList]]];
+duplicate: BOOL ¨ FALSE;
+expList ¨ UpdateList[expList, ListItem];
+m ¨ n;
+UNTIL (key ¨ nextKey[]) = HTNull DO
+FOR i: CARDINAL IN [0 .. n) DO
+IF key = a[i].key THEN GO TO Found;
+REPEAT
+Found => {PushTree[a[i].val]; a[i].key ¨ HTNull; m ¨ m-1};
+FINISHED => PushTree[omittedValue[]];
+ENDLOOP;
+nItems ¨ nItems + 1;
+ENDLOOP;
+IF duplicate THEN ScanList[expList, DuplicateItem];
+IF m # 0 THEN
+FOR i: CARDINAL IN [0 .. n) DO
+IF a[i].key # HTNull THEN {
+MimosaLog.ErrorHti[unknownKey, a[i].key];
+[] ¨ FreeTree[MimP3.VoidExp[a[i].val]];
+};
+ENDLOOP;
+[] ¨ FreeTree[expList];
+MimZones.permZone.FREE[@a];
+};
+BindTree: PUBLIC PROC [t: Tree.Link, binding: PROC [ISEIndex] RETURNS [Tree.Link]]
+RETURNS [Tree.Link] = {
+
+MapTree: Tree.Map = {
+v ¨ t;
+IF t # Tree.Null THEN WITH t SELECT GetTag[t] FROM
+symbol => v ¨ binding[index];
+subtree => {
+tptr: LONG POINTER TO Tree.Node = @tb[index];
+SELECT TRUE FROM
+tptr.shared =>
+SELECT tptr.name FROM
+call, callx => v ¨ MapThreadedTree[t];
+ENDCASE;
+ENDCASE =>
+v ¨ TreeOps.CopyTree[[baseP: @tb, link: t], MapTree];
+};
+ENDCASE;
+};
+
+MapThread: Tree.Map = {
+IF OpName[t] = thread
+THEN {
+node: Tree.Index = GetNode[t];
+PushTree[MapTree[tb[node].son[1]]]; PushTree[Tree.Null];
+PushNode[thread, 2];
+SetAttr[1, FALSE];
+SetInfo[SymbolOps.FromBti[MimP3S.currentScope]];
+v ¨ PopTree[];
+}
+ELSE v ¨ MapTree[t];
+};
+
+MapThreadedTree: Tree.Map = {
+sThread: Tree.Index = GetNode[NthSon[t, 1]];
+dThread: Tree.Index;
+v ¨ TreeOps.CopyTree[[baseP: @tb, link: t], MapThread];
+dThread ¨ GetNode[NthSon[v, 1]];
+tb[dThread].son[2] ¨ tb[sThread].son[2];
+tb[sThread].son[2] ¨ v;
+MarkShared[v, TRUE];
+};
+
+RETURN [MapTree[t]];
+};
+
+IdentityBinding: PROC [sei: ISEIndex] RETURNS [Tree.Link] = {
+RETURN [[symbol[index: sei]]];
+};
+
+CopyTree: PUBLIC Tree.Map = {
+RETURN [BindTree[t, IdentityBinding]];
+};
+EnterRefLits: PROC [node: Tree.Index] = {
+IF node # Tree.nullIndex THEN
+SELECT tb[node].name FROM
+assign, assignx =>
+IF tb[node].attr2 AND tb[node].attr3 THEN
+EnterComposite[Pass3Attributes.OperandType[tb[node].son[1]], tb[node].son[2], tb[node].attr1];
+new =>
+IF tb[node].attr3 THEN {
+subType: Type = Pass3Attributes.TypeForTree[tb[node].son[2]];
+EnterType[SymbolOps.TypeRoot[SymbolOps.own, subType], FALSE];
+IF tb[node].son[3] # Tree.Null THEN
+EnterComposite[SymbolOps.UnderType[SymbolOps.own, subType], tb[node].son[3], TRUE];
+};
+listcons =>
+IF tb[node].attr3 THEN {
+rSei: Type = SymbolOps.ReferentType[SymbolOps.own, SymbolOps.ToType[tb[node].info]];
+cSei: CSEIndex = SymbolOps.UnderType[SymbolOps.own, ItemType[rSei]];
+EnterElement: Tree.Scan = {EnterComposite[cSei, t, TRUE]};
+EnterType[SymbolOps.TypeRoot[SymbolOps.own, rSei], FALSE];
+ScanList[tb[node].son[2], EnterElement];
+};
+ditem => {
+sei: ISEIndex = FirstId[GetNode[tb[node].son[1]]];
+UpdateNarrowing[seb[sei].idType, tb[node].attr2, tb[node].attr3];
+};
+narrow => {
+target: Type = SymbolOps.ToType[tb[node].info];
+IF SymbolOps.RCType[SymbolOps.own, target] = simple THEN {
+nType: CSEIndex = SymbolOps.NormalType[SymbolOps.own, target];
+WITH t: seb[nType] SELECT FROM
+ref => EnterType[t.refType, FALSE];
+ENDCASE;
+};
+UpdateNarrowing[target, tb[node].attr2, tb[node].attr3];
+};
+istype =>
+UpdateNarrowing[
+Pass3Attributes.TypeForTree[tb[node].son[2]],
+tb[node].attr2,
+tb[node].attr3];
+atom => {
+SymLiteralOps.EnterAtom[GetHash[tb[node].son[1]]];
+EnterType[MimData.typeAtomRecord, FALSE];
+};
+bind, bindx => 
+IF ~tb[node].attr3 THEN {
+tt: Tree.Link = NthSon[tb[node].son[1], 2];
+[] ¨ VariantUnionType[OpenedType[Pass3Attributes.OperandType[tt]]];
+};
+ENDCASE;
+};
+
+UpdateNarrowing: PROC [type: Type, rtTest, tagTest: BOOL] = {
+IF rtTest THEN
+EnterType[Pass3Attributes.MarkedType[SymbolOps.UnderType[SymbolOps.own, type]]];
+IF tagTest THEN {
+subType: CSEIndex ¨ OpenedType[type];
+DO
+next: CSEIndex ¨ SymbolOps.UnderType[SymbolOps.own, SymbolOps.TypeLink[SymbolOps.own, subType]];
+IF next = CSENull THEN EXIT;
+[] ¨ VariantUnionType[next];	-- guarantee that union is copied
+subType ¨ next;
+ENDLOOP
+};
+};
+
+UpdateTreeAttr: PUBLIC PROC [t: Tree.Link] RETURNS [attr: Attr] = {
+UpdateAttr: Tree.Scan = {
+WITH t SELECT GetTag[t] FROM
+symbol => {
+IF seb[index].idCtx = MimP3S.currentBody.argCtx THEN
+phraseNP ¨ MergeNP[phraseNP][ref];
+BumpCount[index];
+};
+subtree => {
+node: Tree.Index = index;
+ScanSons[t, UpdateAttr];
+EnterRefLits[node];
+SELECT tb[node].name FROM
+assign, assignx => {
+attr.noAssign ¨ FALSE;
+phraseNP ¨ MergeNP[phraseNP][set];
+};
+IN [call..join], IN [callx..joinx] => {
+MimP3S.currentBody.noXfers ¨ attr.noXfer ¨ FALSE;
+attr.noAssign ¨ FALSE;
+phraseNP ¨ MergeNP[phraseNP][set];
+};
+new, listcons => MimP3S.currentBody.noXfers ¨ attr.noXfer ¨ FALSE;
+ENDCASE;
+};
+ENDCASE;
+};
+attr ¨ fullAttr;
+phraseNP ¨ none;
+UpdateAttr[t];
+attr.const ¨ FALSE;
+};
+ContextEntry: TYPE = RECORD [
+base: Tree.Link,		-- the basing expr (empty if none)
+indirect: BOOL,		-- true iff basing expr is pointer
+info: SELECT tag: * FROM
+list => [ctx: CTXIndex],		-- a single context
+record => [rSei: RecordSEIndex],	-- a group of contexts
+hash => [ctxHti: HTIndex],	-- a single identifier
+ENDCASE
+];
+
+ContextSequence: TYPE = RECORD[SEQUENCE length: NAT OF ContextEntry];
+ContextStack: TYPE = REF ContextSequence;
+
+ctxStack: ContextStack ¨ NIL;
+ctxIndex: INTEGER ¨ 0;
+ContextIncr: CARDINAL = 16;
+
+ExpandStack: PROC = {
+oldstack: ContextStack ¨ ctxStack;
+ctxStack ¨ MimZones.permZone.NEW[ContextSequence[oldstack.length + ContextIncr]];
+FOR i: CARDINAL IN [0 .. oldstack.length) DO ctxStack[i] ¨ oldstack[i] ENDLOOP;
+MimZones.permZone.FREE[@oldstack];
+};
+
+PushCtx: PUBLIC PROC [ctx: CTXIndex] = {
+IF (ctxIndex ¨ ctxIndex+1) >= ctxStack.length THEN ExpandStack[];
+ctxStack[ctxIndex] ¨ [base: Tree.Null, indirect: FALSE, info: list[ctx]];
+};
+
+PushRecordCtx: PUBLIC PROC [rSei: RecordSEIndex, base: Tree.Link, indirect: BOOL] = { 
+IF (ctxIndex ¨ ctxIndex+1) >= ctxStack.length THEN ExpandStack[];
+ctxStack[ctxIndex] ¨ [base: base, indirect: indirect, info: record[rSei]];
+};
+
+PushHtCtx: PUBLIC PROC [hti: HTIndex, base: Tree.Link, indirect: BOOL] = {
+IF (ctxIndex ¨ ctxIndex+1) >= ctxStack.length THEN ExpandStack[];
+ctxStack[ctxIndex] ¨ [base: base, indirect: indirect, info: hash[hti]];
+};
+
+PopCtx: PUBLIC PROC = {ctxIndex ¨ ctxIndex-1};
+
+TopCtx: PUBLIC PROC RETURNS [CTXIndex] = {
+RETURN [WITH ctxStack[ctxIndex] SELECT FROM list => ctx, ENDCASE => ERROR];
+};
+FindSe: PUBLIC PROC [hti: HTIndex] RETURNS [ISEIndex, Tree.Link, BOOL] = {
+found: BOOL;
+nHits: NAT;
+sei: ISEIndex;
+FOR i: INTEGER DECREASING IN [0 .. ctxIndex] DO
+WITH s: ctxStack[i] SELECT FROM
+list => {
+[found, sei] ¨ SearchCtxList[hti, s.ctx];
+IF found THEN GO TO Found;
+};
+record => {
+[nHits, sei] ¨ SearchRecord[hti, s.rSei];
+SELECT nHits FROM
+= 1 => GO TO Found;
+> 1 => GO TO Ambiguous;
+ENDCASE;
+};
+hash => IF hti = s.ctxHti THEN {sei ¨ ISENull; GO TO Found};
+ENDCASE;
+REPEAT
+Found => RETURN [sei, ctxStack[i].base, ctxStack[i].indirect];
+Ambiguous => {
+MimosaLog.ErrorHti[ambiguousId, hti];
+RETURN [MimData.seAnon, Tree.Null, FALSE];
+};
+FINISHED => {
+IF hti # HTNull THEN MimosaLog.ErrorHti[unknownId, hti];
+RETURN [MimData.seAnon, Tree.Null, FALSE];
+};
+ENDLOOP;
+};
+
+SearchCtxList: PUBLIC PROC [hti: HTIndex, ctx: CTXIndex]
+RETURNS [found: BOOL ¨ FALSE, sei: ISEIndex ¨ ISENull] = {
+IF ctx # CTXNull THEN
+WITH c: ctxb[ctx] SELECT FROM
+included => {
+IF c.restricted
+THEN {
+sei ¨ SearchRestrictedCtx[hti, LOOPHOLE[ctx]];
+found ¨ (sei # ISENull);
+}
+ELSE {
+sei ¨ SymbolOps.SearchContext[SymbolOps.own, hti, ctx];
+SELECT TRUE FROM
+(sei # ISENull) =>
+found ¨ TRUE;
+(~c.closed AND ~c.reset) =>
+[found, sei] ¨ MimosaCopier.SearchFileCtx[hti, LOOPHOLE[ctx]];
+ENDCASE;
+};
+IF found AND ~seb[sei].public AND ~Shared[ctx]
+AND sei # MimData.seAnon THEN MimosaLog.ErrorSei[privateId, sei];
+};
+imported => {
+iCtx: IncludedCTXIndex = c.includeLink;
+sei ¨ SymbolOps.SearchContext[SymbolOps.own, hti, ctx];
+IF sei # ISENull
+THEN
+found ¨ ~ctxb[iCtx].restricted OR CheckRestrictedCtx[hti, iCtx] # ISENull
+ELSE {
+[found, sei] ¨ SearchCtxList[hti, iCtx];
+IF found AND sei # MimData.seAnon THEN
+SELECT SymbolOps.LinkMode[SymbolOps.own, sei] FROM
+val => {MoveSe[sei, ctx]; ImportSe[sei, ctx]};
+ref => {
+MoveSe[sei, ctx];
+IF ~MimData.interface THEN {
+idType: Type = seb[sei].idType;
+ut: CSEIndex = SymbolOps.UnderType[SymbolOps.own, idType];
+IF ~Pass3Attributes.VarType[ut] THEN {
+seb[sei].idType ¨ MakeRefType[
+cType: idType,
+bits: Target.bitsPerPtr,
+readOnly: seb[sei].immutable,
+hint: typeANY];
+seb[sei].immutable ¨ TRUE;
+};
+};
+ImportSe[sei, ctx];
+};
+ENDCASE;
+};
+};
+ENDCASE => {
+sei ¨ SymbolOps.SearchContext[SymbolOps.own, hti, ctx];
+found ¨ (sei # ISENull);
+};
+};
+
+MoveSe: PROC [sei: ISEIndex, ctx: CTXIndex] = {
+MimosaCopier.Delink[sei];
+seb[sei].idCtx ¨ ctx;
+SymbolOps.SetSeLink[sei, ctxb[ctx].seList];
+ctxb[ctx].seList ¨ sei;
+};
+MainIncludedCtx: PUBLIC PROC [mdi: MDIndex] RETURNS [ctx: IncludedCTXIndex] = {
+FOR ctx ¨ mdb[mdi].ctx, ctxb[ctx].chain UNTIL ctx = CTXNull DO
+IF SymbolOps.CtxLevel[SymbolOps.own, ctx] = lG THEN EXIT;
+ENDLOOP;
+};
+
+DefaultImport: PROC [iCtx: IncludedCTXIndex, new: BOOL] RETURNS [CTXIndex] = {
+mdi: MDIndex = ctxb[iCtx].module;
+IF mdb[mdi].defaultImport = CTXNull THEN SetDefaultImport[iCtx, new];
+RETURN [mdb[mdi].defaultImport];
+};
+
+ImportTree: PROC [t: Tree.Link, importCtx: CTXIndex] RETURNS [Tree.Link] = {
+iCtx: IncludedCTXIndex = WITH c: ctxb[importCtx] SELECT FROM
+imported => c.includeLink,
+ENDCASE => ERROR;
+
+UpdateBinding: Tree.Map = {
+WITH t SELECT GetTag[t] FROM
+symbol => {
+oldSei: ISEIndex = index;
+oldCtx: CTXIndex = seb[oldSei].idCtx;
+newSei: ISEIndex;
+WITH c: ctxb[oldCtx] SELECT FROM
+included =>
+IF SymbolOps.CtxLevel[SymbolOps.own, oldCtx] # lG OR InterfaceConst[oldSei]
+THEN newSei ¨ oldSei
+ELSE {
+mdi: MDIndex = c.module;
+saveRestricted: BOOL = c.restricted;
+saveShared: BOOL = mdb[mdi].shared;
+targetCtx: CTXIndex;
+c.restricted ¨ FALSE;  mdb[mdi].shared ¨ TRUE;
+targetCtx ¨ IF oldCtx = iCtx
+THEN importCtx
+ELSE DefaultImport[LOOPHOLE[oldCtx], TRUE];
+newSei ¨ SearchCtxList[seb[oldSei].hash, targetCtx].sei;
+mdb[mdi].shared ¨ saveShared; c.restricted ¨ saveRestricted;
+};
+ENDCASE => newSei ¨ oldSei;
+v ¨ [symbol[index: newSei]];
+IF ~MimData.interface AND ctxb[seb[newSei].idCtx].ctxType = imported THEN {
+type: CSEIndex = SymbolOps.UnderType[SymbolOps.own, seb[newSei].idType];
+WITH s: seb[type] SELECT FROM
+ref => IF ~s.var THEN [v, ] ¨ DeRef[v, type];
+ENDCASE;
+};
+BumpCount[newSei];
+};
+subtree => {
+node: Tree.Index = index;
+EnterRefLits[node];
+v ¨ UpdateLeaves[t, UpdateBinding]};
+ENDCASE => v ¨ t;
+};
+RETURN [UpdateBinding[t]];
+};
+
+ImportCtx: PROC [ctx, importCtx: CTXIndex, level: NAT] = {
+FOR sei: ISEIndex ¨ SymbolOps.FirstCtxSe[SymbolOps.own, ctx], SymbolOps.NextSe[SymbolOps.own, sei] UNTIL sei = ISENull DO
+ImportSe[sei, importCtx, level];
+ENDLOOP
+};
+
+ImportSe: PROC [sei: ISEIndex, importCtx: CTXIndex, level: NAT ¨ 0] = {
+type: CSEIndex = SymbolOps.UnderType[SymbolOps.own, seb[sei].idType];
+IF level = 0 THEN
+WITH t: seb[type] SELECT FROM
+transfer => {
+ImportCtx[SymbolOps.ArgCtx[SymbolOps.own, t.typeIn], importCtx, level+1];
+ImportCtx[SymbolOps.ArgCtx[SymbolOps.own, t.typeOut], importCtx, level+1]};
+ENDCASE;
+IF seb[sei].extended THEN {
+t: Tree.Link;
+tag: ExtensionType;
+[tag, t] ¨ SymbolOps.FindExtension[SymbolOps.own, sei];
+SymbolOps.EnterExtension[sei, tag, ImportTree[t, importCtx]];
+};
+};
+SearchRecordSegment: PROC [hti: HTIndex, rSei: RecordSEIndex, suffixed: BOOL]
+RETURNS [nHits: NAT ¨ 0, sei: ISEIndex ¨ ISENull] = {
+found: BOOL;
+n: NAT;
+match: ISEIndex;
+[found, sei] ¨ SearchCtxList[hti, seb[rSei].fieldCtx];
+IF found THEN nHits ¨ 1;
+IF seb[rSei].hints.variant THEN {
+tSei: CSEIndex = VariantUnionType[rSei];
+WITH t: seb[tSei] SELECT FROM
+union => {
+IF ~suffixed AND ~t.controlled AND t.overlaid THEN {
+[n, match] ¨ SearchOverlays[hti, t.caseCtx, rSei];
+IF ~found THEN sei ¨ match;
+nHits ¨ nHits + n;
+};
+IF t.controlled AND seb[t.tagSei].hash = hti THEN {sei ¨ t.tagSei; nHits ¨ nHits + 1};
+};
+sequence =>
+IF t.controlled AND seb[t.tagSei].hash = hti THEN {sei ¨ t.tagSei; nHits ¨ nHits + 1};
+ENDCASE;
+};
+};
+
+SearchOverlays: PROC [hti: HTIndex, ctx: CTXIndex, rSei: RecordSEIndex]
+RETURNS [nHits: NAT ¨ 0, sei: ISEIndex ¨ ISENull] = {
+WITH ctxb[ctx] SELECT FROM
+included => MimosaCopier.CompleteContext[LOOPHOLE[ctx], unit, rSei];
+ENDCASE;
+FOR vSei: ISEIndex ¨ SymbolOps.FirstCtxSe[SymbolOps.own, ctx], SymbolOps.NextSe[SymbolOps.own, vSei]
+UNTIL vSei = ISENull DO
+IF seb[vSei].public OR Shared[ctx] THEN {
+type: Type = SymbolOps.DecodeType[seb[vSei].idInfo];
+WITH r: seb[type] SELECT FROM
+cons =>
+WITH r SELECT FROM
+record => {
+n: NAT;
+match: ISEIndex;
+[n, match] ¨ SearchRecordSegment[hti, LOOPHOLE[type], FALSE];
+IF nHits = 0 THEN sei ¨ match;
+nHits ¨ nHits + n;
+};
+ENDCASE => ERROR;
+ENDCASE;
+};
+ENDLOOP;
+};
+
+SearchRecord: PROC [hti: HTIndex, type: RecordSEIndex]
+RETURNS [nHits: NAT ¨ 0, sei: ISEIndex ¨ ISENull] = {
+rSei: RecordSEIndex ¨ type;
+suffixed: BOOL ¨ FALSE;
+UNTIL rSei = RecordSENull DO
+[nHits, sei] ¨ SearchRecordSegment[hti, rSei, suffixed];
+IF nHits # 0 THEN RETURN;
+rSei ¨ WITH seb[rSei] SELECT FROM
+linked => LOOPHOLE[SymbolOps.UnderType[SymbolOps.own, linkType]],
+ENDCASE => RecordSENull;
+suffixed ¨ TRUE;
+ENDLOOP;
+};
+Shared: PUBLIC PROC [ctx: CTXIndex] RETURNS [BOOL] = {
+RETURN [WITH c: ctxb[ctx] SELECT FROM
+included => mdb[c.module].shared,
+imported => Shared[c.includeLink],
+ENDCASE => TRUE]
+};
+
+CtxRestriction: TYPE = RECORD [ctx: IncludedCTXIndex, list: Tree.Link, linked: BOOL¨FALSE];
+CtxIdTable: TYPE = RECORD [SEQUENCE length: CARDINAL OF CtxRestriction];
+ctxIdTable: REF CtxIdTable ¨ NIL;
+
+CtxHash: PROC [ctx: IncludedCTXIndex] RETURNS [CARDINAL] = INLINE {
+RETURN [CARDINAL[(ctx-IncludedCTXNull)/CTXRecord.included.SIZE] MOD ctxIdTable.length]
+};
+
+MakeIdTable: PUBLIC PROC [nIdLists: CARDINAL] = {
+ctxIdTable ¨ MimZones.permZone.NEW[CtxIdTable[nIdLists]];
+FOR i: CARDINAL IN [0..nIdLists) DO ctxIdTable[i] ¨ [IncludedCTXNull, Tree.Null] ENDLOOP;
+};
+
+EnterIdList: PUBLIC PROC [ctx: IncludedCTXIndex, list: Tree.Link] = {
+i: CARDINAL ¨ CtxHash[ctx];
+DO
+SELECT ctxIdTable[i].ctx FROM
+IncludedCTXNull => {ctxIdTable[i] ¨ [ctx, list]; EXIT};
+ctx => ctxIdTable[i].linked ¨ TRUE;
+ENDCASE;
+IF (i ¨ i+1) = ctxIdTable.length THEN i ¨ 0;
+ENDLOOP
+};
+
+CheckRestrictedCtx: PROC [hti: HTIndex, ctx: IncludedCTXIndex] RETURNS [sei: ISEIndex] = {
+TestId: Tree.Test = {
+WITH t SELECT GetTag[t] FROM
+hash => IF index = hti THEN sei ¨ MimData.seAnon;
+symbol => IF seb[index].hash = hti THEN sei ¨ index;
+ENDCASE;
+RETURN [sei # ISENull];
+};
+i: CARDINAL ¨ CtxHash[ctx];
+DO
+IF ctxIdTable[i].ctx = ctx THEN {
+sei ¨ ISENull;  SearchList[ctxIdTable[i].list, TestId];
+IF sei # ISENull OR ~ctxIdTable[i].linked THEN EXIT;
+};
+IF (i ¨ i+1) = ctxIdTable.length THEN i ¨ 0;
+ENDLOOP;
+IF sei # ISENull AND seb[sei].idCtx = CTXNull THEN seb[sei].idCtx ¨ ctx;
+};
+
+SearchRestrictedCtx: PROC [hti: HTIndex, ctx: IncludedCTXIndex] RETURNS [sei: ISEIndex] = {
+sei ¨ CheckRestrictedCtx[hti, ctx];
+IF sei # ISENull AND sei # MimData.seAnon AND seb[sei].idCtx # ctx THEN {
+[ , sei] ¨ MimosaCopier.SearchFileCtx[hti, ctx];
+seb[sei].public ¨ TRUE; -- second copy, access already checked
+};
+};
+
+CheckDirectoryIds: Tree.Scan = {
+CheckId: Tree.Scan = {
+WITH t SELECT GetTag[t] FROM
+symbol =>
+IF seb[index].idCtx = CTXNull THEN MimosaLog.WarningSei[unusedId, index];
+ENDCASE;
+};
+node: Tree.Index = GetNode[t];
+saveIndex: SourceMap.Loc = MimData.textIndex;
+MimData.textIndex ¨ ToLoc[tb[node].info];
+ScanList[tb[node].son[3], CheckId];
+MimData.textIndex ¨ saveIndex;
+};
+
+CheckDisjoint: PUBLIC PROC [ctx1, ctx2: CTXIndex] = {
+saveIndex: SourceMap.Loc = MimData.textIndex;
+IF ctx1 # CTXNull AND ctx2 # CTXNull THEN
+FOR sei: ISEIndex ¨ SymbolOps.FirstCtxSe[SymbolOps.own, ctx2], SymbolOps.NextSe[SymbolOps.own, sei] UNTIL sei = ISENull DO
+hti: HTIndex ¨ seb[sei].hash;
+IF hti # HTNull
+AND SymbolOps.SearchContext[SymbolOps.own, hti, ctx1] # ISENull THEN {
+IF ~seb[sei].mark3 THEN
+MimData.textIndex ¨ ToLoc[tb[SymbolOps.DecodeTreeIndex[seb[sei].idValue]].info];
+MimosaLog.ErrorHti[duplicateId, hti];
+};
+ENDLOOP;
+MimData.textIndex ¨ saveIndex;
+};
+OpenedType: PROC [type: Type] RETURNS [CSEIndex] = {
+subType: CSEIndex = SymbolOps.NormalType[SymbolOps.own, type];
+WITH t: seb[subType] SELECT FROM
+ref => type ¨ t.refType;
+ENDCASE;
+RETURN [SymbolOps.UnderType[SymbolOps.own, type]];
+};
+
+OpenPointer: PUBLIC PROC [t: Tree.Link, type: Type] RETURNS [Tree.Link, CSEIndex] = {
+rType: CSEIndex;
+nDerefs: CARDINAL ¨ 0;
+DO
+nType: CSEIndex ¨ SymbolOps.NormalType[SymbolOps.own, type];
+WITH p: seb[nType] SELECT FROM
+ref => {
+rType ¨ SymbolOps.UnderType[SymbolOps.own, p.refType];
+IF MimP3S.safety = checked AND
+~(p.counted OR Pass3Attributes.PermanentType[p.refType]) THEN 
+MimosaLog.ErrorTreeOp[unsafeOp, t, uparrow];
+IF seb[SymbolOps.NormalType[SymbolOps.own, rType]].typeTag # ref THEN EXIT;
+IF (nDerefs ¨ nDerefs+1) > 63 THEN EXIT;
+};
+ENDCASE;
+[t, type] ¨ DeRef[t, type];
+ENDLOOP;
+RETURN [t, rType];
+};
+
+BaseTree: PUBLIC PROC [t: Tree.Link, type: Type] RETURNS [val: Tree.Link] = {
+PushTree[t];  PushNode[openx, 1];  SetType[type];  SetAttr[1, FALSE];
+val ¨ PopTree[];
+MarkShared[val, TRUE];
+};
+
+OpenBase: PUBLIC PROC [t: Tree.Link, hti: HTIndex] RETURNS [v: Tree.Link] = {
+type, vType: Type;
+nType: CSEIndex;
+OpenRecord: PROC [indirect: BOOL] = {
+sei: CSEIndex = SymbolOps.UnderType[SymbolOps.own, type];
+WITH seb[sei] SELECT FROM
+record => {
+v ¨ BaseTree[v, vType];
+IF hti # HTNull
+THEN PushHtCtx[hti, v, indirect]
+ELSE PushRecordCtx[LOOPHOLE[sei, RecordSEIndex], v, indirect];
+};
+ENDCASE => IF sei # typeANY THEN MimosaLog.ErrorTree[typeClash, v];
+};
+v ¨ Exp[t, typeANY];
+type ¨ vType ¨ RType[];
+nType ¨ SymbolOps.NormalType[SymbolOps.own, vType];
+RPop[];
+SELECT SymbolOps.TypeForm[SymbolOps.own, nType] FROM
+$definition, $transfer => {
+ctx: CTXIndex = InterfaceCtx[nType, v];
+SELECT TRUE FROM
+ctx = CTXNull => OpenRecord[FALSE];
+hti # HTNull => PushHtCtx[hti, v, FALSE];
+ENDCASE => PushCtx[ctx];
+};
+$ref => {
+[v, type] ¨ OpenPointer[v, vType];
+vType ¨ Pass3Attributes.OperandType[v];
+OpenRecord[TRUE];
+};
+ENDCASE => OpenRecord[FALSE];
+};
+
+CloseBase: PUBLIC PROC [t: Tree.Link, hti: HTIndex] = {
+CloseRecord: PROC = {
+IF SymbolOps.TypeForm[SymbolOps.own, type] = $record THEN PopCtx[];
+};
+type: Type ¨ SymbolOps.NormalType[SymbolOps.own, Pass3Attributes.OperandType[t]];
+SELECT SymbolOps.TypeForm[SymbolOps.own, type] FROM
+$definition => PopCtx[];
+$ref => {type ¨ SymbolOps.ReferentType[SymbolOps.own, type]; CloseRecord[]};
+ENDCASE => CloseRecord[]
+};
+IdInit: PUBLIC PROC = {
+(MimData.table).AddNotify[IdNotify];
+refStack ¨ MimZones.permZone.NEW[RefSequence[16]];
+refIndex ¨ 0;
+ctxStack ¨ MimZones.permZone.NEW[ContextSequence[2*ContextIncr]];
+ctxIndex ¨ -1;
+};
+
+IdReset: PUBLIC Tree.Scan = {
+IF MimData.nErrors = 0 THEN ScanList[t, CheckDirectoryIds];
+MimZones.permZone.FREE[@ctxIdTable];
+MimZones.permZone.FREE[@ctxStack];
+MimZones.permZone.FREE[@refStack];
+(MimData.table).DropNotify[IdNotify];
+};
+}.
+
+     
+Pass3I.mesa
+Copyright ” 1985, 1986, 1987, 1988, 1989, 1990, 1991 by Xerox Corporation.  All rights reserved.
+Russ Atkinson (RRA) February 5, 1990 7:15:13 pm PST
+Satterthwaite, June 25, 1986 3:51:06 pm PDT
+uninitialized variable processing
+tables defining the current symbol table
+called whenever the main symbol table is repacked
+type table management
+RRA: this is here to assist the later passes when they are looking up the types for RC assignment.  It may be overkill.
+This probably arose from a previous error, so don't try to enter it here.
+This probably arose from a previous error, so don't try to enter it here.
+This probably arose from a previous error, so don't try to enter it here.
+This probably arose from a previous error, so don't try to enter it here.
+identifier look-up
+avoid creating spurious principal imports
+service routines for above
+keyed-list matching
+service routines for copying/mapping list structure
+attribute completion/updating
+guarantee that union is copied
+traverses the tree, incrementing reference counts for ids
+conservative
+context stack management
+primary lookup
+import handling
+this trick doesn't generalize (really need a marking scheme)
+searching records
+management of restricted contexts
+basing management
+initialization/finalization
+ù $   ïNewlineDelimiter
+ñ(cedarcode) styleô headôIcodeöú
+œeúUô`Lô3Löœy+ô+öœk	ò	Löúüú#ò.LöúüúUòbLöúüú*ò<Löú
+üú:òILöúüúÒò¸Löúüú%ò1Löú	üúòLöúüúTòiLöú
+üúòLöú
+üú™òπLöúüúØòºLöúüúò+Löúüúüúò-LöúüúGòQLöúüúœò‹óóöœnúüòLöüúuò|LöüúòLöüúòóô!Löú	üúüú)ò?Lò.Lò Löúüúüúüú	üúüú
+òBLöú
+üúüúò!Lò LöúüúòLöú
+üúòLò ö†úüúüúò&LòLöúüúò1Lö
+üúüúüúüúüúòFLöúüúò"LòLò óö†úüúüúò.öüúüú+üúòYöüúòLöüúüú%òHLò+LòLòóLöüúòóLòLò óö†	úüúüúò*öüúüú-üúüúòdö	üúüúü
+úüúüò.LöúòöüúüòLöúüúüúüúò=Löúüúüúüúò(LöüúòóLöüúòóLòóòLò óóö†úüúüúòLöüúüú%òHLòLòLòLò óö†úüúüúòLòLòLöüúüúüúò+LòLò óö
+†úüúüúüúüúò5öüúüúü
+úüúüúüòJLò öüúüúüòLöúòLöúòLöüúòöüúMòPLò)óLöüúòóLòLòLöüúòóLöüúüúüúòCLòLò óö†úüúüúüúò5Löúüúüúüú!ò6Löüúüúüúüúò$öüúüúòLò;Löüúüú!òBLòóLöüúüúòLòóóô(Löúüúœcò"Löúüú°ò$Löúüú°ò*Löúüú°ò1Lò ö†úòLô1LòLòLòLòLòóóôö
+†	úüúüúüúüúò?Lò)Lò8LòLò óö†úüú-òBöüúüúüòò	öüúüúòLòöüú`üúüòyLòöúòLöüúüúüú*òJóLöüúòóLòóóòöüú-üò3Löúüúò9óóLöüúòóòLò óóö†úüúò%öüòLò=Löüú1üúüúò=öüúüúüò Löú1üúò7LòCLöú/üúò5LòFLöüúüúòóLöüúüú"ò8LöüúòóLòöúüúüúòLöüútôwLò óóö†úüúüú"üúòFö	üúüúüúüúüò5òLöúüúüúüúò-öüú	üòòLòLöú>ò>Löüúüúüúüú	ò%Löüú3üúüúüú	òHLöüúòLòóòöüú3üúò;LòLöúNòNöüúüúüòöúòLöúüúò$LöúGòGLö	üúüúüúüú
+°ò7LòóöüúòLôIóóLòóLöüúòLòóò
+LòLöú@ò@öüúüúüòöúòLöúüúò$Löú'ò'LòóöüúòLôIóóLöüúòLòóòLòLöúNòNöüúüúüòò
+LòFöüú.üúò6Lö†ú.ò:LöúòLö
+üúüúüúüúüú	ò.LòóLòóöüúòLôIóóLöüúòLòóòLöúNòNöüúüúüòò
+LòFöüú.üúò6Löú#üúò*Lö
+üúüúüúüúüú	ò.LòóLòóöüúòLôIóóLöüúòLòóLöüúòóLòóLöüúòóöüú)üò3öúòLöüúüú'ò<óöüúò
+Löüú3üúüúüú	òHóóLöüú@üúòKòLò óóö†úüú+üúòILòHö†
+úòöüúüúòLòHöüúüúüò ò	öüúüú1üòKLöúüúòóóLöüúòóLöú!ò!LòóLò+LòóLöüúüúò'LòLòóóôö†úüúüúüúò;LòLòLòLòLòLöú
+üúòLò%öüúòöüúòLöüúüúüúòALöüúüúò+LòLòLòöüúüòòLò'öüúüúüúüòCLò%óLòóòöüúüú0üòMLòóLöúüúòLòóöüúòLöüúüúò0LòLòóóöüúüúüòòLöüú!üúò7öüú-üúüòCöüúüòLöüú@òBLöüú)ò0óóLòóöúüú#ò3Lò(Lò*öüú	òöüúòLòLöúIòILòóöüúòLòLöú,ò,LòóóLòLòLòóLöüúòóLöüúüú üúòKLöüúüú(òALòóöüúòLò(Löú*ò*öüú	òLöüú+ò/LöüúòóLòóóLòLòLò óö
+†úüú!üúüúüúòWLò:LòLòLòLöú+ò+LòLöüúòLòLò óö†úüúüúò>LòLòLò7öüúòLöüúòLöüú)üúò3óLòLò óö
+†úüúüú%üúüúò\Lò#öüúüúòLöüúüúò+Löüúüúò0LòLòóLòLò óö
+†úüúüúüú	üúò_Lò'öüúüúòöüúüò(LöúüúòòLöüúüúüú&ò`öüúòLöüúüúò+Löüúüúò1óóóLòLòóLòLò óö
+†	úüúüú üú	üúòpöüúüúüòLò1òLòöüú!ò#öüúòLô)Löüúüúüúüúò1Löú0üúüúòGLòóöüòLò:óóLòóLöüúüúòóöüúüúòLöüúüúò+LòLòóLòóóôö†úüúüúüúò7öüú(üò2LöúüúüúòLöüúüúüúòóLòLò óö†úüúüúüúò6Löúüúüúüú!ò6Lö
+üúüú;üúüúüúòãòLò óóö
+†úüúüúüúüúò8Löüúüú4òZLòLò óö†úüúò'LòCLöüú!üúò9LòLò óö†úüúò(Löúüúüúüú!ò6Lò?Löüúüú!üúòILòLò óö†	úüúüúò*Löúüúüúüú!ò6ö	üúüúüú&üúüòlLòIóLòóóôö†úüúüú0òKLò#öüúüúüòöúüú-üò?Löúüúò9óLöüòóòLò óóö
+†úüúüúKüú
+üú	òÜLöúüúüúò2Löú
+üúüúüú	üúüúò;Lò ö†úòLòLò(öüúüúüú
+üòLöüúüúüúüúò'öüòòLöúüúòLòLòóöüúòLò(LòLòLòLòóóLöüúòóLòLò óö†úòöüúüúòLòLò3Löú1ò1óòLò óóLòLöúüúòLöúüúòLöúüúüú òGLöúüúüúòLò(Lòöüúüò#öüúüúüú
+üòLöüúüúüúüúò#öüòLò:Löüúò%óLöüúòóLòLöüúòóLöüúüú"ò3öüúüòöüúüúüú
+üòöüúüúòLò)Löú'ò'LòóLöüúòóóLòLöúüúòLòóóô3ö†úüúüúüúüúüúòjLò ö†úòLòö	üúüúüúüúüò2LòòLöúüúüúüúò-öüúüúüòòöüúüòLò&Löüúòóóöüúò
+Lò5óóLòóLöüúòóLòLò óö†	úòöüúòöüúòLòLò8LòLöúüúòLöú0ò0LòLòóLöüúòóLòLò óö†úòLò,LòLò7Lò Lò(LòLöúüúòLòLò óLöüúòLòLò óö†úüúüúò=LöüúòLòLò óö†úüúòLöüú ò&Löúòóóôö†úüúò)öüúüòöüúüòòöüúüúüò)Löú^ò^óóòöüúüúòLöú=ò=Löú6üúò=öüúüò#LöúMüúòSóLòóóòöüúüúòLòTLòDLö†ú'üúò:Löú3üúò:Lò(Lòóóò
+Lò2LòALòóòLöú/ò/öüú2üúò:Löú>ò>öüúüúüòLöúüúò#LöüúòóLòóLöú8ò8Lòóò	Löú_ò_óò	Lò2Löú"üúò)LòóòöüúüúòLôLò+LöúCòCLòóóLöüúòóóòLò óóö†úüúüúò=öüúüòLöúPòPóöüú	üúòLò%öüòLò`LöüúüúüúòLöú°!ò>LòLöüòóLòóLòLò óö†úüúüúüúòCLô9ö†
+úòöüúüúüòòöüú.üò4Lò"óLòLòóòLòLòLòöüúüòòLöúüúòLò"Lòóöüúüúò'LôLöú+üúò1LöúüúòLò"LòóLöú<üúòBLöüúòóLòóLöüúòóLòóLòLòLòLöúüúòLòóóôöúüúüúòLöú°"ò4Löú
+üú°"ò3öúüúüòLöú°ò-Löú!°ò7Löú°ò1LöüòóòLò óóLöúüúüúüú	üúüúòELöúüúüúò)Lò LöúüúòLöú
+üúòLöúüúòLò ö†úüúòLò"Löúüú1òQLö
+üúüúüúüúüúòOLöúüúò"LòLò óö†úüúüúò(Löüú,üúòALöú1üúòILòLò óö†úüúüú2üúòVLöüú,üúòALòJLòLò óö†	úüúüú+üúòJLöüú,üúòALòGLòLò óLö†úüúüúò.Lò ö†úüúüúüúò*LöüúüúüúüúüúüúòKLòóóôö
+†úüúüúüúüúòJLöúüúòLöúüúòLòö	üúüúü
+úüúüò/öüúüúüòò	Lò)LöüúüúüúüúòLöúòóòLò)öüúüòLöúüúüúòLöúüúüúòLöüúòóLöúòóLö	úüúüúüúüúò<LöüúòóöüòLöú	üú/ò>òLò%Löüúüúò*LòóöüúòLöüúüú$ò8Löüúüúò*LòóóLöüúòóLòLò óö
+†úüúüúüú	üúòsöüúüòöüúüúüòòöüúòöüúòLöúüúò.LòLòóöüúòLò7öüúüúüòòLöúüúòóöúüúòLöú/üúò>óLöüúòóLòóóLö
+üúüúüúüúüú$òpLòóòLò'Lò7öüúòöüòLöúüú(òIóöüúòLò(öüúüúüò&öüú(üò2Lò.òLòöüúüúòLöúòLöú:ò:öüúüúò&òLöúòLòLòLòóLöúüúòLòóLòóLòLòóLöüúòóóLòóóLòóöüúòLò7LòLòóóóLòLò óö†úüú#ò/LòLòLò+LòLòóóôö†úüúüúüúòOöüú%üúüò>Löüú-üúüúò9LöüúòóLòLò óö†úüúüúüúòNLò!Löüú"üúòELöüúò LòLò óö†
+úüú%üúòLöúüúüúüò<LòLöüúüúòLò óö†úòöüúüúüòòLòLò%Lòöüúüúüò òöüú0üúòKLöüúòöüúòLòLöúüúò$Löúüúò#LòLöúüúüúò.öúüúòLöüú
+òLöüúüú
+üúò+óLò8Lò<LòóóóLöüúòóLòöüúüú,üúòKLòHöüúüúüòLöúüúüúò-LöüúòóLòóLòLòóòLòLòLò$óLöüú
+òóLòóLöüúòLòLò óö†	úüú#üúò:öüú`üúüòyLò LöüòóòLò óóö†úüú-üú	òGLòEöüúüòLô<öüúüúüòòLòILòKóLöüúòóóöüúüúòLòLòLò7Lò=LòóLòóóôö
+†úüú/üúüú	üú"òÉLöúüúòLöúüúòLòLò6Löüúüúòöüúüúò!Lò(öüúüúüòò
+öüúüúüúüúò4Löú2ò2LöüúüúòLòLòóLöüúüúüú%òVLòóòLöüúüúüú%òVóLöüúòóLòóLòLò óö†úüú4üú	üú"ò}öüúüúüòLöú)üúòDLöüúòóöüúbüúüò|öüúüúüúò)Lò4öüúüúüòòöüúüúüòòLöúüúòLòLöú&üúüúò=LöüúüúòLòLòóLöüúüúòóóLöüúòóLòóLöüúòóLòLò óö†úüú%üú	üú"òlLòLöú
+üúüúòöüúüòLò8Löüúüúüúòöúüúüúüò!Löú
+üú/òALöüúòóLöúüúòLöüúòóLòóóô!ö
+†úüúüúüúüúò6öüúüúüúüò%Lò!Lò"LöüúüúòóòLò óóLöúüúüú2ü
+úò[Löúüúüúüú	üúüúòHLöúüúüúò!Lò ö
+†úüúüúüúüúòCLöüúüú*üúüúòVLòLò óö†úüúüúüúò1Löúüúò9Lö
+üúüúüúüú.üúòYLòLò óö†úüúüú-òELöúüúòöüòöüúüòLöú1üúò7Löúüúò#LöüúòóLöüúüúò,LöüòóòLò óóö†úüú'üúòZö†úòöüúüúüòLöúüúüúò1Löú
+üúüúò4LöüúòóLöüúòLòóLöúüúòöüòöüúüúò!Lò7Löüúüúüúüúò4LòóLöüúüúò,LöüúòóLöüúüúüúòHLòLò óö†úüú&üúò[Lò#öüúüúüúüúòILò0Löúüú°&ò>LòóLòLò óö†úò ö†úòöüúüúüòöú	ò	Löüúüú'òIóLöüúòóLòóLòLò-Lò)Lò#LòLòLò óö†úüúüúò5Lò-öüúüúüò)öüúaüúüòzLòöüúüú=üúòVöüúüòLòPóLò%LòóLöüúòóóLòLòóóôö†
+úüúüúò4Lò>öüúüúüò LòLöüúòóLöüú,ò2òLò óóö†úüúüúüúòULòLöú	üúòöüòLò<öüúüúüòòLò6öüúüúüú+üúò]Lò,óLöüú?üúüúòKLöüúüúüúò(LöúòóLöüúòóLòLöüúòóLöüúòLòLò óö†úüúüúüúòMLöú>üúòELòLöúüúòLòLò óö†úüúüúüúòMLòLòö†
+úüúüúò%Lò9öüú
+üúüòòLòöüúòLöüúò Löüúüú#ò>óLöúòóLöüúüúüú#òCóLòóLòLòLò3Lòöüú*üò4òLò'öüúüúüòLöúüúò#Löú"üúò)LöüúòóLòóò	Lò"Löú'ò'LöúüúòLòóLöüúüúòóLòLò óö†	úüúüú!ò7ö†úüúòLöüú3üú
+òCLöúòóLöúQòQöüú)üò3LòLòLLöüúòóLòóóôö†úüúüúòLò$Löúüúò2LòLöúüú!òALòLòLò óö†úüúòLöüúüú ò;Löúüúò$Löúüúò"Löúüúò"Lò%LòóóKòLò ó Öó    É  ¨‰  

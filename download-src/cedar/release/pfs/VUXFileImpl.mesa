@@ -1,0 +1,1547 @@
+
+DIRECTORY
+Arpa,
+Ascii,
+Basics,
+Basics16,
+BasicTime USING [GetClockPulses, GMT, Now, nullGMT, Pack, Period, TimeNotKnown, Update],
+Convert,
+CStrings USING [CString],
+HostTime,
+IO,
+PFS,
+PFSBackdoor,
+PFSClass,
+PFSNames,
+RefText USING [ObtainScratch, ReleaseScratch],
+Rope USING [Compare, Cat, Concat, Equal, Fetch, Find, FindBackward, Flatten, FromChar, FromRefText, Index, IsEmpty, IsPrefix, Length, Match, ROPE, Substr],
+UnixErrno,
+UnixFSPrivate USING [ReportFailure, TranslateErrno],
+UnixSysCalls,
+UnixSysCallExtensions USING [SetGetBlocking, SetPutBlocking],
+UXStrings,
+UnixTypes USING [AccModTimes, FD, FileFlags, Fmt, Mode, RES, Stat, Time, TimeVal],
+VUXFiles
+;
+
+VUXFileImpl: CEDAR MONITOR LOCKS lock.lock USING lock: REF VUXData
+IMPORTS Arpa, Ascii, Basics, Basics16, BasicTime, Convert, HostTime, IO, PFS, PFSBackdoor, PFSClass, PFSNames, RefText, Rope, UnixErrno, UnixFSPrivate, UnixSysCalls, UnixSysCallExtensions, UXStrings, VUXFiles
+EXPORTS PFS, VUXFiles
+~ {
+OpenFileObject: PUBLIC TYPE ~ PFSClass.OpenFileObject; -- necessary to establish a type identity for the compiler
+
+FHandle: TYPE ~ VUXFiles.FHandle;
+GMT: TYPE ~ BasicTime.GMT;
+DirHandle: TYPE ~ VUXFiles.DirHandle;
+ROPE: TYPE ~ Rope.ROPE;
+Mode: TYPE ~ UnixTypes.Mode;
+Version: TYPE ~ PFSNames.Version;
+Component: TYPE ~ PFSNames.Component;
+PATH: TYPE ~ PFSNames.PATH;
+FileType: TYPE ~ PFS.FileType;
+UniqueID: TYPE ~ PFS.UniqueID;
+MTime: TYPE ~ INT;
+RES: TYPE ~ UnixTypes.RES;
+FSHandle: TYPE ~ PFSClass.FSHandle;
+CString: TYPE ~ CStrings.CString;
+unixEpoch: GMT ¨ BasicTime.Pack[
+[year~1970, month~January, day~1, hour~0, minute~0, second~0, zone~0, dst~no]
+];
+defaultCreateMode: Mode ¨ [fmt~reg, owner~[true, true, false]];
+defaultCaseFileMode: Mode ¨ [fmt~reg, owner~[true, false, false], group~[true, false, false], others~[true, false, false]];
+lockRetries: CARDINAL ¨ 10;
+bufferBytes: CARDINAL ¨ 8192;
+vuxFlavor: ATOM ~ $VUX;
+LookupSimple: PROC [dH: DirHandle, nameOnServer: ROPE]
+RETURNS [fH: FHandle, fmt: UnixTypes.Fmt, bytes: INT, mTime: MTime, attachedTo: PATH ¨ NIL]
+~ {
+
+reply: VUXFiles.DirOpRes; 
+[reply, attachedTo] ¨ VUXFiles.Lookup[dH, nameOnServer];
+SELECT reply.status FROM
+ok => {
+fH ¨ reply.file;
+fmt ¨ reply.attributes.mode.fmt;
+bytes ¨ LOOPHOLE[reply.attributes.size];
+mTime ¨ reply.attributes.mtime;
+};
+ENOENT => {
+fH ¨ NIL;
+fmt ¨ reg;
+bytes ¨ 0;
+mTime ¨ 0;
+};
+ENDCASE => PFSBackdoor.ProduceError[UnixFSPrivate.TranslateErrno[reply.status], IO.PutFR1["Unix error in VUXFileImpl.LookupSimple for %g", [rope[nameOnServer]] ], NEW[UnixErrno.Errno ¨ reply.status]];
+};
+
+ux0Component: Component ~ PFSNames.Fetch[PFS.PathFromRope["-ux:/"], 0];
+ResolveAttachment: PROC [attachment: PATH, attachedTo: PATH] RETURNS [PATH] ~ {
+{
+absolute: PATH ~ IF PFSNames.IsAbsolute[attachedTo] THEN attachedTo ELSE PFSNames.Cat[PFSNames.Directory[attachment], attachedTo];
+RETURN[ PFSNames.ReplaceComponent[absolute, 0, ux0Component] ];
+};
+};
+
+LookupVersionByMTime: PROC [dH: DirHandle, base: ROPE, wantedMTime: MTime]
+RETURNS [fH: FHandle, nameOnServer: ROPE, version: Version, fmt: UnixTypes.Fmt ¨ reg, bytes: INT ¨ 0, attachedTo: PATH]
+~ {
+
+found: BOOL ¨ FALSE;
+EachDirEntry: VUXFiles.EachDirEntryProc -- [entry: DirEntry] RETURNS [continue: BOOL ¨ TRUE] -- ~ {
+version ¨ entry.version;
+SELECT Rope.Compare[entry.nameWithoutVersion, base, FALSE] FROM
+less => RETURN[TRUE]; -- must be the case file
+equal => IF (entry.version # [none]) THEN {
+mTime: MTime;
+nameOnServer ¨ EncodeVersionInName[entry.nameWithoutVersion, entry.version.version];
+[fH~fH, fmt~fmt, bytes~bytes, mTime~mTime, attachedTo~attachedTo] ¨
+LookupSimple[dH, nameOnServer];
+IF (fH # NIL) AND (mTime = wantedMTime) THEN {
+found ¨ TRUE;
+RETURN[FALSE];
+};
+};
+greater => {
+RETURN[FALSE];
+};
+ENDCASE => ERROR; -- implementation error; invariants violated
+};
+VUXFiles.EnumerateDirectory[dH, EachDirEntry, base, FALSE];
+IF NOT found THEN RETURN [NIL, base, [none], reg, 0, NIL];
+};
+
+FindHighestVersion: PROC [dH:DirHandle, base: ROPE, staleOK: BOOL]
+RETURNS [highestVersion: Version ¨ [none], nameOnServer: ROPE, found: BOOL ¨ FALSE] ~ {
+highestVersionNo: INT ¨ 0;
+foundCased: BOOL ¨ FALSE;
+foundUncased: BOOL ¨ FALSE;
+EachDirEntry: VUXFiles.EachDirEntryProc -- [entry: DirEntry] RETURNS [continue: BOOL ¨ TRUE] -- ~ {
+SELECT Rope.Compare[entry.nameWithoutVersion, base, FALSE] FROM
+less => RETURN[TRUE]; -- must be the case file
+equal => IF (entry.version # [none]) THEN {
+temp: INT ~ entry.version.version; -- for coercion between Version and INT
+IF temp > highestVersionNo THEN {
+foundCased ¨ TRUE;
+highestVersionNo ¨ temp;
+}
+}
+ELSE 
+foundUncased ¨ TRUE;
+greater => RETURN[FALSE];
+ENDCASE ; 
+};
+VUXFiles.EnumerateDirectory[dH, EachDirEntry, base, staleOK];
+IF foundCased THEN {
+nameOnServer ¨ EncodeVersionInName[base, highestVersionNo];
+highestVersion ¨ [numeric, highestVersionNo];
+found ¨ TRUE;
+}
+ELSE IF foundUncased THEN {
+nameOnServer ¨ base;
+found ¨ TRUE;
+};
+};
+
+FindLowestVersion: PROC [dH: DirHandle, base: ROPE, staleOK: BOOL]
+RETURNS [lowestVersion: Version ¨ [none], nameOnServer: ROPE, found: BOOL ¨ FALSE] ~ {
+lowestVersionNo: INT ¨ INT.LAST;
+foundCased: BOOL ¨ FALSE;
+foundUncased: BOOL ¨ FALSE;
+EachDirEntry: VUXFiles.EachDirEntryProc -- [entry: DirEntry] RETURNS [continue: BOOL ¨ TRUE] -- ~ {
+SELECT Rope.Compare[entry.nameWithoutVersion, base, FALSE] FROM
+less => RETURN[TRUE]; -- must be the case file
+equal => IF (entry.version # [none]) THEN {
+temp: INT ~ entry.version.version; -- for coercion between Version and INT
+IF( temp > 0) AND (temp < lowestVersionNo) THEN {
+foundCased ¨ TRUE;
+lowestVersionNo ¨ temp;
+}
+}
+ELSE 
+foundUncased ¨ TRUE;
+greater => RETURN[FALSE];
+ENDCASE; 
+};
+VUXFiles.EnumerateDirectory[dH, EachDirEntry, base, staleOK];
+IF foundCased THEN {
+nameOnServer ¨ EncodeVersionInName[base, lowestVersionNo];
+lowestVersion ¨ [numeric, lowestVersionNo];
+found ¨ TRUE;
+}
+ELSE IF foundUncased THEN {
+nameOnServer ¨ base;
+found ¨ TRUE;
+};
+};
+
+FindExistingFile: PROC [name: PATH, wantedUniqueID: UniqueID] RETURNS [dH: DirHandle, fH: FHandle, nameOnServer: ROPE, version: Version, fmt: UnixTypes.Fmt, bytes: INT, uniqueID: UniqueID, attachedTo: PATH] ~ {
+base: ROPE;
+{
+ENABLE UNWIND => {
+IF dH # NIL THEN VUXFiles.UnPinDirPath[dH];
+};
+isPattern: BOOL;
+found: BOOL;
+mTime: MTime;
+
+dH ¨ VUXFiles.FollowDirPath[path~PFSNames.Parent[name], case~FALSE, create~FALSE];
+[base~base, version~version, isPattern~isPattern] ¨ ReadBaseComponent[path~name, case~FALSE];
+IF isPattern THEN PFSBackdoor.ProduceError[patternNotAllowed, IO.PutFR1["Pattern (%g) not allowed in VUXFileImpl.FindExistingFile", [rope[PFS.RopeFromPath[name]]] ], name];
+SELECT version.versionKind FROM
+none, highest => {
+[version, nameOnServer, found] ¨ FindHighestVersion[dH, base, FALSE];
+IF NOT found THEN GOTO Out;
+};
+lowest => {
+[version, nameOnServer, found] ¨ FindLowestVersion[dH, base, FALSE];
+IF NOT found THEN GOTO Out;
+};
+all => {
+IF (wantedUniqueID = PFS.nullUniqueID) THEN ProduceError[patternNotAllowed,
+"Version * not allowed in VUXFileImpl.FindExistingFile", name]; 
+found ¨ FALSE;
+};
+numeric => {
+nameOnServer ¨ EncodeVersionInName[base, version.version];
+found ¨ TRUE;
+};
+ENDCASE => ERROR -- can't happen -- ;
+IF found THEN [fH, fmt, bytes, mTime, attachedTo] ¨ LookupSimple[dH, nameOnServer];
+uniqueID ¨ [egmt~[gmt~GMTFromMTime[mTime], usecs~0]];
+IF (wantedUniqueID = PFS.nullUniqueID) THEN GOTO Out;
+IF (fH = NIL) OR ((wantedUniqueID # PFS.nullUniqueID) AND (wantedUniqueID # uniqueID)) 
+THEN [fH, nameOnServer, version, fmt, bytes, attachedTo] ¨ LookupVersionByMTime[dH, base, MTimeFromGMT[wantedUniqueID.egmt.gmt]];
+IF attachedTo # NIL THEN attachedTo ¨ ResolveAttachment[name, attachedTo];
+uniqueID ¨ wantedUniqueID; -- okay even if lookup failed
+EXITS
+Out => NULL;
+};
+VUXFiles.UnPinDirPath[dH];
+IF fH = NIL THEN {
+PFSBackdoor.ProduceError[unknownFile,
+IO.PutFR1["%g not found in VUXFileImpl.FindExistingFile", [rope[PFS.RopeFromPath[name]]] ],
+name];
+};
+};
+
+AtomicallyRename: PROC [dHFrom: DirHandle, fHFrom: FHandle, dHTo: DirHandle, baseTo: ROPE, desiredVersion: Version, deleteIfError: BOOL, attach: BOOL ¨ FALSE]
+RETURNS [version: Version] ~ {
+toNameOnServer: ROPE;
+toNameRefText: REF TEXT;
+{
+ENABLE UNWIND => {
+IF deleteIfError THEN SilentlyRemove[dHFrom, fHFrom];
+};
+SELECT desiredVersion.versionKind FROM
+lowest => PFSBackdoor.ProduceError[versionSpecified, IO.PutFR1["Lowest is not a valid version number for a new file (%g)", [rope[baseTo]] ], baseTo];
+next, highest, none => {
+found: BOOL;
+vTemp: CARDINAL;
+res: RES;
+[highestVersion~version, found~found] ¨ FindHighestVersion[dH~dHTo, base~baseTo, staleOK~TRUE];
+FOR try: CARDINAL ¨ 0, try+1 DO
+IF try > lockRetries THEN ERROR; -- ??? PFSBackdoor.ReportFSError[lockConflict, sH, baseTo, "Too many retries on create."];
+IF (vTemp ¨ version.version) >= (CARDINAL.LAST - 1) THEN ProduceError[noMoreVersions, "No more versions", baseTo];
+version ¨ [numeric, vTemp+1];
+toNameOnServer ¨ Rope.Cat[dHTo.fHandle, "/", EncodeVersionInName[baseTo, version.version]];
+{
+from: CString ~ UXO[fHFrom];
+to: CString ~ UXO[toNameOnServer];
+IF attach 
+THEN res ¨ UnixSysCalls.SymLink[from, to] 
+ELSE res ¨ UnixSysCalls.Link[from, to];
+UXR[from]; UXR[to];
+};
+IF res # success THEN {
+errno: UnixErrno.Errno ¨ UnixErrno.GetErrno[];
+IF errno= EEXIST THEN LOOP ELSE ReportFailure["AtomicallyRename", "Couldn't link next version", toNameOnServer, errno];
+};
+dHTo.contentKnownStale ¨ TRUE;
+EXIT;
+ENDLOOP;
+IF NOT attach THEN {
+from: CString ~ UXO[fHFrom];
+res ¨ UnixSysCalls.Unlink[from];
+UXR[from];
+};
+IF res # success THEN {
+errno: UnixErrno.Errno ~ UnixErrno.GetErrno[]; 
+ReportFailure["AtomicallyRename", "Couldn't unlink file from temporary name", fHFrom, errno];
+};
+dHFrom.contentKnownStale ¨ TRUE;
+};
+numeric => {
+err: UnixErrno.Errno ¨ ok;
+res: RES;
+version ¨ desiredVersion;
+toNameOnServer ¨ Rope.Cat[dHTo.fHandle, "/", EncodeVersionInName[baseTo, version.version]];
+{
+from: CString ~ UXO[fHFrom];
+to: CString ~ UXO[toNameOnServer];
+IF attach 
+THEN res ¨ UnixSysCalls.SymLink[from, to] 
+ELSE res ¨ UnixSysCalls.Link[from, to];
+UXR[from]; UXR[to];
+};
+IF res#success THEN {
+err ¨ UnixErrno.GetErrno[];
+IF err= EEXIST THEN ReportFailure["AtomicallyRename", "Couldn't create requested version of file", toNameOnServer, err];
+};
+IF NOT attach THEN {
+from: CString ~ UXO[fHFrom];
+res ¨ UnixSysCalls.Unlink[from];
+UXR[from];
+};
+dHFrom.contentKnownStale ¨ dHTo.contentKnownStale ¨ TRUE;
+};
+ENDCASE => ERROR; -- Can't happen
+};
+};
+
+SilentlyRemove: PROC [dH: DirHandle, base: ROPE] ~ {
+from: CString ~ UXO[Rope.Cat[dH.fHandle, "/", base]];
+[] ¨ UnixSysCalls.Unlink[from];
+UXR[from];
+dH.contentKnownStale ¨ TRUE;
+};
+
+tempNamePrefix: ROPE ¨ NIL;
+
+CreateTempName: PROC [base: ROPE] RETURNS [tempName: ROPE] ~ {
+u1, u2: CARD;
+IF tempNamePrefix = NIL THEN {
+a: Arpa.Address ~ Arpa.MyAddress[];
+tempNamePrefix ¨ IO.PutFLR["fs.%g.%g.%g.%g", LIST[[cardinal[a.a]], [cardinal[a.b]], [cardinal[a.c]], [cardinal[a.d]]]];
+};
+u1 ¨ u2 ¨ BasicTime.GetClockPulses[];
+u1 ¨ LOOPHOLE[BasicTime.Now[! BasicTime.TimeNotKnown => CONTINUE]];
+tempName ¨ IO.PutFR["%g.%g.%g", [rope[tempNamePrefix]], [cardinal[u1]], [cardinal[u2]] ];
+};
+
+caseFileNamePrefix: PUBLIC ROPE ¨ ".~case~";
+caseFileNamePrefixLen: PUBLIC INT ¨ Rope.Length[caseFileNamePrefix];
+
+CreateCaseFile: PUBLIC PROC [dh: DirHandle, name: ROPE] ~ {
+caseFileName: ROPE ¨ Rope.Concat[caseFileNamePrefix, name];
+file: CString ~ UXO[Rope.Cat[dh.fHandle, "/", caseFileName]];
+fd: UnixTypes.FD ~ UnixSysCalls.Open[file, magicFlags[create], defaultCaseFileMode];
+UXR[file];
+IF fd#error THEN [] ¨ UnixSysCalls.Close[fd];
+dh.contentKnownStale ¨ TRUE;
+};
+
+CheckCaseFile: PROC [dH: DirHandle, base: ROPE] RETURNS [caseFileName: ROPE ¨ NIL] ~ {
+EachDirEntry: VUXFiles.EachDirEntryProc -- [entry: DirEntry] RETURNS [continue: BOOL ¨ TRUE] -- ~ {
+SELECT Rope.Compare[entry.nameWithoutVersion, base, FALSE] FROM
+less => ERROR; -- invariants violated
+equal => 
+IF (entry.version = [numeric, 0]) THEN {
+caseFileName ¨ entry.nameWithoutVersion;
+RETURN[FALSE];
+}
+ELSE RETURN[TRUE];
+greater => RETURN[FALSE];
+ENDCASE;  
+};
+VUXFiles.EnumerateDirectory[dH, EachDirEntry, base, FALSE];
+};
+
+CollectCaseFile: PUBLIC PROC [dH: DirHandle, base: ROPE] ~ {
+versionFound: BOOL ¨ FALSE;
+caseFileNames: LIST OF ROPE ¨ NIL;
+EachDirEntry: VUXFiles.EachDirEntryProc -- [entry: DirEntry] RETURNS [continue: BOOL ¨ TRUE] -- ~ {
+SELECT Rope.Compare[entry.nameWithoutVersion, base, FALSE] FROM
+less => RETURN[TRUE]; -- the case file
+equal => IF (entry.version # [none]) AND (entry.version # [numeric, 0])THEN {
+versionFound ¨ TRUE;
+RETURN[FALSE];
+};
+greater => {
+RETURN[FALSE];
+};
+ENDCASE; -- invariants violated
+};
+EachCaseFileEntry: VUXFiles.EachDirEntryProc -- [entry: DirEntry] RETURNS [continue: BOOL ¨ TRUE] -- ~ {
+IF Rope.Equal[entry.nameWithoutVersion, base, FALSE] THEN {
+IF entry.version = [numeric, 0] THEN
+caseFileNames ¨ CONS[Rope.Concat[caseFileNamePrefix, entry.nameWithoutVersion], caseFileNames];
+RETURN[TRUE];
+};
+RETURN[FALSE];
+};
+VUXFiles.EnumerateDirectory[dH, EachDirEntry, base, FALSE];
+IF NOT versionFound THEN {
+VUXFiles.EnumerateDirectory[dH, EachCaseFileEntry, base, FALSE];
+FOR each: LIST OF ROPE ¨ caseFileNames, each.rest WHILE each # NIL DO
+SilentlyRemove[dH, each.first];
+ENDLOOP;
+};
+};
+FSData: TYPE ~ REF FSDataObject;
+FSDataObject: TYPE ~ RECORD [
+fs: ROPE
+];
+
+vuxMaintenanceProcs: PFSClass.MaintenanceProcs ¨ NEW[PFSClass.MaintenanceProcsObject ¨ [
+sweep: VUXSweep,
+validate: VUXValidate
+]];
+
+VUXSweep: PFSClass.SweepProc ~ {
+dH: DirHandle ¨ VUXFiles.GetDirRoot[];
+VUXFiles.SweepDirCache[dH, seconds];
+[] ¨ VUXFiles.UnPinDir[dH];
+};
+
+VUXGetHandle: PFSClass.GetHandleProc -- [fs: ROPE, flavorSpecified: BOOL] RETURNS [h: FSHandle, downMsg: ROPE] -- ~ {
+IF flavorSpecified 
+THEN [h, downMsg] ¨ GetHandleInner[fs, FALSE]
+ELSE { h ¨ NIL; downMsg ¨ NIL };
+};
+
+VUXGetROHandle: PFSClass.GetHandleProc -- [fs: FS, flavorSpecified: BOOL] RETURNS [h: FSHandle, downMsg: ROPE ¨ NIL] -- ~ {
+IF flavorSpecified 
+THEN [h, downMsg] ¨ GetHandleInner[fs, TRUE]
+ELSE { h ¨ NIL; downMsg ¨ NIL };
+};
+
+GetHandleInner: PROC [fs: ROPE, readOnly: BOOL] RETURNS [h: PFSClass.FSHandle, downMsg: ROPE ¨ NIL] ~ {
+data: FSData ¨ NEW[FSDataObject ¨ [fs]];
+IF NOT Rope.IsEmpty[fs] THEN RETURN[NIL, NIL];
+h ¨ NEW[PFSClass.FSObject ¨ [flavor: vuxFlavor, name: fs, maintenanceProcs: vuxMaintenanceProcs, procs: vuxProcs, data: data]];
+};
+
+VUXValidate: PFSClass.ValidateProc -- [h: FSHandle] RETURNS [obsolete: BOOL, downMsg: ROPE] -- ~ {
+data: FSData ¨ NARROW[h.data]; -- sanity check;
+RETURN[ FALSE, NIL ]; -- always available
+};
+moduleName: ROPE ~ "VUXFileImpl.";
+ReportFailure: PROC [procName: ROPE, msg: ROPE, what: REF, errno: UnixErrno.Errno] ~ {
+procPrefix: ROPE ~ Rope.Cat[moduleName, procName, ": "];
+filename: ROPE ¨ WITH what SELECT FROM
+file: PFSClass.OpenFile => PFS.RopeFromPath[file.fullFName],
+path: PATH => PFS.RopeFromPath[path],
+rope: ROPE => rope,
+ENDCASE => "???";
+message: ROPE ~ Rope.Cat[procPrefix, msg, " for ", filename];
+UnixFSPrivate.ReportFailure[errno, message];
+};
+
+ProduceError: PROC [code: PFSBackdoor.ErrorCode, explanation: Rope.ROPE, info: REF] ~ {
+filename: ROPE ¨ WITH info SELECT FROM
+file: PFSClass.OpenFile => PFS.RopeFromPath[file.fullFName],
+path: PATH => PFS.RopeFromPath[path],
+rope: ROPE => rope,
+ENDCASE => "???";
+message: ROPE ~ Rope.Cat[explanation, " for ", filename];
+PFSBackdoor.ProduceError[code, message, info];
+};
+
+vuxProcs: PFSClass.FileManipulationProcs ¨ NEW[PFSClass.FileManipulationProcsObject ¨ [
+delete: VUXDelete,
+enumerateForInfo: VUXEnumerateForInfo,
+enumerateForNames: VUXEnumerateForNames,
+fileInfo: VUXFileInfo,
+lookupName: VUXLookupName,
+rename: VUXRename,
+copy: VUXCopy,
+setAttributes: VUXSetAttributes,
+setByteCountAndUniqueID: VUXSetByteCountAndUniqueID,
+setClientProperty: VUXSetClientProperty,
+getClientProperty: VUXGetClientProperty,
+enumerateClientProperties: VUXEnumerateClientProperties,
+read: VUXRead,
+write: VUXWrite,
+open: VUXOpen,
+close: VUXClose,
+store: VUXStore,
+retrieve: VUXRetrieve,
+attach: VUXAttach,
+getInfo: VUXGetInfo,
+pfsNameToUnixName: VUXPFSNameToUnixName,
+caseSensitive: VUXCaseSensitive
+]];
+
+VUXDelete: PUBLIC PFSClass.DeleteProc -- [h: FSHandle, file: NAME, wantedUniqueID: UniqueID, proc: PFS.NameConfirmProc] -- ~ {
+dH: DirHandle;
+version: Version;
+nameOnServer: ROPE;
+uniqueID: UniqueID;
+[dH~dH, nameOnServer~nameOnServer, version~version, uniqueID~uniqueID] ¨ FindExistingFile[file, wantedUniqueID];
+IF (proc = NIL) OR proc[PFSNames.SetVersionNumber[file, version], uniqueID] THEN {
+ENABLE UNWIND => {
+VUXFiles.UnPinDirPath[dH];
+};
+unixFile: ROPE ~ Rope.Cat[dH.fHandle, "/", nameOnServer];
+fileString: CString ~ UXO[unixFile];
+res: RES ~ UnixSysCalls.Unlink[fileString];
+UXR[fileString];
+IF res#success THEN {
+errno: UnixErrno.Errno ~ UnixErrno.GetErrno[];
+ReportFailure["VUXDelete", "Delete Failed", unixFile, errno];
+};
+dH.contentKnownStale ¨ TRUE;
+CollectCaseFile[dH, DecodeVersionFromName[nameOnServer].nameWithoutVersion];
+};
+};
+
+VUXFileInfo: PUBLIC PFSClass.FileInfoProc -- [h: FSHandle, file: PATH, wantedUniqueID: UniqueID] RETURNS [version: Version, attachedTo: PATH, bytes: INT, uniqueID: UniqueID, mutability: PFS.Mutability, fileType: PFS.FileType] -- ~ {
+dH: DirHandle;
+fH: ROPE;
+fmt: UnixTypes.Fmt;
+shortNameComp: PFSNames.Component;
+[dH~dH, fH~fH, version~version, bytes~bytes, uniqueID~uniqueID, fmt~fmt, attachedTo~attachedTo] ¨
+FindExistingFile[file, wantedUniqueID];
+mutability ¨ mutable;
+fileType ¨ PFSFileTypeFromUnixFmt[fmt];
+VUXFiles.UnPinDirPath[dH];
+};
+
+VUXGetInfo: PFSClass.GetInfoProc -- [h: FSHandle, file: OpenFile] RETURNS [fullFName, attachedTo: PATH, uniqueID: UniqueID, bytes: INT, mutability: PFS.Mutability, fileType: PFS.FileType] -- ~ TRUSTED {
+data: REF VUXData ~ NARROW[file.data];
+fd: UnixTypes.FD ¨ data.fd; 
+buf: UnixTypes.Stat;
+res: RES ~ UnixSysCalls.FStat[fd, @buf];
+IF res # success THEN {
+errno: UnixErrno.Errno ~ UnixErrno.GetErrno[];
+ReportFailure["VUXGetInfo", "Stat failed", file, errno];
+};
+RETURN[file.fullFName, file.attachedTo, file.uniqueID, buf.size, file.mutability, file.fileType];
+};
+
+VUXRename: PUBLIC PFSClass.RenameProc -- [h: FSHandle, fromFile: NAME, wantedUniqueID: UniqueID, toFile: NAME, keep: CARDINAL, proc: PFS.NameConfirmProc] RETURNS [done: BOOL ¨ FALSE] -- ~ {
+dHFrom, dHTo: DirHandle;
+{
+ENABLE UNWIND => {
+IF dHFrom # NIL THEN VUXFiles.UnPinDirPath[dHFrom];
+IF dHTo # NIL THEN VUXFiles.UnPinDirPath[dHTo];
+};
+fromNameOnServer, fromNameWithoutVersion, baseTo: ROPE;
+isPattern, createCaseFile: BOOL;
+fHFrom: FHandle;
+uniqueID: UniqueID;
+version, specifiedVersion, createdVersion: Version;
+[dH~dHFrom, nameOnServer~fromNameOnServer, fH~fHFrom, version~version, uniqueID~uniqueID] ¨ FindExistingFile[fromFile, wantedUniqueID];
+IF (proc = NIL) OR proc[PFSNames.SetVersionNumber[fromFile, version], uniqueID] THEN {
+dHTo ¨ VUXFiles.FollowDirPath[path~toFile, case~FALSE, create~TRUE];
+[base~baseTo, version~specifiedVersion, isPattern~isPattern] ¨ ReadBaseComponent[path~toFile, case~FALSE];
+IF isPattern THEN ProduceError[patternNotAllowed, "Pattern not allowed in VUXFileImpl.VUXRename", toFile];
+SELECT version.versionKind FROM
+highest, none => specifiedVersion ¨ [next];
+next, numeric => NULL; 
+ENDCASE => ProduceError[versionSpecified, "Illegal version specified in Rename", toFile];
+createdVersion ¨ AtomicallyRename[dHFrom, fHFrom, dHTo, baseTo, specifiedVersion, FALSE ! PFS.Error => GOTO failed];
+fromNameWithoutVersion ¨ DecodeVersionFromName[fromNameOnServer].nameWithoutVersion;
+CollectCaseFile[dHFrom, fromNameWithoutVersion];
+SELECT version.versionKind FROM
+numeric => createCaseFile ¨ (CheckCaseFile[dHTo, baseTo] = NIL);
+ENDCASE => createCaseFile ¨ (createdVersion = [numeric, 1]);
+IF createCaseFile THEN {
+[base~baseTo] ¨ ReadBaseComponent[path~toFile, case~TRUE];
+CreateCaseFile[dHTo, baseTo ! PFS.Error => CONTINUE ];
+};
+VUXFiles.UnPinDirPath[dHTo]; dHTo ¨ NIL;
+};
+VUXFiles.UnPinDirPath[dHFrom]; dHFrom ¨ NIL;
+RETURN[TRUE];
+EXITS
+failed => { VUXFiles.UnPinDirPath[dHTo]; VUXFiles.UnPinDirPath[dHFrom] }
+};
+};
+
+VUXRetrieve: PUBLIC PFSClass.RetrieveProc -- [h: FSHandle, file: NAME, wantedUniqueID: UniqueID, proc: PFS.RetrieveConfirmProc, checkFileType: BOOL ¨ FALSE] -- ~ {
+fH: FHandle;
+bytesExpected: CARD;
+str: IO.STREAM;
+uniqueID: UniqueID;
+fd: UnixTypes.FD;
+openedVersion: Version;
+buffer: REF TEXT;
+attachedTo: PATH;
+offset: CARD ¨ 0;
+
+[fH~fH, version~openedVersion, bytes~bytesExpected, uniqueID~uniqueID, attachedTo~attachedTo] ¨
+FindExistingFile[file, wantedUniqueID];
+str ¨ proc[PFSNames.SetVersionNumber[file, openedVersion], bytesExpected, uniqueID];
+IF str = NIL THEN RETURN;
+buffer ¨ RefText.ObtainScratch[MIN[bytesExpected, bufferBytes]];
+{
+name: CString ~ UXO[fH];
+fd ¨ OpenSetBlocking[name, magicFlags[read], []];
+UXR[name];
+};
+IF fd = error THEN {
+errno: UnixErrno.Errno ~ UnixErrno.GetErrno[];
+ReportFailure["Retrieve", "Open failed", fH, errno];
+};
+TRUSTED {
+ENABLE UNWIND => {
+RefText.ReleaseScratch[buffer];
+};
+DO
+bytesRead: INT;
+ptr: CString ~ LOOPHOLE[LOOPHOLE[buffer, CString] +SIZE[TEXT[0]]];
+bytesRead ¨ UnixSysCalls.Read[fd, ptr, buffer.maxLength];
+IF bytesRead < 0 THEN {
+errno: UnixErrno.Errno ~ UnixErrno.GetErrno[];
+ReportFailure["Retrieve", "Read failed", fH, errno];
+};
+buffer.length ¨ bytesRead;
+IO.PutBlock[str, buffer];
+IF buffer.length < buffer.maxLength THEN EXIT;
+ENDLOOP;
+};
+RefText.ReleaseScratch[buffer];
+};
+
+OpenSetBlocking: PROC [path: CString, flags: UnixTypes.FileFlags, mode: UnixTypes.Mode] RETURNS [fd: UnixTypes.FD] ~ {
+fd ¨ UnixSysCalls.Open[path, flags, mode];
+IF fd = error THEN RETURN;
+{
+res: RES ~ IF flags.access = RDONLY THEN UnixSysCallExtensions.SetGetBlocking[fd, allData]
+ELSE UnixSysCallExtensions.SetPutBlocking[fd, allData];
+IF res # success THEN fd¨error ;
+};
+};
+
+AtomicallyCreate: PROC [file: PATH, checkFileType: BOOL ¨ FALSE, fileType: PFS.FileType ¨ PFS.tUnspecified, createOptions: PFS.CreateOptions, openFlags:  UnixTypes.FileFlags, action: PROC[UnixTypes.FD, CStrings.CString]] RETURNS [fd: UnixTypes.FD ¨ error, version: Version] ~ {
+tempNameOnServer, realBase: ROPE;
+tempNameString: CString;
+specifiedVersion: Version;
+BeginCreate: PROC  ~ {
+isPattern: BOOL;
+dH ¨ VUXFiles.FollowDirPath[path~file, case~FALSE, create~TRUE];
+[base~realBase, version~specifiedVersion, isPattern~isPattern] ¨ ReadBaseComponent[path~file, case~FALSE];
+IF isPattern THEN ProduceError[patternNotAllowed, "Pattern not allowed in VUXFileImpl.VUXStore", file];
+SELECT specifiedVersion.versionKind FROM
+none, highest => specifiedVersion ¨ [next];
+next, numeric => NULL;
+ENDCASE => ProduceError[versionSpecified, "Illegal version specified in Store", file]; 
+tempNameOnServer ¨ Rope.Cat[dH.fHandle, "/", CreateTempName[realBase]];
+tempNameString ¨ UXO[tempNameOnServer];
+fd ¨ OpenSetBlocking[tempNameString, magicFlags[create], []];
+IF fd = error THEN {
+errno: UnixErrno.Errno ~ UnixErrno.GetErrno[];
+ReportFailure["AtomicallyCreate", "Open failed", tempNameOnServer, errno];
+};
+{
+desiredMode: Mode ~ VUXFiles.GetCreateMode[dH~dH, forDirectory~FALSE];
+IF UnixSysCalls.FChMod[fd, desiredMode] # success THEN { 
+errno: UnixErrno.Errno ~ UnixErrno.GetErrno[];
+ReportFailure["AtomicallyCreate", "ChMod failed", tempNameOnServer, errno];
+};
+};
+dH.contentKnownStale ¨ TRUE;
+};
+
+EndCreate: PROC  ~ TRUSTED {
+createCaseFile: BOOL;
+res: RES ¨ UnixSysCalls.FSync[fd];
+errno: UnixErrno.Errno;
+IF res#success AND (errno ¨ UnixErrno.GetErrno[]) # EBADF THEN {
+ReportFailure["AtomicallyCreate.EndCreate", "Server full? FSync failed", file, errno];
+};
+version ¨ AtomicallyRename[dH, tempNameOnServer, dH, realBase, specifiedVersion, TRUE];
+SELECT version.versionKind FROM
+numeric => createCaseFile ¨ (CheckCaseFile[dH, realBase] = NIL);
+ENDCASE => createCaseFile ¨ (version = [numeric, 1]); -- ???
+IF createCaseFile THEN {
+[base~realBase] ¨ ReadBaseComponent[path~file, case~TRUE];
+CreateCaseFile[dH, realBase];
+};
+VUXFiles.UnPinDirPath[dH]; dH ¨ NIL;
+};
+
+dH: DirHandle;
+
+TRUSTED {
+ENABLE UNWIND => {
+IF dH # NIL THEN VUXFiles.UnPinDirPath[dH];
+};
+BeginCreate[];
+IF action#NIL THEN action[fd, tempNameString];
+EndCreate[];
+UXR[tempNameString];
+};
+
+};
+
+VUXStore: PUBLIC PFSClass.StoreProc -- [h: FSHandle, file: NAME, wantedUniqueID: UniqueID, str: IO.STREAM, proc: PFS.StoreConfirmProc, checkFileType: BOOL ¨ FALSE, fileType: PFS.FileType ¨ PFS.tUnspecified, createOptions: PFS.CreateOptions] -- ~ {
+dH: DirHandle;
+
+DoStore: PROC [fd: UnixTypes.FD, stringName: CString] ~ TRUSTED {
+buffer: REF TEXT;
+TRUSTED {
+ENABLE UNWIND => {
+IF buffer # NIL THEN RefText.ReleaseScratch[buffer];
+};
+buffer ¨ RefText.ObtainScratch[bufferBytes];
+DO
+bytesWritten: INT;
+ptr: CString ~ LOOPHOLE[LOOPHOLE[buffer, CString] +SIZE[TEXT[0]]];
+buffer.length ¨ IO.GetBlock[str, buffer, 0, buffer.maxLength];
+IF buffer.length = 0 THEN EXIT;
+bytesWritten ¨ UnixSysCalls.Write[fd, ptr, buffer.length];
+IF bytesWritten # buffer.length THEN {
+IF bytesWritten < 0 THEN { 
+errno: UnixErrno.Errno ~ UnixErrno.GetErrno[]; 
+ReportFailure["Store", "Write failed", file, errno];
+}
+ELSE ProduceError[inconsistent, "Invalid assumption about UnixSysCalls.Write in VUXFileImpl.Store", file];
+};
+ENDLOOP;
+{
+ENABLE PFS.Error => CONTINUE;
+oldMode: ROPE ¨ PFS.GetClientProperty[PFS.OpenFileFromStream[str], "UnixMode"];
+buf: UnixTypes.Stat;
+res: RES ~ UnixSysCalls.FStat[fd, @buf];
+newModeBits: CARD16 ¨ LOOPHOLE[buf.mode];
+IF res#success THEN { 
+errno: UnixErrno.Errno ~ UnixErrno.GetErrno[];
+ReportFailure["DoStore", "Stat failed", file, errno];
+};
+IF oldMode # NIL THEN {
+oldModeBits: CARD16 ~ Convert.CardFromRope[oldMode];
+newerModeBits: CARD16 ~ Basics16.BITOR[newModeBits, Basics16.BITAND[oldModeBits, 111B]];
+[] ¨ UnixSysCalls.FChMod[fd, LOOPHOLE[newerModeBits]];
+};
+};
+FixUID[stringName, wantedUniqueID];
+RefText.ReleaseScratch[buffer]; buffer ¨ NIL;
+};
+};
+
+fd: UnixTypes.FD;
+version: Version;
+[fd, version] ¨ AtomicallyCreate[file~file, createOptions~createOptions, openFlags~[access: WRONLY], action~DoStore];
+[] ¨ UnixSysCalls.Close[fd];
+IF proc # NIL THEN [] ¨ proc[PFSNames.SetVersionNumber[file, version]];
+};
+
+PFSFileTypeFromUnixFmt: PROC [ ufs: UnixTypes.Fmt ]
+RETURNS [ pfs: PFS.FileType ¨ PFS.tUnspecified ] ~ {
+pfs ¨ SELECT ufs FROM
+dir	=> PFS.tDirectory,
+ENDCASE	=> PFS.tUnspecified;
+};
+
+VUXEnumerateForInfo: PFSClass.EnumerateForInfoProc -- [h: FSHandle, pattern: NAME, proc: InfoProc, lbound: NAME, hbound: NAME] -- ~ {
+data: FSData ~ NARROW[h.data]; -- sanity check;
+Enumerate[h, pattern, NIL, proc];
+};
+
+VUXEnumerateForNames: PFSClass.EnumerateForNamesProc -- [h: FSHandle, pattern: NAME, proc: PFS.NameProc, lbound: NAME, hbound: NAME] -- ~ {
+data: FSData ¨ NARROW[h.data]; -- sanity check;
+Enumerate[h, pattern, proc, NIL];
+};
+
+VUXLookupName: PFSClass.LookupNameProc -- [h: FSHandle, file: NAME] RETURNS[NAME] -- ~ {
+data: FSData ¨ NARROW[h.data]; -- sanity check;
+dH: DirHandle;
+fH: FHandle;
+version: Version;
+[dH~dH, fH~fH, version~version] ¨
+FindExistingFile[file, PFS.nullUniqueID ! PFS.Error => IF error.code = $unknownFile THEN CONTINUE ELSE REJECT];
+VUXFiles.UnPinDirPath[dH];
+IF fH # NIL THEN RETURN[PFSNames.SetVersionNumber[file, version]]
+ELSE RETURN [NIL]; 
+};
+
+VUXCopy: PFSClass.CopyProc -- [h: FSHandle, fromFile: NAME, wantedUniqueID: UniqueID, toFile: NAME, keep: CARDINAL, proc: PFS.NameConfirmProc] RETURNS [done: BOOL ¨ FALSE] -- ~ {
+data: FSData ¨ NARROW[h.data]; -- sanity check;
+};
+
+VUXSetAttributes: PFSClass.SetAttributesProc -- [h: FSHandle, file: OpenFile, attributes: PFS.CreateOptions] -- ~ {
+data: FSData ¨ NARROW[h.data]; -- sanity check;
+NotYetImpl;
+};
+
+VUXSetByteCountAndUniqueID: PFSClass.SetByteCountAndUniqueIDProc -- [h: FSHandle, file: OpenFile, bytes: INT, uniqueID: PFS.UniqueID] -- ~ {
+data: FSData ¨ NARROW[h.data]; -- sanity check;
+fd: UnixTypes.FD ¨ NARROW[file.data, REF VUXData].fd;
+IF bytes>=0 THEN {
+res: RES ~ UnixSysCalls.FTruncate[fd, bytes];
+IF res#success THEN {
+errno: UnixErrno.Errno ~ UnixErrno.GetErrno[];
+ReportFailure["VUXSetByteCountAndUniqueID", "FTruncate failed to change byteCount", file, errno];
+};
+};
+};
+
+VUXGetClientProperty: PFSClass.GetClientPropertyProc -- [h: FSHandle, file: OpenFile, propertyName: ROPE] RETURNS [propertyValue: ROPE] -- ~ TRUSTED {
+data: FSData ¨ NARROW[h.data]; -- sanity check;
+fd: UnixTypes.FD ¨ NARROW[file.data, REF VUXData].fd;
+buf: UnixTypes.Stat;
+res: RES ~ UnixSysCalls.FStat[fd, @buf];
+IF res#success THEN {
+errno: UnixErrno.Errno ~ UnixErrno.GetErrno[];
+ReportFailure["VUXGetClientProperty", "Stat failed", file, errno];
+};
+SELECT TRUE FROM 
+Rope.Equal[propertyName, "UnixMode"] => {
+RETURN[Convert.RopeFromCard[LOOPHOLE[buf.mode, CARD16], 8]];
+};
+Rope.Equal[propertyName, "UnixOwner"] => {
+RETURN[Convert.RopeFromCard[buf.uid]];
+};
+Rope.Equal[propertyName, "UnixGroup"] => {
+RETURN[Convert.RopeFromCard[buf.gid]];
+};
+ENDCASE => RETURN[NIL];
+};
+
+VUXEnumerateClientProperties: PFSClass.EnumerateClientPropertiesProc -- [h: FSHandle, file: OpenFile, proc: PFS.PropProc] -- ~ TRUSTED {
+data: FSData ¨ NARROW[h.data]; -- sanity check;
+fd: UnixTypes.FD ¨ NARROW[file.data, REF VUXData].fd;
+buf: UnixTypes.Stat;
+res: RES ~ UnixSysCalls.FStat[fd, @buf];
+IF NOT proc["UnixGroup", Convert.RopeFromCard[buf.gid]] THEN RETURN;
+IF NOT proc["UnixMode", Convert.RopeFromCard[LOOPHOLE[buf.mode, CARD16], 8]] THEN RETURN;
+[] ¨ proc["UnixOwner", Convert.RopeFromCard[buf.uid]];
+};
+
+VUXRead: UNSAFE PROC [h: FSHandle, file: PFSClass.OpenFile, filePosition, nBytes: CARD, toPtr: LONG POINTER, toStart: CARD] RETURNS [bytesRead: INT]  ~ UNCHECKED {
+fs: FSData ~ NARROW[h.data]; -- sanity check
+data: REF VUXData ~ NARROW[file.data];
+fd: UnixTypes.FD ¨ data.fd; 
+failure: ROPE;
+errno: UnixErrno.Errno ¨ ok;
+DoRead: ENTRY PROC [lock: REF VUXData] RETURNS [failure: ROPE ¨ NIL] ~ TRUSTED {
+ENABLE UNWIND => NULL;
+fdIndex: PFSBackdoor.FDIndex ~ data.fdIndex;
+data.fdIndex ¨ PFSBackdoor.unreliableIndex;
+IF filePosition # fdIndex THEN {
+res: INT ~ UnixSysCalls.LSeek[fd, filePosition, set];
+IF res < 0 THEN {
+errno ¨ UnixErrno.GetErrno[];
+RETURN["LSeek failed"];
+};
+};
+bytesRead ¨ UnixSysCalls.Read[d~fd, buf~LOOPHOLE[toPtr+toStart], nBytes~nBytes];
+IF bytesRead < 0 THEN {
+errno ¨ UnixErrno.GetErrno[];
+RETURN["Read failed"];
+};
+IF fdIndex # PFSBackdoor.unreliableIndex THEN data.fdIndex ¨ filePosition+bytesRead;
+};
+bytesRead ¨ 0;
+IF (failure ¨ DoRead[data]) # NIL THEN ReportFailure["VUXRead", failure, file, errno];
+};
+
+VUXData: TYPE ~ PFSBackdoor.VUXData;
+
+
+VUXWrite: PROC [h: FSHandle, file: PFSClass.OpenFile, filePosition, nBytes: CARD, fromPtr: LONG POINTER, fromStart: CARD] RETURNS [bytesWritten: INT] ~ {
+fs: FSData ¨ NARROW[h.data]; -- sanity check
+data: REF VUXData ~ NARROW[file.data];
+fd: UnixTypes.FD ¨ data.fd; 
+failure: ROPE;
+errno: UnixErrno.Errno ¨ ok;
+DoWrite: ENTRY PROC [lock: REF VUXData] RETURNS [failure: ROPE ¨ NIL] ~ {
+ENABLE UNWIND => NULL;
+fdIndex: PFSBackdoor.FDIndex ~ data.fdIndex;
+data.fdIndex ¨ PFSBackdoor.unreliableIndex;
+IF filePosition # fdIndex THEN {
+res: INT ~ UnixSysCalls.LSeek[fd, filePosition, set];
+IF res < 0 THEN {
+errno ¨ UnixErrno.GetErrno[];
+RETURN["LSeek failed"];
+};
+};
+bytesWritten ¨ UnixSysCalls.Write[d~fd, buf~LOOPHOLE[fromPtr+fromStart], nBytes~nBytes];
+IF bytesWritten < 0 THEN {
+errno ¨ UnixErrno.GetErrno[];
+RETURN["Write failed"];
+};
+IF fdIndex # PFSBackdoor.unreliableIndex THEN data.fdIndex ¨ filePosition+bytesWritten;
+};
+bytesWritten ¨ 0;
+IF (failure ¨ DoWrite[data]) # NIL THEN ReportFailure["VUXWrite", failure, file, errno];
+};
+
+VUXOpen: PFSClass.OpenProc -- [h: FSHandle, file: NAME, wantedUniqueID: UniqueID, access: PFS.AccessOptions, checkFileType: BOOL, fileType: PFS.FileType, createOptions: PFS.CreateOptions] RETURNS [OpenFile] -- ~ {
+data: FSData ¨ NARROW[h.data]; -- sanity check;
+openFile: PFSClass.OpenFile ¨ NEW[PFSClass.OpenFileObject ¨ 
+[fs: h, uniqueID: PFS.nullUniqueID, state: open, bytes: 0, mutability: mutable, fileType: PFS.tUnspecified, access: access]];
+fd: UnixTypes.FD;
+version: Version;
+fullUName: ROPE;
+attachedTo: PATH;
+SELECT access FROM
+read => {
+fmt: UnixTypes.Fmt;
+[fH~fullUName, uniqueID~openFile.uniqueID, bytes~openFile.bytes, version~version, fmt~fmt, attachedTo~attachedTo] ¨ FindExistingFile[file, wantedUniqueID];
+{
+fileString: CString ~ UXO[fullUName];
+fd ¨ OpenSetBlocking[path: fileString, 
+flags: [access: RDONLY],
+mode: [] 
+];
+UXR[fileString];
+};
+openFile.fileType ¨ PFSFileTypeFromUnixFmt[fmt];
+openFile.fullFName ¨ file.SetVersionNumber[version];
+openFile.attachedTo ¨ attachedTo;
+openFile.data ¨ NEW[VUXData ¨ [fd]];
+RETURN [openFile];
+};
+create => {
+[fd, version] ¨ AtomicallyCreate[file, checkFileType, fileType, createOptions, [access: WRONLY], NIL];
+openFile.fullFName ¨ file.SetVersionNumber[version];
+[fH~fullUName, uniqueID~openFile.uniqueID] ¨ FindExistingFile[openFile.fullFName, PFS.nullUniqueID ! PFS.Error => {fullUName ¨ NIL; CONTINUE}];
+IF wantedUniqueID#PFS.nullUniqueID THEN openFile.uniqueID ¨ wantedUniqueID;
+openFile.data ¨ NEW[VUXData ¨ [fd, UXS[fullUName]]];
+RETURN [openFile];
+};
+write => {
+version ¨ PFSNames.ShortName[file].version;
+IF version.versionKind=next OR version.versionKind=none THEN {
+[fd, version] ¨ AtomicallyCreate[file, checkFileType, fileType, createOptions, [access: RDWR], NIL];
+openFile.fullFName ¨ file.SetVersionNumber[version];
+[fH~fullUName, uniqueID~openFile.uniqueID] ¨ FindExistingFile[openFile.fullFName, PFS.nullUniqueID ! PFS.Error => {fullUName ¨ NIL; CONTINUE}];
+IF wantedUniqueID#PFS.nullUniqueID THEN openFile.uniqueID ¨ wantedUniqueID;
+openFile.data ¨ NEW[VUXData ¨ [fd, UXS[fullUName]]];
+}
+ELSE {
+[fH~fullUName, uniqueID~openFile.uniqueID, bytes~openFile.bytes, version~version, attachedTo~attachedTo] ¨ FindExistingFile[file, wantedUniqueID ! PFS.Error => {fullUName ¨ NIL; CONTINUE}];
+IF attachedTo#NIL THEN {
+PFSBackdoor.ProduceError[accessDenied, Rope.Concat[fullUName, " is an attachment and cannot be opened for writing"]]; 
+};
+{
+fileString: CString ~ UXO[fullUName];
+fd ¨ OpenSetBlocking[path: fileString, 
+flags: [access: RDWR],
+mode: [] 
+];
+UXR[fileString];
+};
+openFile.fullFName ¨ file.SetVersionNumber[version];
+openFile.data ¨ NEW[VUXData ¨ [fd]];
+};
+openFile.fullFName ¨ file.SetVersionNumber[version];
+RETURN [openFile];
+};
+append => {
+[fH~fullUName, uniqueID~openFile.uniqueID, bytes~openFile.bytes, version~version, attachedTo~attachedTo] ¨ FindExistingFile[file, wantedUniqueID];
+IF attachedTo#NIL THEN {
+PFSBackdoor.ProduceError[accessDenied, Rope.Concat[fullUName, " is an attachment and cannot be opened for appending"]]; 
+};
+{
+fileString: CString ~ UXO[fullUName];
+fd ¨ OpenSetBlocking[path: fileString, 
+flags: [trunc: false, creat: false, access: RDWR],
+mode: [] 
+];
+UXR[fileString];
+};
+openFile.fullFName ¨ file.SetVersionNumber[version];
+openFile.data ¨ NEW[VUXData ¨ [fd]];
+RETURN [openFile];
+};
+ENDCASE => ERROR;
+};
+
+VUXAttach: PFSClass.AttachProc -- [h: FSHandle, file: NAME, to: NAME, keep: CARDINAL, wantedUniqueID: UniqueID, remoteCheck: BOOL ¨ TRUE] RETURNS [toFName: NAME] -- ~ {
+dH: DirHandle;
+
+realBase: ROPE;
+specifiedVersion: Version;
+version: Version;
+BeginCreate: PROC  ~ {
+isPattern: BOOL;
+dH ¨ VUXFiles.FollowDirPath[path~file, case~FALSE, create~TRUE];
+[base~realBase, version~specifiedVersion, isPattern~isPattern] ¨ ReadBaseComponent[path~file, case~FALSE];
+IF isPattern THEN ProduceError[patternNotAllowed, "Pattern not allowed in VUXFileImpl.VUXStore", file];
+SELECT specifiedVersion.versionKind FROM
+none, highest => specifiedVersion ¨ [next];
+next, numeric => NULL;
+ENDCASE => ProduceError[versionSpecified, "Illegal version specified in Attach", file]; 
+
+{
+toFileName: ROPE ~ PFS.PFSNameToUnixName[to];
+IF toFileName=NIL THEN PFSBackdoor.ProduceError[unknownFile, Rope.Cat["Couldn't deduce a unix name for ", PFS.RopeFromPath[to], " in UXAttach."]];
+version ¨ AtomicallyRename[dH, toFileName, dH, realBase, specifiedVersion, FALSE, TRUE]; -- the proceure is misnamed; it is only atomically making a link.
+};
+dH.contentKnownStale ¨ TRUE;
+};
+
+EndCreate: PROC ~ TRUSTED {
+createCaseFile: BOOL;
+SELECT version.versionKind FROM
+numeric => createCaseFile ¨ (CheckCaseFile[dH, realBase] = NIL);
+ENDCASE => createCaseFile ¨ (version = [numeric, 1]); -- ???
+IF createCaseFile THEN {
+[base~realBase] ¨ ReadBaseComponent[path~file, case~TRUE];
+CreateCaseFile[dH, realBase];
+};
+VUXFiles.UnPinDirPath[dH]; dH ¨ NIL;
+};
+
+
+TRUSTED {
+ENABLE UNWIND => {
+IF dH # NIL THEN VUXFiles.UnPinDirPath[dH];
+};
+BeginCreate[];
+EndCreate[];
+toFName ¨ PFSNames.SetVersionNumber[file, version];
+};
+
+};
+
+VUXClose: PFSClass.CloseProc -- [h: FSHandle, file: OpenFile, abort: BOOL] -- ~ {
+fsData: FSData ~ NARROW[h.data]; -- sanity check;
+data: REF VUXData ~ NARROW[file.data, REF VUXData];
+fd: UnixTypes.FD ~ data.fd;
+failure: ROPE;
+errno: UnixErrno.Errno ¨ ok;
+DoClose: ENTRY PROC [lock: REF VUXData] RETURNS [failure: ROPE ¨ NIL] ~ {
+ENABLE UNWIND => NULL;
+res: RES;
+data.fdIndex ¨ PFSBackdoor.unreliableIndex;
+IF file.access#read THEN {
+res ¨ UnixSysCalls.FSync[fd];
+IF res#success AND UnixErrno.GetErrno[] # EBADF THEN {
+errno ¨ UnixErrno.GetErrno[];
+RETURN["Server full?  FSync failed"];
+};
+};
+IF data.setUniqueIDAtClose#NIL THEN FixUID[data.setUniqueIDAtClose, file.uniqueID];
+res ¨ UnixSysCalls.Close[fd];
+IF res#success THEN {
+errno ¨ UnixErrno.GetErrno[];
+RETURN["Close failed"];
+};
+};
+IF (failure ¨ DoClose[data]) # NIL THEN ReportFailure["VUXClose", failure, file, errno];
+};
+
+FixUID: PROC [stringName: CString, wantedUniqueID: UniqueID] ~ TRUSTED {
+mTime: MTime ~ MTimeFromGMT[wantedUniqueID.egmt.gmt];
+modTimeVal: UnixTypes.AccModTimes ¨
+[accessTime: [sec: mTime, usec: 0], modTime: [sec: mTime, usec: 0]];
+IF wantedUniqueID.egmt.gmt # BasicTime.nullGMT THEN IF UnixSysCalls.UTimes[stringName, @modTimeVal] # success THEN { 
+errno: UnixErrno.Errno ~ UnixErrno.GetErrno[];
+ReportFailure["FixUID", "UTimes failed", UXStrings.ToRope[stringName], errno];
+};
+};
+
+VUXSetClientProperty: PUBLIC PFSClass.SetClientPropertyProc -- [h: FSHandle, file: OpenFile, propertyName: ROPE, propertyValue: ROPE] -- = {
+data: FSData ¨ NARROW[h.data]; -- sanity check;
+fd: UnixTypes.FD ¨ NARROW[file.data, REF VUXData].fd;
+SELECT TRUE FROM 
+Rope.Equal[propertyName, "UnixMode"] => {
+cardMode: CARD16 ~ Convert.CardFromRope[propertyValue, 8];
+res: RES ~ UnixSysCalls.FChMod[fd, LOOPHOLE[cardMode]];
+};
+Rope.Equal[propertyName, "UnixOwner"] => {
+ProduceError[notImplemented, "The UnixOwner cannot be changed in the VUX view", file];
+};
+Rope.Equal[propertyName, "UnixGroup"] => {
+ProduceError[notImplemented, "The UnixGroup cannot be changed in the VUX view", file];
+};
+ENDCASE => ProduceError[notImplemented, Rope.Concat[propertyName, " is not an implemented property in the VUX view"], file];
+};
+
+VUXCaseSensitive: PUBLIC PFSClass.CaseSensitiveProc -- [h: FSHandle, file: PATH] RETURNS [ BOOL ] -- = {
+RETURN[FALSE];
+};
+
+VUXPFSNameToUnixName: PUBLIC PFSClass.PFSNameToUnixNameProc -- [h: FSHandle, file: PATH] RETURNS [ ROPE ] -- = {
+lastComponent: Component ¨ PFSNames.ShortName[file];
+IF lastComponent.version.versionKind#numeric THEN {
+RETURN[FindExistingFile[file, PFS.nullUniqueID].fH]
+}
+ELSE {
+lastRope: ROPE ¨ PFSNames.ComponentRope[lastComponent];
+newLastRope: ROPE ¨ EncodeVersionInName[lastRope, lastComponent.version.version];
+newName: PATH ¨ PFSNames.ReplaceShortName[file, MakeComponent[newLastRope, [none]]];
+resultExceptCase: ROPE ¨ PFS.RopeFromPath[newName, slashes];
+RETURN[LowerCase[resultExceptCase]];
+};
+};
+
+NotYetImpl: ERROR ~ CODE;
+
+oneEltPath: PATH ¨ PFSNames.ConstructName[components~LIST[ MakeComponent["*", [none]] ] ];
+oneEltDirPath: PATH ¨ PFSNames.ConstructName[components~LIST[ MakeComponent["*", [none]] ], directory~TRUE ];
+
+MakeComponent: PROC [r: ROPE, v: Version] RETURNS [Component] ~ {
+RETURN[[name:[r, 0, Rope.Length[r]], version: v]];
+};
+
+magicFlags: ARRAY {read, create, append, write} OF UnixTypes.FileFlags ~ [
+read: [access: RDONLY], -- read only
+create: [trunc: true, creat: true, access: WRONLY], -- truncate, create, write only
+append: [creat: true, append: true, access: WRONLY], -- create, append, write only
+write: [trunc: true, creat: true, access: WRONLY] -- truncate, create, write only
+];
+
+ReadBaseComponent: PROC [path: PATH, case: BOOL] RETURNS [base: ROPE, version: Version, isPattern: BOOL ¨ FALSE] ~ {
+shortName: Component ~ PFSNames.ShortName[path];
+base ¨ PFSNames.ComponentRope[shortName];
+version ¨ shortName.version;
+IF NOT case THEN {
+base ¨ LowerCase[base];
+};
+};
+
+LowerCase: PROC [r: ROPE] RETURNS[ROPE] ~ {
+len: INT ¨ r.Length[];
+buf: REF TEXT ¨ RefText.ObtainScratch[len];
+FOR i: INT IN [0..len) DO
+buf[i] ¨ Ascii.Lower[r.Fetch[i]];
+ENDLOOP;
+buf.length ¨ len;
+RETURN[Rope.FromRefText[buf]];
+};
+GMTFromMTime: PUBLIC PROC [unixTime: UnixTypes.Time] RETURNS [gmt: GMT] ~ {
+RETURN [BasicTime.Update[unixEpoch, INT[unixTime]]];
+};
+
+MTimeFromGMT: PUBLIC PROC [gmt: GMT] RETURNS [unixTime: UnixTypes.Time] ~ {
+RETURN [BasicTime.Period[from~unixEpoch, to~gmt]];
+};
+
+CompareSunTimes: PUBLIC PROC [t1, t2: UnixTypes.TimeVal] RETURNS [Basics.Comparison] ~ {
+RETURN [SELECT t1.sec FROM
+< t2.sec => less,
+> t2.sec => greater,
+ENDCASE => Basics.CompareCard[t1.usec, t2.usec]];
+};
+
+EncodeVersionInName: PROC [name: ROPE, version: CARD] RETURNS [nameWithVersion: ROPE] ~ {
+versionNumber: CARDINAL ¨ version;
+nameWithVersion ¨ Rope.Cat[ name, ".~", Convert.RopeFromCard[versionNumber, 10, FALSE], "~" ];
+};
+
+versionPartLeftBracket: ROPE ¨ ".~";
+versionPartRightBracket: CHAR ¨ '~;
+versionPartLeftBracketLen: INT ¨ Rope.Length[versionPartLeftBracket];
+versionPartRightBracketLen: INT ¨ 1;
+versionPartBracketsLen: INT ¨ versionPartLeftBracketLen + versionPartRightBracketLen;
+
+DecodeVersionFromName: PROC [name: ROPE] RETURNS [dirEntry: VUXFiles.DirEntry] ~ {
+nameLen, bangPos: INT;
+versionNumber: CARD;
+versionNumberRope: ROPE;
+dirEntry ¨ [name, [none], FALSE];
+nameLen ¨ Rope.Length[name];
+IF Rope.IsPrefix[caseFileNamePrefix, name, FALSE] THEN RETURN; -- accelerator
+bangPos ¨ Rope.FindBackward[name, versionPartLeftBracket];
+IF bangPos < 0 THEN bangPos ¨ nameLen;
+dirEntry.nameWithoutVersion ¨ Rope.Flatten[name, 0, bangPos];
+IF bangPos > (nameLen-versionPartBracketsLen) THEN RETURN;
+IF Rope.Fetch[name, nameLen-1] = versionPartRightBracket
+THEN versionNumberRope ¨ Rope.Substr[name, bangPos+versionPartLeftBracketLen, nameLen-bangPos-versionPartBracketsLen]
+ELSE versionNumberRope ¨ Rope.Substr[name, bangPos+versionPartLeftBracketLen];
+versionNumber ¨ Convert.CardFromRope[versionNumberRope, 10
+! Convert.Error => {versionNumber ¨ 0; CONTINUE }];
+IF versionNumber # 0 THEN dirEntry.version ¨ [numeric, versionNumber];
+};
+
+
+UXS: PROC[r: REF] RETURNS [CString] ~ INLINE{
+RETURN[UXStrings.Create[r]];
+};
+
+UXO: PROC[r: REF] RETURNS [CString] ~ INLINE{
+RETURN[UXStrings.CreateScratch[r]];
+};
+UXR: PROC[s: CString] ~ INLINE{
+UXStrings.ReleaseScratch[s];
+};
+initialInfoSetSize: CARDINAL ¨ 16;
+InfoSet: TYPE ~ REF InfoSetObject;
+InfoSetObject: TYPE ~ RECORD [
+size: CARDINAL,
+info: SEQUENCE maxSize: CARDINAL OF Info
+];
+infoSetSize: CARDINAL ¨ SIZE[InfoSetObject[0]]; -- avoid compiler bug 
+maxMaxSize: CARDINAL ¨ (CARDINAL.LAST - infoSetSize - 10) / SIZE[Info]; -- the '10' is just for luck
+
+InfoKind: TYPE ~ { caseHint, file, subdirectory };
+Info: TYPE ~ RECORD [
+name: ROPE, -- not including version part
+kind: InfoKind,
+version: Version
+];
+
+AddInfoToSet: PROC [set: InfoSet, info: Info] RETURNS [newSet: InfoSet] ~ {
+IF set = NIL THEN { set ¨ NEW[InfoSetObject[initialInfoSetSize]]; set.size ¨ 0 };
+IF set.size < set.maxSize
+THEN { newSet ¨ set }
+ELSE {
+newSize: CARDINAL ~ MIN[2*set.maxSize, maxMaxSize];
+newSet ¨ NEW[InfoSetObject[newSize]];
+FOR i: CARDINAL IN [0 .. set.size) DO
+newSet.info[i] ¨ set.info[i];
+ENDLOOP;
+newSet.size ¨ set.size;
+};
+newSet.info[newSet.size] ¨ info;
+newSet.size ¨ newSet.size + 1;
+};
+
+
+lastCharRope: ROPE ~ Rope.FromChar[CHAR.LAST];
+
+Enumerate: PROC [h: FSHandle, pattern: PATH, nameProc: PFS.NameProc, infoProc: PFS.InfoProc] ~ {
+casedDirPath: PATH;
+dH: VUXFiles.DirHandle;
+match: PATH;
+matchCount: INT;
+version: PFSNames.Version ¨ PFSNames.ShortName[pattern].version;
+Matched: PROC[dH: VUXFiles.DirHandle, nameSoFar: PATH, casedName: ROPE, uncasedName: ROPE, version: PFSNames.Version, isDir: BOOL] RETURNS [continue: BOOL ¨ TRUE] ~ {
+name: PATH ¨ PFSNames.ReplaceShortName[PFSNames.Cat[nameSoFar, IF isDir THEN oneEltDirPath ELSE oneEltPath], MakeComponent[casedName, version]];
+IF nameProc # NIL THEN
+continue ¨ nameProc[name]
+ELSE {
+bytes: INT;
+fileType: PFS.FileType;
+fmt: UnixTypes.Fmt;
+attachedTo: PATH ¨ NIL;
+mTime: MTime;
+uniqueID: PFS.UniqueID;
+mutability: PFS.Mutability ¨ mutable;
+lowName: ROPE ¨ uncasedName;
+fH: FHandle;
+IF version.versionKind = numeric THEN
+lowName ¨ EncodeVersionInName[uncasedName, version.version];
+[fH~fH, fmt~fmt, bytes~bytes, mTime~mTime, attachedTo~attachedTo] ¨ LookupSimple[dH, lowName];
+uniqueID ¨ [egmt~[gmt~GMTFromMTime[mTime], usecs~0]];
+fileType ¨ PFSFileTypeFromUnixFmt[fmt];
+IF attachedTo#NIL THEN attachedTo ¨ ResolveAttachment[name, attachedTo];
+continue ¨ infoProc[name, attachedTo, uniqueID, LOOPHOLE[bytes], mutability, fileType];
+};
+};
+
+NameInfo: TYPE ~ RECORD[ name: ROPE, version: Version, casedName: ROPE];
+noName: NameInfo ~ [NIL, [none], NIL];
+
+EnumerateInner: PROC[level: INT, dH: VUXFiles.DirHandle, nameSoFar: PATH] RETURNS [continue: BOOL ¨ TRUE] ~ {
+component: ROPE ¨ VUXFiles.GetDirComponent[path~pattern, pos~level, smashCase~FALSE];
+starPos: INT ~ Rope.Index[component, 0, "*"];
+lowestPossible: ROPE ¨ Rope.Substr[VUXFiles.GetDirComponent[path~pattern, pos~level, smashCase~TRUE], 0, starPos];
+highestPossible: ROPE ¨ Rope.Concat[lowestPossible, lastCharRope];
+set: InfoSet ¨ NIL;
+latestCaseHint, thisName, casedName: ROPE ¨ NIL;
+lag: NameInfo ¨ noName;
+
+EachName: VUXFiles.EachDirEntryProc ~ {
+thisName ¨ entry.nameWithoutVersion;
+casedName ¨ thisName;
+IF Rope.Compare[thisName, highestPossible] = greater THEN RETURN[FALSE];
+SELECT TRUE FROM
+entry.version.versionKind = numeric AND entry.version.version=0 => {
+latestCaseHint ¨ thisName;
+};
+entry.version.versionKind = none => {
+IF Rope.Equal[thisName, "."] OR Rope.Equal[thisName, ".."] THEN
+RETURN[TRUE];
+IF latestCaseHint # NIL THEN
+SELECT Rope.Compare[latestCaseHint, thisName, FALSE] FROM
+less => latestCaseHint ¨ NIL;
+equal => casedName ¨ latestCaseHint;
+ENDCASE;
+IF Rope.Match[component, thisName, FALSE] THEN {
+IF level = PFSNames.ComponentCount[pattern] - 1 THEN {
+RETURN Matched[dH, nameSoFar, casedName, thisName, [none], TRUE];
+}
+ELSE {
+continue: BOOL ¨ TRUE;
+subDH: VUXFiles.DirHandle ¨ NIL;
+[dHChild~subDH] ¨ VUXFiles.GetDirChild[dH, thisName, FALSE ! PFS.Error => IF error.code = $unknownFile THEN {subDH ¨ NIL; CONTINUE}];
+IF subDH # NIL THEN {
+continue ¨ EnumerateInner[level + 1, subDH, PFSNames.ReplaceShortName[PFSNames.Cat[nameSoFar, oneEltPath], MakeComponent[casedName, [none]]]];
+[] ¨ VUXFiles.UnPinDir[subDH];
+};
+RETURN [continue];
+};
+};
+};
+entry.version.versionKind = numeric => {
+IF level # PFSNames.ComponentCount[pattern] - 1 THEN
+RETURN[TRUE];
+IF latestCaseHint # NIL THEN
+SELECT Rope.Compare[latestCaseHint, thisName, FALSE] FROM
+less => latestCaseHint ¨ NIL;
+equal => casedName ¨ latestCaseHint;
+ENDCASE;
+IF Rope.Match[component, thisName, FALSE] THEN {
+it: NameInfo ¨ noName;
+SELECT version.versionKind FROM
+all, none => {
+it ¨ [thisName, entry.version, casedName];
+};
+numeric => {
+IF entry.version = version THEN
+it ¨ [thisName, entry.version, casedName];
+};
+lowest => {
+IF NOT Rope.Equal[lag.name, thisName, TRUE] THEN {
+it ¨ [thisName, entry.version, casedName];
+};
+lag ¨ [thisName, entry.version, casedName];
+};
+highest => {
+IF NOT Rope.Equal[lag.name, thisName, TRUE] THEN {
+it ¨ lag;
+};
+lag ¨ [thisName, entry.version, casedName];
+};
+ENDCASE => ERROR;
+IF it.name # NIL THEN {
+RETURN[ Matched[dH, nameSoFar, it.casedName, it.name, it.version, FALSE] ]	;
+};
+};
+};
+ENDCASE => ERROR;
+};
+IF level >= PFSNames.ComponentCount[pattern] THEN
+RETURN;
+IF starPos >= 0 THEN lowestPossible ¨ lowestPossible.Substr[0, starPos];
+VUXFiles.EnumerateDirectory[dH, EachName, lowestPossible, FALSE];
+IF lag.name#NIL AND version.versionKind=highest 
+THEN  RETURN[ Matched[dH, nameSoFar, lag.casedName, lag.name, lag.version, FALSE] ];
+};
+
+{
+ENABLE {
+UNWIND => {
+IF dH # NIL THEN VUXFiles.UnPinDirPath[dH]; dH ¨ NIL;
+};
+};
+IF PFSNames.IsADirectory[pattern] THEN	-- Perhaps dubious
+pattern ¨ PFSNames.Cat[pattern, oneEltPath];
+[dH, match, matchCount] ¨ FollowDirPathForEnumeration[PFSNames.StripVersionNumber[pattern]];
+IF dH # NIL THEN
+[] ¨ EnumerateInner[matchCount, dH, match];
+};
+IF dH # NIL THEN VUXFiles.UnPinDirPath[dH];
+};
+
+FollowDirPathForEnumeration: PROC [pattern: PATH] RETURNS [dH: DirHandle, match: PATH, matchCount: INT ¨ 0] ~ {
+ENABLE UNWIND => {
+IF dH # NIL THEN VUXFiles.UnPinDirPath[dH];
+};
+dir: PATH ¨ PFSNames.Directory[pattern];
+dirPath: PATH;
+caseFileName: ROPE;
+component, casedComponent: ROPE;
+i: INT ¨ 0;
+EachDirEntry: VUXFiles.EachDirEntryProc -- [entry: VUXFiles.DirEntry] RETURNS [continue: BOOL ¨ TRUE] -- ~ {
+SELECT TRUE FROM
+Rope.Compare[entry.nameWithoutVersion, component, FALSE] = greater => {
+continue ¨ FALSE;
+};
+entry.version.versionKind = numeric AND entry.version.version=0 => {
+casedComponent ¨ entry.nameWithoutVersion;
+continue ¨ FALSE;
+};
+ENDCASE => NULL; 
+};
+dH ¨ VUXFiles.GetDirRoot[];
+dirPath ¨ PFSNames.SubName[name~dir, start~0, count~1, absolute~TRUE, directory~TRUE];
+FOR i ¨ 1, i + 1 WHILE i < PFSNames.ComponentCount[pattern] - 1 DO
+component ¨ casedComponent ¨ VUXFiles.GetDirComponent[path~pattern, pos~i, smashCase~TRUE];
+IF Rope.Find[component, "*"] >= 0 THEN
+EXIT;
+caseFileName ¨ Rope.Concat[caseFileNamePrefix, component];
+VUXFiles.EnumerateDirectory[dH, EachDirEntry, component, FALSE];
+dirPath ¨ PFSNames.ReplaceShortName[PFSNames.Cat[dirPath, oneEltPath], MakeComponent[casedComponent, [none]] ];
+dH ¨ VUXFiles.GetDirChild[dH~dH, childName~component, create~FALSE ! PFS.Error => { IF error.code = $unknownFile THEN {VUXFiles.UnPinDirPath[dH]; dH ¨ NIL; CONTINUE }}].dHChild;
+IF dH = NIL THEN RETURN;
+ENDLOOP;
+match ¨ dirPath;
+matchCount ¨ i;
+};
+
+UIDFromMTime: PROC [mTime: MTime] RETURNS [UniqueID] ~ {
+RETURN[[egmt: [gmt: HostTime.ExtendedGMTFromHostTime[[a~LOOPHOLE[mTime]]].gmt, usecs: 0], host: [0, 0]]]
+};
+PFSClass.ClearCachedServer["-vux"];
+PFSClass.Register[vuxFlavor, VUXGetHandle];
+}...
+  
+   8  
+VUXFileImpl.mesa
+Copyright ” 1987, 1988, 1989, 1990, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Demers, February 19, 1988 4:54:19 pm PST
+Xerox3, January 15, 1988 12:37:12 pm PST
+JKF November 16, 1988 4:51:21 pm PST
+Tim Diebert: May 18, 1988 8:46:48 am PDT
+Carl Hauser, September 21, 1989 10:05:55 am PDT
+Doug Wyatt, February 2, 1990 3:56:14 pm PST
+Nichols, March 29, 1990 3:38 pm PST
+Willie-s, July 9, 1992 4:56 pm PDT
+Chauser, February 3, 1993 3:11 pm PST
+Michael Plass, January 27, 1992 5:34 pm PST
+Wade, May 3, 1991 5:27 pm PDT
+
+TODO: The EachDirProcs need to terminate enumeration (sorted assumption).
+TODO: Ensure that the FileInfoProc does the right thing about attachedTo [DKW].
+Copied Types
+Parameters
+File lookup and creation
+Return info for named file if it's present and we can stat it successfully.
+Return fH=NIL if named file is nonexistent.
+Raise PFS.Error otherwise.
+All attachments supported in this view must be -ux file names and should be identified as such to clients.
+Return info for file if it's present and we can stat it successfully.
+Return fH=NIL if no file exists with given name and created time.
+Raise PFS.Error for other errors.
+Determine a version number for to file; rename the from file to that version.
+If "deleteIfError" is TRUE, the "from" file will disappear even if the rename operation fails.
+ignore failures
+Registered As a PFS Class
+Returns [NIL, NIL] if fs can't be located.
+at the moment, we only support the local Unix name space. 
+Error reporting
+Procs to provide versioned view
+fullFName ¨ PFSNames.SetVersionNumber[file, version];
+chmod done separately from open to override umask.
+Sync the file, because otherwise writes to full NFS servers all appear to work, but the bits don't appear there.
+Preserve "Execute" bits in Unix-based views
+This is not pleasant...
+IF wantedUniqueID.egmt.time # BasicTime.nullGMT THEN TRUSTED {
+bah! there's no string name available for the UTimes.
+mTime: MTime ~ MTimeFromGMT[wantedUniqueID.egmt.time];
+modTimeVal: UnixTypes.AccModTimes _
+[accessTime: [sec: mTime, usec: 0], modTime: [sec: mTime, usec: 0]];
+res: RES ~ UnixSysCalls.UTimes[stringName, @modTimeVal];
+};
+Sync the file, because otherwise writes to full NFS servers all appear to work, but the bits don't appear there.
+have to find it; may raise PFS.Error[FileNotFound]
+produce the unix name by syntactic transformation
+Utility
+Time Conversion
+Version Encoding
+
+
+Enumerations
+Parameters
+Sets of Info
+Not used right now.
+EnumerationAborted: PRIVATE ERROR ~ CODE;
+Enumerate all the files that match the pattern, calling either nameProc or infoProc (whichever is non-NIL) on each.
+Called on each file name matched, it constructs the final name and calls either the name proc or the info proc.
+The recursive tree walk.  I suppose all the continue flag stuff could be done with exceptions.
+Pass to VUXFiles.EnumerateDirectory to fill "set" with a directory's file entries.
+See if we have a case hint for this guy.
+Check for match.
+Match if we're processing the last component, else recur.
+Don't match files until the last pattern component.
+See if we have a case hint for this guy.
+Now try for match.
+If versions match, we're in.
+Match everything.
+Versions must agree.
+
+Main for EnumerateInner.
+We enumerate the directory and build a set that has all the files, dirs, and case hints in it.  The enumeratioin should place each case hint immediately before the files it pertains to.
+Main code for Emuerate.
+Match the non-wildcard part of the pattern.  We could let EnumerateInner do this, but we don't, for both historical and speed reasons.
+Follows a pattern down the file tree through all components with no '* characters.  The case information for each directory traversed is remembered.  When done, we return a directory handle for the matched part, its name, and the length of the name.
+assert: Rope.Equal [entry.nameWithoutVersion, component] 
+Component 0 is empty by convention, and we don't process the last one.
+At this point, i has either the index of the component with the first *, or the index of the last component.
+the LOOPHOLE is to guard again bogus unix file times
+Initialization
+ ù 7  ïNewlineDelimiter
+ñ(cedarcode) styleïNewLineDelimiterô codeöúôKöú
+œeúOôZKô(Kô(Kô$Kô(Kô/Kô+Kô#Kô"Kô%Kô+KôKô KôIôOKò óóöœk	ò	KòKòKòKò	Köú
+ûúûú4òXKòKöú	ûúòKò	KöûúòKöûúòKòKò	Kò	Köúûú!ò.KöúûúÉûú
+òõKò
+Köúûú!ò4KòKöúûú"ò=Kò
+Köú
+ûúûúûúòRKòKöúòKò óöœnúûúûúûúûúûúòBKöûú>ûúûúÑò–Köûúûú
+òKòheadôKöúûúûúœc:òqKò Köú	ûúò!KöûúûúûúòKöúûúò%KöûúûúûúòKöúûúòKöú	ûúò!Köúûúò%KöûúûúûúòKöú
+ûúûú
+òKöú
+ûúûú
+òKöúûúûúòKöûúûúûúòKöú
+ûúò#Köú	ûúò!óô
+öúûúò KòMKòóKöú?ò?Köú{ò{KöúûúòKöúûúòKöúûúòóôöüúûúûúò6Köûú*ûúûúûúò[KöúòKôKKô+KôKò KöúòKöú8ò8öûúûòòKòKöú ò Köúûúò(KöúòKòóöûúòKöúûúò	Köú
+ò
+Kò
+Köú
+ò
+KòóKöûúIûúQûú"ò»óKòKò óKöú)ûúòGKôjöüúûúûúûúûúûúòOöúòKö	ú
+ûúûú!ûúûú:òÇKöûú9ò?KöúòóKòKò óöüúûúûúòJKöûúûú5ûúûúòwKòKôEKôAKô!Kò Köúûúûúòöüú†7úòcKòöûú.ûúûò?Köúûúûú†ò.öú	ûúûúò+KòKöúTòTKöúcòcöûúûúûúûúò.KöúûúòKöûúûúòKòóKòóòKöûúûúòKòóKöûúûú†,ò>óKòóKöú4ûúò;Köûúûúûúûúûúûúò:KòKò óöüúûúûúûúòBKöûú2ûú	ûúûúòWKöúûúòKöúûúûúòKöúûúûúòöüú†7úòcöûú.ûúûò?Köúûúûú†ò.öú	ûúûúò+Köúûú†'òJöûúûúò!KöúûúòKöúòKòóKòöûúòKöúûúòóóKöúûúûúòKöûúò
+óKòóKöú=ò=öûúûúòKöú;ò;Köú-ò-KöúûúòKòóöûúûúûúòKöúòKöúûúòKöúòóKòKò óöüúûúûúûúòBKöûú1ûú	ûúûúòVKöúûúûúûúò KöúûúûúòKöúûúûúòöüú†7úòcöûú.ûúûò?Köúûúûú†ò.öú	ûúûúò+Köúûú†'òJöûúûúûúò1KöúûúòKöúòKòóKòöûúòKöúûúòóóKöúûúûúòKöûúò	óKòóKöú=ò=öûúûúòKöú:ò:Köú+ò+KöúûúòKòóöûúûúûúòKöúòKöúûúòKöúòóKòKò óöüúûúûúûú,ûú/ûú"ûúò“KöúûúòòöûúûúòKöûúûúûúò+KòóKöúûúòKöúûúòKöúòKò Köú=ûú	ûúòRKöúVûúò]Köûúûú-ûúJûúò¨öûúûòòKöú>ûúòEKöûúûúûúûúòKòóòKöú=ûúòDKöûúûúûúûúòKòóòKöûúûúûúaòåKöúûúòKòóòKöú:ò:KöúûúòKòóKöûúûú†úò%óKöûúûúFòSKöú5ò5Köûúûúûúûúò5ö
+ûúûúûúûúûúòWKöûú}òÅóKöûúûúûú2òJKöú†ò8öûòKöúûúòóKòóKöúòöûúûúûúòKöú&ûú>ûúòàKòóKòKò óöüúûú?ûú*ûú
+ûúûúòûKöûúòKôMKô^KöúûúòKöúûúûúòòöûúûúòKöûúûú ò5Kòóöûúûò&Köú5ûú^òïöúòKöúûúòKöúûúòKöúûúò	KöúYûúò_öûúûúûòKöûúûúûú†Zò{Köûúûúûúûú:òrKòKöú[ò[öúòKöúûú	òKöúûúò"öûúò
+Köûú&ò*Köûú#ò'óKöûúûúòKöúòóöûúûúòKöú.ò.Kö
+ûúûúûúûúûúXòwKöúòóKöúûúòKöûúòKöûúòóöûúûúûúòKöúûú	òKöú ò Köûúò
+KöúòóöûúûúòKöú.œiò/Kò]KöúòóKöúûúò KòóöúòKòKöúûúò	KöúòKöú[ò[öúòKöúûú	òKöúûúò"öûúò
+Köûú&ò*Köûú#ò'óKöûúûúòKöúòóöûúûúòKöúòKöûúûúûúeòxKöúòóöûúûúûúòKöúûú	òKöú ò Köûúò
+KöúòóKöú4ûúò9KòóKöûúûú†ò!óKòóKòKò óöüúûúûúò4Köúûú"ò5KöúòKöûúò
+KöúûúòKòKò óKöúûúûúòKò ö
+üúûúûúûúûúò>KöúûúòöûúûúûúòKò#KöúûúûúFòwKòóKöú%ò%Köúûú+ûúòCKöúûúLòYKòKò óKöúûúûúò,Köúûúûú#òDKò öüúûúûúûúò;Köúûú)ò;Köúûú*ò=KöúûúDòTKöûúò
+KôKöûú
+ûúò-KöúûúòKòKò óöüúûúûúûúûúûúòVöüú†7úòcöûú.ûúûò?Köúûú†ò%öú	ò	öûú ûúò(Köú(ò(KöûúûúòKòóKöûúûúûúòóKöúûúûúòKöûúò
+óKòóKöú4ûúò;KòKò óöüúûúûúûúò<KöúûúûúòKö	úûúûúûúûúò"öüú†7úòcöûú.ûúûò?Köúûúûú†ò&öú	ûúûúûúòMKöúûúòKöûúûúòKòóòKöûúûúòKòóKöûú†òóKòóöüú†7úòhöûú,ûúûúò;öûúûò$KöúûúKò_óKöûúûúòKòóKöûúûúòKòóKöú4ûúò;öûúûúûúòKöú9ûúò@öûúûúûúûúûúûúûòEKöúòKöûúòóKòóKòóóôIcode1öúûúûúò öúûúûúòMöúûòMòMò óöú1ûú$òXMöúòMöúòMöúòMò óöüúò Köú&ò&Köú$ò$KöúòKöúòóKò öüú†LúòuöûúòKöûú#ûúò-Köûúûúûúò óKòKò óöüú†Púò{öûúòKöûú#ûúò,Köûúûúûúò óKòKò óöüúûúûúûúûú!ûúûúògKöú	ûúûúô*Köúûúò(öûúûúûúûúûúûúò.Köú:ô:óKöúûúxòKòKò óöüú†;úòbKöúûú
+†ò/Köûúûúûú†ò)KòóóóôKöúûúò"ö
+üúûúûúûúûúòVKöúûú(ò8öú
+ûúûúûúûò&Köúûúò<Köúûúûúò%Köúûú	òKöûú
+òóKöú	ûú0ò=Kò,KöúòKò óöüúûú1ûúûúòWöú
+ûúûúûúûò&Köúûúò<Köúûúûúò%Köúûú	òKöûú
+òóKöú	ûú,ò9Köú.ò.KöúòóKò óöúôcode2öú+ûú)òWKöúòKöú&ò&Köú(ò(KöúòKöúòKöúòKöúòKöú ò Köú4ò4Köú(ò(Köú(ò(Köú8ò8KöúòKöúòKöúòKöúòKöúòKöúòKöúòKòKò(KòKòKò óöü	úûú†–csN†úò~KöúòKòKöúûúòKöúòKöúpòpöûú	ûúûú:ûúòRöûúûúòKöúòKòóKöú
+ûú+ò9Köúûúò$Köúûú#ò+KöûúòöûúûúòKò.Kò=KòóKöúûúòKöúLòLKòóKòKò óöüúûú†¢¥†úòËKòKöúûúò	KöúòKöú"ò"KöúâòâKòKò'KöúòKöú5ô5KòKò óöü
+ú†ùúûúò Köúûúûúò&KöúûúòKöúòKöúûú ò(öûúûúòKò.Kò8KöúòóKöûú[òaKòKò óö
+ü	úûú†¢Ö†¢†úòΩKöúòòöûúûúòKöûú
+ûúûúò3Köûúûúûúò/KòóKöú2ûúò7Köúûúò KòKòKò3Köúáòáöûú	ûúûú>ûúòVKöú0ûú	ûúòDKöúcûúòjKöûúûúYòjöûúûòKöú+ò+KöúûúòKöûúRòYóKöúRûúûú
+ûú	òtKöúTòTKöú0ò0öûúûòKöú;ûúò@Köûú5ò<óöûúûúòKöú4ûúò:Köúûú
+ûúò6KòóKöú$ûúò(KòóKöú(ûúò,KöûúûúòöûòKöúHòHóKòóKòKò óö
+üúûú†¢g†¢†úò£KòKöúûúòKöúûúûúòKöúòKöúûúòKòKöúûúûúòKöúûúòKöúûúòKò KöúáòáKöúTòTKöûúûúûúûúòKöúûúò@öúòKöúûúòKöú1ò1Köûúò
+KöúòóöûúûúòKò.Kò4Köúòóöûúò	öûúûúòKöúòKòóöûòKöúûúòKö	úûúûúûúûúòBKöú9ò9öûúûúòKò.Kò4KöúòóKöúòKöûúòKöûú"ûúûúò.KöûúòóKòóKòKòKò óöüúûúCûúûúòvKöú*ò*Köûúûúûúòöúòö	úûúûúûúûú2òZKöûú3ò7óKöûúûúò KòóKòKò óöüúûúûúûúûúûúûúûú9ûúûúûúûúòïKöúûúò!KòKòöüúûúòKöúûúòKöú,ûú	ûúò@KöúcûúòjKöûúûúVògöûúûò(Köú+ò+KöúûúòKöûúPòWóKöúGòGKöúûúò'Köú=ò=öûúûúòKò.KòJKöúòóöúòKô2Köú?ûúòFöûú0ûúò9Kò.KòKKöúòóKöúòóKöúûúòKòKò óöü	úûúûúòKöúûúòKôpKöúûúò"Kòöûúûú"ûúûúò@KòVKöúòóKöúQûúòWöûúûòKöú;ûúò@Köûú/†ò<óöûúûúòKöú4ûúò:KöúòKòóKöú ûúò$KòKò óKöúòKò öûúò	öûúûúòKöûúûúûúò+KòóKòKöûúûúûúò.KòKöûúòKòóKò KòóKò öüúûú†¢t†¢†¢4†úò˜KöúòKò öüúûúûúûúòAKöúûúûúòöûúò	öûúûúòKöûú
+ûúûú ò4KòóKöú,ò,öûòKöúûúòKö	úûúûúûúûúòBKöúûú,ò>KöûúûúûúòKöú:ò:öûúûúò&öûúûúòKöú.°ò/Kò4KöúòóKöûúfòjKöúòóKöûúòóòKô+KôKöûúûú
+ûúòKöú	ûúûúûú&òOKöúòKöúûú ò(Köúûúûúò)öûúûúòKò.Kò5KòóöûúûúûúòKöúûú!ò4KöúûúûúûúòXKöúûúò6KòóKòóKöú#ò#Köú)ûúò-KòóKòKò óKöúûúòKöúòKöú\ûúòuKòKöûúûúûú5òGKòKò óö
+üúûúûúûúûúòhöúûúûòKöúûúòKöûúûúòóKöúòKò óöüú †NúòÖKöúûú
+†ò/Köúûúò!KöúòKò óöüú!†RúòãKöúûú
+†ò/Köúûúò!KöúòKò óöüú†-úòXKöúûú
+†ò/KòKòKöúòKöú9ûúûú
+ûúûúûúûúûúòëKöúòKöûúûúûúûú*òAKöûúûúûúòKöúòKò óöüú†ìúò≤Köúûú
+†ò/KöúòKò óöüú†BúòsKöúûú
+†ò/KòKöúòKò óöüú'†GúòåKöúûú
+†ò/Köúûúûúûúò5öûú
+ûúòKöúûú%ò-öûúûúòKò.KòaKòóKöúòóöûú.ûúûúô>Kô5Köú6ô6KöúhôhKöúûú0ô8KöúôóKöúòKò óöüú!†UúûúòñKöúûú
+†ò/Köúûúûúûúò5KöúòKöúûú ò(öûúûúòKò.KòBKòóöûúûúûúòöú)ò)Köûúûúûúò<Köúòóöú*ò*Köûú ò&Köúòóöú*ò*Köûú ò&KöúòóKöûúûúûúòóKöúòKò óöüú)†7úûúòàKöúûú
+†ò/Köúûúûúûúò5KöúòKöúûú ò(Köûúûú2ûúûúòDKöûúûú'ûúûúûúûúòYKöú6ò6KöúòKò óöüúûúûú>ûú	ûúûúûúûúûúû	úò£Köúûú
+†ò,Köúûúûúò&KöúûúòKöú	ûúòKòöüúûúûúûú
+ûúûúûúûúòPKöûúûúûúòKöú,ò,Köú+ò+öûúûúò Köúûú-ò5öûú	ûúòKòKöûúòKöúòóKöúòóKöú(ûú òPöûúûúòKòKöûúòKöúòóKöûú'ûú'òTKòóKòKöûúûúûú0òVKòKò óöú	ûúò%Kò óöüúûú>ûúûúûúûúûúûúòôKöúûú
+†ò,Köúûúûúò&KöúûúòKöú	ûúòKòöüúûúûúûú
+ûúûúûúòIKöûúûúûúòKöú,ò,Köú+ò+öûúûúò Köúûú-ò5öûú	ûúòKòKöûúòKöúòóKöúòóKöú,ûú$òXöûúûúòKòKöûúòKöúòóKöûú'ûú*òWKòóKöúòKöûúûúûú1òXKöúòKò óöüú†∂úò’Köúûú
+†ò/Köúûú.ûúEûú ò∫KöúûúòKòKöúûúòKöúûúòöûúûòöú	ò	KöúòKöúõòõöúòKöúûúò%Köú8ûúòMKöûúòKöúòóKöú0ò0Köú4ò4Kò!Köúûúò$KöûúòKòóöúòKöúXûúûúòfKöú4ò4Kö	úRûúûúûúûúòèKöûúûúûú$òKKöúûúûúò4KöûúòKöúòóöú
+ò
+Köú+ò+öûúûúûúò>KöúXûúûúòdKöú4ò4Kö	úRûúûúûúûúòèKöûúûúûú$òKKöúûúûúò4KöúòóöûúòKöúìûúûúûúòΩöûúûúûúòKöúvòvKöúòóöúòKöúûúò%Köú8ûúòKKöûúòKöúòóKöú4ò4Köúûúò$KöúòóKöú4ò4KöûúòKöúòóöúòKöúíòíöûúûúûúòKöúxòxKöúòóöúòKöúûúò%KöúTûúògKöûúòKöúòóKöú4ò4Köúûúò$KöûúòKòóKöûúûúòóKöúòKò óöü	ú†Öúò®KöúòKò Köú
+ûúòKòKòöüúûúòKöúûúòKöú,ûú	ûúò@KöúcûúòjKöûúûúVògöûúûò(Köú+ò+KöúûúòKöûúQòXóKò öúòKöúûúûúò-KöûúûúûúTûú%òíKöúKûúûú†AòöKöúòóKöúûúòKòKò óöü	úûúûúòKöúûúòöûúûòKöú;ûúò@Köûú/†ò<óöûúûúòKöú4ûúò:KöúòKòóKöú ûúò$KòKò óKò öûúò	öûúûúòKöûúûúûúò+KòóKòKòKöú3ò3KòóKò KöúòKò óöüú†0úòQKöúûú
+†ò1Köúûúûúûú
+ò3KöúûúòKöú	ûúòKòöüúûúûúûú
+ûúûúûúòIKöûúûúûúòKöúûúò	Köú+ò+KôpöûúûúòKòöûúûúûúûúò6KòKöûúò%KöúòóKòóKöûúûúûú0òSKöúòöûúûúòKòKöûúòKöúòóKòóKöûúûúûú1òXKöúòKò óöüúûú3ûúòHKöú5ò5Köúhòhöûú-ûúûú8ûúòuKò.KòNKöúòóKöúòKò óöüúûú †¢F†úòåKöúûú
+†ò/Köúûúûúûúò5öûúûúûúòöú)ò)Köú
+ûú*ò:Köúûúûúò7Köúòóöú*ò*KöúVòVKöúòóöú*ò*KöúVòVKöúòóKöûúuò|óKöúòKò óöüúûú†¢*†úòhKöûúûúòKöúòKò óöüúûú †¢*†úòpKò4öûú+ûúò3Kô2Köûúûúò3KòóöûúòKô1Köú
+ûú)ò7Köúûú@òQKöú	ûúGòTKöúûúûú ò<Köûúò$KöúòóKöúòóKò ôKöü
+úûúûúòKò Köúûú%ûú!òZKöúûú%ûú*ûúòmKò öüúûúûúûúòAKöûú,ò2KòóKò öúûúûúòJKöúûú†ò$Köú+ûú†òSKöú,ûú†òRKöú*ûú†òQKòKò óöüúûúûúûúûúûúûúûúòtKöú0ò0Köú)ò)KöúòöûúûúûúòKöúòKöúòóKöúòóKò ö
+ü	úûúûúûúûúò+KöúûúòKöúûúûúò+öûúûúûú
+ûòKöú!ò!KöûúòóKöúòKöûúòKöúòóóôö
+üúûúûúûúûúòKKöûúûúò4KòKò óö
+üúûúûúûúûúòKKöûú,ò2KòKò óöüúûúûúûúòXöûúûúûòKöúòKöúòKöûú*ò1óKòKò óóôöüúûúûúûúûúûúòYKöúûúò"KöúPûú	ò^KòKò óKöúûúò$Köúûúò#Köúûú'òEKöúûúò$Köúûú:òUKò öüúûúûúûú"òRKöúûúòKöúûúòKöúûúòKöúûúò!KöúòKö	ûú)ûúûúûú†òMKöú:ò:Köûúûúò&Köú=ò=Köûú,ûúûúò:öûú6ò8KöûúqòuKöûúJòNóöú:ò:Köú'ûúò3óKöûúûú-òFKòKò óKò óö
+ûúûúûúûúûúò-KöûúòKòKò óö
+ûúûúûúûúûúò-Köûúò#KòKô óöûúûúûúòKöúòKòKô óóôô
+Köúûúò"óôKöú	ûúûúò"öúûúûúòKöúûúòKöúûú
+ûúûúò(KòóKöúûúûú†òFö
+úûúûúûúûú†òdKò óKöú
+ûú$ò2öúûúûúòKöúûú†ò)KöúòKöúòKòKò óöüúûúûúòKKöûúûúûú	ûú4òQöûúòKöûúòöûúòKöú	ûúûúò3Köú	ûúò%öûúûúûúûò%KòKöûúòóKòKòóóKöú ò KòKòKò óóKò KôKöüúûúûúûúô)Köúûúûúûúò.Kò ö
+ü	úûúûúûúûúò`KôsKöúûúòKöúòKöúûúòKöúûúòKò@öüúûú$ûúûúûú$ûúûúûúûúò¶KôoKö	úûú5ûúûúûú1òêöûúûúûòKòóöûúòKöúûúòKöú
+ûú
+òKöúòKöúûúûúòKòKöú
+ûú
+òKöúûúò%Köú	ûúòKòöûúûò%Köú<ò<óKöú^ò^Köú5ò5Köú'ò'Köûúûúûú2òHKöú0ûúòWKòóKòKò óKö	ú
+ûúûúûúûúòHKöúûú
+ûúò&Kò öüúûúûú%ûúûúûúûúòmJô^Köúûú?ûúòUKöú	ûú!ò-KöúûúKûúòrKöúûú-òBKöúûúòKöú%ûúûúò0KöúòKò öüúò'JöúRôRKöú$ò$KòKöûú3ûúûúûúòHöûúûúûòöú$ûúòDKòKòóöú%ò%öûúûúûò?KöûúûúòóJöú(ô(öûúûúûòöûú(ûúûò9KöúûúòKò$KöûúòóóJôöûú!ûúûúò0Jô9öûú.ûúò6Köûú5ûúòAKòóöûúòKöú
+ûúûúòKöúûúò Köú5ûúûú
+ûúûú
+ûúûúòÖöûú	ûúûúòKöúéòéKòKòóKöûúòKòóKòóKòóöú(ò(Jô3öûú.ûò4KöûúûúòóJöú(ô(öûúûúûòöûú(ûúûò9KöúûúòKò$KöûúòóóJöúôöûú!ûúûúò0JöúôKöúòöûúûòòJöúôKöú*ò*KòóòJöúôöûúûòKöú*ò*óKòóòöûúûú ûúûúò2Köú*ò*KöúòóKöú+ò+Kòóòöûúûú ûúûúò2Kò	KöúòóKöú+ò+KòóKöûúûúòóöûúûúûúòKöûú<ûúòLKòóKòóKòóKöûúûúòóKòóJô Jôöûú+ûò1KöûúòóJôπKöûúûú4òHKöú:ûúòAöûú
+ûúûúò0Köûúûú?ûúòTóKòóKò KôòöûúòöûúòKöûúûúûú!ûúò5KòóKòóöûú ûú†ò9Köú,ò,óKôÜKöú\ò\öûúûúûòKöú+ò+óKòóKöûúûúûúò+KòKò óöüúûúûúûúûúûú	òoKô˘öûúûúòKöûúûúûúò+KòóKöúûúò(Köú	ûúòKöúûúòKöúûúò Köúûúòöüú†@úòlöûúûúûòöú2ûúòGKöúûúòKòóKöú9ô9öú$ûúòDKöú*ò*KöúûúòKòóKöûúûúòóKòóKöúòKöú@ûúûúòVKôFöûúûú*ûòBKöúUûúò[öûú ûò&KöûúòóKò:Köú9ûúò@KöúoòoKöú=ûúûúûúûú"ûúûúò±KöûúûúûúûúòKöûúòóKôlKöúœtòKöúòKòKò óöüúûúûúò8Kô4Köûú2ûú(òhKòóóôKò#Köú+ò+KòóKòó Öó    √    

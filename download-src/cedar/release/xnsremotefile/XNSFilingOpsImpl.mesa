@@ -1,0 +1,411 @@
+
+
+DIRECTORY
+BasicTime USING [GetClockPulses, GMT, Now, nullGMT, PulsesToMicroseconds],
+Basics USING [UnsafeBlock],
+CrRPC USING [BulkDataSink, BulkDataSource, BulkDataValueProc, CreateClientHandle, DestroyClientHandle, Handle, ReadBulkDataStream],
+FilingP10V5,
+FilingAttributesP10V5 USING [Attribute, AttributeSequence, AttributeSequenceObject, AttributeValue, FileID, InterpretedAttributeType, Version],
+IO USING [EndOf, PutFR, rope, UnsafeGetBlock, UnsafePutBlock],
+QuickFilingP10V5 USING [QuickGetAttributes],
+PFS USING [Error, UniqueID],
+PFSNames USING [PATH],
+RefText USING [ReleaseScratch],
+Rope USING [Fetch, FromRefText, ROPE, Substr],
+RuntimeError USING [ ],
+UserCredentials USING [GetIdentity],
+XNS USING [Address, unknownAddress],
+XNSAuth USING [Conversation, Credentials, GetCredentials, GetNextVerifier, Identity, Initiate, Refresh, SetRecipientHostNumber, Verifier],
+XNSCH USING [LookupAddressFromRope],
+XNSCHName USING [Name, RopeFromName],
+XNSFilingAttributes USING [BuildAttribute, BuildScope, EncapsulateFileID, Interpreted, nullAttributes, nullControls],
+XNSFilingFileMgr USING [OpenFile, OpenFileObject],
+XNSFilingNames USING [ParseName, UnparseName],
+XNSFilingOps USING [EnumProc, Info, Op, ServerData, ServerDataObject],
+XNSFilingPrivate USING [ConvertFSNameToXNS, InfoFromAttributeStream];
+
+XNSFilingOpsImpl: CEDAR MONITOR
+IMPORTS BasicTime, CrRPC, FilingP10V5, IO, PFS, QuickFilingP10V5, RefText, Rope, UserCredentials, XNSAuth, XNSCH, XNSCHName, XNSFilingAttributes, XNSFilingNames, XNSFilingPrivate
+EXPORTS XNSFilingFileMgr, XNSFilingOps ~ {
+OPEN FilingP10V5, FilingAttributesP10V5, XNSFilingAttributes, XNSFilingFileMgr, XNSFilingOps, XNSFilingPrivate;
+ROPE: TYPE ~ Rope.ROPE;
+BangStarFile: PROC [file: ROPE]
+RETURNS [pattern: PFSNames.PATH ¬ NIL] ~ { NULL };
+
+ConvertToPattern: PROC [pattern: PFSNames.PATH, op: Op]
+RETURNS [pat: PFSNames.PATH] ~ {
+};
+
+BuildPath: PROC [mnt: ServerData, rope: ROPE, isDir: BOOL]
+RETURNS [pathy: PFSNames.PATH] ~ {
+format: ROPE ~ IF ( isDir ) THEN "/%g/" ELSE "/%g";
+rope ¬ IO.PutFR[format, IO.rope[rope] ];
+pathy ¬ XNSFilingNames.ParseName[rope];
+};
+
+RemoveLeadingSlash: PROC [withSlash: ROPE]
+RETURNS [matcher: ROPE] ~ {
+matcher ¬ IF ( withSlash.Fetch[0] # '/ ) THEN withSlash ELSE withSlash.Substr[1];
+};
+OpenInternal: ENTRY PROC [mnt: XNSFilingOps.ServerData] ~ {
+ENABLE UNWIND => { NULL };
+mnt.admin.files ¬ mnt.admin.files.SUCC;
+};
+
+CloseInternal: ENTRY PROC [mnt: XNSFilingOps.ServerData] ~ {
+ENABLE UNWIND => { NULL };
+mnt.admin.files ¬ mnt.admin.files.PRED;
+};
+ReadFileOp: PUBLIC PROC [mnt: ServerData, xnsFile: OpenFile, filePosition, nBytes: CARD, to: POINTER] RETURNS [bytesRead: INT ¬ 0] ~ {
+range: FilingP10V5.ByteRange ~ [filePosition, nBytes];
+Sink: CrRPC.BulkDataSink ~ TRUSTED {
+block: Basics.UnsafeBlock ~ [to, 0, nBytes];
+abort ¬ checkAbort[h];
+bytesRead ¬ s.UnsafeGetBlock[block];
+};
+RetrieveBytesOp[mnt, xnsFile.fileH, range, Sink];
+};
+
+WriteFileOp: PUBLIC PROC [mnt: ServerData, xnsFile: OpenFile, filePosition, nBytes: CARD, from: POINTER] RETURNS [bytesWritten: INT ¬ 0] ~ {
+range: FilingP10V5.ByteRange ~ [filePosition, nBytes];
+Source: CrRPC.BulkDataSource ~ TRUSTED {
+block: Basics.UnsafeBlock ~ [from, 0, nBytes];
+abort ¬ checkAbort[h];
+s.UnsafePutBlock[block];
+bytesWritten ¬ nBytes;
+};
+ReplaceBytesOp[mnt, xnsFile.fileH, range, Source];
+};
+
+CloseFileOp: PUBLIC PROC [mnt: ServerData, xnsFile: OpenFile] ~ {
+IF ( mnt.session # NIL ) THEN CloseOp[mnt, xnsFile.fileH];
+CloseInternal[mnt];
+};
+
+OpenFileOp: PUBLIC PROC [mnt: ServerData, fullFName: PFSNames.PATH]
+RETURNS [xnsFile: OpenFile ¬ NIL] ~ {
+withSlash: ROPE ~ XNSFilingNames.UnparseName[fullFName];
+newFile: ROPE ~ RemoveLeadingSlash[withSlash];
+attributes: AttributeSequence ~ BuildAttribute[newFile, Interpreted.pathname.ORD];
+fileH: FilingP10V5.Handle ~ OpenOp[mnt, attributes];
+now: BasicTime.GMT ~ BasicTime.Now[];
+xfile: OpenFile ~ NEW[OpenFileObject ¬ [fileH, now]];
+OpenInternal[mnt];
+xnsFile ¬ xfile;
+};
+
+EnumerateOp: PUBLIC PROC [mnt: ServerData, pattern: PFSNames.PATH, proc: EnumProc, op: Op] ~ {
+Listing: CrRPC.BulkDataSink ~ {
+EachElement: CrRPC.BulkDataValueProc ~ {
+info: Info ~ InfoFromAttributeStream[s];
+{
+nonEmpty: BOOL ~ ( ( info.isDir ) AND ( info.numKids # 0 ) );
+pathy: PFSNames.PATH ~ BuildPath[mnt, info.pathName, info.isDir];
+IF ( pathy = NIL ) THEN { abort ¬ FALSE; RETURN };
+abort ¬ NOT proc[pattern, info, pathy];
+};
+};
+IF ( s.EndOf[] ) THEN { abort ¬ FALSE; RETURN }; -- "Services" feature workaround
+abort ¬ CrRPC.ReadBulkDataStream[h, s, checkAbort, EachElement];
+};
+root: FilingP10V5.Handle ~ mnt.root;
+types: AttributeTypeSequence ~ GetCedarATS[op];
+withSlash: ROPE ~ XNSFilingNames.UnparseName[pattern];
+matcher: ROPE ~ RemoveLeadingSlash[withSlash];
+scope: FilingP10V5.ScopeSequence ~ BuildScope[$matches, matcher, InterpretedAttributeType.pathname.ORD];
+ListOp[mnt, root, types, scope, Listing];
+};
+LogonOp: PUBLIC PROC [server: ROPE] RETURNS [mnt: ServerData ¬ NIL] ~ {
+qualified: XNSCHName.Name; add: XNS.Address;
+LogonOpInner: PROC ~ {
+name: ROPE ~ XNSCHName.RopeFromName[qualified];
+address: REF XNS.Address ~ NEW[XNS.Address ¬ add];
+crH: CrRPC.Handle ~ CrRPC.CreateClientHandle[$CMUX, address];
+realId: XNSAuth.Identity ~ UserCredentials.GetIdentity[];
+conversation: XNSAuth.Conversation ~ XNSAuth.Initiate[realId, qualified];
+credentials: XNSAuth.Credentials ~ XNSAuth.GetCredentials[conversation];
+verifier: XNSAuth.Verifier; session: REF FilingP10V5.Session; timeToLive: CARD32;
+XNSAuth.SetRecipientHostNumber[conversation, address.host];
+verifier ¬ XNSAuth.GetNextVerifier[conversation];
+session ¬ NEW[Session ¬ FilingP10V5.Logon[crH, qualified, credentials, verifier]];
+session.verifier ¬ XNSAuth.GetNextVerifier[conversation];
+timeToLive ¬ FilingP10V5.Continue[crH, session­];
+XNSAuth.Refresh[conversation, timeToLive];
+CrRPC.DestroyClientHandle[crH];
+mnt ¬ NEW[ServerDataObject ¬ [name, qualified, address, conversation, session, timeToLive, FilingP10V5.nullHandle, ]];
+};
+[qualified, add] ¬ XNSCH.LookupAddressFromRope[server];
+IF ( add = XNS.unknownAddress ) THEN GOTO NoCanDo;
+LogonOpInner[];
+EXITS
+NoCanDo => { ERROR };
+};
+
+MountRootOp: PUBLIC PROC [mnt: ServerData] ~ {
+crH: CrRPC.Handle ~ CrRPC.CreateClientHandle[$CMUX, mnt.address];
+mnt.session.verifier ¬ XNSAuth.GetNextVerifier[mnt.tkt];
+mnt.root ¬ FilingP10V5.Open[crH, nullAttributes, FilingP10V5.nullHandle, nullControls, mnt.session­];
+CrRPC.DestroyClientHandle[crH];
+};
+
+ContinueOp: PUBLIC PROC [mnt: ServerData] ~ {
+crH: CrRPC.Handle ~ CrRPC.CreateClientHandle[$CMUX, mnt.address];
+mnt.session.verifier ¬ XNSAuth.GetNextVerifier[mnt.tkt];
+mnt.admin.trTTL ¬ mnt.timeToLive ¬ FilingP10V5.Continue[crH, mnt.session­];
+XNSAuth.Refresh[conversation: mnt.tkt, seconds: mnt.admin.trTTL];
+CrRPC.DestroyClientHandle[crH];
+};
+
+OpenOp: PUBLIC PROC [mnt: ServerData, attributes: AttributeSequence] 
+RETURNS [fileH: FilingP10V5.Handle] ~ {
+crH: CrRPC.Handle ~ CrRPC.CreateClientHandle[$CMUX, mnt.address];
+fileH ¬ FilingP10V5.Open[h: crH, attributes: attributes, directory: mnt.root, controls: nullControls, session: mnt.session­];
+CrRPC.DestroyClientHandle[crH];
+};
+
+OpenFIDOp: PUBLIC PROC [mnt: ServerData, fid: FileID] 
+RETURNS [fileH: FilingP10V5.Handle] ~ {
+crH: CrRPC.Handle ~ CrRPC.CreateClientHandle[$CMUX, mnt.address];
+attributes: AttributeSequence ¬ NEW[AttributeSequenceObject[1]];
+attributes[0] ¬ [type: InterpretedAttributeType.fileID.ORD, value: EncapsulateFileID[fid]];
+mnt.session.verifier ¬ XNSAuth.GetNextVerifier[mnt.tkt];
+fileH ¬ FilingP10V5.Open[h: crH, attributes: attributes, directory: FilingP10V5.nullHandle, controls: nullControls, session: mnt.session­];
+CrRPC.DestroyClientHandle[crH];
+};
+
+ListOp: PUBLIC PROC [mnt: ServerData, fileH: FilingP10V5.Handle, types: AttributeTypeSequence, scope: ScopeSequence, listing: CrRPC.BulkDataSink] ~ {
+crH: CrRPC.Handle ~ CrRPC.CreateClientHandle[$CMUX, mnt.address];
+mnt.session.verifier ¬ XNSAuth.GetNextVerifier[mnt.tkt];
+FilingP10V5.List[crH, fileH, types, scope, listing, mnt.session­];
+CrRPC.DestroyClientHandle[crH];
+};
+
+QuickInfoOp: PUBLIC PROC [mnt: ServerData, fileH: FilingP10V5.Handle, types: AttributeTypeSequence] RETURNS [info: Info] ~ {
+crH: CrRPC.Handle ~ CrRPC.CreateClientHandle[$CMUX, mnt.address];
+text: REF TEXT;
+mnt.session.verifier ¬ XNSAuth.GetNextVerifier[mnt.tkt];
+[info.version, info.bytes, info.created, info.fileType, text, info.fID, info.isDir, info.numKids] ¬ QuickFilingP10V5.QuickGetAttributes[crH, fileH, types, mnt.session­];
+info.pathName ¬ Rope.FromRefText[text];
+RefText.ReleaseScratch[text];
+CrRPC.DestroyClientHandle[crH];
+};
+
+DeleteOp: PUBLIC PROC [mnt: ServerData, fileH: FilingP10V5.Handle] ~ {
+crH: CrRPC.Handle ~ CrRPC.CreateClientHandle[$CMUX, mnt.address];
+mnt.session.verifier ¬ XNSAuth.GetNextVerifier[mnt.tkt];
+FilingP10V5.Delete[h: crH, file: fileH, session: mnt.session­];
+CrRPC.DestroyClientHandle[crH];
+};
+
+CloseOp: PUBLIC PROC [mnt: ServerData, fileH: FilingP10V5.Handle] ~ {
+crH: CrRPC.Handle ~ CrRPC.CreateClientHandle[$CMUX, mnt.address];
+FilingP10V5.Close[h: crH, file: fileH, session: mnt.session­];
+CrRPC.DestroyClientHandle[crH];
+};
+
+RetrieveBytesOp: PUBLIC PROC [mnt: ServerData, file: FilingP10V5.Handle, range: FilingP10V5.ByteRange, sink: CrRPC.BulkDataSink] ~ {
+crH: CrRPC.Handle ~ CrRPC.CreateClientHandle[$CMUX, mnt.address];
+FilingP10V5.RetrieveBytes[crH, file, range, sink, mnt.session­];
+CrRPC.DestroyClientHandle[crH];
+};
+
+ReplaceBytesOp: PUBLIC PROC [mnt: ServerData, file: FilingP10V5.Handle, range: ByteRange, source: CrRPC.BulkDataSource] ~ {
+crH: CrRPC.Handle ~ CrRPC.CreateClientHandle[$CMUX, mnt.address];
+FilingP10V5.ReplaceBytes[crH, file, range, source, mnt.session­];
+CrRPC.DestroyClientHandle[crH];
+};
+
+LogoffOp: PUBLIC PROC [mnt: ServerData] ~ {
+ENABLE PFS.Error => { GOTO GiveUp };
+IF ( mnt.session = NIL ) THEN RETURN;
+{
+session: REF Session ~ mnt.session;
+address: REF XNS.Address ~ mnt.address;
+crH: CrRPC.Handle ~ CrRPC.CreateClientHandle[$CMUX, address];
+FilingP10V5.Logoff[h: crH, session: session­];
+CrRPC.DestroyClientHandle[crH];
+};
+mnt.session ¬ NIL;
+EXITS GiveUp => { NULL };
+};
+
+XNSDelete: PUBLIC PROC [mnt: ServerData, file: ROPE, wantedUniqueID: PFS.UniqueID] ~ {
+fileH: FilingP10V5.Handle; info: Info; withKids: BOOL;
+[fileH, info, withKids] ¬ FindFile[mnt, file, wantedUniqueID.egmt.time, $delete];
+};
+
+XNSEnumerateForInfo: PUBLIC PROC ~ {
+<<
+P: PROC [file: ROPE, bytes: INT, created: BasicTime.GMT, fileType: FileType, version: Version, fID: FileID, isDir: BOOL, withKids: BOOL, pathName: REF TEXT] RETURNS [continue: BOOL] = {
+continue ¬ proc[file, bytes, created, fileType];
+};
+EnumerateOp[h, pattern, P, $enumerate];
+>>
+};
+
+openTime: CARD;
+startO, endO: CARD;
+FindFile: PROC [mnt: ServerData, file: ROPE, wantedTime: BasicTime.GMT, op: Op]
+RETURNS [fileH: FilingP10V5.Handle ¬ FilingP10V5.nullHandle, info: Info, withKids: BOOL] = {
+Note: EnumProc ~ {
+IF ( wantedTime # eInfo.created ) THEN RETURN;
+fileH ¬ OpenFIDOp[mnt, eInfo.fID];
+info ¬ eInfo;
+continue ¬ FALSE;
+};
+timeSearch: BOOL ~ ( wantedTime # BasicTime.nullGMT );
+newFile: ROPE ¬ ConvertFSNameToXNS[file, op];
+attributes: AttributeSequence ¬ BuildAttribute[newFile, Interpreted.pathname.ORD];
+startO ¬ BasicTime.GetClockPulses[];
+fileH ¬ OpenOp[mnt, attributes];
+IF ( fileH # FilingP10V5.nullHandle ) THEN {
+endO ¬ BasicTime.GetClockPulses[];
+openTime ¬ BasicTime.PulsesToMicroseconds[endO] - BasicTime.PulsesToMicroseconds[startO];
+info ¬ InfoFromOpenFile[mnt, fileH, op];
+withKids ¬ ( ( info.isDir ) AND ( info.numKids # 0 ) );
+IF ( ( NOT timeSearch ) OR ( wantedTime = info.created ) ) THEN { RETURN };
+};
+
+CloseOp[mnt, fileH];
+fileH ¬ FilingP10V5.nullHandle;
+IF ( timeSearch ) THEN {
+pattern: PFSNames.PATH ~ ConvertToPattern[BangStarFile[file], $enumerate];
+EnumerateOp[mnt, pattern, Note, op];
+endO ¬ BasicTime.GetClockPulses[];
+openTime ¬ BasicTime.PulsesToMicroseconds[endO] - BasicTime.PulsesToMicroseconds[startO];
+IF ( fileH # FilingP10V5.nullHandle ) THEN RETURN;
+};
+
+ERROR;
+};
+
+infoTime: CARD;
+startE, endE: CARD;
+InfoFromOpenFile: PROC [mnt: ServerData, fileH: FilingP10V5.Handle, op: Op]
+RETURNS [info: Info] = {
+types: AttributeTypeSequence ~ GetCedarATS[op];
+startE ¬ BasicTime.GetClockPulses[];
+info ¬ QuickInfoOp[mnt, fileH, types];
+endE ¬ BasicTime.GetClockPulses[];
+infoTime ¬ BasicTime.PulsesToMicroseconds[endE] - BasicTime.PulsesToMicroseconds[startE];
+};
+deleteATS: AttributeTypeSequence;
+enumerateATS: AttributeTypeSequence;
+enumerateNamesATS: AttributeTypeSequence;
+retrieveATS: AttributeTypeSequence;
+storeATS: AttributeTypeSequence;
+
+GetCedarATS: PROC [op: Op] RETURNS [attributes: AttributeTypeSequence] = {
+attributes ¬ SELECT op FROM
+delete => deleteATS,
+enumerate => enumerateATS,
+enumerateNames => enumerateNamesATS,
+rename => enumerateATS,
+retrieve => retrieveATS,
+store => storeATS,
+ENDCASE => ERROR;
+};
+
+MakeCedarATS: PROC RETURNS [delete, enumerate, enumerateNames, retrieve, store: AttributeTypeSequence] ~ {
+CardAT: PROC [iat: InterpretedAttributeType]RETURNS [card: CARD32] ~ INLINE { card ¬ iat.ORD };
+delete ¬ NEW[AttributeTypeSequenceObject[6]];
+enumerate ¬ NEW[AttributeTypeSequenceObject[8]];
+enumerateNames ¬ NEW[AttributeTypeSequenceObject[2]];
+retrieve ¬ NEW[AttributeTypeSequenceObject[5]];
+store ¬ NEW[AttributeTypeSequenceObject[1]];
+delete[0] ¬ CardAT[createdOn]; 
+delete[1] ¬ CardAT[fileID];
+delete[2] ¬ CardAT[isDirectory];
+delete[3] ¬ CardAT[numberOfChildren];
+delete[4] ¬ CardAT[version];
+delete[5] ¬ CardAT[pathname];
+enumerate[0] ¬ CardAT[createdOn]; 
+enumerate[1] ¬ CardAT[dataSize];
+enumerate[2] ¬ CardAT[name];
+enumerate[3] ¬ CardAT[pathname];
+enumerate[4] ¬ CardAT[type];
+enumerate[5] ¬ CardAT[isDirectory];
+enumerate[6] ¬ CardAT[version];
+enumerate[7] ¬ CardAT[fileID];
+enumerateNames[0] ¬ CardAT[pathname];
+enumerateNames[1] ¬ CardAT[isDirectory];
+retrieve[0] ¬ CardAT[createdOn];
+retrieve[1] ¬ CardAT[dataSize];
+retrieve[2] ¬ CardAT[version];
+retrieve[3] ¬ CardAT[pathname];
+retrieve[4] ¬ CardAT[fileID];
+store[0] ¬ CardAT[version];
+};
+Init: PROC = {
+[deleteATS, enumerateATS, enumerateNamesATS, retrieveATS, storeATS] ¬ MakeCedarATS[];
+};
+
+Init[];
+}.
+   <  XNSFilingOpsImpl.mesa
+Copyright Ó 1988, 1989, 1990, 1992 by Xerox Corporation.  All rights reserved.
+Tim Diebert: September 14, 1988 11:11:57 am PDT
+Willie-Sue, August 30, 1989 7:00:59 pm PDT
+Bill Jackson (bj), May 30, 1990 2:34 pm PDT
+Junk
+format: ROPE ~ IF ( isDir ) THEN "/%g/%g/" ELSE "/%g/%g";
+rope _ IO.PutFR[format, IO.rope[mnt.serverName], IO.rope[rope] ];
+matcher _ "BJackson/bridge.tar.Z!+";
+Reference Counting Files Open/Close
+FileMgr Operations
+we don't have to close files after a logout!
+newFile: ROPE ~ PFS.RopeFromPath[fullFName];
+??? XNSFilingOpsImpl.FindFile ???
+Composite Operations
+the server has given us a file that has a bad character in it so go around
+Remote Operations
+Strong Authentication logic
+CrRPC.Error, AuthenticationError, SessionError, ServiceError,XNSAuth.AuthenticationError, XNSAuth.CallError
+SessionError, AuthenticationError, CrRPC.Error
+PFS Access Routines
+IF ( withKids ) THEN {
+ENABLE UNWIND => { CloseOp[mnt, fileH] };
+xx: ROPE ~ IO.PutFR["Directory %g has children", IO.rope[file] ];
+PFSBackdoor.ProduceError[accessDenied, xx]
+};
+{
+delete: BOOL _ IF ( proc = NIL ) THEN TRUE ELSE proc[fullName, uniqueID];
+IF ( delete ) THEN { DeleteOp[fileH] };
+};
+Filing Utils
+check if this is (not) the one
+Any file found didn't meet the create time requested.
+So, we need to do an enumerate to find a file matching it
+
+
+since it is a timeSearch we need to do an enumerate
+attributes: AttributeSequence ~ FilingP10V5.GetAttributes[crH, fileH, types, mnt.session^];
+[...] _ InfoFromAttributeSequence[attributes];
+AttributeTypeSequences (fixed)
+Initialization
+Ê‡  –(cedarcode) style•NewlineDelimiter
+˜ codešœ™Kšœ
+ÏeœC™NK™/K™*K™+K˜ —šÏk	˜	Kšœ
+žœžœ&˜JKšœžœ˜Kšœžœx˜ƒKšœ˜Kšœžœt˜Kšžœžœ6˜>Kšœžœ˜,Kšžœžœ˜Kšœ	žœžœ˜Kšœžœ˜Kšœžœžœ
+˜.Kšœžœ˜Kšœžœ˜$Kšžœžœ˜$Kšœžœ}˜ŠKšžœžœ˜$Kšœ
+žœ˜%Kšœžœ\˜uKšœžœ˜2Kšœžœ˜.Kšœžœ4˜FKšœžœ/˜EK˜ —šÏnœžœž˜Kšžœ žœžœ=žœB˜²Kšžœ#˜*Kšžœk˜oKšžœžœžœ˜headšÏz™KšŸœžœžœžœžœžœžœ˜RK˜ š
+Ÿœžœžœ
+žœžœ˜XKšœ˜K˜ —šŸ	œžœžœ	žœžœžœ˜]Kš	œžœžœžœžœ
+™9Kšœžœžœžœ™AKš	œžœžœžœžœ˜3Kšœžœžœ˜(K˜'K˜K˜ —š
+Ÿœžœžœžœžœ˜FKšœ
+žœžœžœ˜QKšœ$™$Kšœ˜——š #™#šŸœžœžœ#˜;Kšžœžœžœ˜Kšœ"žœ˜'K˜K˜ —šŸœžœžœ#˜<Kšžœžœžœ˜Kšœ"žœ˜'K˜——š ™šŸ
+œžœžœ<žœžœžœžœ	˜†Kšœ6˜6šŸœžœ˜$Kšœ,˜,K˜K˜$Kšœ˜—Kšœ1˜1Kšœ˜K˜ —šŸœžœžœ<žœžœžœžœ	˜ŒKšœ6˜6šŸœžœ˜(Kšœ.˜.K˜Kšœ˜K˜Kšœ˜—Kšœ2˜2K˜K˜ —šŸœžœžœ)˜Ašžœžœžœ˜:K™,—Kšœ˜Kšœ˜K˜ —šŸ
+œžœžœ'žœžœžœ˜iKšœžœ)˜8Kšœ	žœ!˜.Kšœ	žœžœ™,KšœMžœ˜RKšœ4˜4Kšœžœ˜%Kšœžœ ˜5Kšœ˜K˜Kšœ!™!K˜K˜ ——š ™šŸœžœžœ%žœ˜^šŸœ˜šŸœ˜(Kšœ(˜(˜Kšœ
+žœžœ˜=Kšœžœ-˜Aš
+žœžœžœžœžœ˜2KšœJ™J—Kšœžœ˜'Kšœ˜—Kšœ˜—Kš	žœžœžœžœÏc ˜QK˜@Kšœ˜—K˜$Kšœ/˜/Kšœžœ'˜6Kšœ	žœ!˜.Kšœcžœ˜hKšœ)˜)Kšœ˜——š ™šŸœžœžœ
+žœžœžœ˜GKšœ žœ	˜,šŸœžœ˜Kšœžœ%˜/Kš	œ	žœžœžœžœ˜2Kšœ=˜=š ™Kšœ9˜9KšœI˜IKšœH˜HKšœ%žœ"žœ˜QKšœ;˜;K˜1Kšœ
+žœE˜RK˜9K˜1Kšœ*˜*Kšœ˜—Kšœžœm˜vKšœ˜—Kšœžœ˜7Kšžœ	žœžœžœ	˜2Kšœ˜šž˜Kšœžœ˜—˜K˜ ——šŸœžœžœ˜.Kšœl™lKšœA˜AK˜8K˜eKšœ˜Kšœ˜K˜ —šŸ
+œžœžœ˜-KšœA˜AK˜8K˜KK•StartOfExpansionG[conversation: XNSAuth.Conversation, seconds: CARD _ 16040B (7200)]šœA˜AKšœ˜Kšœ˜K˜ —šŸœžœžœ3žœ ˜mKšœA˜AK˜}Kšœ˜Kšœ˜K˜ —šŸ	œžœžœ!žœ ˜^KšœA˜AKšœ žœ˜@Kšœ7žœ!˜[K˜8K˜‹Kšœ˜Kšœ˜K˜ —šŸœžœžœ‚˜•KšœA˜AK˜8K˜BKšœ˜Kšœ˜K˜ —šŸœžœžœLžœ˜|KšœA˜AKšœžœžœ˜K˜8K˜©K˜'Kšœ˜Kšœ˜Kšœ˜K˜ —šŸœžœžœ1˜FKšœA˜AK˜8K˜?Kšœ˜Kšœ˜K˜ —šŸœžœžœ1˜EKšœA˜AK˜>Kšœ˜Kšœ˜K˜ —šŸœžœžœh˜„KšœA˜AK˜@Kšœ˜Kšœ˜K˜ —šŸœžœžœ`˜{KšœA˜AK˜AKšœ˜Kšœ˜K˜ —šŸœžœžœ˜+šžœžœžœ
+˜$Kšœ.™.—K–3[h: CrRPC.Handle, session: FilingP10V5.Session]šžœžœžœžœ˜%šœ˜Kšœ	žœ˜#Kšœ	žœžœ˜'Kšœ=˜=K˜.Kšœ˜Kšœ˜—Kšœžœ˜Kšžœžœ˜Kšœ˜K˜ ——š ™š
+Ÿ	œžœžœžœžœ˜VKšœ1žœ˜6K˜Qšžœžœ™Kšžœžœ™)Kšœžœžœ$žœ™AJšœ*™*K™—šœ™Icode2–O[h: CrRPC.Handle, file: FilingP10V5.Handle, session: FilingP10V5.Session]šœžœžœ
+žœžœžœžœ™IMšžœžœ™'M™—K˜K˜ —šŸœžœžœ˜$Kšœ˜šŸœžœžœ	žœžœ<žœžœžœžœžœžœ˜¹K˜0Kšœ˜—Mšœ'˜'Mšœ˜K˜K˜ ——š ™Kšœ
+žœ˜Kšœžœ˜šŸœžœžœžœ
+žœLžœ˜¬šŸœ˜šžœ žœžœ˜.Kšœ™—K˜"K˜Kšœžœ˜Kšœ˜—Kšœžœ&˜6Kšœ	žœ ˜-KšœMžœ˜RK˜$K˜ šžœ$žœ˜,K˜"K˜YK˜(Kšœžœ˜7Kš
+žœžœžœ!žœžœ˜KKšœ˜K˜ —Kšœo™oK™ Kšœ˜˜K™ —šžœžœ˜Kšœ3™3Kšœžœ4˜JK–&[problem: FilingP10V5.AccessProblem]šœ$˜$K˜"K˜YKšžœ$žœžœ˜2Kšœ˜K˜ —K–Z[r1: ROPE _ NIL, r2: ROPE _ NIL, r3: ROPE _ NIL, r4: ROPE _ NIL, r5: ROPE _ NIL]šžœ˜Kšœ˜—K˜ Kšœ
+žœ˜Kšœžœ˜šŸœžœ6žœ˜dKšÏbœ*˜/K–{[h: CrRPC.Handle, file: FilingP10V5.Handle, types: FilingP10V5.AttributeTypeSequence, session: FilingP10V5.Session]šœ[™[Kšœ.™.K˜$Kšœ¢œ˜&K˜"K˜YKšœ˜——š ™Kšœ!˜!Kšœ$˜$Kšœ)˜)Kšœ#˜#Kšœ ˜ K˜ šŸœžœ
+žœ(˜Jšœžœž˜Kšœ˜Kšœ˜Kšœ$˜$Kšœ˜Kšœ˜Kšœ˜Kšžœžœ˜—Kšœ˜—K˜ šŸœžœžœP˜jKšŸœžœ!žœžœžœžœ˜`Kšœ	žœ!˜-Kšœžœ!˜0Kšœžœ!˜5Kšœžœ!˜/Kšœžœ!˜,K˜K˜K˜ K˜%K˜K˜K˜"K˜ K˜K˜ K˜K˜#K˜K˜K˜%K˜(K˜ K˜K˜K˜K˜K˜Kšœ˜——š ™šŸœžœ˜K˜UKšœ˜K˜ ———K˜Kšœ˜— …—    7  LÙ  

@@ -1,0 +1,556 @@
+
+DIRECTORY
+BasicTime USING [GMT, Now, nullGMT, Period],
+Convert USING [RopeFromInt],
+DFInternal USING [AbortDF, CheckAbort, Client, ClientDescriptor, DefaultInteractionProc, DoAbort, GetFileInfo, LocalFileInfo, RemoteFileInfo, ReportFSError, ShortName, SimpleInteraction, YesOrNo],
+DFOperations USING [AbortInteraction, DFInfoInteraction, FileAction, FileInteraction, InfoInteraction, InteractionProc, SModelAction],
+DFUtilities USING [Date, DateFormat, DateToRope, DirectoryItem, FileItem, Filter, GetVersionNumber, ImportsItem, IncludeItem, ParseFromStream, ProcessItemProc, RemoveVersionNumber, SyntaxError, WriteItemToStream],
+FS USING [Copy, Create, Delete, Error, ExpandName, FileInfo, GetInfo, GetName, OpenFile, OpenFileFromStream, StreamFromOpenFile, StreamOpen],
+IO USING [Close, GetIndex, PutFLR, PutFR, PutFR1, STREAM],
+Rope USING [Cat, Concat, Equal, Index, Length, ROPE, Run, Substr];
+SModelImpl: CEDAR MONITOR
+IMPORTS BasicTime, Convert, DFInternal, DFUtilities, FS, IO, Rope
+EXPORTS DFOperations = BEGIN
+
+ROPE: TYPE = Rope.ROPE;
+STREAM: TYPE = IO.STREAM;
+checkImports: BOOL ¨ FALSE;
+
+tempDF: ROPE = Rope.Cat["SModelTemporaryDF-", Convert.RopeFromInt[from: LOOPHOLE[BasicTime.Now[]]], "-"];
+nSModels: NAT ¨ 0;
+
+
+SModel: PUBLIC PROC [dfFile: ROPE, action: DFOperations.SModelAction, interact: DFOperations.InteractionProc, clientData: REF, log: STREAM, workingDir: ROPE]
+RETURNS [errors, warnings, filesActedUpon: INT ¨ 0] = {
+client: DFInternal.Client = NEW[DFInternal.ClientDescriptor ¨ [
+(interact ¨ IF interact = NIL THEN DFInternal.DefaultInteractionProc ELSE interact),
+clientData,
+log, log,
+workingDir
+]];
+NewTemporaryDF: ENTRY PROC [pages: INT] RETURNS [out: STREAM] = {
+ENABLE UNWIND => NULL;
+filename: ROPE ~ tempDF.Concat[Convert.RopeFromInt[nSModels]];
+outFile: FS.OpenFile ~ 
+FS.Create[
+name: filename, pages: pages,
+setKeep: TRUE, keep: CARDINAL.LAST
+! FS.Error => {
+localInfo: REF DFInternal.LocalFileInfo
+¨ NEW[DFInternal.LocalFileInfo ¨ [name: filename]];
+DFInternal.ReportFSError[error, localInfo, client, $abort];
+}
+];
+nSModels ¨ nSModels.SUCC;
+RETURN[FS.StreamFromOpenFile[outFile, $write]]
+};
+CloseTemporaryDF: PROC [out: STREAM] RETURNS [tempName: ROPE] = {
+outFile: FS.OpenFile = FS.OpenFileFromStream[out];
+tempName ¨ outFile.GetName[].fullFName;  -- includes version number
+out.Close[];
+};
+FinishWithTemporaryDF: ENTRY PROC
+[tempName: ROPE, localName: ROPE, commit: BOOL ¨ TRUE] = {
+ENABLE UNWIND => NULL;
+FS.Delete[tempName];
+};
+UserConfirms: PROC [localInfo: REF DFInternal.LocalFileInfo, remoteInfo: REF DFInternal.RemoteFileInfo] RETURNS [BOOL] = {
+RETURN[DFInternal.YesOrNo[
+client: client,
+message: 
+IO.PutFR[
+"%g {%g} to %g ?",
+[rope[localInfo.name]],
+[rope[DFUtilities.DateToRope[localInfo.date]]],
+[rope[DFUtilities.RemoveVersionNumber[remoteInfo.name]]]
+],
+default: TRUE
+]]
+};
+SModelInner: PROC [dfFile: ROPE, date: DFUtilities.Date]
+RETURNS [REF DFInternal.RemoteFileInfo ¨ NIL] = {
+directoryPath: ROPE ¨ NIL;
+writeDirectoryPath: ROPE ¨ NIL;
+directoryLen: INT ¨ 0;
+somethingChanged: BOOL ¨ FALSE;
+dfRemoteInfo: REF DFInternal.RemoteFileInfo = NEW[DFInternal.RemoteFileInfo
+¨ [name: dfFile, date: date]];
+dfLocalInfo: REF DFInternal.LocalFileInfo = NEW[DFInternal.LocalFileInfo ¨ [name: DFInternal.ShortName[dfFile]]];
+DoOneItem: DFUtilities.ProcessItemProc = {
+StoreThisFile: PROC [ localInfo: REF DFInternal.LocalFileInfo, remoteInfo: REF DFInternal.RemoteFileInfo, formatFromDF: DFUtilities.DateFormat] RETURNS [store: BOOL ¨ FALSE] = {
+lGMT: BasicTime.GMT = localInfo.date.gmt;  -- can't be nullGMT
+rGMT: BasicTime.GMT = remoteInfo.date.gmt;  -- may be nullGMT
+attachmentsArePossible: BOOL = FALSE;
+IF attachmentsArePossible THEN { -- Disable this until we have attachments in PCedar - MFP
+IF localInfo.attachedTo.Length[] = 0 THEN RETURN[TRUE];
+IF ~Rope.Equal[
+DFUtilities.RemoveVersionNumber[remoteInfo.name],
+DFUtilities.RemoveVersionNumber[localInfo.attachedTo],
+FALSE] THEN {
+IF remoteInfo.date = localInfo.date AND Rope.Equal[
+DFInternal.ShortName[remoteInfo.name],
+DFInternal.ShortName[localInfo.attachedTo],
+FALSE] THEN {
+[] ¨ FS.Copy[
+to: DFUtilities.RemoveVersionNumber[localInfo.name],
+from: remoteInfo.name,
+wantedCreatedTime: remoteInfo.date.gmt,
+remoteCheck: action.remoteCheck,
+attach: TRUE
+! FS.Error => GO TO storeAnyway
+];
+localInfo.date.format ¨ $omitted;
+DFInternal.GetFileInfo[info: localInfo, remoteCheck: FALSE, client: client
+! FS.Error => DFInternal.ReportFSError[error, localInfo, client, $abort]
+];
+RETURN[FALSE];
+EXITS
+storeAnyway => NULL;
+};
+RETURN[TRUE]
+};
+};
+SELECT formatFromDF FROM
+$explicit, $omitted => RETURN[lGMT ~= rGMT];
+$notEqual => RETURN[action.remoteCheck AND lGMT ~= rGMT];
+$greaterThan =>
+SELECT TRUE FROM
+~action.remoteCheck => RETURN[FALSE];
+remoteInfo.date.format ~= $explicit => RETURN[TRUE];  -- no extant remote file
+ENDCASE =>
+SELECT BasicTime.Period[from: lGMT, to: rGMT] FROM
+< 0 => RETURN[TRUE];
+= 0 => RETURN[FALSE];
+> 0 => {
+warnings ¨ warnings.SUCC;
+DFInternal.SimpleInteraction[
+client,
+NEW[DFOperations.InfoInteraction ¨ [
+class: $warning,
+message: IO.PutFLR["%g {%g} is referenced with '>' in the DF file but is older than the remote version %g {%g}.", LIST[
+[rope[localInfo.name]],
+[rope[DFUtilities.DateToRope[localInfo.date]]],
+[rope[remoteInfo.name]],
+[rope[DFUtilities.DateToRope[remoteInfo.date]]]
+]]
+]]
+];
+RETURN[FALSE]
+};
+ENDCASE;
+ENDCASE;
+};
+ReportMissing: PROC [localInfo: REF DFInternal.LocalFileInfo] = {
+warnings ¨ warnings.SUCC;
+DFInternal.SimpleInteraction[
+client,
+NEW[DFOperations.InfoInteraction ¨ [
+class: $warning,
+message: IO.PutFR1["'%g' doesn't exist.", [rope[localInfo.name]]]
+]]
+];
+};
+SelfReference: PROC [shortName: ROPE] RETURNS [BOOL] = {
+RETURN[shortName.Equal[dfLocalInfo.name, FALSE]] 
+};
+DFInternal.CheckAbort[client];
+WITH item SELECT FROM 
+directory: REF DFUtilities.DirectoryItem =>
+IF directory.readOnly THEN writeDirectoryPath ¨ NIL
+ELSE {
+directoryPath ¨ directory.path1 ¨ FS.ExpandName[directory.path1].fullFName;
+directoryLen ¨ Rope.Length[directoryPath];
+writeDirectoryPath ¨ TranslateHost[directoryPath];
+};
+file: REF DFUtilities.FileItem => IF writeDirectoryPath # NIL THEN {
+shortName: ROPE = DFUtilities.RemoveVersionNumber[file.name];
+localInfo: REF DFInternal.LocalFileInfo ¨ NEW[DFInternal.LocalFileInfo ¨ [shortName]];
+remoteInfo: REF DFInternal.RemoteFileInfo ¨
+NEW[DFInternal.RemoteFileInfo ¨ [
+name: directoryPath.Concat[file.name],
+date: file.date
+]];
+knownRemoteVersion: ROPE ¨ NIL;
+DFInternal.GetFileInfo[info: localInfo, remoteCheck: FALSE, client: client
+! FS.Error =>
+IF error.group = $user THEN {ReportMissing[localInfo]; GO TO skip}
+ELSE DFInternal.ReportFSError[error, localInfo, client, $abort]
+];
+IF action.remoteCheck THEN {
+CheckWriteInfo[Rope.Concat[writeDirectoryPath, shortName], localInfo, remoteInfo
+! FS.Error => DFInternal.ReportFSError[error, remoteInfo, client, $abort];
+];
+};
+knownRemoteVersion ¨ DFUtilities.GetVersionNumber[remoteInfo.name];
+remoteInfo.name ¨ DFUtilities.RemoveVersionNumber[remoteInfo.name];
+SELECT TRUE FROM
+SelfReference[shortName] => {
+remoteDFInfo: REF DFInternal.RemoteFileInfo =
+NEW[DFInternal.RemoteFileInfo ¨ [name: remoteInfo.name]];
+CheckWriteInfo[TranslateHost[remoteDFInfo.name], localInfo, remoteDFInfo
+! FS.Error => DFInternal.ReportFSError[error, remoteDFInfo, client, $abort];
+];
+IF remoteDFInfo.date.gmt ~= BasicTime.nullGMT AND
+file.date.format = $explicit AND
+BasicTime.Period[from: file.date.gmt, to: remoteDFInfo.date.gmt] > 0 AND
+~DFInternal.YesOrNo[
+client: client,
+message: 
+IO.PutFLR[
+"%g may be obsolete, since the remote version from which it is derived {%g} is older than %g {%g} (the present newest remote one); continue anyway?", LIST[
+[rope[shortName]],
+[rope[DFUtilities.DateToRope[file.date]]],
+[rope[remoteDFInfo.name]],
+[rope[DFUtilities.DateToRope[remoteDFInfo.date]]]
+]],
+default: FALSE,
+blunder: TRUE
+] THEN DFInternal.DoAbort[client.log, "Obsolete self-reference; remote version is newer than date in DF file."];
+IF StoreThisFile[localInfo, remoteInfo, file.date.format] THEN
+somethingChanged ¨ TRUE;  -- we'll actually store it later, if user approves.
+dfRemoteInfo.name ¨ remoteInfo.name;  -- redundant unless top-level DF
+file.name ¨ shortName;  -- ensure no version number
+SELECT file.date.format FROM
+$explicit, $omitted => file.date ¨ [$explicit, outFile.GetInfo[].created];
+ENDCASE;
+};
+StoreThisFile[localInfo, remoteInfo, file.date.format]
+AND UserConfirms[localInfo, remoteInfo] => {
+somethingChanged ¨ TRUE;
+IF action.storeChanged THEN {
+DFInternal.SimpleInteraction[
+client,
+NEW[DFOperations.FileInteraction ¨ [
+localFile: localInfo.name,
+remoteFile: remoteInfo.name,
+dateFormat:
+SELECT file.date.format FROM
+$explicit => $explicit,
+$greaterThan => $greaterThan,
+ENDCASE => $notEqual,
+date: localInfo.date.gmt,
+action: store
+]]
+];
+file.name ¨ FS.Copy[
+to: remoteInfo.name, from: localInfo.name, attach: FALSE
+! FS.Error => DFInternal.ReportFSError[error, remoteInfo, client, $abort]];
+localInfo.name ¨ Rope.Substr[localInfo.name, 0, Rope.Index[localInfo.name, 0, "!"]]; -- remove any version info
+IF makeAttachment THEN [] ¨ FS.Copy[
+to: localInfo.name, from: file.name, attach: TRUE
+! FS.Error => DFInternal.ReportFSError[error, remoteInfo, client, $abort]];
+IF Rope.Run[file.name, 0, directoryPath, 0, FALSE] = directoryLen
+THEN {
+file.name ¨ Rope.Substr[file.name, directoryLen];
+}
+ELSE {
+DFInternal.DoAbort[client.log, IO.PutFR1["Bogus file name (%g).", [rope[file.name]] ]];
+};
+};
+filesActedUpon ¨ filesActedUpon.SUCC;
+SELECT file.date.format FROM
+$explicit, $omitted => file.date ¨ localInfo.date;
+ENDCASE => file.name ¨ shortName;
+};
+ENDCASE => {
+remoteVersion: ROPE = knownRemoteVersion;
+IF NOT remoteVersion.Equal[DFUtilities.GetVersionNumber[file.name]] THEN {
+file.name ¨ shortName.Concat[remoteVersion];
+somethingChanged ¨ TRUE;
+};
+SELECT file.date.format FROM
+$omitted => {
+file.date ¨ localInfo.date;
+somethingChanged ¨ TRUE;
+};
+$explicit =>
+IF file.date ~= localInfo.date THEN {
+file.date ¨ localInfo.date;
+somethingChanged ¨ TRUE;
+};
+ENDCASE;
+};
+EXITS
+skip => NULL;
+};
+include: REF DFUtilities.IncludeItem => {
+path: ROPE ¨ include.path1 ¨ FS.ExpandName[include.path1].fullFName;
+remoteInfo: REF DFInternal.RemoteFileInfo = SModelInner[path, include.date];
+IF ~Rope.Equal[remoteInfo.name, path, FALSE] THEN {
+include.path1 ¨ remoteInfo.name;
+somethingChanged ¨ TRUE};
+SELECT include.date.format FROM
+$explicit, $omitted => {
+include.date ¨ remoteInfo.date;
+somethingChanged ¨ TRUE};
+ENDCASE => include.path1 ¨ DFUtilities.RemoveVersionNumber[include.path1];
+};
+imports: REF DFUtilities.ImportsItem => IF checkImports THEN {
+localInfo: REF DFInternal.LocalFileInfo =
+NEW[DFInternal.LocalFileInfo ¨ [name: DFInternal.ShortName[imports.path1]]];
+remoteInfo: REF DFInternal.RemoteFileInfo =
+NEW[DFInternal.RemoteFileInfo ¨ [name: imports.path1, date: imports.date]];
+DFInternal.GetFileInfo[info: localInfo, remoteCheck: FALSE, client: client
+! FS.Error =>
+IF error.group = $user THEN {ReportMissing[localInfo]; GO TO skip}
+ELSE DFInternal.ReportFSError[error, localInfo, client, $abort]
+];
+SELECT TRUE FROM
+localInfo.date.gmt = BasicTime.nullGMT => {
+warnings ¨ warnings.SUCC;
+DFInternal.SimpleInteraction[
+client,
+NEW[DFOperations.InfoInteraction ¨ [
+class: $warning,
+message: IO.PutFR1["Local import %g not found.",
+[rope[localInfo.name]]
+]
+]]
+];
+};
+imports.date.format = $explicit AND imports.date.gmt # localInfo.date.gmt => {
+warnings ¨ warnings.SUCC;
+DFInternal.SimpleInteraction[
+client,
+NEW[DFOperations.InfoInteraction ¨ [
+class: $warning,
+message: IO.PutFR["Local import %g does not have requested date.",
+[rope[localInfo.name]], [rope[DFUtilities.DateToRope[localInfo.date]]]
+]
+]]
+];
+};
+ENDCASE;
+IF action.remoteCheck THEN {
+CheckWriteInfo[remoteInfo.name, localInfo, remoteInfo
+! FS.Error => DFInternal.ReportFSError[error, remoteInfo, client, $abort];
+];
+IF localInfo.date.gmt # remoteInfo.date.gmt THEN {
+warnings ¨ warnings.SUCC;
+DFInternal.SimpleInteraction[
+client,
+NEW[DFOperations.InfoInteraction ¨ [
+class: $warning,
+message: IO.PutFLR["%g {%g} doesn't correspond to %g {%g}.", LIST[
+[rope[localInfo.name]], [rope[DFUtilities.DateToRope[localInfo.date]]],
+[rope[remoteInfo.name]], [rope[DFUtilities.DateToRope[remoteInfo.date]]]]
+]
+]]
+];
+};
+IF imports.date.format = explicit THEN somethingChanged ¨ NOT Rope.Equal[imports.path1, remoteInfo.name, FALSE];
+imports.path1 ¨ remoteInfo.name;
+};
+SELECT imports.date.format FROM
+$explicit => NULL;
+$omitted => {imports.date ¨ localInfo.date; somethingChanged ¨ TRUE};
+ENDCASE => imports.path1 ¨ DFUtilities.RemoveVersionNumber[imports.path1];
+EXITS
+skip => NULL;
+};
+ENDCASE;
+DFUtilities.WriteItemToStream[out, item];
+};
+in: STREAM = FS.StreamOpen[
+fileName: dfLocalInfo.name, accessOptions: $read, wDir: client.workingDir
+! FS.Error => DFInternal.ReportFSError[error, dfLocalInfo, client, $abort]
+];
+inFile: FS.OpenFile = FS.OpenFileFromStream[in];
+out: STREAM = NewTemporaryDF[inFile.GetInfo[].pages];
+outFile: FS.OpenFile = FS.OpenFileFromStream[out];
+makeAttachment: BOOL ~ WITH clientData SELECT FROM 
+refBool: REF BOOL => refBool≠ ENDCASE => TRUE;
+
+dfLocalInfo.date ¨ [$explicit, inFile.GetInfo[].created];
+DFInternal.SimpleInteraction[
+client,
+NEW[DFOperations.DFInfoInteraction ¨ [action: start, dfFile: dfLocalInfo.name]]
+];
+DFUtilities.ParseFromStream[in, DoOneItem, DFUtilities.Filter[comments: TRUE] !
+DFUtilities.SyntaxError -- [reason: ROPE]-- =>
+DFInternal.DoAbort[
+log,
+IO.PutFR["Syntax error in '%g'[%d]: %g",
+[rope[dfLocalInfo.name]], [cardinal[in.GetIndex[]]], [rope[reason]]
+],
+interact,
+clientData
+];
+DFInternal.AbortDF => {
+in.Close[];
+FinishWithTemporaryDF[CloseTemporaryDF[out], NIL, FALSE];
+};
+];
+in.Close[];
+dfLocalInfo.date.gmt ¨ outFile.GetInfo[].created;
+IF somethingChanged AND UserConfirms[dfLocalInfo, dfRemoteInfo]
+THEN {
+tempName: ROPE = CloseTemporaryDF[out];
+remoteDFName: ROPE;
+dfRemoteDateFormat: DFUtilities.DateFormat = dfRemoteInfo.date.format;
+dfRemoteInfo.date ¨ dfLocalInfo.date;
+IF action.storeChanged THEN {
+DFInternal.SimpleInteraction[
+client,
+NEW[DFOperations.FileInteraction ¨ [
+localFile: dfLocalInfo.name,
+remoteFile: dfRemoteInfo.name,
+dateFormat:
+SELECT dfRemoteDateFormat FROM
+$explicit => $explicit,
+$greaterThan => $greaterThan,
+ENDCASE => $notEqual,
+date: dfLocalInfo.date.gmt,
+action: $store
+]]
+];
+remoteDFName ¨ FS.Copy[to: dfRemoteInfo.name, from: tempName, attach: FALSE
+! FS.Error => DFInternal.ReportFSError[error, dfRemoteInfo, client, $abort]];
+[] ¨ FS.Copy[to: dfLocalInfo.name, from: remoteDFName, attach: makeAttachment
+! FS.Error => DFInternal.ReportFSError[error, dfRemoteInfo, client, $abort]];
+FinishWithTemporaryDF[tempName, dfLocalInfo.name];
+};
+filesActedUpon ¨ filesActedUpon.SUCC;
+}
+ELSE FinishWithTemporaryDF[CloseTemporaryDF[out], NIL, FALSE];
+DFInternal.SimpleInteraction[
+client,
+NEW[DFOperations.DFInfoInteraction ¨ [
+action: end,
+dfFile: dfLocalInfo.name,
+message: IF somethingChanged THEN NIL ELSE "DF file is unchanged"
+]]
+];
+RETURN[dfRemoteInfo]
+};
+[] ¨ SModelInner[dfFile, [] !
+ABORTED => {
+DFInternal.SimpleInteraction[client, NEW[DFOperations.AbortInteraction ¨ [TRUE]]];
+};
+DFInternal.AbortDF => {
+errors ¨ errors.SUCC;
+DFInternal.SimpleInteraction[client, NEW[DFOperations.DFInfoInteraction
+¨ [action: $abort, dfFile: dfFile]]];
+CONTINUE
+};
+];
+};
+
+CheckWriteInfo: PROC [path: ROPE, localInfo: REF DFInternal.LocalFileInfo, remoteInfo: REF DFInternal.RemoteFileInfo] = {
+wantedCreatedTime: BasicTime.GMT ~ localInfo.date.gmt;
+fullFName: ROPE ¨ NIL;
+created: BasicTime.GMT ¨ BasicTime.nullGMT;
+[fullFName: fullFName, created: created] ¨ FS.FileInfo[DFUtilities.RemoveVersionNumber[path]
+! FS.Error =>
+SELECT error.code FROM
+$unknownCreatedTime, $unknownFile => {
+GOTO NotFound};
+ENDCASE;
+];
+remoteInfo.name ¨ fullFName;
+remoteInfo.date ¨ [$explicit, created];
+RETURN;
+EXITS NotFound => remoteInfo.date ¨ [$omitted, BasicTime.nullGMT]};
+
+TranslateHost: PROC [path: ROPE] RETURNS [ROPE] = {
+<<IF Rope.Match["[*]*", path] THEN {
+rPos: INT ¨ Rope.SkipTo[path, 1, "]"];
+host: ROPE ¨ Rope.Substr[path, 1, rPos-1];
+rest: ROPE ¨ Rope.Substr[path, rPos+1];
+writeHost: ROPE ¨ FSPseudoServers.TranslateForWrite[host];
+IF NOT Rope.Equal[host, writeHost, FALSE] THEN {
+IF NOT Rope.IsPrefix["[", writeHost] THEN writeHost ¨ Rope.Cat["[", writeHost, "]"];
+IF (Rope.Fetch[writeHost, Rope.Length[writeHost]-1] = '>) AND Rope.IsPrefix["<", rest]
+THEN rest ¨ Rope.Substr[rest, 1];
+RETURN [Rope.Concat[writeHost, rest]];
+};
+};>>
+RETURN [path];
+};
+
+
+END.
+
+
+   ú  
+SModelImpl.mesa
+Copyright ” 1984, 1985, 1986, 1990, 1991, 1993 by Xerox Corporation.  All rights reserved.
+Bob Hagmann on May 18, 1984 9:04:25 am PDT
+Russ Atkinson (RRA) June 8, 1988 8:29:10 pm PDT
+Willie-sue, March 30, 1993 12:02 pm PST
+Swinehart, November 15, 1988 11:29:35 am PST
+Eduardo Pelegri-Llopart March 2, 1989 10:51:37 am PST
+Michael Plass, January 23, 1992 10:30 am PST
+Spreitze, May 2, 1990 12:02 pm PDT
+Chauser, November 8, 1990 4:38 pm PST
+Doug Wyatt, September 2, 1993 11:52 am PDT
+
+Hacks
+
+old behavior = TRUE
+Global (monitored) variables
+
+Exported to DFOperations
+This procedure returns TRUE if, in principle, the file should be stored.  It does not alter either 'localInfo' or 'remoteInfo' and does not let the user influence its decision.
+If the local file is not attached, we store it anyway, so that the attachment will be made.
+If the local file is attached to a remote file whose name differs from the one specified in the DF, we store it even if the dates match, so that the proper attachment will be made.
+If the short names of the two files are the same and they have the same date, we assume that the remote file is good enough.  We need to make an attachment "the other way", however, and prevent the main loop from doing anything.
+force GetFileInfo to get the highest number version (that we just wrote)
+update attachedTo
+The following tests need to be done delicately, since we may not know the actual truth about the remote file, but only what the DF file claims is true.  In particular, it is quite possible that remoteDate.gmt = nullGMT when a remote file actually exists.  (This case arises if formatFromDF ~= $explicit and ~action.remoteCheck.)
+Get the directory in angle-bracket format
+The local file is known to exist.  Any remote file with whose date matches will be satisfactory.  Note that remoteInfo.name will typically have a version (hint).  We do the checking with the name suitably translated for the write server, since that gets around extra checking on the read servers, which are allowed to lag the write server anyway.
+At this point, remoteInfo.date.format will be $explicit if we are supposed to believe that there is a remote file with create date remoteInfo.date.gmt, and remoteInfo.date.format will be $omitted if we are supposed to believe no such file exists.  Furthermore, remoteInfo.name has no version number.
+This file item is a reference to the DF file we are updating.  We check to see if the !H version on the remote server is newer than the input version of the DF file.  If so, the user is warned, since he is probably using an obsolete DF file.
+Factor out the directory path
+If the file's date and/or (remote) version number is missing or incorrect, we may wish to update them/it.  Because of the logic on the earlier call of GetFileInfo, the local file is known to exist.  However, it may or may not be attached to a remote file, since the user may have explicitly prohibited a Copy in the preceding arm of the SELECT.
+We would like to RESUME at this point, but until ABORTED is redeclared as a SIGNAL, it won't work.
+File not found, so just continue with updated info
+MJS May 2, 1990: changed to update always, not just if created=wantedCreatedTime.
+CheckWriteInfo: PROC [path: ROPE, localInfo: REF DFInternal.LocalFileInfo, remoteInfo: REF DFInternal.RemoteFileInfo] = {
+-- CheckWriteInfo as of January 29, 1990 1:07:25 pm PST
+[fullFName: remoteInfo.name, created: remoteInfo.date.gmt] _ FS.FileInfo[
+name: path,
+wantedCreatedTime: localInfo.date.gmt
+! FS.Error =>
+SELECT error.code FROM
+$unknownCreatedTime, $unknownFile => {
+File not found, so just continue with updated info
+remoteInfo.date.gmt _ BasicTime.nullGMT;
+remoteInfo.date.format _ $omitted;
+CONTINUE;
+};
+ENDCASE;
+];
+};
+
+Eduardo Pelegri-Llopart March 2, 1989 10:49:25 am PST
+Changes to: NewTemporaryDF (local of SModel) and, FinishWithTemporaryDF (local of SModel) to deal with (obviously unfrequent) FS errors.
+Michael Plass, December 1, 1989 11:18:03 am PST
+Dummied out TranslateHost; under PFS, there is currently only one host.
+Michael Plass, January 2, 1990 1:32:48 pm PST
+Changed NewTemporaryDF to generate really unique names.  Made version-number fixups happen even when attachements are not implemented.
+
+ù   ïNewlineDelimiter
+ñ(cedarcode) styleô codeöúôKöú
+œeúOôZKöú*ô*Kô/Kô'Kô,Kô5Kô,Kô"Kô%Kô*Kò öœk	ò	Köú
+ûúûúò,KöúûúòKöúûúñûúòƒKöúûútòÜKöúûúƒò’KöûúûúÖòçKöûúûú*ûúò:Köúûú%ûúúòBóóheadöúûúûòKöûú.ûúûúòAKöûúûòóò KöûúûúûúòKöûúûúûúûúòóKô ôKô öúûúûúòKôóKò óöúôKô Köúûú<ûúòiKöú
+ûúòKò óKöúôKò öœnúûúûú
+ûúYûúûúûúûú$ûú	ò’öúûú ò?Kö	úûúûúûú#ûúòTKöúòKò	Köú
+ò
+Köúòóöüúûúûú	ûúûúûúòAKöûúûúûúòKöú
+ûú0ò>öú	ûúòöûúò
+KöúòKöú	ûúûúûò"öúûúòKöúûúûú.ò[Köú;ò;KòóóKòóKöúûúòKöûúûú%ò.Köúòóö
+üúûúûúûúûúòAKöú	ûúûúò2Köú)œcòCKòKöúòóöüúûúûúûúûú
+ûúûúò\KöûúûúûúòKöûúòKöúòóöüúûúûú'ûúûúûúòzöûúòKöúòöú	ò	öûúò	KöúòKöúòKöú/ò/Köú8ò8KöúòóóKöú	ûòKöúòóKòóöüúûú
+ûúûúûúûúòjKöúûúûúòKöúûúûúòKöúûúòKöúûúûúòKöúûúûú9òjKöúûúûúBòqöü	ú!ò*öüúûúûú'ûúBûú	ûúûúò±Köúûúïô∞Köúûú†ò>Köúûú†ò=Köúûúûúò%öûúûú†9òZKöú[ô[Köûú#ûúûúûúò7Köú`ûúRô¥öûúòKöú1ò1Köú6ò6öûúûúòKöú‰ô‰öûú"ûúò3Köú&ò&Köú+ò+öûúûúòöúûúòKöú4ò4KöúòKöú'ò'Köú ò KöúûòKöúûú
+ûúûúòKöúòóöú!ò!KöúHôHóöú5ûúòJKöúôKöúûúDòHKòóKöûúûúòöûòKöúûúòóKòóóKöûúûúòKòóóKöúòóKöúÄûú∆ô»öûúûòKöúûúò,Köúûúûúò9öúòöûúûúûòKöúûúûúò%Köú'ûúûú†òNöûúò
+öûú(ûò2KöúûúûúòKöúûúûúòöúòKöúûúòöúòKöúòöûú!ò$Kòöú	ûúgûúòwKöúòKöú/ò/KöúòKöú/ò/KòóKòóKöúòóKöûúûúòKòóKöûúòóóóóKöûúòóKòóöüúûúûúòAKöúûúòöúòKöúòöûú!ò$KòKöú	ûú6òAKòóKöúòóKòóö
+üúûúûúûúûúò8Köûú#ûúò1KòóKöúòöûúûúûúòöúûúò+Köú)ô)öûúûúûò3öûúòKöú"ûú'òKKöú*ò*Köú2ò2Kòóóóö	úûúûúûúûúòDKöúûú.ò=Köúûúûú)òVöúûúò+öûúò!Köú&ò&KöúòKöúòóóKöúûúûúòöú5ûú	ûúòJöúûú	òKöûúûúûúûúòBKöûú;ò?óKöúòóöûúûúòKöú⁄ô⁄öúPòPKöúûúFòJKöúòóKòóKöúCòCKöúCòCKöú´ô´öûúûúûòöúòKöú%ûúvûúJûúôÒöúûúò-Köûú6ò9óöúHòHKöúûúHòLKöúòóöûú,ûò1Köúûò KöúEûòHöúòKöúòöú	ò	öûúò
+KöúñûúòõKöúòKöú*ò*KöúòKöú1ò1KöúòóóKöú	ûúòKöú	ûòKöúûújòpóóöûú8ûò>Köúûú†3òMóKöú&† òFKöú†ò3öûúûòKöúJòJKöûúòóKòóöú7ûú)òcKöúûúòöûúûúòöúòKòöûú!ò$KöúòKöúòöúòöûúûòKöúòKöúòKöûúòóóKöúòKòKöúòóKòóöúûúòKöú3ûò8KöúûúGòKóKöúU†òoöûúûúûúò$Köú-ûò1KöúûúGòKóöûú*ûúòAöûúòKöúôKöú1ò1KòóöûúòKöúûú6òWKöúòóóKòóKöú ûúò%öûúûòKöú2ò2Köûúò!óKòóöûúòKöú—ûúôÿKöúûúò)öûúûú>ûúòJKöú,ò,KöúûúòKòóöûúûòöúòKöúòKöúûúòKöúòóöúòöûúûúò%KöúòKöúûúòKöúòóóKöûúòóKöúòóóöûòKöúûúòóKòóöú	ûúò)Köúûúûú%òDKöúûú=òLöûú$ûúûúò3Köú ò KöúûúòóöûúûòöúòKöúòKöúûúòóKöûúCòJóKöúòóöú	ûúûúûúò>öúûúò)KöûúIòLóöúûúò+KöûúHòKóöú5ûúòJöúûú	òKöûúûúûúûúòBKöûú;ò?óKöúòóöûúûúûòöú+ò+KöúûúòöúòKöúòöûú!ò$Kòöú	ûú%ò0KöúòKòóKòóKöúòóKòóöú ûú+òNKöúûúòöúòKöúòöûú!ò$Kòöú	ûú7òBKöúFòFKòóKòóKöúòóKòóKöûúòóöûúûúòöú5ò5KöúûúFòJKöúòóöûú*ûúò2KöúûúòöúòKöúòöûú!ò$Kòöú	ûú2ûúòBKöúGòGKöúIòIKòóKòóKöúòóKòóKöûú ûúûú,ûúòpKò KòóöûúûòKöúûúòKöú?ûúòEKöûúCòJóöûòKöúûúòóKòóKöûúòóKöú)ò)KòóöúûúûúòKöúIòIKöúûúFòJKòóKöúûúûúò0Köúûú*ò5Köú	ûúûúò2KöúûúûúûúûúûúûúûúûúòbKò Köú9ò9öúòKöúòKöûúLòOKöúòóöúHûúòOöú†úò.öúòKöúòöûú&ò(KöúCòCKòóKöú	ò	Kò
+KöúòóóöúòKöúòKöú-ûúûúò9KöúòóKöúòóKòKöú1ò1öûúûú(ò?öûúòKöú
+ûúò'KöúûúòKöúFòFKöú%ò%öûúûúòöúòKòöûú!ò$KöúòKöúòöúòöûúûòKöúòKöúòKöûúòóóKöúòKòKöúòóKòóöúûú5ûòKKöúûúIòMóöúûúFòMKöúûúIòMóKöú2ò2KòóKöú ûúò%KòóKöûú.ûúûúò>óöúòKöúòöûú#ò&KöúòKöúòKö	ú	ûúûúûúûúòAKöúòóKöúòóKöûúòKòóöúòöûúòKöú%ûú"ûúòRKöúûúûúûúôbKöúòóöúòKöúûúòKöú%ûúEòmKöûòKòóKòóKòKò óö
+üúûúûúûú'ûúòyKöúûúò6KöúûúûúòKöúûúò+öú+ûú/ò\öúûú	òöûúûòöú&ò&Köú2ô2KöûúòóKöûúòóóKöúòóKöúQôQKöúòKöú'ò'KöûúòKöûú>òCKò óö
+üúûúûúûú'ûúôyKöüú&ô7öú=ûú
+ôIKöúôKöú%ô%öúûú	ôöûúûôöú&ô&Köú2ô2Köú(ô(Köú"ô"Köûúô	KôóKöûúôóóKöúôóKôKô óö
+üúûúûúûúûúò3ö–kyœy°¢ò$Kö¢°¢ò&Kö¢°¢ ò*Kö¢°¢ò'Kö¢°¢+ò:ö°¢°¢°¢°¢ò0Kö°¢°¢°¢+òTö°¢8°¢òVKö°¢ò!óKö°¢ ò&Kö¢òóKö¢°òóKöûúòKòKò óKò Köûúòô5Köúœrú£úAôàóô/Köúüú.ôGóô-KöúÜôÜóKô Kò Kò ó Öó    @L  dÍ  

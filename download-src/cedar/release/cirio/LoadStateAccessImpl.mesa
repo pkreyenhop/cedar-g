@@ -1,0 +1,690 @@
+
+DIRECTORY
+Atom USING[MakeAtom],
+BasicTime USING[GMT, Pack, Update],
+CardTab USING[Create, Fetch, Insert, Ref],
+CCTypes USING [CCError],
+CirioNubAccess USING[CreateRemoteNub, DestroyNub, FileEntry, GetFileEntry, Handle, LookupMatchingSymEntryByName, LookupMatchingSymEntryByValue, LookupSymEntryByID, ModuleType, PCInfo, PCtoInfo, Read32BitsAsCard, SymEntry, TextType],
+CirioTargets USING [Target],
+Commander USING[CommandProc, Register],
+CommanderOps USING[ArgumentVector, Parse],
+Convert USING[CardFromRope, RopeFromCard],
+ObjectFiles USING[CreateParsed, GetFormatString, GetModuleInfo, Module, ModuleFromParsedAndPC, ModuleInfo, Parsed],
+ObjectFilesPrivate USING[StabRange],
+IO,
+LoadStateAccess USING[BasicPCInfo, LoadedModuleInfo, LoadedSegmentsInfo],
+PFS USING [RopeFromPath, PathFromRope],
+PFSNames USING [PATH, Equal],
+RefTab USING[Create, Fetch, Insert, Ref],
+Rope USING[Cat, Concat, Equal, ROPE],
+SunADotOut USING[ModuleFromParsedAndStabRange],
+SymTab USING[Create, Fetch, Insert, Ref],
+SystemInterface USING[CirioFile, CirioFileInfo, CloseFileSet, CreateFileSet, FileSet, GetCirioFileFromDebuggee, GetFileInfo, GetNameOfFile, ShowReport];
+
+
+
+LoadStateAccessImpl: CEDAR MONITOR LOCKS lsh USING lsh: LoadStateHandle IMPORTS Atom, BasicTime, CardTab, CCTypes, CirioNubAccess, Commander, CommanderOps, Convert, IO, ObjectFiles, PFS, PFSNames, RefTab, Rope, SunADotOut, SymTab, SystemInterface EXPORTS LoadStateAccess =
+BEGIN OPEN ObjF: ObjectFiles;
+
+ROPE: TYPE ~ Rope.ROPE;
+PATH: TYPE ~ PFSNames.PATH;
+CirioFile: TYPE = SystemInterface.CirioFile;
+LoadedSegmentsInfo: TYPE = LoadStateAccess.LoadedSegmentsInfo;
+LoadStateHandle: TYPE = REF LoadStateHandleBody;
+LoadStateHandleBody: PUBLIC TYPE = MONITORED RECORD[
+serverName: Rope.ROPE,
+nub: CirioNubAccess.Handle,
+fileSet: SystemInterface.FileSet,
+objHash: ObjectFileHashTable,
+addrHash: LoadedObjectFileHashTable,
+nameHash: ModuleNameHashTable];
+
+CreateLoadStateHandle: PUBLIC PROC[serverName: Rope.ROPE, nub: CirioNubAccess.Handle, fileSet: SystemInterface.FileSet] RETURNS[LoadStateHandle] =
+BEGIN
+objHash: ObjectFileHashTable ¬ CreateObjectFileHashTable[];
+addrHash: LoadedObjectFileHashTable ¬ CreateLoadedFileHashTable[];
+nameHash: ModuleNameHashTable ¬ CreateNameHashTable[];
+RETURN[NEW[LoadStateHandleBody¬[ , serverName, nub, fileSet, objHash, addrHash, nameHash]]];
+END;
+
+
+LoadedModule: TYPE = REF LoadedModuleBody;
+LoadedModuleBody: TYPE = RECORD[
+loadedFile: LoadedFile,
+module: ObjectFiles.Module,
+moduleRelativeBaseAddr: CARD,  -- relative to the loadedFile
+info: REF LoadStateAccess.LoadedModuleInfo];
+
+LoadedFile: TYPE = REF LoadedFileBody;
+LoadedFileBody: TYPE = RECORD[
+lsh: LoadStateHandle,
+loadedFileInfo: CirioNubAccess.FileEntry,
+packagedFile: PackagedFile,
+lsi: LoadedSegmentsInfo,
+basicInfo: REF LoadStateAccess.BasicPCInfo];
+
+
+
+GetLoadedModuleInfoFromAbsPC: PUBLIC ENTRY PROC[lsh: LoadStateHandle, absPC: CARD, targetData: REF ANY ¬ NIL] RETURNS[REF LoadStateAccess.LoadedModuleInfo] =
+BEGIN
+ENABLE UNWIND => NULL;
+loadedModule: LoadedModule ¬ FindLoadedModuleFromAbsPC[lsh, absPC, targetData];
+IF loadedModule = NIL THEN RETURN[NIL] ELSE
+RETURN[loadedModule.info];
+END;
+
+GetLoadedModuleInfoFromStemName: PUBLIC ENTRY PROC[lsh: LoadStateHandle, moduleName: ROPE, nToSkip: CARD, targetData: REF ANY ¬ NIL] RETURNS[REF LoadStateAccess.LoadedModuleInfo] = {
+ENABLE UNWIND => NULL;
+target: CirioTargets.Target ¬ NARROW[lsh.nub.target];
+moduleRope: Rope.ROPE ¬ moduleName;
+namedObjectFiles: CardTab.Ref--symID -> loadedModule-- ¬ NARROW[SymTab.Fetch[lsh.nameHash.table, moduleRope].val];
+lookUpPattern: Rope.ROPE ¬ Rope.Concat[moduleRope, ".*"];
+moduleEntry: CirioNubAccess.SymEntry ¬ CirioNubAccess.LookupMatchingSymEntryByName[lsh.nub, 0, lookUpPattern, FALSE, ModuleType, 0, nToSkip];
+loadedModule: LoadedModule;
+found: BOOL;
+ra: REF ANY;
+IF moduleEntry#NIL AND moduleEntry.symID=noSymId THEN ERROR--we said this couldn't happen--;
+IF namedObjectFiles = NIL THEN
+IF NOT SymTab.Insert[lsh.nameHash.table, moduleRope, namedObjectFiles ¬ CardTab.Create[3]] THEN ERROR;
+IF moduleEntry#NIL THEN {
+[found, ra] ¬ namedObjectFiles.Fetch[moduleEntry.symID];
+IF found THEN loadedModule ¬ NARROW[ra]
+ELSE {
+loadedFileInfo: CirioNubAccess.FileEntry ¬ CirioNubAccess.GetFileEntry[lsh.nub, moduleEntry.fileSeqNum];
+nominalAbsPC: CARD ¬ moduleEntry.value;
+loadedFile: LoadedFile ¬ FindLoadedFile[lsh, nominalAbsPC, loadedFileInfo, targetData];
+loadedModule ¬ GetLoadedModuleFromLoadedFile[loadedFile, nominalAbsPC + moduleEntry.size - 1, LIST[PFS.PathFromRope[moduleRope]], moduleRope];
+IF NOT namedObjectFiles.Insert[moduleEntry.symID, loadedModule] THEN ERROR CCTypes.CCError[cirioError, IO.PutFR["LoadStateAccessImpl. GetLoadedModuleInfoFromStemName: namedObjectFiles.Insert[%g, %g] collides", [cardinal[moduleEntry.symID]], [rope[moduleName]] ]];
+};
+}
+ELSE IF Rope.Equal[target.opSys, "SunOS5"] --AND moduleEntry=NIL-- THEN {
+installRope: Rope.ROPE ¬ Rope.Concat[target.CNameToLoaderName[target, "XR_install_"], moduleRope];
+moduleEntry ¬ CirioNubAccess.LookupMatchingSymEntryByName[lsh.nub, 0, installRope, FALSE, TextType, 0, nToSkip];
+IF moduleEntry#NIL THEN {
+[found, ra] ¬ namedObjectFiles.Fetch[moduleEntry.symID];
+IF found THEN loadedModule ¬ NARROW[ra]
+ELSE {
+loadedFileInfo: CirioNubAccess.FileEntry ¬ CirioNubAccess.GetFileEntry[lsh.nub, moduleEntry.fileSeqNum];
+nominalAbsPC: CARD ¬ moduleEntry.value;
+loadedFile: LoadedFile ¬ FindLoadedFile[lsh, nominalAbsPC, loadedFileInfo, targetData];
+loadedModule ¬ GetLoadedModuleFromLoadedFile[loadedFile, nominalAbsPC - 1, LIST[PFS.PathFromRope[moduleRope]], moduleRope];
+IF NOT namedObjectFiles.Insert[moduleEntry.symID, loadedModule] THEN ERROR CCTypes.CCError[cirioError, IO.PutFR["LoadStateAccessImpl. GetLoadedModuleInfoFromStemName: backup namedObjectFiles.Insert[%g, %g] collides", [cardinal[moduleEntry.symID]], [rope[moduleName]] ]];
+};
+};
+};
+
+IF loadedModule = NIL THEN {
+IF nToSkip = 0 THEN SystemInterface.ShowReport[IO.PutFR1["LoadStateAccessImpl reports no loaded files with name %g", IO.rope[moduleRope]], $urgent]
+ ELSE  SystemInterface.ShowReport[IO.PutFR["LoadStateAccessImpl reports fewer than %g loaded files with name %g", IO.card[nToSkip+1], IO.rope[moduleRope]], $urgent];
+RETURN[NIL]}
+ ELSE RETURN[loadedModule.info];
+};
+
+GetRopeListForLoadedModuleInfo: PUBLIC PROC[info: REF LoadStateAccess.LoadedModuleInfo] RETURNS[LIST OF Rope.ROPE] =
+BEGIN
+IF info = NIL THEN RETURN[LIST["MISSING"]] ELSE
+BEGIN
+loadedFile: Rope.ROPE ¬ PFS.RopeFromPath[SystemInterface.GetNameOfFile[info.loadedFile]];
+loadedFileBase: Rope.ROPE ¬ IO.PutFR1["  loaded at %g", IO.card[info.lsi[text].base]];
+moduleFiles: Rope.ROPE ¬ "containing";
+moduleBase: Rope.ROPE ¬ IO.PutFR1["  loaded at (object file relative) %g", IO.card[info.moduleRelativeBaseAddr]];
+IF info.possibleModuleFileNames = NIL THEN moduleFiles ¬ Rope.Concat[moduleFiles, " an unknown file"] ELSE
+BEGIN
+moreThanOne: BOOLEAN ¬ FALSE;
+FOR names: LIST OF PATH ¬ info.possibleModuleFileNames, names.rest WHILE names # NIL DO
+IF moreThanOne THEN 
+moduleFiles ¬ Rope.Concat[moduleFiles, " or"];
+moduleFiles ¬ Rope.Concat[moduleFiles, IO.PutFR1[" %g", IO.rope[PFS.RopeFromPath[names.first]]]];
+moreThanOne ¬ TRUE;
+ENDLOOP;
+END;
+RETURN[LIST[loadedFile, moduleBase, moduleFiles, moduleBase]];
+END;
+END;
+
+GetRopeListForLoadedFileContainingLoadedModule: PUBLIC PROC[info: REF LoadStateAccess.LoadedModuleInfo] RETURNS[LIST OF Rope.ROPE] =
+BEGIN
+IF info = NIL THEN RETURN[LIST["MISSING"]] ELSE
+BEGIN
+loadedFileName: Rope.ROPE ¬ PFS.RopeFromPath[SystemInterface.GetNameOfFile[info.loadedFile]];
+stats: Rope.ROPE ¬ IO.PutFR["\Ts: %g, mtime: %g", IO.card[info.sizeOfLoadedFile], IO.time[info.createTimeOfLoadedFile]];
+RETURN[LIST[loadedFileName, stats]];
+END;
+END;
+
+FindLoadedModuleFromAbsPC: PROC[lsh: LoadStateHandle, absPC: CARD, targetData: REF ANY ¬ NIL] RETURNS[LoadedModule] =
+BEGIN
+fullInfo: FullPCInfo ¬ GetFullPCInfo[lsh, absPC];
+pcInfo: CirioNubAccess.PCInfo ¬ fullInfo.pcInfo;
+loadedFileInfo: CirioNubAccess.FileEntry ¬ fullInfo.loadedFileInfo;
+loadedFile: LoadedFile ¬ FindLoadedFile[lsh, absPC, loadedFileInfo, targetData];
+
+IF fullInfo.basicInfo = NIL THEN
+BEGIN
+SystemInterface.ShowReport[IO.PutFR1["LoadStateAccessImpl reports no basic information available for absPC = %g", IO.card[absPC]], $urgent];
+RETURN[NIL]
+END
+ ELSE RETURN[GetLoadedModuleFromLoadedFile[loadedFile, absPC, fullInfo.basicInfo.possibleModuleNames]];
+END;
+
+
+
+FullPCInfo: TYPE = RECORD[
+basicInfo: REF LoadStateAccess.BasicPCInfo,
+pcInfo: CirioNubAccess.PCInfo,
+loadedFileInfo: CirioNubAccess.FileEntry];
+
+FindLoadedFile: PROC[lsh: LoadStateHandle, absPC: CARD, fileInfo: CirioNubAccess.FileEntry, targetData: REF ANY ¬ NIL] RETURNS[LoadedFile] =
+BEGIN
+IF fileInfo=NIL THEN RETURN[NIL];
+IF absPC < fileInfo.textReloc OR fileInfo.textReloc + fileInfo.textSize <= absPC THEN
+BEGIN
+SystemInterface.ShowReport[IO.PutFR1["LoadStateAccessImpl reports that absPC = %g is possibly in some breakpoint patch area", IO.card[absPC]], $normal];
+RETURN[NIL]
+END
+ ELSE
+BEGIN
+loadedFile: LoadedFile ¬ NARROW[CardTab.Fetch[lsh.addrHash.table, fileInfo.textReloc].val];  -- what about zero length files??
+
+IF loadedFile = NIL THEN -- we havn't seen it before, so we have to make it
+BEGIN
+packagedFile: PackagedFile ¬ FindFile[lsh, fileInfo, targetData];
+basicInfo: REF LoadStateAccess.BasicPCInfo ¬ GetFullPCInfo[lsh, absPC].basicInfo;
+loadedFile ¬ NEW[LoadedFileBody¬[lsh, fileInfo, packagedFile, LoadedSegmentsInfoFromFileEntry[fileInfo], basicInfo]];
+IF NOT CardTab.Insert[lsh.addrHash.table, fileInfo.textReloc, loadedFile] THEN ERROR;
+END;
+
+RETURN[loadedFile];
+END;
+END;
+
+
+GetBasicPCInfo: PUBLIC ENTRY PROC[lsh: LoadStateHandle, absPC: CARD] RETURNS[REF LoadStateAccess.BasicPCInfo] =
+{ENABLE UNWIND => NULL; RETURN[GetFullPCInfo[lsh, absPC].basicInfo]};
+
+
+
+ModuleType: CARD = CirioNubAccess.ModuleType;
+TextType: CARD = CirioNubAccess.TextType;
+
+GetFullPCInfo: PROC[lsh: LoadStateHandle, absPC: CARD] RETURNS[FullPCInfo] =
+BEGIN
+pcInfo: CirioNubAccess.PCInfo ¬ CirioNubAccess.PCtoInfo[lsh.nub, absPC];
+IF pcInfo=NIL THEN {
+ SystemInterface.ShowReport[IO.PutFR1["LoadStateAccessImpl reports no PCInfo for abs PC = %g; perhaps the incremental loader lock could not be acquired", IO.card[absPC]], $urgent];
+RETURN [[NIL, NIL, NIL]]};
+
+IF pcInfo.fileSeqNum = 0 THEN {
+ SystemInterface.ShowReport[IO.PutFR1["LoadStateAccessImpl reports no PCInfo for abs PC = %g", IO.card[absPC]], $urgent];
+RETURN [[NIL, NIL, NIL]]};
+
+{fileInfo: CirioNubAccess.FileEntry ¬ CirioNubAccess.GetFileEntry[lsh.nub, pcInfo.fileSeqNum];
+nominalEmbeddedEntry: CirioNubAccess.SymEntry;
+procEntry: CirioNubAccess.SymEntry;
+
+IF pcInfo.guessedEmbeddedFileSymID # 0  THEN
+nominalEmbeddedEntry ¬ CirioNubAccess.LookupSymEntryByID[lsh.nub, pcInfo.guessedEmbeddedFileSymID];
+procEntry ¬ CirioNubAccess.LookupSymEntryByID[lsh.nub, pcInfo.procSymID];
+
+IF pcInfo.guessedEmbeddedFileSymID = 0 OR nominalEmbeddedEntry = NIL THEN
+BEGIN
+SystemInterface.ShowReport[IO.PutFR1["LoadStateAccessImpl reports no guessedEmbeddedFile for abs PC = %g", IO.card[absPC]], $normal];
+RETURN[[NIL, pcInfo, fileInfo]];
+END;
+
+
+BEGIN
+basicInfo: REF LoadStateAccess.BasicPCInfo ¬ NEW[LoadStateAccess.BasicPCInfo¬[
+loadedFileName: pcInfo.fileName,
+lsi: LoadedSegmentsInfoFromFileEntry[fileInfo],
+possibleModuleNames: LIST[pcInfo.guessedEmbeddedFileName], -- for now
+moduleRelativeBaseAddr: nominalEmbeddedEntry.value-fileInfo.textReloc,
+procedureName: pcInfo.procName,
+procedureModuleRelativeBaseAddr: IF procEntry = NIL THEN 0 ELSE procEntry.value-nominalEmbeddedEntry.value]];
+prevEntrySymId: CARD ¬ nominalEmbeddedEntry.symID;
+
+IF nominalEmbeddedEntry.type = CirioNubAccess.ModuleType OR nominalEmbeddedEntry.type = CirioNubAccess.ModuleType+1 THEN
+basicInfo.possibleModuleNames ¬ AddAName[PFS.PathFromRope[nominalEmbeddedEntry.name], basicInfo.possibleModuleNames]
+ ELSE
+BEGIN
+anEarlierEntry: CirioNubAccess.SymEntry ¬ CirioNubAccess.LookupMatchingSymEntryByValue[lsh.nub, prevEntrySymId, nominalEmbeddedEntry.value, ModuleType, 0, 0];
+IF anEarlierEntry # NIL AND anEarlierEntry.value = nominalEmbeddedEntry.value THEN
+BEGIN
+basicInfo.possibleModuleNames ¬ AddAName[PFS.PathFromRope[anEarlierEntry.name], basicInfo.possibleModuleNames];
+prevEntrySymId ¬ anEarlierEntry.symID;
+END;
+END;
+
+DO
+anEarlierEntry: CirioNubAccess.SymEntry ¬ CirioNubAccess.LookupMatchingSymEntryByValue[lsh.nub, prevEntrySymId, nominalEmbeddedEntry.value, ModuleType, 0, -1];
+IF anEarlierEntry = NIL OR anEarlierEntry.value # nominalEmbeddedEntry.value THEN EXIT;
+basicInfo.possibleModuleNames ¬ AddAName[PFS.PathFromRope[anEarlierEntry.name], basicInfo.possibleModuleNames];
+prevEntrySymId ¬ anEarlierEntry.symID;
+ENDLOOP;
+prevEntrySymId ¬ nominalEmbeddedEntry.symID;
+DO
+aLaterEntry: CirioNubAccess.SymEntry ¬ CirioNubAccess.LookupMatchingSymEntryByValue[lsh.nub, prevEntrySymId, nominalEmbeddedEntry.value, ModuleType, 0, 1];
+IF aLaterEntry = NIL OR aLaterEntry.value # nominalEmbeddedEntry.value THEN EXIT;
+basicInfo.possibleModuleNames ¬ AddAName[PFS.PathFromRope[aLaterEntry.name], basicInfo.possibleModuleNames];
+prevEntrySymId ¬ aLaterEntry.symID;
+ENDLOOP;
+RETURN[[basicInfo, pcInfo, fileInfo]];
+END;
+}END;
+
+
+
+GetRopeForBasicPCInfo: PUBLIC PROC[info: REF LoadStateAccess.BasicPCInfo, absPC: CARD, ctr, pc, mo, la: BOOL] RETURNS[Rope.ROPE] = {
+IF info = NIL THEN RETURN["unreadable frame"];
+{to: IO.STREAM ~ IO.ROS[];
+to.PutRope[info.procedureName];
+to.PutRope[" ("];
+IF pc THEN to.PutF1["pc=%xH, ", [cardinal[absPC - (info.lsi[text].base+info.moduleRelativeBaseAddr) ]] ];
+to.PutRope["from"];
+IF info.possibleModuleNames = NIL THEN to.PutRope[" an unknown module file"] ELSE
+BEGIN
+moreThanOne: BOOLEAN ¬ FALSE;
+FOR names: LIST OF PATH ¬ info.possibleModuleNames, names.rest WHILE names # NIL DO
+IF moreThanOne THEN  to.PutRope[" or"];
+to.PutChar[' ];
+to.PutRope[PFS.RopeFromPath[names.first]];
+moreThanOne ¬ TRUE;
+ENDLOOP;
+END;
+IF mo THEN to.PutF1[" with code offset %xH", [cardinal[info.moduleRelativeBaseAddr]] ];
+IF ctr THEN {
+to.PutRope[" in "];
+to.PutRope[PFS.RopeFromPath[info.loadedFileName]];
+IF la THEN to.PutF1[", code loaded at %08xH", [cardinal[info.lsi[text].base]] ]};
+to.PutRope[")"];
+
+RETURN[IO.RopeFromROS[to]]}};
+
+GetRopeListForBasicPCInfo: PUBLIC PROC[info: REF LoadStateAccess.BasicPCInfo] RETURNS[LIST OF Rope.ROPE] =
+BEGIN
+IF info = NIL THEN RETURN[LIST["unreadable frame"]]
+ ELSE
+BEGIN
+loadedFile: Rope.ROPE ¬ IO.PutFR["object file %g loaded at %g", IO.rope[PFS.RopeFromPath[info.loadedFileName]], IO.card[info.lsi[text].base]];
+moduleFiles: Rope.ROPE ¬ "containing";
+loadedAt: Rope.ROPE ¬ IO.PutFR1["  loaded at (object file relative) %g", IO.card[info.moduleRelativeBaseAddr]];
+procedure: Rope.ROPE ¬ IO.PutFR["calling %g at (module relative) %g", IO.rope[info.procedureName], IO.card[info.procedureModuleRelativeBaseAddr]];
+
+IF info.possibleModuleNames = NIL THEN moduleFiles ¬ Rope.Concat[moduleFiles, " an unknown module file"] ELSE
+BEGIN
+moreThanOne: BOOLEAN ¬ FALSE;
+FOR names: LIST OF PATH ¬ info.possibleModuleNames, names.rest WHILE names # NIL DO
+IF moreThanOne THEN moduleFiles ¬ Rope.Concat[moduleFiles, " or"];
+moduleFiles ¬ Rope.Concat[moduleFiles, IO.PutFR1[" %g", IO.rope[PFS.RopeFromPath[names.first]]]];
+moreThanOne ¬ TRUE;
+ENDLOOP;
+END;
+
+RETURN[LIST[loadedFile, moduleFiles, loadedAt, procedure]];
+END;
+END;
+
+
+
+PackagedFile: TYPE = REF PackagedFileBody;
+PackagedFileBody: TYPE = RECORD[
+mtime: CARD,
+size: CARD,
+createTime: BasicTime.GMT,
+parsedFile: CirioFile,
+parsed: ObjectFiles.Parsed];
+
+
+
+LoadedSegmentsInfoFromFileEntry: PROC [fileInfo: CirioNubAccess.FileEntry] RETURNS [LoadedSegmentsInfo] ~ {
+RETURN [[
+text: [fileInfo.textReloc, fileInfo.textSize],
+data: [fileInfo.dataReloc, fileInfo.dataSize],
+bss: [fileInfo.bssReloc, fileInfo.bssSize]
+]]};
+
+FindFile: PROC[lsh: LoadStateHandle, loadedFileInfo: CirioNubAccess.FileEntry, targetData: REF ANY ¬ NIL] RETURNS[PackagedFile] ~ {
+key: ATOM ¬ CreateLoadedFileKey[PFS.RopeFromPath[loadedFileInfo.fileName], loadedFileInfo.mtime, loadedFileInfo.size];
+packagedFile: PackagedFile ¬ NARROW[RefTab.Fetch[lsh.objHash.table, key].val];
+mTimeAsGMT: BasicTime.GMT ¬ GMTFromSunTime[loadedFileInfo.mtime];
+IF packagedFile = NIL THEN {--we havn't seen it before, so we have to go looking for it
+file: CirioFile ¬ SystemInterface.GetCirioFileFromDebuggee[lsh.fileSet, loadedFileInfo.fileName, lsh.serverName, [egmt: [mTimeAsGMT, 0]] ];
+parsed: ObjectFiles.Parsed ¬ NIL;
+checkedFile: CirioFile ¬ NIL;
+IF file#NIL THEN {
+fileInfo: SystemInterface.CirioFileInfo ¬ SystemInterface.GetFileInfo[file];
+ConditionalCheckFile: PROC RETURNS [CirioFile] = {
+IF loadedFileInfo.mtime = 0 THEN RETURN[file]; -- dont check
+IF mTimeAsGMT # fileInfo.uniqueID.egmt.gmt OR loadedFileInfo.size # CARD[fileInfo.bytes] THEN RETURN[NIL];
+RETURN[file]};
+checkedFile ¬ ConditionalCheckFile[];
+IF checkedFile # NIL THEN parsed ¬ ObjF.CreateParsed[checkedFile, NIL, targetData];
+};
+packagedFile ¬ NEW[PackagedFileBody¬[loadedFileInfo.mtime, loadedFileInfo.size, mTimeAsGMT, checkedFile, parsed]];
+IF NOT RefTab.Insert[lsh.objHash.table, key, packagedFile] THEN ERROR;
+};
+RETURN[packagedFile];
+};
+
+
+GetLoadedModuleFromLoadedFile: PROC[loadedFile: LoadedFile, absPC: CARD, possibleNames: LIST OF PATH, moduleRope: Rope.ROPE ¬ NIL] RETURNS[LoadedModule] =
+{
+module: ObjF.Module ¬ NIL;
+stabRange: StabRange ¬ [0,0];
+fastway: BOOL ¬ FALSE;
+relPC: CARD;
+format: Rope.ROPE ¬ ObjectFiles.GetFormatString[loadedFile.packagedFile.parsed];
+IF format.Equal["SunADotOut"] THEN fastway ¬ TRUE;
+IF fastway THEN {
+stabRange ¬ FindStabRange[loadedFile, absPC];
+IF stabRange.count # 0 THEN
+module ¬ SunADotOut.ModuleFromParsedAndStabRange[loadedFile.packagedFile.parsed, stabRange];
+}
+ELSE {
+relPC ¬ RelativePCFromAbsolutePC[loadedFile, absPC];
+module ¬ ObjF.ModuleFromParsedAndPC[loadedFile.packagedFile.parsed, [[0, ""], relPC], moduleRope];
+};
+
+IF module = NIL OR (fastway AND stabRange.count = 0) THEN
+{
+SystemInterface.ShowReport[IO.PutFR1["LoadStateAccessImpl reports that the object file containing absPC = %g appears to be optimized", IO.card[absPC]], $urgent];
+RETURN[NIL]
+};
+{moduleInfo: REF ObjF.ModuleInfo ¬ ObjF.GetModuleInfo[module];
+info: REF LoadStateAccess.LoadedModuleInfo ¬ IF moduleInfo = NIL THEN NIL ELSE
+NEW[LoadStateAccess.LoadedModuleInfo¬[
+loadedFile.packagedFile.mtime,
+loadedFile.packagedFile.size,
+loadedFile.packagedFile.createTime,
+loadedFile.packagedFile.parsedFile,
+loadedFile.packagedFile.parsed,
+loadedFile.lsi,
+module,
+possibleNames,
+0 --module.startPC  moduleInfo.startPC--]];
+loadedModule: LoadedModule ¬ IF moduleInfo = NIL THEN NIL ELSE NEW[LoadedModuleBody¬[loadedFile, module, 0 --moduleInfo.startPC--, info]];
+IF moduleInfo # NIL AND info # NIL THEN info.possibleModuleFileNames ¬ AddAName[moduleInfo.fileName, info.possibleModuleFileNames];
+RETURN[loadedModule];
+};
+};
+
+
+GMTFromSunTime: PROC[sunTime: CARD] RETURNS[BasicTime.GMT] =
+{
+RETURN[BasicTime.Update[unixOrg, sunTime]];
+};
+unixOrg: BasicTime.GMT ¬ BasicTime.Pack[[1970, January, 1, 0, 0, 0, 0, no]];
+
+
+AddAName: PROC[newName: PATH, names: LIST OF PATH] RETURNS[LIST OF PATH] =
+{
+FOR nms: LIST OF PATH ¬ names, nms.rest WHILE nms # NIL DO
+IF nms.first.Equal[newName] THEN RETURN[names];
+ENDLOOP;
+RETURN[CONS[newName, names]];
+};
+
+
+
+
+ObjectFileHashTable: TYPE = REF ObjectFileHashTableBody;
+ObjectFileHashTableBody: TYPE = RECORD[table: RefTab.Ref];
+
+
+CreateObjectFileHashTable: PROC RETURNS[ObjectFileHashTable] =
+{RETURN[NEW[ObjectFileHashTableBody ¬ [RefTab.Create[]]]]};
+
+
+CreateLoadedFileKey: PROC[longPathName: Rope.ROPE, mtime: CARD, size: CARD] RETURNS[ATOM] =
+{RETURN[Atom.MakeAtom[Rope.Cat[Convert.RopeFromCard[mtime], Convert.RopeFromCard[size], longPathName]]]};
+
+
+LoadedObjectFileHashTable: TYPE = REF LoadedObjectFileHashTableBody;
+LoadedObjectFileHashTableBody: TYPE = RECORD[table: CardTab.Ref];
+
+
+CreateLoadedFileHashTable: PROC RETURNS[LoadedObjectFileHashTable] =
+{RETURN[NEW[LoadedObjectFileHashTableBody ¬ [CardTab.Create[]]]]};
+
+
+ModuleNameHashTable: TYPE = REF ModuleNameHashTableBody;
+ModuleNameHashTableBody: TYPE = RECORD[table: SymTab.Ref];
+
+CreateNameHashTable: PROC RETURNS[ModuleNameHashTable] =
+{RETURN[NEW[ModuleNameHashTableBody ¬ [SymTab.Create[]]]]};
+
+NameEntry: TYPE = REF NameSeq;
+NameSeq: TYPE = RECORD [SEQUENCE nEntries: CARDINAL OF NameData];
+NameData: TYPE = RECORD [symID: CARD ¬ noSymId, loadedModule: LoadedModule ¬ NIL];
+noSymId: CARD = CARD.LAST; --no actual symID can have this value
+
+
+RelativePCFromAbsolutePC: PROC[loadedFile: LoadedFile, absPC: CARD] RETURNS [relPC: CARD] ~ {
+nub: CirioNubAccess.Handle ¬ loadedFile.lsh.nub;
+fileInfo: CirioNubAccess.FileEntry ¬ loadedFile.loadedFileInfo;
+
+
+pcInfo: CirioNubAccess.PCInfo ¬ CirioNubAccess.PCtoInfo[nub, absPC];
+pcSymEntryResult: CirioNubAccess.SymEntry ¬ CirioNubAccess.LookupSymEntryByID[nub, pcInfo.procSymID];
+procValue: CARD ¬ IF pcSymEntryResult = NIL THEN ERROR ELSE pcSymEntryResult.value;
+procedureStartRelativePC: CARD ¬ procValue - fileInfo.textReloc;
+relPC ¬ procedureStartRelativePC;
+};
+
+StabRange: TYPE = ObjectFilesPrivate.StabRange;
+
+FindStabRange: PROC[loadedFile: LoadedFile, absPC: CARD] RETURNS[StabRange] =
+BEGIN
+nub: CirioNubAccess.Handle ¬ loadedFile.lsh.nub;
+fileInfo: CirioNubAccess.FileEntry ¬ loadedFile.loadedFileInfo;
+
+
+pcInfo: CirioNubAccess.PCInfo ¬ CirioNubAccess.PCtoInfo[nub, absPC];
+pcSymEntryResult: CirioNubAccess.SymEntry ¬ CirioNubAccess.LookupSymEntryByID[nub, pcInfo.procSymID];
+procValue: CARD ¬ IF pcSymEntryResult = NIL THEN ERROR ELSE pcSymEntryResult.value;
+procedureStartRelativePC: CARD ¬ procValue - fileInfo.textReloc;
+GroupSize: CARD = 16;
+nGroups: INT ¬ fileInfo.readerDataSize/GroupSize;
+x: CARD ¬ 0;
+y: CARD ¬ nGroups;
+
+IF nGroups = 0 THEN RETURN[[0, 0]];
+
+BEGIN
+xData: StbGpEntry ¬ ReadOneDbxStabGroupEntry[nub, fileInfo, x];
+IF procedureStartRelativePC < xData.firstPC THEN RETURN[[0, 0]];
+IF procedureStartRelativePC <= xData.lastPC THEN RETURN[[xData.firstX, xData.count]];
+END;
+
+WHILE x+1 < y DO
+mid: CARD ¬ (x+y)/2;
+midData: StbGpEntry ¬ ReadOneDbxStabGroupEntry[nub, fileInfo, mid];
+SELECT TRUE FROM
+procedureStartRelativePC < midData.firstPC => y ¬ mid;
+midData.firstPC <= procedureStartRelativePC AND procedureStartRelativePC <= midData.lastPC =>
+RETURN[[midData.firstX, midData.count]];
+midData.lastPC < procedureStartRelativePC => x ¬ mid;
+ENDCASE => ERROR;
+ENDLOOP;
+RETURN[[0, 0]];
+END;
+
+StbGpEntry: TYPE = RECORD[firstX: INT, count: INT, firstPC: CARD, lastPC: CARD];
+
+ReadOneDbxStabGroupEntry: PROC[nub: CirioNubAccess.Handle, fileInfo: CirioNubAccess.FileEntry, gpIndex: CARD] RETURNS[StbGpEntry] =
+BEGIN
+bytesForOneGroup: CARD = 16;
+firstAddr: CARD ¬ fileInfo.readerData+gpIndex*bytesForOneGroup;
+RETURN[[
+ReadIntAtCardAddr[nub, firstAddr],
+ReadIntAtCardAddr[nub, firstAddr+4],
+ReadCardAtCardAddr[nub, firstAddr+8],
+ReadCardAtCardAddr[nub, firstAddr+12]]];
+END;
+
+ReadCardAtCardAddr: PROC[nub: CirioNubAccess.Handle, addr: CARD32] RETURNS[CARD32] =
+BEGIN
+RETURN[CirioNubAccess.Read32BitsAsCard[[nub, addr, 0, FALSE, TRUE]]];
+END;
+
+ReadIntAtCardAddr: PROC[nub: CirioNubAccess.Handle, addr: CARD32] RETURNS[INT32] =
+BEGIN
+RETURN[LOOPHOLE[CirioNubAccess.Read32BitsAsCard[[nub, addr, 0, FALSE, TRUE]]]];
+END;
+
+
+TestLoadStateByPC: Commander.CommandProc =
+BEGIN
+args: CommanderOps.ArgumentVector ¬ CommanderOps.Parse[cmd];
+remoteName: Rope.ROPE ¬ args[1];
+portNum: CARD ¬ Convert.CardFromRope[args[2]];
+absPC: CARD ¬ Convert.CardFromRope[args[3]];
+nub: CirioNubAccess.Handle ¬ CirioNubAccess.CreateRemoteNub[debuggee: remoteName, port: portNum, timeoutMsec: 10000];
+fileSet: SystemInterface.FileSet ¬ SystemInterface.CreateFileSet[];
+BEGIN ENABLE UNWIND =>
+{SystemInterface.CloseFileSet[fileSet]; CirioNubAccess.DestroyNub[nub]};
+loadState: LoadStateHandle ¬ CreateLoadStateHandle[remoteName, nub, fileSet];
+basicInfo: REF LoadStateAccess.BasicPCInfo ¬ GetBasicPCInfo[loadState, absPC];
+moreInfo: REF LoadStateAccess.LoadedModuleInfo ¬ GetLoadedModuleInfoFromAbsPC[loadState, absPC];
+
+rope1: Rope.ROPE ¬ GetRopeForBasicPCInfo[basicInfo, absPC, TRUE, TRUE, TRUE, TRUE];
+ropes2: LIST OF Rope.ROPE ¬ GetRopeListForBasicPCInfo[basicInfo];
+ropes3: LIST OF Rope.ROPE ¬ GetRopeListForLoadedModuleInfo[moreInfo];
+
+IO.PutF1[cmd.out, "%g\N", IO.rope[rope1]];
+FOR rps: LIST OF Rope.ROPE ¬ ropes2, rps.rest WHILE rps # NIL DO
+IO.PutF1[cmd.out, "%g\N", IO.rope[rps.first]];
+ENDLOOP;
+FOR rps: LIST OF Rope.ROPE ¬ ropes3, rps.rest WHILE rps # NIL DO
+IO.PutF1[cmd.out, "%g\N", IO.rope[rps.first]];
+ENDLOOP;
+END;
+SystemInterface.CloseFileSet[fileSet];
+CirioNubAccess.DestroyNub[nub];
+END;
+
+TestLoadStateByName: Commander.CommandProc =
+BEGIN
+args: CommanderOps.ArgumentVector ¬ CommanderOps.Parse[cmd];
+remoteName: Rope.ROPE ¬ args[1];
+portNum: CARD ¬ Convert.CardFromRope[args[2]];
+name: Rope.ROPE ¬ args[3];
+nToSkip: CARD ¬ Convert.CardFromRope[args[4]];
+nub: CirioNubAccess.Handle ¬ CirioNubAccess.CreateRemoteNub[debuggee: remoteName, port: portNum, timeoutMsec: 10000];
+fileSet: SystemInterface.FileSet ¬ SystemInterface.CreateFileSet[];
+BEGIN ENABLE UNWIND =>
+{SystemInterface.CloseFileSet[fileSet]; CirioNubAccess.DestroyNub[nub]};
+loadState: LoadStateHandle ¬ CreateLoadStateHandle[remoteName, nub, fileSet];
+info: REF LoadStateAccess.LoadedModuleInfo ¬ GetLoadedModuleInfoFromStemName[loadState, name, nToSkip];
+ropes: LIST OF Rope.ROPE ¬ GetRopeListForLoadedModuleInfo[info];
+FOR rps: LIST OF Rope.ROPE ¬ ropes, rps.rest WHILE rps # NIL DO
+IO.PutF1[cmd.out, "%g\N", IO.rope[rps.first]];
+ENDLOOP;
+END;
+SystemInterface.CloseFileSet[fileSet];
+CirioNubAccess.DestroyNub[nub];
+END;
+
+
+
+Commander.Register["TestLoadStateByPC", TestLoadStateByPC];
+Commander.Register["TestLoadStateByName", TestLoadStateByName];
+
+END..
+     
+LoadStateAccessImpl.mesa
+Copyright Ó 1990, 1991, 1992, 1993 by Xerox Corporation.  All rights reserved.
+Sturgis, March 23, 1990 3:33 pm PST
+Last tweaked by Mike Spreitzer on August 20, 1993 1:52 pm PDT
+Linda Howe December 28, 1989 8:27:18 am PST
+Coolidge, July 23, 1990 4:22 pm PDT
+Laurie Horton, October 23, 1991 2:55 pm PDT
+Philip James, February 13, 1992 11:03 am PST
+Katsuyuki Komatsu December 29, 1992 8:31 pm PST
+Jas, January 8, 1993 2:00 pm PST
+Willie-s, January 22, 1993 2:25 pm PST
+This module is intended to replace part of the old SymbolFindingImpl.
+It knows about:
+the load state (through the nub),
+parsed object files (through ObjectFiles), and
+finding loaded object files files.
+
+It knows nothing about mobs, CFiles, or Mesa files.
+
+
+
+
+This should be cleaned up (better use of PATH)
+If I understand correctly, this is the containing object file
+I am a little suspicious about installing the name I was supplied with.
+Perhaps I should do what I do when given an absPC, get the list from the basic pc info.  (Or at least check that the given name is in that list?)
+If I understand correctly, this is the containing object file
+I am a little suspicious about installing the name I was supplied with.
+Perhaps I should do what I do when given an absPC, get the list from the basic pc info.  (Or at least check that the given name is in that list?)
+In the SGI IRIX version, I count on this to return NIL to tell me that the absPC is within the patch space.  I think NIL is OK.
+I added this check to accommodate a SGI IRIX pcr bug, when guessedEmbeddedFileSymID is 0 LookupSymEntryByID causes the pcr to PANIC
+We need to try harder here instead of giving up when the LoadState doesn't know a guessedEmbedded file name.  Not all object file formats support this functionality.  
+looks promising, lets continue
+lets consider the nominal entry
+nominal entry does not match conditions, so we have to make our first probe with numToSkip = 0 in order not to miss an entry
+lets try earlier entries
+lets try later entries
+patch: [fileInfo.patchReloc, fileInfo.patchSize],
+common: [fileInfo.commonReloc, fileInfo.commonSize]
+It becomes critical that the module information exists with SGI, I've changed $normal to $urgent
+BasicTime.mesa says that earliestGMT is the beginning of 1968
+Sun documentation says that Sun time (Unix standard?) is zero at beginning of 1970
+hash mechanism
+Stab ranges
+
+This was taken from FindStabRange
+
+We consult a table located in the target world.
+That table is described in 
+/palain-UX/jaune/xrhome/DEVELOPMENT/loading/INCLUDE/xr/ADotOutExtras.h
+in vicinity of dbxstabgroup
+We return [1,0] if there are no dbx symbol table entries for the given pc.
+Suppose that nGroups = 0.  This probably means that the embedded DotO has no dbx symbols.
+lets check x
+invariant:
+procedureStartRelativePC > group[x].lastPC
+y = nGroups OR procedureStartRelativePC < group[y].firstPC
+
+
+no dbx symbols
+crude test of LoadStateAccess and Nub (and fileSets)
+main code
+
+TestLoadStateByPC menhir 4816 4567890
+
+
+TestLoadStateByName menhir 4816 ThreadsSwitch.o 0
+ÊÉ  –"cedarcode" style•NewlineDelimiter
+™ codešœ™Kšœ
+ÏeœC™NKšœ#™#K™=K™+K™#K™+K™,K™/K™ K™&—K˜ šÏk	˜	Kšœžœ˜Kšœ
+žœžœ˜#Kšœžœ˜*Kšœžœ˜KšœžœÔ˜èKšœžœ	˜Kšœ
+žœ˜'Kšœžœ˜*Kšœžœ˜*Kšœžœb˜sKšœžœ˜$Kšžœ˜Kšœžœ4˜IKšžœžœ˜'Kšœ	žœžœ	˜Kšœžœ˜)Kšœžœžœ˜%Kšœžœ˜/Kšœžœ˜)Kšœžœƒ˜˜—K˜ ˜ K˜ —K™E™K™!K™.K™"—K™ ™3K™ ™ K™ ——šÏnœžœžœžœžœžœVžœžœ>žœ˜KšžœžœŸœ˜K˜ Kšžœžœžœ˜Kšžœžœžœ˜Kšœžœ˜,Kšœžœ&˜>K™ Kšœžœžœ˜0š	œžœžœž	œžœ˜4Kšœžœ˜Kšœ˜Kšœ!˜!Kšœ˜Kšœ$˜$Kšœ˜—K˜ š
+Ÿœžœžœžœ@žœ˜’Kšž˜K˜;K˜BK˜6KšžœžœR˜\Kšžœ˜K˜ —K˜ Kšœžœžœ˜*šœžœžœ˜ Kšœ˜K˜KšœžœÏc˜<Kšœžœ#˜,K˜ —Kšœžœžœ˜&šœžœžœ˜Kšœ˜Kšœ)˜)Kšœ˜Kšœ˜Kšœžœ˜,—K˜ ˜ K˜ —šŸœžœžœžœžœžœžœžœžœžœ$˜Kšž˜Kšžœžœžœ˜K˜Ošžœžœžœžœžœž˜+KšÐktÏtœ˜—Kšžœ˜—K˜ Kšœ)ž™.šŸœžœžœžœ#žœžœžœžœžœžœžœ&˜¶Kšžœžœžœ˜Kšœžœ˜5Kšœžœ˜#Kšœ œžœ3˜rKšœžœ!˜9Kšœnžœ˜Kšœ˜Kšœžœ˜Kšœžœžœ˜Kšžœžœžœžœž  œ˜\šžœžœž˜KšžœžœUžœžœ˜f—šžœžœžœ˜K˜8Kšžœžœœžœ˜'šžœ˜˜hK™=—Kšœžœ˜'K˜Wšœ^žœžœ(˜ŽK™GK™‘—Kš
+žœžœ:žœžœžœž˜‡K˜—K˜—šžœžœ$ œžœ˜IKšœžœL˜bKšœSžœ˜pšžœžœžœ˜K˜8Kšžœžœœžœ˜'šžœ˜˜hK™=—Kšœžœ˜'K˜WšœKžœžœ(˜{K™GK™‘—Kš
+žœžœ:žœžœžœ¥˜ŽKšœ˜—K˜—K˜—K˜ šžœžœžœ˜KšžœžœžœDžœ˜“Kš	œžœžœNžœžœ˜¥Kšžœžœ˜—Kšœžœžœ˜ Kšœ˜K˜ —šŸœžœžœžœ#žœžœžœžœ˜tKšž˜šžœžœžœžœžœž˜/Kšž˜Kšœžœžœ>˜YKšœžœžœžœ˜VKšœžœ˜&Kšœžœžœ1žœ$˜qšžœ žœžœ<ž˜jKšž˜Kšœžœžœ˜šžœžœžœžœ,žœ	žœž˜Wšžœžœ˜K˜.—Kšœ'žœžœžœ˜aKšœžœ˜Kšžœ˜—Kšžœ˜—Kšžœžœ3˜>Kšžœ˜—Kšžœ˜—K˜ šŸ.œžœžœžœ#žœžœžœžœ˜„Kšž˜šžœžœžœžœžœž˜/Kšž˜Kšœžœžœ>˜]Kš	œžœžœžœžœ$˜xKšžœžœ˜$Kšžœ˜—Kšžœ˜—K˜ šŸœžœžœžœžœžœžœ˜uKšž˜K˜1K˜0K˜CK˜PK˜ šžœžœž˜ Kšž˜KšœžœUžœ˜ŒKšžœžœ˜Kšž˜—Kšœžœžœ[˜gKšžœ˜—K˜ K˜ K˜ šœžœžœ˜Kšœžœ˜+Kšœ˜Kšœ*˜*—K˜ šŸœžœžœ2žœžœžœžœ˜ŒKšž˜Kš
+žœ
+žœžœžœžœ˜!šžœžœ1ž˜UKšž˜Kšœžœažœ˜˜K™Kšžœžœ˜Kšž˜—šœž˜Kšž˜Kšœžœ> !˜~K˜ šžœžœžœ Ðci˜KKšž˜K˜AKšœžœC˜QKšœžœe˜uKšžœžœDžœžœ˜UKšžœ˜—K˜ Kšžœ˜Kšžœ˜—Kšžœ˜—K˜ K˜ šŸœžœžœžœžœžœžœ˜oKš	œžœžœžœžœ'˜E—K˜ K˜ K˜ KšŸ
+œžœ˜-KšŸœžœ˜)K˜ šŸœžœžœžœ˜LKšž˜K˜Hšžœžœžœ˜Kšœžœ|žœ˜´Kšžœžœžœžœ˜K˜ —šžœžœ˜KšœžœAžœ˜yKšžœžœžœžœ˜K˜ —K˜^Kšœ.˜.Kšœ#˜#K˜ Kšœƒ™ƒšžœ&ž˜,K˜c—K˜IK˜ K™§šžœ%žœžœž˜IKšž˜KšœžœNžœ˜…Kšžœžœ˜ Kšžœ˜K˜ —K˜ šœ™Kšž˜šœžœžœ˜NKšœ ˜ K˜/Kšœžœ" 
+˜EKšœF˜FKšœ˜Kš	œ!žœžœžœžœ.˜mKšœžœ˜2—K˜ K™šžœ7žœ9ž˜xKšœ)žœH˜t—šœž˜K™|Kšž˜K˜žšžœžœžœ3ž˜RKšž˜Kšœ)žœC˜oK˜&Kšžœ˜—Kšžœ˜K˜ —K™šž˜K˜ŸKš
+žœžœžœ3žœžœ˜WKšœ)žœC˜oK˜&Kšžœ˜—K™K˜,šž˜K˜›Kš
+žœžœžœ0žœžœ˜QKšœ)žœ@˜lK˜#Kšžœ˜—Kšžœ ˜&Kšžœ˜—Kšœžœ˜—K˜ K˜ K˜ šŸœžœžœžœ%žœžœžœžœ˜„Kšžœžœžœžœ˜.Kš	œžœžœžœžœ˜Kšœ˜K˜Kšžœžœ_˜iK˜šžœžœžœ'ž˜QKšž˜Kšœžœžœ˜šžœžœžœžœ(žœ	žœž˜SKšžœžœ˜'K˜Kšœžœ˜*Kšœžœ˜Kšžœ˜—Kšžœ˜—KšžœžœM˜Wšžœžœ˜Kšœ˜Kšœžœ$˜2KšžœžœG˜Q—Kšœ˜K˜ Kšžœžœ˜—K˜ šŸœžœžœžœžœžœžœžœ˜jKšž˜Kš
+žœžœžœžœžœ˜3šœž˜Kšž˜Kšœžœžœ&žœžœ%žœ˜ŽKšœžœ˜&Kšœžœžœ1žœ$˜oKš	œžœžœ-žœžœ-˜’K˜ šžœžœžœCž˜mKšž˜Kšœžœžœ˜šžœžœžœžœ(žœ	žœž˜SKšžœžœ/˜BKšœ'žœžœžœ˜aKšœžœ˜Kšžœ˜—Kšžœ˜—K˜ Kšžœžœ0˜;Kšžœ˜—Kšžœ˜—K˜ K˜ K˜ Kšœžœžœ˜*šœžœžœ˜ Kšœžœ˜Kšœžœ˜Kšœžœ˜K˜Kšœ˜—K˜ K˜ K˜ šŸœžœ&žœ˜kšžœ˜	Kšœ1™1Kšœ.˜.Kšœ.˜.Kšœ*˜*Kšœ3™3K˜——K˜ šŸœžœMžœžœžœžœ˜ƒKšœžœžœS˜vKšœžœ+˜NKšœžœ(˜Ašžœžœžœ £˜WK˜‹Kšœžœ˜!Kšœžœ˜šžœžœžœ˜K˜LšŸœžœžœ˜2Kšžœžœžœ ˜<Kšžœ)žœžœžœžœžœ˜jKšžœ˜—K˜%Kšžœžœžœ)žœ˜SK˜—Kšœžœ`˜rKšžœžœ5žœžœ˜FKšœ˜—Kšžœ˜Kšœ˜—K˜ K˜ šŸœžœ žœžœžœžœžœžœžœ˜ššœ˜Kšœžœ˜K˜Kšœ	žœžœ˜Kšœžœ˜KšœžœÏbœ<˜PKšžœžœžœ˜2šžœ	žœ˜K˜-šžœž˜K˜\—K˜—šžœ˜K˜4K˜bK˜—K˜ š	žœ
+žœžœ
+žœž˜9Kšœ˜K™`Kšœžœjžœ˜¡Kšžœžœ˜Kšœ˜—Kšœžœ.˜>šœžœ$žœžœžœžœž˜Nšžœ#˜&Kšœ˜Kšœ˜Kšœ#˜#Kšœ#˜#Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ &œ˜+——Kšœžœžœžœžœžœžœ) œ	˜ŠKš
+žœžœžœžœžœ\˜ƒKšžœ˜Kšœ˜—Kšœ˜—K˜ K˜ K™=K™Rš
+Ÿœžœ
+žœžœžœ˜<Kšœ˜Kšžœ%˜+Kšœ˜Kšœžœ6˜L—K˜ K˜ šŸœžœ
+žœ	žœžœžœžœžœžœžœ˜JKšœ˜šžœžœžœžœžœžœž˜:Kšžœžœžœ˜/Kšžœ˜—Kšžœžœ˜Kšœ˜—K˜ K˜ K˜ ™K˜ Kšœžœžœ˜8Kšœžœžœ˜:K˜ K˜ šŸœžœžœ˜>Kšœžœžœ0˜;K˜ —K˜ šŸœžœžœ	žœžœžœžœ˜[Kšœžœb˜i—K˜ K˜ Kšœžœžœ˜DKšœžœžœ˜AK˜ K˜ šŸœžœžœ˜DKšœžœžœ7˜B—K˜ K˜ Kšœžœžœ˜8Kšœžœžœ˜:K˜ šŸœžœžœ˜8Kšœžœžœ0˜;—K˜ Kšœžœžœ	˜Kšœ	žœžœžœžœžœ˜AKš	œ
+žœžœ	žœ)žœ˜Ršœ	žœžœžœ %˜@K˜ ——K˜ šœ™K™ š
+Ÿœžœ žœžœ	žœ˜]K™!K™ K˜0K˜?K˜ K˜ K˜DK˜eKšœžœžœžœžœžœžœ˜SKšœžœ"˜@K˜!K˜K˜ —Kšœžœ ˜/˜ K™/™K™FK™—K™J—šŸœžœ žœžœ˜MKšž˜K˜0K˜?K˜ K˜ K˜DK˜eKšœžœžœžœžœžœžœ˜SKšœžœ"˜@KšŸ	œžœ˜Kšœ	žœ%˜1Kšœžœ˜Kšœžœ˜K˜ K™YKšžœžœžœ	˜#K˜ ™Kšž˜K˜?Kšžœ*žœžœ	˜@Kšžœ*žœžœ˜UKšžœ˜—K˜ šœ
+™
+Kšœ*™*Kšœ:™:—K™ šžœ	ž˜Kšœžœ˜K˜Cšžœžœž˜K˜6šœ,žœ.˜]Kšžœ"˜(—K˜5Kšžœžœ˜—Kšžœ˜—K™ K™Kšžœ	˜Kšžœ˜—K˜ Kšœžœžœ	žœ	žœžœ
+žœ˜PK˜ šŸœžœJžœžœ˜ƒKšž˜Kšœžœ˜Kšœžœ0˜?šžœ˜Kšœ"˜"Kšœ$˜$K˜%K˜(—Kšžœ˜—K˜ š
+Ÿœžœ#žœžœžœ˜TKšž˜Kšžœ0žœžœ˜EKšžœ˜—K˜ š
+Ÿœžœ#žœžœžœ˜RKšž˜Kšžœžœ0žœžœ˜OKšžœ˜——K˜ ™4K˜ šŸœ˜*Kšž˜K˜<Kšœžœ˜ Kšœ	žœ!˜.Kšœžœ!˜,K˜u˜Cšžœžœžœ˜KšœH˜H—K˜MKšœžœ@˜NKšœ
+žœS˜`K˜ Kšœžœ+žœžœžœžœ˜SKšœžœžœžœ(˜AKšœžœžœžœ,˜EK˜ Kšžœžœ˜*šžœžœžœžœžœžœž˜@Kšžœžœ˜.Kšžœ˜—šžœžœžœžœžœžœž˜@Kšžœžœ˜.Kšžœ˜—Kšžœ˜—K˜&Kšœ˜Kšžœ˜—K˜ šŸœ˜,Kšž˜K˜<Kšœžœ˜ Kšœ	žœ!˜.Kšœžœ˜Kšœ	žœ!˜.K˜u˜Cšžœžœžœ˜KšœH˜H—K˜MKšœžœ^˜gKšœžœžœžœ(˜@šžœžœžœžœžœžœž˜?Kšžœžœ˜.Kšžœ˜—Kšžœ˜—K˜&Kšœ˜Kšžœ˜—K˜ —K˜ K™	K˜ šœ;˜;K™ Kšœ%™%—K™ šœ?˜?K™ Kšœ1™1K˜ —Kšžœ˜—— …—    dH  ‹  

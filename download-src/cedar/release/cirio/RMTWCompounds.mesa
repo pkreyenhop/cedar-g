@@ -1,0 +1,1211 @@
+
+DIRECTORY
+Arrays USING[ArrayIndirectNodeInfo, ArrayIndirectNodeInfoBody, ArrayTypeProcs, CreateArrayType, CreateArrayIndirectNode],
+Basics USING[LowHalf],
+CCTypes USING[CCError, CCErrorCase, CreateIndirectNode, GetBitSize, GetNElements, GetIndirectCreateNode, GetIndirectType, GetTypeRepresentation],
+CedarCode USING[GetTypeOfNode, Operator, LoadThroughIndirectNode, NodeAsIndex],
+CedarNumericTypes USING[NumericDescriptor],
+CedarOtherPureTypes USING[CreateUnknownType, CreateUnknownTypeNode],
+CirioMemory,
+CirioTypes,
+IO,
+MobAccess USING[BlockDesc, BodySE, BTH, ConstVal, CTXH, CTXR, FetchCTXR, FetchMDR, FetchSER, FieldDesc, GetCtxForCTXH, GetMobForCTXH, IncludedCTXR, MakeCTXH, MDR, MobCookie,  SEH, SER, TypeDesc, TypeInfoConsSE],
+MobObjectFiles USING[GetLocalFrameExtensionVar, GetVarLoc, JointMobParsedInfo, VarLoc, VarLocBody],
+MorePfsNames,
+NewRMTW USING[],
+RMTWPrivate,
+PFS USING [PathFromRope],
+PFSNames USING [PATH, Component, ShortName],
+Records USING[CreateIndirectRecordNode, CreateFieldListType, CreateRecordType, FieldCase, IndirectRecordNodeProcs, RecordTypeProcs],
+Rope,
+RopeSequence USING [RopePart, RopeSeq, ParsePartToSeq, Fetch],
+Sequences USING[CreateIndirectSequenceNode, CreateSequenceRecordType, IndirectSRProcs, SequenceTypeProcs],
+Symbols USING[CTXNull],
+TypeStrings,
+VariantRecords USING [CreateIndirectVariantRecordNode, CreateVariantRecordType, GetVRVariant, IndirectVRNodeProcs, VariantRecordTypeDetails, VariantRecordTypeDetailsRec];
+RMTWCompounds: CEDAR PROGRAM
+IMPORTS Arrays, Basics, CCTypes, CedarCode, CedarOtherPureTypes, CirioMemory, CirioTypes, IO, MobAccess, MobObjectFiles, MorePfsNames, RMTWPrivate, PFS, PFSNames, Records, Rope, RopeSequence, Sequences, VariantRecords
+EXPORTS RMTWPrivate
+SHARES Rope
+= BEGIN OPEN MA:MobAccess, MOF:MobObjectFiles, MPN:MorePfsNames, RS:RopeSequence, RMTWPrivate, TS:TypeStrings;
+
+Operator: TYPE = CedarCode.Operator;
+
+CNTD: TYPE = CedarNumericTypes.NumericDescriptor;
+
+CCE: ERROR[case: CCTypes.CCErrorCase, msg: Rope.ROPE ¬ NIL] ¬ CCTypes.CCError;
+
+
+TargetBitsPerWord: CARD = 32;
+TargetUnitFill: CARD = bitsPerAu-1;
+TargetBitsPerLongWord: CARD = 32;
+TargetPackedBitCount: TYPE = [1..TargetBitsPerLongWord];
+TargetPackedFieldSize: ARRAY TargetPackedBitCount OF NAT = [
+01, 02, 04, 04, 08, 08, 08, 08,
+16, 16, 16, 16, 16, 16, 16, 16,
+32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32];
+BasicArrayInfo: TYPE = REF BasicArrayInfoBody;
+BasicArrayInfoBody: TYPE = RECORD[
+nElements: CARD, -- LAST[CARD] for sequences
+entryType: Type,
+packed: BOOLEAN,
+bitSizeValid: BOOLEAN,  -- and pitch
+bitSize: CARD,
+elementSize: CARD,
+pitch: CARD];
+
+GetBasicArrayBitSize: PROC[basicInfo: BasicArrayInfo, rmtw: RemoteMimosaTargetWorld] RETURNS[CARD] = {
+IF NOT basicInfo.bitSizeValid THEN {
+indirectEntryType: Type ¬ CCTypes.GetIndirectType[basicInfo.entryType];
+bitsPerItem: CARD ¬ CCTypes.GetBitSize[indirectEntryType, rmtw.cc];
+mod: NAT ¬ Basics.LowHalf[bitsPerItem] MOD TargetBitsPerWord;
+pitch: CARD ¬ IF basicInfo.packed AND bitsPerItem # 0 AND bitsPerItem <= TargetPackedBitCount.LAST THEN TargetPackedFieldSize[bitsPerItem]
+ ELSE IF mod # 0 THEN (bitsPerItem+(TargetBitsPerWord-mod))
+ ELSE bitsPerItem;
+tentativeBodySize: CARD ¬ pitch*basicInfo.nElements;
+bodySize: CARD ¬
+IF basicInfo.nElements = LAST[CARD] THEN LAST[CARD]
+ELSE IF tentativeBodySize > bitsPerAu THEN
+((tentativeBodySize+TargetUnitFill)/bitsPerAu)*bitsPerAu
+ELSE tentativeBodySize;
+
+basicInfo.bitSize ¬ bodySize;
+basicInfo.elementSize ¬ bitsPerItem;
+basicInfo.pitch ¬ pitch;
+basicInfo.bitSizeValid ¬ TRUE;
+};
+RETURN[basicInfo.bitSize]};
+
+GetBasicArrayElementPitch: PROC[basicInfo: BasicArrayInfo, rmtw: RemoteMimosaTargetWorld] RETURNS[CARD] = {
+IF NOT basicInfo.bitSizeValid THEN [] ¬ GetBasicArrayBitSize[basicInfo, rmtw];
+RETURN[basicInfo.pitch]};
+
+SelectBasicArrayEntry: PROC[index, arrayBitOffset: INT, basicInfo: BasicArrayInfo, arrayMem: Mem, rmtw: RemoteMimosaTargetWorld] RETURNS[Node] = {
+pitch: INT ¬ GetBasicArrayElementPitch[basicInfo, rmtw];
+nominalBitOffset: INT ¬ arrayBitOffset + pitch*index;
+elementSize: INT ¬ basicInfo.elementSize; --legal because previous call to GetArrayElementPitch forced this value to be valid also.
+eltBS: BitStretch ¬ [
+start: CirioTypes.BitsToBa[nominalBitOffset + (pitch-elementSize)],
+size: CirioTypes.BitsToBa[elementSize] ];
+subMem: Mem ¬ arrayMem.MemSubfield[eltBS];
+indirectEltType: Type ¬ CCTypes.GetIndirectType[basicInfo.entryType];
+RETURN CCTypes.CreateIndirectNode[indirectEltType, subMem, rmtw.cc]};
+AnalyzedArraySEH: TYPE = REF AnalyzedArraySEHBody;
+AnalyzedArraySEHBody: TYPE = RECORD[
+rmtw: RemoteMimosaTargetWorld,
+indexType: Type,
+basicInfo: BasicArrayInfo,
+type: Type];
+
+AnalyzeArraySEH: PUBLIC PROC[seh: SEH, ser: SER, cons: REF cons MA.BodySE, ti: REF array MA.TypeInfoConsSE, rmtw: RemoteMimosaTargetWorld] RETURNS[Type] = {
+indexType: Type ¬ AnalyzeSEH[ti.indexType, rmtw, none];
+nElements: CARD;
+{nElements ¬ CCTypes.GetNElements[indexType, rmtw.cc !CCE => GOTO Blowit];
+{basicInfo: BasicArrayInfo ¬ NEW[BasicArrayInfoBody¬[
+nElements: nElements,
+entryType: AnalyzeSEH[ti.componentType, rmtw, none],
+packed: ti.packed,
+bitSizeValid: FALSE,
+bitSize: 0,
+elementSize: 0,
+pitch: 0]];
+private: AnalyzedArraySEH ¬ NEW[AnalyzedArraySEHBody¬[
+rmtw: rmtw,
+indexType: indexType,
+basicInfo: basicInfo,
+type: NIL]];
+private.type ¬ Arrays.CreateArrayType[private.indexType, RMTWArrayTypeProcs, rmtw.cc, private];
+RETURN[private.type]};
+EXITS Blowit => RETURN AnalyzedUnknownSEH[seh, rmtw, "an array whose index Type can't GetNElements", -1];
+}};
+
+AnalArrayTs: PUBLIC PROC [rmtw: RemoteMimosaTargetWorld, tsd: TsDict, i: INT, opts: TsOptions] RETURNS [Type, INT] ~ {
+i2, i3: INT;
+idxType, eltType: Type;
+nElements: CARD;
+[idxType, i2] ¬ AnalyzeTs[rmtw, tsd, i];
+[eltType, i3] ¬ AnalyzeTs[rmtw, tsd, i2];
+{nElements ¬ CCTypes.GetNElements[idxType, rmtw.cc !CCE => GOTO Blowit];
+{basicInfo: BasicArrayInfo ¬ NEW[BasicArrayInfoBody¬[
+nElements: nElements,
+entryType: eltType,
+packed: opts[packed],
+bitSizeValid: FALSE,
+bitSize: 0,
+elementSize: 0,
+pitch: 0]];
+private: AnalyzedArraySEH ¬ NEW[AnalyzedArraySEHBody¬[
+rmtw: rmtw,
+indexType: idxType,
+basicInfo: basicInfo,
+type: NIL]];
+private.type ¬ Arrays.CreateArrayType[private.indexType, RMTWArrayTypeProcs, rmtw.cc, private];
+RETURN[private.type, i3]};
+EXITS Blowit => RETURN [MakeBrokenType[rmtw, "an array whose index Type can't GetNElements", -1], i3];
+}};
+
+RMTWArrayTypeProcs: REF Arrays.ArrayTypeProcs ¬ NEW[Arrays.ArrayTypeProcs¬[
+createIndirectNode: ArrayCreateIndirect,
+getBitSize: ArrayBitSize,
+getEntryType: RMTWArrayGetEntryType]];
+
+ArrayBitSize: PROC[indirectType: Type, cc: CC, data: REF ANY] RETURNS[CARD] = {
+aa: AnalyzedArraySEH ¬ NARROW[data];
+IF aa.basicInfo.bitSizeValid THEN RETURN[aa.basicInfo.bitSize]
+ELSE {
+RETURN[GetBasicArrayBitSize[aa.basicInfo, aa.rmtw]]};
+};
+
+RMTWArrayGetEntryType: PROC[cc: CC, data: REF ANY] RETURNS[Type] = {
+aa: AnalyzedArraySEH ¬ NARROW[data];
+rmtw: RemoteMimosaTargetWorld ¬ aa.rmtw;
+RETURN[aa.basicInfo.entryType]};
+
+ArrayNodeData: TYPE = RECORD[
+aa: AnalyzedArraySEH,
+mem: Mem,
+indirectToArray: Node];
+
+ArrayCreateIndirect: PROC[cc: CC, data: REF ANY, indirectType, targetType: Type, mem: Mem] RETURNS [Node] = {
+aa: AnalyzedArraySEH ¬ NARROW[data];
+nodeData: REF ArrayNodeData ¬ NEW[ArrayNodeData ¬ [aa, mem, NIL]];
+info: Arrays.ArrayIndirectNodeInfo ¬ NEW[Arrays.ArrayIndirectNodeInfoBody ¬ [
+selectEntry: SelectArrayEntry,
+getPointer: GetArrayPointer,
+data: nodeData]];
+nodeData.indirectToArray ¬ Arrays.CreateArrayIndirectNode[indirectType, info];
+RETURN[nodeData.indirectToArray]};
+
+
+SelectArrayEntry: PROC[index: CARD, cc: CC, data: REF ANY] RETURNS[Node] = {
+nodeData: REF ArrayNodeData ¬ NARROW[data];
+rmtw: RemoteMimosaTargetWorld ¬ nodeData.aa.rmtw;
+[] ¬ RMTWArrayGetEntryType[cc, nodeData.aa];
+RETURN[SelectBasicArrayEntry[index, 0, nodeData.aa.basicInfo, nodeData.mem, rmtw]]};
+
+GetArrayPointer: PROC[data: REF ANY, cc: CC] RETURNS[Node] = {
+nodeData: REF ArrayNodeData ¬ NARROW[data];
+RETURN ConvertFromIndirectToPointer[nodeData.indirectToArray, nodeData.mem, nodeData.aa.rmtw]};
+
+AnalyzedSequenceSEHPrivate: TYPE = REF AnalyzedSequenceSEHPrivateBody;
+AnalyzedSequenceSEHPrivateBody: TYPE = RECORD[
+rmtw: RemoteMimosaTargetWorld,
+type: Type,
+preambleType: Type,
+tagIdSeh: REF id MA.BodySE,
+tagFD: REF MA.FieldDesc,
+arrayOffset: INT,
+tailTi: REF sequence MA.TypeInfoConsSE,
+packed: BOOLEAN,
+valid: BOOLEAN, -- following entries valid only when valid = TRUE
+tagType: Type,
+componentType: Type,
+basicInfo: BasicArrayInfo];
+AnalyzeSequenceSEH: PROC[preambleType: Type, tailName: Rope.ROPE, tailOffset: INT, tailSeh: SEH, tailSer: SER, tailCons: REF cons MA.BodySE, tailTi: REF sequence MA.TypeInfoConsSE, rmtw: RemoteMimosaTargetWorld] RETURNS[Type] = {
+basicInfo: BasicArrayInfo ¬ NEW[BasicArrayInfoBody¬[
+nElements: LAST[CARD],
+entryType: NIL, -- will be filled in by first call in RMTWGetEntryType
+packed: tailTi.packed,
+bitSizeValid: FALSE,
+bitSize: 0,
+elementSize: 0,
+pitch: 0]];
+private: AnalyzedSequenceSEHPrivate ¬ NEW[AnalyzedSequenceSEHPrivateBody¬[
+rmtw: rmtw,
+type: NIL,
+preambleType: preambleType,
+tagIdSeh: NIL,
+tagFD: NIL,
+arrayOffset: 0,
+tailTi: tailTi,
+packed: tailTi.packed,
+valid: FALSE,
+tagType: NIL,
+componentType: NIL, -- will be filled in by first call in RMTWGetEntryType
+basicInfo: basicInfo]];
+tagSer: SER ¬ MA.FetchSER[tailTi.tagSei];
+
+WITH tagSer.body SELECT FROM
+idTag: REF id MA.BodySE => -- we are expecting the tag to be an id sei
+BEGIN
+private.tagIdSeh ¬ idTag;
+WITH idTag.idInfoAndValue SELECT FROM
+fd: REF MA.FieldDesc => {private.tagFD ¬ fd};
+ENDCASE => CCE[cirioError];
+END;
+ENDCASE => CCE[cirioError];
+
+private.tagType ¬ AnalyzeSEH[private.tagIdSeh.idType, rmtw, none];
+private.arrayOffset ¬ tailOffset+private.tagFD.bitSize;
+private.type ¬ Sequences.CreateSequenceRecordType[preambleType, tailName, private.tagIdSeh.hash, private.tagType, RMTWSequenceTypeProcs, rmtw.cc, private];
+RETURN[private.type]};
+
+RMTWSequenceTypeProcs: REF Sequences.SequenceTypeProcs ¬ NEW[Sequences.SequenceTypeProcs ¬ [
+createIndirectNode: SequenceCreateIndirect,
+getBitSize: SequenceBitSize,
+getEntryType: RMTWGetEntryType,
+getNominalArrayType: RMTWGetNominalArrayType]];
+
+SequenceCreateIndirect: PROC [cc: CC, data: REF ANY, indirectType, targetType: Type, mem: Mem] RETURNS [Node] ~ {
+private: AnalyzedSequenceSEHPrivate ¬ NARROW[data];
+rmtw: RemoteMimosaTargetWorld ¬ private.rmtw;
+tagMem: Mem ¬ mem.MemSubfield[[CirioTypes.BitsToBa[private.tagFD.bitOffset], CirioTypes.BitsToBa[private.tagFD.bitSize]]];
+entryType: Type ¬ RMTWGetEntryType[rmtw.cc, private];
+tailBitSize: CARD ¬ GetBasicArrayBitSize[private.basicInfo, rmtw];
+nodeData: REF SequenceNodeData ¬ NEW[SequenceNodeData¬[private, mem, tagMem, NIL]];
+nodeData.indirectToSequence ¬ Sequences.CreateIndirectSequenceNode[targetType, IndirectSRProcs, nodeData, cc];
+RETURN[nodeData.indirectToSequence]};
+
+RMTWGetEntryType: PROC[cc: CC, data: REF ANY] RETURNS[Type] = {
+private: AnalyzedSequenceSEHPrivate ¬ NARROW[data];
+rmtw: RemoteMimosaTargetWorld ¬ private.rmtw;
+IF private.componentType = NIL THEN {
+private.componentType ¬ AnalyzeSEH[private.tailTi.componentType, rmtw, none];
+[] ¬ CCTypes.GetIndirectType[private.componentType]; --check
+private.basicInfo.entryType ¬ private.componentType};
+RETURN[private.basicInfo.entryType]};
+
+
+ 
+RMTWGetNominalArrayType: PROC[cc: CC, data: REF ANY] RETURNS[Type] = {
+private: AnalyzedSequenceSEHPrivate ¬ NARROW[data];
+RETURN[Arrays.CreateArrayType[private.tagType, NominalArrayTypeProcs, cc, private]]};
+
+NominalArrayTypeProcs: REF Arrays.ArrayTypeProcs ¬ NEW[Arrays.ArrayTypeProcs¬[
+getEntryType: RMTWGetEntryType]];
+
+
+SequenceBitSize: PROC[indirectType: Type, cc: CC, data: REF ANY] RETURNS[CARD]
+= {CCE[cirioError, "asking for size of a sequence TYPE"]};
+
+IndirectSRProcs: REF Sequences.IndirectSRProcs ¬ NEW[Sequences.IndirectSRProcs¬[
+selectPreamble: SequenceSelectPreamble,
+selectTag: SequenceSelectTag,
+selectTailEntry: SequenceSelectTailEntry,
+getPointer: SequenceGetPointer]];
+
+SequenceNodeData: TYPE = RECORD[
+private: AnalyzedSequenceSEHPrivate,
+mem, tagMem: Mem,
+indirectToSequence: Node];
+
+SequenceSelectPreamble: PROC[procsData: REF ANY, cc: CC] RETURNS[Node] = {
+nodeData: REF SequenceNodeData ¬ NARROW[procsData];
+RETURN CCTypes.GetIndirectCreateNode[nodeData.private.preambleType, nodeData.mem, cc]};
+
+SequenceSelectTag: PROC[procsData: REF ANY, cc: CC] RETURNS[Node] = {
+nodeData: REF SequenceNodeData ¬ NARROW[procsData];
+RETURN CCTypes.GetIndirectCreateNode[nodeData.private.tagType, nodeData.tagMem, cc]};
+
+SequenceSelectTailEntry: PROC[index: CARD, procsData: REF ANY, cc: CC] RETURNS[Node] = {
+nodeData: REF SequenceNodeData ¬ NARROW[procsData];
+rmtw: RemoteMimosaTargetWorld ¬ nodeData.private.rmtw;
+[] ¬ RMTWGetEntryType[cc, nodeData.private];
+RETURN[SelectBasicArrayEntry[index, nodeData.private.arrayOffset, nodeData.private.basicInfo, nodeData.mem, rmtw]]};
+
+SequenceGetPointer: PROC[data: REF ANY, cc: CC] RETURNS[Node] = {
+nodeData: REF SequenceNodeData ¬ NARROW[data];
+RETURN ConvertFromIndirectToPointer[nodeData.indirectToSequence, nodeData.mem, nodeData.private.rmtw]};
+
+AnalyzedVariantRecordSEHPrivate: TYPE = REF AnalyzedVariantRecordSEHPrivateBody;
+AnalyzedVariantRecordSEHPrivateBody: TYPE = RECORD[
+rmtw: RemoteMimosaTargetWorld,
+type: Type,
+preambleType: Type,
+tagIdSeh: REF id MA.BodySE,
+tagFD: REF MA.FieldDesc,
+startOffset: INT,
+tailOffset: INT,
+tailLength: INT,
+tailTi: REF union MA.TypeInfoConsSE,
+tagType: Type,
+nTailTypes: INT,
+tailTypes: AnalyzedCTX];
+AnalyzeVariantRecordSEH: PROC[preambleType: Type, tailName: Rope.ROPE, startOffset: INT, tailSeh: SEH, tailSer: SER, tailCons: REF cons MA.BodySE, tailTi: REF union MA.TypeInfoConsSE, vrLength: INT, rmtw: RemoteMimosaTargetWorld] RETURNS[Type] = {
+private: AnalyzedVariantRecordSEHPrivate ¬ NEW[AnalyzedVariantRecordSEHPrivateBody¬[
+rmtw: rmtw,
+type: NIL,
+preambleType: preambleType,
+tagIdSeh: NIL,
+tagFD: NIL,
+startOffset: 0,
+tailOffset: 0,
+tailLength: 0,
+tailTi: tailTi,
+tagType: NIL,
+nTailTypes: 0,
+tailTypes: AnalyzeCTX[tailTi.caseCtx, NIL, TRUE, FALSE, FALSE, FALSE, TRUE, FALSE, TRUE, rmtw, unspecdBA, NIL].ctxInfo --we can give an incorrect bitSize because we're not going to use it later.
+]];
+
+tagSer: SER ¬ MA.FetchSER[tailTi.tagSei];
+WITH tagSer.body SELECT FROM
+idTag: REF id MA.BodySE => -- we are expecting the tag to be an id sei
+BEGIN
+private.tagIdSeh ¬ idTag;
+WITH idTag.idInfoAndValue SELECT FROM
+fd: REF MA.FieldDesc => {private.tagFD ¬ fd};
+ENDCASE => CCE[cirioError];
+END;
+ENDCASE => CCE[cirioError];
+
+private.tagType ¬ AnalyzeSEH[private.tagIdSeh.idType, rmtw, none];
+private.startOffset ¬ startOffset;
+private.tailOffset ¬  private.tagFD.bitOffset + private.tagFD.bitSize - startOffset;
+private.tailLength ¬ vrLength - (private.tagFD.bitOffset + private.tagFD.bitSize);
+private.nTailTypes ¬ CCTypes.GetNElements[private.tagType, rmtw.cc];
+private.type ¬ VariantRecords.CreateVariantRecordType[preambleType, tailName, private.tagIdSeh.hash, private.tagType, private.nTailTypes, tailTi.controlled, vrTypeDetails, rmtw.cc, private];
+
+RETURN[private.type]};
+
+vrTypeDetails: VariantRecords.VariantRecordTypeDetails ¬ NEW [VariantRecords.VariantRecordTypeDetailsRec ¬ [VariantRecordCreateIndirect, VariantRecordBitSize, GetVariantRecordTailInfo]];
+
+GetVariantRecordTailInfo: PROC [index: INT, procData: REF ANY] RETURNS [Type] = {
+private: AnalyzedVariantRecordSEHPrivate ¬ NARROW[procData];
+rmtw: RemoteMimosaTargetWorld ¬ private.rmtw;
+enumType: Type ¬ private.tagType;
+variantName: Rope.ROPE ¬ EnumeratedTypeIndexToName[enumType, index, rmtw.cc];
+FOR variants: LIST OF FieldInfo ¬ private.tailTypes.typeFields, variants.rest WHILE variants # NIL DO
+IF Rope.Equal[variantName, variants.first.name] THEN
+RETURN[variants.first.unionAnalysis];
+ENDLOOP;
+RETURN [NIL]};
+
+VariantRecordBitSize: PROC[indirectType: Type, cc: CC, procData: REF ANY] RETURNS[CARD] = {
+private: AnalyzedVariantRecordSEHPrivate ¬ NARROW[procData];
+RETURN[private.tailOffset+private.tailLength]};
+
+VariantRecordCreateIndirect: PROC[cc: CC, procData: REF ANY, indirectType, targetType: Type, mem: Mem] RETURNS[Node] = {
+private: AnalyzedVariantRecordSEHPrivate ¬ NARROW[procData];
+tagMem: Mem ¬ IF private.tailTi.controlled THEN mem.MemSubfield[[CirioTypes.BitsToBa[private.tagFD.bitOffset], CirioTypes.BitsToBa[private.tagFD.bitSize]]] ELSE noMem;
+nodeData: REF VariantRecordNodeData ¬ NEW[VariantRecordNodeData¬[
+private,
+mem, tagMem,
+NIL]];
+nodeData.indirectToVariantRecord ¬ VariantRecords.CreateIndirectVariantRecordNode[private.type, IndirectVRProcs, nodeData, cc];
+RETURN[nodeData.indirectToVariantRecord]};
+
+IndirectVRProcs: REF VariantRecords.IndirectVRNodeProcs ¬ NEW[VariantRecords.IndirectVRNodeProcs¬[
+selectPreamble: VariantRecordSelectPreamble,
+readVariantIndex: VariantRecordReadVariantIndex,
+selectTag: VariantRecordSelectTag,
+selectTailBody: VariantRecordSelectTailBody,
+getPointer: VariantRecordGetPointer]];
+
+VariantRecordNodeData: TYPE = RECORD[
+private: AnalyzedVariantRecordSEHPrivate,
+mem, tagMem: Mem,
+indirectToVariantRecord: Node];
+
+VariantRecordSelectPreamble: PROC[procsData: REF ANY, cc: CC] RETURNS[Node] = {
+nodeData: REF VariantRecordNodeData ¬ NARROW[procsData];
+RETURN CCTypes.GetIndirectCreateNode[nodeData.private.preambleType, nodeData.mem, cc]};
+
+VariantRecordReadVariantIndex: PROC[procsData: REF ANY, cc: CC] RETURNS[INT] = {
+tagIndirectNode: Node ¬ VariantRecordSelectTag[procsData, cc];
+tagEnumNode: Node ¬ CedarCode.LoadThroughIndirectNode[CedarCode.GetTypeOfNode[tagIndirectNode], tagIndirectNode, cc];
+tagIndex: CARD ¬ CedarCode.NodeAsIndex[CedarCode.GetTypeOfNode[tagEnumNode], tagEnumNode, cc];
+RETURN [tagIndex]};
+
+VariantRecordSelectTag: PROC[procsData: REF ANY, cc: CC] RETURNS[Node] = {
+nodeData: REF VariantRecordNodeData ¬ NARROW[procsData];
+RETURN CCTypes.GetIndirectCreateNode[nodeData.private.tagType, nodeData.tagMem, cc]};
+
+VariantRecordSelectTailBody: PROC[procsData: REF ANY, cc: CC] RETURNS[Node] = {
+nodeData: REF VariantRecordNodeData ¬ NARROW[procsData];
+index: INT ¬ VariantRecordReadVariantIndex[procsData, cc];
+tail: Type ¬ GetVariantRecordTailInfo[index, nodeData.private];
+RETURN CCTypes.GetIndirectCreateNode[tail, nodeData.mem, cc]};
+
+VariantRecordGetPointer: PROC[procsData: REF ANY, cc: CC] RETURNS[Node] =
+{ 
+nodeData: REF VariantRecordNodeData ¬ NARROW[procsData];
+RETURN ConvertFromIndirectToPointer[nodeData.indirectToVariantRecord, nodeData.mem, nodeData.private.rmtw]};
+
+
+
+
+AnalyzeUnionRecordSEH: PROC [seh: SEH, rmtw: RemoteMimosaTargetWorld] RETURNS [Type] = {
+ser: MA.SER ¬ MA.FetchSER[seh];
+WITH ser.body SELECT FROM
+id: REF id MA.BodySE => WITH id.idInfoAndValue SELECT FROM
+idInfo: REF MobAccess.TypeDesc => {
+ser: MA.SER ¬ MA.FetchSER[idInfo.seh];
+WITH ser.body SELECT FROM
+cons: REF cons MA.BodySE =>
+WITH cons.typeInfo SELECT FROM
+ti: REF record MA.TypeInfoConsSE => 
+RETURN [AnalyzeCTX[ti.fieldCtx, NIL, ti.painted, FALSE, FALSE, TRUE, FALSE, FALSE, TRUE, rmtw, CirioTypes.BitsToBa[ti.length], NIL].recType];
+ENDCASE => CCE[cirioError, "AnalyzeUnionRecordSEH 4"];
+ENDCASE => CCE[cirioError, "AnalyzeUnionRecordSEH 3"];
+};
+ENDCASE => CCE[cirioError, "AnalyzeUnionRecordSEH 2"];
+ENDCASE => CCE[cirioError, "AnalyzeUnionRecordSEH 1"];
+};
+AnalyzeRecordSEH: PUBLIC PROC[seh: SEH, ser: SER, cons: REF cons MA.BodySE, ti: REF record MA.TypeInfoConsSE, rmtw: RemoteMimosaTargetWorld, isRopeRep: BOOL] RETURNS[Type] = {
+ctxInfo: AnalyzedCTX;
+IF ti#NIL THEN {
+<<IF ti.linkPart # NIL THEN  {
+vrSeh: SEH ¬ FollowLinksToTopVariantRecord[ti.linkPart, rmtw];
+RETURN AnalyzeSEH[vrSeh, rmtw, IF isRopeRep THEN RopeRep ELSE none]};>>
+
+RETURN [AnalyzeCTX[ti.fieldCtx, IF ti.linkPart#NIL THEN seh ELSE NIL, ti.painted, (NOT ti.packed) AND ti.argument, FALSE--this is only reached when analyzing types for procedures-as-data - frames analyze their args and results in RMTWFrames by calling AnalyzeCTX directly--, TRUE, FALSE, FALSE, TRUE, rmtw, CirioTypes.BitsToBa[ti.length], NIL].recType];
+}
+ELSE RETURN [AnalyzeCTX[NIL, NIL, FALSE, FALSE, FALSE, TRUE, FALSE, FALSE, TRUE, rmtw, zeroBA, NIL].recType]};
+
+FollowLinksToTopVariantRecord: PROC [seh: SEH, rmtw: RemoteMimosaTargetWorld] RETURNS [SEH] = {
+ser: MA.SER ¬ MA.FetchSER[seh];
+WITH ser.body SELECT FROM
+id: REF id MA.BodySE => WITH id.idInfoAndValue SELECT FROM
+idInfo: REF MobAccess.TypeDesc =>
+BEGIN
+ser: MA.SER ¬ MA.FetchSER[idInfo.seh];
+WITH ser.body SELECT FROM
+cons: REF cons MA.BodySE =>
+WITH cons.typeInfo SELECT FROM
+ti: REF record MA.TypeInfoConsSE =>
+BEGIN
+IF ti.linkPart # NIL THEN
+RETURN FollowLinksToTopVariantRecord[ti.linkPart, rmtw]
+ELSE RETURN [idInfo.seh];
+END;
+ENDCASE => CCE[cirioError, "FollowLinksToTopVariantRecord 4"];
+ENDCASE => CCE[cirioError, "FollowLinksToTopVariantRecord 3"];
+END;
+ENDCASE => CCE[cirioError, "FollowLinksToTopVariantRecord 2"];
+ENDCASE => CCE[cirioError, "FollowLinksToTopVariantRecord 1"];
+};
+
+RecordNode: TYPE ~ REF RecordNodeData;
+RecordNodeData: TYPE = RECORD[
+ac: AnalyzedCTX,
+targetType: Type,
+mem: Mem,
+indirectToRecord: Node];
+
+RecordFetchFieldLoc: PROC[ctxInfo: AnalyzedCTX, index: CARD] RETURNS[REF BitStretch] = {
+fieldLoc: REF BitStretch ¬ ctxInfo.fields[index].fieldLoc;
+RETURN[fieldLoc]};
+
+PrefillAndCorrectFieldLocs: PROC[ctxInfo: AnalyzedCTX] =
+BEGIN
+runningBitOffset: INT ¬ 0;
+FOR index: CARD IN [0..ctxInfo.nFields) DO
+fieldLoc: REF BitStretch ¬ RecordFetchFieldLoc[ctxInfo, index];
+IF fieldLoc # NIL THEN
+BEGIN -- here is where we check, then fix if necessary
+bitSize: INT ~ fieldLoc.size.BaToBits[];
+BitsPerWord: INT = 32;
+BitsPerByte: INT = 8;
+BytesPerWord: INT = 4;
+neededFillBits: INT ¬ BitsPerWord.PRED - ((bitSize+BitsPerWord.PRED) MOD BitsPerWord);
+expectedTotalBitOffset: INT ¬ runningBitOffset + (IF bitSize<BitsPerWord THEN neededFillBits ELSE 0); --pad small fields left, large fields right
+foundTotalBitOffset: INT ¬ fieldLoc.start.BaToBits[];
+IF expectedTotalBitOffset # foundTotalBitOffset THEN -- fix up
+fieldLoc.start ¬ CirioTypes.BitsToBa[expectedTotalBitOffset];
+runningBitOffset ¬ runningBitOffset + neededFillBits + bitSize;
+IF runningBitOffset MOD BitsPerWord # 0 THEN ERROR;
+END;
+ENDLOOP;
+END;
+
+
+RecordProcs: REF Records.IndirectRecordNodeProcs ¬ NEW[Records.IndirectRecordNodeProcs¬[
+selectField: RecordSelectField,
+fieldIndexToNodeTimeConstantValue: RecordIndexToNTConstant,
+getPointer: RecordGetPointer]];
+
+
+RecordSelectField: PROC[index: INT, indirectFieldType: Type, data: REF ANY, cc: CC] RETURNS[Node] = {
+nodeData: RecordNode ¬ NARROW[data];
+ctxInfo: AnalyzedCTX ¬ nodeData.ac;
+rmtw: RemoteMimosaTargetWorld ¬ ctxInfo.rmtw;
+mem: Mem ¬ nodeData.mem;
+fieldDirectType: Type ¬ ctxInfo.fields[index].fieldDirectType;
+subMem: Mem ¬ noMem;
+
+IF NOT ctxInfo.fields[index].analysisValid THEN CCE[cirioError];
+
+IF ctxInfo.blockRecord THEN {
+whyNot: ROPE ¬ NIL;
+fieldSize: CARD ¬ 32;
+fieldSize ¬ CCTypes.GetBitSize[indirectFieldType, cc !CCE => CONTINUE];
+IF ctxInfo.fields[index].varLoc=NIL THEN RETURN UnimplementedTypeNode[fieldDirectType, rmtw, IO.PutFR1["block record field (index %g) with NIL location", [integer[index]] ]];
+WITH ctxInfo.fields[index].varLoc SELECT FROM
+u: REF unknown MOF.VarLocBody => RETURN UnimplementedTypeNode[fieldDirectType, rmtw, IO.PutFR["block record field (index %g) with unknown location (because %g)", [integer[index]], [rope[u.why]] ]];
+ENDCASE => NULL;
+subMem ¬ SelectVarLoc[rmtw.nub, mem, ctxInfo.fields[index].varLoc !CCE => {whyNot ¬ msg; CONTINUE}];
+IF subMem=noMem THEN RETURN UnimplementedTypeNode[fieldDirectType, rmtw, IO.PutFR["block record field (index %g) at broken location (because %g)", [integer[index]], [rope[whyNot]] ]];
+IF fieldSize=32 OR NOT richtigSelect THEN NULL
+ELSE IF fieldSize<32 THEN subMem ¬ subMem.MemSubfield[[start: CirioTypes.BitsToBa[32-fieldSize], size: CirioTypes.BitsToBa[fieldSize]]]
+ELSE NULL--padded on right, indirect taken care of--;
+RETURN CCTypes.CreateIndirectNode[indirectFieldType, subMem, rmtw.cc]}
+ELSE {
+fieldLoc: REF BitStretch ¬ RecordFetchFieldLoc[ctxInfo, index];
+IF fieldLoc = NIL THEN -- unknownOrUnimplementedField
+RETURN UnimplementedTypeNode[fieldDirectType, rmtw, IO.PutFR1["ordinary record field (index %g) with unknown location", [integer[index]] ]];
+subMem ¬ mem.MemSubfield[fieldLoc­];
+RETURN CCTypes.CreateIndirectNode[indirectFieldType, subMem, rmtw.cc]};
+};
+richtigSelect: BOOL ¬ TRUE;
+
+RecordIndexToNTConstant: PROC[index: INT, fieldType: Type, data: REF ANY, cc: CC] RETURNS[Node] ~ {
+nodeData: RecordNode ~ NARROW[data];
+ctxInfo: AnalyzedCTX ~ nodeData.ac;
+rmtw: RemoteMimosaTargetWorld ~ ctxInfo.rmtw;
+mem: Mem ~ nodeData.mem;
+mcr: MobCtxRep ~ WITH ctxInfo.repData SELECT FROM
+x: MobCtxRep => x,
+ENDCASE => CCE[cirioError, "RecordIndexToNTConstant applied to non-mob context"];
+mfr: MobFieldRep ~ WITH ctxInfo[index].repData SELECT FROM
+x: MobFieldRep => x,
+ENDCASE => CCE[cirioError, "RecordIndexToNTConstant applied to non-mob context field"];
+procId: REF id MA.BodySE ~ mfr.serBody;
+procBd: REF MA.BlockDesc ~ WITH procId.idInfoAndValue SELECT FROM
+x: REF MA.BlockDesc => x,
+ENDCASE => CCE[cirioError, "encountered node-time constant whose idInfoAndValue isn't a MA.BlockDesc"];
+textBS: BitStretch ~ mem.MemReadSegReg["text", 0];
+IF textBS.start.bits#0 THEN CCE[cirioError, "non-AU-aligned text segment found"];
+IF NOT ctxInfo.fields[index].analysisValid THEN CCE[cirioError, "accessing non-valid ctxInfo field"];
+IF ctxInfo.blockRecord AND procBd.bth # NIL THEN {
+feSEH: SEH ~ MOF.GetLocalFrameExtensionVar[mcr.bth, mcr.jmpi];
+feSER: REF id MA.BodySE ~ NARROW[MA.FetchSER[feSEH].body];
+feFD: REF MA.FieldDesc ~ NARROW[feSER.idInfoAndValue];
+feVL: MOF.VarLoc ~ NEW [MOF.VarLocBody ¬ [
+bitSize: feFD.bitSize,
+where: frameExtension[0] ]];
+feMem: Mem ¬ noMem;
+whyNot: ROPE ¬ NIL;
+feMem ¬ SelectVarLoc[rmtw.nub, mem, feVL !CCE => {whyNot ¬ msg; CONTINUE}];
+IF feMem=noMem THEN RETURN UnimplementedTypeNode[fieldType, rmtw, IO.PutFR["a block record's node-time constant field (index %g) at broken location (because %g)", [integer[index]], [rope[whyNot]] ]];
+RETURN CreateProcConstant[rmtw, mcr.jmpi, feMem, textBS.start.BaToPtr, procBd.bth]}
+ELSE {
+RETURN CreateProcConstant[rmtw, mcr.jmpi, mem, textBS.start.BaToPtr, procBd.bth]}};
+
+RecordGetPointer: PROC[data: REF ANY, cc: CC] RETURNS[Node] = {
+nodeData: RecordNode ¬ NARROW[data];
+IF nodeData.ac.blockRecord THEN CCE[cirioError, "trying to extract pointer to a block record"];
+RETURN ConvertFromIndirectToPointer[nodeData.indirectToRecord, nodeData.mem, nodeData.ac.rmtw]};
+
+GenRecordFields: PUBLIC PROC[type: Type, cc: CC, nFields: PROC[CARD], eachField: PROC[index: CARD, byteOffset: INT, bitOffset: INT, bitSize: CARD] ] =
+BEGIN
+typeRep: REF ANY ¬ CCTypes.GetTypeRepresentation[type, cc];
+ctxInfo: AnalyzedCTX ¬ NARROW[typeRep];
+nFields[ctxInfo.nFields];
+FOR I: CARD IN [0..ctxInfo.nFields) DO
+fieldLoc: REF BitStretch ¬ RecordFetchFieldLoc[ctxInfo, I];
+IF fieldLoc = NIL THEN CCE[cirioError, "formal procedure parameter is of an unknown type"];
+eachField[I, fieldLoc.start.aus, fieldLoc.start.bits, fieldLoc.size.BaToBits[] ];
+ENDLOOP;
+END;
+
+
+GetChar: PROC [ts: ROPE, i: INT] RETURNS [c: CHAR] ~ {
+WITH ts SELECT FROM
+text: Rope.Text => IF i IN [0..text.length) THEN RETURN [text[i]];
+ENDCASE => IF i IN [0..Rope.Length[ts]) THEN RETURN [Rope.Fetch[ts, i]]; 
+ERROR CCE[cirioError, "ran off end of typestring"];
+};
+
+GetName: PROC [ts: ROPE, i: INT] RETURNS [name: ROPE, j: INT] ~ {
+len: INT ~ GetChar[ts, i].ORD;
+GenChar: PROC RETURNS [CHAR] ~ {j ¬ j.SUCC; RETURN [GetChar[ts, j]]};
+IF len=0 THEN RETURN ["null name", i.SUCC];
+IF len >= 200B THEN CCE[cirioError, "implausible name in typestring"];
+j ¬ i;
+name ¬ Rope.FromProc[len, GenChar];
+j ¬ j.SUCC;
+IF name.Fetch[0].ORD = len-1 THEN name ¬ name.Substr[start: 1];
+};
+
+AnalyzeTsRecord: PUBLIC PROC [rmtw: RemoteMimosaTargetWorld, tsd: TsDict, i: INT] RETURNS [Type, INT] ~ {
+fieldFis: FiHt ¬ [];
+fieldStart, fieldSize: BitAddr ¬ zeroBA;
+ctxInfo: AnalyzedCTX;
+WHILE GetChar[tsd.ts, i].ORD # TS.Code.rightParen.ORD DO
+name: ROPE;
+type, indType: Type;
+i2, i3: INT;
+bits: CARD ¬ 32;
+[name, i2] ¬ GetName[tsd.ts, i];
+[type, i3] ¬ AnalyzeTs[rmtw, tsd, i2];
+indType ¬ CCTypes.GetIndirectType[type];
+bits ¬ CCTypes.GetBitSize[indType, rmtw.cc];
+bits ¬ ((bits+31)/32)*32;
+fieldSize ¬ CirioMemory.BitsToBa[bits];
+fieldFis ¬ FilAppend[fieldFis, LIST[[
+name: name,
+rmtw: rmtw,
+fieldCase: nodeTimeReadWrite,
+analysisValid: TRUE,
+fieldDirectType: type,
+fieldLoc: NEW [BitStretch ¬ [fieldStart, fieldSize]]
+]]];
+i ¬ i3;
+fieldStart ¬ fieldStart.BaAdd[fieldSize];
+ENDLOOP;
+ctxInfo ¬ NEW[AnalyzedCTXBody[fieldFis.n]];
+FOR cell: RECORD[I: CARDINAL, fields: LIST OF FieldInfo] ¬ [0, fieldFis.head], [cell.I+1, cell.fields.rest] WHILE cell.fields # NIL DO
+ctxInfo.fields[cell.I] ¬ cell.fields.first;
+ENDLOOP;
+ctxInfo.painted ¬ FALSE;
+ctxInfo.blockRecord ¬ FALSE;
+ctxInfo.hasNtConst ¬ FALSE;
+ctxInfo.recordType ¬ Records.CreateRecordType[CTXRecordTypeProcs, rmtw.cc, ctxInfo];
+ctxInfo.fieldListType ¬ Records.CreateFieldListType[CTXFieldTypeProcs, rmtw.cc, ctxInfo];
+ctxInfo.ampersandFields ¬ NIL;
+ctxInfo.typeFields ¬ NIL;
+ctxInfo.rmtw ¬ rmtw;
+ctxInfo.bitSize ¬ fieldStart;
+ctxInfo.repData ¬ NIL;
+RETURN [ctxInfo.recordType, i.SUCC]};
+
+AnalyzeCTX: PUBLIC PROC[ctxh: CTXH, bindSeh: SEH, painted, unpackedArgResultRecord, blockRecord, maybeVariant, variantCases, isHelper, defer: BOOL, rmtw: RemoteMimosaTargetWorld, bitSize: BitAddr, jmpi: MOF.JointMobParsedInfo ¬ NIL, bth: MA.BTH ¬ NIL] RETURNS[ctxInfo: AnalyzedCTX, recType: Type] = {
+mob: MA.MobCookie;
+ctxr: CTXR;
+fieldFis: FiHt ¬ [];
+amperFis: FiHt ¬ [];
+typeFis: FiHt ¬ [];
+hasNtConst, isVnt, isSeq: BOOL ¬ FALSE;
+fieldSeh, nextSeh, fieldTypeSeh: SEH;
+fieldIdBody: REF id MobAccess.BodySE;
+fieldSer, fieldTypeSer: SER;
+fieldCons: REF cons MA.BodySE ¬ NIL;
+startOffset, tailOffset, tailSize: INT ¬ 0;
+
+IF blockRecord AND bth=NIL THEN CCE[cirioError, "some fool is trying to analyze a block record type without giving the BTH"];
+IF ctxh = NIL THEN {-- ctxh is NIL, special case for arg/result records in procedure frames
+IF bindSeh#NIL THEN CCE[cirioError, "can't bind a NIL context"];
+ctxInfo ¬ NEW[AnalyzedCTXBody[0]];
+ctxInfo.painted ¬ painted;
+ctxInfo.blockRecord ¬ blockRecord;
+ctxInfo.hasNtConst ¬ FALSE;
+ctxInfo.recordType ¬ Records.CreateRecordType[CTXRecordTypeProcs, rmtw.cc, ctxInfo];
+ctxInfo.fieldListType ¬ Records.CreateFieldListType[CTXFieldTypeProcs, rmtw.cc, ctxInfo];
+ctxInfo.ampersandFields ¬ NIL;
+ctxInfo.typeFields ¬ NIL;
+ctxInfo.rmtw ¬ rmtw;
+ctxInfo.bitSize ¬ bitSize;
+ctxInfo.AnalyzeField ¬ AnalyzeMobField;
+ctxInfo.repData ¬ NEW [MobCtxRepPrivate ¬ [mob, jmpi, bth]];
+RETURN[ctxInfo, ctxInfo.recordType]};
+mob ¬ MA.GetMobForCTXH[ctxh];
+[ctxh, ctxr] ¬ GetCompleteContext[ctxh, rmtw];
+
+FOR fieldSeh ¬ ctxr.seList, nextSeh WHILE fieldSeh#NIL DO
+fieldSer ¬ MA.FetchSER[fieldSeh];
+WITH fieldSer.body SELECT FROM
+id: REF id MA.BodySE => {
+thisFil: LIST OF FieldInfo;
+sk: SehKnowledge ¬ SELECT TRUE FROM
+NOT isHelper => none,
+id.hash.Equal["aRope"] => ROPE,
+id.hash.Equal["aText"] => ROPE,
+id.hash.Equal["anAtom"] => ATOM,
+ENDCASE => none;
+nextSeh ¬ id.ctxLink;
+IF id.idCtx # ctxh THEN LOOP -- not visible--;
+fieldIdBody ¬ id;
+fieldTypeSeh ¬ id.idType;
+fieldTypeSer ¬ MA.FetchSER[fieldTypeSeh];
+thisFil ¬ LIST[[
+name: id.hash,
+fieldCase: nodeTimeReadWrite,
+repData: NEW[MobFieldRepPrivate ¬ [fieldSeh, fieldSer, id, sk]]
+]];
+WITH id.idInfoAndValue SELECT FROM
+x: REF MA.FieldDesc => thisFil.first.fieldCase ¬ IF id.immutable THEN nodeTimeReadOnly ELSE nodeTimeReadWrite;
+x: REF MA.TypeDesc => thisFil.first.fieldCase ¬ typeTimeConstant;
+x: REF MA.BlockDesc => thisFil.first.fieldCase ¬ nodeTimeConstant;
+x: REF MA.ConstVal => thisFil.first.fieldCase ¬ typeTimeConstant;
+ENDCASE => thisFil.first.fieldCase ¬ nodeTimeReadWrite;
+IF IsATypeDecl[fieldTypeSer] THEN {
+thisFil.first.fieldCase ¬ typeTimeConstant;
+typeFis ¬ FilAppend[typeFis, thisFil];
+IF variantCases THEN thisFil.first.unionAnalysis ¬ AnalyzeUnionRecordSEH[fieldSeh, rmtw];
+}
+ELSE IF Rope.Length[id.hash] > 0 AND Rope.Fetch[id.hash, 0] = '& THEN {
+amperFis ¬ FilAppend[amperFis, thisFil];
+}
+ELSE {
+fieldFis ¬ FilAppend[fieldFis, thisFil];
+hasNtConst ¬ hasNtConst OR thisFil.first.fieldCase=nodeTimeConstant;
+WITH id.idInfoAndValue SELECT FROM
+x: REF MA.FieldDesc => {
+tailOffset ¬ x.bitOffset;
+tailSize ¬ x.bitSize;
+IF fieldFis.head=NIL THEN startOffset ¬ tailOffset};
+ENDCASE => NULL;
+WITH fieldTypeSer.body SELECT FROM
+fc: REF cons MA.BodySE => {
+fieldCons ¬ fc;
+WITH fc.typeInfo SELECT FROM
+seqTi: REF sequence MA.TypeInfoConsSE => {
+IF nextSeh#NIL OR NOT maybeVariant THEN CCE[cirioError, "sequence found in implausible place"];
+isSeq ¬ TRUE;
+GOTO NoDetails};
+unTi: REF union MA.TypeInfoConsSE => {
+IF nextSeh#NIL OR NOT maybeVariant THEN CCE[cirioError, "union found in implausible place"];
+isVnt ¬ TRUE;
+GOTO NoDetails};
+ENDCASE => NULL};
+ENDCASE => NULL;
+IF defer THEN {
+thisFil.first.fieldDirectType ¬ NIL;
+thisFil.first.analysisValid ¬ FALSE}
+ELSE {
+thisFil.first.fieldDirectType ¬ AnalyzeSEH[id.idType, rmtw, sk];
+thisFil.first.analysisValid ¬ TRUE};
+IF blockRecord THEN thisFil.first.varLoc ¬ MOF.GetVarLoc[fieldSeh, bth, jmpi]
+ELSE IF id.idInfoAndValue=NIL THEN
+thisFil.first.fieldLoc ¬ NIL
+ELSE WITH id.idInfoAndValue SELECT FROM
+fd: REF MA.FieldDesc => {
+thisFil.first.fieldLoc ¬ NEW[BitStretch ¬ [
+start: CirioTypes.BitsToBa[fd.bitOffset],
+size: CirioTypes.BitsToBa[fd.bitSize] ]]
+};
+ENDCASE =>  thisFil.first.fieldLoc ¬ NIL;
+EXITS NoDetails => thisFil.first.analysisValid ¬ FALSE;
+};
+};
+ENDCASE => CCE[cirioError, "found non-id SE in a Context"];
+ENDLOOP;
+
+{
+ctxInfo ¬ NEW[AnalyzedCTXBody[fieldFis.n]];
+FOR cell: RECORD[I: CARDINAL, fields: LIST OF FieldInfo] ¬ [0, fieldFis.head], [cell.I+1, cell.fields.rest] WHILE cell.fields # NIL DO
+ctxInfo.fields[cell.I] ¬ cell.fields.first;
+ENDLOOP;
+ctxInfo.painted ¬ painted;
+ctxInfo.blockRecord ¬ blockRecord;
+ctxInfo.hasNtConst ¬ hasNtConst;
+ctxInfo.recordType ¬ Records.CreateRecordType[CTXRecordTypeProcs, rmtw.cc, ctxInfo];
+ctxInfo.fieldListType ¬ Records.CreateFieldListType[CTXFieldTypeProcs, rmtw.cc, ctxInfo];
+ctxInfo.ampersandFields ¬ amperFis.head;
+ctxInfo.typeFields ¬ typeFis.head;
+ctxInfo.rmtw ¬ rmtw;
+ctxInfo.bitSize ¬ IF bitSize#unspecdBA THEN bitSize ELSE CirioMemory.BitsToBa[tailOffset+tailSize];
+ctxInfo.AnalyzeField ¬ AnalyzeMobField;
+ctxInfo.repData ¬ NEW [MobCtxRepPrivate ¬ [mob, jmpi, bth]];
+IF unpackedArgResultRecord THEN PrefillAndCorrectFieldLocs[ctxInfo];
+IF isSeq THEN RETURN [NIL, AnalyzeSequenceSEH[ctxInfo.fieldListType, fieldIdBody.hash, tailOffset, fieldTypeSeh, fieldTypeSer, fieldCons, NARROW[fieldCons.typeInfo], rmtw]];
+IF isVnt THEN {
+t: Type ¬ AnalyzeVariantRecordSEH[ctxInfo.fieldListType, fieldIdBody.hash, startOffset, fieldTypeSeh, fieldTypeSer, fieldCons, NARROW[fieldCons.typeInfo], ctxInfo.bitSize.BaToBits[], rmtw];
+IF bindSeh#NIL THEN {
+idx: INT ¬ FindVntIdx[NARROW[fieldCons.typeInfo], bindSeh];
+IF idx>=0 THEN t ¬ VariantRecords.GetVRVariant[t, idx, rmtw.cc]};
+RETURN [NIL, t]};
+RETURN[ctxInfo, ctxInfo.recordType]}
+};
+
+FindVntIdx: PROC [uni: REF union MA.TypeInfoConsSE, bindSeh: SEH] RETURNS [INT] ~ {
+caseCtxr: CTXR ¬ MA.FetchCTXR[uni.caseCtx];
+idSeh: SEH ¬ caseCtxr.seList;
+WHILE idSeh#NIL DO
+idSer: SER ¬ MA.FetchSER[idSeh];
+WITH idSer.body SELECT FROM
+x: REF id MA.BodySE => {
+WITH x.idInfoAndValue SELECT FROM
+td: REF MA.TypeDesc => IF td.seh = bindSeh
+THEN RETURN [td.data];
+ENDCASE => CCE[cirioError, "found non-TYPE variant record case"];
+idSeh ¬ x.ctxLink};
+ENDCASE => CCE[cirioError, "found non-id variant record case"];
+ENDLOOP;
+RETURN[-1]};
+
+FiList: TYPE ~ LIST OF FieldInfo;
+FiHt: TYPE ~ RECORD [head, tail: FiList ¬ NIL, n: INT ¬ 0];
+
+FilAppend: PROC [fl: FiHt, elt: FiList] RETURNS [FiHt] ~ {
+IF fl.tail=NIL THEN fl.head ¬ elt ELSE fl.tail.rest ¬ elt;
+fl.tail ¬ elt; fl.n ¬ fl.n+1; RETURN [fl]};
+
+AnalyzeMobField: PROC [ctxInfo: AnalyzedCTX, index: CARDINAL, fi: FieldInfo] RETURNS [FieldInfo] ~ {
+fieldTypeSeh: SEH ¬ fi.repData.serBody.idType;
+fi.fieldDirectType ¬ AnalyzeSEH[fieldTypeSeh, ctxInfo.rmtw, fi.repData.sk];
+fi.analysisValid ¬ TRUE;
+RETURN [fi]};
+
+GetCompleteContext: PUBLIC PROC[ctxh: CTXH, rmtw: RemoteMimosaTargetWorld] RETURNS[CTXH, CTXR] =
+BEGIN
+ctxr: MA.CTXR ¬ MA.FetchCTXR[ctxh];
+DO
+WITH ctxr SELECT FROM
+x: MA.IncludedCTXR => IF x.seList=NIL OR NOT x.complete THEN {
+mdr: MA.MDR ~ MA.FetchMDR[x.module];
+mobFrom: MA.MobCookie ~ GetDefinitionMob[rmtw.cedarModules, mdr.stamp, MPN.Cons1[MPN.ConsComponent[StemPart[PFS.PathFromRope[mdr.fileId]]]] ];
+IF mobFrom=NIL THEN CCE[cirioError, IO.PutFR["Couldn't find %g for %g", [rope[mdr.fileId]], [rope[mdr.moduleId]] ]];
+IF x.map=Symbols.CTXNull THEN CCE[cirioError, IO.PutFR["No map given for ctx%xx into %g", [cardinal[LOOPHOLE[MA.GetCtxForCTXH[ctxh]]]], [rope[mdr.moduleId]] ]];
+ctxh ¬ MA.MakeCTXH[mobFrom, x.map];
+ctxr ¬ MA.FetchCTXR[ctxh];
+} ELSE EXIT;
+ENDCASE => EXIT;
+ENDLOOP;
+RETURN [ctxh, ctxr];
+END;
+FindSeh: PUBLIC PROC [ctxh: CTXH, name: ROPE, rmtw: RemoteMimosaTargetWorld] RETURNS [n, t: SEH] ~ {
+ctxr: CTXR;
+fieldSeh, nextSeh: SEH;
+fieldSer: SER;
+[ctxh, ctxr] ¬ GetCompleteContext[ctxh, rmtw];
+FOR fieldSeh ¬ ctxr.seList, nextSeh WHILE fieldSeh#NIL DO
+fieldSer ¬ MA.FetchSER[fieldSeh];
+WITH fieldSer.body SELECT FROM
+id: REF id MA.BodySE => {
+nextSeh ¬ id.ctxLink;
+IF id.idCtx # ctxh THEN LOOP -- not visible--;
+IF id.hash.Equal[name] THEN RETURN [fieldSeh, id.idType];
+};
+ENDCASE => CCE[cirioError, "found non-id SE in the helper context"];
+ENDLOOP;
+RETURN [NIL, NIL]};
+
+FindHelpingSehs: PUBLIC PROC [ctxh: CTXH, rmtw: RemoteMimosaTargetWorld] RETURNS [atomRecSeh: SEH ¬ NIL] ~ {
+[,atomRecSeh] ¬ FindSeh[ctxh, "anAtomRep", rmtw];
+IF atomRecSeh=NIL
+THEN CCE[cirioError, "didn't find `anAtomRep' in the helper context"];
+RETURN};
+
+StemPart: PROC[whole: PFSNames.PATH] RETURNS[RS.RopePart] =
+BEGIN
+baseSeq: RS.RopeSeq ¬ RS.ParsePartToSeq[MPN.ComponentName[whole.ShortName], '.];
+IF baseSeq # NIL THEN RETURN[baseSeq.Fetch[0]] ELSE RETURN[[NIL,0,0]];
+END;
+IsATypeDecl: PROC[ser: MA.SER] RETURNS[BOOLEAN] =
+BEGIN
+WITH ser.body SELECT FROM
+id: REF id MA.BodySE => RETURN[FALSE];
+cons: REF cons MA.BodySE =>
+WITH cons.typeInfo SELECT FROM
+isAType: REF mode MA.TypeInfoConsSE => RETURN[TRUE];
+ENDCASE => RETURN[FALSE];
+ENDCASE => ERROR;
+END;
+CTXRecordTypeProcs: REF Records.RecordTypeProcs ¬ NEW[Records.RecordTypeProcs¬[
+createIndirectNode: CTXRecordCreateIndirect,
+getBitSize: CTXRecordBitSize,
+getPaint: CTXRecordsGetPaint,
+comparePaint: CTXRecordsComparePaint,
+nFields: CTXRecordsNFields,
+fieldIndexToName: CTXRecordsFieldIndexToName,
+nameToFieldIndex: CTXRecordsNameToFieldIndex,
+fieldIndexToType: CTXRecordsFieldIndexToType,
+fieldIndexToFieldCase: CTXRecordsFieldIndexToFieldCase,
+fieldIndexToCompileTimeConstantValue: FieldIndexToUnknown]];
+CTXFieldTypeProcs: REF Records.RecordTypeProcs ¬ NEW[Records.RecordTypeProcs¬[
+createIndirectNode: CTXRecordCreateIndirect,
+getPaint: CTXRecordsGetPaint,
+comparePaint: CTXRecordsComparePaint,
+nFields: CTXFieldsNFields,
+fieldIndexToName: CTXRecordsFieldIndexToName,
+nameToFieldIndex: CTXRecordsNameToFieldIndex,
+fieldIndexToType: CTXRecordsFieldIndexToType,
+fieldIndexToFieldCase: CTXRecordsFieldIndexToFieldCase,
+fieldIndexToCompileTimeConstantValue: FieldIndexToUnknown]];
+
+CTXRecordCreateIndirect: PROC [cc: CC, data: REF ANY, indirectType, targetType: Type, mem: Mem] RETURNS [Node] ~ {
+ac: AnalyzedCTX ¬ NARROW[data];
+nodeData: RecordNode ¬ NEW[RecordNodeData ¬ [ac, targetType, mem, NIL]];
+IF ac.hasNtConst THEN [] ¬ mem.MemReadSegReg["text", 0]; --make sure we've got a Frame Mem
+nodeData.indirectToRecord ¬ Records.CreateIndirectRecordNode[targetType, RecordProcs, nodeData, ac.rmtw.cc];
+RETURN[nodeData.indirectToRecord]};
+
+CTXRecordBitSize: PROC[indirectType: Type, cc: CC, data: REF ANY] RETURNS[CARD] ={
+ac: AnalyzedCTX ¬ NARROW[data];
+bits: INT ¬ ac.bitSize.BaToBits;
+RETURN[bits]};
+
+CTXRecordsGetPaint: PROC[data: REF ANY] RETURNS[REF ANY] =
+BEGIN
+ac: AnalyzedCTX ¬ NARROW[data];
+IF ac.painted THEN RETURN[ac] ELSE RETURN[NIL];
+END;
+CTXRecordsComparePaint: PROC[data: REF ANY, otherPaint: REF ANY] RETURNS[BOOLEAN] =
+BEGIN
+ac: AnalyzedCTX ¬ NARROW[data];
+IF otherPaint = NIL THEN CCE[cirioError]; -- we shouldn't be called in this situation
+WITH otherPaint SELECT FROM
+other: AnalyzedCTX => RETURN[ac = other];
+ENDCASE => RETURN[FALSE];
+END;
+CTXRecordsNFields: PROC[data: REF ANY] RETURNS[INT] =
+BEGIN
+ac: AnalyzedCTX ¬ NARROW[data];
+RETURN[ac.nFields];
+END;
+CTXFieldsNFields: PROC[data: REF ANY] RETURNS[INT] =
+BEGIN
+ac: AnalyzedCTX ¬ NARROW[data];
+RETURN[ac.nFields-1];
+END;
+CTXRecordsFieldIndexToName: PROC[index: INT, data: REF ANY] RETURNS[Rope.ROPE] =
+BEGIN
+ac: AnalyzedCTX ¬ NARROW[data];
+RETURN[ac.fields[index].name];
+END;
+CTXRecordsNameToFieldIndex: PROC[name: Rope.ROPE, data: REF ANY] RETURNS[INT] =
+BEGIN
+ac: AnalyzedCTX ¬ NARROW[data];
+FOR I: INT IN [0..ac.nFields) DO
+IF Rope.Equal[name, ac.fields[I].name] THEN RETURN[I];
+ENDLOOP;
+RETURN[-1];
+END;
+CTXRecordsFieldIndexToType: PROC[index: INT, cc: CC, data: REF ANY] RETURNS[Type] = {
+ac: AnalyzedCTX ¬ NARROW[data];
+IF NOT ac.fields[index].analysisValid
+THEN ac.fields[index] ¬ ac.AnalyzeField[ac, index, ac.fields[index]];
+RETURN[ac.fields[index].fieldDirectType]};
+CTXRecordsFieldIndexToFieldCase: PROC[index: INT, cc: CC, data: REF ANY] RETURNS[Records.FieldCase] = {
+ac: AnalyzedCTX ¬ NARROW[data];
+RETURN [ac[index].fieldCase]};
+FieldIndexToUnknown: PROC[index: INT, cc: CC, data: REF ANY] RETURNS[Node] ~ {
+explanation: Rope.ROPE ~ IO.PutFR1["unknown constant field, index=%g", [integer[index]] ];
+ukt: Type ~ CedarOtherPureTypes.CreateUnknownType[cc, explanation];
+RETURN CedarOtherPureTypes.CreateUnknownTypeNode[ukt, explanation, cc]};
+
+UnknownConstField: TYPE ~ RECORD [index: INT, cc: CC, data: REF ANY];
+
+END.
+   .Ž  
+RMTWCompounds.mesa
+Copyright Ó 1989, 1990, 1991, 1992, 1993 by Xerox Corporation.  All rights reserved.
+Theimer, November 27, 1989 4:16:46 pm PST
+Last changed by Theimer on December 13, 1989 8:20:01 pm PST
+Last tweaked by Mike Spreitzer on January 10, 1992 1:46 pm PST
+Last tweaked by Sturgis on April 19, 1990 3:16 pm PDT
+Coolidge, July 18, 1990 11:04 am PDT
+
+Derived from RMTWAtomics.mesa
+Contains the code for AnalyzeRecordSEH, AnalyzeSequenceSEH, and AnalyzeVariantRecordSEH.
+Philip James, August 27, 1991 4:16 pm PDT
+Laurie Horton, January 29, 1992 3:29 pm PST
+Katsuyuki Komatsu December 22, 1992 10:52 am PST
+Willie-s, January 5, 1993 1:18 pm PST
+
+
+
+Target world dependent parameters
+This stuff is adapted from [PCedar2.0]<Mimosa>SymbolOpsImpl and [PCedar2.0]<MachineParms>SparcParms.mesa.
+(the later from [PCedar2.0]<top>MachineParms-Source.df)
+
+
+BasicArrayStuff
+
+(to be used both by array types and sequence types)
+
+remark: if the mob had contained the array bit size, we would not have to do this computation.  Further, because we have to delay the analysis of component types, we are forced into making this a lazy value as well.  Otherwise, we could probably had bitSize as a field on the AnalyzedSEH, rather than a procedure.
+Startle: After writing the above comment, I find that I do perform an analysis of the components at analysis time.  Hmm, maybe it didn't have to be lazy, but I have already coded all that stuff.  Also, I may later discover that I have to lazy analyze the components, in which case I am all set up with this code.
+Remark: this code is adapted from [PCedar2.0]<Mimosa>SymbolOpsImpl.BitsPerElement and [PCedar2.0]<Mimosa>SymbolOpsImpl.BitsForType.
+Remark: If nElements = LAST[CARD] we assume that we are dealing with a sequence and set bodySize to LAST[CARD].
+
+
+Array Types
+
+note that we have ignored the bitOrder field of the SER.  Someday, when we handle multiple types of target machines we may have to revisit this.
+I had assumed that there was no way SelectArrayEntry could be called with out first having obtained the element type.  That assumptions seems to be violated during print frame.  (No one needs to know the type of the result?)  So, we had better be sure that the lazy evaluation has been done.  Hence, the following call to RMTWArrayGetEntryType.
+Sequence Types
+
+The Cirio model for sequences differs from the Mob model.  For Cirio, a sequence has roughly the following structure:
+[preamble: FieldList, tag: Type, tail: Array].
+A sequence SEH (in a mob) describes the tag and tail part of a Cirio Sequence.  These are part of a record type, whose n-1 initial fields describe the Cirio preamble.
+
+Our job is to convert the mob model to the Cirio model.  As a first step, one must realize that an AnalyzedSequenceSEHPrivate refers only to the tag and tail, not to the Cirio sequence as a whole.  The record analysis will check the last field of the record to see if it is really destined to be a Cirio Sequence.
+
+note that we have ignored bitOrder, controlled, machineDependent, and grain.  I am not sure whether I have to use this information.  perhaps when we get to multiple types of target machines?
+
+note: this procedure is called by AnalyzeRecordSEH when it notices that the nominal tail type is a sequence SEH.  The preamble argument describes the preamble as a Cirio Field List.  The tailxx arguments describe the last seh of the enclosing record seh.  
+ultimately, the following items should be lazy constructed
+this is a second guess.  Trying tailOffset failed, that was where the tag began.  I am not sure what will happen if there are fractions of words/aus involved. 
+We make this call to RMTWGetEntryType to asure the existence of the entry type info.  We actually ignore the type info here.
+We shall ignore tailBitSize, but the call to compute it guarantees that the pitch values etc are now correct in private.basicInfo.
+MJS, May 21, 1991: Found the following comment on CreateSequenceNodeSchema: [[Note: the node schema constructed here is designed to have the maximum possible size.  We expect that the CirioSequence code will avoid indices that are too large.  Thus, this code can avoid the responsibility of reading the tag and computing a correct size for the tail.  We need not do so, since this is already being done by SequencesImpl.]]
+
+Remark: the following code would best be done "on the left side of the line".  Before the entry type became "lazy", this was done at SequencesImpl.CreateUnionTailType, with the following construction
+Arrays.CreateArrayType[entryType, indexType, cc]
+However, now that entryTypes are lazy, this becomes more difficult.
+I believe that the code here would migrate to SequencesImpl easily enough.
+Note that it is fortuitous that RMTWGetEntryType has the correct type signature.  It certainly has the correct behavior.  If it had the wrong signature, we would have to build a shell here.
+no one had better call, as a sequence does not have a well defined size
+
+we make this call to RMTWGetEntryType for the same reason that SelectArrayEntry calls RMTWArrayGetEntryType.  (Perhaps other select routines should make similar calls?)
+Variant Record Types
+
+The Cirio model for variant records differs from the Mob model.  For Cirio, a variant record has roughly the following structure:
+[preamble: FieldList, tag: Type, tail: Union Type].
+A union SEH (in a mob) describes the tag and union part of a Cirio variant record.  These are part of a record type, whose n-1 initial fields describe the Cirio preamble.
+
+Our job is to convert the mob model to the Cirio model.  As a first step, one must realize that an AnalyzedVariantRecordSEHPrivate refers only to the tag and tail, not to the Cirio variant record as a whole.  The record analysis will check the last field of the record to see if it is really destined to be a Cirio Variant Record.
+
+
+note: this procedure is called by AnalyzeRecordSEH when it notices that the nominal tail type is a union SEH.  The preamble argument describes the preamble as a Cirio Field List.  The tailxx arguments describe the last seh of the enclosing record seh.  
+no one had better call, as a variant record does not have a well defined size
+MJS, May 28, 1991: Made it include the tailOffset because otherwise printing variant records dies with a Mem subfield out of bounds.
+Record Types
+
+Check if we are dealing with a bound variant record.
+This cons record represents a bound variant arm.  Use the link field to get to the cons record that describes the entire variant record (possibly going through other bound variant id and cons records).
+returns NIL if unknown or UnimplementedField
+This procedure is a workaround for a mob problem
+note: we treat NIL field locs as having width = 0
+I assume that all the numbers involved are non negative
+now, we compute new runningBitOffset
+MJS, May 17, 1991: As part of the NodeSchema elimination, I'm making these procs serve for both ordinary records and block records; thus each body now has corresponding code from RMTWFrames moved and merged into it.
+MJS, May 17, 1991: Old (undated, unattributed) comments for the ordinary case: [[
+note: fieldInfo could be defined as ctxInfo.fields[index], but this would be a copy of a record, and hence it would be incorrect to modify it. 
+Now, two steps are required.  One: get a NodeSchema for the field.  One may already exist, check an array in nodeData.nsData.  If not, create by doing a subField on the BitFieldSchema that should be in the nodeData.nsData, then store it in the array.  Second: create the desired node by calling createIndirectNode on the just obtained NodeSchema for the field.
+
+To fill in the following undefined xx:  Pattern some code after IndirectRecordSelectField in RemoteMimosaTargetWorldImpl.
+
+In the following we need values for: (byteOffset, bitOffset, and bitSize).  These values do not depend upon the structural location of this record, but only upon the idSEH of the field.  Hence, they should have been recorded by AnalyzeCTX when it formed the FieldInfo for this field.  The difficulty is that AnalyzeCTX will also be called by AnalyzeBTH (when it gets written).  For AnalyzeBTH the relevant field info is a MOF.VarLoc.  Consequently, we perform the necessary analysis here (if it has not already been done) and fill it in for later use.]]
+Old (undated, unattributed) comments from the block record case: [[
+(This is a preliminary description.)  We have two jobs here.  The first is to find (or build and record) a NodeSchema for the named field.  The second is to call the createIndirectNode routine in the schema with an appropriate Mem.  The NodeSchema should be recorded in the AnalyzedBTH.
+
+This is an old comment:  is it still applicable?  I have replaced the frame info in the argumetns with a Mem.
+  The Mem should be supplied from the frameData.  However, there may be assorted Mems for the different parts of the frame?  Also, the NodeSchema should also be dependent on where the field is sitting.  The construction of the NodeSchema reflects the various issues about where the field sits within the frame.]]
+MJS, May 17, 1991: It might be worthwhile caching the field nodes.
+MJS, May 26, 1991: For broken proc frames, we must deal with errors arising from usage of the Mem.
+should never happen, this field should have been filled in when someone inspected the type of the field.
+should never happen, this field should have been filled in when someone inspected the type of the field.
+the following is a special purpose routine used in RMTWAtomics.CallProc to obtain info about each argument parameter.  This works only due to many special dispensations.
+IF NOT ctxInfo.fields[I].analysisValid THEN ERROR; -- by the time we call this procedure all of the fields will have to have been handled
+this test is commented because: it doesn't seem to be required, even if analysisValid = FALSE the necessary info for fieldLoc constructino is available.
+Further, we have discovered it to be FALSE in practice.
+Record Contexts
+As a special dispensation, in order to handle empty argument/result records, this procedure will accept ctxh=NIL to produce an effectively empty record.
+unpackedArgResultRecord: this parameter should be true exactly when the record is as described:
+unpacked
+arg or result of a procedure
+unpackedArgResultRecord provokes a workaround because under certain conditoins the mobs incorrectly report record layouts.
+build an ordered list of relevant sehs
+The documentation advertises that ctxr.seList is a (more or less chained) sequence of id SERs.  Thus, each one should bring us to this case
+Now we have to see whether the entry is for a field or a type declaration.
+(type declarations will occur in the ctxr.seLists occurring for body table entries.)
+We don't know how to access this field, very likely it is a procedure.  WE SHOULDN'T BE HERE
+will callers treat this properly?
+now we can build the result
+Get a completely copied context from some definitions mob
+
+AKA the base.
+
+We assume that ser is MA.FetchSER[idType], where idType is the idType field of an id ser.
+
+
+these differ from the record type procs only for the nFields procedure
+Note: this probably returns the wrong size if we are a Sequence or Variant Record.
+we shall use the address of the record data as the paint.  Note that we are trusting the assorted hash table mechanisms to prevent the construction of more than one RecordData for a given record type.
+
+Improved mechanisms must use a triple <official mob versionstamp, mob ctxindex, and analyzedSeh.effectiveflushtime>  because reconstructed types after a flush of the unknown symbol cache should not agree with previously cnstructed types, even if they have the same <versionstamp, ctxindex>.
+
+
+
+we ignore the last entry
+
+
+We could speed this up by using atoms
+
+here is where we finally compute the field type, after we have exited from the local type construction routine for the record as a whole.
+
+
+Ê.ÿ  –"cedarcode" style•NewlineDelimiter
+™ codešœ™Kšœ
+ÏeœI™TK™)K™;K™>K™5K™$K™ Kšœ™K™XK™)K™+K™0K™%—K˜ šÏk	˜	Kšœžœm˜yKšœžœ
+˜Kšœžœ„˜‘Kšœ
+žœ@˜OKšœžœ˜+Kšœžœ+˜DK˜Kšœ˜Kšžœ˜Kšœ
+žœžœžœžœbžœžœžœ˜ÓKšœžœO˜cK˜Kšœžœ˜Kšœ˜Kšžœžœ˜Kšœ	žœžœ˜,Kšœžœw˜„Kšœ˜Kšœžœ,˜>Kšœ
+žœ[˜jKšœžœ
+˜K˜šœžœ–˜ªK™ ——šÐbnœžœž˜KšžœSžœ8žœB˜ÙKšžœ˜Kšžœ˜Kšœžœžœžœžœžœžœžœ˜nK˜ Kšœ
+žœ˜$K˜ Kšžœžœ'˜1K˜ Kšžœžœ&žœžœ˜NK˜ K™ K™ ™!K˜ šœi™iK™7—KšÏnœžœ˜Kš œžœ˜#Kš œžœ˜!Kšœžœ˜8š œžœžœžœ˜<Kšœ˜Kšœ˜Kšœ˜Kšœ ˜ ——K™ K™ K™™ K™3K™ Kšœžœžœ˜.šœžœžœ˜"KšœžœÏc˜,K˜Kšœžœ˜Kšœžœ¡˜$Kšœ	žœ˜Kšœžœ˜Kšœžœ˜—K˜ š œžœ;žœžœ˜fšžœžœžœ˜$Kšœ¹™¹K™¸K™ƒK™oK˜GKšœžœ2˜CKšœžœžœ˜=Kšœžœžœžœžœ%žœžœ#˜ŠKšœžœžœ	žœ&˜;Kšœžœ˜Kšœžœ˜4šœ
+žœ˜Kšžœžœžœžœžœžœ˜3šžœžœž˜*Kšœ8˜8—Kšžœ˜—K˜ K˜K˜$K˜Kšœžœ˜Kšœ˜—šžœ˜K˜ ——š œžœ;žœžœ˜kKšžœžœžœ,˜NKšžœ˜—K˜ š œžœžœKžœ
+˜’Kšœžœ.˜8Kšœžœ ˜5Kšœžœ¡Y˜ƒ˜KšœC˜CKšœ)˜)—K˜*K˜EKšžœ?˜E——K™ K™ ™K™ Kšœžœžœ˜2šœžœžœ˜$Kšœ˜K˜K˜˜K™—K˜ —š œžœžœžœžœžœžœžœžœ0žœ
+˜œK˜7Kšœžœ˜Kšœ6žœžœ	˜Jšœžœ˜5Kšœ˜Kšœ4˜4K˜Kšœžœ˜K˜K˜K˜—šœžœ˜6K˜Kšœ˜K˜Kšœžœ˜—K˜_Kšžœ˜KšžœžœS˜iKšœ˜—K˜ š œžœžœ1žœžœžœ˜vKšœžœ˜K˜Kšœžœ˜K˜(K˜)Kšœ4žœžœ	˜Hšœžœ˜5Kšœ˜Kšœ˜Kšœ˜Kšœžœ˜K˜K˜K˜—šœžœ˜6K˜Kšœ˜K˜Kšœžœ˜—K˜_Kšžœ˜KšžœžœP˜fKšœ˜—K˜ š œžœžœ˜KKšœ(˜(K˜Kšœ&˜&—K˜ š œžœžœžœžœžœžœ˜OKšœžœ˜$Kšžœžœžœ˜>šžœ˜Kšžœ/˜5—Kšœ˜—K˜ š œžœžœžœžœžœ
+˜DKšœžœ˜$K˜(Kšžœ˜ —K˜ šœžœžœ˜Kšœ˜K˜	šœ˜K˜ ——š œžœžœžœžœ,žœ˜mKšœžœ˜$Kšœ
+žœžœžœ˜Bšœ%žœ%˜MK˜Kšœ˜Kšœ˜—K˜NKšžœ˜"—K˜ K˜ š œžœžœžœžœžœžœ
+˜LKšœ
+žœžœ˜+˜1KšœØ™Ø—K˜,KšžœN˜T—K˜ š œžœžœžœžœžœ
+˜>Kšœ
+žœžœ˜+KšžœY˜_K˜ ——™K™ ™uK™.—K™¦K™ Kšœ¹™¹K™ Kšœžœžœ ˜Fšœ žœžœ˜.Kšœ˜Kšœ˜Kšœ˜Kšœ
+žœžœ˜Kšœžœžœ˜Kšœžœ˜Kšœžœ
+žœ˜'Kšœžœ˜Kšœžœ¡1˜AK˜Kšœ˜šœ˜K™¾——™ K™€—š œžœ$žœžœžœžœžœžœžœ
+žœ0žœ
+˜åšœžœ˜4Kšœžœžœ˜Kšœžœ¡6˜FK˜Kšœžœ˜K˜K˜K˜—šœ&žœ!˜JK˜Kšœžœ˜
+Kšœ˜Kšœ
+žœ˜Kšœžœ˜Kšœ˜Kšœ˜K˜Kšœžœ˜K™:Kšœ	žœ˜Kšœžœ¡6˜JKšœ˜—Kšœžœžœ˜)K˜ šžœžœž˜šœžœžœ¡+˜FKšž˜K˜šžœžœž˜%Kšœžœžœ#˜-Kšžœžœ˜—Kšžœ˜—Kšžœžœ˜—K˜ K˜B˜7KšœŸ™Ÿ—K˜›Kšžœ˜—K˜ š œžœžœ ˜\Kšœ+˜+K˜Kšœ˜Kšœ/˜/—K˜ š œžœžœžœžœ,žœ˜qKšœ&žœ˜3K˜-K˜z˜5Kšœ|™|—šœžœ1˜BK™‚—Kšœ
+žœžœ)žœ˜SK˜nKšžœ˜%Kšœ¦™¦—K˜ š œžœžœžœžœžœ
+˜?Kšœ&žœ˜3K˜-šžœžœžœ˜%K˜MKšœ5¡˜<K˜5—Kšžœ˜%—˜ ™ÈKšœ0™0—KšœC™CKšœJ™JK˜ Kšœ˜—š œžœžœžœžœžœ
+˜FKšœ&žœ˜3KšžœO˜U—K˜ š œžœžœ˜Nšœ!˜!Kšœ½™½——˜ ˜ K™G——š œžœžœžœžœžœžœ˜NKšœžœ4˜:—K˜ š œžœžœ˜PKšœ'˜'Kšœ˜Kšœ)˜)Kšœ!˜!—K˜ šœžœžœ˜ Kšœ$˜$Kšœ˜Kšœ˜—K˜ š œžœžœžœžœžœ
+˜JKšœ
+žœžœ˜3KšžœQ˜W—K˜ š œžœžœžœžœžœ
+˜EKšœ
+žœžœ˜3KšžœO˜U—K˜ š œžœžœžœžœžœžœ
+˜XKšœ
+žœžœ˜3K˜6K™ ˜,Kšœ¨™¨—Kšžœn˜t—K˜ š œžœžœžœžœžœ
+˜AKšœ
+žœžœ˜.Kšžœa˜g—K˜ —™K™ ™K™3—K™ªK™ KšœÊ™ÊK™ Kšœ!žœžœ%˜Pšœ%žœžœ˜3Kšœ˜Kšœ˜Kšœ˜Kšœ
+žœžœ˜Kšœžœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœžœ˜$Kšœ˜Kšœžœ˜Kšœ˜—™ K™ý—š œžœ$žœžœžœžœžœžœžœžœžœ!žœ
+˜÷šœ+žœ&˜TK˜Kšœžœ˜
+Kšœ˜Kšœ
+žœ˜Kšœžœ˜Kšœ˜Kšœ˜K˜Kšœ˜Kšœ	žœ˜K˜Kšœ&žœžœžœžœžœžœžœžœžœ
+¡K˜ÂKšœ˜—K˜ Kšœžœžœ˜)šžœžœž˜šœžœžœ¡+˜FKšž˜K˜šžœžœž˜%Kšœžœžœ#˜-Kšžœžœ˜—Kšžœ˜—Kšžœžœ˜—K˜ K˜BK˜"K˜TK˜RK˜DK˜¾K˜ Kšžœ˜—K˜ Kšœ9žœ~˜ºK˜ š œžœ	žœžœžœžœ˜QKšœ+žœ˜<K˜-K˜!Kšœžœ7˜Mšžœžœžœ9žœžœž˜ešžœ.ž˜4Kšžœ˜%—Kšžœ˜—Kšžœžœ˜K˜ K™M—š œžœžœžœžœžœžœ˜[Kšœ+žœ˜<Kšžœ)˜/K™„—K˜ š œžœžœžœžœ,žœ
+˜xKšœ+žœ˜<Kšœžœžœmžœ˜§šœ
+žœžœ˜AKšœ˜Kšœ˜Kšžœ˜—K˜Kšžœ$˜*—K˜ š œžœ&žœ%˜bKšœ,˜,Kšœ0˜0Kšœ"˜"Kšœ,˜,Kšœ&˜&—K˜ šœžœžœ˜%Kšœ)˜)Kšœ˜Kšœ˜—K˜ š œžœžœžœžœžœ
+˜OKšœ
+žœžœ˜8KšžœQ˜W—K˜ šŸœžœžœžœžœžœžœ˜PK˜>K˜uKšœ
+žœP˜^Kšžœ˜—K˜ š œžœžœžœžœžœ
+˜JKšœ
+žœžœ˜8KšžœO˜U—K˜ š œžœžœžœžœžœ
+˜OKšœ
+žœžœ˜8Kšœžœ0˜:K˜?Kšžœ8˜>—K˜ š œžœžœžœžœžœ˜IKšœ˜Kšœ
+žœžœ˜8Kšžœf˜l—K˜ —˜ K˜ —™K˜ š œžœžœ!žœ˜XKšœžœžœžœ˜šžœ
+žœž˜š
+œžœžœžœžœž˜:šœžœ˜#Kšœžœžœžœ˜&šžœ
+žœž˜šœžœžœ
+˜šžœžœž˜šœžœžœ˜$Kšžœžœžœžœžœžœžœžœ(žœ˜—Kšžœžœ(˜6——Kšžœžœ(˜6—Kšœ˜—Kšžœžœ(˜6—Kšžœžœ(˜6—Kšœ˜—K™ š œžœžœžœžœžœžœžœžœ;žœžœ
+˜¯Kšœ˜šžœžœžœ˜™4šœ˜K™ÉKšœžœ4˜>Kšžœžœžœ	žœ
+˜G——K˜ Kšžœžœžœžœžœžœžœžœž¡™œžœžœžœžœ(žœ˜áK˜—Kšžœžœžœžœžœžœžœžœžœžœžœžœ˜n—K˜ š
+ œžœžœ!žœžœ˜_Kšœžœžœžœ˜šžœ
+žœž˜š
+œžœžœžœžœž˜:šœžœ˜!Kšž˜Kšœžœžœžœ˜&šžœ
+žœž˜šœžœžœ
+˜šžœžœž˜šœžœžœ˜#Kšž˜šžœžœž˜Kšžœ1˜7—Kšžœžœ˜Kšžœ˜—Kšžœžœ0˜>——Kšžœžœ0˜>—Kšžœ˜—Kšžœžœ0˜>—Kšžœžœ0˜>—Kšœ˜—K˜ Kšœžœžœ˜&šœžœžœ˜K˜K˜K˜	K˜—˜ Kšœ,™,—š
+ œžœžœžœžœ˜XKšœ
+žœ-˜:šžœ˜K˜ K™0——š œžœ˜8Kšž˜Kšœžœ˜šžœžœžœž˜*Kšœ
+žœ2˜?K™1šžœžœž˜Kšžœ¡0˜6K™7Kšœ	žœ˜(Kš œžœ˜Kš œžœ˜Kš œžœ˜Kš	œžœžœžœžœ˜VKš
+œžœžœžœžœ¡+˜‘Kšœžœ˜5šžœ.žœ¡	˜>K˜=—K™$K˜?Kšžœžœžœžœ˜3Kšžœ˜—Kšžœ˜—Kšžœ˜—K˜ K˜ š œžœ#žœ"˜XKšœ˜Kšœ;˜;šœ˜K™×——K˜ ™QKšœ™K˜ K™èK™ Kšœy™yK™ Kšœ¦žœ™©—™CKšœž™žK™ K™mKšœ¸™¸—K™BK™bš œžœžœ!žœžœžœžœ
+˜eKšœžœ˜$K˜#K˜-K˜K˜>K˜K˜ šžœžœ%žœžœ˜@Kšœh™h—K˜ šžœžœ˜Kšœžœžœ˜Kšœžœ˜Kšœ6žœžœ˜GKš
+žœžœžœžœ.žœO˜®šžœžœž˜-Kš	œžœ	žœžœ.žœn˜ÅKšžœžœ˜—KšœCžœžœ˜dKšžœžœžœ.žœl˜·Kš	žœžœžœžœž˜.Kšžœžœžœn˜‡Kšžœž¡+œ˜5Kšžœ@˜F—šžœ˜Kšœ
+žœ2˜?šžœžœžœ¡˜5Kšžœ.žœV˜Œ—K˜$KšžœA˜G—Kšœ˜Kšœžœžœ˜—K˜ š œžœžœžœžœžœžœ
+˜cKšœžœ˜$Kšœ#˜#Kšœ-˜-K˜šœžœžœž˜1Kšœ˜KšžœžœC˜Q—šœžœžœž˜:Kšœ˜KšžœžœI˜W—Kšœžœžœ˜'š
+œžœžœžœžœž˜AKšœžœžœ˜KšžœžœY˜g—Kšœ2˜2Kšžœžœžœ2˜Qšžœžœ%žœžœ2˜eKšœh™h—šžœžœžœžœ˜2Kšœžœžœ.˜>Kš	œžœžœ
+žœžœ˜:Kšœžœžœžœ˜6šœžœ
+žœžœ˜*Kšœ˜K˜—K˜Kšœžœžœ˜Kšœ*žœžœ˜KKšžœžœžœ(žœƒ˜ÇKšžœM˜S—šžœ˜KšžœM˜S——K˜ š œžœžœžœžœžœ
+˜?Kšœžœ˜$Kšžœžœžœ<˜_KšžœZ˜`K˜ Kšœ©™©—š œžœžœžœžœžœžœžœžœžœžœ˜–Kšž˜Kšœ	žœžœ+˜;Kšœžœ
+˜'Kšœ˜š	žœ œžœžœž˜&Kšœ
+žœ.˜;š	žœžœ!žœžœ¡V™‰Kšœ˜™˜K™7—KšžœžœžœžœA˜[KšœQ˜QKšžœ˜—Kšžœ˜——K˜ ™K˜ š œžœžœžœžœžœ˜6šžœžœž˜Kš	œžœžœžœžœ˜BKš
+žœžœžœžœžœ˜I—Kšžœžœ*˜3K˜—K˜ š œžœžœžœžœžœžœ˜AKšœžœžœ˜Kš œžœžœžœžœžœ˜EKšžœžœžœžœ˜+Kšžœžœžœ/˜FK˜K˜#Kšœžœ˜Kšžœžœ	žœ˜?Kšœ˜—K˜ š œžœžœ1žœžœžœ˜iK˜K˜(K˜š	žœžœžœžœž˜8Kšœžœ˜K˜Kšœžœ˜Kšœžœ˜K˜ K˜&K˜(K˜,K˜K˜'šœžœ˜%K˜K˜Kšœ˜Kšœžœ˜Kšœ˜Kšœ
+žœ'˜4K˜—K˜K˜)Kšžœ˜—Kšœ
+žœ˜+šžœžœ œžœ
+žœžœ?žœžœž˜†K˜+Kšžœ˜—Kšœžœ˜Kšœžœ˜Kšœžœ˜K˜TK˜YKšœžœ˜Kšœžœ˜K˜K˜Kšœžœ˜Kšžœžœ˜%—˜ Kšœmžœ(™˜šœ_™_K™K™—Kšœz™z—š 
+œžœžœžœžœ^žœ9žœžœžœžœžœžœ)˜¬Kšœžœ˜Kšœžœ˜K˜K˜K˜Kšœžœžœ˜'Kšœ!žœ˜%Kšœžœ˜%Kšœžœ˜Kšœžœžœ
+žœ˜$Kšœ#žœ˜+K˜ Kš
+žœžœžœžœžœZ˜}šžœžœžœ¡G˜[Kšžœ	žœžœžœ)˜@Kšœ
+žœ˜"K˜K˜"Kšœžœ˜K˜TK˜YKšœžœ˜Kšœžœ˜K˜K˜K˜'Kšœžœ'˜<Kšžœ˜%—Kšœžœ˜K˜.K˜ K™&šžœ!žœ
+žœž˜9Kšœžœ˜!šžœžœž˜šœžœžœ˜Kšœ‹™‹K™JK™TKšœ	žœžœ˜šœžœžœž˜#Kšžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜ Kšžœ	˜—K˜Kšžœžœžœ¡œ˜.K˜K˜Kšœžœ˜)šœ
+žœ˜K˜Kšœ˜šœ	žœ3˜?Kšœ˜——šžœžœž˜"Kšœžœžœ(žœžœžœ˜nKšœžœžœ8˜AKšœžœžœ9˜BKšœžœžœ8˜AKšžœ0˜7—šžœžœ˜#K˜+K˜&KšžœžœE˜YKšœ˜—šžœžœžœžœ˜GK˜(Kšœ˜—šžœ˜K˜(Kšœžœ*˜Dšžœžœž˜"šœžœžœ˜K˜K˜Kšžœžœžœ˜4—Kšžœžœ˜—šžœžœž˜"šœžœžœ˜K˜šžœžœž˜šœžœ
+žœ˜*Kšžœ	žœžœžœžœžœ4˜_Kšœžœ˜Kšžœ˜—šœžœžœ˜&Kšžœ	žœžœžœžœžœ1˜\Kšœžœ˜Kšžœ˜—Kšžœžœ˜——Kšžœžœ˜—šžœžœ˜Kšœ žœ˜$Kšœžœ˜$—šžœ˜K˜@Kšœžœ˜$—Kšžœžœžœ˜Mšžœžœžœž˜"KšœHžœžœžœž™\šœž˜Kšœ!™!——šžœžœžœž˜'šœžœžœ˜šœžœ˜+K˜)K˜(—Kšœ˜—Kšžœžœ˜)—Kšžœ,žœ˜7Kšœ˜—Kšœ˜—Kšžœžœ-˜;—Kšžœ˜—K˜ ™Kšœ˜Kšœ
+žœ˜+šžœžœ œžœ
+žœžœ?žœžœž˜†K˜+Kšžœ˜—K˜K˜"K˜ K˜TK˜YK˜(K˜"K˜Kšœžœžœ	žœ+˜cK˜'Kšœžœ'˜<Kšžœžœ%˜DKš
+žœžœžœžœqžœ˜­šžœžœ˜Kšœžœ8˜½šžœ	žœžœ˜Kšœžœžœ˜;Kšžœžœ3˜A—Kšžœžœ˜—Kšžœ˜$—Kšœ˜—K˜ š 
+œžœžœžœžœžœžœ˜SKšœ
+žœžœ˜+Kšœžœ˜šžœžœž˜Kšœžœžœ˜ šžœžœž˜šœžœžœ˜šžœžœž˜!šœžœžœžœ˜*Kšžœžœ˜—Kšžœžœ3˜A—K˜—Kšžœžœ1˜?—Kšžœ˜—Kšžœ˜—K˜ Kšœžœžœžœ˜!Kš	œžœžœžœžœ˜;K˜ š 	œžœžœ˜:Kšžœ	žœžœžœ˜:Kšœžœ˜+—K˜ š œžœžœžœ˜dKšœžœ˜.K˜KKšœžœ˜Kšžœ˜—˜ K™9—š œžœžœžœ!žœžœžœ˜`Kšž˜Kšœžœžœžœ˜#šž˜šžœžœž˜šœžœžœ
+žœžœžœžœ˜>Kšœžœžœžœ˜$Kš	œ	žœ<žœžœžœ˜ŽKš
+žœ	žœžœžœžœN˜tKšžœžœžœžœ4žœžœ1˜ Kšœžœ˜#Kšœžœ˜Kšœžœžœ˜—Kšžœžœ˜—Kšžœ˜—Kšžœ˜Kšžœ˜—K™ š œžœžœžœžœ!žœžœ˜dKšœžœ˜Kšœžœ˜Kšœ
+žœ˜K˜.šžœ!žœ
+žœž˜9Kšœžœ˜!šžœžœž˜šœžœžœ˜K˜Kšžœžœžœ¡œ˜.Kšžœžœžœ˜9K˜—Kšžœžœ6˜D—Kšžœ˜—Kšžœžœžœ˜—K˜ š œžœžœžœ!žœžœžœ˜lK˜1šžœž˜Kšžœžœ>˜F—Kšžœ˜—˜ K™—š
+ œžœžœžœžœ˜;Kšž˜Kšœ	žœžœžœ%˜PKšžœžœžœžœžœžœžœ˜FKšžœ˜—™ KšœžœA™Y—š œžœžœžœžœžœ˜1Kšž˜šžœ
+žœž˜Kš	œžœžœžœžœ˜&šœžœžœ
+˜šžœžœž˜Kš	œ	žœžœžœžœ˜4Kšžœžœžœ˜——Kšžœžœ˜—Kšžœ˜—K™ š œžœžœ˜OKšœ,˜,K˜Kšœ˜Kšœ%˜%Kšœ˜Kšœ-˜-Kšœ-˜-Kšœ-˜-Kšœ7˜7Kšœ<˜<—™ K™F—š œžœžœ˜NKšœ,˜,Kšœ˜Kšœ%˜%Kšœ˜Kšœ-˜-Kšœ-˜-Kšœ-˜-Kšœ7˜7Kšœ<˜<—K˜ š œžœžœžœžœ,žœ˜rKšœžœ˜Kšœžœ(žœ˜HKšžœžœ$¡!˜ZK˜lKšžœ˜#—˜ K™R—š œžœžœžœžœžœžœ˜RKšœžœ˜Kšœžœ˜ Kšžœ˜—˜ K™ÈK™ K™¢—š œžœžœžœžœžœžœ˜:Kšž˜Kšœžœ˜Kšžœžœžœžœžœžœ˜/Kšžœ˜—K™ š œžœžœžœžœžœžœžœ˜SKšž˜Kšœžœ˜Kš	žœžœžœžœ¡+˜Ušžœžœž˜Kšœžœ˜)Kšžœžœžœ˜—Kšžœ˜—K™ š œžœžœžœžœžœ˜5Kšž˜Kšœžœ˜Kšžœ˜Kšžœ˜—™ K™—š œžœžœžœžœžœ˜4Kšž˜Kšœžœ˜Kšžœ˜Kšžœ˜—K™ š œžœžœžœžœžœžœ˜PKšž˜Kšœžœ˜Kšžœ˜Kšžœ˜—™ K™%—š œžœžœžœžœžœžœ˜OKšž˜Kšœžœ˜š	žœ œžœžœž˜ Kšžœ%žœžœ˜6Kšžœ˜—Kšžœ˜Kšžœ˜—K™ š œžœžœžœžœžœžœ
+˜UKšœžœ˜K™‰šžœžœ˜%KšžœA˜E—Kšžœ$˜*—K™ š œžœžœžœžœžœžœ˜gKšœžœ˜Kšžœ˜—K™ š œžœžœžœžœžœžœ
+˜NKšœžœžœ?˜ZKšœC˜CKšžœB˜H—K˜ Kšœžœžœ	žœžœžœžœ˜E—K˜ Kšžœ˜—— …—    ¢ì   y 

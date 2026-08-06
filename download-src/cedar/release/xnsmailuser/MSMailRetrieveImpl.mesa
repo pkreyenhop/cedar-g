@@ -1,0 +1,465 @@
+DIRECTORY
+Ascii,
+BasicTime USING [FromNSTime, GMT],
+Convert,
+IO,
+MailBasics,
+MailBasicsFileTypes,
+MailBasicsItemTypes,
+MailBasicsMoreItemTypes,
+MailRetrieve,
+MailUtils USING [GeneratePostmark, GetTimeFromPostmark],
+MSBasics,
+MSMessage USING [GetHeaderRope, headingBodyPart],
+MSRetrieve,
+MSUtils,
+PFS,
+RefText,
+Rope,
+SerializedFiling,
+SystemNames USING [UserName],
+UserProfile,
+XNSCHName USING [NameFromRope, RopeFromName];
+
+MSMailRetrieveImpl: CEDAR PROGRAM
+IMPORTS Ascii, BasicTime, Convert, IO, MailRetrieve, MailUtils, MSMessage, MSRetrieve, MSUtils, PFS, RefText, Rope, SerializedFiling, SystemNames, UserProfile, XNSCHName
+~ BEGIN
+
+STREAM: TYPE ~ IO.STREAM;
+ROPE: TYPE ~ Rope.ROPE;
+Handle: TYPE ~ MailRetrieve.Handle;
+MBXState: TYPE ~ MailRetrieve.MBXState;
+ServerState: TYPE ~ MailRetrieve.ServerState;
+ServerType: TYPE ~ MailRetrieve.ServerType;
+FailureReason: TYPE ~ MailRetrieve.FailureReason;
+
+
+
+MSInfo: TYPE ~ REF MSInfoRec;
+MSInfoRec: TYPE ~ RECORD [
+user: MSBasics.CHName, 		-- user/mailbox name
+envelope: MSBasics.Envelope, 	-- envelope of current message
+postmark: MailBasics.Timestamp,	--  needed later if there is an attachment
+sender: ROPE,		--  needed later if there is an attachment
+newMsg: BOOL, 		-- TRUE when envelope needs to be returned
+systemMessage: ROPE, 		-- derived from envelope if appropriate
+msH: MSRetrieve.Handle,		-- XNS Mail Service handle for mailbox
+handle: Handle,		-- for reproting state changes
+plainTextFromHeader: ROPE,	-- if in header, non-nil until returned as item
+formattingFromHeader: ROPE,	-- if in header, non-nil until returned as item
+bodyAnnotSize: CARD32 ¨ 0,	-- size of extra text in body of message
+lastBodyPartType: MailBasicsItemTypes.ItemType ¨ MailBasicsItemTypes.header,  -- for bodyAnnotSize fix
+reportChanges: PROC[Handle, MBXState]
+];
+msInfoList: LIST OF MSInfo ¨ NIL;
+tiogaTextOK: BOOL ¨ TRUE;
+AttributeType: TYPE = SerializedFiling.AttributeType;
+lastInterlispType: AttributeType = 4919;	-- from MailFormatP1516V3
+
+MSClose: PROC [ref: REF] RETURNS [] ~ {
+msInfo: MSInfo = NARROW[ref];
+MSRetrieve.Close[msInfo.msH];
+};
+MSNewUser: PROC [handle: Handle, user: MailBasics.RName, password: ROPE, pollingInterval: CARDINAL, reportChanges: PROC[Handle, MBXState] ] RETURNS [REF] ~ {
+msInfo: MSInfo ¨ NEW[MSInfoRec];
+msInfo.user ¨ XNSCHName.NameFromRope[user.name];
+msInfo.msH ¨ MSRetrieve.Create[pollingInterval, IF reportChanges#NIL THEN ChangeReportFromMS ELSE NIL];
+msInfo.reportChanges ¨ reportChanges;
+msInfo.handle ¨ handle;
+MSRetrieve.NewUser[msInfo.msH, msInfo.user, password];
+msInfoList ¨ CONS[msInfo, msInfoList];
+RETURN[msInfo];
+};
+MSMailboxState: PROC [ref: REF] RETURNS [mboxState: MBXState] ~ {
+ENABLE MSRetrieve.Failed => ERROR MailRetrieve.Failed[FromMSFailureReason[why], text];
+msInfo: MSInfo = NARROW[ref];
+mboxState ¨ FromMSMboxState[MSRetrieve.MailboxState[msInfo.msH]];
+};
+MSNextServer: PROC [ref: REF] RETURNS
+[noMore: BOOLEAN, state: ServerState, type: ServerType] ~ {
+ENABLE MSRetrieve.Failed => ERROR MailRetrieve.Failed[FromMSFailureReason[why], text];
+msInfo: MSInfo = NARROW[ref];
+msState: MSRetrieve.ServerState;
+noMore ¨ TRUE; state ¨ unknown; type ¨ $unknown;
+[noMore, msState] ¨ MSRetrieve.NextServer[msInfo.msH];
+IF NOT noMore THEN {
+state ¨ FromMSServerState[msState];
+type ¨ $xns; 
+};
+};
+MSServerName: PROC [ref: REF] RETURNS [serverName: MailBasics.RName] ~ {
+msInfo: MSInfo = NARROW[ref];
+serverName.ns ¨ $xns;
+serverName.name ¨ XNSCHName.RopeFromName[MSRetrieve.ServerName[msInfo.msH]];
+};
+MSUserName: PROC [ref: REF] RETURNS [userName: MailBasics.RName] ~ {
+msInfo: MSInfo = NARROW[ref];
+userName.ns ¨ $xns;
+userName.name ¨ XNSCHName.RopeFromName[msInfo.user];
+};
+MSNextMessage: PROC [ref: REF] RETURNS [msgExists, archived, deleted, read: BOOLEAN] ~ {
+ENABLE MSRetrieve.Failed => ERROR MailRetrieve.Failed[FromMSFailureReason[why], text];
+msInfo: MSInfo = NARROW[ref];
+
+[msgExists, read] ¨ MSRetrieve.NextMessage[msInfo.msH];
+archived ¨ FALSE;
+deleted ¨ FALSE;
+IF msgExists THEN {
+msInfo.envelope ¨ MSRetrieve.GetMessageEnvelope[msInfo.msH];
+msInfo.systemMessage ¨ MSUtils.SystemMessageFromEnvelope[msInfo.envelope];
+msInfo.newMsg ¨ TRUE;
+};
+};
+MSStartMessage: PROC [ref: REF] RETURNS [postmark: MailBasics.Timestamp, sender: MailBasics.RName, returnTo: MailBasics.RName] ~ {
+ENABLE MSRetrieve.Failed => ERROR MailRetrieve.Failed[FromMSFailureReason[why], text];
+msInfo: MSInfo = NARROW[ref];
+
+msInfo.postmark ¨ postmark ¨ RopeFromMSPostmark[msInfo.envelope];
+sender ¨ [ns: $xns, name: MSUtils.RopeFromMSRName[msInfo.envelope.originator]];
+msInfo.sender ¨ sender.name;
+returnTo ¨ sender;
+};
+boilerPlate: ROPE ~ "\r===========> msg from XNSMailUser <===========\r";
+MSNextItem: PROC [ref: REF] RETURNS [ih: MailBasics.ItemHeader, currentItem: STREAM] ~ {
+ENABLE MSRetrieve.Failed => ERROR MailRetrieve.Failed[FromMSFailureReason[why], text];
+msInfo: MSInfo = NARROW[ref];
+bp: MSBasics.BodyPartInfo;
+isTiogaText: BOOL ¨ FALSE;
+DoAttachment: PROC[baseName: ROPE, fileType: PFS.FileType] = {
+msg: ROPE;
+this: ROPE ¨ MSGetItemAsRope[ref];
+IF UserProfile.Boolean["XNSMail.FlushMsgsWithAttachments", FALSE] THEN {
+who: ROPE = SystemNames.UserName[];	-- unix name needed
+wDir: ROPE ¨ UserProfile.Token["XNSMail.attachmentsDir", IO.PutFR1["/tilde/%g/.cedar/xnsMailAttachments/", [rope[who]]] ];
+fileName: ROPE ¨ IO.PutFR["%g-%g.txt", [rope[baseName]],
+[rope[Intelligible[msInfo.postmark, msInfo.sender]]] ];
+fullName: PFS.PATH ¨ PFS.AbsoluteName[short: PFS.PathFromRope[fileName], wDir: PFS.PathFromRope[wDir] ];
+fileLength: INT ¨ 0;
+outStream: STREAM;
+
+outStream ¨ PFS.StreamOpen[fileName: fullName, accessOptions: create ! PFS.Error =>  CONTINUE];
+IF outStream = NIL THEN {
+fullName ¨ PFS.AbsoluteName[short: PFS.PathFromRope[fileName], wDir: PFS.PathFromRope[IO.PutFR1["/tilde/%g/", [rope[who]] ]] ];
+outStream ¨ PFS.StreamOpen[fileName: fullName, accessOptions: create ! PFS.Error =>  CONTINUE];
+IF outStream = NIL THEN ERROR MailRetrieve.Failed[$couldntCreateFile, PFS.RopeFromPath[fullName]];
+};
+
+outStream.PutRope[this];
+fileLength ¨ outStream.GetLength[];
+outStream.Close[];
+msg ¨ IO.PutFLR["%g==> %g stored as:\r\t%g (%g bytes) <==\r\r",
+LIST[[rope[boilerPlate]], [rope[baseName]], [rope[PFS.RopeFromPath[fullName]]], [integer[fileLength]]] ];
+ih.type ¨ msInfo.lastBodyPartType ¨ MailBasicsMoreItemTypes.hasAttachment;
+}
+ELSE { 
+msg ¨ IO.PutFR["%g\r %g attachment not retrieved because XNSMail.FlushMsgsWithAttachments was FALSE\r\r", [rope[boilerPlate]], [rope[baseName]] ];
+ih.type ¨ msInfo.lastBodyPartType ¨ MailBasicsItemTypes.multinationalNote;
+};
+currentItem ¨ IO.RIS[msg];
+ih.length ¨ msg.Length[];
+};
+GetNSTextFile: PROC RETURNS[note, plainTextR, formattingR: ROPE] = {
+sf: SerializedFiling.SerializedFile;
+len: INT ~ msInfo.bodyAnnotSize;
+sf ¨ SerializedFiling.GetSerializedFile[MSRetrieve.GetBodyPart[msInfo.msH]];
+note ¨ SerializedFiling.GetRopeContents[sf];
+IF ( len # 0 ) THEN {
+msInfo.bodyAnnotSize ¨ 0;
+IF len < note.Length[] THEN note ¨ note.Substr[len];
+};
+plainTextR ¨ SerializedFiling.GetRopeAttribute[sf, lastInterlispType-1];
+formattingR ¨ SerializedFiling.GetRopeAttribute[sf, lastInterlispType];
+};
+IF msInfo.newMsg THEN {  -- return the envelope
+ih.type ¨ msInfo.lastBodyPartType ¨ MailBasicsItemTypes.envelope;
+[currentItem, ih.length] ¨ BuildMSEnvelopeItem[msInfo.envelope];
+msInfo.newMsg ¨ FALSE;
+RETURN;
+};
+IF msInfo.systemMessage # NIL THEN {  -- return the system message
+ih.type ¨ msInfo.lastBodyPartType ¨ MailBasicsItemTypes.systemMessage;
+currentItem ¨ IO.RIS[msInfo.systemMessage];
+ih.length ¨ Rope.Length[msInfo.systemMessage];
+msInfo.systemMessage ¨ NIL;
+RETURN;
+};
+IF msInfo.plainTextFromHeader # NIL THEN {
+ih.type ¨ msInfo.lastBodyPartType ¨ MailBasicsItemTypes.plainTextForFormatting;
+currentItem ¨ IO.RIS[msInfo.plainTextFromHeader];
+ih.length ¨ Rope.Length[msInfo.plainTextFromHeader];
+msInfo.plainTextFromHeader ¨ NIL;
+RETURN;
+};
+IF msInfo.formattingFromHeader # NIL THEN {
+ih.type ¨ msInfo.lastBodyPartType ¨ MailBasicsItemTypes.tioga1;
+currentItem ¨ IO.RIS[msInfo.formattingFromHeader];
+ih.length ¨ Rope.Length[msInfo.formattingFromHeader];
+msInfo.formattingFromHeader ¨ NIL;
+RETURN;
+};
+bp ¨ MSRetrieve.NextBodyPart[msInfo.msH];
+ih.type ¨ msInfo.lastBodyPartType ¨ MapMSBodyPartType[bp.type];
+SELECT ih.type FROM
+MailBasicsItemTypes.nsTextFile => IF UserProfile.Boolean["XNSMail.nsTextFileAsFile", FALSE]
+THEN DoAttachment["NSTextFile", [3] ]
+ELSE {
+tempBodies: ROPE;
+[tempBodies, , ] ¨ GetNSTextFile[];
+currentItem ¨ IO.RIS[tempBodies];
+ih.type ¨ msInfo.lastBodyPartType ¨ MailBasicsItemTypes.multinationalNote;
+ih.length ¨ tempBodies.Length[];
+};
+MailBasicsItemTypes.vpDocument =>
+DoAttachment["VPDocument", MailBasicsFileTypes.vpDocFileType];
+MailBasicsItemTypes.vpFolder =>
+DoAttachment["VPFolder", [3] ];
+MailBasicsItemTypes.otherNSFile =>
+DoAttachment["OtherNSFile", [3] ];
+MailBasicsItemTypes.interpress =>
+DoAttachment["Interpress", [3] ];
+MailBasicsItemTypes.postscript =>
+ DoAttachment["Postscript", [3] ];
+ENDCASE => [currentItem, ih.length] ¨ MapMSItemContents[bp, msInfo];
+};
+MSGetItem: PROC [ref: REF] RETURNS [STREAM] ~ {
+ENABLE MSRetrieve.Failed => ERROR MailRetrieve.Failed[FromMSFailureReason[why], text];
+msInfo: MSInfo = NARROW[ref];
+RETURN[MSRetrieve.GetBodyPart[msInfo.msH]];
+};
+MSGetItemAsRope: PROC [ref: REF] RETURNS [rp: ROPE] ~ {
+ENABLE MSRetrieve.Failed => ERROR MailRetrieve.Failed[FromMSFailureReason[why], text];
+msInfo: MSInfo = NARROW[ref];
+rp ¨ MSRetrieve.GetBodyPartAsRope[msInfo.msH];
+IF ( msInfo.lastBodyPartType = MailBasicsItemTypes.multinationalNote ) AND ( msInfo.bodyAnnotSize # 0 ) THEN {
+ln: INT ¨ msInfo.bodyAnnotSize;
+msInfo.bodyAnnotSize ¨ 0;
+IF ln < rp.Length[] THEN RETURN[rp.Substr[ln]] ELSE RETURN[rp];
+}
+ELSE RETURN[rp];
+};
+MSGetItemViaCallback: PROC [ref: REF, proc: MailRetrieve.GetItemCallback] ~ {
+ENABLE MSRetrieve.Failed => ERROR MailRetrieve.Failed[FromMSFailureReason[why], text];
+CheckForAbort: PROC RETURNS [BOOL] ~ {
+RETURN[FALSE];
+};
+msInfo: MSInfo = NARROW[ref];
+MSRetrieve.GetBodyPartViaCallback[msInfo.msH, proc];
+};
+MSMarkMessage: PROC [ref: REF] RETURNS [] ~ {
+ENABLE MSRetrieve.Failed => ERROR MailRetrieve.Failed[FromMSFailureReason[why], text];
+msInfo: MSInfo = NARROW[ref];
+MSRetrieve.MarkMessage[msInfo.msH];
+};
+
+MSDeleteMessage: PROC [ref: REF] RETURNS [] ~ {
+ENABLE MSRetrieve.Failed => ERROR MailRetrieve.Failed[FromMSFailureReason[why], text];
+msInfo: MSInfo = NARROW[ref];
+MSRetrieve.DeleteMessage[msInfo.msH];
+};
+
+MSAccept: PROC [ref: REF] RETURNS [] ~ {
+ENABLE MSRetrieve.Failed => ERROR MailRetrieve.Failed[FromMSFailureReason[why], text];
+msInfo: MSInfo = NARROW[ref];
+MSRetrieve.Accept[msInfo.msH];
+};
+RopeFromMSPostmark: PROC [env: MSBasics.Envelope] RETURNS [id: ROPE] = {
+RETURN [MailUtils.GeneratePostmark[gmt: BasicTime.FromNSTime[env.postmark.time], machine: MSUtils.RopeFromMSRName[env.postmark.postedAt]] ];
+};
+
+Intelligible: PROC[timeStamp: MailBasics.Timestamp, sender: ROPE] RETURNS[ROPE] = {
+nameCount: INT ¨ 0;
+timeBuf.length ¨ 0;
+FOR i: INT IN [0..sender.Length[]) DO
+c: CHAR = sender.Fetch[i];
+IF ~(Ascii.Letter[c] OR Ascii.Digit[c]) THEN LOOP;
+timeBuf ¨ RefText.AppendChar[timeBuf, c];
+IF (nameCount ¨ nameCount + 1) >= 8 THEN EXIT;
+ENDLOOP;
+timeBuf ¨ RefText.AppendChar[timeBuf, '-];	-- after name
+timeBuf ¨ Convert.AppendTimeRFC822[timeBuf, MailUtils.GetTimeFromPostmark[timeStamp]];
+FOR i: NAT IN [0..timeBuf.length) DO
+SELECT timeBuf[i] FROM
+' , '\t  => timeBuf[i] ¨ '-;
+': => timeBuf[i] ¨ '.;
+ENDCASE;
+ENDLOOP;
+RETURN[Rope.FromRefText[timeBuf]];
+};
+
+timeBuf: REF TEXT ¨ NEW[TEXT[RefText.line]];
+
+highXNS: MSBasics.BodyPartType = 499;
+
+MapMSBodyPartType: PROC [type: MSBasics.BodyPartType] RETURNS [mapped: MailBasics.ItemType] ~ {
+SELECT type FROM
+MSBasics.lastBodyPart => mapped ¨ MailBasicsItemTypes.lastItem;  -- last item;
+< highXNS => mapped ¨ type;  -- direct map
+ENDCASE => mapped ¨ highXNS;  -- hopefully won't see these for awhile
+};
+
+MapMSItemContents: PROC [bp: MSBasics.BodyPartInfo, msInfo: MSInfo] RETURNS [item: STREAM ¨ NIL, length: INT] ~ {
+SELECT bp.type FROM
+MSMessage.headingBodyPart => {  -- convert X.400 header to text
+header, plainText, formatting: ROPE;
+item ¨ MSRetrieve.GetBodyPart[msInfo.msH];
+[header, plainText, formatting, msInfo.bodyAnnotSize] ¨ MSMessage.GetHeaderRope[item];
+length ¨ Rope.Length[header];
+item ¨ IO.RIS[header];
+IF plainText # NIL AND ( tiogaTextOK ) THEN {
+msInfo.plainTextFromHeader ¨ plainText;
+msInfo.formattingFromHeader ¨ formatting;
+};
+};
+ENDCASE => {  -- return body part as is
+length ¨ bp.sizeInBytes;
+item ¨ NIL;  -- get it from server if requested
+};
+};
+
+BuildMSEnvelopeItem: PROC [envelope: MSBasics.Envelope] RETURNS [item: STREAM, length: INT] ~ {
+rope: ROPE ¨ MSUtils.RopeFromEnvelope[envelope];
+item ¨ IO.RIS[rope];
+length ¨ Rope.Length[rope];
+};
+FromMSMboxState: PROC [msState: MSRetrieve.MboxState] RETURNS [state: MBXState] ~  {
+state ¨ VAL[ORD[msState]];
+};
+
+FromMSServerState: PROC [msState: MSRetrieve.ServerState] RETURNS [state: ServerState] ~  {
+state ¨ VAL[ORD[msState]];
+};
+
+FromMSFailureReason: PROC [msWhy: MSRetrieve.FailureReason] RETURNS [why: FailureReason] ~  {
+why ¨ SELECT msWhy FROM
+$RPC => $communicationFailure,
+$Protocol => $unknownFailure,
+$Service => $connectionRejected,
+$Authentication => $badCredentials,
+ENDCASE => $unknownFailure;
+};
+ChangeReportFromMS: MSRetrieve.ChangeReportProc ~ {
+FOR mL: LIST OF MSInfo ¨ msInfoList, mL.rest UNTIL mL=NIL DO
+IF mL.first.msH = handle THEN
+mL.first.reportChanges[mL.first.handle, FromMSMboxState[state] ];
+ENDLOOP;
+};
+
+InitProcs: PROC = {
+mailRetrieveProcs: MailRetrieve.MailRetrieveProcsRef ¨
+NEW[MailRetrieve.MailRetrieveProcs ¨ [
+which: $xns,
+Close: MSClose,
+NewUser: MSNewUser,
+MailboxState: MSMailboxState,
+NextServer: MSNextServer,
+ServerName: MSServerName,
+UserName: MSUserName,
+NextMessage: MSNextMessage,
+StartMessage: MSStartMessage,
+NextItem: MSNextItem,
+GetItem: MSGetItem,
+GetItemAsRope: MSGetItemAsRope,
+GetItemViaCallback: MSGetItemViaCallback,
+MarkMessage: MSMarkMessage,
+DeleteMessage: MSDeleteMessage,
+Accept: MSAccept
+]];
+
+MailRetrieve.RegisterMailRetrieveProcs[mailRetrieveProcs];
+};
+
+InitProcs[];
+
+END.
+  `  
+MSMailRetrieveImpl.mesa
+Copyright ” 1988, 1989, 1990, 1991 by Xerox Corporation.  All rights reserved.
+Doug Terry, December 12, 1988 6:06:03 pm PST
+Willie-sue, November 6, 1992 11:23 am PST
+Wes Irish, December 22, 1988 6:11:51 pm PST
+
+The glue between MailRetrieveImpl & MSRetrieveImpl; taken from the old MailRetrieveImpl
+
+Handles
+A RetrieveHandle allows clients to retrieval mail from one or more mailboxes on one or more different types of mail servers.  Associated with each handle is a list of mailboxes.  For each mailbox, there is a record that holds the information needed to interact with the mail service maintaining the appropriate mailbox.
+XNS Mail Service:
+Global Variables
+Registered procedures
+Releases resources used by this handle.  Further use of this handle is illegal.
+
+Provides new user name and password, and starts authentication and mailbox checking.  This can be called several times to associate several mailboxes with the handle.
+
+Returns the current mailbox state.  Will not return "unknown" or "userOK" (These change to "cantAuth" or "allDown" after suitable timeouts if necessary.)
+
+Returns information about the next server in the mailbox site list of the user (or the first server if reset=TRUE), and that server becomes the "current server".  If there is no such server, noMore=TRUE, in which case the next call to "NextServer" will start a new sequence of mail retrieval.  If the state is "unknown", attempting to access the mailbox is inadvisable, as the server is probably down.  If the state is "empty", there may in fact be mail, as the state is only a hint obtained by polling. 
+
+Provides the name of the current server.
+
+Provides the name of the current mailbox being accessed.
+
+Returns information about the next message in the mailbox, and that message becomes the "current message".  If there is no such message, msgExists=FALSE.  If deleted=TRUE then the message is really just a placeholder and has been removed from the mailbox; you should not attempt to access the message.  Returning archived=TRUE indicates that the message has been spilled to some file server, and accessing it is likely to be much slower.  If read=TRUE then the message is not new, i.e. it has been previously marked as being read. 
+
+Returns information from the envelope of the message.
+Note: we should be able to get the proper "reply-to" name out of the message envelope if it is present; unfortunately, MSRetrieve doesn't provide the complete envelope so we'll reply to the originator for now.
+
+
+Skips the remainder of any previous item, then delivers the header of the next item.
+This implementation is responsible for mediating between the types of items that Grapevine returns and those that this interface returns; ditto for XNS mail body parts.
+we can't try to strip out the RFC822 extra headers inside an nsTextFile, because they are embedded inside a serialized file - we'd have to pick apart the serialized file and re-write it, which is too much of a pain
+thows away plainText & formatting from GetNSTextFile
+[currentItem, ih.length] _ MapMSItemContents[bp, msInfo];
+
+Provides an IO stream for reading the current item.
+
+Provides the current item as a ROPE.
+
+Provides the current item via a callback.
+
+Marks current message as being read.
+Deletes current message.
+Flush the mailbox entirely (and irrecoverably).
+Postmarks
+Message body items
+Grapevine item types and XNS body part types are mapped into a single number space as follows:  The low XNS body part types (in the range [0..highXNS)) are mapped directly.  Currently (as of November 30, 1988), there are no allocated XNS body part types that do not lie in this range.  Any that are encountered are currently mapped to highXNS.  The high Grapevine item types (in the range (lowGV..GVBasics.LastItem)) are also mapped directly.  Known Grapevine item types that do not lie in this range include the server-supplied "envelope" items; these are handled on a case-by-case basis.  Other item types that do not lie in the directly-mapped range are mapped to lowGV.
+Note: envelope: MailBasics.ItemType = 500;
+Note: postscript: MailBasics.ItemType = 510;
+
+Item contents are generally passed to clients in the same form as they are retrieved from a mail service.  In some cases, however, we transform the items before returning them.  For example, Grapevine's Text items include both the header and the message body; we split these by reading the heading off the item stream and leaving the body.  Also, Grapevine always returns the Recipients as the first and only envelope item; we map this to a complete envelope.  For XNS mail, X.400 style headers are converted to RFC-822 text headers.
+
+Returning a NIL item stream means that the item's contents will be requested from the mail service on demand.  In any case, the length returned should be accurate.
+
+Envelope information is put together into a single "envelope" item that looks like a RFC-822 header.  For XNS mail, we have all of the relevant information in MSBasics.Envelope.  For Grapevine, the StartMessage call returns all but the intended recipients, which is generally returned as the first item.
+
+Type conversions
+State reporting
+[state: MboxState, handle: Handle]
+ ù p  ïNewlineDelimiter
+ñ(cedarcode) styleô codeïMarkoutsideHeaderöœbôKöú
+œeúCôNKöú)œkô,Kô)Köú+ô+Kô KöúWôWKô óöü	ò	KòKöú
+üúüúò"KòKöüúòKöúòKòKòKòKöúòKöú
+üú)ò8Köú	ò	Köú
+üú"ò1KöúòKòKöüúòKòKöúòKòKöúüúòKòKöú
+üúò-óKò ö—blnúüúüò!Köüúüú;üúFò©KöúüòKò KöüúüúüúüúòKöüúüúüúòKöúüúò#Köú
+üúò'Köúüúò-Köúüúò+öúüúò1Kò óóheadôKöúøôøò Kò óöüúôKöúüúüúòöúüúüúòKöúœcò-Köú°ò<Köú °*òJKöúüú°*ò9Köúüú°*ò:Köúüú°(ò>Köú°&ò?Köú°ò/Köúüú°/òJKöúüú°/òKKöúüú°(òCKöúN°òfKöúüúò%KòóóóôKöúüúüú
+üúò!KöúüúüúòKöúüú"ò5Köú)°òBKò óôöœnúüúüúüúò'KöúOôOKöúüúòKöúòKòKô óö¢	úüú4üúüúüúüúüúòùKöú¶ô¶Köúüúò Kò0Köú0üúüúüúüúüúògKò%KòKöú6ò6Köúüúò&Köüú	òKòKô óö¢úüúüúüúòAKöúôôôKöüúüú5òVKöúüúòKòAKòKô óö
+¢úüúüúüú	üú+òaKöúmüúUüúÆô¯Köüúüú5òVKöúüúòKöú ò Köú	üú#ò0Kò6öüúüúüúòKò#KòKòóKòKô óö¢úüúüúüú#òHKöú(ô(KöúüúòKòKòLKòKô óö¢
+úüúüúüú!òDKöú8ô8KöúüúòKòKò4KòKô óö
+¢úüúüúüú&üúòXKö	úìüúüúòüúyüúPôìöüúüú5òVKöúüúòKò óKò7KöúüúòKöú
+üúòöüúüúòKò<KòJKöúüúòKòóKòKô óö¢úüúüúüú[òÇKöú5ô5öüúüú5òVKöúüúòóKò KòAKòOKòKöú—ô—KòKòKô óöúüú8òIKô óö
+¢
+úüúüúüú*üúòXKöúTôTKöúîüúô®Köüúüú5òVKöúüúòKöúòKöúüúüúòö¢úüúüúüúò>Köúüúò
+Köúüúò"Kô÷öüú9üúüúòHKöúüú°ò7Köúüú/üú?òzKöú
+üúüú]òpKöú
+üúüúüúüúüúòhKöúüúòKöúüúòKò Köúüú8üúüúò_öüúüúüúòKö	úüúüúüúüú'òKöúüú8üúüúò_Kö
+üúüúüúüú)üúòbKòóKò KöúòKò#KöúòKöúüú8üú.üú4ò©KòJKòöüúòKöúüúäòíKòJKòóóKöúüúüúòKòKòóö¢úüúüú üúòDKò$Köúüúò KòLKò,öüúüúòKòKöüúüúò4KòóKòHKòGKòóöüúüú°ò/KòAKò@KöúüúòKöüúòKòóöüúüúüú°òBKòFKöúüúüúò+Kò.KöúüúòKöüúòKòóöüúüúüúò*KòOKöúüúüúò1Kò4Köúüúò!KöüúòKòóöüúüúüúò+Kò?Köúüúüúò2Kò5Köúüúò"KöüúòKòóKò)Kò?öüú	üòöú"üú1üúüú!òÅöüúòKöú4ô4KöúüúòKò#Köúüúüúò!KòJKò KòóóKò`Kò?KòEKòCKòDKöüú=òDóKöú9ô9KòKô óö
+¢	úüúüúüúüúò/Köúüú%ô3Köüúüú5òVKöúüúòKöüú%ò+KòKô óö
+¢úüúüúüúüúò7Köú$ô$Köüúüú5òVKöúüúòKò.öüúEüúüúònKöúüúòKòKö
+üúüúüúüúüúò?KòKöüúüúòóKòKô óö¢úüúüú)òMKöú)ô)Köüúüú5òVö¢úüúüúüúò&KöüúüúòKòóKöúüúòKöú4ò4KòKô óö¢úüúüúüúò-Kô$Köüúüú5òVKöúüúòKöú#ò#KòKò óö¢úüúüúüúò/KôKöüúüú5òVKöúüúòKöú%ò%KòKò óö¢úüúüúüúò(Köú/ô/Köüúüú5òVKöúüúòKöúòKòóóô	ö¢úüúüúüúòHKöüúÜòåKòKò óö
+¢úüú)üúüúüúòSKöúüúòKòöüúüúüúüò%KöúüúòKöüúüúüúüúò2Kò)Köüú"üúüúò.KöüúòóKöú+°ò8KòVöüúüúüúüò$öüúüòKòKòKöüúòóKöüúòóKöüúò"KòKò óKö	ú	üúüúüúüúò,óôKöúüúLüúüú¥ô°Kò Kò%Köú*ô*Köú,ô,Kò ö¢úüúüú"ò_öüúüòKöúA°òNKöú°ò*Köüú°'òEóKòKò óKô Köú—üú,üúôïKô ö¢úüú-üúüúüú
+üúòqKöúüúîô£öüú	üòöú °ò?Köúüúò$Kò*KòVKòKöúüúüú	òöüúüúüúüúò-Kò'Kò)KòóKòóöüú°ò'KòKöúüú°"ò/KöúòóóKòKò óKô KöúUüúüú¬ôØKô ö
+¢úüúüúüú
+üúò_Köúüú&ò0KöúüúüúòKòKòóóôö¢úüú!üúòTKöúüúüúòKöúòKò óö¢úüú#üúò[KöúüúüúòKöúòKò óö¢úüú#üúò]öúüúüòKöúòKöúòKöú ò Köú#ò#KöüúòóKöúòóóôö¢ú!ò3Köœs"ô"öüúüúüúüúüúüò<KöüúüúAò_KöüúòóKòKò óö¢	úüúòò6öüú#ò&KöúòKö–bnú
+òKö¢úòKö¢úòKö¢
+úòKö¢
+úòKö¢úòKö¢úòKö¢úòKö¢úòKö¢úòKö¢úòKö¢úò)Kö¢úòKö¢úòKö¢ú
+òKöúòKò óóKöú:ò:KòKò óKòóKò Köüúòó Öó    7   Z  

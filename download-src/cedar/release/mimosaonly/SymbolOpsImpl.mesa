@@ -1,0 +1,973 @@
+
+DIRECTORY
+Alloc USING [Handle, Index, Notifier, AddNotify, Bounds, DropNotify, Top, Units],
+Basics USING [BITRSHIFT, LowHalf],
+ConvertUnsafe,
+Literals USING [Base],
+MimZones USING [permZone],
+MobDefs USING [VersionStamp],
+OSMiscOps USING [WordAnd, WordXor],
+SymbolOps USING [BodyVisitor, DecodeBti, PackedSize],
+Symbols USING [Base, BitAddress, BitCount, bodyType, BTIndex, BTNull, codeCHAR, ContextLevel, CSEIndex, CSENull, CTXIndex, CTXNull, CTXRecord, ctxType, ExtensionType, HashVector, HTIndex, HTNull, HTRecord, htType, HVIndex, ISEIndex, ISENull, lG, Linkage, lL, lZ, MDFirst, MDIndex, MDNull, MDRecord, mdType, Name, nullName, nullType, RecordSEIndex, RecordSENull, RefClass, SEPointer, SERecord, seTag, seType, ssType, TransferMode, Type, typeANY, TypeClass, typeTYPE, UNSPEC],
+SymbolSegment USING [Base, ExtFirst, ExtIndex, ExtRecord, extType, ltType, stType, treeType],
+SymbolTable USING [],
+SymbolTablePrivate USING [SymbolTableBaseRep],
+Table USING [IndexRep],
+Target: TYPE MachineParms USING [PackedBitCount, bitsPerAU, bitsPerWord, logBitsPerAU],
+Tree USING [Base, Link, Map, Null],
+UnsafeStorage USING [GetSystemUZone];
+SymbolOpsImpl: PROGRAM
+IMPORTS Alloc, Basics, ConvertUnsafe, MimZones, OSMiscOps, SymbolOps, UnsafeStorage
+EXPORTS SymbolOps, SymbolTable = {
+OPEN Symbols;
+
+BodyVisitor: TYPE = SymbolOps.BodyVisitor;
+STB: TYPE = REF SymbolTableBaseRep;
+SymbolTableBaseRep: PUBLIC TYPE = SymbolTablePrivate.SymbolTableBaseRep;
+SubString: TYPE = ConvertUnsafe.SubString;
+UNSPEC: TYPE = Symbols.UNSPEC;
+
+bitsPerUnit: NAT = BITS[WORD];
+charsPerUnit: NAT = BITS[UNIT]/BITS[CHAR];
+charsPerWord: NAT = BITS[WORD]/BITS[CHAR];
+Card: PROC [value: Symbols.UNSPEC] RETURNS [CARD] = INLINE {
+RETURN [LOOPHOLE[value]];
+};
+
+TypeInfo: PROC [info: Symbols.UNSPEC] RETURNS [Type] = INLINE {
+RETURN [LOOPHOLE[info]];
+};
+FindString: PUBLIC PROC [stb: STB, s: SubString] RETURNS [name: Name] = {
+name ¨ stb.hashVec[HashValue[stb, s]];
+WHILE name # nullName DO
+ss: SubString ¨ SubStringForName[stb, name];
+IF s.EqualSubStrings[ss] THEN EXIT;
+name ¨ stb.htb[name].link;
+ENDLOOP;
+};
+
+HashValue: PUBLIC PROC [stb: STB, s: SubString] RETURNS [HVIndex] = {
+Mask: WORD = 337b;	-- masks out ASCII case shifts
+len: WORD ¨ s.length;
+lm: WORD ¨ s.length-1;
+first: WORD ¨ OSMiscOps.WordAnd[s.base[s.offset].ORD, Mask];
+last: WORD ¨ OSMiscOps.WordAnd[s.base[s.offset+len-1].ORD, Mask];
+RETURN [OSMiscOps.WordXor[first*200b - first + last, len*20b-len]
+MOD stb.hashVec≠.LENGTH];
+};
+
+SubStringForName: PUBLIC PROC
+[stb: STB, name: Name] RETURNS [s: ConvertUnsafe.SubString] = {
+s.base ¨ stb.ssb;
+IF name = nullName
+THEN s.offset ¨ s.length ¨ 0
+ELSE s.length ¨ stb.htb[name].ssIndex - (s.offset ¨ stb.htb[name-HTRecord.SIZE].ssIndex+1);
+};
+CtxLevel: PUBLIC PROC [stb: STB, ctx: CTXIndex] RETURNS [ContextLevel] = {
+RETURN [IF ctx = CTXNull THEN lZ ELSE stb.ctxb[ctx].level];
+};
+
+CtxEntries: PUBLIC PROC [stb: STB, ctx: CTXIndex] RETURNS [n: CARDINAL ¨ 0] = {
+IF ctx = CTXNull THEN RETURN;
+WITH c: stb.ctxb[ctx] SELECT FROM
+included => IF ~c.reset THEN RETURN;
+ENDCASE;
+FOR sei: ISEIndex ¨ FirstCtxSe[stb, ctx], NextSe[stb, sei] UNTIL sei = ISENull DO
+n ¨ n+1;
+ENDLOOP;
+};
+
+FirstCtxSe: PUBLIC PROC [stb: STB, ctx: CTXIndex] RETURNS [ISEIndex] = {
+RETURN [IF ctx = CTXNull THEN ISENull ELSE stb.ctxb[ctx].seList];
+};
+
+NextSe: PUBLIC PROC [stb: STB, sei: ISEIndex] RETURNS [ISEIndex] = {
+IF sei # ISENull THEN
+WITH id: stb.seb[sei] SELECT FROM
+sequential => RETURN [sei + SERecord.id.sequential.SIZE];
+linked => RETURN [id.link];
+ENDCASE;
+RETURN [ISENull];
+};
+
+SearchContext: PUBLIC PROC [stb: STB, name: Name, ctx: CTXIndex] RETURNS [ISEIndex] = {
+IF ctx # CTXNull AND name # nullName THEN {
+root: ISEIndex ¨ stb.ctxb[ctx].seList;
+sei: ISEIndex ¨ root;
+WHILE sei # ISENull DO
+IF stb.seb[sei].hash = name THEN RETURN [sei];
+WITH id: stb.seb[sei] SELECT FROM
+sequential => sei ¨ sei + SERecord.id.sequential.SIZE;
+linked => IF (sei ¨ id.link) = root THEN EXIT;
+ENDCASE => EXIT;
+ENDLOOP;
+};
+RETURN [ISENull];
+};
+
+SeiForValue: PUBLIC PROC [stb: STB, value: UNSPEC, ctx: CTXIndex] RETURNS [ISEIndex] = {
+FOR sei: ISEIndex ¨ FirstCtxSe[stb, ctx], NextSe[stb, sei] UNTIL sei = ISENull DO
+IF stb.seb[sei].idValue = value THEN RETURN [sei];
+ENDLOOP;
+RETURN [ISENull];
+};
+FindMdi: PUBLIC PROC [stb: STB, stamp: MobDefs.VersionStamp] RETURNS [MDIndex] = {
+FOR mdi: MDIndex ¨ MDFirst, mdi + MDRecord.SIZE UNTIL mdi = stb.mdLimit DO
+IF stb.mdb[mdi].stamp = stamp THEN RETURN [mdi];
+ENDLOOP;
+RETURN [MDNull];
+};
+ArgCtx: PUBLIC PROC [stb: STB, type: CSEIndex] RETURNS [CTXIndex] = {
+sei: RecordSEIndex = ArgRecord[stb, type];
+RETURN [IF sei = RecordSENull THEN CTXNull ELSE stb.seb[sei].fieldCtx];
+};
+
+ArgRecord: PUBLIC PROC [stb: STB, type: CSEIndex] RETURNS [RecordSEIndex] = {
+IF type # nullType THEN
+WITH stb.seb[type] SELECT FROM
+record => RETURN [LOOPHOLE[type, RecordSEIndex]];
+ENDCASE;
+RETURN [RecordSENull];
+};
+
+ClusterSe: PUBLIC PROC [stb: STB, type: Type] RETURNS [Type] = {
+DO
+WITH t: stb.seb[type] SELECT FROM
+id => {
+next: Type = TypeInfo[t.idInfo];
+IF NOT t.extended THEN
+WITH u: stb.seb[next] SELECT FROM
+id => IF t.hash = u.hash THEN {type ¨ next; LOOP};
+ENDCASE;
+};
+ENDCASE;
+RETURN [type];
+ENDLOOP;
+};
+
+EqTypes: PUBLIC PROC [stb: STB, type1, type2: Type] RETURNS [BOOL] = {
+IF type1 # type2 THEN {
+ut1: CSEIndex = UnderType[stb, type1];
+ut2: CSEIndex = UnderType[stb, type2];
+IF ut1 # ut2 THEN {
+WITH se1: stb.seb[ut1] SELECT FROM
+record => 
+WITH se2: stb.seb[ut2] SELECT FROM
+record => {
+IF se1.fieldCtx = se2.fieldCtx THEN
+IF se1.painted = se2.painted THEN RETURN [TRUE];
+};
+ENDCASE;
+ENDCASE;
+RETURN [FALSE];
+};
+};
+RETURN [TRUE];
+};
+
+NormalType: PUBLIC PROC [stb: STB, type: Type] RETURNS [CSEIndex] = {
+WHILE type # nullType DO
+sei: CSEIndex = UnderType[stb, type];
+WITH t: stb.seb[sei] SELECT FROM
+subrange => type ¨ t.rangeType;
+ENDCASE => RETURN [sei];
+ENDLOOP;
+RETURN [CSENull];
+};
+
+RecordLink: PUBLIC PROC [stb: STB, type: RecordSEIndex] RETURNS [RecordSEIndex] = {
+WITH t: stb.seb[type] SELECT FROM
+linked => RETURN [LOOPHOLE[UnderType[stb, t.linkType], RecordSEIndex]];
+ENDCASE;
+RETURN [RecordSENull];
+};
+
+RecordRoot: PUBLIC PROC [stb: STB, type: RecordSEIndex] RETURNS [root: RecordSEIndex] = {
+root ¨ type;
+DO
+next: RecordSEIndex ¨ RecordLink[stb, root];
+IF next = RecordSENull THEN RETURN [root];
+root ¨ next;
+ENDLOOP;
+};
+
+ReferentType: PUBLIC PROC [stb: STB, type: Type] RETURNS [Type] = {
+sei: CSEIndex = NormalType[stb, type];
+WITH t: stb.seb[sei] SELECT FROM
+ref => RETURN [t.refType];
+ENDCASE => RETURN [typeANY];
+};
+
+TransferTypes: PUBLIC PROC
+[stb: STB, type: Type] RETURNS [typeIn, typeOut: RecordSEIndex] = {
+sei: CSEIndex = UnderType[stb, type];
+WITH t: stb.seb[sei] SELECT FROM
+transfer => RETURN [typeIn: ArgRecord[stb, t.typeIn], typeOut: ArgRecord[stb, t.typeOut]];
+ENDCASE;
+RETURN [RecordSENull, RecordSENull];
+};
+
+TypeForm: PUBLIC PROC [stb: STB, type: Type] RETURNS [TypeClass] = {
+RETURN [IF type = nullType THEN $nil ELSE stb.seb[UnderType[stb, type]].typeTag];
+};
+
+TypeLink: PUBLIC PROC [stb: STB, type: Type] RETURNS [Type] = {
+sei: CSEIndex = UnderType[stb, type];
+WITH se: stb.seb[sei] SELECT FROM
+record => WITH se SELECT FROM linked => RETURN [linkType]; ENDCASE;
+ENDCASE;
+RETURN [nullType];
+};
+
+TypeRoot: PUBLIC PROC [stb: STB, type: Type] RETURNS [root: Type] = {
+root ¨ type;
+DO
+next: Type ¨ TypeLink[stb, root];
+IF next = nullType THEN RETURN [root];
+root ¨ next;
+ENDLOOP;
+};
+
+UnderType: PUBLIC PROC [stb: STB, type: Type] RETURNS [CSEIndex] = {
+sei: Type ¨ type;
+WHILE sei # nullType DO
+sep: SEPointer = @stb.seb[sei];
+IF LOOPHOLE[sei, Table.IndexRep].tag # seTag THEN ERROR;
+WITH se: sep≠ SELECT FROM
+id => {IF se.idType # typeTYPE THEN ERROR; sei ¨ TypeInfo[se.idInfo]};
+cons => EXIT;
+ENDCASE => ERROR;
+ENDLOOP;
+RETURN [LOOPHOLE[sei, CSEIndex]];
+};
+
+XferMode: PUBLIC PROC [stb: STB, type: Type] RETURNS [TransferMode] = {
+sei: CSEIndex = UnderType[stb, type];
+RETURN [WITH t: stb.seb[sei] SELECT FROM transfer => t.mode, ENDCASE => $none];
+};
+bitsPerAU: CARDINAL = Target.bitsPerAU;
+bitsPerWord: CARDINAL = Target.bitsPerWord;
+unitFill: CARDINAL = bitsPerAU-1;
+
+AUsForType: PUBLIC PROC [stb: STB, type: Type] RETURNS [CARD] = {
+RETURN [Basics.BITRSHIFT[BitsForType[stb, type]+unitFill, Target.logBitsPerAU]];
+};
+
+BitsForType: PUBLIC PROC [stb: STB, type: Type] RETURNS [b: BitCount ¨ 0] = {
+DO
+sei: CSEIndex = UnderType[stb, type];
+IF sei = CSENull THEN RETURN [0];
+WITH t: stb.seb[sei] SELECT FROM
+mode => {b ¨ bitsPerWord; EXIT};
+basic => {b ¨ t.length; EXIT};
+signed => {b ¨ t.length; EXIT};
+unsigned => {b ¨ t.length; EXIT};
+real => {b ¨ t.length; EXIT};
+enumerated => {IF NOT t.empty THEN b ¨ BitsForRange[Cardinality[stb, sei]-1]; EXIT};
+record => {b ¨ t.length; EXIT};
+ref => {b ¨ t.length; EXIT};
+array => {
+b ¨ BitsPerElement[stb, t.componentType, t.packed]*Cardinality[stb, t.indexType];
+IF b > bitsPerAU THEN b ¨ ((b + unitFill)/bitsPerAU)*bitsPerAU;
+EXIT;
+};
+arraydesc => {b ¨ t.length; EXIT};
+transfer => {b ¨ t.length; EXIT};
+relative => type ¨ t.offsetType;
+opaque => {b ¨ t.length; EXIT};
+zone => {b ¨ t.length; EXIT};
+subrange => {
+IF NOT t.empty THEN b ¨ BitsForRange[Cardinality[stb, sei]-1];
+EXIT;
+};
+ENDCASE => RETURN [0];
+ENDLOOP;
+};
+
+BitsPerElement: PUBLIC PROC [stb: STB, type: Type, packed: BOOL] RETURNS [BitCount] = {
+nBits: BitCount ¨ BitsForType[stb, type];
+mod: NAT ¨ Basics.LowHalf[nBits] MOD bitsPerWord;
+IF packed AND (nBits#0 AND nBits<=Target.PackedBitCount.LAST) THEN
+RETURN [SymbolOps.PackedSize[nBits]];
+IF mod # 0 THEN nBits ¨ nBits + (bitsPerWord-mod);
+RETURN [nBits];
+};
+
+Cardinality: PUBLIC PROC [stb: STB, type: Type] RETURNS [CARD] = {
+DO
+sei: CSEIndex = UnderType[stb, type];
+WITH t: stb.seb[sei] SELECT FROM
+enumerated => IF NOT t.empty THEN RETURN [t.range+1];
+subrange => IF NOT t.empty THEN RETURN [t.range+1];
+basic => IF t.code = codeCHAR THEN RETURN [256];
+relative => {type ¨ t.offsetType; LOOP};
+ENDCASE;
+RETURN [0];
+ENDLOOP;
+};
+
+FindExtension: PUBLIC PROC
+[stb: STB, sei: ISEIndex] RETURNS [type: ExtensionType, tree: Tree.Link] = {
+FOR exti: SymbolSegment.ExtIndex
+¨ SymbolSegment.ExtFirst, exti + SymbolSegment.ExtRecord.SIZE
+UNTIL exti = stb.extLimit DO
+IF stb.extb[exti].sei = sei THEN RETURN [stb.extb[exti].type, stb.extb[exti].tree];
+ENDLOOP;
+RETURN [$none, Tree.Null];
+};
+
+FnField: PUBLIC PROC
+[stb: STB, field: ISEIndex] RETURNS [offset: BitAddress ¨ [0], size: BitCount ¨ 0] = {
+FOR sei: ISEIndex ¨ FirstCtxSe[stb, stb.seb[field].idCtx], NextSe[stb, sei] DO
+size ¨ BitsForType[stb, stb.seb[sei].idType] + (bitsPerWord-1);
+size ¨ size - (Basics.LowHalf[size] MOD bitsPerWord);
+IF sei = field THEN EXIT;
+offset ¨ [offset + size];
+ENDLOOP;
+};
+
+NameForSe: PUBLIC PROC [stb: STB, sei: ISEIndex] RETURNS [Name] = {
+RETURN [IF sei = ISENull THEN nullName ELSE stb.seb[sei].hash];
+};
+
+LinkMode: PUBLIC PROC [stb: STB, sei: ISEIndex] RETURNS [Linkage] = {
+IF stb.seb[sei].idType = typeTYPE
+THEN {
+IF TypeForm[stb, TypeInfo[stb.seb[sei].idInfo]] = $opaque THEN RETURN [$type];
+}
+ELSE
+SELECT XferMode[stb, stb.seb[sei].idType] FROM
+$proc, $program =>
+IF NOT stb.seb[sei].constant OR stb.seb[sei].extended THEN RETURN [$val];
+$signal, $error => IF NOT stb.seb[sei].constant THEN RETURN [$val];
+ENDCASE => IF NOT stb.seb[sei].constant THEN RETURN [$ref];
+RETURN [$manifest];
+};
+
+RecField: PUBLIC PROC
+[stb: STB, field: ISEIndex] RETURNS [offset: BitAddress, size: BitCount] = {
+RETURN [offset: [bd: Card[stb.seb[field].idValue]], size: Card[stb.seb[field].idInfo]];
+};
+
+RCType: PUBLIC PROC [stb: STB, type: Type] RETURNS [RefClass] = {
+tv: Type ¨ type;
+struc: RefClass ¨ $simple;
+DO
+sei: CSEIndex = UnderType[stb, tv];
+WITH t: stb.seb[sei] SELECT FROM
+record =>
+SELECT TRUE FROM
+~t.hints.refField => RETURN [$none];
+t.hints.unifield => {tv ¨ stb.seb[stb.ctxb[t.fieldCtx].seList].idType; LOOP};
+ENDCASE => RETURN [$composite];
+ref => IF t.counted THEN RETURN [struc];
+array => {struc ¨ $composite; tv ¨ t.componentType; LOOP};
+relative => {tv ¨ t.offsetType; LOOP};
+subrange => {tv ¨ t.rangeType; LOOP};
+union => IF t.hints.refField THEN RETURN [$composite];
+sequence => {struc ¨ $composite; tv ¨ t.componentType; LOOP};
+zone => IF t.counted THEN RETURN [struc];
+ENDCASE;
+RETURN [$none];
+ENDLOOP;
+};
+
+VariantField: PUBLIC PROC [stb: STB, type: CSEIndex] RETURNS [sei: ISEIndex] = {
+WITH t: stb.seb[type] SELECT FROM
+record =>
+FOR sei ¨ FirstCtxSe[stb, t.fieldCtx], NextSe[stb, sei] UNTIL sei = ISENull DO
+SELECT TypeForm[stb, stb.seb[sei].idType] FROM
+$sequence, $union => EXIT;
+ENDCASE;
+ENDLOOP;
+ENDCASE => sei ¨ ISENull;
+};
+ParentBti: PUBLIC PROC [stb: STB, bti: BTIndex] RETURNS [BTIndex] = {
+WHILE bti # BTNull DO
+next: BTIndex ¨ stb.bb[bti].link.index;
+IF stb.bb[bti].link.which = $parent THEN RETURN [next];
+bti ¨ next;
+ENDLOOP;
+RETURN [BTNull];
+};
+
+SiblingBti: PUBLIC PROC [stb: STB, bti: BTIndex] RETURNS [BTIndex] = {
+IF stb.bb[bti].link.which = $sibling
+THEN RETURN [stb.bb[bti].link.index]
+ELSE RETURN [BTNull];
+};
+
+SonBti: PUBLIC PROC [stb: STB, bti: BTIndex] RETURNS [BTIndex] = {
+RETURN [stb.bb[bti].firstSon];
+};
+
+EnumerateBodies: PUBLIC PROC
+[stb: STB, root: BTIndex, proc: SymbolOps.BodyVisitor] RETURNS [bti: BTIndex] = {
+bti ¨ root;
+UNTIL bti = BTNull DO
+IF proc[bti] THEN RETURN;
+IF stb.bb[bti].firstSon # BTNull
+THEN bti ¨ stb.bb[bti].firstSon
+ELSE
+DO
+prev: BTIndex ¨ bti;
+IF bti = root THEN RETURN [BTNull];
+bti ¨ stb.bb[bti].link.index;
+IF stb.bb[prev].link.which # $parent THEN EXIT;
+ENDLOOP;
+ENDLOOP;
+};
+BitsForRange: PUBLIC PROC [maxValue: CARD] RETURNS [nBits: BitCount ¨ 1] = {
+fieldMax: CARD ¨ 1;
+WHILE nBits < bitsPerWord AND fieldMax < maxValue DO
+nBits ¨ nBits + 1;
+fieldMax ¨ 2*fieldMax + 1;
+ENDLOOP
+};
+own: PUBLIC STB ¨ NIL;
+
+table: Alloc.Handle;
+
+initialized: BOOL ¨ FALSE;
+ssUnits: Alloc.Index;
+hashVec: LONG POINTER TO HashVector;
+
+htb: Symbols.Base;		-- hash table
+ssb: LONG STRING;		-- id string
+seb: Symbols.Base;		-- se table
+ctxb: Symbols.Base;		-- context table
+mdb: Symbols.Base;		-- module directory base
+bb: Symbols.Base;		-- body table
+extb: SymbolSegment.Base;	-- extension table
+
+UpdateBases: Alloc.Notifier = {
+own.hashVec ¨ hashVec;
+own.htb ¨ htb ¨ base[htType];
+own.ssb ¨ ssb ¨ LOOPHOLE[base[ssType], ConvertUnsafe.LS];
+own.seb ¨ seb ¨ base[seType];
+own.ctxb ¨ ctxb ¨ base[ctxType];
+own.mdb ¨ mdb ¨ base[mdType];
+own.bb ¨ bb ¨ base[bodyType];
+own.tb ¨ base[SymbolSegment.treeType];
+own.ltb ¨ base[SymbolSegment.ltType];
+own.stb ¨ base[SymbolSegment.stType];
+own.extb ¨ extb ¨ base[SymbolSegment.extType];
+IF own.notifier # NIL THEN own.notifier[own];
+};
+
+Initialize: PUBLIC PROC [ownTable: Alloc.Handle, scratchZone: UNCOUNTED ZONE] = { 
+IF initialized THEN Finalize[];
+IF own = NIL THEN own ¨ MimZones.permZone.NEW[SymbolTableBaseRep];
+hashVec≠ ¨ ALL[HTNull];
+own.notifier ¨ NIL;
+own.mdLimit ¨ MDFirst;
+own.extLimit ¨ SymbolSegment.ExtFirst;
+own.mainCtx ¨ CTXNull;
+own.stHandle ¨ NIL;
+own.sourceFile ¨ NIL;
+table ¨ ownTable;
+table.AddNotify[UpdateBases];
+ssUnits ¨ table.Units[ssType, TEXT[0].SIZE] + TEXT[0].SIZE;
+ssb≠ ¨ StringBody[length: 0, maxlength: 0, text:];
+IF AllocateHash[] # nullName THEN ERROR;
+IF MakeNonCtxSe[SERecord.cons.nil.SIZE] # CSENull THEN ERROR;
+seb[CSENull] ¨ SERecord[mark3: FALSE, mark4: FALSE, body: cons[
+align: none, typeInfo: nil[]]];
+IF MakeNonCtxSe[SERecord.cons.mode.SIZE] # typeTYPE THEN ERROR;
+seb[typeTYPE] ¨ SERecord[mark3: TRUE, mark4: TRUE, body: cons[
+align: none, typeInfo: mode[]]];
+IF table.Units[ctxType, CTXRecord.nil.SIZE] # CTXNull THEN ERROR;
+ctxb[CTXNull] ¨ CTXRecord[varUpdated: FALSE, seList: ISENull, level: lZ, extension: nil[]];
+initialized ¨ TRUE;
+};
+
+Reset: PUBLIC PROC = {
+nC: CARDINAL = (table.Bounds[ssType].size - TEXT[0].SIZE)*charsPerWord;
+desc: SubString;
+hvi: HVIndex;
+htLimit: HTIndex = table.Top[htType];
+ssUnits ¨ table.Top[ssType];
+ssb≠ ¨ StringBody[length: htb[htLimit-HTRecord.SIZE].ssIndex, maxlength: nC, text:];
+hashVec≠ ¨ ALL[HTNull];
+FOR hti: HTIndex ¨ HTNull+HTRecord.SIZE, hti+HTRecord.SIZE UNTIL hti = htLimit DO
+desc ¨ SubStringForName[own, hti];
+hvi ¨ HashValue[own, desc];
+htb[hti].link ¨ hashVec[hvi];
+hashVec[hvi] ¨ hti;
+htb[hti].anyInternal ¨ htb[hti].anyPublic ¨ FALSE;
+ENDLOOP;
+own.mdLimit ¨ table.Top[mdType];
+own.extLimit ¨ table.Top[SymbolSegment.extType];
+};
+
+Finalize: PUBLIC PROC = {
+table.DropNotify[UpdateBases];
+table ¨ NIL;
+initialized ¨ FALSE;
+};
+
+
+EnterString: PUBLIC PROC [s: SubString] RETURNS [name: Name] = {
+hvi: HVIndex = HashValue[own, s];
+desc: SubString;
+offset, nLen: CARDINAL;
+length: [0..255];
+ssi: Alloc.Index;
+FOR name ¨ hashVec[hvi], htb[name].link UNTIL name = nullName DO
+desc ¨ SubStringForName[own, name];
+IF ConvertUnsafe.EqualSubStrings[s, desc] THEN RETURN [name];
+ENDLOOP;
+offset ¨ ssb.length;
+length ¨ s.length;
+nLen ¨ ssb.length+length+1;
+IF nLen > ssb.maxlength THEN {
+nUnits: CARDINAL = StringBody[nLen].SIZE - StringBody[ssb.length].SIZE;
+nChars: CARDINAL = nUnits*charsPerUnit;
+IF (ssi ¨ table.Units[ssType, nUnits]) # ssUnits THEN ERROR;
+ssUnits ¨ ssUnits + nUnits;
+ssb≠ ¨ StringBody[length: offset, maxlength: ssb.maxlength + nChars, text:];
+};
+ssb[ssb.length] ¨ VAL[length];
+ssb.length ¨ ssb.length + 1;
+ConvertUnsafe.AppendSubString[to: ssb, from: s];
+name ¨ AllocateHash[];
+htb[name].link ¨ hashVec[hvi];
+hashVec[hvi] ¨ name;
+};
+
+AllocateHash: PROC RETURNS [HTIndex] = {
+hti: HTIndex = table.Units[htType, HTRecord.SIZE];
+htb[hti] ¨ HTRecord[
+anyInternal: FALSE, anyPublic: FALSE,
+link: HTNull,
+ssIndex: ssb.length];
+RETURN [hti];
+};
+
+HashBlock: PUBLIC PROC RETURNS [LONG POINTER TO HashVector] = {
+RETURN [hashVec];
+};
+
+
+StaticNestError: PUBLIC SIGNAL = CODE;
+
+NextLevel: PUBLIC PROC [cl: ContextLevel] RETURNS [nl: ContextLevel] = {
+IF cl+1 < ContextLevel.LAST THEN nl ¨ cl+1 ELSE {SIGNAL StaticNestError; nl ¨ cl};
+};
+
+BlockLevel: PUBLIC PROC [cl: ContextLevel] RETURNS [nl: ContextLevel] = {
+RETURN [IF cl = lG THEN lL ELSE cl];
+};
+
+
+ctxLevelSplit: NAT = (ContextLevel.LAST+1)/2;
+
+Circular: PROC [ctx: CTXIndex] RETURNS [BOOL] = INLINE {
+RETURN [WITH c: ctxb[ctx] SELECT FROM included => ~c.reset, ENDCASE=> FALSE];
+};
+
+NewCtx: PUBLIC PROC [level: ContextLevel] RETURNS [ctx: CTXIndex] = {
+ctx ¨ table.Units[ctxType, CTXRecord.simple.SIZE];
+ctxb[ctx] ¨ [
+level: level,
+varUpdated: FALSE,
+seList: ISENull,
+extension: simple[]];
+};
+
+SetMainCtx: PUBLIC PROC [ctx: CTXIndex] = {
+own.mainCtx ¨ ctx;
+};
+
+SetCtxLevel: PUBLIC PROC [ctx: CTXIndex, level: ContextLevel] = {
+ctxb[ctx].level ¨ level;
+};
+
+ResetCtxList: PUBLIC PROC [ctx: CTXIndex] = {
+sei: ISEIndex = ctxb[ctx].seList;
+IF sei # ISENull THEN {ctxb[ctx].seList ¨ NextSe[own, sei]; SetSeLink[sei, ISENull]};
+};
+
+FirstVisibleSe: PUBLIC PROC [ctx: CTXIndex] RETURNS [sei: ISEIndex] = {
+sei ¨ ctxb[ctx].seList;
+WHILE sei # ISENull AND seb[sei].idCtx # ctx DO sei ¨ NextSe[own, sei] ENDLOOP;
+};
+
+NextVisibleSe: PUBLIC PROC [sei: ISEIndex] RETURNS [next: ISEIndex] = {
+next ¨ sei;
+IF next # ISENull THEN DO
+next ¨ NextSe[own, next];
+IF next = ISENull OR seb[next].idCtx = seb[sei].idCtx THEN EXIT;
+ENDLOOP;
+};
+
+VisibleCtxEntries: PUBLIC PROC [ctx: CTXIndex] RETURNS [n: CARDINAL ¨ 0] = {
+IF ctx = CTXNull OR Circular[ctx] THEN RETURN;
+FOR sei: ISEIndex ¨ FirstCtxSe[own, ctx], NextSe[own, sei] UNTIL sei = ISENull DO
+IF seb[sei].idCtx = ctx THEN n ¨ n+1;
+ENDLOOP;
+};
+
+CtxVariant: PUBLIC PROC [ctx: CTXIndex] RETURNS [ISEIndex] = {
+FOR sei: ISEIndex ¨ FirstCtxSe[own, ctx], NextSe[own, sei] UNTIL sei = ISENull DO 
+IF TypeForm[own, seb[sei].idType] = union THEN RETURN [sei];
+ENDLOOP;
+RETURN [ISENull];
+};
+
+
+MakeSeChain: PUBLIC PROC
+[ctx: CTXIndex, n: CARDINAL, linked: BOOL] RETURNS [ISEIndex] = {
+IF n # 0 THEN {
+seChain: ISEIndex = table.Units[seType,
+(n-1)*SERecord.id.sequential.SIZE + 
+(IF linked THEN SERecord.id.linked.SIZE ELSE SERecord.id.terminal.SIZE)];
+sei: ISEIndex ¨ seChain;
+THROUGH [1..n) DO
+seb[sei] ¨ [mark3: FALSE, mark4: FALSE, body:
+id[idCtx: ctx, hash: nullName, ctxLink: sequential[]]];
+sei ¨ sei + SERecord.id.sequential.SIZE;
+ENDLOOP;
+IF linked
+THEN
+seb[sei] ¨ [mark3: FALSE, mark4: FALSE, body:
+id[idCtx: ctx, hash: nullName, ctxLink: linked[ISENull]]]
+ELSE
+seb[sei] ¨ [mark3: FALSE, mark4: FALSE, body:
+id[idCtx: ctx, hash: nullName, ctxLink: terminal[]]];
+RETURN [seChain];
+};
+RETURN [ISENull];
+};
+
+MakeCtxSe: PUBLIC PROC [name: Name, ctx: CTXIndex] RETURNS [ISEIndex] = {
+next: ISEIndex ¨ ISENull;
+sei: ISEIndex = table.Units[seType, SERecord.id.linked.SIZE];
+SELECT TRUE FROM
+(ctx = CTXNull) => {};
+Circular[ctx] => {
+pSei: ISEIndex = ctxb[ctx].seList;
+IF pSei = ISENull
+THEN next ¨ sei
+ELSE {next ¨ NextSe[own, pSei]; SetSeLink[pSei, sei]};
+ctxb[ctx].seList ¨ sei;
+};
+ENDCASE => {
+pSei: ISEIndex ¨ ctxb[ctx].seList;
+IF pSei = ISENull
+THEN ctxb[ctx].seList ¨ sei
+ELSE {
+UNTIL (next ¨ NextSe[own, pSei]) = ISENull DO pSei ¨ next ENDLOOP;
+SetSeLink[pSei, sei];
+};
+};
+seb[sei] ¨ [mark3: FALSE, mark4: FALSE, body:
+id[idCtx: ctx, hash: name, ctxLink: linked[link: next]]];
+RETURN [sei];
+};
+
+NameClash: PUBLIC SIGNAL [name: Name] = CODE;
+
+FillCtxSe: PUBLIC PROC [sei: ISEIndex, name: Name, public: BOOL] = {
+ctx: CTXIndex = seb[sei].idCtx;
+seb[sei].hash ¨ name;
+IF name # nullName THEN {
+IF htb[name].anyInternal AND ctx # CTXNull THEN
+FOR pSei: ISEIndex ¨ FirstCtxSe[own, ctx], NextSe[own, pSei] UNTIL pSei = sei DO
+IF seb[pSei].hash = name THEN {SIGNAL NameClash[name]; EXIT};
+ENDLOOP;
+htb[name].anyInternal ¨ TRUE;
+IF public THEN htb[name].anyPublic ¨ TRUE;
+};
+};
+
+EnterExtension: PUBLIC PROC [sei: ISEIndex, type: ExtensionType, tree: Tree.Link] = {
+OPEN SymbolSegment;
+exti: ExtIndex;
+extLimit: ExtIndex = own.extLimit;
+FOR exti ¨ ExtFirst, exti + ExtRecord.SIZE UNTIL exti = extLimit DO
+IF extb[exti].sei = sei THEN GO TO Update;
+REPEAT
+Update => extb[exti] ¨ ExtRecord[sei:sei, type:type, tree:tree];
+FINISHED =>
+IF tree # Tree.Null THEN {
+exti ¨ table.Units[extType, ExtRecord.SIZE];
+own.extLimit ¨ own.extLimit + ExtRecord.SIZE;
+extb[exti] ¨ ExtRecord[sei:sei, type:type, tree:tree]};
+ENDLOOP;
+seb[sei].extended ¨ TRUE;
+};
+
+SetSeLink: PUBLIC PROC [sei, next: ISEIndex] = {
+WITH seb[sei] SELECT FROM linked => link ¨ next; ENDCASE => ERROR;
+};
+
+MakeNonCtxSe: PUBLIC PROC [size: CARDINAL] RETURNS [CSEIndex] = {
+sei: CSEIndex = table.Units[seType, size];
+seb[sei] ¨ [mark3: FALSE, mark4: FALSE, body: cons[align: unknown, typeInfo: ]];
+RETURN [sei];
+};
+
+
+CopyBasicType: PUBLIC PROC [type: CSEIndex] RETURNS [copy: CSEIndex] = {
+WITH master: seb[type] SELECT FROM
+basic => {
+copy ¨ MakeNonCtxSe[SERecord.cons.basic.SIZE];
+seb[copy] ¨ SERecord[
+mark3: master.mark3, mark4: master.mark4,
+body: cons[align: master.align, typeInfo: basic[
+code: master.code, ordered: master.ordered, length: master.length]]];
+};
+ENDCASE => copy ¨ typeANY;
+};
+
+CopyXferType: PUBLIC PROC
+[type: CSEIndex, mapper: Tree.Map] RETURNS [copy: CSEIndex] = {
+WITH master: seb[type] SELECT FROM
+transfer => {
+copy ¨ MakeNonCtxSe[SERecord.cons.transfer.SIZE];
+seb[copy] ¨ SERecord[
+mark3: master.mark3, mark4: master.mark4,
+body: cons[align: master.align, typeInfo: transfer[
+mode: master.mode, safe: master.safe,
+typeIn: CopyArgs[master.typeIn, NIL],
+typeOut: CopyArgs[master.typeOut, mapper]]]]};
+ENDCASE => copy ¨ typeANY;
+};
+
+CopyArgSe: PUBLIC PROC [copy, master: ISEIndex] = {
+CopyArg[copy, master, NIL];
+};
+
+CopyArgs: PROC [args: CSEIndex, mapper: Tree.Map] RETURNS [copy: CSEIndex] = {
+IF args = CSENull
+THEN copy ¨ CSENull
+ELSE
+WITH t: seb[args] SELECT FROM
+record => {
+ctx1: CTXIndex = t.fieldCtx;
+ctx2: CTXIndex = NewCtx[CtxLevel[own, ctx1]];
+seChain: ISEIndex = MakeSeChain[ctx2, CtxEntries[own, ctx1], FALSE];
+sei1: ISEIndex ¨ ctxb[ctx1].seList;
+sei2: ISEIndex ¨ ctxb[ctx2].seList ¨ seChain;
+UNTIL sei1 = ISENull DO
+CopyArg[sei2, sei1, mapper];
+sei1 ¨ NextSe[own, sei1]; sei2 ¨ NextSe[own, sei2];
+ENDLOOP;
+copy ¨ MakeNonCtxSe[SERecord.cons.record.notLinked.SIZE];
+seb[copy] ¨ SERecord[mark3: t.mark3, mark4: t.mark4, body: cons[
+align: t.align,
+typeInfo: record[
+spare: t.spare,
+machineDep: FALSE,
+packed: FALSE,
+list: FALSE,
+monitored: FALSE,
+painted: FALSE,
+argument: TRUE,
+bitOrder: t.bitOrder,
+grain: t.grain,
+hints: t.hints,
+fieldCtx: ctx2,
+length: t.length,
+linkPart: notLinked[]]]];
+};
+any => {
+copy ¨ MakeNonCtxSe[SERecord.cons.any.SIZE];
+seb[copy] ¨ SERecord[mark3: t.mark3, mark4: t.mark4,
+body: cons[align: t.align, typeInfo: any[]]];
+};
+ENDCASE => ERROR;
+};
+
+CopyArg: PROC [copy, master: ISEIndex, mapper: Tree.Map] = {
+seb[copy].hash ¨ seb[master].hash;
+seb[copy].public ¨ seb[master].public;
+seb[copy].immutable ¨ seb[master].immutable;
+seb[copy].constant ¨ seb[master].constant;
+seb[copy].idType ¨ seb[master].idType;
+seb[copy].idInfo ¨  seb[master].idInfo;
+seb[copy].idValue ¨ seb[master].idValue;
+seb[copy].linkSpace ¨ FALSE;
+seb[copy].mark3 ¨ seb[master].mark3; seb[copy].mark4 ¨ seb[master].mark4;
+IF mapper # NIL AND seb[master].extended
+THEN {
+type: ExtensionType;
+t: Tree.Link;
+[type, t] ¨ FindExtension[own, master];
+EnterExtension[copy, type, mapper[t]];
+}
+ELSE seb[copy].extended ¨ FALSE;
+};
+
+
+LinkBti: PUBLIC PROC [bti, parent: BTIndex] = {
+prev: BTIndex;
+IF parent # BTNull THEN
+IF (prev ¨ bb[parent].firstSon) = BTNull
+THEN bb[parent].firstSon ¨ bti
+ELSE {
+UNTIL bb[prev].link.which = parent DO prev ¨ bb[prev].link.index ENDLOOP;
+bb[prev].link ¨ [which: sibling, index: bti];
+};
+bb[bti].link ¨ [which:parent, index:parent];
+};
+
+DelinkBti: PUBLIC PROC [bti: BTIndex] = {
+prev, next: BTIndex;
+parent: BTIndex = ParentBti[own, bti];
+IF parent # BTNull THEN {
+prev ¨ bb[parent].firstSon;
+IF prev = bti
+THEN
+bb[parent].firstSon ¨
+IF bb[bti].link.which = parent THEN BTNull ELSE bb[bti].link.index
+ELSE {
+UNTIL (next ¨ bb[prev].link.index) = bti DO prev ¨ next ENDLOOP;
+bb[prev].link ¨ bb[next].link;
+};
+};
+bb[bti].link ¨ [which: parent, index: BTNull];
+};
+
+
+ConstantId: PUBLIC PROC [sei: ISEIndex] RETURNS [BOOL] = {
+IF seb[sei].constant THEN
+SELECT XferMode[own, seb[sei].idType] FROM
+proc, signal, error, program =>
+RETURN [seb[sei].mark4 AND SymbolOps.DecodeBti[seb[sei].idInfo] = BTNull];
+ENDCASE => RETURN [TRUE];
+RETURN [FALSE];
+};
+
+
+hashVec ¨ UnsafeStorage.GetSystemUZone[].NEW[HashVector ¨ ALL[HTNull]];
+
+}.
+  û  
+SymbolOpsImpl.mesa
+Copyright ” 1986, 1987, 1988, 1991 by Xerox Corporation.  All rights reserved.
+Satterthwaite, June 18, 1986 10:28:58 am PDT
+Russ Atkinson (RRA) January 20, 1989 5:02:37 pm PST
+JKF October 13, 1988 12:49:08 pm PDT
+Willie-s, September 24, 1991 4:52 pm PDT
+loopholes for Symbols.UNSPEC
+hash manipulation
+context management
+module management
+type manipulation
+Is this good enough?
+This happens if a truly nasty sei is used
+information returning procedures
+Gives a conservative estimate
+Gives a conservative estimate
+Note: must round up to word boundary for function fields
+body table management
+utilities not requiring a symbol table
+From SymbolPackExt (only useful for own symbols)
+called whenever the main symbol table is repacked
+called to set up the compiler's symbol table 
+hash entry creation
+Need to expand the string.
+lexical level accounting
+context table manipulation
+makes a non-include context entry
+change the list for ctx to a proper chain
+semantic entry creation
+copying within current table
+body table utilities
+attribute extraction
+START HERE
+Russ Atkinson (RRA) July 31, 1987 6:28:05 pm PDT
+changed CopyArgs to copy bitOrder & grain fields
+
+ ù #V  ñ(cedarcode) styleïNewlineDelimiter
+ô headöúôIcodeöú
+œeúCôNLöœy)–kyô,Löúœkú!ô3Lô$Lô(óò ö†	ò	Löú†úFòQLöú†ú†	úò"LöúòLöú	†úòLöú	†úòLöú†úòLöú
+†úò#Löú
+†ú&ò5Löú†ú≈†úò⁄Löú†úJò]Löú†úòLöú†úò.Löú†úòLöú†ú†ú8òWLöú†úò#Löú†úò%óóöœnú†òLö†úLòSLö†úò"Lö†ú	òLò Löú†úò*Lö†ú†ú†úò#Löú†ú†ú)òHLöú†úò*Lö†ú†ú†úòLò Löú†ú†ú†úòLöú†ú†ú†ú†ú†úò*Löú†ú†ú†ú†ú†úò*óöú†ôö°ú†ú†ú†ú†ú†úò<Lö†ú†ú	òLöúòLò óö
+°ú†ú†ú†ú
+†úò?Lö†ú†úòLöúòóóöúôö
+°
+ú†ú†ú†ú†úòILöú&ò&ö†ú†òLöú,ò,Lö†ú†ú†úò#LöúòLö†úòóLöúòLò óö
+°	ú†ú†ú†ú†úòELö°ú†ú	œcò1Löú†úòLöú†úòLöú†ú&†úò<Löú†ú,†úòALö†ú<†ú†úò[LöúòLò óö
+°ú†ú†ú†ú†ú!ò]Löúòö†úòLö†úòLö†úF†úò[óLöúòóóöúôö
+°ú†ú†ú†ú†úòJLö†ú†ú†ú†úò;LöúòLò óö°
+ú†ú†ú†ú†ú†ú	òOLö†ú†ú†úòö†ú†ú†ò!Löú†ú
+†ú†úò$Lö†úòóö†ú8†ú†òQLöúòLö†úòóLöúòLò óö
+°
+ú†ú†ú†ú†úòHLö†ú†ú†ú	†úòALöúòLò óö
+°ú†ú†ú†ú†úòDö†ú†òö†ú†ú†ò!Löú†ú†úò9Löú
+†úòLö†úòóóLö†úòLöúòLò óö
+°ú†ú†ú†ú†úòWö†ú†ú†úò+Löú&ò&Lòö†ú†òLö†ú†ú†úò.ö†ú†ú†ò!Löú1†úò6Löú
+†ú†ú†úò.Lö†ú†úòóLö†úòóLöúòóLö†úòLöúòLò óö°ú†ú†ú†ú	†ú†úòXö†ú8†ú†òQLö†ú†ú†úò2Lö†úòóLö†úòLöúòóóöúôö
+°ú†ú†ú†ú†úòRö†ú(†ú†ú†òJLö†ú†ú†úò0Lö†úòóLö†ú
+òLöúòóóöúôö
+°ú†ú†ú†ú†úòELöú*ò*Lö†ú†ú†ú	†úòGLöúòLò óö
+°	ú†ú†ú†ú†úòMö†ú†òö†ú†ú†òLöú
+†ú†úò1Lö†úòóóLö†úòLöúòLò óö
+°	ú†ú†ú†ú†úò@ö†òö†ú†ú†ò!òLöú ò ö†ú†ú†òö†ú†ú†ò!Löú†ú†ú†úò2Lö†úòóóLöúòóLö†úòóLö†úòLö†úòóLöúòLò óö°ú†ú†ú†ú†ú†úòFö†ú†úòLöú&ò&Löú&ò&ö†ú†úòö†ú†ú†ò"ò
+ö†ú†ú†ò"òLôö†ú†ò#Lö†ú†ú†ú†úò0óLòóLö†úòóóLö†úòóLö†ú†úòLòóLòóLö†ú†úòLöúòLò óö
+°
+ú†ú†ú†ú†úòEö†ú†òLöú%ò%ö†ú†ú†ò LöúòLö†ú†úòóLö†úòóLö†úòLöúòLò óö
+°
+ú†ú†ú†ú†úòSö†ú†ú†ò!Löú
+†ú†ú-òGLö†úòóLö†úòöúòLò óóö
+°
+ú†ú†ú†ú†úòYLòö†òLöú,ò,Lö†ú†ú†úò*LöúòLö†úòóLöúòLò óö
+°ú†ú†ú†ú†úòCLöú&ò&ö†ú†ú†ò Löú†úòLö†ú†úòóöúòLò óóö
+°ú†ú†ú†ú†ú%ò^Löú%ò%ö†ú†ú†ò Löú†úHòZLö†úòóLö†úò$LöúòLò óö
+°ú†ú†ú†ú†úòDLö†ú†ú†ú†ú(òQLöúòLò óö
+°ú†ú†ú†ú†úò?Löú%ò%ö†ú†ú†ò!Löú
+†ú†ú†ú†ú†úòCLö†úòóLö†úòLöúòLò óö
+°ú†ú†ú†ú†úòELòö†òLöú!ò!Lö†ú†ú†úò&LöúòLö†úòóLöúòLò óö
+°	ú†ú†ú†ú†úòDLòö†ú†òLöúòö†ú†ú"†ú†úò8Lô)óö†ú
+†ú†òLöú†ú†ú†úòFLöú†úòLö†ú†úòóLö†úòóLö†ú†úò!LöúòLò óö
+°ú†ú†ú†ú†úòGLöú%ò%Lö
+†ú†ú†ú†ú†úòOLöúòóóöú ô Löú†úò'Löú†úò+Löú
+†úò!Lò ö°
+ú†ú†ú†ú†ú†úòALôLö†ú	†	ú8òPLöúòLò óö
+°ú†ú†ú†ú†úòMLôö†òLöú%ò%Lö†ú†ú†úò!ö†ú†ú†ò Löú†úò Löú†úòLöú†úòLöú†úò!Löú†úòLö	ú†ú†ú	†ú,†úòTLöú†úòLöú†úòò
+LöúQòQLö†ú†ú*ò?Lö†úòLòóLöú†úò"Löú†úò!Löú ò Löú†úòLöú†úòöúòLö†ú†ú	†ú+ò>Lö†úòLöúòóLö†ú†úòóLö†úòóLöúòLò óö°ú†ú†ú†ú†ú†úòWLöú)ò)Löú†ú†úò1ö	†ú†ú
+†ú†ú†òBLö†úò%óLö†ú	†ú#ò2Lö†ú	òLöúòLò óö°ú†ú†ú†ú†ú†úòBö†òLöú%ò%ö†ú†ú†ò Lö	ú†ú†ú	†ú†úò5Lö	ú†ú†ú	†ú†úò3Löú	†ú†ú†úò0Löú"†úò(Lö†úòóLö†úòLö†úòóLöúòLò óö
+°ú†ú†ú†ú†ú+ògö†úW†
+ú†ò{Lö†ú†ú†ú,òSLö†úòóLö†úòLöúòLò óö
+°ú†ú†ú†ú†ú3òkö†úI†òNLô8Löú?ò?Löú$†úò5Lö†ú†ú†úòLöúòLö†úòóLöúòLò óö
+°	ú†ú†ú†ú†úòCLö†ú†ú†ú
+†úò?LöúòLò óö
+°ú†ú†ú†ú†úòEö†úò!ö†úòLö†ú8†ú†ú	òNLòóö†òö†ú$†ò.òLö
+†ú†ú†ú†ú†úòIóLö	ú†ú†ú†ú†úòCLö
+†ú†ú†ú†ú†úò;óóóLö†úòLöúòLò óö
+°ú†ú†ú†ú†ú)òbLö†úQòWLöúòLò óö
+°ú†ú†ú†ú†úòALöúòLòö†òLöú#ò#ö†ú†ú†ò ò	ö†ú†ú†òLöú†ú	ò$LöúG†úòMLö†ú†úòóóLöú†ú†ú†ú	ò(Löú4†úò:Löú †úò&Löú†úò%Löú	†ú†ú†úò6Löú7†úò=Löú†ú†ú†ú	ò)Lö†úòóLö†ú	òLö†úòóLöúòLò óö
+°ú†ú†ú†ú†úòPö†ú†ú†ò!ò	ö†ú5†ú†òNö†ú$†ò.Löú†úòLö†úòóLö†úòóóLö†úòóLöúòóóöúôö
+°	ú†ú†ú†ú†úòEö†ú†òLöú'ò'Lö†ú"†ú†úò7LöúòLö†úòóLö†ú
+òLöúòLò óö
+°
+ú†ú†ú†ú†úòFLö
+†ú#†ú†ú†ú†ú
+ò_LöúòLò óö
+°ú†ú†ú†ú†úòBLö†úòLöúòóLò ö
+°ú†ú†ú†ú.†úònLòö†ú†òLö†ú†ú†úòö†úò Lö†úòö†òö†òLòLö†ú†ú†ú
+ò#LöúòLö†ú#†ú†úò/Lö†úòóóóLö†úòóLöúòóóöú&ô&ö
+°ú†ú†ú†ú†úòLLöú
+†úòö†ú†ú†ò4LöúòLöúòLö†òóLöúòóóô0öú†ú†ú†úòLò óöúòLò óLöú†ú†úòLöúòöú	†ú†ú†úò$Lò óLöú¢ò!Löú†ú†ú¢òLöú¢òLöú¢ò%Löú¢ò,Löú¢ò Löú¢ò,Lò ö°úòLöú1ô1LòLöúòLöú†ú†úò9LòLò LòLòLò&Lò%Lò%Lò.Lö†ú†ú†úò-LòLò óö
+°
+ú†ú†ú'†	ú†úòRLöú-ô-Lö†ú†úòLö†ú†ú†ú†úòBLöú†ú	òLöú†úòLöúòLöú&ò&LöúòLöú†úòLöú†úòLòLòLö	ú†ú†ú†ú†úò;Löú2ò2Lö†ú†ú†úò(Lö†ú †ú†ú†úò=Löú†ú	†ú-ò_Lö†ú!†ú†ú†úò?Löú †ú	†ú.ò_Lö†ú$†ú†ú†úòALöú&†ú0ò[Löú†úòLöúòLò óö°ú†ú†úòLöú†ú †ú†úòGLòLòLöú%ò%LòLöú/†ú!òTLöú†ú	òö	†ú †ú†ú†ú†òQLöú"ò"LòLòLòLöú,†úò2Lö†úòóLò Lò0LòLò óö°ú†ú†úòLöúòLöú†úòLöú†úòLöúòLò óLöúôò ö°ú†ú†ú†úò@Lò!LòLöú†úòLöúòLòö†ú%†ú†ò@Löú#ò#Lö†ú(†ú†úò=Lö†úòóLòLòLöúòö†ú†úòLöúôLöú†ú†ú†úòGLöú†úò'Lö†ú/†ú†úò<LöúòLöúLòLLöúòóLöú†ú	òLöúòLöú0ò0LòLòLòLöúòLò óö°ú†ú†úò(Löú,†úò2òLöú†ú†úò%LòLòóLö†úòLöúòLò óö°	ú†ú†ú†ú†ú†ú†úò?Lö†úòLöúòLò óóöúôLò Lö°ú†ú†ú†úò&Lò ö°	ú†ú†ú†úòHLö
+†ú†ú†ú†ú†úòRLöúòLò óö°
+ú†ú†ú†úòILö†ú†ú	†ú†úò$LöúòóLò óöúôLò Löú†ú†úò-Lò ö
+°ú†ú†ú†ú†úò8Lö†ú†ú†ú†ú†ú†úòMLöúòLò óö°ú†ú†ú†úòELöú!ô!Löú,†úò2òLöúòLöú†úòLòLòóLöúòLò óö°
+ú†ú†úò+LöúòLöúòóLò ö°ú†ú†ú)òALöúòLöúòóLò ö°ú†ú†úò-Löú)ô)Lò!Lö†ú†ú@òULöúòLò óö°ú†ú†ú†úòGLòLö†ú†ú†ú†úòOLöúòLò óö°ú†ú†ú†úòGLöúòö†ú†ú†òLöúòLö†ú†ú †ú†úò@Lö†úòóLöúòLò óö
+°ú†ú†ú†ú†ú	òLLö†ú†ú†ú†úò.ö†ú8†ú†òQLö†ú†ú	ò%Lö†úòóLöúòLò óö°
+ú†ú†ú†úò>ö†ú8†ú†úòRLö†ú(†ú†úò<Lö†úòóLö†úòLöúòLò óóöúôLò ö°ú†ú†ú†ú
+†ú†úòZö†ú†úòöú'ò'öú†úò$Löú†ú†ú†ú†ú†úòIóóLöúòö†ú†òLöú†ú	†ú?òeLöú#†úò(Lö†úòóö†úò	ö†òLöú†ú	†úAògóö†òLöú†ú	†ú=òcóóLö†úòLòóLö†úòLöúòLò óö°	ú†ú†ú†úòILöúòLöú7†úò=ö†ú†ú†òLòòLöú"ò"ö†úòLö†úòLö†ú2ò6óLòLòóö†úòLöú"ò"ö†úòLö†úòö†úòLö†ú&†ú†úòBLòLòóóLòóóLöú†ú	†úAògLö†úòLöúòLò óLö°	ú†ú†ú†úò-Lò ö°	ú†ú†ú%†úòDLòLòö†ú†úòö†ú†ú†ò/ö†ú:†ú†òPLö†ú†ú†ú†úò=Lö†úòóóLöú†úòLö†ú†ú†úò*LöúòóöúòLò óóö°ú†ú†ú:òULö†úòLòLò"ö†ú#†ú†ú†òCLö†ú†ú†ú†úò*ö†òLò@ö†úòö†ú†úòLöú&†úò,Löú(†úò-Lò7óóóLö†úòóLöú†úòLöúòLò óö°	ú†ú†úò0Lö
+†ú
+†ú†ú†ú†úòBLöúòLò óö
+°ú†ú†ú†ú†úòALöú*ò*Löú†ú	†ú*òPLö†úòLöúòLò óóLöúôò ö°ú†ú†ú†úòHö†ú†ú†ò"ò
+Löú(†úò.òLò)öú0ò0LòEóóLòóLö†úòóLöúòLò óö°ú†ú†ú#†úòYö†ú†ú†ò"òLöú+†úò1òLò)öú3ò3Lò%Löú †úò%Lò.óóóLö†úòóLöúòLò óö°	ú†ú†úò3Löú†úòLöúòóLò ö°ú†ú$†úòNö†úòLö†úòö†òö†ú†ú†òòLòLöú-ò-Löú=†úòDLò#Lò-ö†ú†òLòLöú3ò3Lö†úòóLöú3†úò9ò@LòöúòLòLöú†úòLöú†úòLöú†úòLöú†úòLöú	†úòLöú
+†úòLöúòLöúòLòLòLòLòóóLòóòLöú&†úò,ò4Löú-ò-óLòóLö†ú†úòóóóLöúòLò óö°ú†ú/ò<Lò"Lò&Lò,Lò*Lò&Lò'Lò(Löú†úòLòIö†ú
+†ú†úò(ö†úòLòLòLò'Lò&LòóLö†ú†úò óLöúòLò óóLöúôò ö°ú†ú†úò/Lòö†ú†òö†ú&ò(Lö†úòö†úòLö†ú†ú†úòILò-LòóóóLò,LòLò óö°	ú†ú†úò)LòLöú&ò&ö†ú†úòLòö†úòö†òòLö†ú†ú†úòBóóö†úòLö†ú$†ú†úò@LòLòóóLòóLò.LòLò óóLöúôò ö
+°
+ú†ú†ú†ú†úò:ö†ú†òö†ú †ò*öúòLö†ú†ú0òJóLö†ú†ú†úòóóLö†ú†úòöúòLò óóóóLö†ú†ô
+ò Löú)†ú†ú
+òGLò óLòô0Löú0ô0óLô ó Öó    en  çb  

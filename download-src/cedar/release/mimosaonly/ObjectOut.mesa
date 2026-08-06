@@ -1,0 +1,811 @@
+
+DIRECTORY
+Alloc USING [AddNotify, Base, Bias, Bounds, DropNotify, Handle, Notifier, Top],
+Basics USING [LowHalf, RawBytes],
+CompilerUtil USING [Address, FileByteIndex],
+ConvertUnsafe USING [AppendSubStringToRefText, SubString],
+FileParms USING [Name],
+IO USING [GetIndex, SetIndex, STREAM, UnsafeBlock, UnsafePutBlock],
+LiteralOps USING [CopyLiteral, CopyStringLiteral, ForgetEntries, StringValue, TextType],
+Literals USING [Base],
+MimData USING [codeSeg, compilerVersion, fgTable, fixupLoc, importCtx, interface, mainCtx, moduleCtx, mtRoot, mtRootSize, objectVersion, ownSymbols, source, symSeg, typeAtomRecord],
+MimZones USING [permZone],
+MobDefs USING [FTNull, SGRecord, VersionStamp],
+OSMiscOps USING [Address, Copy, Fill, FreeUnits, Units],
+RCMap USING [Base],
+RCMapOps USING [Acquire, Create, Destroy, GetSpan, RCMT],
+Rope USING [Flatten, Length, Text, TextRep],
+RTMob USING [AnyStamp, RefLitItem, RefLitList, RTHeader, StampIndex, StampList, TypeItem, TypeList, UTInfo],
+SymbolOps USING [HashBlock, SubStringForName],
+Symbols USING [Base, HashVector, MDIndex, MDNull, Name, OwnMdi, Type],
+SymbolSegment USING [Base, bodyType, constType, ctxType, ExtFirst, ExtIndex, ExtRecord, extType, FGHeader, FGTEntry, htType, ltType, mdType, seType, ssType, STHeader, stType, VersionID, WordOffset],
+SymLiteralOps USING [DescribeRefLits, DescribeTypes, EnumerateRefLits, EnumerateTypes, RefLitItem, RefLitsVisitor, TypeIndex, TypesVisitor, UTypeId],
+Table USING [IPointer, Selector, Tag],
+Tree USING [Base, firstIndex, Index, Link, Map, Node, Null, treeTag, treeType],
+TreeOps USING [FreeTree, GetTag, UpdateLeaves],
+TypeStrings USING [Create],
+UnsafeStorage USING [GetSystemUZone];
+ObjectOut: PROGRAM
+IMPORTS Alloc, Basics, ConvertUnsafe, IO, LiteralOps, MimData, MimZones, OSMiscOps, RCMapOps, Rope, SymbolOps, SymLiteralOps, TreeOps, TypeStrings, UnsafeStorage
+EXPORTS CompilerUtil
+SHARES Rope
+= {
+
+STREAM: TYPE = IO.STREAM;
+
+FileByteIndex: TYPE = CompilerUtil.FileByteIndex;
+StreamIndex: TYPE = FileByteIndex;
+Address: TYPE = CompilerUtil.Address;
+
+stream: STREAM ¬ NIL;
+padding: IO.UnsafeBlock ¬ [NIL, 0, 0];
+zone: UNCOUNTED ZONE = UnsafeStorage.GetSystemUZone[];
+
+bytesPerCARD: NAT = BYTES[CARD];
+bytesPerUnit: NAT = BYTES[UNIT];
+bytesPerPage: NAT = 16;
+unitsPerPage: NAT = bytesPerPage / bytesPerUnit;
+unitsPerCARD: NAT = bytesPerCARD / bytesPerUnit;
+
+unitsPerWord: NAT = UNITS[WORD];
+
+TextScratch: TYPE = ARRAY [0..240) OF WORD;
+textScratch: REF TextScratch = MimZones.permZone.NEW[TextScratch];
+
+StringHeaderKludge: TYPE = MACHINE DEPENDENT RECORD [len, max: CARD16];
+StringHeaderStringBodyCheck: NAT[0..0] =
+SIZE[StringHeaderKludge] - SIZE[StringBody[0]];
+StringHeaderKludgeCheck: NAT[0..0] =
+SIZE[SymbolSegment.FGHeader[0]] - SIZE[SymbolSegment.WordOffset] - SIZE[StringHeaderKludge];
+
+RoundUpBytes: PROC [bytes: INT] RETURNS [INT] = INLINE {
+IF bytesPerCARD # 1 THEN {
+mod: CARDINAL = Basics.LowHalf[bytes] MOD bytesPerCARD;
+IF mod # 0 THEN bytes ¬ bytes + (bytesPerCARD-mod);
+};
+RETURN [bytes];
+};
+
+RoundUpUnits: PROC [units: INT] RETURNS [INT] = INLINE {
+IF unitsPerCARD # 1 THEN {
+mod: CARDINAL = Basics.LowHalf[units] MOD unitsPerCARD;
+IF mod # 0 THEN units ¬ units + (unitsPerCARD-mod);
+};
+RETURN [units];
+};
+
+RoundDownBytes: PROC [bytes: INT] RETURNS [INT] = INLINE {
+IF bytesPerCARD # 1 THEN {
+mod: CARDINAL = Basics.LowHalf[bytes] MOD bytesPerCARD;
+IF mod # 0 THEN bytes ¬ bytes - mod;
+};
+RETURN [bytes];
+};
+
+treeTag: Table.Tag = Tree.treeTag;
+
+Suspect: SIGNAL = CODE;
+testMod: BOOL ¬ TRUE;
+testLen: BOOL ¬ TRUE;
+
+PutBytes: PROC [block: IO.UnsafeBlock, pad: BOOL ¬ FALSE] = {
+index: CARD = IO.GetIndex[stream];
+rem: CARDINAL ¬ index MOD bytesPerPage;
+IF testMod AND (rem MOD bytesPerCARD) # 0 THEN SIGNAL Suspect;
+IF block.count # 0 THEN IO.UnsafePutBlock[stream, block];
+rem ¬ Basics.LowHalf[block.count] MOD bytesPerCARD;
+SELECT TRUE FROM
+rem = 0 => {};
+pad => {
+padding.count ¬ bytesPerCARD-rem;
+IO.UnsafePutBlock[stream, padding];
+};
+testLen => SIGNAL Suspect;
+ENDCASE;
+};
+
+NextFilePage: PROC RETURNS [CARD] = {
+index: CARD ¬ IO.GetIndex[stream];
+rem: CARD = index MOD bytesPerPage;
+IF rem # 0 THEN {
+delta: NAT ¬ bytesPerPage - rem;
+padding.count ¬ delta;
+index ¬ index + delta;
+PutBytes[padding];
+};
+RETURN [index];
+};
+
+WriteObjectUnits: PROC [addr: Address, n: CARD] = {
+PutBytes[[base: LOOPHOLE[addr], startIndex: 0, count: n*bytesPerUnit]];
+};
+
+RewriteObjectUnits: PROC [index: StreamIndex, addr: Address, n: CARD] = {
+saveIndex: StreamIndex = stream.GetIndex[];
+stream.SetIndex[index];
+PutBytes[[LOOPHOLE[addr], 0, n*bytesPerUnit]];
+stream.SetIndex[saveIndex];
+};
+
+WriteTableBlock: PROC [p: Table.IPointer, size: CARD] = {
+WriteObjectUnits[LOOPHOLE[p], size];
+};
+
+
+mobOffset: CARD ¬ 0;
+mobIndex: FileByteIndex ¬ 0;
+
+MobIndex: PROC [offset: CARD] RETURNS [FileByteIndex] = INLINE {
+RETURN [mobIndex + offset];
+};
+
+StartMob: PUBLIC PROC = {
+[] ¬ NextFilePage[];
+mobIndex ¬ stream.GetIndex[];
+mobOffset ¬ 0;
+};
+
+ReadMobOffset: PUBLIC PROC RETURNS [CARD] = {
+RETURN [mobOffset / bytesPerUnit];
+};
+
+ReadMobIndex: PUBLIC PROC RETURNS [StreamIndex] = {
+RETURN [MobIndex[mobOffset]];
+};
+
+AppendMobCard: PUBLIC PROC [word: CARD] = {
+Long: PROC [p: LONG POINTER] RETURNS [LONG POINTER] = {RETURN[p]};
+IF IO.GetIndex[stream] MOD bytesPerCARD # 0 THEN ERROR;
+PutBytes[[base: LOOPHOLE[Long[@word]], startIndex: 0, count: bytesPerCARD]];
+mobOffset ¬ mobOffset + bytesPerCARD;
+};
+
+AppendMobPair: PUBLIC PROC [first: CARD16, second: CARD16] = {
+Pair: TYPE = MACHINE DEPENDENT RECORD [first: CARD16, second: CARD16];
+bpp: NAT = BYTES[Pair];
+Long: PROC [p: LONG POINTER] RETURNS [LONG POINTER] = {RETURN[p]};
+pair: Pair ¬ [first: first, second: second];
+IF IO.GetIndex[stream] MOD bytesPerCARD # 0 THEN ERROR;
+PutBytes[[base: LOOPHOLE[Long[@pair]], startIndex: 0, count: bpp]];
+mobOffset ¬ mobOffset + bpp;
+};
+
+AppendMobUnits: PUBLIC PROC [addr: Address, n: CARD] = {
+WriteObjectUnits[addr, n];
+mobOffset ¬ mobOffset + n*bytesPerUnit;
+};
+
+AppendMobString: PUBLIC PROC [s: LONG STRING] = {
+len: CARDINAL = s.length;
+max: CARDINAL = RoundUpBytes[len];
+header: StringHeaderKludge ¬ [len, max];
+AppendMobUnits[@header, StringHeaderKludge.SIZE];
+AppendMobUnits[@s.text, StringBody[max].SIZE - StringBody[0].SIZE];
+};
+
+FillMobPage: PUBLIC PROC = {
+rem: CARDINAL = mobOffset MOD bytesPerPage;
+IF rem # 0 THEN {
+[] ¬ NextFilePage[];
+mobOffset ¬ mobOffset + (bytesPerPage - rem);
+};
+};
+
+UpdateMobUnits: PUBLIC PROC [index: FileByteIndex, addr: Address, n: CARD] = {
+RewriteObjectUnits[index, addr, n];
+};
+
+EndMob: PUBLIC PROC = {
+[] ¬ NextFilePage[];
+};
+
+
+SetFgt: PROC [d: SymbolSegment.WordOffset, sourceFile: FileParms.Name]
+RETURNS [fgBase, fgBytes: CARD ¬ 0] = {
+nu: INT = d;
+MimData.symSeg.units.units ¬ d;
+IF MimData.interface
+THEN {
+MimData.symSeg.extraUnits.units ¬ 0;
+MimData.codeSeg.file ¬ MobDefs.FTNull;
+MimData.codeSeg.base.units ¬ 0;
+MimData.codeSeg.units.units ¬ 0;
+MimData.mtRoot.framesize ¬ 0;
+}
+ELSE { 
+max: INT = RoundUpBytes[Rope.Length[sourceFile]];
+len: CARD = SymbolSegment.FGHeader[max].SIZE + MimData.fgTable.LENGTH*SymbolSegment.FGTEntry.SIZE;
+fgBase ¬ nu;
+fgBytes ¬ bytesPerUnit * len;
+MimData.symSeg.extraUnits.units ¬ len;
+};
+MimData.codeSeg.class ¬ code;
+MimData.codeSeg.extraUnits.units ¬ 0;
+};
+
+
+ltBias: CARD ¬ 0;
+stBias: CARD ¬ 0;
+
+WriteExtensions: PROC [table: Alloc.Handle] RETURNS [size: CARD] = {
+tb: Tree.Base;
+ltb: Literals.Base;	-- output literal table base
+stb: Literals.Base;	-- output string table base
+treeLoc: Tree.Index ¬ Tree.firstIndex;
+initialized: BOOL ¬ FALSE;	-- set after rep of Tree.Null is written
+OutputNotify: Alloc.Notifier = {
+tb ¬ base[Tree.treeType];
+ltb ¬ base[SymbolSegment.ltType];
+stb ¬ base[SymbolSegment.stType];
+seb ¬ base[SymbolSegment.seType];
+ctxb ¬ base[SymbolSegment.ctxType];
+extb ¬ base[SymbolSegment.extType];
+};
+OutputLiteral: PROC [t: Tree.Link.literal] RETURNS [Tree.Link] = {
+t.index ¬ LiteralOps.CopyLiteral[[baseP: @ltb, index: t.index]]-ltBias;
+RETURN [t];
+};
+OutputString: PROC [t: Tree.Link.string] RETURNS [Tree.Link] = {
+t.index ¬ LiteralOps.CopyStringLiteral[baseP: @stb, index: t.index]-stBias;
+RETURN [t];
+};
+SetEmpty: Tree.Map = {RETURN [Tree.Null]};
+OutputTree: Tree.Map = {
+WITH link: t SELECT TreeOps.GetTag[t] FROM
+literal => v ¬ OutputLiteral[link];
+string => v ¬ OutputString[link];
+subtree => {
+s: Tree.Link = TreeOps.UpdateLeaves[link, OutputTree];
+IF s = Tree.Null AND initialized
+THEN v ¬ Tree.Null
+ELSE
+WITH s SELECT TreeOps.GetTag[s] FROM
+subtree => {
+node: Tree.Index = index;
+units: CARD = Tree.Node[tb[node].nSons].SIZE;
+WriteTableBlock[@tb[node], units];	-- common header
+[] ¬ TreeOps.FreeTree[TreeOps.UpdateLeaves[s, SetEmpty]];
+v ¬ [subtree[index: treeLoc]];
+treeLoc ¬ treeLoc + units;
+};
+ENDCASE => v ¬ s;
+};
+ENDCASE => v ¬ link;
+};
+extb: SymbolSegment.Base;
+extLimit: SymbolSegment.ExtIndex;
+seb, ctxb: Symbols.Base;
+table.AddNotify[OutputNotify];
+[] ¬ OutputTree[Tree.Null];
+initialized ¬ TRUE;
+extb ¬ table.Bounds[SymbolSegment.extType].base;
+extLimit ¬ table.Top[SymbolSegment.extType];
+FOR exti: SymbolSegment.ExtIndex ¬ SymbolSegment.ExtFirst,
+exti + SymbolSegment.ExtRecord.SIZE
+UNTIL exti = extLimit DO
+extb[exti].tree ¬
+IF MimData.interface OR extb[exti].type = value OR extb[exti].type = default
+THEN OutputTree[extb[exti].tree]
+ELSE Tree.Null;
+ENDLOOP;
+table.DropNotify[OutputNotify];
+RETURN [treeLoc-Tree.firstIndex];
+};
+
+WriteExtensionTable: PROC [table: Alloc.Handle] RETURNS [CARD] = {
+extb: SymbolSegment.Base ¬ NIL;
+extLimit: SymbolSegment.ExtIndex ¬ table.Top[SymbolSegment.extType];
+OutputNotify: Alloc.Notifier = {extb ¬ base[SymbolSegment.extType]};
+size: CARD ¬ 0;
+table.AddNotify[OutputNotify];
+FOR exti: SymbolSegment.ExtIndex ¬ SymbolSegment.ExtFirst,
+exti + SymbolSegment.ExtRecord.SIZE
+UNTIL exti = extLimit DO
+IF extb[exti].tree # Tree.Null THEN {
+size ¬ size + SymbolSegment.ExtRecord.SIZE;
+WriteTableBlock[@extb[exti], SymbolSegment.ExtRecord.SIZE];
+};
+ENDLOOP;
+table.DropNotify[OutputNotify];
+RETURN [size];
+};
+
+
+<<
+RRA: Obsolete, November 21, 1989 10:13:59 pm PST
+WritePackTables: PROC [table: Alloc.Handle] = {
+nOuter: CARDINAL = MimData.nBodies - MimData.nInnerBodies;
+IF nOuter # 0 THEN {
+OutputNotify: Alloc.Notifier = {bb ¬ base[SymbolSegment.bodyType]};
+BodyLength: PROC [info: Symbols.BodyInfo] RETURNS [CARDINAL] = INLINE {
+RETURN [WITH info SELECT FROM External => bytes, ENDCASE => 0];
+};
+OuterBody: PROC [bti: Symbols.BTIndex] = {
+WITH body: bb[bti] SELECT FROM
+Callable =>
+IF ~body.inline THEN {
+outer[next] ¬ PackageSymbols.OuterPackRecord[
+hti: SymbolOps.NameForSe[MimData.ownSymbols, body.id],
+entryIndex: body.entryIndex,
+length: BodyLength[body.info],
+firstSon: InnerBodies[bti],
+resident: body.resident];
+next ¬ next + 1;
+};
+ENDCASE
+};
+InnerBodies: PROC [root: Symbols.BTIndex] RETURNS [origin: PackageSymbols.IPIndex] = {
+ProcessBody: PROC [bti: Symbols.BTIndex] RETURNS [BOOL] = {
+WITH body: bb[bti] SELECT FROM
+Callable =>
+IF ~body.inline AND body.level > Symbols.lL THEN {
+IF origin # PackageSymbols.IPNull THEN
+WriteObjectUnits[@buffer, PackageSymbols.InnerPackRecord.SIZE];
+buffer ¬ PackageSymbols.InnerPackRecord[
+entryIndex: body.entryIndex,
+length: BodyLength[body.info],
+lastSon: FALSE];
+IF origin = PackageSymbols.IPNull THEN origin ¬ nextIP;
+nextIP ¬ nextIP + 1;
+};
+ENDCASE => NULL;
+RETURN [FALSE];
+};
+buffer: PackageSymbols.InnerPackRecord;
+origin ¬ PackageSymbols.IPNull;
+IF root # Symbols.RootBti
+THEN [] ¬ SymbolOps.EnumerateBodies[MimData.ownSymbols, root, ProcessBody]
+ELSE
+FOR sonBti: Symbols.BTIndex ¬ SymbolOps.SonBti[MimData.ownSymbols, root], SymbolOps.SiblingBti[MimData.ownSymbols, sonBti]
+UNTIL sonBti = Symbols.BTNull DO
+WITH body: bb[sonBti] SELECT FROM
+Callable => NULL;	-- processed as an outer body
+ENDCASE => [] ¬ SymbolOps.EnumerateBodies[
+MimData.ownSymbols, sonBti, ProcessBody];
+ENDLOOP;
+IF origin # PackageSymbols.IPNull THEN {
+buffer.lastSon ¬ TRUE;
+WriteObjectUnits[@buffer, PackageSymbols.InnerPackRecord.SIZE];
+};
+};
+bb: Symbols.Base ¬ NIL;
+outer: REF OuterPackRecordSeq ¬ MimZones.tempZone.NEW[OuterPackRecordSeq[nOuter]];
+outerPtr: LONG POINTER TO PackageSymbols.OuterPackRecord = @outer[0];
+outerDesc: PackDescriptor = DESCRIPTOR[outerPtr, nOuter];
+next: CARDINAL ¬ 0;
+nextIP: PackageSymbols.IPIndex ¬ PackageSymbols.IPIndex.FIRST;
+
+table.AddNotify[OutputNotify];
+OuterBody[Symbols.RootBti];
+FOR bti: Symbols.BTIndex ¬ SymbolOps.SonBti[MimData.ownSymbols, Symbols.RootBti], SymbolOps.SiblingBti[MimData.ownSymbols, bti]
+UNTIL bti = Symbols.BTNull DO
+OuterBody[bti];
+ENDLOOP;
+table.DropNotify[OutputNotify];
+IF next # nOuter OR nextIP # MimData.nInnerBodies THEN ERROR;
+SortPackInfo[outerDesc, 1, nOuter];
+WriteObjectUnits[outerPtr, nOuter*PackageSymbols.OuterPackRecord.SIZE];
+MimZones.tempZone.FREE[@outer];
+};
+};
+
+PackDescriptor: TYPE = LONG DESCRIPTOR FOR ARRAY OF PackageSymbols.OuterPackRecord;
+OuterPackRecordSeq: TYPE = RECORD [
+SEQUENCE len: NAT OF PackageSymbols.OuterPackRecord
+];
+SortPackInfo: PROC [a: PackDescriptor, l, u: CARDINAL] = {
+h: CARDINAL ¬ u - l;
+DO
+h ¬ h/2;
+FOR k: CARDINAL IN [l+h .. u) DO
+i: CARDINAL ¬ k;
+j: CARDINAL ¬ k-h;
+key: Symbols.Name ¬ a[k].hti;
+t: PackageSymbols.OuterPackRecord ¬ a[k];
+WHILE LOOPHOLE[key, CARD] < LOOPHOLE[a[j].hti, CARD] DO
+a[i] ¬ a[j];
+i ¬ j;
+IF j < l+h THEN EXIT;
+j ¬ j-h;
+ENDLOOP;
+a[i] ¬ t;
+ENDLOOP;
+IF h <= 1 THEN EXIT;
+ENDLOOP
+};>>
+
+
+StartObjectFile: PUBLIC PROC [objectStream: STREAM] = {
+stream ¬ objectStream;
+padding ¬ [
+base: LOOPHOLE[zone.NEW[Basics.RawBytes[bytesPerPage]]],
+startIndex: 0,
+count: bytesPerPage];
+OSMiscOps.Fill[padding.base, WORDS[Basics.RawBytes[bytesPerPage]], 0];
+};
+
+TableOut: PUBLIC PROC [table: Alloc.Handle] = {
+h: SymbolSegment.STHeader;
+fixupLoc: StreamIndex;
+d: SymbolSegment.WordOffset;
+units: CARD;
+WriteSubTable: PROC [selector: Table.Selector] = {
+base: Alloc.Base;
+size: CARD;
+[base, size] ¬ RoundedBounds[selector];
+WriteTableBlock[base + table.Bias[selector], size];
+};
+RoundedBounds: PROC [selector: Table.Selector] RETURNS [base: Alloc.Base, size: CARD] = {
+[base, size] ¬ Alloc.Bounds[table, selector];
+IF unitsPerCARD # 1 THEN {
+rem: CARDINAL ¬ size MOD unitsPerCARD;
+IF rem # 0 THEN size ¬ size + (unitsPerCARD - rem);
+};
+RETURN [base, size];
+};
+MimData.symSeg.class ¬ symbols;
+MimData.symSeg.base.units ¬ NextFilePage[] / bytesPerUnit;
+h.versionIdent ¬ SymbolSegment.VersionID;
+h.version ¬ MimData.objectVersion;
+h.sourceVersion ¬ MimData.source.version;
+h.creator ¬ MimData.compilerVersion;
+h.definitionsFile ¬ MimData.interface;
+h.extended ¬ TRUE;
+h.directoryCtx ¬ MimData.moduleCtx;
+h.importCtx ¬ MimData.importCtx;
+h.outerCtx ¬ MimData.mainCtx;
+d ¬ SymbolSegment.STHeader.SIZE;
+h.hvBlock.offset ¬ d;
+d ¬ d + (h.hvBlock.size ¬ Symbols.HashVector.SIZE);
+h.htBlock.offset ¬ d;
+d ¬ d + (h.htBlock.size ¬ RoundedBounds[SymbolSegment.htType].size);
+h.ssBlock.offset ¬ d;
+d ¬ d + (h.ssBlock.size ¬ RoundedBounds[SymbolSegment.ssType].size);
+h.innerPackBlock ¬ h.outerPackBlock ¬ [d, 0];
+<<	RRA: Obsolete, November 21, 1989 10:17:51 pm PST
+IF NOT MimData.interface THEN {
+h.innerPackBlock.offset ¬ d;
+d ¬ d + (h.innerPackBlock.size ¬ MimData.nInnerBodies*PackageSymbols.InnerPackRecord.SIZE);
+h.outerPackBlock.offset ¬ d;
+d ¬ d + (h.outerPackBlock.size ¬
+(MimData.nBodies-MimData.nInnerBodies)*PackageSymbols.OuterPackRecord.SIZE);
+};
+>>
+h.constBlock.offset ¬ d;
+ d ¬ d + (h.constBlock.size ¬ RoundedBounds[SymbolSegment.constType].size);
+h.seBlock.offset ¬ d;
+ d ¬ d + (h.seBlock.size ¬ RoundedBounds[SymbolSegment.seType].size);
+h.ctxBlock.offset ¬ d;
+ d ¬ d + (h.ctxBlock.size ¬ RoundedBounds[SymbolSegment.ctxType].size);  
+h.mdBlock.offset ¬ d;
+d ¬ d + (h.mdBlock.size ¬ RoundedBounds[SymbolSegment.mdType].size);
+h.bodyBlock.offset ¬ d;
+d ¬ d + (h.bodyBlock.size ¬ RoundedBounds[SymbolSegment.bodyType].size);
+h.epMapBlock ¬ h.spareBlock ¬ [d, 0];
+IF RoundedBounds[SymbolSegment.extType].size # 0
+THEN fixupLoc ¬ stream.GetIndex[]
+ELSE {
+h.treeBlock ¬ h.litBlock ¬ h.sLitBlock ¬ h.extBlock ¬ [d, 0];
+[h.fgRelBase, h.fgCount] ¬ SetFgt[d, MimData.source.locator];
+};
+WriteObjectUnits[@h, SymbolSegment.STHeader.SIZE];
+WriteObjectUnits[SymbolOps.HashBlock[], h.hvBlock.size];
+WriteSubTable[SymbolSegment.htType];
+WriteSubTable[SymbolSegment.ssType];
+<<IF ~MimData.interface THEN WritePackTables[table];>>
+WriteSubTable[SymbolSegment.constType];
+WriteSubTable[SymbolSegment.seType];
+WriteSubTable[SymbolSegment.ctxType];
+WriteSubTable[SymbolSegment.mdType];
+WriteSubTable[SymbolSegment.bodyType];
+IF RoundedBounds[SymbolSegment.extType].size # 0 THEN {
+[ltBias, stBias] ¬ LiteralOps.ForgetEntries[];
+h.treeBlock.offset ¬ d;
+h.treeBlock.size ¬ WriteExtensions[table];
+d ¬ d + h.treeBlock.size;
+
+h.litBlock.offset ¬ d;
+h.litBlock.size ¬ units ¬ RoundedBounds[SymbolSegment.ltType].size - ltBias;
+WriteTableBlock[RoundedBounds[SymbolSegment.ltType].base + table.Bias[SymbolSegment.ltType] + ltBias, units];
+d ¬ d + units;
+
+h.sLitBlock.offset ¬ d;
+h.sLitBlock.size ¬ units ¬ RoundedBounds[SymbolSegment.stType].size - stBias;
+WriteTableBlock[RoundedBounds[SymbolSegment.stType].base + table.Bias[SymbolSegment.stType] + stBias, units];
+d ¬ d + units;
+
+h.extBlock.offset ¬ d;
+h.extBlock.size ¬ WriteExtensionTable[table];
+d ¬ d + h.extBlock.size;
+[h.fgRelBase, h.fgCount] ¬ SetFgt[d, MimData.source.locator];
+RewriteObjectUnits[fixupLoc, @h, SymbolSegment.STHeader.SIZE];
+};
+IF ~MimData.interface THEN {
+r: Rope.Text = Rope.Flatten[MimData.source.locator];
+p: LONG POINTER = LOOPHOLE[r, LONG POINTER] + SIZE[Rope.TextRep[0]];
+len: NAT = r.length;
+max: NAT = RoundUpBytes[len];
+offset: CARD ¬ SymbolSegment.FGHeader[0].SIZE + units;
+pair: StringHeaderKludge ¬ [len, max];
+[] ¬ NextFilePage[];
+units ¬ max/bytesPerUnit;
+WriteObjectUnits[@offset, SymbolSegment.WordOffset.SIZE];
+WriteObjectUnits[@pair, StringHeaderKludge.SIZE];
+PutBytes [block: [base: p, startIndex: 0, count: len], pad: TRUE];
+WriteObjectUnits[MimData.fgTable.BASE, MimData.fgTable.LENGTH*SymbolSegment.FGTEntry.SIZE];
+OSMiscOps.FreeUnits[MimData.fgTable.BASE];
+}
+};
+
+RTTableOut: PUBLIC PROC [table: Alloc.Handle] = {
+nLits: CARDINAL = SymLiteralOps.DescribeRefLits[].length;
+nTypes: CARDINAL = SymLiteralOps.DescribeTypes[].length;
+IF nLits + nTypes # 0 THEN {
+OPEN RTMob;
+EqText: PROC [rt: REF TEXT, pt: LONG POINTER TO TEXT] RETURNS [BOOL] = INLINE {
+IF rt.length # pt.length THEN RETURN [FALSE];
+FOR i: CARDINAL IN [0..rt.length) DO
+IF rt[i] # pt[i] THEN RETURN [FALSE];
+ENDLOOP;
+RETURN [TRUE];
+};
+EnterText: PROC [s: REF TEXT] RETURNS [loc: CARDINAL ¬ 0] = {
+t: LONG POINTER TO TEXT;
+units: CARDINAL;
+scratchSize: NAT = SIZE[TextScratch];
+DO
+IF loc >= textLoc THEN EXIT;
+t ¬ textBase + loc;
+IF EqText[s, t] THEN RETURN;
+loc ¬ loc + RoundUpUnits[TEXT[t.length].SIZE];
+ENDLOOP;
+units ¬ RoundUpUnits[TEXT[s.length].SIZE];
+IF textBase = NIL AND units < scratchSize
+THEN {
+textBase ¬ LOOPHOLE[textScratch];
+textLimit ¬ SIZE[TextScratch];
+}
+ELSE
+WHILE (textLoc + units) > textLimit DO
+newLimit: CARDINAL = SELECT textLimit FROM
+<= scratchSize => scratchSize+scratchSize,
+< (LAST[CARDINAL]-1024)/2 => textLimit+textLimit,
+< (LAST[CARDINAL]-1024) => LAST[CARDINAL]-512,
+ENDCASE => ERROR;
+newBase: LONG POINTER = OSMiscOps.Units[newLimit];
+IF textBase # NIL THEN {
+OSMiscOps.Copy[from: textBase, to: newBase, nwords: textLoc/unitsPerWord];
+IF textBase # LOOPHOLE[textScratch, LONG POINTER] THEN
+OSMiscOps.FreeUnits[textBase];
+};
+textBase ¬ newBase;
+textLimit ¬ newLimit;
+ENDLOOP;
+loc ¬ textLoc;
+OSMiscOps.Copy
+[from: LOOPHOLE[s, LONG POINTER], to: textBase+loc, nwords: units/unitsPerWord];
+textLoc ¬ textLoc + units;
+};
+EnterStamp: PROC [mdi: Symbols.MDIndex] RETURNS [index: RTMob.StampIndex] = {
+IF mdi = Symbols.MDNull
+THEN index ¬ RTMob.AnyStamp
+ELSE {
+stamp: MobDefs.VersionStamp = table.Bounds[SymbolSegment.mdType].base[mdi].stamp;
+FOR i: NAT IN [1 .. nextStamp) DO
+IF stamp = stampList[i] THEN RETURN [[i]];
+ENDLOOP;  
+IF stampList = NIL OR nextStamp >= stampList.limit THEN ExpandStampList[];
+index ¬ [nextStamp];
+stampList[nextStamp] ¬ stamp;
+nextStamp ¬ nextStamp + 1;
+};
+};
+ExpandStampList: PROC = INLINE {
+oldSize: NAT = nextStamp - 1;
+AdjustStampList[oldSize + MAX[MIN[oldSize/2, 128], 32]];
+};
+AdjustStampList: PROC [newSize: NAT] = {
+oldSize: NAT = nextStamp - 1;
+newList: REF RTMob.StampList = NEW[RTMob.StampList[newSize]];
+FOR i: NAT IN [1 .. MIN[oldSize, newSize]] DO newList[i] ¬ stampList[i] ENDLOOP;
+stampList ¬ newList;
+};
+
+rtOffset: CARD ¬ RTHeader.SIZE;
+header: RTHeader ¬ [
+refLitTable: LOOPHOLE[rtOffset],
+litBase: LOOPHOLE[LONG[0]],
+litLength: 0,
+rcMapBase: LOOPHOLE[LONG[0]],
+rcMapLength: 0,
+stampTable: LOOPHOLE[LONG[0]],
+typeTable: LOOPHOLE[rtOffset + RefLitList[nLits].SIZE]];
+fixupIndex: StreamIndex = ReadMobIndex[];
+textBase: LONG POINTER ¬ NIL;  -- to a sequence of StringBody's
+textLimit: CARDINAL ¬ 0;
+textLoc: CARDINAL ¬ 0;
+stampList: REF RTMob.StampList ¬ NIL;
+nextStamp: NAT ¬ 1;
+
+AppendMobUnits[@header, RTHeader.SIZE];
+AppendMobPair[0, nLits];
+IF nLits # 0 THEN {
+WriteLitItem: SymLiteralOps.RefLitsVisitor = {
+info: RefLitItem;
+loc, chars: CARDINAL;
+referentType: Symbols.Type;
+WITH v: item SELECT FROM
+atom => {
+desc: ConvertUnsafe.SubString ¬
+SymbolOps.SubStringForName[MimData.ownSymbols, v.pName];
+k: NAT ¬ desc.length;
+n: NAT ¬ k + (bytesPerCARD - (k MOD bytesPerCARD));
+s: REF TEXT ¬ NEW[TEXT[n]];
+ConvertUnsafe.AppendSubStringToRefText[s, desc];  
+WHILE k < n DO s[k] ¬ 0c; k ¬ k + 1; ENDLOOP;
+loc ¬ EnterText[s];
+chars ¬ s.length;
+referentType ¬ MimData.typeAtomRecord;
+s ¬ NIL;
+};
+text => {
+s: LONG STRING = LiteralOps.StringValue[v.value];
+checkLoophole: NAT[0..0] = TEXT[0].SIZE - StringBody[0].SIZE;
+loc ¬ EnterText[LOOPHOLE[s, REF TEXT]];
+chars ¬ s.length;  -- ARRGGH
+referentType ¬ LiteralOps.TextType[v.value];
+};
+ENDCASE => ERROR;
+info ¬ [
+referentType: SymLiteralOps.TypeIndex[referentType, FALSE],
+offset: loc, length: RoundUpUnits[TEXT[chars].SIZE]];
+AppendMobUnits[@info, RefLitItem.SIZE];
+tl ¬ tl + 1;
+};
+tl: NAT ¬ 0;
+SymLiteralOps.EnumerateRefLits[WriteLitItem];
+IF tl # nLits THEN ERROR;
+};
+
+AppendMobPair[0, nTypes];
+rtOffset ¬ rtOffset + RefLitList[nLits].SIZE + TypeList[nTypes].SIZE;
+header.rcMapBase ¬ LOOPHOLE[rtOffset];
+IF nTypes = 0
+THEN header.rcMapLength ¬ 0
+ELSE {
+rcmt: RCMapOps.RCMT = RCMapOps.Create[zone: zone, expansionOK: TRUE];
+tc: NAT ¬ 0;
+EnterUT: PROC [type: Symbols.Type] RETURNS [RTMob.UTInfo] = {
+mdi: Symbols.MDIndex;
+sei: Symbols.Type;
+[mdi, sei] ¬ SymLiteralOps.UTypeId[type];
+RETURN [[version: EnterStamp[mdi], sei: sei]];
+};
+WriteTypeItem: SymLiteralOps.TypesVisitor = {
+s: LONG STRING ¬ TypeStrings.Create[MimData.ownSymbols, type, zone];
+info: TypeItem ¬ [
+table: MimData.mtRoot.sseg,
+sei: type,
+canonical: canonical,
+rcMap: rcmt.Acquire[MimData.ownSymbols, type],
+ct: [EnterText[LOOPHOLE[s, REF TEXT]]],  -- ARRGGH
+ut: EnterUT[type]];
+zone.FREE[@s];
+AppendMobUnits[@info, TypeItem.SIZE];
+tc ¬ tc + 1;
+};
+
+[] ¬ EnterStamp[Symbols.OwnMdi];
+SymLiteralOps.EnumerateTypes[WriteTypeItem];
+IF tc # nTypes THEN ERROR;
+header.rcMapLength ¬ RoundUpUnits[rcmt.GetSpan[].size];
+AppendMobUnits[rcmt.GetSpan[].base, header.rcMapLength];
+rtOffset ¬ rtOffset + header.rcMapLength;
+[] ¬ RCMapOps.Destroy[rcmt];
+};
+header.stampTable ¬ LOOPHOLE[rtOffset];
+AdjustStampList[nextStamp-1];
+AppendMobUnits[LOOPHOLE[stampList, LONG POINTER], StampList[nextStamp-1].SIZE];
+rtOffset ¬ rtOffset + StampList[nextStamp-1].SIZE;
+stampList ¬ NIL;
+header.litBase ¬ LOOPHOLE[rtOffset];
+header.litLength ¬ textLoc;
+IF textBase # NIL THEN {
+AppendMobUnits[textBase, textLoc];
+IF textBase # LOOPHOLE[textScratch, LONG POINTER] THEN
+OSMiscOps.FreeUnits[textBase];
+};
+UpdateMobUnits[fixupIndex, @header, RTHeader.SIZE];
+}
+};
+
+EndObjectFile: PUBLIC PROC [update: BOOL] = {
+IF stream # NIL AND update THEN {
+saveIndex: StreamIndex = stream.GetIndex[];
+stream.SetIndex[MimData.fixupLoc];
+WriteObjectUnits[@MimData.codeSeg, MobDefs.SGRecord.SIZE];
+WriteObjectUnits[@MimData.symSeg, MobDefs.SGRecord.SIZE];
+WriteObjectUnits[MimData.mtRoot, MimData.mtRootSize];
+stream.SetIndex[saveIndex];
+};
+IF padding.base # NIL THEN zone.FREE[@padding.base];
+stream ¬ NIL;
+};
+
+}.
+  Z  
+ObjectOut.mesa
+Copyright Ó 1985, 1986, 1987, 1988, 1989, 1990, 1991 by Xerox Corporation.  All rights reserved.
+Satterthwaite, June 23, 1986 3:41:36 pm PDT
+Sweet, September 2, 1980  3:05 PM
+Russ Atkinson (RRA) January 23, 1990 1:13:35 pm PST
+JKF August 15, 1988 1:40:35 pm PDT
+Willie-s, September 24, 1991 2:20 pm PDT
+also see Pass4B.mesa
+An arbitrary power of 2 (at least as large as bytesPerCARD), historically required to be an actual file page, but no longer so constrained.
+RRA: The above static checks are to ensure congruence of sizes (at least) between the string header in the FGHeader and as declared in StringHeaderKludge and in the built-in StringBody.
+We are requested to pad out to a 32-bit boundary
+mob i/o
+offset in file in bytes from the start
+the starting stream index
+This is presumed to be in addressing units.
+This is presumed to be in bytes.
+Workaround for Mimosa bug:
+RRA: Eventually we can flush this check
+Workaround for Mimosa bug:
+RRA: Eventually we can flush this check
+symbol table i/o 
+tree i/o
+do we really want to use a string bias here?
+package table i/o
+Shell sort of a[l..u)
+main drivers
+h.bodyBlock.size _ MimData.defBodyLimit;
+RRA sez: what the hell was this for?  An xref of the compiler and binder revealed no clients, and the whole bodyBlock gets written anyway!  This caused confusion to MobMapperImpl, you bet!  Many of the INLINE bodies were omitted!  March 20, 1989.
+Write out the literal table
+Write out the string literal table
+Write out the extension table
+There is enough room in the scratch area to avoid expensive allocation
+Sanity check
+This should no longer happen!
+
+Ê  •NewlineDelimiter
+–(cedarcode) style™ headšœ™Icodešœ
+ÏeœU™`LšÏy+™+Lšž!™!L™3L™"L™(—˜ šÏk	˜	LšœŸœD˜OLšœŸœ˜!LšœŸœ˜,LšœŸœ'˜:Lšœ
+Ÿœ˜LšŸœŸœŸœ˜CLšœŸœH˜XLšœ	Ÿœ˜LšœŸœ¨˜µLšœ	Ÿœ˜LšœŸœ"˜/Lšœ
+Ÿœ)˜8LšœŸœ˜Lšœ	Ÿœ%Ÿœ˜9LšœŸœ"˜,LšœŸœa˜lLšœ
+Ÿœ˜.LšœŸœ9˜FLšœŸœ³˜ÆLšœŸœ‚˜•LšœŸœ˜&LšœŸœE˜OLšœŸœ"˜/LšœŸœ
+˜LšœŸœ˜%——šÏn	œŸ˜LšŸœŸœy˜¡LšŸœ˜LšŸœ˜Lšœ˜L˜ LšŸœŸœŸœŸœ˜L˜ šœŸœ˜1L™—LšœŸœ˜"Lšœ	Ÿœ˜%L˜ LšœŸœŸœ˜Lšœ	ŸœŸœ˜&LšœŸ	œŸœ"˜6L˜ LšœŸœŸœŸœ˜ LšœŸœŸœŸœ˜ šœŸœ˜Lšœ‹™‹—LšœŸœ˜0LšœŸœ˜0L˜ LšœŸœŸœŸœ˜ L˜ Lš	œŸœŸœ
+ŸœŸœ˜+LšœŸœ!Ÿœ˜BL˜ LšœŸœŸœŸ	œŸœŸœ˜GLš œŸœ	ŸœŸœ˜Xš
+ œŸœ	ŸœŸœŸœ˜LšŸœ¶™¹—L˜ š œŸœ	ŸœŸœŸœŸœ˜8šŸœŸœ˜LšœŸœŸœ˜7LšŸœ	Ÿœ$˜3L˜—LšŸœ	˜L˜L˜ —š œŸœ	ŸœŸœŸœŸœ˜8šŸœŸœ˜LšœŸœŸœ˜7LšŸœ	Ÿœ$˜3L˜—LšŸœ	˜L˜L˜ —š œŸœ	ŸœŸœŸœŸœ˜:šŸœŸœ˜LšœŸœŸœ˜7LšŸœ	Ÿœ˜$L˜—LšŸœ	˜L˜L˜ —L˜"L˜ Lš œŸœŸœ˜Lšœ	ŸœŸœ˜Lšœ	ŸœŸœ˜L˜ š
+ œŸœ	ŸœŸœŸœ˜=LšœŸœŸœ˜"LšœŸœ	Ÿœ˜'Lš
+Ÿœ	ŸœŸœŸœŸœ	˜>LšŸœŸœŸœ˜9Lšœ"Ÿœ˜3šŸœŸœŸ˜Lšœ˜šœ˜Lšœ0™0Lšœ!˜!LšŸœ!˜#Lšœ˜—LšœŸœ	˜LšŸœ˜—Lšœ˜L˜ —š œŸœŸœŸœ˜%LšœŸœŸœ˜"LšœŸœ	Ÿœ˜#šŸœ	Ÿœ˜LšœŸœ˜ Lšœ˜Lšœ˜Lšœ˜Lšœ˜—LšŸœ	˜Lšœ˜L˜ —š œŸœŸœ˜3LšœŸœ/˜GLšœ˜L˜ —š œŸœ(Ÿœ˜ILšœ+˜+Lšœ˜Lšœ
+Ÿœ˜.Lšœ˜Lšœ˜L˜ —š œŸœŸœ˜9LšœŸœ˜$Lšœ˜L˜ ——Lšœ™˜ šœŸœ˜Lšœ&™&—šœ˜L™—L˜ š
+ œŸœ
+ŸœŸœŸœ˜@LšŸœ˜Lšœ˜L˜ —š œŸœŸœ˜L˜Lšœ˜L˜L˜L˜ —š
+ œŸœŸœŸœŸœ˜-Lšœ+™+LšŸœ˜"Lšœ˜—L˜ š œŸœŸœŸœ˜3Lšœ ™ LšŸœ˜Lšœ˜L˜ —š œŸœŸœŸœ˜+Lšœ™Lš œŸœŸœŸœŸœŸœŸœŸœ˜Bš
+ŸœŸœŸœŸœŸœ˜7LšŸœ$™'—LšœŸœ4˜LLšœ%˜%L˜L˜ —š
+ œŸœŸœ	Ÿœ
+Ÿœ˜>šœŸœŸœŸ	œŸœ	Ÿœ
+Ÿœ˜FLšœŸœŸœ˜—Lšœ™Lš œŸœŸœŸœŸœŸœŸœŸœ˜BLšœ,˜,š
+ŸœŸœŸœŸœŸœ˜7LšŸœ$™'—LšœŸœ+˜CLšœ˜L˜L˜ —š œŸœŸœŸœ˜8Lšœ˜L˜'L˜L˜ —š
+ œŸœŸœŸœŸœ˜1LšœŸœ˜LšœŸœ˜"Lšœ(˜(Lšœ+Ÿœ˜1Lšœ(ŸœŸœ˜CLšœ˜L˜ —š œŸœŸœ˜LšœŸœŸœ˜+šŸœ	Ÿœ˜Lšœ˜Lšœ-˜-Lšœ˜—šœ˜L˜ ——š œŸœŸœ*Ÿœ˜NLšœ#˜#L˜L˜ —š œŸœŸœ˜Lšœ˜Lšœ˜L˜ ——Lšœ™˜ š œŸœ;ŸœŸœ	˜nLšœŸœ˜Lšœ˜šŸœ˜šŸœ˜Lšœ$˜$Lšœ&˜&Lšœ˜Lšœ ˜ Lšœ˜L˜—šŸœ˜LšœŸœ)˜1Lš	œŸœŸœŸœŸœ˜bLšœ˜Lšœ˜Lšœ&˜&Lšœ˜——Lšœ˜Lšœ%˜%Lšœ˜L˜ ——Lšœ™˜ LšœŸœ˜LšœŸœ˜L˜ š œŸœŸœŸœ˜DL˜LšœÏc˜0Lšœ¡˜/Lšœ&˜&LšœŸœŸœ¡(˜Cš œ˜ L˜Lšœ!˜!Lšœ!˜!Lšœ!˜!Lšœ#˜#Lšœ#˜#L˜—š œŸœŸœ˜BLšœG˜GLšŸœ˜Lšœ˜—š œŸœŸœ˜@šœK˜KL™,—LšŸœ˜Lšœ˜—Lš œŸœ˜*š 
+œ˜šŸœ	ŸœŸ˜*L˜#L˜!˜L˜6šŸœŸœ˜ LšŸœ˜šŸ˜šŸœŸœŸ˜$˜L˜LšœŸœŸœ˜-Lšœ#¡˜3L˜9Lšœ˜Lšœ˜Lšœ˜—LšŸœ
+˜———Lšœ˜—LšŸœ˜—Lšœ˜—L˜L˜!L˜L˜Lšœ˜LšœŸœ˜Lšœ0˜0Lšœ,˜,šŸœWŸ
+œŸ˜w˜šŸœŸœŸœ˜LLšŸœ˜ LšŸœ˜——LšŸœ˜—L˜LšŸœ˜!Lšœ˜L˜ —š œŸœŸœŸœ˜BLšœŸœ˜LšœD˜DLš œ8˜DLšœŸœ˜Lšœ˜šŸœWŸ
+œŸ˜wšŸœŸœ˜%Lšœ&Ÿœ˜+Lšœ5Ÿœ˜;Lšœ˜—LšŸœ˜—Lšœ˜LšŸœ˜Lšœ˜L˜ ——Lšœ™˜ šœ˜L˜0—š œŸœ˜/LšœŸœ*˜:šŸœŸœ˜Lš œ7˜Cš
+ 
+œŸœŸœŸœŸœ˜GLš
+ŸœŸœŸœŸœŸœ˜?Lšœ˜—š 	œŸœ˜*šŸœŸœŸ˜˜šŸœŸœ˜šœ-˜-Lšœ6˜6L˜L˜L˜L˜—L˜L˜——LšŸ˜—Lšœ˜—š œŸœŸœ%˜Vš œŸœŸœŸœ˜;šŸœŸœŸ˜˜šŸœŸœŸœ˜2šŸœ Ÿ˜&Lšœ9Ÿœ˜?—šœ(˜(L˜L˜Lšœ	Ÿœ˜—LšŸœ Ÿœ˜7L˜L˜——LšŸœŸœ˜—LšŸœŸœ˜Lšœ˜—Lšœ'˜'Lšœ˜šŸœ˜LšŸœF˜JšŸ˜šŸœw˜zšŸœŸ˜ šŸœŸœŸ˜!LšœŸœ¡˜/LšŸœM˜T—LšŸœ˜————šŸœ Ÿœ˜(LšœŸœ˜Lšœ9Ÿœ˜?Lšœ˜—Lšœ˜—LšœŸœ˜LšœŸœ(Ÿœ˜RLšœ
+ŸœŸœŸœ,˜ELšœŸ
+œ˜9LšœŸœ˜Lšœ8Ÿœ˜>L˜ L˜L˜šŸœ}ŸœŸ˜Lšœ˜LšŸœ˜—L˜LšŸœŸœŸœŸœ˜=Lšœ#˜#LšœAŸœ˜GLšœŸœ	˜L˜—Lšœ˜L˜ —LšœŸœŸœŸ
+œŸœŸœŸœ ˜SšœŸœŸœ˜#LšŸœŸœŸœ˜3L˜—š œŸœŸœ˜:Lšœ™LšœŸœ	˜šŸ˜L˜šŸœŸœŸœŸ˜ LšœŸœ˜LšœŸœ˜L˜L˜)šŸœŸœŸœŸœŸœŸ˜7L˜L˜LšŸœ	ŸœŸœ˜Lšœ˜LšŸœ˜—L˜	LšŸœ˜—LšŸœŸœŸœ˜LšŸ˜—Lšœ˜L˜ ——Lšœ™˜ š œŸœŸœŸœ˜7L˜LšœŸœŸœF˜iLšœŸœ$˜FL˜L˜ —š œŸœŸœ˜/Lšœ˜L˜Lšœ˜LšœŸœ˜š œŸœ˜2L˜LšœŸœ˜Lšœ'˜'L˜3L˜—š œŸœŸœŸœ˜YLšœ-˜-šŸœŸœ˜LšœŸœŸœ˜&LšŸœ	Ÿœ$˜3L˜—LšŸœ˜L˜—Lšœ˜Lšœ:˜:L˜)Lšœ"˜"Lšœ)˜)Lšœ$˜$Lšœ&˜&LšœŸœ˜Lšœ#˜#Lšœ ˜ Lšœ˜LšœŸœ˜ Lšœ˜Lšœ-Ÿœ˜3Lšœ˜LšœD˜DLšœ˜LšœD˜DLšœ-˜-šœ3˜3šŸœŸœŸœ˜Lšœ˜LšœUŸœ˜[L˜˜ LšœFŸœ˜L—Lšœ˜Lšœ˜——Lšœ˜LšœK˜KLšœ˜LšœE˜ELšœ˜LšœI˜ILšœ˜LšœD˜DLšœ˜LšœH˜HšÏb(™(Lšœö™ö—L˜%šŸœ.˜0LšŸœ˜!šŸœ˜L˜=Lšœ=˜=L˜——Lšœ,Ÿœ˜2Lšœ8˜8Lšœ$˜$Lšœ$˜$LšŸœŸœŸ˜6Lšœ'˜'Lšœ$˜$Lšœ%˜%Lšœ$˜$Lšœ&˜&šŸœ/Ÿœ˜7Lšœ.˜.L˜L˜*L˜L˜ L™L˜LšœL˜LLšœm˜mL˜L˜ L™"L˜LšœM˜MLšœm˜mL˜L˜ L™L˜Lšœ-˜-L˜Lšœ=˜=Lšœ8Ÿœ˜>Lšœ˜—šŸœŸœ˜Lšœ4˜4LšœŸœŸœŸœŸœŸœŸœ˜DLšœŸœ˜LšœŸœ˜LšœŸœŸœ	˜6Lšœ&˜&L˜Lšœ˜Lšœ3Ÿœ˜9Lšœ+Ÿœ˜1Lšœ<Ÿœ˜BLšœ!ŸœŸœŸœ˜[Lšœ$Ÿœ˜*Lšœ˜—Lšœ˜L˜ —š 
+œŸœŸœ˜1LšœŸœ*˜9LšœŸœ(˜8šŸœŸœ˜LšŸœ˜š œŸœŸœŸœŸœŸœŸœŸœ˜OLšŸœŸœŸœŸœ˜-šŸœŸœŸœŸ˜$LšŸœŸœŸœŸœ˜%LšŸœ˜—LšŸœŸœ˜Lšœ˜—š 	œŸœŸœŸœŸœŸœ	˜=Lš	œŸœŸœŸœŸœ˜LšœŸœ˜LšœŸœŸœ˜%šŸ˜LšŸœŸœŸœ˜L˜LšŸœŸœŸœ˜LšœŸœŸœ˜.LšŸœ˜—LšœŸœŸœ˜*šŸœŸœŸœ˜)šŸœ˜L™FLšœŸœ˜!LšœŸœ˜Lšœ˜—šŸ˜šŸœŸ˜&šœ
+ŸœŸœŸ˜*Lšœ*˜*LšœŸœŸœ!˜1Lš	œŸœŸœŸœŸœ˜.LšŸœŸœ˜—Lšœ	ŸœŸœ˜2šŸœŸœŸœ˜LšœJ˜Jš	ŸœŸœŸœŸœŸ˜6Lšœ˜—L˜—Lšœ˜Lšœ˜LšŸœ˜———L˜šœ˜LšœŸœŸœŸœ1˜P—Lšœ˜Lšœ˜—š 
+œŸœŸœ˜MšŸœ˜LšŸœ˜šŸœ˜LšœQ˜QšŸœŸœŸœŸ˜!LšŸœŸœŸœ˜*LšŸœ˜
+—LšŸœŸœŸœŸœ˜JL˜L˜L˜L˜——Lšœ˜—š œŸœŸœ˜ Lšœ	Ÿœ˜LšœŸœŸœ˜8Lšœ˜—š œŸœŸœ˜(Lšœ	Ÿœ˜Lšœ	ŸœŸœ˜=LšŸœŸœŸœŸœŸœŸœ˜PL˜L˜L˜ —Lšœ
+ŸœŸœ˜˜LšœŸœ˜ Lšœ	ŸœŸœ˜Lšœ˜LšœŸœŸœ˜Lšœ˜LšœŸœŸœ˜LšœŸœŸœ˜8—Lšœ)˜)Lšœ
+ŸœŸœŸœ¡ ˜?LšœŸœ˜Lšœ	Ÿœ˜LšœŸœŸœ˜%LšœŸœ˜L˜ Lšœ!Ÿœ˜'Lšœ˜šŸœŸœ˜š œ"˜.L˜LšœŸœ˜Lšœ˜šŸœ	ŸœŸ˜˜	LšœX˜XLšœŸœ˜LšœŸœŸœ˜3Lš	œŸœŸœŸœŸœ˜Lšœ2˜2LšŸœŸœŸœ˜-L˜L˜Lšœ&˜&LšœŸœ˜Lšœ˜—˜	LšœŸœŸœ#˜1Lš	œŸœ	ŸœŸœŸœ˜=LšœŸœŸœŸœ˜'Lšœ¡	˜Lšœ,˜,L˜—LšŸœŸœ˜—˜Lšœ4Ÿœ˜;Lšœ"ŸœŸœ˜5—Lšœ!Ÿœ˜'L˜Lšœ˜—LšœŸœ˜L˜-šŸœŸœŸœ˜L™—L˜L˜ —Lšœ˜Lšœ(ŸœŸœ˜ELšœŸœ˜&šŸœ˜LšŸœ˜šŸœ˜LšœŸœ,Ÿœ˜ELšœŸœ˜š œŸœŸœ˜=L˜L˜L˜)LšŸœ(˜.Lšœ˜—š œ ˜-LšœŸœŸœ6˜D˜Lšœ˜L˜
+L˜Lšœ.˜.LšœŸœŸœŸœ¡	˜2L˜—LšœŸœ˜LšœŸœ˜%L˜Lšœ˜L˜ —L˜ L˜,šŸœŸœŸœ˜L™—Lšœ7˜7Lšœ8˜8L˜)Lšœ˜Lšœ˜——LšœŸœ˜'L˜Lš	œŸœŸœŸœŸœ˜OLšœ-Ÿœ˜2LšœŸœ˜LšœŸœ˜$Lšœ˜šŸœŸœŸœ˜Lšœ"˜"š	ŸœŸœŸœŸœŸ˜6Lšœ˜—L˜—Lšœ-Ÿœ˜3Lšœ˜—šœ˜L˜ ——š œŸœŸœ
+Ÿœ˜-šŸœ
+ŸœŸœŸœ˜!Lšœ+˜+Lšœ"˜"Lšœ4Ÿœ˜:Lšœ3Ÿœ˜9Lšœ5˜5Lšœ˜Lšœ˜—LšŸœŸœŸœŸœ˜4Lšœ	Ÿœ˜Lšœ˜L˜ ——L˜L™ — …—    ]´  -  

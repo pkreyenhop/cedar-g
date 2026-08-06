@@ -1,0 +1,546 @@
+
+DIRECTORY 
+Atom, Basics, Commander, IO, Rope, SafeStorage, Xl, XlDetails, XlEndianPrivate, XlPrivate, XlPrivateTypes;
+
+XlImplUtilities: CEDAR MONITOR LOCKS c USING c: Connection
+IMPORTS Atom, Basics, Commander, IO, Rope, SafeStorage, Xl, XlDetails, XlEndianPrivate, XlPrivate
+EXPORTS Xl, XlPrivate
+SHARES XlPrivateTypes ~ 
+BEGIN OPEN Xl, XlPrivate;
+
+checkHard: BOOL ~ FALSE; --make self checking code optional
+checkSpreitzer: BOOL ¬ FALSE; --make self checking code optional
+ConnectionPrivate: <<Xl>> PUBLIC TYPE = XlPrivateTypes.ConnectionPrivateImplRec; 
+
+untracedZone: ZONE ¬ NIL; 
+
+ReplaceBuffer: <<INTERNAL>> PROC [c: Connection, bytes: CARD] = {
+text: REF Xl.Card32Sequence;
+buf: LONG POINTER TO PACKED ARRAY [0..0) OF BYTE;
+bytes ¬ MAX[bytes, 1000, c.bufLimit];
+text ¬ untracedZone.NEW[Xl.Card32Sequence[(bytes+3)/4]];
+TRUSTED {buf ¬ LOOPHOLE[LOOPHOLE[text, CARD]+UNITS[Xl.Card32Sequence[0]]]};
+IF c.bufNext#0 THEN {
+IF c.bufNext MOD 4 # 0 THEN BadImplError[c]; --Not properly aligned
+TRUSTED { Basics.MoveWords[dst: LOOPHOLE[buf], src: LOOPHOLE[c.buf], count: c.bufNext / BYTES[WORD]] };
+};
+c.buf ¬ buf;
+c.bufLimit ¬ bytes;
+c.bufPrivate ¬ text;
+};
+
+RealAssertBuffer: PUBLIC <<INTERNAL>> PROC [c: Connection, bytes: CARD] = {
+XlPrivate.SoftFlushBuffer[c, TRUE];
+IF c.bufProblem#NIL THEN {
+IF (c.bufLimit-c.bufNext)<bytes THEN {
+c.bufReady ¬ 0; 
+c.bufNext ¬ 0; 
+};
+};
+IF (c.bufLimit-c.bufNext)<bytes THEN {
+ReplaceBuffer[c, bytes]
+};
+};
+
+RealFlushBuffer: PUBLIC <<INTERNAL>> PROC [c: Connection, delay: BOOL] = TRUSTED {
+ENABLE UNCAUGHT => {
+IF c.bufProblem=NIL THEN c.bufProblem ¬ $whileFlush;
+GOTO Oops;
+};
+ready: CARD ¬ c.bufReady;
+IF c.bufNext#c.bufExpected OR c.bufSkipped#0 THEN BadImplError[c]; 
+IF c.bufNext#ready THEN BadImplError[c]; --Not between commands !
+IF ready MOD 4 # 0 THEN BadImplError[c]; --Not properly aligned
+IO.UnsafePutBlock[c.xmit, [base: LOOPHOLE[c.buf], startIndex: 0, count: LOOPHOLE[ready]]];
+c.bufReady ¬ 0; 
+c.bufExpected ¬ c.bufExpected-ready;
+c.bufNext ¬ c.bufNext-ready;
+IF delay 
+THEN c.needFlushing ¬ TRUE
+ELSE {
+c.needFlushing ¬ FALSE;
+IO.Flush[c.xmit]; 
+};
+EXITS Oops => {};
+};
+
+FineFlushBuffer: <<INTERNAL>> PROC [c: Connection] = INLINE {
+cnt: CARD ¬ c.bufNext;
+IF cnt MOD 4 # 0 THEN BadImplError[c]; --Not properly aligned
+IO.UnsafePutBlock[c.xmit, [base: LOOPHOLE[c.buf], startIndex: 0, count: LOOPHOLE[cnt]]];
+c.needFlushing ¬ TRUE; 
+c.bufReady ¬ 0;
+c.bufNext ¬ 0;
+c.bufExpected ¬ c.bufExpected-cnt;
+};
+
+RealFineAssertBuffer: PUBLIC PROC [c: Connection, bytes: CARD] = {
+FineFlushBuffer[c];
+IF (c.bufLimit-c.bufNext)<bytes THEN {
+ReplaceBuffer[c, bytes]
+};
+};
+
+BadImplError: PUBLIC PROC [c: Connection] = {
+lastOpCode: CARD ¬ c.lastOpCode;
+IF ~c.alive THEN RETURN;
+IF c.bufProblem=NIL THEN c.bufProblem ¬ $bad;
+c.alive ¬ FALSE;
+<<Set breakpoints here>>
+ERROR;
+};
+
+InlineBInitPartial: PROC [c: Connection, opCode: BYTE, minor: BYTE ¬ 0, length: CARD16, assertBytes: CARD] = INLINE {
+start: CARD;
+p: PWArray ~ LOOPHOLE[c.buf];
+AdvanceSequenceNumber[c, opCode, assertBytes];
+start ¬ c.bufNext;
+TRUSTED { p­[start/4] ¬ LOOPHOLE[RequestHeader[opCode, minor, length], CARD32] };
+c.bufNext ¬ start+4;
+c.bufExpected ¬ start+length*4; --for debugging
+c.bufSkipped ¬ 0;
+};
+
+BInit: PUBLIC PROC [c: Connection, opCode: BYTE, minor: BYTE ¬ 0, length: INT] = {
+InlineBInitPartial[c, opCode, minor, Low16[length], length*4]
+};
+
+BInitPartial: PUBLIC PROC [c: Connection, opCode: BYTE, minor: BYTE ¬ 0, length: INT, assertBytes: CARD] = {
+InlineBInitPartial[c, opCode, minor, Low16[length], assertBytes]
+};
+
+----------------
+
+PaddingBytes: PUBLIC PROC [n: INT] RETURNS [INT] = {
+RETURN [pad[n MOD 4]]
+};
+pad: ARRAY [0..3] OF INT = [0, 3, 2, 1];
+
+ReportError: PROC [c: Connection, errorMatch: Xl.Match, err: ErrorNotifyEvent] = {
+c.lastError ¬ err;
+IF errorMatch#NIL THEN {
+mr: Xl.MatchRep ¬ errorMatch­;
+IF mr.proc=NIL THEN RETURN;
+IF mr.tq=NIL THEN mr.tq ¬ Xl.CreateTQ[];
+Xl.Enqueue[tq: mr.tq, proc: mr.proc, data: mr.data, event: err];
+};
+};
+
+BuildDeadConnectionError: PROC [c: Xl.Connection] RETURNS [REF EventRep.errorNotify] = {
+err: REF EventRep.errorNotify ¬ NEW[EventRep.errorNotify];
+err.connection ¬ c;
+err.errorKind ¬ requestFromDeadConnection;
+IF c#NIL THEN c.lastError ¬ err;
+RETURN [err];
+};
+
+BuildAndPutDeadConnectionError: PROC [c: Xl.Connection] ={
+x: REF EventRep.errorNotify ~ BuildDeadConnectionError[c];
+IF c#NIL THEN {
+PutConnectionProp[c, $readErrorFromProperty, NEW[Xl.ErrorNotifyEvent _ x]];
+};
+};
+
+DoWithLocks: PUBLIC ENTRY PROC [c: Connection, action: PROC [c: Connection], details: Xl.Details] = {
+ENABLE {
+UNWIND => NULL;
+IO.Error, IO.EndOfStream => {
+BuildAndPutDeadConnectionError[c];
+GOTO readErrorFromProperty;
+};
+Xl.XError => {
+refError: REF Xl.ErrorNotifyEvent ~ NEW[Xl.ErrorNotifyEvent ¬ err];
+c.lastError ¬ err;
+PutConnectionProp[c, $readErrorFromProperty, refError];
+GOTO readErrorFromProperty;
+};
+UNCAUGHT => {--separate branch to be able for detailed breakpoints
+BuildAndPutDeadConnectionError[c];
+GOTO readErrorFromProperty;
+};
+};
+IF ~c.alive THEN GOTO forwardDeadConnection; 
+action[c];
+IF c.bufProblem#NIL THEN GOTO forwardDeadConnection;
+EXITS 
+forwardDeadConnection => {
+SELECT TRUE FROM
+details=NIL => RETURN;
+details.localErrors=inline OR details.synchronous => {
+error: REF EventRep.errorNotify ~ BuildDeadConnectionError[c];
+RETURN WITH ERROR Xl.XError[error];
+};
+details.localErrors=ignore => RETURN;
+details.localErrors=likeRemote => {
+error: REF EventRep.errorNotify ~ BuildDeadConnectionError[c];
+ReportError[c, details.errorMatch, error];
+};
+ENDCASE => ERROR;
+};
+readErrorFromProperty => {
+WITH GetConnectionProp[c, $readErrorFromProperty] SELECT FROM
+refError: REF Xl.ErrorNotifyEvent => {
+error: Xl.ErrorNotifyEvent ¬ refError­;
+SELECT TRUE FROM
+details=NIL => RETURN;
+details.localErrors=inline OR details.synchronous => {
+RETURN WITH ERROR Xl.XError[error];
+};
+details.localErrors=ignore => RETURN;
+details.localErrors=likeRemote => {
+ReportError[c, details.errorMatch, error];
+};
+ENDCASE => ERROR;
+};
+ENDCASE => ERROR;
+};
+};
+
+ContinueDirectRequest: PUBLIC INTERNAL PROC [c: Connection] = {
+FineFlushBuffer[c];
+};  
+
+StartDirectRequest: PUBLIC INTERNAL PROC [c: Connection, opCode: BYTE, minor: BYTE ¬ 0, length: CARD16] = {
+BInitPartial[c, opCode, minor, length, 4];
+FineFlushBuffer[c];
+}; 
+
+debugArrayCnt: INT = 4000;
+DebugArray: TYPE = ARRAY [0..debugArrayCnt) OF BYTE ¬ ALL[0];
+prevDebugArray: REF DebugArray ¬ NIL;
+lastDebugArray: REF DebugArray ¬ NIL;
+
+XlDebugOnCommand: Commander.CommandProc = {
+debugStream: IO.STREAM ¬ cmd.err;
+checkSpreitzer ¬ TRUE;
+IF debugStream=NIL THEN debugStream ¬ cmd.out;
+Atom.PutProp[$XlDebug, $DebugStream, debugStream];
+};
+
+XlDebugOffCommand: Commander.CommandProc = {
+checkSpreitzer ¬ FALSE;
+Atom.PutProp[$XlDebug, $DebugStream, NIL];
+};
+
+AdvanceSequenceNumber: PROC [c: Connection, opcode: BYTE, assert: CARD] = INLINE {
+IF <<checkHard AND>> opcode=0 THEN BadImplError[c];
+IF <<checkHard AND>> c.bufNext+c.bufSkipped#c.bufExpected THEN BadImplError[c];
+[] ¬ XlPrivate.AssertBuffer[c, assert];
+c.sequenceNumber ¬ Basics.LowHalf[c.sequenceNumber+1];
+IF checkSpreitzer THEN {
+cPriv: REF XlPrivateTypes.ConnectionPrivateImplRec ~ c.cPriv;
+WITH cPriv.debug SELECT FROM
+rd: REF DebugArray => rd[c.sequenceNumber MOD debugArrayCnt] ¬ opcode; 
+ENDCASE => {
+rd: REF DebugArray ¬ NEW[DebugArray]; 
+cPriv.debug ¬ rd;
+rd[c.sequenceNumber MOD debugArrayCnt] ¬ opcode; 
+prevDebugArray ¬ lastDebugArray;
+lastDebugArray ¬ rd;
+}
+};
+};
+
+BRequestWithBlock: PUBLIC PROC [c: Connection, opCode: CARD, blockBytes: CARD, additionalBytes: CARD ¬ 0] RETURNS [p: LONG POINTER] = {
+start: CARD;
+AdvanceSequenceNumber[c, opCode, blockBytes];
+start ¬ c.bufNext;
+c.bufNext ¬ start+blockBytes;
+c.bufExpected ¬ start+blockBytes+additionalBytes;
+c.bufSkipped ¬ 0;
+TRUSTED {p ¬ LOOPHOLE[LOOPHOLE[c.buf, CARD32] + start]};
+};
+
+BContinueWithBlock: PUBLIC PROC [c: Connection, blockBytes: CARD] RETURNS [p: LONG POINTER] = {
+start: CARD ¬ c.bufNext;
+IF (c.bufLimit-start)<blockBytes THEN BadImplError[c];
+c.bufNext ¬ start+blockBytes;
+TRUSTED {p ¬ LOOPHOLE[LOOPHOLE[c.buf, CARD32] + start]};
+};
+
+BPutBool: PUBLIC PROC [c: Connection, b: BOOL] = {
+IBPut8[c, ToCBool[b]]
+};
+BPutINT16: PUBLIC PROC [c: Connection, i: INT16] = {
+IBPut16[c, LOOPHOLE[i]]
+};
+Low16: PROC [i: INT] RETURNS [CARD16] = INLINE {
+RETURN [Basics.LowHalf[LOOPHOLE[i]]]
+};
+BPutINT32as16: PUBLIC PROC [c: Connection, i: INT32] = {
+IBPut16[c, Low16[i]];
+};
+BPutPixmap: PUBLIC PROC [c: Connection, p: Pixmap] = {
+IBPut32[c, p.id];
+};
+BPutColorMap: PUBLIC PROC [c: Connection, m: ColorMap] = {
+IBPut32[c, m.colorMapID];
+};
+BPutTime: PUBLIC PROC [c: Connection, t: TimeStamp] = {
+IBPut32[c, t.t];
+};
+BPutVisual: PUBLIC PROC [c: Connection, v: Visual] = {
+IBPut32[c, v.visualID];
+};
+BPutCursor: PUBLIC PROC [c: Connection, cursor: Cursor] = {
+IBPut32[c, cursor.id];
+};
+BPut0s: PUBLIC PROC [c: Connection, cnt: INT] = {
+FOR i: INT IN [0..cnt) DO IBPut8[c, 0] ENDLOOP;
+};
+
+BPutRope: PUBLIC PROC [c: Connection, rope: ROPE, start: INT ¬ 0, len: INT ¬ LAST[INT]] = {
+connection: Connection ~ c;
+size: INT ¬ Rope.Length[rope];
+IF start<size AND len>0 THEN {
+action: PROC [c: CHAR] RETURNS [quit: BOOL ¬ FALSE] = {
+IBPut8[connection, ORD[c]]
+};
+size ¬ size-start; len ¬ MIN[size, len]; 
+[] ¬ Rope.Map[rope, start, len, action]; 
+};
+};
+
+BPutPaddedRope: PUBLIC PROC [c: Connection, rope: ROPE, start: INT, len: INT] = {
+connection: Connection ~ c;
+size: INT ¬ Rope.Length[rope];
+IF start<size AND len>0 THEN {
+action: PROC [c: CHAR] RETURNS [quit: BOOL ¬ FALSE] = {
+IBPut8[connection, ORD[c]]
+};
+size ¬ size-start; len ¬ MIN[size, len]; 
+[] ¬ Rope.Map[rope, start, len, action]; 
+BPut0s[connection, PaddingBytes[len]];
+};
+};
+
+DPutCARD16: PUBLIC INTERNAL PROC [c: Connection, val: CARD16] ~ {
+XlEndianPrivate.InlinePut16[c, val];
+};
+
+DPutCARD32: PUBLIC INTERNAL PROC [c: Connection, val: CARD32] ~ {
+XlEndianPrivate.InlinePut32[c, val];
+};
+
+DPutWindow: PUBLIC INTERNAL PROC [c: Connection, w: Window] ~ {
+XlEndianPrivate.InlinePut32[c, WindowId[w]];
+};
+
+DPutPad: PUBLIC INTERNAL PROC [c: Connection, len: INT] ~ {
+FOR i: INT IN [0..PaddingBytes[len]) DO
+IO.InlinePutChar[c.xmit, VAL[0]];  
+c.bufSkipped ¬ c.bufSkipped+1
+ENDLOOP;
+};
+
+DPutPaddedRope: PUBLIC INTERNAL PROC [c: Connection, rope: ROPE, start, len: INT] ~ {
+size: INT ¬ Rope.Length[rope];
+IF start<size AND len>0 THEN {
+size ¬ size-start; len ¬ MIN[size, len]; 
+IO.PutRope[c.xmit, rope, start, len]; 
+c.bufSkipped ¬ c.bufSkipped+len;
+DPutPad[c, len];
+};
+};
+
+GetExtensionCard16: PUBLIC PROC [ev: ExtensionEvent, index: NAT] RETURNS [CARD16] = {
+RETURN [XlEndianPrivate.InlineExtensionGet16[ev, index]]
+};
+
+GetExtensionCard32: PUBLIC PROC [ev: ExtensionEvent, index: NAT] RETURNS [CARD32] = {
+RETURN [XlEndianPrivate.InlineExtensionGet32[ev, index]]
+};
+
+GetTextCARD16: PUBLIC PROC [text: REF TEXT, startPos: INT] RETURNS [CARD16] = {
+RETURN [XlEndianPrivate.InlineTextGet16[text, startPos]];
+};
+
+GetTextCARD32: PUBLIC PROC [text: REF TEXT, startPos: INT] RETURNS [CARD32] = {
+RETURN [XlEndianPrivate.InlineTextGet32[text, startPos]];
+};
+
+ERead8: PUBLIC PROC [r: Reply] RETURNS [BYTE] = TRUSTED {
+IF r.next<32 THEN RETURN [Read8[r]];
+r.next ¬ r.next+1;
+RETURN [r.varPart[r.next-33]]
+};
+
+ERead16: PUBLIC PROC [r: Reply] RETURNS [CARD16] = TRUSTED {
+IF r.next<31 THEN RETURN [Read16[r]];
+IF r.next<32 THEN ERROR;
+r.next ¬ r.next+2;
+RETURN [XlEndianPrivate.InlineRawGet16[LOOPHOLE[r.varPart], r.next-34]];
+};
+
+ERead32: PUBLIC PROC [r: Reply] RETURNS [CARD32] = TRUSTED {
+IF r.next<29 THEN RETURN [Read32[r]];
+IF r.next<32 THEN ERROR;
+r.next ¬ r.next+4;
+RETURN [XlEndianPrivate.InlineRawGet32[LOOPHOLE[r.varPart], r.next-36]];
+};
+
+EReadRope: PUBLIC PROC [r: Reply] RETURNS [rope: ROPE] = TRUSTED {
+IF r.next<32 THEN ERROR ELSE {
+n: INT ~ r.varPart[r.next-32];
+m: NAT ¬ n;
+WHILE m>0 AND r.varPart[r.next+m-32]=0 DO m ¬ m-1 ENDLOOP;
+rope ¬ RopeFromRaw[p: LOOPHOLE[r.varPart], start: r.next-31, len: m];
+r.next ¬ r.next + 1 + n;
+};
+};
+
+RopeFromRaw: PUBLIC UNSAFE PROC [p: LONG POINTER TO Basics.RawBytes, start: CARD, len: INT] RETURNS [r: Rope.ROPE] = {
+EachChar: PROC RETURNS [c: CHAR] = TRUSTED {
+c ¬ VAL[p­[start]]; start ¬ start + 1;
+};
+r ¬ Rope.FromProc[len, EachChar];
+};
+
+InternalRoundTrip: PUBLIC INTERNAL PROC [c: Connection]  = {
+reply: Reply;
+StartDirectRequest[c, 43, 0, 1]; --GetInputFocus
+reply ¬ FinishWithReply[c];
+DisposeReply[c, reply];
+};
+
+RopeToString16: PUBLIC PROC [r: ROPE] RETURNS [s: String16] = {
+pos: INT ¬ -1;
+firstByte: BOOL ¬ TRUE;
+P: PROC RETURNS [CHAR] = {
+IF firstByte 
+THEN {firstByte ¬ FALSE; RETURN [0C]}
+ELSE {firstByte ¬ TRUE; pos ¬ pos+1; RETURN [Rope.Fetch[r, pos]]};
+};
+s.s ¬ Rope.FromProc[Rope.Length[r]*2, P];
+};
+
+
+Flush: PUBLIC PROC [c: Connection, delayed: BOOL ¬ FALSE] ~ {
+action: INTERNAL PROC [c: Connection] = {
+IF c.bufReady#0 
+THEN {
+RealFlushBuffer[c, FALSE]
+}
+ELSE IF c.needFlushing THEN {
+c.needFlushing ¬ FALSE;
+IO.Flush[c.xmit]; 
+};
+};
+IF Xl.Alive[c] THEN {
+IF delayed 
+THEN c.needFlushing ¬ TRUE
+ELSE DoWithLocks[c, action, XlDetails.ignoreErrors];
+};
+};
+
+RoundTrip: PUBLIC PROC [c: Connection, details: Details]  = {
+action: INTERNAL PROC [c: Connection] = {
+InternalRoundTrip[c]
+};
+DoWithLocks[c, action, details];
+};
+
+SetButtonGrabOwner: PUBLIC ENTRY PROC [c: Connection, timeStamp: TimeStamp, value: REF] RETURNS [SetGrabOwnerSuccess] = {
+limit: TimeStamp;
+IF c=NIL THEN RETURN [failedLaterTime];
+limit ¬ Xl.LastTime[c];
+IF Period[limit, timeStamp]>0 THEN {
+IF limit#currentTime THEN RETURN [failedFutureTime]
+};
+IF Period[c.buttonGrabTimeStamp, timeStamp]>0 OR c.buttonGrabTimeStamp=currentTime THEN {
+c.buttonGrabTimeStamp ¬ timeStamp; c.buttonGrabOwner ¬ value; 
+RETURN [succeeded];
+};
+RETURN [IF timeStamp=c.buttonGrabTimeStamp THEN failedEqualTime ELSE failedLaterTime];
+};
+
+ClearButtonGrabOwner: PUBLIC ENTRY PROC [c: Connection, timeStamp: TimeStamp] = {
+IF c#NIL AND Period[timeStamp, c.buttonGrabTimeStamp]<=0 THEN c.buttonGrabOwner ¬ NIL;
+};
+
+TRUSTED {untracedZone ¬ SafeStorage.GetUntracedZone[]};
+Commander.Register["XlDebugX1On", XlDebugOnCommand, "Internal debugging"];
+Commander.Register["XlDebugX1Off", XlDebugOffCommand, "Internal debugging"];
+END.
+   `  XlImplUtilities.mesa
+Copyright Ó 1988, 1989, 1990, 1991, 1992, 1993 by Xerox Corporation.  All rights reserved.
+Created by Christian Jacobi, April 7, 1988 2:01:36 pm PDT
+Christian Jacobi, September 14, 1993 4:18 pm PDT
+Willie-s, January 17, 1992 11:23 am PST
+
+--This is an error situation but we have to allocate enough memory nevertheless.  
+--Otherwise there could be a memory smash if caller ignores dead'ness 
+--
+Check assertion between commands
+--
+--
+Re-establish assertion between commands
+--
+Note that between commands assertion is not true as this is called with partial commands
+--
+Re-establish values for assertion between commands
+Wedge; but that happens only while debugging XlImpl or when connection was dead before...
+length: in 32 bit words
+--
+Re-establish values for assertion between commands
+###make those checks optional again after the famous "spreitzer" bug is fixed
+--
+--
+Re-establish values for assertion between commands
+--
+swapTable: PUBLIC REF READONLY ARRAY KeyArrayIndex OF KeyCode;
+FancySwapEndian: PROC = {
+swapEndian: REF ARRAY KeyArrayIndex OF KeyCode = 
+NEW[ARRAY KeyArrayIndex OF KeyCode];
+FOR i: KeyArrayIndex IN KeyArrayIndex DO
+byte: CARDINAL ¬ ORD[i] / 8;
+toSwap: [0..8) ¬ ORD[i] MOD 8;
+value: CARDINAL ¬ byte*8 + 7 - toSwap;
+swapEndian[i] ¬ VAL[value];  --small steps: princops compiler mumbled ambiguous length
+ENDLOOP;
+swapTable ¬ swapEndian;
+};
+--NOT delayed !
+--timeStamp is in the future; 
+--must prevent that because a future grab could not be cleared 
+--but must also check for case of LastTime not yet initialized 
+--Oops: If for 42 days no key is pressed... 
+FancySwapEndian[];
+Ê”  –(cedarcode) style•NewlineDelimiter
+˜ codešœ™Kšœ
+ÏeœO™ZKšœ6Ïk™9K™0K™'K™ —šž	œ˜
+KšœžœO˜jK˜ —š
+Ïnœžœžœžœžœ˜:Kšžœžœ>˜aKšžœ˜Kšžœ˜—šžœžœ˜K˜ —KšœžœžœÏc"˜;Kšœžœžœ "˜@Kšœžœžœ,˜QK˜ Kšœžœžœ˜K˜ šŸœžœžœ˜AKšœžœ˜Kšœžœžœžœžœžœžœžœ˜1Kšœžœ˜%Kšœžœ!˜8Kš
+žœžœžœžœžœ˜Kšžœžœ˜Kšžœžœžœ ˜CKš
+žœžœžœžœžœ˜gK˜—Kšœ˜Kšœ˜Kšœ˜K˜K˜ —šŸœžœžœžœ˜KKšœ
+œœžœ˜#šžœžœžœ˜KšœR™RKšœF™Fšžœžœ˜&Kšœ˜Kšœ˜K˜—K˜—šžœžœ˜&Kšœ˜K˜—Kšœ˜K˜ —š
+Ÿœžœžœžœžœ˜Ršžœžœ˜Kšžœžœžœ˜4Kšžœ˜
+K˜—Kšœžœ˜Kšœ™Kšœ ™ Kšžœžœžœ˜CKšœ™Kšžœžœ ˜AKšžœžœžœ ˜?Kšžœžœžœ
+˜ZKšœ˜Kšœ™Kšœ'™'Kšœ$˜$Kšœ˜Kšœ™šžœ˜	Kšžœž˜šžœ˜Kšœžœ˜Kšžœ˜K˜——Kšžœ˜Kšœ˜K˜ —šŸœžœžœ˜=KšœX™XKšœžœ˜Kšžœžœžœ ˜=Kšžœžœžœ˜XKšœžœ˜Kšœ˜K™Kšœ2™2Kšœ˜Kšœ"˜"Kšœ˜—K˜ šŸœžœžœžœ˜BKšœ˜šžœžœ˜&Kšœ˜K˜—K˜—K˜ šŸœžœ˜-KšœY™YKšœžœ˜ Kšžœ
+žœžœ˜Kšžœžœžœ˜-Kšœ
+žœ˜KšÏb˜Kšžœ˜K˜—K˜ šŸœžœžœ	žœžœžœžœ˜uKšœ™Kšœžœ˜Kšœžœ˜K˜.Kšœ˜Kšžœžœ'žœ˜QK™Kšœ2™2Kšœ˜Kšœ  ˜/Kšœ˜Kšœ˜—K˜ šŸœžœžœžœ	žœžœ˜RKšœ=˜=Kšœ˜K˜ —šŸœžœžœžœ	žœžœžœ˜lKšœ@˜@Kšœ˜—K˜ KšŸ˜K˜ šŸœžœžœžœžœžœ˜4Kšžœžœ˜K˜Kšœžœžœžœ˜(—K˜ šŸœžœA˜RK˜šžœžœžœ˜Kšœ˜Kšžœ	žœžœžœ˜Kšžœžœžœ˜(K˜@K˜—Kšœ˜—K˜ šŸœžœžœžœ˜XKšœžœžœ˜:Kšœ˜Kšœ*˜*Kšžœžœžœ˜ Kšžœ˜K˜—K˜ šŸœžœ˜:Kšœžœ4˜:šžœžœžœ˜Kšœ-žœ˜KK˜—K˜—K˜ š
+Ÿœžœžœžœžœ*˜ešžœ˜Kšžœžœ˜šžœžœ˜K˜"Kšžœ˜Kšœ˜—šœ˜Kšœ
+žœžœ˜CKšœ˜K˜7Kšžœ˜Kšœ˜—šžœ 5˜BK˜"Kšžœ˜Kšœ˜—K˜—Kšžœ
+žœžœ˜-K˜
+Kšžœžœžœžœ˜4šžœ˜˜šžœžœž˜Kšœžœžœ˜šœžœ˜6Kšœžœ4˜>Kšžœžœžœ˜#K˜—Kšœžœ˜%˜#Kšœžœ4˜>K˜*K˜—Kšžœžœ˜—K˜—˜šžœ.žœž˜=šœ
+žœ˜&K˜'šžœžœž˜Kšœžœžœ˜šœžœ˜6Kšžœžœžœ˜#K˜—Kšœžœ˜%˜#K˜*K˜—Kšžœžœ˜—K˜—Kšžœžœ˜—K˜——Kšœ˜K˜ —šŸœžœžœžœ˜?Kšœ˜Kšœ˜K˜ —šŸœžœžœžœžœ	žœžœ˜kKšœ*˜*Kšœ˜Kšœ˜—K˜ Kšœžœ˜Kšœžœžœžœžœžœ˜=Kšœžœžœ˜%Kšœžœžœ˜%K˜ šŸœ˜+Kšœžœžœ˜!Kšœžœ˜Kšžœžœžœ˜.K˜2K˜K˜ —šŸœ˜,Kšœžœ˜Kšœ%žœ˜*K˜K˜ —š
+Ÿœžœžœ
+žœžœ˜RK™MKšžœžœ˜3Kšžœ8žœ˜OK˜'K˜6šžœžœ˜Kšœžœ3˜=šžœžœž˜Kšœžœ#žœ˜Gšžœ˜Kšœžœžœ˜&K˜Kšœžœ˜1K˜ K˜K˜——K˜—K˜K˜ —šŸœžœžœžœžœžœžœžœžœ˜‡Kšœ™Kšœžœ˜K˜-Kšœ˜Kšœ™Kšœ2™2Kšœ˜Kšœ1˜1Kšœ˜Kšœ™Kšžœžœžœžœ˜8K˜K˜ —šŸœžœžœžœžœžœžœ˜_Kšœžœ˜Kšžœžœ˜6Kšœ˜Kšžœžœžœžœ˜8K˜K˜ —šŸœžœžœžœ˜2Kšœ˜K˜—šŸ	œžœžœžœ˜4Kšœžœ˜K˜—šŸœžœžœžœžœžœ˜0Kšžœžœ˜$Kšœ˜—šŸœžœžœžœ˜8Kšœ˜K˜—šŸ
+œžœžœ˜6Kšœ˜K˜—šŸœžœžœ!˜:Kšœ˜K˜—šŸœžœžœ"˜7Kšœ˜K˜—šŸ
+œžœžœ˜6Kšœ˜K˜—šŸ
+œžœžœ$˜;Kšœ˜K˜—šŸœžœžœžœ˜1Kš
+žœžœžœ
+žœžœ˜/K˜—K˜ šŸœžœžœ	žœžœžœžœ˜[Kšœ˜Kšœžœ˜šžœžœžœ˜šœžœžœžœžœžœ˜7Kšœžœ˜Kšœ˜—Kšœžœ˜)Kšœ)˜)K˜—K˜—K˜ šŸœžœžœžœ	žœžœ˜QKšœ˜Kšœžœ˜šžœžœžœ˜šœžœžœžœžœžœ˜7Kšœžœ˜Kšœ˜—Kšœžœ˜)Kšœ)˜)Kšœ&˜&K˜—K˜—K˜ š
+Ÿ
+œžœžœžœžœ˜AKšœ$˜$Kšœ˜K˜ —š
+Ÿ
+œžœžœžœžœ˜AKšœ$˜$Kšœ˜K˜ —šŸ
+œžœžœžœ˜?Kšœ,˜,Kšœ˜K˜ —š
+Ÿœžœžœžœžœ˜;šžœžœžœž˜'Kšžœžœ˜#Kšœ˜Kšžœ˜—K˜—K˜ šŸœžœžœžœžœžœ˜UKšœžœ˜šžœžœžœ˜Kšœžœ˜)Kšžœ$˜&Kšœ ˜ Kšœ˜K˜—Kšœ˜K˜ —šŸœžœžœžœžœžœ˜UKšžœ2˜8Kšœ˜—K˜ šŸœžœžœžœžœžœ˜UKšžœ2˜8Kšœ˜—K˜ šŸœžœžœžœžœžœžœžœ˜OKšžœ3˜9K˜K˜ —šŸœžœžœžœžœžœžœžœ˜OKšžœ3˜9K˜—K˜ šŸœžœžœžœžœžœ˜9Kšžœžœžœ˜$Kšœ˜Kšžœ˜K˜K˜ —šŸœžœžœžœžœžœ˜<Kšžœžœžœ˜%Kšžœžœžœ˜Kšœ˜Kšžœ!žœ˜HK˜K˜ —šŸœžœžœžœžœžœ˜<Kšžœžœžœ˜%Kšžœžœžœ˜Kšœ˜Kšžœ!žœ˜HK˜K˜ —šŸ	œžœžœžœžœžœ˜Bšžœžœžœžœ˜Kšœžœ˜K•StartOfExpansion>[s: REF READONLY TEXT, start: NAT _ 0, len: NAT _ 32767]šœžœ˜Kšžœžœžœ	žœ˜:Kšœžœ'˜EKšœ˜K˜—K˜—K˜ šŸœžœžœžœžœžœžœžœžœžœ
+žœ˜vš
+Ÿœžœžœžœžœ˜,Kšœžœ˜&K˜—Kšœ!˜!Kšœ˜—K˜ šŸœžœžœžœ˜<Kšœ˜Kšœ! ˜0Kšœ˜Kšœ˜K˜—K˜ š
+Ÿœžœžœžœžœ˜?Kšœžœ˜Kšœžœžœ˜šŸœžœžœžœ˜šžœ˜Kšžœžœžœ˜%Kšžœžœžœ˜B—K˜—Kšœ)˜)K˜K˜ —šœžœžœžœžœžœ	™>šŸœžœ™šœžœžœžœ™1Kšžœžœžœ
+™$—šžœžœž™(Kšœžœžœ™Kšœžœžœ™Kšœžœ™&Kšœžœ
+ 9™VKšžœ™—Kšœ™Kšœ™——K˜ š
+Ÿœžœžœžœžœ˜=šœžœžœ˜)Kšžœ	™šžœ˜šžœ˜Kšœžœ˜K˜—šžœžœžœ˜Kšœžœ˜Kšžœ˜Kšœ˜——Kšœ˜—šžœžœ˜šžœ	˜Kšžœž˜Kšžœ0˜4—K˜—Kšœ˜K˜ —šŸ	œžœžœ'˜=šœžœžœ˜)Kšœ˜Kšœ˜—Kšœ ˜ K˜K˜ —šŸœžœžœžœ.žœžœ˜yKšœž˜Kšžœžœžœžœ˜'Kšœ˜šžœžœ˜$Kš ™Kš ?™?Kš "œ ™?Kš ,™,Kšžœžœžœ˜3K˜—šžœ,žœ#žœ˜YKšœ>˜>Kšžœ˜K˜—Kšžœžœ!žœžœ˜VK˜K˜ —šŸœžœžœžœ*˜QKš
+žœžœžœ-žœžœ˜VKšœ˜—K˜ Kšžœ0˜7Kšœ™K˜JK˜LKšžœ˜— …—    72  S&  

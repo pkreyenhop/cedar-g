@@ -1,0 +1,1105 @@
+
+DIRECTORY
+Ascii,
+C2CAccess,
+C2CBasics,
+C2CCodePlaces,
+C2CCodeDefsPrivate,
+C2CCodeUtils,
+C2CDefs,
+C2CEmit,
+C2CTarget,
+C2CTypes,
+IntCodeDefs,
+IO,
+RefText,
+Rope;
+
+C2CEmitImpl: CEDAR PROGRAM
+IMPORTS C2CAccess, C2CEmit, C2CBasics, C2CCodeUtils, C2CTypes, IO, RefText, Rope
+EXPORTS C2CEmit, C2CDefs =
+BEGIN
+OPEN C2CDefs, C2CEmit, IntCodeDefs;
+
+remark: SIGNAL = CODE;
+signalOnRemark: BOOL ¬ TRUE;
+nest: PUBLIC ROPE ¬ "@(";
+unNest: PUBLIC ROPE ¬ "@)";
+line: PUBLIC ROPE ¬ "\n";
+optionalLine: PUBLIC ROPE ¬ "@.";
+twoLines: PUBLIC ROPE ¬ "@!";
+noIndent: PUBLIC ROPE ¬ "@_";
+nestNLine: PUBLIC ROPE ¬ "@(\n";
+unNestNLine: PUBLIC ROPE ¬ "@)\n";
+
+nullClass: IntCodeDefs.ArithClass = [lastExtension, FALSE, 0];
+
+Code: TYPE = REF CodeRep;
+CodeRep: PUBLIC TYPE = C2CCodeDefsPrivate.CodeRec;
+STREAM: TYPE = IO.STREAM;
+ROPE: TYPE = Rope.ROPE;
+maxPos: CARD = LAST[INT]/2;
+
+ROPEorTEXT: TYPE = REF;
+
+CodePlaceRec: TYPE = RECORD [c: Code ¬ NIL, block: REF CodeBlock ¬ NIL, blockPos: INT ¬ LAST[INT]];
+CodePlaces: TYPE = ARRAY C2CCodePlaces.CodePlace OF CodePlaceRec;
+
+codeBlockSize: NAT = 120;
+CodeBlock: TYPE = RECORD [
+item: ARRAY [0..codeBlockSize) OF REF ANY ¬ ALL[NIL]
+];
+
+freeList: LIST OF REF ANY ¬ NIL;
+
+NewListPiece: PROC [foo: REF ANY] RETURNS [l: LIST OF REF ANY] = {
+l ¬ freeList;
+IF l=NIL THEN RETURN [LIST[foo]];
+freeList ¬ freeList.rest;
+l.rest ¬ NIL;
+l.first ¬ foo;
+};
+
+FreeList: PROC [list, last: LIST OF REF ANY] = {
+IF list#NIL THEN {
+IF last=NIL THEN last ¬ list; 
+last.rest ¬ freeList; 
+list.first ¬ NIL; --incomplete! repeat on new
+freeList ¬ list
+};
+};
+
+codeBlockCnt: INT ¬ 0;
+codeBlockCntMax: INT = 80;
+freeCodeBlocks: REF CodeBlock ¬ NIL;
+
+NewCodeBlock: PROC [] RETURNS [cb: REF CodeBlock] = {
+cb ¬ freeCodeBlocks;
+IF cb=NIL THEN RETURN [NEW[CodeBlock]];
+WITH cb.item[0] SELECT FROM
+b: REF CodeBlock => {
+codeBlockCnt ¬ codeBlockCnt-1;
+freeCodeBlocks ¬ b; 
+};
+ENDCASE => {
+codeBlockCnt ¬ 0;
+freeCodeBlocks ¬  NIL;
+};
+cb.item[0] ¬ NIL;
+};
+
+FreeCodeBlock: PROC [cb: REF CodeBlock] = {
+IF cb#NIL AND codeBlockCnt<codeBlockCntMax THEN {
+cb.item[0] ¬ freeCodeBlocks;
+freeCodeBlocks ¬ cb;
+codeBlockCnt ¬ codeBlockCnt+1;
+FOR i: NAT IN [1..codeBlockSize) DO cb.item[i] ¬ NIL ENDLOOP;
+}
+};
+
+----------------------------------------------------------------
+
+Internalize: PUBLIC PROC [r: ROPE] RETURNS [ROPE ¬ NIL] = {
+leng: INT ¬ Rope.Length[r];
+next: INT ¬ 0;
+DO
+next ¬ Rope.SkipTo[s: r, pos: next, skip: "@"];
+IF next>=leng THEN RETURN [r];
+r ¬ Rope.Replace[base: r, start: next, len: 0, with: "@"];
+leng ¬ leng+1; next ¬ next+2;
+ENDLOOP;
+};
+
+CComment: PUBLIC PROC [r: ROPE] RETURNS [comment: Code] = {
+comment ¬ RopeCode[Rope.Cat["/* ", CleanUpComment[Internalize[r]], " */ "]];
+comment.whiteSpaceOnly ¬ TRUE;
+};
+
+CleanUpComment: PROC [r: ROPE] RETURNS [ROPE] = {
+IF C2CAccess.params.extraShortAndUgly THEN RETURN [""]
+ELSE {
+leng: INT ¬ Rope.Length[r];
+FOR i: INT IN [0..leng) DO
+SELECT Rope.Fetch[r, i] FROM
+'/ => IF i+1=leng 
+THEN r ¬ Rope.Concat[r, "_"] 
+ELSE IF Rope.Fetch[r, i+1]='* THEN r ¬ Rope.Replace[r, i+1, 1, "."];
+'* => IF i+1<leng AND Rope.Fetch[r, i+1]='/ THEN r ¬ Rope.Replace[r, i, 1, "."];
+C2CEmit.breakChar => r ¬ Rope.Replace[r, i, 1, "_"];
+Ascii.TAB => NULL;
+>='\177, <'  => r ¬ Rope.Replace[r, i, 1, "_"];
+ENDCASE => NULL;
+ENDLOOP;
+};
+RETURN [r];
+};
+
+lParam: ROPE = Rope.Flatten[Rope.Concat["(", C2CEmit.nest]];
+rParam: ROPE = Rope.Flatten[Rope.Concat[")", C2CEmit.unNest]];
+lLParam: ROPE = Rope.Flatten[Rope.Concat["(", C2CEmit.nestNLine]];
+rLParam: ROPE = Rope.Flatten[Rope.Cat[C2CEmit.line, ")", C2CEmit.unNest]];
+
+Parentize: PUBLIC PROC [c: CodeOrRope] RETURNS [code: Code] = {
+isAdress: BOOL ¬ FALSE;
+adressable: BOOL ¬ FALSE;
+dead: BOOL ¬ FALSE;
+class: IntCodeDefs.ArithClass ¬ [lastExtension, FALSE, 0];
+WITH c SELECT FROM
+cr: REF C2CCodeDefsPrivate.CodeRec => {
+IF cr.precedence>=parenPrecedence THEN RETURN [cr];
+isAdress ¬ cr­.isAdress;
+adressable ¬ cr­.adressable;
+class ¬ cr­.class;
+dead ¬ cr­.dead;
+};
+ENDCASE => {};
+code ¬ C2CEmit.Cat[lParam, c, rParam]; 
+code.precedence ¬ parenPrecedence;
+code.isAdress ¬ isAdress;
+code.adressable ¬ adressable;
+code.class ¬ class;
+code.dead ¬ dead;
+};
+
+ParentizeAndLn: PUBLIC PROC [c: CodeOrRope] RETURNS [code: Code] = {
+isAdress: BOOL ¬ FALSE;
+adressable: BOOL ¬ FALSE;
+dead: BOOL ¬ FALSE;
+class: IntCodeDefs.ArithClass ¬ [lastExtension, FALSE, 0];
+WITH c SELECT FROM
+cr: REF C2CCodeDefsPrivate.CodeRec => {
+IF cr.precedence>=parenPrecedence THEN RETURN [cr];
+isAdress ¬ cr­.isAdress;
+adressable ¬ cr­.adressable;
+class ¬ cr­.class;
+dead ¬ cr­.dead;
+};
+ENDCASE => {};
+code ¬ C2CEmit.Cat[lLParam, c, rLParam]; 
+code.precedence ¬ parenPrecedence;
+code.isAdress ¬ isAdress;
+code.adressable ¬ adressable;
+code.class ¬ class;
+code.dead ¬ dead;
+};
+
+nestLimit: INT = 10; --must be such that spaces is large enough
+spaces: Rope.ROPE = Rope.Flatten["                              "];
+maxLineLeng: INT ¬ 120;
+
+TrustAsRope: PROC [x: REF ANY] RETURNS [ROPE] = {
+WITH x SELECT FROM
+r: ROPE => RETURN [r];
+rt: REF TEXT => RETURN [RefText.TrustTextAsRope[rt]];
+ENDCASE => IF x=NIL THEN RETURN[""] ELSE ERROR;
+};
+
+lineStreamHeader: Rope.ROPE = "Positions  001 \000";
+lineStreamTrailer: Rope.ROPE = "\000\000\000\000\000\000\000\000";
+pieceCount, piceSum: INT ¬ 0;
+
+ProcessAndOutputCode: PUBLIC PROC [stream: IO.STREAM, lineStream: IO.STREAM, c: Code, lineChar: CHAR, allowUnIndent: BOOL ¬ TRUE] = {
+nesting: INT ¬ 0;
+lineEmpty: BOOL ¬ TRUE;
+doubleEmpty: BOOL ¬ TRUE; --must be defined defined while lineEmpty=TRUE
+chars: INT ¬ 0;
+lineNumber: CARD ¬ 1;
+doLineStream: BOOL ¬ C2CAccess.params.generateLineNumberStream;
+extraUgly: BOOL ¬ C2CAccess.params.extraShortAndUgly;
+PutLineFileNumber: PROC [i: CARD] = TRUSTED {
+block: PACKED ARRAY [0..4) OF BYTE;
+block[0] ¬ i / 100000000B MOD 256;
+block[1] ¬ i /    200000B MOD 256;
+block[2] ¬ i /        256 MOD 256;
+block[3] ¬ i              MOD 256;
+TRUSTED {
+bp: LONG POINTER = @block;
+IO.UnsafePutBlock[lineStream,  [LOOPHOLE[bp], 0, 4]]
+};
+};
+PutLineFileRope: PROC [r: Rope.ROPE] = {
+n: CARD ¬ Rope.Length[r];
+all: CARD ¬ ((n + 7) / 8) * 8;
+PutLineFileNumber[n];
+IO.PutRope[lineStream, r];
+FOR i: CARD IN [n..all) DO IO.PutChar[lineStream, 0C] ENDLOOP; 
+};
+PutSpaces: PROC [nesting: INT] = INLINE {
+IF nesting>0 AND ~extraUgly THEN {
+IF nesting>=nestLimit THEN {
+IO.PutText[stream, "/*"];
+IO.PutRope[stream, C2CCodeUtils.RopeFromInt[nesting / nestLimit]];
+IO.PutText[stream, "*/"];
+nesting ¬ (nesting MOD nestLimit) + 1;
+};
+IO.PutRope[stream, spaces, 0, nesting*3];
+};
+};
+Out: PROC [r: ROPE, start: INT ¬ 0, len: INT] = INLINE {
+IF lineEmpty THEN {PutSpaces[nesting]; lineEmpty ¬ FALSE};
+IO.PutRope[stream, r, start, len]; 
+chars ¬ chars+len;
+};
+NewLine: PROC [] = {
+IF ~lineEmpty THEN {
+lineEmpty ¬ TRUE; doubleEmpty ¬ FALSE;
+IO.PutChar[stream, lineChar];
+lineNumber ¬ lineNumber+1;
+chars ¬ 0;
+}
+};
+SeparationLine: PROC [] = {
+IF ~lineEmpty THEN NewLine[];
+IF ~doubleEmpty THEN IO.PutChar[stream, lineChar];
+doubleEmpty ¬ TRUE;
+};
+HandlePosition: PROC [r: Rope.ROPE, pos: INT, isStart: BOOL] = {
+Template: TYPE = --WORD8 MSBIT MACHINE DEPENDEND-- PACKED RECORD [cA, cB: BYTE, fA, fB, fC: BYTE, sA, sB, sC: BYTE];
+template: Template;
+start, chars: CARD;
+NewLine[];
+start ¬ ORD[Rope.Fetch[r, pos+0]] * 100000000B + ORD[Rope.Fetch[r, pos+1]] *  200000B + ORD[Rope.Fetch[r, pos+2]] * 256 + ORD[Rope.Fetch[r, pos+3]];
+chars ¬ ORD[Rope.Fetch[r, pos+4]] * 100000000B + ORD[Rope.Fetch[r, pos+5]] *  200000B + ORD[Rope.Fetch[r, pos+6]] * 256 + ORD[Rope.Fetch[r, pos+7]];
+IF lineNumber<1 OR lineNumber>LAST[CARD16] THEN ERROR;
+IF start<0 OR chars<0 THEN ERROR;
+IF start>maxPos OR chars>maxPos THEN ERROR;
+chars ¬ chars+start;
+IF chars>maxPos THEN ERROR;
+template.cA ¬ lineNumber / 256 MOD 256;
+template.cB ¬ lineNumber MOD 256;
+template.fA ¬ start / 65536 MOD 256;
+IF ~isStart THEN template.fA ¬ template.fA + 128;
+template.fB ¬ start / 256 MOD 256;
+template.fC ¬ start MOD 256;
+template.sA ¬ chars / 65536 MOD 256;
+template.sB ¬ chars / 256 MOD 256;
+template.sC ¬ chars MOD 256;
+TRUSTED {
+tp: LONG POINTER = @template;
+IO.UnsafePutBlock[lineStream,  [LOOPHOLE[tp], 0, 8]]
+};
+};
+IF c.delayedX THEN C2CBasics.CantHappen;
+IF doLineStream THEN {
+IO.PutRope[lineStream, lineStreamHeader];
+PutLineFileRope[C2CAccess.params.moduleName];
+PutLineFileRope[C2CAccess.params.versionStamp];
+};
+FOR list: LIST OF REF ANY ¬ c.base, list.rest WHILE list#NIL DO
+blockIdx: INT ¬ 0; 
+next, leng: INT;
+DO --loop over list.first [CodeBlock or single string]
+IterationNext: PROC [x: REF ANY] RETURNS [ROPE] = INLINE {
+IF blockIdx>=codeBlockSize THEN RETURN[NIL];
+WITH x SELECT FROM
+seq: REF CodeBlock => {
+WHILE blockIdx<codeBlockSize DO 
+y: REF ANY ¬ seq.item[blockIdx]; blockIdx ¬ blockIdx+1;
+WITH y SELECT FROM
+r: ROPE => RETURN [r];
+rt: REF TEXT => TRUSTED { 
+RETURN [RefText.TrustTextAsRope[LOOPHOLE[rt]]]
+};
+ENDCASE => IF y#NIL THEN ERROR;  
+ENDLOOP;
+FreeCodeBlock[seq];
+RETURN [NIL];
+};
+r: ROPE => {blockIdx ¬ codeBlockSize; RETURN [r]};
+rt: REF TEXT => TRUSTED { 
+blockIdx ¬ codeBlockSize; RETURN [RefText.TrustTextAsRope[LOOPHOLE[rt]]] 
+};
+ENDCASE => IF x=NIL THEN RETURN[NIL] ELSE ERROR;
+};
+firstPos: INT ¬ 0;
+r: ROPE ¬ IterationNext[list.first];
+IF r=NIL THEN EXIT; --exits loop over list.first
+leng ¬ Rope.Length[r];
+WHILE firstPos<leng DO --loop over pieces of single string
+next ¬ Rope.SkipTo[s: r, pos: firstPos, skip: "\n@"];
+IF next>firstPos THEN 
+Out[r: r, start: firstPos, len: next-firstPos];
+IF next<leng THEN 
+SELECT Rope.Fetch[r, next] FROM
+'\n => {NewLine[]; next ¬ next+1};
+C2CEmit.breakChar => {
+IF next+1>=leng THEN NewLine[]
+ELSE
+SELECT Rope.Fetch[r, next+1] FROM
+'( => {
+nesting ¬ nesting+1;
+IF chars>maxLineLeng THEN NewLine[];
+};
+') => {
+nesting ¬ nesting-1;
+IF chars>maxLineLeng THEN NewLine[];
+};
+'/  => NewLine[];
+'_  => {NewLine[]; IF allowUnIndent THEN lineEmpty ¬ FALSE};
+'!  => SeparationLine[];
+'# => IF doLineStream THEN {
+HandlePosition[r, next+2, TRUE]; 
+next ¬ next+8
+};
+'% => IF doLineStream THEN {
+HandlePosition[r, next+2, FALSE]; 
+next ¬ next+8
+};
+'.  => {
+IF chars>maxLineLeng THEN NewLine[];
+};
+C2CEmit.breakChar  => Out["@", 0, 1];
+ENDCASE => NewLine[];
+next ¬ next+2;
+};
+ENDCASE => C2CBasics.CantHappen;
+firstPos ¬ next;
+ENDLOOP --WHILE--;
+ENDLOOP --DO--;
+ENDLOOP --FOR--;
+IF doLineStream THEN {
+IO.PutRope[lineStream, lineStreamTrailer];
+};
+};
+
+Deref: PUBLIC PROC [c: Code, pointeeBits: INT] RETURNS [Code] = {
+IF c=NIL OR c.usageInhibited OR c.whiteSpaceOnly OR c.dead THEN C2CBasics.CantHappen;
+c.delayedCWord ¬ c.delayedCRef ¬ FALSE;
+c ¬ DCleanCode[c]; 
+c ¬ MinPrecedence[c, unaryPrecedence];
+c.delayedDeref ¬ c.delayedX ¬ TRUE; 
+c.pointeeBits ¬ pointeeBits;
+c.adressable ¬ TRUE;
+c.precedence ¬ unaryPrecedence;
+c.class ¬ IF pointeeBits>0 AND pointeeBits<=LAST[ArithPrecision] 
+THEN [unsigned, FALSE, pointeeBits]
+ELSE nullClass;
+RETURN [c]
+};
+
+IsDelayedDeref: PUBLIC PROC [c: Code] RETURNS [BOOL] = {
+RETURN [ c.delayedX AND c.delayedDeref ];
+};
+
+TakeAddr: PUBLIC PROC [c: Code, preventCastingToWord: BOOL] RETURNS [Code] = {
+IF c=NIL OR c.usageInhibited OR c.whiteSpaceOnly OR c.dead THEN C2CBasics.CantHappen;
+IF c.isAdress THEN {c.isAdress ¬ FALSE; RETURN [c]};
+IF c.delayedX THEN {
+IF c.delayedDeref THEN {
+c.class ¬ [address, FALSE, C2CTarget.bitsPerWord];
+c.delayedDeref ¬ c.delayedCRef ¬ FALSE;
+c.delayedX ¬ c.delayedCWord ¬ ~preventCastingToWord;
+RETURN [c];
+};
+c.delayedX ¬ c.delayedDeref ¬ c.delayedCWord ¬ c.delayedCRef ¬ FALSE;
+};
+c ¬ MinPrecedence[c, unaryPrecedence];
+c ¬ Cat["&", c];
+c ¬ SetPrecedence[c, unaryPrecedence];
+c.class ¬ [address, FALSE, C2CTarget.bitsPerWord];
+c.hasCRef ¬ c.hasCWord ¬ FALSE;
+c.delayedX ¬ c.delayedCWord ¬ ~preventCastingToWord;
+RETURN [c];
+};
+
+PreventCastingToWord: PUBLIC PROC [c: Code] RETURNS [Code] = {
+c.delayedCWord ¬ FALSE;
+c.delayedX ¬ c.delayedDeref OR c.delayedCRef; 
+RETURN [c];
+};
+
+CastWord: PUBLIC PROC [c: CodeOrRope] RETURNS [code: Code] = {
+done: BOOL ¬ FALSE;
+WITH c SELECT FROM
+co: REF CodeRep => {code ¬ co};
+r: ROPE => code ¬ IdentCode[r];
+rt: REF TEXT => code ¬ IdentCode[Rope.FromRefText[rt]];
+ENDCASE => C2CBasics.CantHappen; 
+code.delayedCRef ¬ FALSE;
+IF code.delayedX THEN {
+IF code.delayedDeref THEN {
+bits: INT ¬ code.pointeeBits;
+code ¬ DCleanCode[code];
+IF bits=C2CTarget.bitsPerWord THEN RETURN [code];
+IF bits>C2CTarget.bitsPerWord THEN C2CBasics.CantHappen;
+};
+code.delayedCRef ¬ FALSE; code.pointeeBits ¬ -1;
+}
+ELSE IF code.hasCWord THEN RETURN [code];
+code ¬ MinPrecedence[code, unaryPrecedence];
+code.delayedCWord ¬ code.delayedX  ¬ TRUE;
+};
+
+CastRef: PUBLIC PROC [c: Code, pointeeBits: INT] RETURNS [Code] = {
+c.delayedCWord ¬ c.hasCWord ¬ FALSE;
+c ¬ MinPrecedence[c, unaryPrecedence];
+IF c.delayedX THEN {
+IF c.delayedDeref THEN {
+bits: INT ¬ c.pointeeBits;
+c ¬ DCleanCode[c]; 
+IF bits#C2CTarget.bitsPerWord THEN C2CBasics.CantHappen;
+c.hasCRef ¬ FALSE;
+};
+}
+ELSE IF c.hasCRef AND c.hasCRefBits=pointeeBits THEN {
+RETURN [c];
+};
+c.pointeeBits ¬ pointeeBits;
+c.delayedDeref ¬ c.delayedCWord ¬ FALSE;
+c.delayedX ¬ c.delayedCRef ¬ TRUE;
+RETURN [c];
+};
+SetWord: PUBLIC PROC [c: Code] RETURNS [Code] = {
+c ¬ MinPrecedence[c, unaryPrecedence];
+IF c.delayedX THEN {
+IF c.delayedDeref THEN {
+bits: INT ¬ c.pointeeBits;
+c ¬ DCleanCode[c]; c.delayedDeref ¬ FALSE;
+IF bits#C2CTarget.bitsPerWord THEN C2CBasics.CantHappen;
+};
+IF c.delayedCWord THEN RETURN [c];
+};
+c.delayedX ¬ c.delayedDeref ¬ c.delayedCRef ¬ c.delayedCWord ¬ c.hasCRef ¬ FALSE;
+c.hasCRefBits ¬ -1;
+c.hasCWord ¬ TRUE;
+RETURN [c];
+};
+SetRef: PUBLIC PROC [c: Code, pointeeBits: INT] RETURNS [Code] = {
+c ¬ MinPrecedence[c, unaryPrecedence];
+IF c.delayedX THEN {
+IF c.delayedDeref THEN C2CBasics.CantHappen;
+IF c.delayedCRef THEN {
+IF c.pointeeBits#pointeeBits THEN C2CBasics.CantHappen;
+RETURN [c];
+};
+};
+c.delayedX ¬ c.delayedDeref ¬ c.delayedCRef ¬ c.delayedCWord ¬ c.hasCWord ¬ FALSE;
+c.hasCRefBits ¬ pointeeBits;
+c.hasCRef ¬ TRUE;
+RETURN [c];
+};
+CodeToRope: PUBLIC PROC [c: CodeOrRope] RETURNS [r: ROPE] = { 
+WITH c SELECT FROM
+co: REF CodeRep => RETURN [RealCodeToRope[co]];
+r: ROPE => RETURN [r];
+rt: REF TEXT => RETURN [Rope.FromRefText[rt]];
+ENDCASE => IF c=NIL THEN RETURN [NIL] ELSE C2CBasics.CantHappen; 
+};
+
+CodeToRopeD: PUBLIC PROC [c: CodeOrRope] RETURNS [r: ROPE] = { 
+WITH c SELECT FROM
+co: REF CodeRep => {
+r ¬ RealCodeToRope[co];
+FreeCode[co];
+RETURN [r];
+};
+r: ROPE => RETURN [r];
+rt: REF TEXT => RETURN [Rope.FromRefText[rt]];
+ENDCASE => IF c=NIL THEN RETURN [NIL] ELSE C2CBasics.CantHappen; 
+};
+
+PutList: PROC [s: IO.STREAM, lora: LIST OF REF ANY] = {
+FOR l: LIST OF REF ANY ¬ lora, l.rest WHILE l#NIL DO
+WITH l.first SELECT FROM
+r: ROPE => IO.PutRope[s, r];
+rt: REF TEXT => IO.PutText[s, rt];
+ENDCASE => IF l.first#NIL THEN ERROR;
+ENDLOOP;
+};
+
+RealCodeToRope: PROC [c: Code] RETURNS [r: ROPE] = { -- non destructive
+ros: STREAM ¬ NIL;
+suf: REF TEXT ¬ NIL;
+IF c=NIL THEN RETURN [NIL];
+IF c.usageInhibited THEN C2CBasics.CantHappen;
+ros ¬ IO.ROS[];
+IF c.delayedX THEN {
+IF c.delayedDeref THEN {
+IF c.hasCRef AND c.hasCRefBits=c.pointeeBits 
+THEN {
+IF c.precedence<identPrecedence 
+THEN {IO.PutText[ros, "(*("]; suf ¬ "))"}
+ELSE {IO.PutText[ros, "(*"]; suf ¬ ")"};
+}
+ELSE {
+IF c.precedence<identPrecedence 
+THEN {
+IO.PutText[ros, "(*"];
+IO.PutRope[ros, PointerCast[c.pointeeBits]];
+IO.PutText[ros, "("];
+suf ¬ "))";
+}
+ELSE {
+IO.PutText[ros, "(*"];
+IO.PutRope[ros, PointerCast[c.pointeeBits]];
+suf ¬ ")";
+};
+};
+}
+ELSE IF c.delayedCRef THEN {
+IF ~c.hasCRef OR c.hasCRefBits#c.pointeeBits THEN {
+IF c.precedence<identPrecedence 
+THEN {
+IO.PutRope[ros, "("];
+IO.PutRope[ros, PointerCast[c.pointeeBits]];
+IO.PutRope[ros, "("];
+suf ¬ "))";
+}
+ELSE {
+IO.PutRope[ros, "("];
+IO.PutRope[ros, PointerCast[c.pointeeBits]];
+suf ¬ ")";
+};
+};
+}
+ELSE IF c.delayedCWord THEN {
+IF ~c.hasCWord THEN IO.PutText[ros, "(word) "];
+};
+};
+PutList[ros, c.base];
+IO.PutText[ros, suf];
+RETURN[IO.RopeFromROS[self: ros]];
+};
+
+PointerCast: PROC [bits: INT] RETURNS [c: ROPE] = {
+c ¬ GetPointerCast[bits];
+IF c#NIL THEN RETURN [c];
+c ¬ C2CTypes.DefinePtrType[bits];
+c ¬ Rope.Cat[" (", c, ") "];
+RememberPointerCast[bits, c];
+};
+
+lastBits: INT ¬ 0;
+lastPCast: ROPE;
+ResePointerCastCache: PROC[] = {
+lastBits ¬ 0;
+lastPCast ¬ NIL;
+};
+
+
+GetPointerCast: PROC [bits: INT] RETURNS [ROPE] = INLINE {
+IF bits=lastBits THEN RETURN [lastPCast] ELSE RETURN [NIL];
+};
+
+RememberPointerCast: PROC [bits: INT, c: ROPE] = INLINE {
+lastPCast ¬ c;
+lastBits ¬ bits;
+};
+
+DCleanCode: PROC [c: Code] RETURNS [Code] = {
+IF c=NIL THEN RETURN [NewCode[]];
+IF c.usageInhibited OR c.isAdress THEN C2CBasics.CantHappen;
+IF c.delayedX THEN {
+IF c.delayedDeref THEN {
+IF c.precedence<unaryPrecedence THEN {
+c ¬ DEncloseCode["(", c, ")"];
+c.precedence ¬ parenPrecedence;
+};
+IF c.hasCRef AND c.hasCRefBits=c.pointeeBits
+THEN c ¬ DEncloseCode["(* ", c, " )"]
+ELSE {
+c ¬ DEncloseCode[PointerCast[c.pointeeBits], c];
+c ¬ DEncloseCode["(* ", c, " )"];
+};
+c.hasCWord ¬ c.pointeeBits=C2CTarget.bitsPerWord;
+c.hasCRef ¬ FALSE; 
+c.pointeeBits ¬ -1;
+c.precedence ¬ parenPrecedence;
+}
+ELSE IF c.delayedCRef THEN {
+IF c.precedence<unaryPrecedence THEN {
+c ¬ DEncloseCode["(", c, ")"];
+c.precedence ¬ parenPrecedence;
+};
+IF ~c.hasCRef OR c.hasCRefBits#c.pointeeBits THEN {
+c ¬ DEncloseCode[PointerCast[c.pointeeBits], c];
+c ¬ DEncloseCode["(", c, ")"];
+c.precedence ¬ parenPrecedence;
+};
+c.hasCWord ¬ FALSE;
+c.hasCRef ¬ TRUE; c.hasCRefBits ¬ c.pointeeBits;
+}
+ELSE IF c.delayedCWord THEN {
+IF ~c.hasCWord THEN {
+IF c.precedence<unaryPrecedence THEN c ¬ DEncloseCode["(", c, ")"];
+c ¬ DEncloseCode["(word) ", c];
+c.precedence ¬ unaryPrecedence;
+c.hasCWord ¬ TRUE; c.hasCRef ¬ FALSE;
+}
+};
+};
+c.delayedCWord ¬ c.delayedCRef ¬ c.delayedDeref ¬ c.delayedX ¬ c.whiteSpaceOnly ¬ FALSE;
+RETURN [c];
+};
+
+RopeCode: PUBLIC PROC [r: ROPE ¬ NIL] RETURNS [c: Code] = {
+c ¬ RefAnyCode[r]
+};
+
+RefTextCode: PUBLIC PROC [r: REF TEXT ¬ NIL] RETURNS [c: Code] = {
+c ¬ RefAnyCode[r]
+};
+
+RefAnyCode: PUBLIC PROC [r: REF ANY ¬ NIL] RETURNS [c: Code] = INLINE {
+cr: LIST OF REF ANY ¬ NewListPiece[r];
+c ¬ NewCode[];
+c.base ¬ c.last ¬ cr;
+c.precedence ¬ notExpressionPrecedence;
+};
+
+IdentCode: PUBLIC PROC [r: ROPE ¬ NIL] RETURNS [c: Code] = {
+c ¬ RefAnyCode[r];
+c.precedence ¬ identPrecedence;
+c.adressable ¬ TRUE;
+};
+
+NewCode: PROC RETURNS [c: Code] = {
+out: NAT ¬ freeCodeSeq.out;
+IF freeCodeSeq.in # out THEN { --not empty
+c ¬ freeCodeSeq.items[out];
+freeCodeSeq.out ¬ (out + 1) MOD freeCodeCount;
+c­ ¬ [];
+RETURN;
+};
+c ¬ NEW[CodeRep];
+};
+
+freeCodeCount: NAT = 128; 
+freeCodeSeq: REF FreeCodeSeq ¬ NEW[FreeCodeSeq];
+FreeCodeSeq: TYPE = RECORD [
+in, out: NAT ¬ 0, --equal = empty
+items: ARRAY [0..freeCodeCount) OF Code
+];
+
+FreeCode: PROC [c: Code] = {
+IF c#NIL THEN {
+nextIn: NAT;
+c.usageInhibited ¬ TRUE;
+c.base ¬ c.last ¬ NIL;
+nextIn ¬ (freeCodeSeq.in + 1) MOD freeCodeCount;
+IF nextIn#freeCodeSeq.out THEN {--don't make it look empty
+freeCodeSeq.items[freeCodeSeq.in] ¬ c;
+freeCodeSeq.in ¬ nextIn;
+};
+};
+};
+
+NewCodeCopy: PROC [c: Code] RETURNS [cc: Code] = {
+IF c.usageInhibited THEN C2CBasics.CantHappen;
+cc ¬ NewCode[];
+cc.precedence ¬ c.precedence;
+cc.delayedDeref ¬ c.delayedDeref;
+cc.delayedCRef ¬ c.delayedCRef;
+cc.delayedCWord ¬ c.delayedCWord;
+cc.delayedX ¬ cc.delayedDeref OR cc.delayedCRef OR cc.delayedCWord;
+cc.hasCRefBits ¬ c.hasCRefBits;
+cc.hasCRef ¬ c.hasCRef;
+cc.hasCWord ¬ c.hasCWord;
+cc.pointeeBits ¬ c.pointeeBits;
+cc.adressable ¬ c.adressable;
+cc.isAdress ¬ c.isAdress;
+cc.whiteSpaceOnly ¬ c.whiteSpaceOnly;
+cc.class ¬ c.class;
+};
+
+MinPrecedence: PUBLIC PROC [c: Code, minimum: Precedence¬assignPrecedence] RETURNS [modifiedC: Code] = {
+IF c=NIL OR c.usageInhibited THEN C2CBasics.CantHappen;
+IF c.precedence<minimum THEN {
+c ¬ DCleanCode[c];
+IF c.precedence<minimum THEN {
+c ¬ DEncloseCode["(", c, ")"];
+c.precedence ¬ parenPrecedence;
+};
+};
+RETURN[c];
+};
+
+NonEmpty: PUBLIC PROC [c: Code] RETURNS [BOOL] = {
+RETURN [c#NIL AND (c.base#NIL)]
+};
+
+NonWhiteSpace: PUBLIC PROC [c: Code] RETURNS [BOOL] = {
+RETURN [c#NIL AND (c.base#NIL) AND ~c.whiteSpaceOnly]
+};
+
+SetWhiteSpace: PUBLIC PROC [c: Code] RETURNS [sameButModifiedInPlace: Code] = {
+sameButModifiedInPlace ¬ c;
+IF sameButModifiedInPlace#NIL THEN sameButModifiedInPlace.whiteSpaceOnly ¬ TRUE
+};
+
+SetPrecedence: PUBLIC PROC [c: Code, precedence: Precedence¬parenPrecedence] RETURNS [sameCode: Code] = {
+IF c=NIL OR c.usageInhibited OR c.whiteSpaceOnly THEN C2CBasics.CantHappen;
+c.precedence ¬ precedence;
+sameCode ¬ c;
+};
+
+SetArithClass: PUBLIC PROC [c: Code, class: IntCodeDefs.ArithClass] RETURNS [sameCode: Code] = {
+IF c=NIL OR c.usageInhibited OR c.whiteSpaceOnly THEN C2CBasics.CantHappen;
+c.class ¬ class;
+sameCode ¬ c;
+};
+
+SetAddressable: PUBLIC PROC [c: Code, addressable: BOOL ¬ TRUE] RETURNS [sameCode: Code] = {
+IF c=NIL OR c.usageInhibited OR c.whiteSpaceOnly THEN C2CBasics.CantHappen;
+c.adressable ¬ addressable;
+sameCode ¬ c;
+};
+
+SetIsAddress: PUBLIC PROC [c: Code, isAddress: BOOL ¬ TRUE] RETURNS [sameCode: Code] = {
+IF c=NIL OR c.usageInhibited OR c.whiteSpaceOnly OR c.dead THEN C2CBasics.CantHappen;
+c.isAdress ¬ isAddress;
+sameCode ¬ c;
+};
+
+SetDead: PUBLIC PROC [c: Code, dead: BOOL ¬ TRUE] = {
+IF c=NIL OR c.usageInhibited THEN C2CBasics.CantHappen;
+c.dead ¬ dead;
+};
+
+GetPrecedence: PUBLIC PROC [c: Code] RETURNS [precedence: Precedence¬notExpressionPrecedence] = {
+IF c=NIL OR c.usageInhibited THEN C2CBasics.CantHappen;
+precedence ¬ c.precedence;
+};
+
+GetArithClass: PUBLIC PROC [c: Code] RETURNS [class: IntCodeDefs.ArithClass¬nullClass] = {
+IF c=NIL OR c.usageInhibited THEN C2CBasics.CantHappen;
+class ¬ c.class;
+};
+
+GetAddressable: PUBLIC PROC [c: Code] RETURNS [addressable: BOOL ¬ FALSE] = {
+IF c=NIL OR c.usageInhibited THEN C2CBasics.CantHappen;
+addressable ¬ c.adressable;
+};
+
+GetIsAddress: PUBLIC PROC [c: Code] RETURNS [isAddress: BOOL ¬ FALSE] = {
+IF c=NIL OR c.usageInhibited THEN C2CBasics.CantHappen;
+isAddress ¬ c.isAdress;
+};
+
+GetIsDead: PUBLIC PROC [c: Code] RETURNS [BOOL] = {
+RETURN [c#NIL AND c.dead]
+};
+
+BinOp: PUBLIC PROC [c1: Code, op: ROPE, c2: Code, precedence: Precedence] RETURNS [c: Code] = {
+c1 ¬ DCleanCode[c1]; 
+c2 ¬ DCleanCode[c2]; 
+IF c1.precedence<=precedence THEN c1 ¬ DEncloseCode["(", c1, ")"];
+IF c2.precedence<=precedence THEN c2 ¬ DEncloseCode["(", c2, ")"];
+c1 ¬ DCatRef[c1, op];
+c1 ¬ DCatCode[c1, c2];
+c1.precedence ¬ precedence;
+c1.hasCRef ¬ c1.hasCWord ¬ c1.whiteSpaceOnly ¬ FALSE;
+RETURN[c1];
+};
+
+CopyC: PUBLIC PROC [c: Code] RETURNS [Code] = {
+BaseCodeToRope: PROC [c: Code] RETURNS [r: Rope.ROPE] = {
+ros: IO.STREAM ¬ IO.ROS[];
+PutList[ros, c.base];
+r ¬ IO.RopeFromROS[self: ros];
+};
+cc: REF CodeRep ¬ c;
+newList: LIST OF REF ANY ¬ NIL;
+IF cc=NIL THEN RETURN [NIL];
+IF c.usageInhibited THEN C2CBasics.CantHappen;
+cc ¬ NewCodeCopy[c];
+newList ¬ NewListPiece[BaseCodeToRope[c]];
+cc.base ¬ newList;
+cc.last ¬ newList;
+RETURN [cc]
+};
+
+CatCall: PUBLIC PROC [function: ROPE, c1, c2, c3, c4, c5: REF ¬ NIL] RETURNS [c: Code] = {
+c ¬ Cat[c1, c2, c3, c4, c5];
+c ¬ Cat[function, lParam, c, rParam];
+c.precedence ¬ primaryPrecedence;
+};
+
+CatRemark: PUBLIC PROC [c: Code, r: ROPE] RETURNS [Code] = {
+IF C2CAccess.params.extraShortAndUgly THEN RETURN [c];
+IF c=NIL OR c.base=NIL THEN RETURN [CComment[r]];
+IF c.usageInhibited THEN C2CBasics.CantHappen;
+c.last.rest ¬ NewListPiece[Rope.Cat["/* ", CleanUpComment[Internalize[r]], " */ "]];
+c.last ¬ c.last.rest;
+RETURN [c];
+};
+
+CatDebugInfo: PUBLIC PROC [c: Code, r: ROPE, key: REF ¬ NIL] RETURNS [Code] = {
+IF C2CAccess.params.debuggingCode AND c#NIL THEN {
+c ¬ CatRemark[c, r];
+};
+RETURN [c];
+};
+
+debugPat: ROPE ¬ NIL;
+debug: SIGNAL = CODE;
+
+DCatCode: PROC [c1, c2: Code] RETURNS [c: Code] = {
+IF c1=NIL THEN RETURN[c2];
+IF c1.usageInhibited THEN C2CBasics.CantHappen;
+IF c2=NIL THEN RETURN[c1];
+IF c2.usageInhibited THEN C2CBasics.CantHappen;
+IF c1.base=NIL THEN {FreeCode[c1]; RETURN[c2]};
+IF c2.base=NIL THEN {FreeCode[c2]; RETURN[c1]};
+IF debugPat#NIL THEN 
+IF Rope.Match[debugPat, TrustAsRope[c2.base.first]] THEN debug;
+c1.last.rest ¬ c2.base;
+c1.last ¬ c2.last;
+c1.precedence ¬ notExpressionPrecedence;
+c1.adressable ¬ FALSE;
+c1.class ¬ nullClass;
+c1.dead ¬ c2.dead;
+FreeCode[c2];
+RETURN[c1];
+};
+
+DCatRef: PROC [c1: Code, ref: REF] RETURNS [c: Code] = {
+dead: BOOL ¬ FALSE;
+c2: Code ¬ NIL;
+piece: REF ANY ¬ NIL;
+IF c1#NIL AND (c1.usageInhibited OR c1.whiteSpaceOnly) THEN C2CBasics.CantHappen;
+IF ref = NIL THEN RETURN [c1];
+IF c1 = NIL OR c1.base = NIL THEN RETURN [DToC[ref]];
+WITH ref SELECT FROM
+co: REF CodeRep => {
+c2 ¬ DCleanCode[co];
+IF c2.base = NIL THEN RETURN [c1];
+IF c2.whiteSpaceOnly 
+THEN dead ¬ c1.dead
+ELSE dead ¬ c2.dead;
+};
+rr: ROPE => piece ¬ rr;
+rt: REF TEXT => piece ¬ rt;
+ENDCASE => C2CBasics.CantHappen;
+IF c2 # NIL
+THEN {
+c1.last.rest ¬ c2.base;
+c1.last ¬ c2.last;
+FreeCode[c2];
+}
+ELSE {
+IF debugPat # NIL THEN 
+IF Rope.Match[debugPat, TrustAsRope[piece]] THEN debug;
+c1.last ¬ c1.last.rest ¬ NewListPiece[piece];
+};
+c1.precedence ¬ notExpressionPrecedence;
+c1.adressable ¬ FALSE;
+c1.class ¬ nullClass;
+c1.dead ¬ dead;
+RETURN [c1];
+};
+
+DEncloseCode: PROC [prefix: ROPEorTEXT, c1: Code, suffix: ROPEorTEXT¬NIL] RETURNS [Code] = {
+pl: LIST OF REF ANY ¬ NewListPiece[prefix];
+IF c1=NIL OR c1.usageInhibited THEN C2CBasics.CantHappen;
+c1.whiteSpaceOnly ¬ FALSE;
+IF c1.base=NIL 
+THEN {c1.base ¬ c1.last ¬ pl}
+ELSE {
+l: LIST OF REF ANY ¬ pl;
+l.rest ¬ c1.base; c1.base ¬ l
+};
+IF suffix#NIL THEN {
+sl: LIST OF REF ANY ¬ NewListPiece[suffix];
+c1.last.rest ¬ sl;
+c1.last ¬ sl;
+};
+c1.dead ¬ FALSE;
+RETURN [c1];
+};
+
+Cat: PUBLIC PROC [c1, c2, c3, c4, c5: REF ¬ NIL] RETURNS [c: Code ¬ NIL] = {
+Each: PROC [x: REF] = INLINE {
+IF x#NIL THEN {
+IF c = NIL 
+THEN {c ¬ DToC[x]; c.class ¬ nullClass}
+ELSE {c ¬ DCatRef[c, x];};
+};
+};
+Each[c1];
+Each[c2];
+Each[c3];
+Each[c4];
+Each[c5];
+};
+
+DToC: PROC [c: REF ¬ NIL] RETURNS [Code ¬ NIL] = {
+IF c#NIL THEN 
+WITH c SELECT FROM
+co: REF CodeRep => RETURN [DCleanCode[co]];
+rr: ROPE => RETURN [RopeCode[rr]];
+rt: REF TEXT => RETURN [RefTextCode[rt]];
+ENDCASE => C2CBasics.CantHappen;
+};
+
+emittedCodes: REF CodePlaces ¬ NIL;
+ResetEmittedCodes: PROC[] = {
+emittedCodes ¬ NEW[CodePlaces];
+};
+
+AppendCode: PUBLIC PROC [place: C2CCodePlaces.CodePlace, code: CodeOrRope] = {
+IF code#NIL THEN {
+WITH code SELECT FROM
+cr: REF CodeRep => cr.hasCRef ¬ cr.hasCWord ¬ FALSE;
+ENDCASE => {};
+IF simplify[place] 
+THEN {
+newCode: Code ¬ DToC[code];
+oldCode: Code ¬ emittedCodes[place].c;
+IF oldCode=NIL THEN { oldCode ¬ emittedCodes[place].c ¬ NewCode[] };
+FOR l: LIST OF REF ANY ¬ newCode.base, l.rest WHILE l#NIL DO
+IF emittedCodes[place].blockPos>=codeBlockSize THEN {
+block: REF CodeBlock ¬ NewCodeBlock[];
+newPiece: LIST OF REF ANY ¬ NewListPiece[block];
+emittedCodes[place].block ¬ block;
+emittedCodes[place].blockPos ¬ 0;
+IF oldCode.last=NIL
+THEN oldCode.base ¬ newPiece
+ELSE oldCode.last.rest ¬ newPiece;
+oldCode.last ¬ newPiece;
+};
+emittedCodes[place].block[emittedCodes[place].blockPos] ¬ l.first;
+emittedCodes[place].blockPos ¬ emittedCodes[place].blockPos + 1;
+ENDLOOP;
+FreeList[newCode.base, newCode.last];
+}
+ELSE {
+emittedCodes[place].c ¬ DCatRef[emittedCodes[place].c, code];
+};
+};
+};
+
+simplify: ARRAY C2CCodePlaces.CodePlace OF BOOL = [TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE, FALSE, FALSE, TRUE, FALSE]; 
+
+CollectCode: PUBLIC PROC [place: C2CCodePlaces.CodePlace, final: BOOL] RETURNS [c: Code] = {
+IF final # simplify[place] THEN ERROR;
+c ¬ emittedCodes[place].c;
+emittedCodes[place] ¬ [c: NIL, block: NIL, blockPos: LAST[INT]];
+};
+
+C2CBasics.CallbackWhenC2CIsCalled[ResetEmittedCodes];
+C2CBasics.CallbackWhenC2CIsCalled[ResePointerCastCache];
+IF Rope.Length[lineStreamHeader]#16 THEN ERROR;
+IF Rope.Length[lineStreamTrailer]#8 THEN ERROR;
+END.
+  ²  
+C2CEmitImpl.mesa
+Copyright Ó 1987, 1988, 1989, 1990, 1991, 1993 by Xerox Corporation.  All rights reserved.
+Christian Jacobi, 1987
+JKF May 25, 1990 9:25:16 am PDT
+Willie-s, September 24, 1991 6:14 pm PDT
+Christian Jacobi, January 20, 1993 3:06 pm PST
+--ROPE or REF TEXT; not REF CodeBlock
+No UNWIND for speed resons
+No UNWIND for speed resons
+--replaces characters which are not legal in C comments
+--also replaces characters used by C2CEmit for formating
+--removes formatting instructions of code
+--scan in values
+--check in rangeness and compute nextPos
+--c line
+--start pos and code
+--stop pos
+--output
+Uses also blockIdx, codeBlockSize!
+Returns nil for exiting inner loop
+
+
+
+--returns same or different code
+--Good reuse rate even if small.
+--Large to delay reuse for increase chance of detection of usageInhibited.
+--keep all the other fancy bits
+--returned code has has... type fields from c1, if non NIL
+--assert we know that c1 and c2 are non-nil
+--assert there is real appending to do
+--returned code has type fields from c1, if non NIL
+assert there is real appending to do
+--ignores delayed mumbo
+--modifies c1 inline
+--converts refs to code
+Global data owned by current compilation
+
+ Ê,D  –(cedarcode) style•NewlineDelimiter
+™ šœ™Icodešœ
+ÏeœO™ZKšœ™K™K™(K™.K˜ —šÏk	˜	Kšœ˜Kšœ
+˜
+Kšœ
+˜
+Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ
+˜
+Kšœ	˜	Kšœ˜Kšžœ˜Kšœ˜Kšœ˜K˜ —šÏnœžœž˜Kšžœ8žœ˜PKšžœ˜—šž˜Kšžœ˜#—Iimp˜ Kšœžœžœ˜Kšœžœžœ˜Kšœžœžœ˜Lšœžœžœ˜Lšœžœžœ˜Lšœžœžœ˜!Lšœ
+žœžœ˜Lšœ
+žœžœ˜Lšœžœžœ
+˜ Lšœžœžœ
+˜"L˜ Kšœ4žœ˜>K˜ Kšœžœžœ	˜Kšœ	žœžœ˜2Kšžœžœžœžœ˜Kšžœžœžœ˜Kšœžœžœžœ˜K˜ Kšœžœžœ˜K˜ Kšœžœžœžœ	žœžœžœžœžœ˜cKšœžœžœžœ˜AK˜ Kšœžœ˜šœžœžœ˜Kšœžœžœžœžœžœžœ˜4K˜Jšœ%™%—L˜ Lšœ
+žœžœžœžœžœ˜ L˜ šŸœžœžœžœžœžœžœžœžœ˜BLšœ™Lšœ˜Lš
+žœžœžœžœžœ˜!Lšœ˜Lšœ	žœ˜Lšœ˜L˜L˜ —šŸœžœžœžœžœžœ˜0Lšœ™šžœžœžœ˜Lšžœžœžœ˜Lšœ˜LšœžœÏc˜-Lšœ˜L˜—Lšœ˜—L˜ Lšœžœ˜Lšœžœ˜Lšœžœžœ˜$L˜ šŸœžœžœžœ˜5Lšœ˜Lš
+žœžœžœžœžœ˜'šžœžœž˜šœžœ˜Lšœ˜Lšœ˜L˜—šžœ˜Lšœ˜Lšœžœ˜Lšœ˜——Lšœžœ˜Lšœ˜L˜ —šŸœžœžœ˜+šžœžœžœžœ˜1Lšœ˜Lšœ˜Lšœ˜Lšžœžœžœžœžœžœ˜=L˜—Lšœ˜—L˜ LšŸ@˜@L˜ šŸœžœžœžœžœžœžœ˜;Lšœžœ˜Lšœžœ˜šž˜Lšœ/˜/Lšžœžœžœ˜Lšœ:˜:Lšœ˜Lšžœ˜—L˜—L˜ š
+Ÿœžœžœžœžœ˜;LšœL˜LLšœžœ˜Lšœ˜—K˜ š
+Ÿœžœžœžœžœ˜1Jš 7™7Jš 8™8Kšžœ$žœžœ˜6šžœ˜Kšœžœ˜šžœžœžœž˜šžœž˜šœžœ
+˜Kšžœ˜Kšžœžœžœ"˜D—Kšœžœ
+žœžœ ˜PKšœ4˜4Kšœžœžœ˜Kšœ/˜/Kšžœžœ˜—Kšžœ˜—K˜—Lšžœ˜L˜—˜ Kšœžœ0˜<Kšœžœ2˜>Kšœ	žœ5˜BKšœ	žœ=˜JK˜ —šŸ	œžœžœžœ˜?Kšœ
+žœžœ˜Kšœžœžœ˜Kšœžœžœ˜Kšœ0žœ˜:šžœžœž˜šœžœ ˜'Kšžœ žœžœ˜3Kšœ˜Kšœ˜Kšœ˜Kšœ˜K˜—Kšžœ˜—Kšœ'˜'Kšœ"˜"Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜—K˜ šŸœžœžœžœ˜DKšœ
+žœžœ˜Kšœžœžœ˜Kšœžœžœ˜Kšœ0žœ˜:šžœžœž˜šœžœ ˜'Kšžœ žœžœ˜3Kšœ˜Kšœ˜Kšœ˜Kšœ˜K˜—Kšžœ˜—Kšœ)˜)Kšœ"˜"Kšœ˜Kšœ˜Kšœ˜Kšœ˜K˜—L˜ Lšœžœ *˜?Lšœžœ2˜CLšœžœ˜L˜ šŸœžœžœžœžœžœ˜1šžœžœž˜Kšœžœžœ˜Kšœžœžœžœ˜5Kšžœžœžœžœžœžœžœ˜/—K˜K˜ —Kšœžœ˜4Kšœžœ&˜BKšœžœ˜K˜ šŸœžœžœ
+žœžœžœžœžœžœžœ˜…Kš )™)Kšœ	žœ˜Kšœžœžœ˜Kšœžœžœ .˜HKšœžœ˜Kšœžœ˜Kšœžœ-˜?Kšœžœ&˜5šŸœžœžœžœ˜-Kš	œžœžœžœžœ˜#KšœÏfœžœ˜"Kšœ¡œžœ˜"Kšœ¡œžœ˜"Kšœ¡œžœ˜"šžœ˜	Kšœžœ
+˜Kšžœžœ˜4Kšœ˜—K˜—šŸœžœ
+žœ˜(Kšœžœ˜Kšœžœ˜Kšœ˜Kšžœ˜Kšžœžœžœ
+žœžœžœ˜?Kšœ˜—šŸ	œžœžœžœ˜)šžœžœžœ˜"šžœžœ˜Kšžœ˜Kšžœ@˜BKšžœ˜Kšœžœ˜&K˜—Kšžœ'˜)K˜—K˜—šÐbnœžœžœ	žœžœžœ˜8Kšžœžœ"žœ˜:Kšžœ!˜#Kšœ˜K˜—šŸœžœ˜šžœžœ˜Kšœžœžœ˜&Kšžœ˜Kšœ˜Kšœ
+˜
+Kšœ˜—K˜—šŸœžœ˜Kšžœžœ˜Kšžœžœžœ˜2Kšœžœ˜Kšœ˜—š
+Ÿœžœ
+žœžœžœ˜@Kšœ
+žœ !œžœžœ
+žœžœžœ˜tKšœ˜Kšœžœ˜Kšœ
+˜
+K™Kšœžœ¡œžœ¡œžœžœ˜”Kšœžœ¡œžœ¡œžœžœ˜”K™(Kšžœžœžœžœžœžœ˜6Kšžœ	žœ	žœžœ˜!Kšžœžœžœžœ˜+Kšœ˜Kšžœžœžœ˜K™Kšœžœ˜'Kšœžœ˜!K™Kšœžœ˜$Kšžœ
+žœ!˜1Kšœžœ˜"Kšœžœ˜K™
+Kšœžœ˜$Kšœžœ˜"Kšœžœ˜K™šžœ˜	Kšœžœžœ˜Kšžœžœ˜4Kšœ˜—Kšœ˜—Kšžœžœ˜(šžœžœ˜Kšžœ'˜)Kšœ-˜-Kšœ/˜/Kšœ˜—šžœžœžœžœžœžœžœž˜?Kšœ
+žœ˜Kšœžœ˜šžœ 3˜6šŸœžœžœžœžœžœžœ˜:Kšœ"™"K™"Kšžœžœžœžœ˜,šžœžœž˜šœžœ˜šžœžœ˜ Kšœžœžœ-˜7šžœžœž˜Kšœžœžœ˜šœžœžœžœ˜Kšžœžœ˜.Kšœ˜—Kš
+žœžœžœžœžœ˜!—Kšžœ˜—Kšœ˜Kšžœžœ˜Kšœ˜—Kšœžœžœ˜2šœžœžœžœ˜Kšœžœžœ˜IKšœ˜—Kšžœžœžœžœžœžœžœžœ˜0—Kšœ˜—Kšœ
+žœ˜Kšœžœ˜$Kš	žœžœžœžœ ˜0Kšœ˜šžœžœ #˜:Kšœ5˜5šžœžœ˜Kšœ/˜/—šžœžœ˜šžœž˜Kšœ"˜"šœ˜Kšžœžœ
+˜šž˜šžœž˜!šœ˜Kšœ˜Kšžœžœ˜$K˜—šœ˜Kšœ˜Kšžœžœ˜$K˜—Kšœ˜Kšœžœžœžœ˜<Kšœ˜šœžœžœ˜Kšœžœ˜!Kšœ˜Kšœ˜—šœžœžœ˜Kšœžœ˜"Kšœ˜Kšœ˜—šœ˜Kšžœžœ˜$Kšœ˜—Kšœ%˜%Kšžœ˜——Kšœ˜Kšœ˜—Kšžœ˜ ——Kšœ˜Kšžœ 	œ˜—Kšžœ œ˜—Kšžœ œ˜—šžœž˜Kšžœ(˜*Kšž˜—K˜—L˜ š
+Ÿœžœžœžœžœ˜AKšžœžœžœžœžœžœ˜ULšœ!žœ˜'Lšœ˜Kšœ&˜&Lšœžœ˜$Lšœ˜Lšœžœ˜Lšœ˜šœ
+žœžœžœ˜ALšžœžœ˜#Lšžœ˜—Lšžœ˜
+L˜—L˜ š
+Ÿœžœžœžœžœ˜8Kšžœžœ˜)K˜—L˜ š
+Ÿœžœžœ!žœžœ˜NKšžœžœžœžœžœžœ˜UKšžœžœžœžœ˜4šžœžœ˜šžœžœ˜Lšœžœ˜2Lšœ!žœ˜'Lšœ4˜4Lšžœ˜Lšœ˜—Lšœ?žœ˜EL˜—Kšœ&˜&Kšœ˜Kšœ&˜&Lšœžœ˜2Kšœžœ˜Lšœ4˜4Lšžœ˜L˜—L˜ šŸœžœžœžœ˜>Lšœžœ˜Lšœžœ˜.Lšžœ˜L˜L˜ —šŸœžœžœ˜>Kšœžœžœ˜šžœžœž˜Kšœžœ˜Kšœžœ˜Kšœžœžœ+˜7Kšžœ˜!—Lšœž˜šžœžœ˜šžœžœ˜Lšœžœ˜Lšœ˜Lšžœžœžœ˜1Lšžœžœ˜8L˜—Lšœžœ˜0Lšœ˜—Lšžœžœžœžœ˜)Kšœ,˜,Kšœ%žœ˜*Kšœ˜—L˜ šŸœžœžœžœ˜CLšœžœ˜$Kšœ&˜&šžœžœ˜šžœžœ˜Lšœžœ˜Lšœ˜Lšžœžœ˜8Lšœžœ˜L˜—L˜—šžœžœžœžœ˜6Lšžœ˜L˜—Lšœ˜Lšœ"žœ˜(Lšœžœ˜"Lšžœ˜L˜L™ —šŸœžœžœ˜1Kšœ&˜&šžœžœ˜šžœžœ˜Lšœžœ˜Lšœ$žœ˜*Lšžœžœ˜8L˜—Lšžœžœžœ˜"L˜—LšœKž˜QLšœ˜Lšœž˜Lšžœ˜L˜L™ —š
+Ÿœžœžœžœžœ˜BKšœ&˜&šžœžœ˜Lšžœžœ˜,šžœžœ˜Lšžœžœ˜7Lšžœ˜L˜—L˜—LšœLžœ˜RLšœ˜Lšœžœ˜Lšžœ˜L˜L™ —š
+Ÿ
+œžœžœžœžœ˜>šžœžœž˜Kšœžœžœ˜/Kšœžœžœ˜Kšœžœžœžœ˜.Kšžœžœžœžœžœžœžœ˜A—L˜L˜ —š
+Ÿœžœžœžœžœ˜?šžœžœž˜šœžœ˜Kšœ˜Kšœ˜Kšžœ˜Kšœ˜—Kšœžœžœ˜Kšœžœžœžœ˜.Kšžœžœžœžœžœžœžœ˜A—L˜—L˜ šŸœžœžœžœžœžœžœžœ˜7šžœžœžœžœžœžœžœž˜4šžœ	žœž˜Lšœžœžœ˜Lšœžœžœžœ˜"Lš
+žœžœ	žœžœžœ˜%—Lšžœ˜—Lšœ˜—L˜ š	Ÿœžœžœžœ ˜GLšœžœžœ˜Lšœžœžœ˜Lš
+žœžœžœžœžœ˜Lšžœžœ˜.Lšœžœžœ˜šžœžœ˜šžœžœ˜šžœžœ˜-šžœ˜šžœ˜ Lšžœžœ!˜)Lšžœžœ ˜(—L˜—šžœ˜šžœ˜ šžœ˜Lšžœ˜Lšžœ*˜,Lšžœ˜Lšœ˜L˜—šžœ˜Lšžœ˜Lšžœ*˜,Lšœ
+˜
+L˜——L˜——L˜—šžœžœžœ˜šžœžœžœ˜3šžœ˜ šžœ˜Lšžœ˜Lšžœ*˜,Lšžœ˜Lšœ˜L˜—šžœ˜Lšžœ˜Lšžœ*˜,Lšœ
+˜
+L˜——L˜—Lšœ˜—šžœžœžœ˜Lšžœžœžœ˜/Lšœ˜—L˜—Lšœ˜Lšžœ˜Lšžœžœ˜"L˜—L˜ š
+Ÿœžœžœžœžœ˜3Lšœ˜Kšžœžœžœžœ˜Lšœ!˜!Lšœ˜Lšœ˜Lšœ˜L˜ Lšœ
+žœ˜Lšœžœ˜šŸœžœ˜ Lšœ˜Lšœžœ˜K˜K˜ —L˜ šŸœžœžœžœžœžœ˜:Lšžœžœžœžœžœžœ˜;L˜—L˜ š
+Ÿœžœžœžœžœ˜9Lšœ˜Lšœ˜L˜L˜ ——šŸ
+œžœžœ˜-Lšœ ™ Lšžœžœžœžœ˜!Lšžœžœ
+žœ˜<šžœžœ˜šžœžœ˜šžœžœ˜&Lšœ˜Lšœ˜L˜—šžœžœ˜,Lšžœ!˜%šžœ˜Lšœ0˜0Lšœ!˜!L˜——Lšœ1˜1Lšœžœ˜Lšœ˜Lšœ˜L˜—šžœžœžœ˜šžœžœ˜&Lšœ˜Lšœ˜L˜—šžœžœžœ˜3Lšœ0˜0Lšœ˜Lšœ˜Lšœ˜—Lšœžœ˜Lšœžœ ˜0L˜—šžœžœžœ˜šžœžœ˜Lšžœžœ˜CLšœ˜Lšœ˜Lšœžœžœ˜%L˜—L˜—L˜—LšœRžœ˜XLšžœ˜L˜—L˜ šŸœžœžœžœžœžœ˜;Kšœ˜Lšœ˜L˜ —šŸœžœžœžœžœžœžœ˜BKšœ˜Lšœ˜L˜ —šŸ
+œžœžœžœžœžœžœžœ˜GLš	œžœžœžœžœ˜&Kšœ˜Lšœ˜Lšœ'˜'Lšœ˜—L˜ šŸ	œžœžœžœžœžœ˜<Lšœ˜Kšœ˜Kšœžœ˜Lšœ˜—L˜ šŸœžœžœ˜#Lšœžœ˜šžœžœ ˜*Lšœ˜Lšœžœ˜.L˜Lšžœ˜L˜—Lšœžœ
+˜L˜L˜ šœžœ˜Lšœ ™ LšœJ™J—Lšœžœžœ˜0šœžœžœ˜Lšœ	žœ ˜!Lšœžœžœ˜'Lšœ˜——L˜ šŸœžœ˜šžœžœžœ˜Lšœžœ˜Lšœžœ˜Kšœžœ˜Lšœžœ˜0šžœžœ ˜:Lšœ&˜&Lšœ˜L˜—L˜—L˜L˜ —šŸœžœžœ˜2Lšžœžœ˜.Lšœ˜Kšœ˜Kšœ!˜!Kšœ˜Kšœ!˜!Kšœžœžœ˜CKšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ%˜%Kšœ˜L˜—L˜ šŸœžœžœ1žœ˜hKšžœžœžœžœ˜7šžœžœ˜Kšœ˜šžœžœ˜K˜Kšœ˜Kšœ˜—K˜—Kšžœ˜
+K˜—K˜ š
+Ÿœžœžœžœžœ˜2Kšžœžœžœ	žœ˜K˜—K˜ š
+Ÿœžœžœžœžœ˜7Kš
+žœžœžœ	žœžœ˜5K˜—K˜ šŸœžœžœžœ#˜OKšœ˜Kšžœžœžœ)ž˜OK˜—K˜ šŸœžœžœ3žœ˜iKš
+žœžœžœžœžœ˜KKšœ˜Kšœ˜K˜—K˜ šŸœžœžœ*žœ˜`Kš
+žœžœžœžœžœ˜KKšœ˜Kšœ˜K˜—K˜ šŸœžœžœžœžœžœ˜\Kš
+žœžœžœžœžœ˜KKšœ˜Kšœ˜K˜—K˜ šŸœžœžœžœžœžœ˜XKšžœžœžœžœžœžœ˜UKšœ˜Kšœ˜K˜K˜ —š
+Ÿœžœžœžœžœ˜5Kšžœžœžœžœ˜7Kšœ˜K˜—K˜ šŸœžœžœžœ5˜aKšžœžœžœžœ˜7Kšœ˜K˜—K˜ šŸœžœžœžœ.˜ZKšžœžœžœžœ˜7Kšœ˜K˜—K˜ šŸœžœžœžœžœžœ˜MKšžœžœžœžœ˜7Kšœ˜K˜—K˜ šŸœžœžœžœžœžœ˜IKšžœžœžœžœ˜7Kšœ˜K˜—K˜ š
+Ÿ	œžœžœžœžœ˜3Kšžœžœžœ˜K˜—K˜ š
+Ÿœžœžœžœ$žœ˜_Kšœ˜Kšœ˜Kšžœžœ!˜BKšžœžœ!˜BK˜K˜Kšœ˜Kšœ/žœ˜5Kšžœ˜K˜—K˜ šŸœžœžœžœ˜/šŸœžœžœ
+žœ˜9Lš	œžœžœžœžœ˜Lšœ˜Kšœžœ˜K˜—Kšœžœ˜Kš	œ	žœžœžœžœ˜Kš
+žœžœžœžœžœ˜Lšžœžœ˜.Kšœ˜Kšœ*˜*K˜K˜Kšžœ˜K˜—K˜ šŸœžœžœžœžœžœžœ˜ZKšœ˜Kšœ%˜%Kšœ!˜!K˜—K˜ š
+Ÿ	œžœžœžœžœ˜<Kš ™Kšžœ$žœžœ˜6Kšžœžœžœžœžœžœ˜1Kšžœžœ˜.KšœT˜TKšœ˜Kšžœ˜Kšœ˜—L˜ šŸœžœžœžœžœžœžœ˜Ošžœ žœžœžœ˜2K˜K˜—Kšžœ˜K˜—K˜ Kšœ
+žœžœ˜Kšœžœžœ˜K˜ šŸœžœžœ˜3Jšœ:™:Kšžœžœžœžœ˜Kšžœžœ˜/Kšžœžœžœžœ˜Kšžœžœ˜/Jšœ+™+Kšžœ	žœžœžœ˜/Kšžœ	žœžœžœ˜/Jšœ&™&šžœ
+žœžœ˜Kšžœ2žœ˜?—K˜K˜Kšœ(˜(Kšœžœ˜Kšœ˜Kšœ˜K˜Kšžœ˜K˜K˜ —šŸœžœžœžœ˜8Jš 3™3Kšœžœžœ˜Kšœžœ˜Kšœžœžœ˜Kš
+žœžœžœžœžœ˜QKšžœžœžœžœ˜Kšžœžœžœžœžœžœ˜5šžœžœž˜šœžœ˜Kšœ˜Kšžœžœžœžœ˜"šžœ˜Kšžœ˜Kšžœ˜—Kšœ˜—Kšœžœ˜Kšœžœžœ˜Kšžœ˜ —Jšœ$™$šžœž˜šžœ˜K˜K˜K˜K˜—šžœ˜šžœžœžœ˜Kšžœ*žœ˜7—Kšœ-˜-K˜——Kšœ(˜(Kšœžœ˜Kšœ˜Kšœ˜Kšžœ˜K˜K˜ —šŸœžœ3žœžœ˜\Kšœ™Kšœ™Kš	œžœžœžœžœ˜+Kšžœžœžœžœ˜9Kšœžœ˜šžœ	žœ˜Kšžœ˜šžœ˜Kš	œžœžœžœžœ˜Kšœ˜Kšœ˜——šžœžœžœ˜Kš	œžœžœžœžœ˜+Kšœ˜Kšœ˜K˜—Kšœ
+žœ˜Kšžœ˜K˜K˜ —šŸœžœžœžœžœžœžœ˜LšŸœžœžœžœ˜šžœžœžœ˜šžœžœ˜Kšžœ#˜'Kšžœ˜—K˜—K˜—Kšœ	˜	Kšœ	˜	Kšœ	˜	Kšœ	˜	Kšœ	˜	K˜K˜ —šŸœžœžœžœžœ	žœ˜2Jš ™šžœžœžœ˜šžœžœž˜Kšœžœžœ˜+Kšœžœžœ˜"Kšœžœžœžœ˜)Kšžœ˜ ——K˜—K˜ JšÏb(™(šœžœžœ˜#šŸœžœ˜Lšœžœ˜K˜K˜ ——šŸ
+œžœ7˜Nšžœžœžœ˜šžœžœž˜Kšœžœ'žœ˜4Kšžœ˜—šžœ˜šžœ˜Lšœ˜Lšœ&˜&Lšžœ	žœžœ1˜Dšžœžœžœžœžœžœžœž˜<šžœ-žœ˜5Lšœžœ˜&Lš	œ
+žœžœžœžœ˜0Lšœ"˜"Lšœ!˜!šžœž˜Lšžœ˜Lšžœ˜"—Lšœ˜Lšœ˜—LšœB˜BLšœ@˜@Lšžœ˜—Lšœ%˜%L˜—šžœ˜Lšœ=˜=L˜——L˜—L˜—L˜ Kšœ
+žœžœžœžœžœžœžœžœžœžœžœžœžœžœžœ˜€L˜ š
+Ÿœžœžœ)žœžœ˜\Lšžœžœžœ˜&Lšœ˜Lš	œžœ	žœžœžœ˜@L˜L™ —L˜ Lšœ5˜5Lšœ8˜8Lšžœ"žœžœ˜/Lšžœ"žœžœ˜/Lšžœ˜— …—    kX  œN  

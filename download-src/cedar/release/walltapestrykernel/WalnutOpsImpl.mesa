@@ -1,0 +1,1144 @@
+
+DIRECTORY
+BasicTime USING [GMT, nullGMT, Now],
+FS USING [Error, ExpandName],
+IO,
+MailUtils USING [GeneratePostmark],
+Process USING [Detach, SecondsToTicks, SetTimeout],
+RefText USING [New],
+Rope,
+RuntimeError USING [BoundsFault],
+SendMailParseMsg USING [ParseHeadersFromRope],
+ThisMachine USING [Name],
+ViewerClasses USING [Viewer],
+ViewerTools USING [TiogaContents],
+
+WalnutDB  -- USING lots -- ,
+WalnutDefs USING [CheckReportProc, Error, LogInfo, MsgSet, dontCareMsgSetVersion, dontCareDomainVersion, SchemaMismatch, SeFromToCcSuDaMid, WalnutOpsHandle, WalnutOpsHandleRec],
+WalnutKernelDefs USING [LogEntry, MsgLogEntry],
+WalnutLog -- USING lots -- ,
+WalnutOps,
+WalnutOpsInternal,
+WalnutRegistryPrivate USING [NotifyForEvent, NotifyForMove, NotifyForMsgEvent, NotifyForMsgSetEvent],
+WalnutRoot USING [AcquireWriteLock, CloseTransaction, CommitAndContinue, EraseDB, ExamineHandleList, GetOpsHandleList, GetQuota, Open, ReturnNewMailStream, RootHandle, RootHandleRec, Shutdown, StartTransaction];
+
+
+WalnutOpsImpl: CEDAR MONITOR
+IMPORTS
+BasicTime, FS, IO, MailUtils, Process, RefText, Rope, RuntimeError, ThisMachine,
+SendMailParseMsg,
+WalnutDefs,
+WalnutDB, WalnutOpsInternal,
+WalnutLog,
+WalnutRegistryPrivate, WalnutRoot
+
+EXPORTS WalnutDefs, WalnutOps
+
+= BEGIN OPEN WalnutOps, WalnutOpsInternal;
+
+TiogaContents: TYPE = ViewerTools.TiogaContents;
+ROPE: TYPE = Rope.ROPE;
+STREAM: TYPE = IO.STREAM;
+GMT: TYPE = BasicTime.GMT;
+
+LogInfo: TYPE = WalnutDefs.LogInfo;
+MsgSet: TYPE = WalnutDefs.MsgSet;
+DomainVersion: TYPE = WalnutOps.DomainVersion;
+MsgSetVersion:  TYPE = WalnutOps.MsgSetVersion;
+
+CheckReportProc: TYPE = WalnutDefs.CheckReportProc;
+WalnutOpsHandle: TYPE = WalnutDefs.WalnutOpsHandle;
+WalnutOpsHandleRec: TYPE = WalnutDefs.WalnutOpsHandleRec;
+
+GeneralEnumerator: TYPE = WalnutDB.GeneralEnumerator;
+GeneralEnumeratorRec: PUBLIC TYPE = WalnutDB.GeneralEnumeratorRec;
+
+RootHandle: TYPE = WalnutRoot.RootHandle;
+RootHandleRec: PUBLIC TYPE = WalnutRoot.RootHandleRec;
+
+KernelHandle: TYPE = WalnutOpsInternal.KernelHandle;
+KernelHandleRec: PUBLIC TYPE = WalnutOpsInternal.KernelHandleRec;
+
+ActiveName: PUBLIC ROPE ¨ "Active";
+DeletedName: PUBLIC ROPE ¨ "Deleted";
+
+
+EnumeratorForMsgs: TYPE = REF EnumeratorForMsgsObject;
+EnumeratorForMsgsObject: PUBLIC TYPE = RECORD[
+wH: WalnutOpsHandle,
+headers: REF TEXT ¨ NIL,
+enumerator: SELECT type: * FROM
+FromLog => [ createDate: BasicTime.GMT ¨ BasicTime.nullGMT, scanPos: INT ¨ 0, endPos: INT ¨ 0 ],
+FromMsgSet => [lazyEnum: WalnutDB.LazyEnumerator],
+ENDCASE ];
+
+checkActivityCondition: CONDITION;
+
+fudgeFactor: INT ¨ 20;
+
+SizeOfDatabase: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle]
+	RETURNS[messages, msgSets: INT] = {
+ENABLE UNWIND => NULL;
+Sd: PROC =
+{ [messages, msgSets] ¨ WalnutDB.SizeOfDatabase[opsHandle] };
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Sd, FALSE];
+};
+
+LogLength: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle] RETURNS[length: INT] = {
+ENABLE UNWIND => NULL;
+LLen: PROC = 
+{ length ¨ WalnutLog.LogLength[opsHandle] };
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, LLen, FALSE];
+};
+
+MsgSetsInfo: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle]
+	RETURNS[version, num: INT] = {
+ENABLE UNWIND => NULL;
+Msv: PROC =
+{ [version, num] ¨ WalnutDB.MsgSetsInfo[opsHandle] };
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Msv, FALSE];
+};
+
+
+CreateMsg: PUBLIC ENTRY PROC [opsHandle: WalnutOpsHandle, msgName: ROPE, body: TiogaContents] = {
+ENABLE UNWIND => NULL;
+Cm: PROC = {
+at: INT ¨ WalnutLog.WriteMessage[opsHandle, msgName, body];
+le: WalnutKernelDefs.LogEntry;
+mle: WalnutKernelDefs.MsgLogEntry;
+WalnutLog.SetIndex[opsHandle, at];
+le ¨ WalnutLog.NextEntry[opsHandle].le;
+mle ¨ NARROW[le];
+mle.show ¨ TRUE;
+[] ¨ WalnutDB.AddNewMsg[opsHandle, mle];
+};
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Cm, TRUE];
+}; 
+
+CreateMsgSet: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle, name: ROPE, msDomainVersion: DomainVersion] = {
+ENABLE UNWIND => NULL;
+exists: BOOL ¨ FALSE;
+Cme: INTERNAL PROC = {
+exists ¨ WalnutDB.CreateMsgSet[opsHandle, name, msDomainVersion].existed;
+[] ¨ WalnutLog.CreateMsgSet[opsHandle, name];
+};
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Cme, TRUE];
+IF ~exists THEN WalnutRegistryPrivate.NotifyForMsgSetEvent[created, name];
+};
+
+MsgSetExists: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle, name: ROPE, msDomainVersion: DomainVersion]
+RETURNS[exists: BOOL, version: INT] = {
+ENABLE UNWIND => NULL;
+Mse: INTERNAL PROC =
+{ [exists, version] ¨ WalnutDB.MsgSetExists[opsHandle, name, msDomainVersion] };
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Mse, FALSE];
+};
+
+SizeOfMsgSet: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle, name: ROPE] RETURNS[messages, version: INT] = {
+ENABLE UNWIND => NULL;
+Sms: INTERNAL PROC =
+{ [messages, version] ¨ WalnutDB.NumInMsgSet[opsHandle, name] };
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Sms, FALSE];
+};
+
+EmptyMsgSet: PUBLIC ENTRY PROC [opsHandle: WalnutOpsHandle, msgSet: MsgSet] RETURNS [someInDeleted: BOOL] = {
+ENABLE UNWIND => NULL;
+Ems: INTERNAL PROC[inProgress: BOOL] = {
+someInDeleted ¨ FALSE;
+IF WalnutDB.EqMsgSets[msgSet.name, DeletedName] THEN RETURN;
+IF ~inProgress THEN {
+at: INT;
+IF ~WalnutDB.VerifyMsgSet[opsHandle, msgSet] THEN RETURN;
+at ¨ WalnutLog.EmptyMsgSet[opsHandle, msgSet.name].at;
+WalnutDB.SetOpInProgressPos[opsHandle, at];
+};
+someInDeleted ¨ WalnutDB.EmptyMsgSet[opsHandle, msgSet, CheckReport];
+};
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.LongRunningApply[opsHandle, Ems];
+};
+
+DestroyMsgSet: PUBLIC ENTRY PROC [opsHandle: WalnutOpsHandle, msgSet: MsgSet, msDomainVersion: DomainVersion]
+RETURNS [someInDeleted: BOOL] = {
+ENABLE UNWIND => NULL;
+isActive: BOOL;
+Dms: INTERNAL PROC[inProgress: BOOL] = {
+someInDeleted ¨ FALSE;
+IF ~inProgress THEN {
+at: INT;
+IF ~WalnutDB.VerifyMsgSet[opsHandle, msgSet] THEN RETURN;
+WalnutDB.VerifyDomainVersion[opsHandle, msDomainVersion];
+at ¨ IF isActive THEN WalnutLog.EmptyMsgSet[opsHandle, msgSet.name].at
+ELSE WalnutLog.DestroyMsgSet[opsHandle, msgSet.name].at;
+WalnutDB.SetOpInProgressPos[opsHandle, at];
+};
+IF isActive THEN someInDeleted ¨ WalnutDB.EmptyMsgSet[opsHandle, msgSet, CheckReport]
+ELSE someInDeleted ¨
+WalnutDB.DestroyMsgSet[opsHandle, msgSet, msDomainVersion, CheckReport];
+};
+
+WalnutOpsInternal.CheckInProgress[opsHandle];
+IF msgSet.name.Equal[DeletedName, FALSE] THEN RETURN[FALSE];	-- may not destroy Deleted
+isActive ¨ msgSet.name.Equal[ActiveName, FALSE];
+WalnutOpsInternal.LongRunningApply[opsHandle, Dms];
+IF ~isActive THEN WalnutRegistryPrivate.NotifyForMsgSetEvent[destroyed, msgSet.name];
+};
+EnumerateMsgs: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle] RETURNS[enum: EnumeratorForMsgs] = {
+ENABLE UNWIND => NULL;
+thisEnum: REF FromLog EnumeratorForMsgsObject;
+Em: INTERNAL PROC = {
+thisEnum.wH ¨ opsHandle;
+thisEnum.createDate ¨ opsHandle.rootHandle.createDate;
+thisEnum.endPos ¨ WalnutLog.LogLength[opsHandle];
+};
+WalnutOpsInternal.CheckInProgress[opsHandle];
+thisEnum ¨ NEW[FromLog EnumeratorForMsgsObject];
+WalnutOpsInternal.CarefullyApply[opsHandle, Em, FALSE];
+RETURN[thisEnum];
+};
+
+NextMsg: PUBLIC ENTRY PROC[enum: EnumeratorForMsgs] RETURNS
+	[msgID: ROPE, msList: LIST OF ROPE, headers: REF TEXT] = {
+ENABLE UNWIND => NULL;
+ok: BOOL ¨ TRUE;
+wH: WalnutOpsHandle = enum.wH;
+Nm: INTERNAL PROC = {
+skipped: INT;
+isAt: INT;
+natLen: NAT;
+wle: WalnutLog.LogEntry;
+TRUSTED { WITH thisEnum: enum SELECT FROM 
+FromLog => {
+IF thisEnum.createDate # wH.rootHandle.createDate THEN
+ERROR WalnutDefs.Error[$db, $InvalidEnumerator, "Wrong rootfile referenced"];
+skipped ¨ WalnutLog.SetPosition[wH, thisEnum.scanPos];
+DO
+wle: WalnutLog.LogEntry;
+at: INT;
+[wle, at] ¨ WalnutLog.QuickScan[wH];
+IF at >= thisEnum.endPos OR wle = NIL THEN { ok ¨ FALSE; RETURN };
+TRUSTED { WITH mle: wle SELECT FROM
+CreateMsg => {
+natLen ¨ mle.headersLen;	-- this better not cause an error
+msgID ¨ mle.msg;
+isAt ¨ WalnutDB.GetMsgEntryPosition[wH, msgID];
+IF isAt = -1 OR isAt > mle.entryStart THEN LOOP;	-- oops or duplicate
+msList ¨ WalnutDB.GetCategories[wH, msgID];
+IF thisEnum.headers = NIL OR thisEnum.headers.maxLength < natLen THEN
+thisEnum.headers ¨ RefText.New[natLen];
+WalnutLog.GetRefTextFromLog[wH, mle.entryStart+mle.textOffset, natLen, thisEnum.headers];
+headers ¨ thisEnum.headers;
+thisEnum.scanPos ¨ WalnutLog.NextAt[wH];
+EXIT;
+};
+ENDCASE => LOOP;
+};
+ENDLOOP;
+};
+FromMsgSet => {
+valid: BOOL;
+[msgID, valid] ¨ WalnutDB.NextMsgInMsgSet[thisEnum.lazyEnum];
+IF NOT valid OR msgID = NIL THEN RETURN;
+isAt ¨ WalnutDB.GetMsgEntryPosition[wH, msgID];
+msList ¨ WalnutDB.GetCategories[wH, msgID];
+[] ¨ WalnutLog.SetPosition[wH, isAt];
+wle ¨ WalnutLog.QuickScan[wH].le;
+TRUSTED { WITH mle: wle SELECT FROM
+CreateMsg => {
+natLen ¨ mle.headersLen;
+IF thisEnum.headers = NIL OR thisEnum.headers.maxLength < natLen THEN
+thisEnum.headers ¨ RefText.New[natLen];
+WalnutLog.GetRefTextFromLog[wH, isAt+mle.textOffset, natLen, thisEnum.headers] }
+ENDCASE };
+headers ¨ thisEnum.headers };
+ENDCASE =>
+ERROR WalnutDefs.Error[$db, $InvalidEnumerator, "Wrong type of enumerator"];
+};
+};
+WalnutOpsInternal.CheckInProgress[wH];
+WalnutOpsInternal.CarefullyApply[wH, Nm, FALSE];
+IF ~ok THEN RETURN[NIL, NIL, NIL];
+};
+
+EnumerateMsgsInMsgSet: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle, name: ROPE] RETURNS[enum: EnumeratorForMsgs] = {
+ENABLE UNWIND => NULL;
+Me: INTERNAL PROC = {
+msgSet: WalnutDB.MsgSet;
+version: INT;
+exists: BOOL;
+[exists, version] ¨ WalnutDB.MsgSetExists[opsHandle, name, WalnutDefs.dontCareDomainVersion];
+IF NOT exists THEN RETURN;
+msgSet.name ¨ name; msgSet.version ¨ version;
+enum ¨ NEW[EnumeratorForMsgsObject ¨ [enumerator: FromMsgSet[lazyEnum: WalnutDB.EnumerateMsgsInMsgSet[opsHandle, msgSet]]]];
+enum.wH ¨ opsHandle;
+};
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Me, FALSE];
+};
+
+MsgsEnumeration: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle, alphaOrder: BOOL] RETURNS[mL: LIST OF ROPE] = {
+ENABLE UNWIND => NULL;
+Me: INTERNAL PROC =
+{ mL ¨ WalnutDB.MsgsEnumeration[opsHandle, alphaOrder] };
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Me, FALSE];
+};
+MsgSetNames: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle, alphaOrder: BOOL]
+RETURNS[mL: LIST OF ROPE, msDomainVersion: DomainVersion] = {
+ENABLE UNWIND => NULL;
+Ems: INTERNAL PROC =
+{ [mL, msDomainVersion] ¨ WalnutDB.MsgSetsNames[opsHandle, alphaOrder] };
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Ems, FALSE];
+};
+
+MsgsInSetEnumeration: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle, name: ROPE, fromStart: BOOL]
+RETURNS [mL: LIST OF ROPE, msVersion: MsgSetVersion] = {
+ENABLE UNWIND => NULL;
+Emis: INTERNAL PROC = {
+[mL, msVersion] ¨ WalnutDB.MsgsInSetEnumeration[opsHandle, name, fromStart]
+};
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Emis, FALSE];
+};
+
+EnumerateMsgSets: PUBLIC ENTRY PROC [
+opsHandle: WalnutOpsHandle,
+alphaOrder: BOOL ¨ TRUE, proc: PROC[msgSet: MsgSet] RETURNS[continue: BOOL] ]
+RETURNS [msVersion: MsgSetVersion] = {
+ENABLE UNWIND => NULL;
+Emss: INTERNAL PROC =
+{ msVersion ¨ WalnutDB.EnumerateMsgSets[opsHandle, alphaOrder, proc] };
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Emss, FALSE];
+};
+
+EnumerateMsgsInSet: PUBLIC ENTRY PROC [
+opsHandle: WalnutOpsHandle,
+name: ROPE,
+fromStart: BOOL,
+proc: PROC[msg, tocEntry: ROPE, hasBeenRead: BOOL, startOfSubject: INT] RETURNS[continue: BOOL] ]
+RETURNS [msVersion: MsgSetVersion] = {
+ENABLE UNWIND => NULL;
+Ems: INTERNAL PROC =
+{ msVersion ¨ WalnutDB.EnumerateMsgsInSet[opsHandle, name, fromStart, proc] };
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Ems, FALSE];
+};
+
+GenerateEntriesPlusDate: PUBLIC ENTRY PROC [
+opsHandle: WalnutOpsHandle,
+attr: ATOM, start: ROPE ¨ NIL, end: ROPE ¨ NIL,
+dateStart: ROPE ¨ NIL, dateEnd: ROPE ¨ NIL]
+	RETURNS [genEnum: GeneralEnumerator] = {
+ENABLE UNWIND => NULL;
+GenEnt: INTERNAL PROC =
+{ genEnum ¨ WalnutDB.GenerateEntriesPlusDate[opsHandle, attr, start, end, dateStart, dateEnd] };
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, GenEnt, FALSE];
+}; 
+
+NextEntry: PUBLIC ENTRY PROC[genEnum: GeneralEnumerator] RETURNS 
+	[entry: EntryRef] = {
+ENABLE UNWIND => NULL;
+Ne: INTERNAL PROC = {
+entryWalDB: WalnutDB.EntryRef ¨ WalnutDB.NextEntry[genEnum];
+textStart, textLen, formatLen: INT;
+contents: WalnutLog.TiogaContents;
+
+IF entryWalDB#NIL THEN {
+entry ¨ NEW[EntryObject]; 
+entry.seFromToCcSuDaMid ¨ entryWalDB.seFromToCcSuDaMid;
+entry.msgSetName ¨ entryWalDB.msgSetName;
+[textStart: textStart, textLen: textLen, formatLen: formatLen] ¨ WalnutDB.GetMsgTextInfo[opsH: genEnum.opsH, msg: entryWalDB.seFromToCcSuDaMid.msgID];
+contents ¨ WalnutLog.GetTiogaContents[opsH: genEnum.opsH, textStart: textStart, textLen: textLen, formatLen: formatLen];
+entry.msgText ¨ contents.contents;
+};
+
+};
+WalnutOpsInternal.CheckInProgress[genEnum.opsH];
+WalnutOpsInternal.CarefullyApply[genEnum.opsH, Ne, FALSE];
+};
+
+
+ParseHeaders: PUBLIC ENTRY PROC [opsHandle: WalnutOpsHandle, headers: ROPE, proc: WalnutOps.ParseProc]
+	RETURNS[msgHeaders: WalnutOps.MsgHeaders] = {
+ENABLE UNWIND => NULL;
+WalnutOpsInternal.CheckInProgress[opsHandle];
+msgHeaders ¨ SendMailParseMsg.ParseHeadersFromRope[headers, proc];
+};
+
+MsgExists: PUBLIC ENTRY PROC [opsHandle: WalnutOpsHandle, msg: ROPE]
+	RETURNS[exists: BOOL] = {
+ENABLE UNWIND => NULL;
+Me: INTERNAL PROC =
+{ exists ¨ WalnutDB.MsgExists[opsHandle, msg] };
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Me, FALSE];
+};
+
+GetCategories: PUBLIC ENTRY PROC [opsHandle: WalnutOpsHandle, msg: ROPE]
+	RETURNS[msL: LIST OF ROPE] = {
+ENABLE UNWIND => NULL;
+GetC: INTERNAL PROC =
+{ msL¨ WalnutDB.GetCategories[opsHandle, msg] };
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, GetC, FALSE];
+};
+
+GetDisplayProps: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle, msg: ROPE]
+	RETURNS[hasBeenRead: BOOL, tocEntry: ROPE, startOfSubject: INT] = {
+ENABLE UNWIND => NULL;
+GetDP: INTERNAL PROC = {
+[hasBeenRead, tocEntry, startOfSubject] ¨ WalnutDB.GetDisplayProps[opsHandle, msg]
+};
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, GetDP, FALSE];
+};
+
+GetMsgDate: PUBLIC ENTRY PROC [opsHandle: WalnutOpsHandle, msg: ROPE]
+	RETURNS[date: BasicTime.GMT] = {
+ENABLE UNWIND => NULL;
+GetMD: INTERNAL PROC = { date ¨ WalnutDB.GetMsgDate[opsHandle, msg] };
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, GetMD, FALSE];
+};
+
+GetMsg: PUBLIC ENTRY PROC [opsHandle: WalnutOpsHandle, msg: ROPE]
+RETURNS[contents: TiogaContents, herald, shortName: ROPE] = {
+ENABLE UNWIND => NULL;
+GetMT: INTERNAL PROC = {
+textStart, textLen, formatLen, shortNameLen: INT;
+[textStart, textLen, formatLen, herald, shortNameLen] ¨ WalnutDB.GetMsgText[opsHandle, msg];
+IF textStart = 0 THEN RETURN;
+contents ¨ WalnutLog.GetTiogaContents[opsHandle, textStart, textLen, formatLen];
+shortName ¨ herald.Substr[0, shortNameLen];
+};
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, GetMT, FALSE];
+};
+
+GetMsgText: PUBLIC ENTRY PROC [opsHandle: WalnutOpsHandle, msg: ROPE, text: REF TEXT]
+	RETURNS[contents: REF TEXT] = {
+ENABLE UNWIND => NULL;
+CheckForNat: PROC[len: INT] RETURNS[nat: NAT] = { nat ¨ len };
+Gmt: INTERNAL PROC = {
+textStart, textLen: INT;
+natLen: NAT;
+[textStart, textLen, ] ¨ WalnutDB.GetMsgText[opsHandle, msg];
+IF textStart = 0 THEN {
+contents ¨ text;
+IF contents # NIL THEN contents.length ¨ 0;
+RETURN};
+BEGIN ENABLE RuntimeError.BoundsFault => GOTO oops;
+natLen ¨ CheckForNat[textLen];
+IF text = NIL OR (natLen > text.maxLength) THEN
+contents ¨ RefText.New[natLen] ELSE contents ¨ text;
+WalnutLog.GetRefTextFromLog[opsHandle, textStart, textLen, contents];
+EXITS
+oops =>
+ERROR WalnutDefs.Error[$log, $MsgTooLong, "Msg will not fit in a REF TEXT"];
+END;
+};
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Gmt, FALSE];
+};
+
+GetMsgHeaders: PUBLIC ENTRY PROC [opsHandle: WalnutOpsHandle, msg: ROPE, text: REF TEXT]
+	RETURNS[headers: REF TEXT] = {
+ENABLE UNWIND => NULL;
+natLen: NAT ;
+Gmh: INTERNAL PROC = {
+wle: WalnutLog.LogEntry;
+isAt: INT = WalnutDB.GetMsgEntryPosition[opsHandle, msg];
+headers ¨ text;
+IF isAt = -1 THEN {
+IF headers # NIL THEN headers.length ¨ 0;
+RETURN};
+[] ¨ WalnutLog.SetPosition[opsHandle, isAt];
+[wle, ] ¨ WalnutLog.QuickScan[opsHandle];
+BEGIN ENABLE RuntimeError.BoundsFault => GOTO oops;
+TRUSTED { WITH mle: wle SELECT FROM
+CreateMsg => {
+natLen ¨ mle.headersLen;
+IF headers = NIL OR headers.maxLength < natLen THEN
+headers ¨ RefText.New[natLen];
+WalnutLog.GetRefTextFromLog[
+opsHandle, mle.entryStart+mle.textOffset, natLen, headers];
+};
+ENDCASE => NULL;
+};
+
+EXITS
+oops =>
+ERROR WalnutDefs.Error[$log, $MsgHeadersTooLong,
+IO.PutFR1["Msg headers (%g bytes) will not fit in a REF TEXT", [integer[natLen]]] ];
+END;
+};
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Gmh, FALSE];
+};
+
+GetMsgShortName: PUBLIC ENTRY PROC [opsHandle: WalnutOpsHandle, msg: ROPE]
+	RETURNS[shortName: ROPE] = {
+ENABLE UNWIND => NULL;
+Gmsn: INTERNAL PROC = {
+shortNameLen: INT;
+herald: ROPE;
+[, , , herald, shortNameLen] ¨ WalnutDB.GetMsgText[opsHandle, msg];
+shortName ¨ herald.Substr[0, shortNameLen];
+};
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Gmsn, FALSE];
+};
+
+GetMsgSize: PUBLIC ENTRY PROC [opsHandle: WalnutOpsHandle, msg: ROPE]
+	RETURNS[textLen, formatLen: INT] = {
+ENABLE UNWIND => NULL;
+Gms: INTERNAL PROC =
+{ [, textLen, formatLen] ¨ WalnutDB.GetMsgTextInfo[opsHandle, msg] };
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Gms, FALSE];
+};
+
+GetIsInReplyTo: PUBLIC ENTRY PROC [opsHandle: WalnutOpsHandle, msg: ROPE]
+	RETURNS[isInReplyTo: BOOL] = {
+ENABLE UNWIND => NULL;
+Giirt: INTERNAL PROC =
+{ isInReplyTo ¨ WalnutDB.GetIsInReplyTo[opsHandle, msg] };
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Giirt, FALSE];
+};
+
+GetHasBeenRead: PUBLIC ENTRY PROC [opsHandle: WalnutOpsHandle, msg: ROPE]
+	RETURNS[hadBeenRead: BOOL] = {
+ENABLE UNWIND => NULL;
+Ghbr: INTERNAL PROC = {
+hadBeenRead ¨ WalnutDB.GetHasBeenRead[opsHandle, msg];
+};
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Ghbr, FALSE];
+};
+
+SetHasBeenRead: PUBLIC ENTRY PROC [opsHandle: WalnutOpsHandle, msg: ROPE] = {
+ENABLE UNWIND => NULL;
+Shbr: INTERNAL PROC = {
+[] ¨ WalnutLog.HasBeenRead[opsHandle, msg];
+WalnutDB.SetHasBeenRead[opsHandle, msg];
+};
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Shbr, TRUE];
+WalnutRegistryPrivate.NotifyForMsgEvent[firstRead, msg];
+};
+
+GenerateUniqueMsgName: PUBLIC PROC[opsHandle: WalnutOpsHandle] RETURNS[msg: ROPE] = {
+ENABLE UNWIND => NULL;
+Gumn: INTERNAL PROC = {
+DO	-- this should never loop more than once
+msg ¨ MailUtils.GeneratePostmark[machine: ThisMachine.Name[] ];
+IF NOT WalnutDB.MsgExists[opsHandle, msg] THEN EXIT;
+ENDLOOP;
+};
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Gumn, FALSE];
+};
+
+AddMsg: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle, msg: ROPE, from, to: MsgSet]
+	RETURNS [exists: BOOL ¨ FALSE] = {
+ENABLE UNWIND => NULL;
+Am: INTERNAL PROC = {
+exists ¨ WalnutDB.AddMsg[opsHandle, msg, from, to];
+[] ¨ WalnutLog.AddMsg[opsHandle, msg, to.name];
+};
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Am, TRUE];
+IF NOT exists THEN WalnutRegistryPrivate.NotifyForMove[msg: msg, to: to.name, from: NIL];
+};
+
+MoveMsg: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle, msg: ROPE, from, to: MsgSet]
+	RETURNS [exists: BOOL ¨ FALSE] = {
+ENABLE UNWIND => NULL;
+Mm: INTERNAL PROC = {
+exists ¨ WalnutDB.MoveMsg[opsHandle, msg, from, to];
+[] ¨ WalnutLog.MoveMsg[opsHandle, msg, from.name, to.name];
+};
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Mm, TRUE];
+IF NOT exists THEN
+WalnutRegistryPrivate.NotifyForMove[msg: msg, to: to.name, from: from.name];
+};
+
+RemoveMsg: PUBLIC ENTRY PROC [opsHandle: WalnutOpsHandle, msg: ROPE, from: MsgSet, deletedVersion: MsgSetVersion]
+RETURNS [deleted: BOOL ¨ FALSE] = {
+ENABLE UNWIND => NULL;
+Rm: INTERNAL PROC = {
+deleted ¨ WalnutDB.RemoveMsg[opsHandle, msg, from, deletedVersion];
+[] ¨ WalnutLog.RemoveMsg[opsHandle, msg, from.name];
+};
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Rm, TRUE];
+IF deleted THEN WalnutRegistryPrivate.NotifyForMsgEvent[deleted, msg]
+ELSE WalnutRegistryPrivate.NotifyForMove[msg: msg, to: NIL, from: from.name];
+};
+StartNewMail: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle]
+	RETURNS[newMailStream: STREAM] = {
+ENABLE UNWIND => NULL;
+RETURN[WalnutOpsInternal.DoStartNewMail[opsHandle]]
+};
+RecordNewMailInfo: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle, logLen: INT, server: ROPE, num: INT] = {
+ENABLE UNWIND => NULL;
+when: BasicTime.GMT;
+Snml: PROC = {
+now: INT ¨ WalnutDB.GetServerInfo[opsHandle, server] + num;
+when ¨ BasicTime.Now[];
+[] ¨ WalnutLog.RecordNewMailInfo[opsHandle, logLen, when, server, now];
+WalnutDB.SetNewMailInfo[opsHandle, logLen, when, server, now];
+};
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Snml, TRUE];
+opsHandle.kernelHandle.newMailSomewhere ¨ TRUE;
+};
+
+EndNewMail: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle] = {
+ENABLE UNWIND => NULL;
+strm: STREAM ¨ opsHandle.kernelHandle.mailStream;
+WalnutOpsInternal.CheckInProgress[opsHandle];
+opsHandle.kernelHandle.mailStream ¨ NIL;
+IF strm # NIL THEN
+WalnutRoot.ReturnNewMailStream[opsHandle ! WalnutDefs.Error , IO.Error, FS.Error => CONTINUE];
+IF opsHandle.kernelHandle.newMailSomewhere THEN
+WalnutRegistryPrivate.NotifyForEvent[mailRead];
+};
+
+GetNewMail: PUBLIC ENTRY PROC[
+opsHandle: WalnutOpsHandle, activeVersion: INT,
+proc: PROC[msg, tocEntry: ROPE, startOfSubject: INT]]
+RETURNS[responses: LIST OF WalnutOps.ServerInfo, complete: BOOL] = {
+ENABLE UNWIND => NULL;
+[responses, complete] ¨ WalnutOpsInternal.DoNewMail[opsHandle, activeVersion, proc];
+};
+
+AcceptNewMail: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle, activeVersion: INT] = {
+ENABLE UNWIND => NULL;
+WalnutOpsInternal.DoAcceptNewMail[opsHandle, activeVersion];
+};
+
+
+ValidOpsHandle: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle]
+RETURNS[isValid: BOOL] = {
+ENABLE UNWIND => NULL;
+IF opsHandle = NIL THEN RETURN[FALSE];
+RETURN[opsHandle.kernelHandle # NIL];
+};
+
+CreateWalnutOpsHandle: PUBLIC ENTRY PROC[rootFile: ROPE, wantReadOnly: BOOL ¨ FALSE]
+	RETURNS[opsHandle: WalnutOpsHandle] = {
+ENABLE UNWIND => NULL;
+
+canonicalName: ROPE ¨ FS.ExpandName[rootFile].fullFName;
+opsHL: LIST OF WalnutOpsHandle = WalnutRoot.GetOpsHandleList[];
+tries: INT ¨ 0;
+ExistingHandle: PROC[file: ROPE] RETURNS[opsH: WalnutOpsHandle] = {
+FOR wL: LIST OF WalnutOpsHandle ¨ opsHL, wL.rest UNTIL wL = NIL DO
+IF file.Equal[wL.first.rootName, FALSE] THEN RETURN[wL.first];
+ENDLOOP;
+RETURN[NIL];
+};
+RemoveOldHandle: PROC[ohL: LIST OF WalnutOpsHandle] RETURNS[new: LIST OF WalnutOpsHandle] = {
+prev: LIST OF WalnutOpsHandle ¨ NIL;
+new ¨ ohL;		-- in case fall out of loop
+FOR wL: LIST OF WalnutOpsHandle ¨ ohL, wL.rest UNTIL wL = NIL DO
+IF NOT canonicalName.Equal[wL.first.rootName, FALSE] THEN
+{ prev ¨ wL; LOOP };
+WalnutOpsInternal.InternalShutdown[wL.first ! WalnutDefs.Error => CONTINUE];
+wL.first.kernelHandle ¨ NIL;
+wL.first.logHandle ¨ NIL;
+wL.first.expungeHandle ¨ NIL;
+wL.first.schemaHandle ¨ NIL;
+wL.first.rootHandle ¨ NIL;
+IF prev = NIL THEN RETURN[wL.rest];
+prev.rest ¨ wL.rest;
+RETURN[ohL];
+ENDLOOP;
+};
+WalnutRoot.ExamineHandleList[RemoveOldHandle];
+opsHandle ¨
+NEW[WalnutOpsHandleRec ¨ [rootName: canonicalName, readOnly: wantReadOnly] ];
+opsHandle.kernelHandle ¨ NEW[KernelHandleRec];
+DO
+dupRoot: ROPE ¨ NIL;
+prevH: WalnutOpsHandle;
+[] ¨ WalnutRoot.Open[opsH: opsHandle, newHandle: TRUE ! WalnutDefs.Error => {
+IF NOT ((code = $DuplicateSegmentName) OR (code = $DuplicateSegmentIndex)) THEN REJECT;
+IF tries = 2 THEN REJECT;	-- don't loop forever
+dupRoot ¨ explanation;
+prevH ¨ ExistingHandle[dupRoot];
+IF prevH = NIL THEN REJECT;
+IF ( prevH.kernelHandle # NIL ) AND ( NOT prevH.kernelHandle.isShutdown ) THEN REJECT;
+CONTINUE;
+};
+]; 	-- checks for duplicate segments
+IF dupRoot = NIL THEN RETURN;
+canonicalName ¨ dupRoot;
+WalnutRoot.ExamineHandleList[RemoveOldHandle];
+tries ¨ tries + 1;
+ENDLOOP;
+};
+
+GetHandleForRootfile: PUBLIC ENTRY PROC[rootFile: ROPE]
+	RETURNS[opsHandle: WalnutOpsHandle] = {
+canonicalName: ROPE = FS.ExpandName[rootFile].fullFName;
+FOR wL: LIST OF WalnutOpsHandle ¨ WalnutRoot.GetOpsHandleList[], wL.rest UNTIL wL = NIL DO
+IF canonicalName.Equal[wL.first.rootName, FALSE] THEN RETURN[wL.first];
+ENDLOOP;
+RETURN[NIL];
+};
+
+Startup: PUBLIC ENTRY PROC [opsHandle: WalnutOpsHandle]
+RETURNS[newMailExists: BOOL] = {
+
+kH: KernelHandle;
+IF (kH ¨ opsHandle.kernelHandle) = NIL THEN
+kH ¨ opsHandle.kernelHandle ¨ NEW[KernelHandleRec];
+BEGIN ENABLE {
+WalnutDefs.Error => { kH.errorInProgress ¨ TRUE; REJECT};
+UNWIND => NULL;
+};
+
+schemaInvalid: BOOL ¨ TRUE;
+
+InitialCheck: INTERNAL PROC = {
+dbRootCreateDate: GMT;
+dbFileKey, dbMailFor: ROPE;
+IF opsHandle.key.Length[] # 0 THEN {
+[dbRootCreateDate, dbFileKey, dbMailFor] ¨ WalnutDB.GetRootInfo[opsHandle];
+IF ( dbRootCreateDate = BasicTime.nullGMT ) OR
+( dbFileKey.Length[] = 0 ) OR ( dbMailFor.Length[] = 0) THEN {
+WalnutDB.SetRootInfo[opsHandle, opsHandle.rootHandle.createDate, opsHandle.key, opsHandle.mailFor];
+WalnutRoot.CommitAndContinue[opsHandle];
+}
+ELSE {
+IF dbRootCreateDate # opsHandle.rootHandle.createDate THEN
+WalnutDefs.Error[$db, $WrongRootFile,
+IO.PutFR["RootFile has date %g, database says %g",
+[time[opsHandle.rootHandle.createDate]], [time[dbRootCreateDate]]] ];
+IF ~dbFileKey.Equal[opsHandle.key, FALSE] THEN
+WalnutDefs.Error[$db, $WrongRootFile,
+IO.PutFR["RootFile has key %g, database says %g",
+[rope[opsHandle.key]], [rope[dbFileKey]]] ];
+IF ~dbMailFor.Equal[opsHandle.mailFor, FALSE] THEN
+WalnutDefs.Error[$db, $WrongRootFile,
+IO.PutFR["RootFile says mailFor %g, database says %g",
+[rope[opsHandle.mailFor]], [rope[dbMailFor]]] ];
+};
+};
+IF (kH.newMailSomewhere ¨ WalnutDB.GetNewMailLogLength[opsHandle] # 0)
+THEN RETURN;
+BEGIN
+serverList: LIST OF ServerInfo ¨ WalnutDB.EnumerateServers[opsHandle];
+FOR sL: LIST OF ServerInfo ¨ serverList, sL.rest UNTIL sL = NIL DO
+IF (kH.newMailSomewhere ¨ sL.first.num#0) THEN RETURN;
+ENDLOOP;
+END;
+};
+
+IF kH.started THEN RETURN WITH ERROR WalnutDefs.Error[$db, $AlreadyStarted];
+IF opsHandle.rootHandle = NIL THEN [] ¨ WalnutRoot.Open[opsHandle];
+StartStatsReporting[opsHandle];
+
+BEGIN
+exp: ROPE;
+BEGIN
+schemaInvalid ¨ WalnutRoot.StartTransaction[opsHandle  ! WalnutDefs.Error => {
+IF code # $MismatchedSegment THEN REJECT;
+exp ¨ explanation;
+GOTO mismatched;
+}];
+EXITS
+mismatched => RETURN WITH ERROR WalnutDefs.Error[$db, $SchemaMismatch, exp];
+END;
+END;
+
+schemaInvalid ¨ WalnutRoot.StartTransaction[opsHandle];
+opsHandle.kernelHandle.isShutdown ¨ FALSE;
+WalnutLog.OpenLogStreams[opsHandle];
+
+BEGIN
+exp: ROPE;
+BEGIN
+[] ¨ WalnutDB.DeclareDB[opsHandle, schemaInvalid !
+WalnutDefs.SchemaMismatch => { exp ¨ explanation; GOTO mismatch}];
+StatsReport[opsHandle, "\n\n ***** Startup called with rootFile: %g", [rope[opsHandle.rootName]] ];
+EXITS
+mismatch => RETURN WITH ERROR WalnutDefs.Error[$db, $SchemaMismatch, exp];
+END;
+END;
+
+kH.started ¨ TRUE;
+kH.errorInProgress ¨ FALSE;
+CarefullyApply[opsHandle, InitialCheck, FALSE];
+CheckInProgress[opsHandle];
+RETURN[kH.newMailSomewhere];
+END;
+};
+
+Shutdown: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle] = {
+ENABLE {
+WalnutDefs.Error => { opsHandle.kernelHandle.errorInProgress ¨ TRUE; REJECT};
+UNWIND => NULL;
+};
+WalnutOpsInternal.InternalShutdown[opsHandle];
+};
+
+Scavenge: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle]
+	RETURNS[newMailExists: BOOL] = {
+
+kH: KernelHandle;
+IF (kH ¨ opsHandle.kernelHandle) = NIL THEN
+kH ¨ opsHandle.kernelHandle ¨ NEW[KernelHandleRec];
+opsHandle.readOnly ¨ FALSE;
+
+BEGIN ENABLE {
+WalnutDefs.Error => { kH.errorInProgress ¨ TRUE; REJECT};
+UNWIND => NULL;
+};
+
+WalnutLog.ShutdownLog[opsHandle];
+WalnutRoot.Shutdown[opsHandle];
+
+[] ¨ WalnutRoot.Open[opsH: opsHandle, newSegmentOk: TRUE];
+
+StartStatsReporting[opsHandle];
+StatsReport[opsHandle, "\n *** Scavenge"];
+
+IF opsHandle.readOnly THEN
+ERROR WalnutDefs.Error[$DB, $IsReadOnly, "Can't erase a readonly database"];
+
+[] ¨ WalnutRoot.StartTransaction[opsHandle, FALSE]; -- don't care if schema is invalid
+opsHandle.kernelHandle.isShutdown ¨ FALSE;
+WalnutLog.OpenLogStreams[opsHandle];
+WalnutRoot.AcquireWriteLock[opsHandle];
+kH.started ¨ TRUE;
+kH.errorInProgress ¨ FALSE;
+
+WalnutRoot.EraseDB[opsHandle];
+[] ¨ WalnutDB.InitSchema[opsHandle];
+WalnutDB.SetRootInfo[opsHandle, opsHandle.rootHandle.createDate, opsHandle.key, opsHandle.mailFor];
+WalnutDB.SetParseLogInProgress[opsHandle, TRUE];
+WalnutDB.SetParseLogPos[opsHandle, 0];
+WalnutRoot.CommitAndContinue[opsHandle];
+kH.newMailSomewhere ¨ FALSE;
+
+[] ¨ WalnutOpsInternal.ParseLog[opsHandle, TRUE];
+WalnutDB.SetTimeOfLastScavenge[opsHandle, BasicTime.Now[]];
+newMailExists ¨ kH.newMailSomewhere;
+END;
+};
+
+
+GetExpungeInfo: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle]
+	RETURNS[firstDestroyedMsgPos, bytesInDestroyedMsgs: INT] = {
+ENABLE UNWIND => NULL;
+Gei: PROC = {
+[ firstDestroyedMsgPos, bytesInDestroyedMsgs] ¨ WalnutDB.GetExpungeInfo[opsHandle]
+};
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Gei, FALSE]
+};
+
+ExpungeMsgs: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle, deletedVersion: INT]
+RETURNS[bytesInDestroyedMsgs: INT] = {
+ENABLE UNWIND => NULL;
+Expm: INTERNAL PROC[inProgress: BOOL] = {
+IF ~inProgress THEN {
+at: INT;
+[] ¨ WalnutDB.VerifyMsgSet[opsHandle, [DeletedName, deletedVersion]];
+at ¨ WalnutLog.ExpungeMsgs[opsHandle].at;
+WalnutDB.SetOpInProgressPos[opsHandle, at];
+};
+WalnutDB.ExpungeMsgs[opsHandle, deletedVersion, CheckReport];
+bytesInDestroyedMsgs ¨ WalnutDB.GetExpungeInfo[opsHandle].bytesInDestroyedMsgs
+};
+WalnutOpsInternal.CheckInProgress[opsHandle];
+CheckReport[opsHandle, "Deleting msgs"];
+WalnutOpsInternal.LongRunningApply[opsHandle, Expm];
+};
+
+CopyToExpungeLog: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle] RETURNS[copyDone: BOOL] = {
+ENABLE UNWIND => NULL;
+ExpL: INTERNAL PROC[inProgress: BOOL] = {
+IF ~inProgress THEN {
+at: INT;
+spaceInUse, quota, max, wanted: INT;
+[spaceInUse, quota] ¨ WalnutRoot.GetQuota[opsHandle];
+max ¨ WalnutOpsInternal.ComputeMaxExpungeLogPages[opsHandle];
+wanted ¨ max + spaceInUse + fudgeFactor;
+IF wanted > quota THEN {
+WalnutOpsInternal.CheckReport[opsHandle,
+"\n An expunge log of %g pages would exceed your quota (%g) by %g pages",
+[integer[max]], [integer[quota]], [integer[wanted - quota]] ];
+WalnutOpsInternal.CheckReport[opsHandle,
+"\n Ask an alpine administrator for more space, then Expunge again\n"];
+copyDone ¨ FALSE;
+RETURN;
+};
+at ¨ WalnutLog.WriteExpungeLog[opsHandle].at;   -- write log entry of intent
+WalnutDB.SetOpInProgressPos[opsHandle, at];
+};
+WalnutOpsInternal.DoLogExpunge[opsHandle]
+};
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.LongRunningApply[opsHandle, ExpL];
+copyDone ¨ TRUE;
+};
+
+GetTimeOfLastExpunge: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle]
+	RETURNS[when: BasicTime.GMT] = {
+ENABLE UNWIND => NULL;
+Gdle: PROC =
+{ when ¨ WalnutDB.GetTimeOfLastExpunge[opsHandle] };
+WalnutOpsInternal.CheckInProgress[opsHandle];
+WalnutOpsInternal.CarefullyApply[opsHandle, Gdle, FALSE]
+};
+ReadArchiveFile: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle, file: ROPE, msgSet: WalnutDefs.MsgSet ¨ [NIL, -1]]
+		RETURNS[numNew: INT] = {
+ENABLE UNWIND => NULL;
+RETURN[WalnutOpsInternal.DoReadArchiveFile[opsHandle, file, msgSet]];
+};
+
+WriteArchiveFile: PUBLIC ENTRY PROC[
+opsHandle: WalnutOpsHandle,
+file: ROPE, msgSetList: LIST OF WalnutDefs.MsgSet, append: BOOL] RETURNS[ok: BOOL]= {
+ENABLE UNWIND => NULL;
+
+RETURN[WalnutOpsInternal.DoWriteArchiveFile[opsHandle, file, msgSetList, append]];
+};
+
+
+
+RegisterReporter: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle, reportStream: STREAM] = {
+ENABLE UNWIND => NULL;
+kH: KernelHandle = opsHandle.kernelHandle;
+FOR rL: LIST OF STREAM ¨ kH.reporterList, rL.rest UNTIL rL= NIL DO
+IF rL.first = reportStream THEN RETURN;
+ENDLOOP;
+kH.reporterList ¨ CONS[reportStream, kH.reporterList];
+};
+
+UnregisterReporter: PUBLIC ENTRY PROC[opsHandle: WalnutOpsHandle, reportStream: STREAM] = {
+ENABLE UNWIND => NULL;
+prev: LIST OF STREAM;
+kH: KernelHandle = opsHandle.kernelHandle;
+
+IF kH.reporterList = NIL OR reportStream = NIL THEN RETURN;
+IF kH.reporterList.first = reportStream THEN
+{ kH.reporterList ¨ kH.reporterList.rest; RETURN};
+
+prev ¨ kH.reporterList;
+FOR rL: LIST OF STREAM ¨ kH.reporterList, rL.rest UNTIL rL= NIL DO
+IF rL.first = reportStream THEN { prev.rest¨ rL.rest; RETURN};
+prev¨ rL;
+ENDLOOP;
+};
+
+CheckForRecentActivity: ENTRY PROC = {
+TRUSTED {Process.SetTimeout[@checkActivityCondition, Process.SecondsToTicks[5*60]];};
+DO
+WAIT checkActivityCondition;
+FOR wL: LIST OF WalnutOpsHandle ¨ WalnutRoot.GetOpsHandleList[], wL.rest UNTIL wL = NIL DO
+kH: KernelHandle = wL.first.kernelHandle;
+IF kH = NIL THEN LOOP;
+IF kH.started THEN {
+ENABLE UNWIND => kH.recentActivity ¨ FALSE;
+IF kH.recentActivity = TRUE THEN kH.recentActivity ¨ FALSE
+ELSE IF ~kH.isShutdown THEN { 
+kH.isShutdown ¨ TRUE;
+WalnutRoot.CloseTransaction[wL.first];
+kH.isShutdown ¨ TRUE;
+StatsReport[wL.first, " $$ Close transactions due to inactivity"];
+};
+};
+ENDLOOP;
+ENDLOOP;
+};
+
+
+TRUSTED {Process.Detach[FORK CheckForRecentActivity] };
+WalnutRegistryPrivate.NotifyForEvent[initializing];
+
+END.
+  ˆ  
+WalnutOpsImpl.mesa
+Copyright ” 1984, 1986, 1987, 1988, 1989, 1992 by Xerox Corporation.  All rights reserved. 
+Willie-Sue, August 1, 1989 9:05:51 pm PDT
+Donahue, May 12, 1986 2:25:09 pm PDT
+Jack Kent, May 29, 1987 10:46:22 pm PDT
+Terry, August 29, 1990 3:46 pm PDT
+Willie-s, April 27, 1992 1:59 pm PDT
+Implementation of (some of) WalnutOps
+
+
+Types
+
+Public variables
+Private types
+
+Variables
+
+Procedures
+These procedures are all of the primitive atomic actions out of which Walnut is built. More complex operations will be found in WalnutClientOps (someday).
+Information about the Walnut database
+Adding new messages to the database
+Log a message from some agent other than Grapevine and add it to the database. Body is expected to conform to the syntax for messages.  The first message on the log with a given name wins. Any subsequent messages with the same name are dropped on the floor.
+
+Primitive message set operations
+Create a message set with name msgSet.
+the named message set already exists (return with exists TRUE).
+Remove all messages from msgSet. Messages that are no longer in any message set will be added to "Deleted".
+
+msgSet is "Deleted" (do nothing).
+messages added to "Deleted" (return with someInDeleted TRUE).
+Remove the specified message set from the database.
+
+msgSet must exist (ignore otherwise).
+msgSet is "Active" (same as EmptyMsgSet).
+msgSet is "Deleted" (do nothing).
+
+
+Create an enumeration for a message set.
+Create an enumeration for the messages in a message set.
+Parsing a message
+proc is called for each fieldName encountered in the headers; if proc is NIL then all headers are returned.  It is ok to take the REF TEXT returned by NextMsg and use it, wrapped in a RefText.TrustTextAsRope.
+Primitive message operations
+
+
+More complex message set / message operations
+Add the message (msg) to the message set (to).
+
+msg must exist (ignore).
+to must exist (ignore).
+to must not be "Deleted" (ignore).
+msg is already in to (return with exists TRUE)
+msg had been in "Deleted" (was taken out) (return with undeleted TRUE)
+Move the message (msg) from one message set (from) to another (to).
+
+msg must exist (ignore).
+from, to must exist (ignore).
+msg must be in from (ignore).
+msg is already in to (return with exists TRUE).
+msg was in "Deleted" (return with undeleted TRUE)
+msg is now in "Deleted" (return with deleted TRUE)
+Remove the message (msg) from the message set (from). If this action results in the message not belonging to any message set, it will be placed in the Deleted message set.
+
+msg must exist (ignore).
+from must exist (ignore).
+from must not be "Deleted" (ignore).
+msg must be in from (ignore).
+msg was added to "Deleted" (return with nowInDeleted TRUE).
+
+Adding new messages from grapevine to the database - used by newMail process
+
+
+used by higher levels
+
+Starting and stopping Walnut
+Start up Walnut with a reference to a Walnut log file.  This may involve replaying any actions specified in the "tail" of the log (that portion beyond the lastCommit) so that the database and log agree (in fact, if the database does not exist, it may involve reconstruction of the database in its entirety). If fullScavenge is TRUE, the database is emptied and reconstructed using information from the log. If wantReadOnly is TRUE, the log and the database are opened for reading only. If the log or the database cannot be written, readOnly is TRUE upon return.
+
+already started ($AlreadyStarted).
+database or log has become inaccessible ($DatabaseInaccessible, $LogInaccessible) 
+cannot write the log or the database (return with isReadOnly TRUE).
+check for unaccepted mail
+this second StartTransaction is to really test for schemaInvalid - Cypress does some weird stuff here; the first StartTransaction always returns schemaInvalid if this database hasn't been opened before; the second StartTransaction will return schemaInvalid = FALSE
+WalnutRegistryPrivate.NotifyForEvent[started];	-- has to be done by higher levels
+Save the Walnut state and shutdown Walnut.
+Procedures
+Space conservation (removing unreferenced messages)
+claim - when not in use, the expunge log has 0 pages
+
+Producing and reading archive files
+Reading an archive file is a long operation; it is resilient, so that it will complete when restarted.  The file is first copied to the current log (if the archive file exists) and then the tail of the log is "replayed", which may involve creating new messages and shuffling them around in the database.
+
+Write a "readArchiveFile" log entry; if the archiveFile exists, parses it and writes the appropriate entries (new msgs and moves if msgSet is not "Active" (NIL defaults to categories specified in the file).  Then replays the log. If the file couldn't be read, numNew = -1;
+Write an archive file that contains the messages from the given message sets.  No log entry is written and no updates are made to the database (we just hold the monitor to guarantee that no changes to the message sets occur).
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+
+
+ù *F  ñ(cedarcode) styleïNewlineDelimiter
+ô codeöœbôKöú
+œeúPô[Kô)Köœy$ô$Kô'Kô"Kô$óKò Köú%ô%Kô öœk	ò	Köú
+†ú†úò$Kö†ú†úòKö†úòKöú
+†úò#Köú†ú&ò3Köú†úòKöúòKöú†úò!Köú†úò.Köú†úòKöú†ú
+òKöú†úò"Kò Köú
+œcúòKöú†ú°ò±Köú†úò/Köú
+°úòKöú
+ò
+KöúòKöú†úJòeKöú†ú√ò”Kò óKò ö–bnú†ú†òö†òKöú†ú†ú?òPKòKòKöúòKöú
+ò
+Köú!ò!óKò Kö†úòKò Köú†ú†úò*óKô öùôKò Köú†úò0Kö†ú†ú†úòKö†ú†ú†ú†úòKö†ú†ú†úòKò Köú	†úò#Köú†úò!Köú†úò.Köú†úò/Kò Köú†úò3Köú†úò3Köú†ú!ò9Kò Köú†úò5Köú†ú†ú!òBKò Köú†úò)Köú†ú†úò6Kò Köú†ú"ò4Köú†ú†ú%òAóKô öùôKò Köœn
+ú†ú†úò#Kö£ú†ú†úò%Kò óöùôKò Köú†ú†úò6öú†ú†ú†úò.KòKöú	†ú†ú†úòöú†ú	†òKöú#†ú†ú†úò`Köú2ò2Kö†úò
+óóóKô öù	ô	Kò Köú†	úò"Kò Köú†úòóKô öù
+ô
+Kôöô%Kò ö£ú†ú†ú†úò=Köú†ú†úò$Kö†ú†ú†úòö£ú†úò
+Kò=óKöú-ò-Köú0†úò7KòóKò ö£	ú†ú†ú†ú†ú	†úòQKö†ú†ú†úòö£ú†úòKò,óKöú-ò-Köú2†úò9KòóKò ö£ú†ú†ú†úò:Köú†ú†úòKö†ú†ú†úòö£ú†úòKò5óKöú-ò-Köú1†úò8KòóKò óöù#ô#Kò ö
+£	ú†ú†ú†ú'†úòaKöúÅôÅKö†ú†ú†úòö£ú†úòKöú†ú4ò;KòKò"Köú"ò"Kò'Köú†úòKöú†úòKò(KòóKöú-ò-Köú0†úò6KòóóKô öù ô Kò ö
+£ú†ú†ú†ú#†ú%òkKöú&ô&Köú?ô?Kö†ú†ú†úòKöú†ú†úòö£ú†ú†úòKòIKò-KöúòóKöú-ò-Köú1†úò7Kö†ú	†ú;òJKòóKò ö£ú†ú†ú†ú#†ú"†ú	†ú†úòèKö†ú†ú†úòö£ú†ú†úòKòPóKöú-ò-Köú1†úò8KòóKò ö£ú†ú†ú†ú#†ú†ú†úòkKö†ú†ú†úòö£ú†ú†úòKò@óKöú-ò-Köú1†úò8KòóKò ö£ú†ú†ú†ú.†ú†úòmKöúkôkKô Köú!ô!Köú=ô=Kö†ú†ú†úòö£ú†ú†ú†úò(Köú†úòKö†ú.†ú†úò<ö†ú†úòKöú†úòKö†ú+†ú†úò9Kò6Köú+ò+KòóKòEKòóKöú-ò-Köú3ò3KòóKò ö£ú†ú†ú†úN†ú†úòèKöú3ô3Kô Kô%Kô)Köú!ô!Kö†ú†ú†úòKöú
+†úòö£ú†ú†ú†úò(Köú†úòö†ú†úòKöú†úòKö†ú+†ú†úò9Köú9ò9öú†ú
+†ú1òFKö†ú4ò8óKöú+ò+Kòóö†ú
+†úEòUö†úòKöúHòHóóKòóKò Köú-ò-Kö†ú †ú†ú†ú†ú°òWKöú)†úò0Köú3ò3Kö†ú†úDòUKòóKô ö
+£ú†ú†ú†ú†úòaKö†ú†ú†úòKöú
+†ú!ò.ö£ú†ú†úòKòKò6Kò1KöúòóKöú-ò-Köú†ú"ò0Köú0†úò7Kö†úòKòóKò ö	£ú†ú†ú†ú†ò;Köú	†ú
+†ú†ú†ú†ú†úò;Kö†ú†ú†úòKöú†ú†úòKöúòö£ú†ú†úòKöú	†úòKöú†úò
+Köú†úòKòö†ú†ú†ú†úò*òö†ú0†ò6Kö†úHòMóKò6ö†òKòKöú†úòKò$Kö†ú†ú†ú†ú†ú†úòBö†ú†ú
+†ú†ò#öúòKöú°!ò:KòKò/Kö	†ú†ú†ú†ú°òEKò+ö†ú†ú†ú%†òEKò'óKöúYòYKòKò(Kö†úòKòóKö†ú†úòKòóKö†úòóKòóòKöú†úòKò=Kö†ú†ú†ú	†ú†ú†úò(Kò/Kò+Kò%Kò!ö†ú†ú
+†ú†ò#KöúòKòö†ú†ú†ú%†òEKò'óKöúPòPKö†úò
+óKòóö†úò
+Kö†úGòLóKòóKöúòóKöú&ò&Köú)†úò0Kö†ú†ú†ú†ú†ú†úò"KòóKò ö£ú†ú†ú†ú#†ú†úòuKö†ú†ú†úòö£ú†ú†úòKòKöú	†úòKöú†úòKò]Kö†ú†ú†ú†úòKò-Köú†úrò|KòKöúòóKöú-ò-Köú0†úò7KöúòóKò ö£ú†ú†ú†ú)†ú†ú†ú†ú†úònKö†ú†ú†úòö£ú†ú†úòKò9óKöú-ò-Köú0†úò7KòóKô ö£ú†ú†ú†ú)†ú†ú†ú†ú†ú%òäKöú(ô(Kö†ú†ú†úòö£ú†ú†úòKòIóKöú-ò-Köú1†úò8KòóKò ö£ú†ú†ú†ú#†ú†ú†ú†ú†ú†úòôKöú8ô8Kö†ú†ú†úòö£ú†ú†úòKòKKöúòóKöú-ò-Köú2†úò9KòóKò ö£ú†ú†ú†ú+†ú†ú†ú†ú†ú†úò∂Kö†ú†ú†úòö£ú†ú†úòKòGóKöú-ò-Köú2†úò9KòóKò ö£ú†ú†ú†ú%†ú†ú†ú†ú†ú†ú†ú†úò¬Kö†úò&Kö†ú†ú†úòö£ú†ú†úòKòNóKöú-ò-Köú1†úò8KòKò óö£ú†ú†ú†ú%†ú	†ú†ú†ú†ú†ú†ú†ú†úò§Köú†ú!ò)Kö†ú†ú†úòö£ú†ú†úòKò`óKöú-ò-Köú4†úò;KòKò óö	£	ú†ú†ú†ú†òAKöúòKö†ú†ú†úòö£ú†ú†úòKò<Köú†úò#Köú"ò"Kò Kö†ú†ú†úòKöú†úòKò7Kò)KòñKïStartOfExpansion4[textStart: INT, textLen: INT, formatLen: INT]òxKò"KòóKò KöúòKöú0ò0Köú3†úò:KòKò óóöùôKò ö
+£ú†ú†ú†ú'†úòfKöú†ú&ò.Köú–ô–Kö†ú†ú†úòKöú-ò-KòBKòKò óóöùôKô ö
+£	ú†ú†ú†ú#†úòDKöú†ú	†úòKö†ú†ú†úòö£ú†ú†úòKò0óKöú-ò-Köú0†úò7KòóKò ö
+£ú†ú†ú†ú#†úòHKö	ú†ú†ú†ú†úòKö†ú†ú†úòö£ú†ú†úòKò0óKöú-ò-Köú2†úò9KöúòóKò ö
+£ú†ú†ú†ú"†úòIKö	ú†ú†ú†ú†úòDKö†ú†ú†úòö£ú†ú†úòKòRKöúòóKöú-ò-Köú3†úò:KòóKò ö
+£
+ú†ú†ú†ú#†úòEKöú†ú†úò!Kö†ú†ú†úòKö£ú†ú†ú2òFKöú-ò-Köú3†úò:KòóKò ö£ú†ú†ú†ú#†ú†ú-†úòKö†ú†ú†úòö£ú†ú†úòKöú-†úò1Kò\Kö†ú†ú†úòKòPKò+KöúòóKöú-ò-Köú3†úò:KòóKò ö£
+ú†ú†ú†ú#†ú†ú†úòUKöú†ú†ú†úò Kö†ú†ú†úòKö
+£ú†ú†ú†ú†úò>ö£ú†ú†úòKöú†úòKöú†úòKò=ö†ú†úòKòKö†ú†ú†úò+Kö†úòóö†ú†ú†úò3Kòö†ú†ú†ú†ò/Köú†úò4óKöúEòEóö†òòKö†úGòLóóKö†úòKöúòóKöú-ò-Köú1†úò8KòóKò ö£ú†ú†ú†ú#†ú†ú†úòXKöú†ú
+†ú†úòKö†ú†ú†úòKöú†úòö£ú†ú†úòKòKöú†ú0ò9Kòö†ú†úòKö†ú†ú†úò)Kö†úòóKò,Kò)Kö†ú†ú†úò3ö†ú†ú
+†ú†ò#öúòKòö†ú†ú†ú†ò3KòóöúòKöú;ò;óKòóKö†ú†úòKòóKò ö†òòö†ú+ò0Kö†úRòTóóóKö†úòKöúòóKöú-ò-Köú1†úò8KòóKò ö
+£ú†ú†ú†ú#†úòJKöú†ú†úòKö†ú†ú†úòö£ú†ú†úòKöú†úòKöú†úòKòCKò+KöúòóKöú-ò-Köú2†úò9KòóKò ö
+£
+ú†ú†ú†ú#†úòEKöú†ú†úò%Kö†ú†ú†úòö£ú†ú†úòKòEóKöú-ò-Köú1†úò8KòóKò ö
+£ú†ú†ú†ú#†úòIKöú†ú†úòKö†ú†ú†úòö£ú†ú†úòKò:óKöú-ò-Köú3†úò:KòKò óö
+£ú†ú†ú†ú#†úòIKöú†ú†úòKö†ú†ú†úòö£ú†ú†úòKò6KöúòóKöú-ò-Köú2†úò9KòóKò ö
+£ú†ú†ú†ú#†úòMKö†ú†ú†úòö£ú†ú†úòKò+Köú(ò(KöúòóKöú-ò-Köú2†úò8Köú8ò8KòKò óö
+£ú†ú†ú†ú†úòUKö†ú†ú†úòö£ú†ú†úòö†ú°(ò+Kò?Kö†ú†ú$†ú†úò4Kö†úòóKöúòóKöú-ò-Köú2†úò9KòóóKô öù-ô-Kò ö
+£ú†ú†ú†ú"†úòRKöú†ú
+†ú†úò#Köú.ô.Kô KôKôKöú"ô"Köú.ô.KôFKö†ú†ú†úòö£ú†ú†úòKò3Kò/KöúòóKöú-ò-Köú0†úò6Kö†ú†ú†úB†úòYKòóKò ö
+£ú†ú†ú†ú"†úòSKöú†ú
+†ú†úò#KôCKô KôKôKôKöú/ô/Köú1ô1Köú2ô2Kö†ú†ú†úòö£ú†ú†úòKò4Kò;KöúòóKöú-ò-Köú0†úò6ö†ú†ú†òKöúLòLóKòóKò ö
+£	ú†ú†ú†ú#†ú.òqKö†ú†ú†úò#Köú´ô´Kô KôKôKöú$ô$KöúôKô;Kö†ú†ú†úòö£ú†ú†úòKòCKò4KöúòóKöú-ò-Köú0†úò6ö†ú	†ú6òEKö†ú3†úòMóKòóóKô öùLôLKô ö£ú†ú†ú†úò;Köú†ú†úò#Kö†ú†ú†úòKö†ú-ò3KöúòóKô ö£ú†ú†ú†ú%†ú
+†ú†úòiKö†ú†ú†úòKöú†úòö£ú†úòKöú†ú3ò;KòKòGKöú>ò>KöúòóKöú-ò-Köú2†úò8Köú*†úò/KòóKò ö£
+ú†ú†ú†ú ò=Kö†ú†ú†úòKöú†ú%ò1Köú-ò-Köú$†úò(ö†ú†ú†òKöú>†ú†ú
+†úò^óö†ú)†ò/Köú/ò/óKòóKò óöùôKô ö£
+ú†ú†ú†ú-†ú†ú†ú†ú†ú†ú†ú!†úò…Kö†ú†ú†úòKòTKòóKò ö
+£ú†ú†ú†ú,†úòTKö†ú†ú†úòKöú<ò<KòóóKò öùôKò ö
+£ú†ú†
+ú†ú
+†úòXKö†ú†ú†úòKö
+†ú†ú†ú†ú†úò&Kö†ú†úò%KòKò óö£ú†ú†ú†ú†ú†ú†úòTKöú†ú ò(Kö†ú†ú†úòKò Köú†ú†ú ò8Köú†ú†ú1ò?Köú†úòö£ú†ú†ú†úòCö†ú†ú†ú"†ú†ú†òBKö†ú†ú†ú†úò>Kö†úòóKö†ú†úòKòóö£ú†ú†ú†ú†ú†ú†úò]Köú†ú†ú†úò$Köú°ò'ö†ú†ú†ú †ú†ú†ò@ö†ú†ú(†ú†ò9Köú†úòóKöúB†úòLKöú†úòKöú†úòKöú†úòKöú†úòKöú†úòKö†ú†ú†ú†ú
+ò#KòKö†úòKö†úòóKòóKöú.ò.òKö†úJòMóKöú†úò.ö†òKöú	†ú†úòKöúòöú1†úòMKö
+†ú†ú!†ú"†ú†úòWKö†ú†ú†ú°ò/KòKò Kö†ú	†ú†ú†úòKö†ú†ú†ú†ú!†ú†úòVKö†úò	KöúòKöú° ò$óKö†ú†ú†ú†úòKòKöú.ò.KòKö†úòóKòKò óö
+£ú†ú†ú†ú†úò7Köú†ú ò(Köú†ú†ú ò8ö†ú†ú†ú:†ú†ú†òZKö†ú(†ú†ú†úòGKö†úòóKö†ú†úòKöúòKò óö£ú†ú†ú†ú†ú†úòXKöú±ô±Kô Kô"KôRKôCKò Köúòö†ú!†ú†ò+Köú†úò3óö†ú†úòKöú+†ú†úò9Kö†ú†úòKöúòóKò Köú†ú†úòKò ö£ú†ú†úòKöú†úòKöú†úòö†ú†úò$KòKö†ú*†ò.öú†ú†úò>KöúcòcKöú(ò(Kòóóö†úòö†ú4†ò:öú%ò%ö†ú0ò2KöúEòEóóóö†ú!†ú†ò.öú%ò%ö†ú/ò1Köú,ò,óóóö†ú%†ú†ò2öú%ò%ö†ú4ò6Köú0ò0óóóKòóKòóö†úDòFKö†ú†úòóKöúôö†òKöú†ú†ú3òFö†ú†ú†ú"†ú†ú†òBKö†ú(†ú†úò6Kö†úòóKö†úòóKöúòóKò Kö
+†ú†ú†ú†ú†ú(òLKö†ú†ú†ú!òCKöúòKò ö†òKöú†úò
+Kö†òòNKö†ú†ú†úò)KòKö†úòKöúòóö†òKöú†ú†ú†ú-òLóKö†úòóKö†úòKò Köú#ùúﬂôàKò7Köú$†úò*Kò$Kò ö†òKöú†úò
+Kö†òò2Köú2†úòBóKöúcòcö†òKöú†ú†ú†ú-òJóKö†úòóKö†úòKò Köú†úòKöú†úòKöú(†úò/KöúòKöúQôQKö†úòKö†úòKòóKò ö£ú†ú†ú†ú ò;Köú*ô*ö†úòKöú?†ú†úòMKö†ú†úòKöúòóKöú.ò.KòKò óö£ú†ú†ú†úò7Kö†ú†úò!Kò Kòö†ú!†ú†ò+Köú†úò3óKöú†úòKò ö†ú†úòKöú+†ú†úò9Kö†ú†úòKöúòóKò Köú!ò!KöúòKò Köú4†úò:Kò KöúòKöú*ò*Kò ö†ú†òKö†úGòLóKò Köú,†ú°"òVKöú$†úò*Köú$ò$Köú'ò'Köú†úòKöú†úòKò KöúòKò$KöúcòcKöú(†úò0Köú&ò&Köú(ò(Köú†úòKò Köú+†úò1Köú;ò;Kò$Kö†úòKòóóóKò öù
+ô
+öù3ô3Kò ö£ú†ú†ú†úò=Köú†ú-†úò=Kö†ú†ú†úòö£ú†úòKòRKöúòóKöú-ò-Köú1†úò7KòóKò ö£ú†ú†ú†ú-†ú†ú†úòvKö†ú†ú†úòö£ú†ú†ú†úò)ö†ú†úòKöú†úòKòEKò)Köú+ò+KòóKöú=ò=KòNKöúòóKöú-ò-Köú(ò(Köú4ò4KöúòóKò ö£ú†ú†ú†ú†ú†úò[Kö†ú†ú†úòö£ú†ú†ú†úò)ö†ú†úòKöú†úòKöú †úò$Kò5Kò=Kò(Kô4ö†ú†úòöú(ò(öúIòIKöú>ò>óóöú(ò(KòGóKöú†úòKö†úòKòóKöú0°òLKöú+ò+KòóKöú)ò)KöúòóKöú-ò-Köú4ò4Köú†úòKöúòóKò ö£ú†ú†ú†úòCKöú†ú†úò!Kö†ú†ú†úòö£ú†úòKò4óKöú-ò-Köú2†úò8KòóóKô öù#ô#KôØKô ö£ú†ú†ú†ú#†ú†úòqKöú†ú	†úòKôêKö†ú†ú†úòKö†ú?òEKòóKò ö£ú†ú†ú†úò$KöúòKöú†ú†ú†ú†ú†ú†úòUKô·Kö†ú†ú†úòKò Kö†úLòRKòóKò óóò öùEôEKò ö
+£ú†ú†ú†ú+†úòYKö†ú†ú†úòKöú*ò*ö†ú†ú†ú†ú†ú†ú†òBKö†ú†ú†úò'Kö†úòóKöú†ú ò6KòóKò ö
+£ú†ú†ú†ú+†úò[Kö†ú†ú†úòKöú†ú†ú†úòKöú*ò*Kò Kö†ú†ú†ú†ú†ú†úò;ö†ú&†ò,Köú*†úò2óKò Kòö†ú†ú†ú†ú†ú†ú†òBKö†ú†ú†úò>Kò	Kö†úòóKòKò óóö£ú†ú†úò&Kö†úNòUö†òKö†úòö†ú†ú†ú:†ú†ú†òZKöú)ò)Kö†ú†ú†ú†úòö†ú†úòKö†ú†ú†úò+ö†ú†ú†ú†ò:ö†ú†ú†úòKöú†úòKò&Köú†úòKòBKòóóKòóKö†úòóKö†úòóKòóKò óKò öúEôEKö†ú†úò7Köú3ò3Kò óKö†úòKô Kô ó Öó    Ñ¢  ¬ﬁ  

@@ -1,0 +1,723 @@
+
+DIRECTORY Atom, IO, RefText, Rope, UnparserBuffer; 
+
+UnparserBufferImpl: CEDAR PROGRAM
+IMPORTS Atom, IO, RefText, Rope
+EXPORTS UnparserBuffer
+= BEGIN OPEN UnparserBuffer;
+
+
+LORA: TYPE ~ LIST OF REF ANY;
+
+Privates: TYPE = REF PrivateParts;
+PrivateParts: PUBLIC TYPE = RECORD [
+n: Nat ¨ 0,	--size of queues and stack
+bl, cl, br, cr, sr, srx: Nat--[0 .. n)-- ¨ 0,
+buff: Seq ¨ NIL,
+rsb: SetbPtr ¨ nilSetbPtr, --setb of innermost object at buffer insertion point
+hasAlways: BOOL ¨ FALSE, --there's an always break in the buffer
+hasMiser: BOOL ¨ FALSE, --pre-buffer should accumulate
+maySetb: BOOL ¨ TRUE, --at pre-buffer insertion, last miser is in innermost object or ancestor
+leftBroke: BOOL ¨ FALSE,
+prebIndent: Nat ¨ 0,
+minIndent: Nat ¨ 0, --least possible indendation, at insertion end of buffer; necessarily excludes misers, since they don't enter buffer
+bufferWidth: Nat ¨ 0,	--sum of widths of chars in c
+indentation: Nat ¨ 0,
+ops, opsTail: LORA ¨ NIL,
+rm: OpBreak, --root of the current miser breaking problem
+rosb: SetbPtr ¨ nilSetbPtr, --setb of obs.first
+lm: OpBreak, --rightmost miser that affects coming pre-input
+obs: ObStack ¨ NIL --innermost first
+];
+
+Seq: TYPE = REF Sequence;
+Sequence: TYPE = RECORD [elts: SEQUENCE length: Nat OF Element];
+
+Element: TYPE = RECORD [
+c: CHAR,
+changes: Changes ¨ NIL,
+s: INTEGER,
+bs: BStuff
+];
+
+Changes: TYPE = REF ChangesPrivate;
+ChangesPrivate: TYPE = RECORD [
+dlooks: ROPE ¨ NIL,
+charProps, nodeProps: PropList ¨ NIL,
+nodeFormat, nodeComment: ATOM ¨ NIL
+];
+
+clearProps: PropList = LIST[NIL];
+
+BStuff: TYPE = RECORD [
+p: Nat,	--index in c of following buffer char
+variant: SELECT type: * FROM
+setb => [prevSB: SetbPtr, minIndent, nextSB: Nat],
+breakpoint => [cond: BreakCondition, offset: INTEGER, sepChars, sepWidth: Nat],
+ENDCASE];
+
+biggestN: CARDINAL = LAST[Nat];
+
+SetbPtr: TYPE ~ RECORD [inBuf: BOOL, ptr: Nat];
+
+firstSetbPtr: SetbPtr ~ [FALSE, 0];
+nilSetbPtr: SetbPtr ~ [FALSE, biggestN];
+
+ObStack: TYPE ~ LIST OF Obj;
+Obj: TYPE ~ REF ObjPrivate;
+ObjPrivate: TYPE ~ RECORD [
+si: Nat, --prebIndent at setb
+dm: OpBreak --determining miser: rightmost one that affects my setb indent
+];
+
+REFTEXT: TYPE ~ REF TEXT; --used for char insertions
+
+OpB: TYPE ~ REF OpBPrivate;
+OpBPrivate: TYPE ~ RECORD [kind: {begin, end}];
+
+BreakList: TYPE ~ LIST OF OpBreak;
+OpBreak: TYPE ~ REF OpBreakPrivate;
+OpBreakPrivate: TYPE ~ RECORD [
+cond: BreakCondition, offset: INTEGER, sep: ROPE,
+advantage: Nat, need: Nat ¨ 0, children: BreakList ¨ NIL,
+taken: BOOL ¨ FALSE, solns: Solns ¨ NIL];
+
+Solns: TYPE ~ REF SolnSeq;
+SolnSeq: TYPE ~ RECORD [
+maxNeed: Nat, --MAX[need, MAX(over all kids) kid.maxNeed]
+minA: INTEGER, --MAX[need, MAX(over all kids) kid.minA] - advantage
+size: Nat, --of subtree
+len: Nat, --occupied sequence slots
+elts: SEQUENCE maxLen: Nat OF SolnInterval];
+
+SolnInterval: TYPE ~ RECORD [start, cost: Nat, take: NMY];
+NMY: TYPE ~ {no, maybe, yes};
+
+NewInittedHandle: PUBLIC PROC [publics: PublicParts] RETURNS [h: Handle] = {
+h ¨ NEW [PublicParts ¨ publics];
+IF h.spacers = NIL THEN h.spacers ¨ LIST[IO.SP];
+h.ps ¨ CreatePrivates[h.margin];
+Init[h];
+RETURN};
+
+CreatePrivates: PUBLIC PROC [margin: Nat ¨ 80] RETURNS [ps: Privates] = {
+ps ¨ NEW [PrivateParts ¨ [buff: NEW [Sequence[margin+3]] ]];
+ps.n ¨ margin+3;
+RETURN};
+
+Init: PUBLIC PROC [h: Handle] = {
+h.ps.bl ¨ h.ps.cl ¨ h.ps.br ¨ h.ps.cr ¨ h.ps.sr ¨ h.ps.srx ¨ h.ps.bufferWidth ¨ h.ps.minIndent ¨ h.ps.indentation ¨ h.ps.prebIndent ¨ 0;
+h.ps.rsb ¨ h.ps.rosb ¨ nilSetbPtr;
+h.ps.hasAlways ¨ h.ps.hasMiser ¨ h.ps.maySetb ¨ h.ps.leftBroke ¨ FALSE;
+h.ps.ops ¨ h.ps.opsTail ¨ NIL;
+h.ps.rm ¨ h.ps.lm ¨ NIL;
+h.ps.obs ¨ NIL;
+Setb[h];
+RETURN};
+
+BCount: PROC [h: Handle] RETURNS [nb: Nat] = {
+nb ¨ IF h.ps.br >= h.ps.bl THEN h.ps.br - h.ps.bl ELSE (h.ps.n - h.ps.bl + h.ps.br)};
+
+CCount: PROC [h: Handle] RETURNS [nc: Nat] = {
+nc ¨ IF h.ps.cr >= h.ps.cl THEN h.ps.cr - h.ps.cl ELSE (h.ps.n - h.ps.cl + h.ps.cr)};
+
+Ensure: PROC [h: Handle, m: Nat] = INLINE {
+IF h.ps.n >= m THEN RETURN;
+IF h.ps.n = biggestN THEN ERROR;
+Enlarge[h, MIN[biggestN, CARDINAL[m]+m/2]]};
+
+Enlarge: PROC [h: Handle, m: Nat] = {
+news: Seq = NEW [Sequence[m]];
+oldCL: Nat = h.ps.cl;
+oldBL: Nat = h.ps.bl;
+nbr, ncr: Nat ¨ 0;
+IF h.ps.hasMiser THEN ERROR--I think Enlarge is only called while pre-buffer is being kept empty--;
+FOR ci: Nat ¨ h.ps.cl, Right[h, ci] WHILE ci # h.ps.cr DO
+news[ncr].c ¨ h.ps.buff[ci].c;
+news[ncr].changes ¨ h.ps.buff[ci].changes;
+ncr ¨ ncr + 1;
+ENDLOOP;
+h.ps.cl ¨ 0; h.ps.cr ¨ ncr;
+FOR bi: Nat ¨ h.ps.bl, Right[h, bi] WHILE bi # h.ps.br DO
+news[nbr].bs ¨ h.ps.buff[bi].bs;
+WITH x: news[nbr].bs SELECT FROM
+setb => {IF x.prevSB.inBuf THEN x.prevSB.ptr ¨ LeftL[h, x.prevSB.ptr, oldBL];
+IF x.nextSB#biggestN THEN x.nextSB ¨ LeftL[h, x.nextSB, oldBL]};
+breakpoint => NULL;
+ENDCASE => ERROR;
+news[nbr].bs.p ¨ LeftL[h, news[nbr].bs.p, oldCL];
+nbr ¨ nbr.SUCC;
+ENDLOOP;
+IF h.ps.rsb.inBuf THEN h.ps.rsb.ptr ¨ LeftL[h, h.ps.rsb.ptr, oldBL];
+h.ps.bl ¨ 0; h.ps.br ¨ nbr;
+FOR i: Nat IN [0 .. h.ps.sr) DO news[i].s ¨ h.ps.buff[i].s ENDLOOP;
+h.ps.buff ¨ news;
+h.ps.n ¨ m;
+};
+
+Right: PROC [h: Handle, m: Nat] RETURNS [Nat] = INLINE
+{RETURN [IF m + 1 # h.ps.n THEN m + 1 ELSE 0]};
+
+RightL: PROC [h: Handle, m, l: Nat] RETURNS [Nat] = INLINE
+{cm2: CARDINAL ¨ CARDINAL[m] + l;
+IF cm2 >= h.ps.n THEN cm2 ¨ cm2 - h.ps.n;
+RETURN [cm2]};
+
+Left: PROC [h: Handle, m: Nat] RETURNS [Nat] = INLINE
+{RETURN [(IF m = 0 THEN h.ps.n ELSE m) - 1]};
+
+LeftL: PROC [h: Handle, m, l: Nat] RETURNS [Nat] = INLINE
+{RETURN [IF m < l THEN (m + h.ps.n - l) ELSE (m - l)]};
+
+PrevSbp: PROC [h: Handle, sbp: SetbPtr] RETURNS [SetbPtr] ~ {
+IF sbp.inBuf THEN WITH x: h.ps.buff[sbp.ptr].bs SELECT FROM
+setb => RETURN [x.prevSB];
+ENDCASE => ERROR
+ELSE SELECT sbp.ptr FROM
+=0 => RETURN [nilSetbPtr];
+<h.ps.sr => RETURN [[FALSE, sbp.ptr.PRED]];
+ENDCASE => ERROR};
+
+Setb: PUBLIC PROC [h: Handle] = {ps: Privates = h.ps; {OPEN ps, h;
+IF hasMiser THEN {
+IF NOT maySetb THEN ERROR--INPUT RESTRICTION violated--;
+opsTail ¨ opsTail.rest ¨ LIST[NEW[OpBPrivate ¨ [begin]]];
+obs ¨ CONS[NEW [ObjPrivate ¨ [prebIndent, lm]], obs];
+}
+ELSE IF bl = br AND cl = cr THEN {
+Ensure[h, sr+2];
+buff[sr].s ¨ indentation;
+rsb ¨ [FALSE, sr];
+sr ¨ sr + 1}
+ELSE {
+Ensure[h, BCount[h]+2];
+IF rsb.inBuf THEN WITH x: buff[rsb.ptr].bs SELECT FROM
+setb => {IF x.nextSB#biggestN THEN ERROR; x.nextSB ¨ br};
+ENDCASE => ERROR;
+buff[br].bs ¨ [cr, setb[rsb, minIndent, biggestN]];
+rsb ¨ [TRUE, br];
+br ¨ Right[h, br]}
+}};
+
+Endb: PUBLIC PROC [h: Handle] = {ps: Privates = h.ps; {OPEN ps, h;
+brl: Nat;
+IF hasMiser THEN {
+opsTail ¨ opsTail.rest ¨ LIST[NEW[OpBPrivate ¨ [end]]];
+maySetb ¨ lm = obs.first.dm;
+IF obs.rest=NIL THEN {--have to lift root to next enclosing object
+prosb: SetbPtr ~ PrevSbp[h, rosb];
+obs.first.si ¨ SbpMinIndent[h.ps, prosb];
+rosb ¨ prosb;
+maySetb ¨ FALSE;
+}
+ELSE obs ¨ obs.rest;
+RETURN};
+WHILE bl # br AND buff[brl ¨ Left[h, br]].bs.type = breakpoint DO br ¨ brl ENDLOOP;
+IF bl # br THEN {
+psb: SetbPtr ~ PrevSbp[h, rsb];
+IF NOT rsb.inBuf THEN ERROR --Left[h, br] points at a setb in the buffer--;
+br ¨ Left[h, br];
+IF psb.inBuf THEN WITH x: buff[psb.ptr].bs SELECT FROM
+setb => {IF x.nextSB#rsb.ptr THEN ERROR; x.nextSB ¨ biggestN};
+ENDCASE => ERROR;
+rsb ¨ psb}
+ELSE {IF rsb.inBuf THEN ERROR --we just saw that buff had only breakpoints in it--;
+WHILE cl # cr DO OutputChar[h] ENDLOOP;
+IF sr = 0 THEN ERROR -- Endb with no matching Setb
+ELSE {
+psr: Nat ~ sr.PRED;
+IF srx = sr THEN {
+srx ¨ psr;
+leftBroke ¨ TRUE};
+IF rsb=[FALSE, psr] THEN rsb ¨ PrevSbp[h, rsb];
+sr ¨ psr}}}};
+
+OutputChar: PROC [h: Handle] = {ps: Privates = h.ps; {OPEN ps, h;
+IF buff[cl].changes # NIL THEN OutputChanges[h, buff[cl].changes];
+WITH h.output SELECT FROM
+so: BufferOutput.stream => {
+IO.PutChar[so.stream, buff[cl].c]};
+ENDCASE => ERROR;
+indentation ¨ indentation + width[buff[cl].c];
+bufferWidth ¨ bufferWidth - width[buff[cl].c];
+cl ¨ Right[h, cl];
+IF cl = cr AND buff[cr].changes # NIL THEN {OutputChanges[h, buff[cr].changes]; buff[cr].changes ¨ NIL}}};
+
+OutputChanges: PROC [h: Handle, changes: Changes] = {
+ps: Privates = h.ps; {OPEN ps, h;
+WITH h.output SELECT FROM
+so: BufferOutput.stream => {
+IF changes.dlooks # NIL THEN IO.PutF[so.stream, "%l", [rope[changes.dlooks]]];
+IF changes.charProps # NIL THEN IO.PutF[so.stream, "%p", [refAny[Newize[changes.charProps]]]];
+IF changes.nodeProps # NIL THEN IO.PutF[so.stream, "%n", [refAny[Newize[changes.nodeProps]]]];
+IF changes.nodeFormat # NIL THEN IO.PutF[so.stream, "%n", [atom[changes.nodeFormat]]];
+IF changes.nodeComment # NIL THEN IO.PutF[so.stream, "%n", [boolean[changes.nodeComment = $TRUE]]];
+};
+ENDCASE => ERROR;
+}};
+
+Newize: PROC [props: PropList] RETURNS [new: PropList] = INLINE {
+new ¨ IF props # clearProps THEN props ELSE NIL};
+
+Oldize: PROC [props: PropList] RETURNS [new: PropList] = INLINE {
+new ¨ IF props # NIL THEN props ELSE clearProps};
+
+OutputLooks: PROC [h: Handle, looks: Rope.ROPE] = {
+WITH h.output SELECT FROM
+so: BufferOutput.stream => IO.PutF[so.stream, "%l", [rope[looks]]];
+ENDCASE => ERROR};
+
+SbpMinIndent: PROC [ps: Privates, sbp: SetbPtr] RETURNS [Nat] ~ {
+IF sbp=nilSetbPtr THEN ERROR
+ELSE IF sbp.inBuf THEN WITH x: ps.buff[sbp.ptr].bs SELECT FROM
+setb => RETURN [x.minIndent];
+ENDCASE => ERROR
+ELSE RETURN [ps.buff[sbp.ptr].s]};
+
+Bp: PUBLIC PROC [h: Handle, cond: BreakCondition, offset: INTEGER, sep: ROPE] = {
+ps: Privates = h.ps; {OPEN ps, h;
+ocr: Nat ~ cr;
+sepChars, sepWidth: Nat ¨ 0;
+IF hasMiser THEN lm.need ¨ MAX[lm.need, prebIndent-margin];
+IF cond=miser AND NOT hasMiser THEN {
+lm ¨ rm ¨ NEW [OpBreakPrivate ¨ [always, 0, NIL, 0]];
+opsTail ¨ ops ¨ LIST[NIL];
+obs ¨ LIST[NEW [ObjPrivate ¨ [SbpMinIndent[ps, rsb], rm]]];
+rosb ¨ rsb;
+hasMiser ¨ TRUE};
+IF cond = always THEN hasAlways ¨ TRUE ELSE {
+sepChars ¨ sep.Length[];
+IF NOT hasMiser THEN Ensure[h, CCount[h] + sepChars + 1];
+FOR i: Nat IN [0 .. sepChars) DO
+ch: CHAR = sep.Fetch[i];
+IF NOT hasMiser THEN {
+buff[cr].c ¨ ch;
+cr ¨ Right[h, cr];
+buff[cr].changes ¨ NIL};
+sepWidth ¨ sepWidth + width[ch];
+ENDLOOP;
+IF NOT hasMiser THEN bufferWidth ¨ bufferWidth + sepWidth;
+};
+IF cond=miser THEN {
+advantage: INTEGER ~ prebIndent-(obs.first.si+offset);
+IF lm # obs.first.dm THEN ERROR--INPUT RESTRICTION violated--;
+IF advantage <= 0 THEN {Ropeb[h, sep]; RETURN}
+ELSE {
+ob: OpBreak ~ NEW [OpBreakPrivate ¨ [cond, offset, sep, advantage]];
+obs.first.dm.children ¨ CONS[ob, obs.first.dm.children];
+opsTail ¨ opsTail.rest ¨ LIST[ob];
+lm ¨ ob;
+prebIndent ¨ prebIndent + sepWidth;
+RETURN}};
+IF hasMiser THEN {
+ob: OpBreak ~ NEW [OpBreakPrivate ¨ [cond, offset, sep, 0]];
+opsTail ¨ opsTail.rest ¨ LIST[ob];
+lm ¨ obs.first.dm;
+prebIndent ¨ obs.first.si + offset;
+IF obs.rest=NIL THEN {
+SolveTree[h, ps];
+FlushPreBuffer[h, ps]};
+RETURN};
+{unbrokenMinIndent: Nat ~ minIndent + sepWidth;
+brokenMinIndent: Nat ~ SbpMinIndent[ps, rsb] + offset;
+Ensure[h, BCount[h]+2];
+buff[br].bs ¨ [ocr, breakpoint[cond, offset, sepChars, sepWidth]];
+br ¨ Right[h, br];
+minIndent ¨ MIN[unbrokenMinIndent, brokenMinIndent];
+LeftLoop[h]}}};
+
+SolveTree: PROC [h: Handle, ps: Privates] ~ {OPEN ps;
+IF rm.children.rest#NIL THEN ERROR --I think this never happens (MJS February 21, 1990)--;
+[] ¨ SubSolve[rm.children.first];
+MarkSolution[rm.children.first, 0];
+RETURN};
+
+MarkSolution: PROC [brk: OpBreak, ia: Nat] ~ {
+solns: Solns ~ brk.solns;
+oa: Nat ¨ ia;
+IF ia >= solns[solns.len.PRED].start THEN brk.taken ¨ FALSE
+ELSE IF ia < solns[0].start THEN brk.taken ¨ TRUE
+ELSE FOR idx: Nat IN [1 .. solns.len) DO
+si: SolnInterval ~ solns[idx];
+IF ia < si.start THEN {
+brk.taken ¨ SELECT si.take FROM
+no => FALSE,
+yes => TRUE,
+maybe => preferEarly,
+ENDCASE => ERROR;
+EXIT};
+REPEAT FINISHED => ERROR;
+ENDLOOP;
+IF brk.taken THEN oa ¨ ia ¨ brk.advantage;
+FOR kids: BreakList ¨ brk.children, kids.rest WHILE kids#NIL DO
+MarkSolution[kids.first, oa];
+ENDLOOP;
+RETURN};
+preferEarly: BOOL ¨ TRUE;
+
+SeqPtrList: TYPE ~ LIST OF SeqPtr;
+SeqPtr: TYPE ~ RECORD [brk: OpBreak, startIA, nextIA, cost, nextIdx: Nat];
+
+FindCostRun: PROC [brk: OpBreak, startIdx, decA, incC: Nat] RETURNS [SeqPtr] ~ {
+solns: Solns ~ brk.solns;
+cost: Nat ~ solns[startIdx].cost;
+startIA: Nat ~ MAX[solns[startIdx].start - decA, 0];
+next: Nat;
+FOR next ¨ startIdx.SUCC, next.SUCC WHILE next < solns.len AND solns[next].cost = cost DO NULL ENDLOOP;
+IF next=solns.len THEN RETURN [[brk, startIA, biggestN, cost+incC, biggestN]];
+RETURN [[brk, startIA, solns[next].start-decA, cost+incC, next]]};
+
+SubSolve: PROC [brk: OpBreak] RETURNS [solns: Solns] ~ {
+maxNeed: Nat ¨ brk.need;
+minA: INTEGER ¨ brk.need;
+size: Nat ¨ 1;
+ohnes: SeqPtrList ¨ NIL;
+mits: SeqPtrList ¨ NIL;
+startIA: Nat ¨ 0;
+FOR kids: BreakList ¨ brk.children, kids.rest WHILE kids#NIL DO
+kidSolns: Solns ~ SubSolve[kids.first];
+size ¨ size + kidSolns.size;
+maxNeed ¨ MAX[maxNeed, kidSolns.maxNeed];
+minA ¨ MAX[minA, kidSolns.minA];
+IF kidSolns.minA > 0
+THEN ohnes ¨ CONS[[kids.first, 0, kidSolns.minA, biggestN, 0], ohnes]
+ELSE ohnes ¨ CONS[FindCostRun[kids.first, 0, 0, 0], ohnes];
+IF kidSolns.minA > brk.advantage
+THEN mits ¨ CONS[[kids.first, 0, kidSolns.minA-brk.advantage, biggestN, 0], mits]
+ELSE {
+FOR j: Nat IN [1 .. kidSolns.len) DO
+IF kidSolns[j].start > brk.advantage THEN {
+mits ¨ CONS[FindCostRun[kids.first, j.PRED, brk.advantage, 1], mits];
+EXIT};
+REPEAT FINISHED => mits ¨ CONS[[kids.first, 0, biggestN, 1, biggestN], mits];
+ENDLOOP;
+};
+ENDLOOP;
+brk.solns ¨ solns ¨ NEW [SolnSeq[2*size+1]];
+solns.maxNeed ¨ maxNeed;
+solns.minA ¨ minA ¨ minA - brk.advantage;
+solns.size ¨ size;
+solns.len ¨ 0;
+DO
+nextIA: Nat ¨ biggestN;
+costo: Nat ¨ 0;
+costm: Nat ¨ 1;
+FOR to: SeqPtrList ¨ ohnes, to.rest WHILE to#NIL DO
+SELECT to.first.nextIA - startIA FROM
+>0 => NULL;
+=0 => to.first ¨ FindCostRun[to.first.brk, to.first.nextIdx, 0, 0];
+<0 => ERROR;
+ENDCASE => ERROR;
+nextIA ¨ MIN[nextIA, to.first.nextIA];
+costo ¨ costo + to.first.cost;
+ENDLOOP;
+FOR tm: SeqPtrList ¨ mits, tm.rest WHILE tm#NIL DO
+SELECT tm.first.nextIA - startIA FROM
+>0 => NULL;
+=0 => tm.first ¨ FindCostRun[tm.first.brk, tm.first.nextIdx, brk.advantage, 1];
+<0 => ERROR;
+ENDCASE => ERROR;
+nextIA ¨ MIN[nextIA, tm.first.nextIA];
+costm ¨ costm + tm.first.cost;
+ENDLOOP;
+{nsi: SolnInterval ~ SELECT costm-costo FROM
+>0 => [startIA, costo, no],
+=0 => [startIA, costo, maybe],
+<0 => [startIA, costm, yes],
+ENDCASE => ERROR;
+new: BOOL;
+IF solns.len=0 THEN new ¨ TRUE ELSE {
+osi: SolnInterval ~ solns[solns.len.PRED];
+new ¨ nsi.cost # osi.cost OR nsi.take # osi.take};
+IF new THEN {
+IF solns.len >= solns.maxLen THEN ERROR;
+solns[solns.len] ¨ nsi;
+solns.len ¨ solns.len.SUCC};
+IF nextIA=biggestN OR costo=0 THEN EXIT;
+startIA ¨ nextIA;
+}ENDLOOP;
+RETURN};
+
+FlushPreBuffer: PROC [h: Handle, ps: Privates] ~ {OPEN ps, h;
+hasMiser ¨ FALSE;
+FOR ol: LORA ¨ ops.rest, ol.rest WHILE ol#NIL DO
+WITH ol.first SELECT FROM
+rt: REFTEXT => FOR i: NAT IN [0..rt.length) DO Charb[h, rt[i]] ENDLOOP;
+r: ROPE => Ropeb[h, r];
+opo: OpB => SELECT opo.kind FROM
+begin => Setb[h];
+end => Endb[h];
+ENDCASE => ERROR;
+opb: OpBreak => IF opb.cond#miser
+THEN Bp[h, opb.cond, opb.offset, opb.sep]
+ELSE IF opb.taken THEN Bp[h, always, opb.offset, NIL]
+ELSE Ropeb[h, opb.sep];
+cs: Changes => {
+IF cs.dlooks#NIL THEN Looksb[h, cs.dlooks];
+IF cs.charProps#NIL THEN CharPropsb[h, Newize[cs.charProps]];
+IF cs.nodeProps#NIL THEN NodePropsb[h, Newize[cs.nodeProps]];
+IF cs.nodeFormat#NIL THEN NodeFormatb[h, cs.nodeFormat];
+IF cs.nodeComment#NIL THEN NodeCommentb[h, cs.nodeComment=$TRUE]};
+ENDCASE => ERROR;
+ENDLOOP;
+rm ¨ NIL;
+RETURN};
+
+Charb: PUBLIC PROC [h: Handle, ch: CHAR] = {ps: Privates = h.ps; {OPEN ps, h;
+w: INTEGER ~ width[ch];
+IF hasMiser THEN {
+prebIndent ¨ prebIndent + w;
+WITH opsTail.first SELECT FROM
+rt: REFTEXT => IF rt.length < rt.maxLength THEN {
+IF RefText.AppendChar[rt, ch] # rt THEN ERROR;
+RETURN};
+ENDCASE => NULL;
+opsTail ¨ opsTail.rest ¨ LIST[RefText.New[textSize]];
+RETURN};
+Ensure[h, CCount[h]+2];
+buff[cr].c ¨ ch;
+cr ¨ Right[h, cr];
+buff[cr].changes ¨ NIL;
+bufferWidth ¨ bufferWidth + w;
+minIndent ¨ minIndent + w;
+LeftLoop[h]}};
+textSize: Nat ¨ 20;
+
+EnsureChangeOp: PROC [ps: Privates] ~ {
+WITH ps.opsTail.first SELECT FROM
+cs: Changes => RETURN;
+ENDCASE => NULL;
+ps.opsTail ¨ ps.opsTail.rest ¨ LIST[NEW[ChangesPrivate ¨ []]];
+RETURN};
+
+Looksb: PUBLIC PROC [h: Handle, looks: Rope.ROPE] = {
+ps: Privates = h.ps; {OPEN ps, h;
+SELECT TRUE FROM
+hasMiser => {EnsureChangeOp[ps];
+{cs: Changes ~ NARROW[opsTail.first]; cs.dlooks ¨ cs.dlooks.Concat[looks]}};
+cl = cr => OutputChanges[h, NEW [ChangesPrivate ¨ [looks]]];
+ENDCASE => {
+IF buff[cr].changes = NIL THEN buff[cr].changes ¨ NEW [ChangesPrivate ¨ []];
+buff[cr].changes.dlooks ¨ Rope.Concat[buff[cr].changes.dlooks, looks];
+};
+}};
+
+CharPropsb: PUBLIC PROC [h: Handle, props: PropList] = {
+ps: Privates = h.ps; {OPEN ps, h;
+op: PropList = Oldize[props];
+SELECT TRUE FROM
+hasMiser => {EnsureChangeOp[ps];
+{cs: Changes ~ NARROW[opsTail.first]; cs.charProps ¨ op}};
+cl = cr => OutputChanges[h, NEW [ChangesPrivate ¨ [charProps: op]]];
+ENDCASE => {
+IF buff[cr].changes = NIL THEN buff[cr].changes ¨ NEW [ChangesPrivate ¨ []];
+buff[cr].changes.charProps ¨ op;
+};
+}};
+
+NodeFormatb: PUBLIC PROC [h: Handle, format: ATOM] = {
+ps: Privates = h.ps; {OPEN ps, h;
+SELECT TRUE FROM
+hasMiser => {EnsureChangeOp[ps];
+{cs: Changes ~ NARROW[opsTail.first]; cs.nodeFormat ¨ format}};
+cl = cr => OutputChanges[h, NEW[ChangesPrivate ¨ [nodeFormat: format]]];
+ENDCASE => {
+IF buff[cr].changes = NIL THEN buff[cr].changes ¨ NEW [ChangesPrivate ¨ []];
+buff[cr].changes.nodeFormat ¨ format;
+};
+}};
+
+NodePropsb: PUBLIC PROC [h: Handle, props: PropList] = {
+ps: Privates = h.ps; {OPEN ps, h;
+op: PropList = Oldize[props];
+SELECT TRUE FROM
+hasMiser => {EnsureChangeOp[ps];
+{cs: Changes ~ NARROW[opsTail.first]; cs.nodeProps ¨ op}};
+cl = cr => OutputChanges[h, NEW [ChangesPrivate ¨ [nodeProps: op]]];
+ENDCASE => {
+IF buff[cr].changes = NIL THEN buff[cr].changes ¨ NEW [ChangesPrivate ¨ []];
+buff[cr].changes.nodeProps ¨ op;
+};
+}};
+
+NodeCommentb: PUBLIC PROC [h: Handle, comment: BOOL] = {
+ps: Privates = h.ps; {OPEN ps, h;
+atom: ATOM = IF comment THEN $TRUE ELSE $FALSE;
+SELECT TRUE FROM
+hasMiser => {EnsureChangeOp[ps];
+{cs: Changes ~ NARROW[opsTail.first]; cs.nodeComment ¨ atom}};
+cl=cr => OutputChanges[h, NEW[ChangesPrivate ¨ [nodeComment: atom]]];
+ENDCASE => {
+IF buff[cr].changes = NIL THEN buff[cr].changes ¨ NEW [ChangesPrivate ¨ []];
+buff[cr].changes.nodeComment ¨ atom;
+};
+}};
+
+Ropeb: PUBLIC PROC [h: Handle, r: Rope.ROPE] = {
+FOR i: INT IN [0 .. Rope.Length[r]) DO Charb[h, Rope.Fetch[r, i]] ENDLOOP};
+
+Atomb: PUBLIC PROC [h: Handle, a: ATOM] = {Ropeb[h, Atom.GetPName[a]]};
+
+LeftLoop: PROC [h: Handle] = {ps: Privates = h.ps; {OPEN ps, h;
+DO
+IF cl # cr AND (bl = br OR buff[bl].bs.p # cl) THEN
+OutputChar[h]
+ELSE IF cl = cr AND bl = br THEN
+EXIT
+ELSE WITH x: buff[bl].bs SELECT FROM
+setb => {
+IF x.nextSB#biggestN THEN WITH y: buff[x.nextSB].bs SELECT FROM
+setb => {IF y.prevSB # [TRUE, bl] THEN ERROR; y.prevSB ¨ [FALSE, sr]};
+ENDCASE => ERROR
+ELSE {IF rsb # [TRUE, bl] THEN ERROR; rsb ¨ [FALSE, sr]};
+Ensure[h, sr+2];
+buff[sr].s ¨ indentation;
+sr ¨ sr + 1;
+bl ¨ Right[h, bl];
+leftBroke ¨ FALSE;
+};
+breakpoint => 
+IF indentation + bufferWidth > margin
+OR (SELECT x.cond FROM
+width => FALSE,
+united => srx=sr OR hasAlways,
+lookLeft => leftBroke,
+always => TRUE,
+ENDCASE => ERROR) THEN {
+
+Breakline[h, buff[sr-1].s + x.offset];
+srx ¨ sr;
+bufferWidth ¨ bufferWidth - x.sepWidth;
+cl ¨ RightL[h, cl, x.sepChars];
+IF br = (bl ¨ Right[h, bl]) THEN
+hasAlways ¨ FALSE;
+leftBroke ¨ FALSE;
+}
+ELSE IF Right[h, bl] # br AND buff[Right[h, bl]].bs.type = breakpoint
+AND x.cond # united THEN {
+bl ¨ Right[h, bl];
+leftBroke ¨ FALSE;
+}
+ELSE 
+EXIT;
+ENDCASE => ERROR;
+ENDLOOP;
+
+IF hasAlways THEN
+ERROR; 
+}};
+
+Breakline: PROC [h: Handle, indent: INTEGER] = {ps: Privates = h.ps; {OPEN ps, h;
+goalIndent: INTEGER = indent;
+
+WITH h.output SELECT FROM
+
+so: BufferOutput.stream => {
+IO.PutChar[so.stream, IO.CR];
+FOR sl: LIST OF CHAR ¨ h.spacers, sl.rest WHILE indent # 0 DO
+rep: INTEGER ¨ indent/h.width[sl.first];
+THROUGH [0 .. rep) DO
+IO.PutChar[so.stream, sl.first];
+ENDLOOP;
+indent ¨ indent - rep * h.width[sl.first];
+ENDLOOP;
+};
+
+ENDCASE => ERROR;
+
+indentation ¨ goalIndent;
+}};
+
+END.
+  à  
+UnparserBufferImpl.mesa 
+Copyright ” 1990, 1991 by Xerox Corporation.  All rights reserved.
+Gnelson, December 6, 1983 2:05 am
+Last tweaked by Mike Spreitzer on February 21, 1990 10:19 am PST
+Last changed by Pavel on March 26, 1988 12:16:04 pm PST
+JKF October 2, 1988 1:13:14 pm PDT
+The "buffer" solves the problem once the breaking of the misers has been determined.  Taken misers go into the buffer as always breaks; non-taken misers go in as their seps.
+The miser breaking is solved in the "pre-buffer", which accumulates all operations destined for the buffer.  The solution technique makes the following INPUT RESTRICTION: if all the non-miser breakpoints were to break, the indendation at each miser breakpoint M does not depend on any other miser breakpoints except those directly contained in objects that are proper ancestors of the object that directly contains M.  Another way to state this restriction scans the input left-to-right and keeps a state variable called "the last miser".  Each miser breakpoint sets the last miser to itself.  Associate with every object a "determining" miser, which is the last miser at the point of the object's setb.  Every non-miser breakpoint sets the last miser to the determining miser of the innermost object.  The input restriction is that just before each miser the last miser is one directly contained in a proper ancestor of the innermost object.
+The pre-buffer passes its input directly to the buffer, except between the insertion (into the pre-buffer) of a miser break and the next non-miser break that is a sibling of the miser or directly contained in an object that is an ancestor of the object that contains the miser.
+The input restriction enables conversion of the miser breaking problem into the following tree-based problem...
+buff.c & buff.changes is circular buffer with pointers [cl .. cr).
+changes[i] is the tioga changes between c[i-1] and c[i].
+buff.bs is circular buffer with pointers [bl .. br).
+buff.s is stack with sr elts in it.
+TRUE iff an object has (recursively) broken since last setb removed from buffer or its latest breakpoint removed from buffer, whichever is later.
+indentation at the insertion end of pre-buffer, assuming misers not taken, others taken
+width that has been output on current line so far.
+the "pre-buffer": operations not yet input to the buffer, starting with the first miser break; first element is a dummy.
+The indentations of the setbs that have been removed from the buffer but whose matching endbs have not yet been input are stored in s[0], s[1], ... s[sr-1].  Furthermore, for i < srx, the setb whose indentation is stored in s[i] has been broken; for srx <= i < sr, s[i] is the indentation of a setb on the "current line" that may or may not be broken.
+Either [TRUE, index in buff.bs] or [FALSE, index in buff.s].
+cost is biggestN for incoming advantage < minA.
+cost is 0 for incoming advantage >= maxNeed.
+last elt is for cost=0. first elt's start = MAX[minA, 0].
+IA stands for Incoming (to brk, not kid) Advantage.
+startIA IN [s.startIA .. s.nextIA] for each SeqPtr s.
+[startIA .. nextIA) is subrange of [to.first.startIA .. to.first.nextIA)
+[startIA .. nextIA) is subrange of [tm.first.startIA .. tm.first.nextIA)
+[startIA .. nextIA) is subrange of [s.startIA .. s.nextIA) for each SeqPtr s.
+We now have bl # br AND (cl = cr OR buff[bl].bs.p = cl)
+This shouldn't be able to happen; the last two cases in the loop are supposed to screen this out.
+ ù _  ïNewlineDelimiter
+ñ(cedarcode) styleô codeöúôKöú
+œeú7ôBKöú!ô!Kô@Kô7Kô"óKò Köœk	úûú!ò3Kò ö—bnxúûúûò!KöûúûúòKöûúòKöúûúûúòKò Kô≠KôÆKôïKôoKò KöûúûúûúûúûúûúòKò Köú
+ûúûúò"öúûúûúûúò$Köúœcò&Köú†úò-öúûúòKöúBôBKöú8ô8Kô4Kô#óKöú†4òOKöúûúûú†'ò@Köú
+ûúûú†ò6Köú	ûúûú†Hò^öúûúûúòKôëóòKôWóKöú†tòàKöú†ò3öúòKô2óöúûúûúòKôxóKöú†,ò9Köú†ò/Köú†/ò<Köúûú†ò$KòóKò Köúûúûú
+òKö	ú
+ûúûúûúûú
+ò@Kò öú	ûúûúòKöúûúòKöúûúòöúûúòKöúﬂôﬂóKò
+KöúòóKò Köú	ûúûúò#öúûúûúòKöœgúûúûúòKöú!ûúò%Köúûúûò#KòóKò Köúûúûúò!Kò öúûúûúòKöú†%ò-öú	ûú	ûòKöú2ò2Köú-ûúòOKöûúò	óóKò Köú
+ûúûúòKò öú	ûúûú	ûúò/Kô<óKò Köúûúò#Köúûúò(Kò Köú	ûúûúûúòKöúûúûúòöúûúûúòKöú	†òKöú†>òJKöúòóKò Kö	ûúûúûúûú†ò4Kò KöúûúûúòKöúûúûúò/Kò Köúûúûúûú	ò"Köú	ûúûúò#öúûúûúòKöúûúûúò1Köú5ûúò9Köúûúûúûúò)óKò Köúûúûú	òöú	ûúûúòKöú†+ò9Köúûú†4òCKöú†òKöú
+†ò#Köúûúûúò,Kô/Kô,Kô9óKò Köúûúûúûúò:KöûúûúòKò öœnúûúûúûúòLKöúûúò Köûúûúûúûúûúûúò0Kò KöúòKöûúòKò óö¢úûúûúûúòIKöúûúûúò<KöúòKöûúòKò óö¢úûúûúò!KöúàòàKò"KöúAûúòGKöúûúòKöúûúòKöúûúòKòKöûúòKò óö¢úûúûúò.KöúûúûúûúòUKò óö¢úûúûúò.KöúûúûúûúòUKò óö¢úûúûúò+KöûúûúûúòKöûúûúûúò Köúûúûúò,Kò óö¢úûúò%KöúûúòKöúòKöúòKöúòKöûúûúû†Gúòcöûú!ûúûò9KòKöú*ò*KöúòKöûúòóKòöûú!ûúûò9Kò öûúûúûò öú	ûúûú.òMKöûúûú'ò@óKöúûúòKöûúûúòóKöú1ò1Köú
+ûúòKöûúòóKöûúûú.òDKòKöûúûúûúûúòCKòKòKöúòKò óö¢úûúûú	ûò6Kö	úûúûúûúûúò/óKò ö¢úûúûú	ûò:Köúûúûúò!Köûúûúò)KöûúòKò óö¢úûúûú	ûò5ö	úûúûúûúûú
+ò-Kò óóö¢úûúûú	ûò9ö	úûúûúûúûúò7Kò óóö¢úûúûúò=ö	ûúûúûúûúûò;KöúûúòKöûúûòóöûúûú	ûòKöúûúòKöúûúûú
+ûúò+KöûúûúòóóKò ö¢úûúûú&ûúòBöûú
+ûúòKö	ûúûú	ûúû†úò8Köúûúûúò9Köúûúûú'ò5Kòóöûúûú	ûú	ûúò"KòKöúòKöúûúòKöúòóöûúòKòö	ûúûúûúûúûò6Köú	ûúûúûúò9KöûúûúòóKöú3ò3KöúûúòKöúòóKöúòóKò ö¢úûúûú&ûúòBKöú	ò	öûú
+ûúòKöúûúûúò7Kòöûú
+ûúûú†,òBKò"Kò)KòKöú
+ûúòKòóKöûúòKöûúòóKöûú	ûú.ûú
+ûúòSöûú	ûúòKòKö
+ûúûúûúûú†.úòKKöúòö	ûúûúûúûúûò6Köú	ûúûúûúò>KöûúûúòóKöú
+ò
+óö
+ûúûúûúûú†4úòSKöûú	ûúûúò'Köûúûúûú†ò2öûúòKöúûúòöûú
+ûúòKöú
+ò
+KöúûúòóKöûúûúûúò/KöúòóóóKò ö¢
+úûú&ûúòAKöûúûúûú$òBöûú
+ûúûòöúòKöûú!ò#óKöûúûúòóKò.Kò.KòKö
+ûú	ûúûúûú9ûúòjKò óö¢úûú"ò5Köúûúò!öûú
+ûúûòöúòKöûú	°úûúûúûú%°ú	òNKöûúûúûúûú<ò^Köûúûúûúûú<ò^Köûúûúûúûú3òVKöûúûúûúûú?òcKòóKöûúûúòóöúòKò óóö¢úûúûúûúòAKö	úûúûúûúûúò1Kò óö¢úûúûúûúòAKö	úûú	ûúûúûúò1Kò óö¢úûúûúò3öûú
+ûúûòKöúûú&òCKöûúûúòóóKò ö¢úûúûú
+òAKöûúûúûòöûúûúûúûúûúûò>KöúûúòKöûúûòóKöûúûúò"óKò ö
+¢úûúûú+ûúûúòQKöúûúò!KöúòKöúòKöûú
+ûúûúò;öûúûúûú
+ûúò%Köú
+ûúûúò5KöúûúûúòKöúûúûú-ò;KòKöúûúòóöûúûúûúûúò-KöúòKöûúûú
+ûú%ò9öûúûúûò Köúûúòöûúûú
+ûúòKöúòKòKöúûúòóKöú ò KöûúòóKöûúûú
+ûú&ò:KòóöûúûúòKöúûú$ò6Köûúûúû†úò>Köûúûúûúò.öûúòKöúûú3òDKöúûúò8Köúûúò"KöúòKöú#ò#Köûúò	óóöûú
+ûúòKöúûú+ò<Köúûúò"KòKöú#ò#öûú
+ûúûúòKòKöúòóKöûúòóKöú/ò/Köú6ò6KòKöúBòBKòKöúûú%ò4KòKò óö¢	úûúûúò5Kö
+ûúûúûúûú†6úòZKò!Kò#KöûúòóKò ö¢úûúò.KòKòKöûúûúûúûò;Köûúûúûúûò1öûúûú
+ûúûò(Köúòöûúûúòöúûú	ûòKöúûúòKöúûúòKòKöûúûúòóKöûúòóKöûúûúûúòKöûúòóKöûúûúò*öûú+ûúûúûò?KòKöûúòóKöûúòKöúûúûúòKò óKöúûúûúûúò"öúûúûú5òJKô3óKò ö¢úûú+ûúòPKòKò!Köúûú"ò4Köú
+ò
+KöûúûúûúûúûúûúûúûúògKöûúûúûú1òNKöûú<òBóKò ö¢úûúûúò8KòKöúûúòKòKöúûúòKöúûúòKòöûú+ûúûúûò?Köú'ò'KöúòKöú
+ûúò)Köúûúò öûúòKöûú	ûú4òEKöûú	ûú*ò;óöûúò KöûúûúAòQöûúòöûúûúûò$öûú#ûúò+KöúûúûúòEKöûúòóKöûúûúûú/òMKöûúòóKòóóKöûúòóKöúûúò,KöúòKöú)ò)KöúòKöúòöûòKô5KòKòKòöûú!ûúûúûò3öûúûò%KöúûúòKòCKöúûúòKöûúûúòóKöú	ûúò&KôHKòKöûúòóöûú ûúûúûò2öûúûò%KöúûúòKòOKöúûúòKöûúûúòóKöú	ûúò&KôHKòKöûúòóKôMöúûúûò,KòKòKòKöûúûúòóKöúûúò
+öûúûúûúûúò%Köú$ûúò*Köúûúò2óöûúûúòKöûúûúûúò(KöúòKöúûúòóKöûúûú	ûúûúò(KòKöúûúò	óKöûúòóKò ö¢úûúûúò=Köúûúòö	ûúûúûúûúûò0öûú
+ûúûòKöúûúûúûúûúûúûúòGKöúûúòöúûú
+ûò KòKòKöûúûúòóöúûúò!Köûú%ò)Köûúûúûúûúò5KöûúòóòKö
+ûú°úûúûú°úò+Köûúûúûú%ò=Köûúûúûú%ò=Köûúûúûúò8Köûúûúûú(òBóKöûúûúòóKöûúòóKöúûúò	KöûúòóKò ö
+¢úûúûúûúûúòMKöúûúòöûú
+ûúòKòöûúûúûòöúûúûúûúò1Köûú!ûúûúò.KöûúòóKöûúûúòóKöúûúò5KöûúòóKòKòKòKöúûúòKòKòKòKöúòKò óö¢úûúò'öûúûúûò!KöúûúòKöûúûúòóKöúûúûúò>KöûúòóKò ö¢úûúûúûúò5Köúûúò!öûúûúûòöú ò Köúûú°ú°úòLóKöúûúò<öûúòKöûúûúûúûúòLKöú°ú$°úòFKöúòóóKöúòKò óö¢
+úûúûú!ò8Köúûúò!Kòöûúûúûòöú ò Köúûú%ò:óKöúûú%òDöûúòKöûúûúûúûúòLKöú°úò KöúòóóKöúòKò óö¢úûúûúûúò6Köúûúò!öûúûúûòöú ò Köúûú*ò?óKöúûú)òHöûúòKöûúûúûúûúòLKöú°úò%KöúòóóKöúòKò óö¢
+úûúûú!ò8Köúûúò!Kòöûúûúûòöú ò Köúûú%ò:óKöúûú%òDöûúòKöûúûúûúûúòLKöú°úò KöúòóóKöúòKò óö¢úûúûúûúò8Köúûúò!Kö	úûúûú	ûúûúò/öûúûúûòöú ò Köúûú)ò>óKöúûú(òEöûúòKöûúûúûúûúòLKöú°úò$KöúòóóKöúòKò óö¢úûúûúûúò0Kö
+ûúûúûúûúûúòKóKò Kö¢úûúûúûú!òGKò ö¢úûú&ûúò?öûòöûú	ûú
+ûúûò3Köúòóöûúûú	ûú	ûò KöûòóKöúûú
+ûúô7öûúûúûúûò$ò	ö	ûúûúûúûúûò?Köú	ûúûúûúûúûúòFKöûúûòóKöûúûúûúûúûú	ûúò9KòKöúòKòKòKöúûúòKòóòöûú#ò%öûúûúûú
+ûúûú-ûúûúûúûúòÖKò Köú&ò&Köú	ò	Köú'ò'Köúòöûúûò KöúûúòóKöúûúòKöúòóóö
+ûúûúûú)ûúûúò`KöúòKöúûúòKöúòóöûúòKöûúòóóKöûúûúòóKöûúòóKò öûúûòKöúaôaKöûúòóKòKò óö¢	úûúûúûúòQKöúûú
+òKò öûú
+ûúûòKò öúòKöûúûúûúòöûúûúûúûúûúûò=Köúûúò(öûúûòKöûúò KöûúòóKöú*ò*KöûúòóKòKò óKöûúûúòóKò KöúòöúòKò óóKöûúòóó Öó    Né  xu  

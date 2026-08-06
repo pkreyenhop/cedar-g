@@ -1,0 +1,739 @@
+DIRECTORY Atom, Commander, CommanderOps, List, IO, CrankIO, CrankTypes, FS, MPTree, MPLeaves, ProcessProps, Rope, SymTab, CardTab, CrankOps;
+
+CrankOpsImpl: CEDAR PROGRAM
+IMPORTS Atom, CommanderOps, List, IO, SymTab, CardTab, ProcessProps, Rope
+EXPORTS CrankOps
+~ BEGIN OPEN CrankTypes;
+
+ROPE: TYPE = Rope.ROPE;
+
+Error: PUBLIC SIGNAL [message: ROPE, tree: REF] = CODE;
+
+Assert: PUBLIC PROC [true: BOOLEAN, format: ROPE ¬ NIL, value: IO.Value ¬ [null[]], tree: REF ¬ NIL] = {
+IF NOT true THEN {
+msg: ROPE ~ IO.PutFR1[format, value];
+WITH ProcessProps.GetProp[$CommanderHandle] SELECT FROM
+cmd: Commander.Handle => {
+IO.PutRope[cmd.err, "Assertion failed: "];
+IO.PutRope[cmd.err, msg];
+IO.PutRope[cmd.err, "\n (use CrankErrorTree command to dump tree) \n"];
+CommanderOps.PutProp[cmd, $CrankErrorTree, tree];
+};
+ENDCASE;
+Error[msg, tree];
+};
+};
+
+Help: PUBLIC PROC [format: ROPE, value: IO.Value ¬ [null[]], tree: REF ¬ NIL] RETURNS [result: REF ¬ NIL] = {
+SIGNAL Error[IO.PutFR1[format, value], tree]; -- may assign result with debugger
+};
+AddAttribute: PUBLIC PROC [aNode: AttributedNode, name: ATOM, value: REF] = {
+FOR each: LIST OF REF ¬ aNode.attributes, each.rest.rest UNTIL each = NIL DO
+IF each.first = name THEN ERROR; -- multiple attribute assignment
+ENDLOOP;
+aNode.attributes ¬ CONS[name, CONS[value, aNode.attributes]];
+};
+
+GetAttribute: PUBLIC PROC [aTree: Tree, name: ATOM] RETURNS [value: REF] = {
+aNode: AttributedNode = NARROW[aTree];
+FOR each: LIST OF REF ¬ aNode.attributes, each.rest.rest UNTIL each = NIL DO
+IF each.first = name THEN RETURN [each.rest.first];
+ENDLOOP;
+RETURN [NIL]
+};
+
+ReplaceAttribute: PUBLIC PROC [aNode: AttributedNode, name: ATOM, value: REF] = {
+FOR each: LIST OF REF ¬ aNode.attributes, each.rest.rest UNTIL each = NIL DO
+IF each.first = name THEN { each.rest.first ¬ value; RETURN };
+ENDLOOP;
+ERROR; -- attribute not present
+};
+
+AddTypeCodeAttribute: PUBLIC PROC [tree: REF, attributeName: ATOM, typeCode: TypeCode] = {
+AddAttribute[NARROW[tree], attributeName, NEW[TypeCode ¬ typeCode]]
+};
+
+GetTypeCodeAttribute: PUBLIC PROC [tree: REF, attributeName: ATOM] RETURNS [TypeCode] = {
+IF attributeName = NIL THEN attributeName ¬ $TYPECODE;
+WITH GetAttribute[tree, attributeName] SELECT FROM
+rt: REF TypeCode => RETURN [rt­];
+ENDCASE => RETURN [nullTypeCode];
+};
+
+GetTypeValueAttribute: PUBLIC PROC [typeGraph: TypeGraph, tree: REF] RETURNS [TypeCode] = {
+WITH UnderType[typeGraph, GetTypeCodeAttribute[tree, $TYPECODE]] SELECT FROM
+rt: REF TypeRep.type => RETURN [rt.value];
+ENDCASE => Assert[FALSE, "Type expected here",,tree];
+RETURN [nullTypeCode]
+};
+
+NewTypeGraph: PUBLIC PROC RETURNS [TypeGraph] = {
+typeGraph: TypeGraph = NEW[TypeGraphRep ¬ [n: 0, tab: CardTab.Create[], interfaceTable: SymTab.Create[case: FALSE]]];
+[] ¬ NewTypeType[typeGraph, nullTypeCode]; -- Predeclare type 0 for use as $NEEDTYPECODE attribute for type expressions
+RETURN [typeGraph]
+};
+
+NewType: PUBLIC PROC [typeGraph: TypeGraph, type: Type] RETURNS [typeCode: TypeCode]= {
+type.typeCode ¬ typeCode ¬ typeGraph.n;
+[] ¬ CardTab.Insert[x: typeGraph.tab, key: typeGraph.n, val: type];
+typeGraph.n ¬ typeGraph.n + 1;
+};
+
+NewDefinitionType: PUBLIC PROC [typeGraph: TypeGraph, qualifier: ROPE, shortName: ROPE, groundType: TypeCode] RETURNS [TypeCode] = {
+tc: TypeCode = NewType[typeGraph, NEW[TypeRep.definition ¬ [class: $DEFINITION, v: definition[qualifier: qualifier, shortName: shortName, groundType: groundType]]]];
+RETURN [tc];
+};
+
+NewInitialType: PUBLIC PROC [typeGraph: TypeGraph, environmentModule: ROPE, tree: Tree, groundType: TypeCode] RETURNS [TypeCode] = {
+tc: TypeCode = NewType[typeGraph, NEW[TypeRep.initial ¬ [class: $INITIAL, v: initial[environmentModule: environmentModule, tree: tree, groundType: groundType]]]];
+RETURN [tc];
+};
+
+NewReferenceType: PUBLIC PROC [typeGraph: TypeGraph, referentType: TypeCode, class: ATOM] RETURNS [TypeCode] = {
+tc: TypeCode = NewType[typeGraph, NEW[TypeRep.reference ¬ [class: class, v: reference[referentType: referentType]]]];
+RETURN [tc];
+};
+
+NewTypeType: PUBLIC PROC [typeGraph: TypeGraph, value: TypeCode] RETURNS [TypeCode] = {
+tc: TypeCode = NewType[typeGraph, NEW[TypeRep.type ¬ [class: $TYPE, v: type[value: value]]]];
+RETURN [tc];
+};
+
+TypeFromTypeCode: PUBLIC PROC [typeGraph: TypeGraph, typeCode: TypeCode] RETURNS [Type] = {
+RETURN [NARROW[CardTab.Fetch[x: typeGraph.tab, key: typeCode].val]]
+};
+
+recursionDepthLimit: NAT ¬ 75;
+ComputeExternalTypeRep: PUBLIC PROC [typeGraph: TypeGraph] = {
+FOR i: CARD IN [0..typeGraph.n) DO
+DoPointerType: PROC [t: Type, kind: ATOM, baseType: TypeCode] = {
+l: LIST OF REF ANY ¬ LIST[kind, $RECURSIVE];
+t.ext ¬ l;
+t.ext ¬ l ¬ LIST[kind, Do[baseType]];
+};
+DoFieldList: PROC [fieldList: FieldList] RETURNS [LIST OF REF] = {
+lora: LIST OF REF ¬ NIL;
+FOR each: FieldList ¬ fieldList, each.rest UNTIL each = NIL DO
+pair: LIST OF REF = LIST[each.first.name, Do[each.first.rangeType]];
+lora ¬ CONS[pair, lora];
+ENDLOOP;
+RETURN [List.DReverse[lora]]
+};
+DoVariantList: PROC [variantList: VariantList] RETURNS [LIST OF REF] = {
+lora: LIST OF REF ¬ NIL;
+FOR each: VariantList ¬ variantList, each.rest UNTIL each = NIL DO
+pair: LIST OF REF = LIST[each.first.value, DoFieldList[each.first.chooses]];
+lora ¬ CONS[pair, lora];
+ENDLOOP;
+RETURN [List.DReverse[lora]]
+};
+Do: PROC [typeCode: TypeCode] RETURNS [REF] = {
+t: Type = TypeFromTypeCode[typeGraph, typeCode];
+l: LIST OF REF ANY;
+IF t = NIL THEN RETURN [$UNKNOWN];
+IF t.ext # NIL THEN RETURN [t.ext];
+t.ext ¬ $ILLEGALRECURSION;
+recursionDepthLimit ¬ recursionDepthLimit - 1;
+WITH t SELECT FROM
+t: REF TypeRep.definition => {g: REF ¬ Do[t.groundType]; t.ext ¬ g};
+t: REF TypeRep.initial => {t.ext ¬ Do[t.groundType]};
+t: REF TypeRep.qualifiedVariant => {g: REF ¬ Do[t.groundType]; t.ext ¬ LIST[t.class, t.qualifier, g]};
+t: REF TypeRep.scalar => {t.ext ¬ t.class};
+t: REF TypeRep.reference => {DoPointerType[t, t.class, t.referentType]};
+t: REF TypeRep.notImplemented => {t.ext ¬ LIST[t.class, $UNIMPLEMENTED]};
+t: REF TypeRep.control => {
+a: REF = Do[t.argumentType];
+r: REF = Do[t.returnType];
+t.ext ¬ LIST[t.class, a, r]
+};
+t: REF TypeRep.enumerated => {
+l ¬ NIL;
+FOR each: LIST OF EnumerationItem ¬ t.items, each.rest UNTIL each = NIL DO
+l ¬ CONS[each.first.name, l];
+ENDLOOP;
+l ¬ List.DReverse[l];
+t.ext ¬ CONS[t.class, l];
+};
+t: REF TypeRep.subrange => {
+g: REF ¬ Do[t.groundType];
+t.ext ¬ l¬LIST[t.class, g, t.first, t.last];
+};
+t: REF TypeRep.union => {
+pair: LIST OF REF = LIST[t.tagName, Do[t.tagType]];
+t.ext ¬ l¬LIST[t.class, pair, DoVariantList[t.variantList]];
+};
+t: REF TypeRep.sequence => {
+t.ext ¬ LIST[t.class, t.limitName, Do[t.domainType], Do[t.rangeType]]
+};
+t: REF TypeRep.record => {t.ext ¬ CONS[t.class, DoFieldList[t.fieldList]]};
+t: REF TypeRep.array => {
+d: REF ¬ Do[t.domainType];
+r: REF ¬ Do[t.rangeType];
+t.ext ¬ l¬LIST[t.class, d, r]
+};
+t: REF TypeRep.simple => {t.ext ¬ t.class};
+t: REF TypeRep.type => {t.ext ¬ LIST[t.class, Do[t.value]]};
+ENDCASE => ERROR;
+recursionDepthLimit ¬ recursionDepthLimit + 1;
+RETURN [t.ext]
+};
+[] ¬ Do[i];
+ENDLOOP;
+};
+
+AssertNotVar: PUBLIC PROC [tree: REF] = {
+Assert[GetAttribute[tree, $VAR] # $TRUE, "Not a VAR expression",,tree];
+};
+
+PropagateAttribute: PUBLIC PROC [dstNode: REF, dstAttributeKey: ATOM, srcNode: AttributedNode, srcAttributeKey: ATOM] = {
+v: REF = GetAttribute[srcNode, srcAttributeKey];
+IF v # NIL THEN AddAttribute[NARROW[dstNode], dstAttributeKey, v];
+};
+Alias: PROC [context: Context, id: ROPE, for: ROPE] = {
+AddSymbol[context, id, LookupSymbol[context, for]];
+};
+
+Root: PUBLIC PROC [context: Context] RETURNS [Context] = {
+UNTIL context.parent = NIL DO context ¬ context.parent ENDLOOP;
+RETURN [context]
+};
+
+LookupTypeCode: PUBLIC PROC [context: Context, id: ROPE] RETURNS [TypeCode] = {
+WITH LookupSymbol[context, id] SELECT FROM
+r: REF SymbolTableEntryRep.other => {
+WITH TypeFromTypeCode[context.types, r.typeCode] SELECT FROM
+t: REF TypeRep.type => RETURN [t.value];
+ENDCASE => NULL;
+}
+ENDCASE => NULL;
+Assert[FALSE, "Type identifier expected here, \"%g\" found", [rope[id]]];
+RETURN [nullTypeCode]
+};
+
+UnderType: PUBLIC PROC [typeGraph: TypeGraph, typeCode: TypeCode] RETURNS [Type] = {
+DO
+type: Type = TypeFromTypeCode[typeGraph, typeCode];
+WITH type SELECT FROM
+t: REF TypeRep.definition => typeCode ¬ t.groundType;
+t: REF TypeRep.initial => typeCode ¬ t.groundType;
+ENDCASE => RETURN [type];
+ENDLOOP;
+};
+
+BaseType: PUBLIC PROC [typeGraph: TypeGraph, typeCode: TypeCode] RETURNS [Type] = {
+DO
+type: Type = TypeFromTypeCode[typeGraph, typeCode];
+WITH type SELECT FROM
+t: REF TypeRep.definition => typeCode ¬ t.groundType;
+t: REF TypeRep.initial => typeCode ¬ t.groundType;
+t: REF TypeRep.subrange => typeCode ¬ t.groundType;
+ENDCASE => RETURN [type];
+ENDLOOP;
+};
+
+Debug: PROC = {ENABLE ABORTED=>CONTINUE; ERROR};
+GetTypeRange: PUBLIC PROC [context: Context, tree: Tree] RETURNS [first: DINT ¬ 0, last: DINT ¬ 2**31-1] = {
+aNode: AttributedNode = NARROW[tree];
+WITH aNode.syntaxNode SELECT FROM
+node: REF MPLeaves.HTNode => {
+type: Type = UnderType[context.types, LookupTypeCode[context, node.name]];
+WITH type SELECT FROM
+t: REF TypeRep.scalar => {
+SELECT t.class FROM
+$BYTE, $CHAR => RETURN [0, 255];
+$CARD32 => RETURN [0, 0FFFFFFFFH];
+$CARD16 => RETURN [0, 0FFFFH];
+$INT16 => RETURN [-8000H, 07FFFH];
+$DINT => RETURN [DINT.FIRST, DINT.LAST];
+$DCARD => RETURN [0, DINT.LAST]; -- Wrong!!! need better return value.
+ENDCASE;
+};
+subrange: REF TypeRep.subrange => {
+RETURN[first: DIntFromRef[subrange.first], last: DIntFromRef[subrange.last]];
+};
+ENDCASE;
+};
+ENDCASE;
+{r: REF INT ¬ NARROW[Help[format: "Expected numeric type here", tree: tree], REF INT];
+IF r#NIL THEN last ¬ r­;
+};
+};
+
+EnumerateFieldList: PROC [typeGraph: TypeGraph, fieldList: FieldList, firstFieldIndex: INT, tags: LIST OF ROPE, action: CrankOps.FieldProc] RETURNS [BOOL] = {
+fieldIndex: INT ¬ firstFieldIndex;
+FOR each: FieldList ¬ fieldList, each.rest UNTIL each = NIL DO
+tagName: ROPE ¬ NIL;
+tagTypeCode: TypeCode ¬ nullTypeCode;
+IF each.rest = NIL THEN {
+WITH UnderType[typeGraph, each.first.rangeType] SELECT FROM
+u: REF TypeRep.union => {
+tagName ¬ u.tagName;
+tagTypeCode ¬ u.tagType;
+IF tags # NIL THEN {
+FOR v: VariantList ¬ u.variantList, v.rest UNTIL v = NIL DO
+IF Rope.Equal[tags.first, NARROW[v.first.value]] THEN {
+IF action[fieldIndex: fieldIndex, fieldName: tagName, fieldTypeCode: tagTypeCode, tagName: NIL, tagTypeCode: nullTypeCode] THEN RETURN [TRUE];
+RETURN [EnumerateFieldList[typeGraph, v.first.chooses, fieldIndex+1, tags.rest, action]];
+}; 
+ENDLOOP;
+[] ¬ Help["%g does not name a variant", [rope[tags.first]]];
+RETURN [FALSE];
+};
+IF tagName = NIL THEN {
+FOR v: VariantList ¬ u.variantList, v.rest UNTIL v = NIL DO
+IF EnumerateFieldList[typeGraph, v.first.chooses, fieldIndex, NIL, action] THEN RETURN [TRUE];
+ENDLOOP;
+};
+};
+s: REF TypeRep.sequence => {
+tagName ¬ s.limitName;
+tagTypeCode ¬ s.domainType;
+};
+ENDCASE => NULL;
+};
+IF action[fieldIndex: fieldIndex, fieldName: each.first.name, fieldTypeCode: each.first.rangeType, tagName: tagName, tagTypeCode: tagTypeCode] THEN RETURN [TRUE];
+fieldIndex ¬ fieldIndex + 1;
+ENDLOOP;
+RETURN [FALSE];
+};
+
+EnumerateFields: PUBLIC PROC [typeGraph: TypeGraph, typeCode: TypeCode, action: CrankOps.FieldProc] RETURNS [BOOL] = {
+tags: LIST OF ROPE ¬ NIL;
+tc: TypeCode ¬ typeCode;
+DO
+WITH UnderType[typeGraph, tc] SELECT FROM
+q: REF TypeRep.qualifiedVariant => {tags ¬ CONS[q.qualifier, tags]; tc ¬ q.groundType};
+r: REF TypeRep.record => RETURN [EnumerateFieldList[typeGraph, r.fieldList, 0, tags, action]];
+ENDCASE => RETURN [Help["type has no fields"]#NIL];
+ENDLOOP;
+};
+
+QualifyVariant: PUBLIC PROC [typeGraph: TypeGraph, typeCode: TypeCode, qualifier: ROPE] RETURNS [TypeCode] = {
+q: TypeCode ¬ nullTypeCode;
+q ¬ NewType[typeGraph, NEW[TypeRep.qualifiedVariant ¬ [class: $QUALIFIEDVARIANT, v: qualifiedVariant[qualifier: qualifier, groundType: typeCode]]]];
+RETURN [q];
+};
+
+NewContext: PUBLIC PROC [parent: Context] RETURNS [Context] = {
+context: Context = NEW[ContextRep ¬ [parent: parent, types: IF parent = NIL THEN NewTypeGraph[] ELSE parent.types, symbols: SymTab.Create[], moduleName: IF parent = NIL THEN NIL ELSE parent.moduleName, fieldListLast: NIL, concreteForOpaque: IF parent = NIL THEN NIL ELSE parent.concreteForOpaque, exports: IF parent = NIL THEN NIL ELSE parent.exports]];
+RETURN [context];
+};
+
+AddSymbol: PUBLIC PROC [context: Context, id: ROPE, val: SymbolTableEntry] = {
+Assert[SymTab.Insert[x: context.symbols, key: id, val: val], "Multiply defined identifier: %g", [rope[id]]];
+};
+
+AddFieldListToContext: PUBLIC PROC [context: Context, fieldList: FieldList] = {
+FOR each: FieldList ¬ fieldList, each.rest UNTIL each = NIL DO
+IF each.first.name # NIL THEN {
+AddSymbol[context, each.first.name, NEW[SymbolTableEntryRep.other ¬ [other[typeCode: each.first.rangeType, readonly: FALSE, constantValue: NIL]]]];
+};
+ENDLOOP;
+};
+
+LookupSymbol: PUBLIC PROC [context: Context, id: ROPE] RETURNS [SymbolTableEntry] = {
+FOR each: Context ¬ context, each.parent UNTIL each = NIL DO
+found: BOOL ¬ FALSE; val: REF;
+[found, val] ¬ SymTab.Fetch[x: each.symbols, key: id];
+IF found THEN RETURN [NARROW[val]]
+ENDLOOP;
+RETURN [NARROW[Help["Undefined identifier: %g", [rope[id]]]]]
+};
+
+ExportType: PUBLIC PROC [context: Context, concrete, opaque: TypeCode] = {
+context.concreteForOpaque ¬ CONS[[concrete, opaque], context.concreteForOpaque];
+};
+
+GetConcreteTypeCode: PUBLIC PROC [context: Context, typeCode: TypeCode] RETURNS [TypeCode] = {
+FOR each: LIST OF ConcreteForOpaque ¬ context.concreteForOpaque, each.rest UNTIL each = NIL DO
+IF each.first.opaque = typeCode THEN RETURN [each.first.concrete]
+ENDLOOP;
+RETURN [nullTypeCode]
+};
+GetIdentifier: PUBLIC PROC [tree: Tree] RETURNS [ROPE] = {
+aNode: AttributedNode = NARROW[tree];
+WITH aNode.syntaxNode SELECT FROM
+rope: ROPE => RETURN [rope];
+ht: REF MPLeaves.HTNode => RETURN [ht.name];
+ENDCASE => RETURN [NARROW[Help[format: "Expected identifier here", tree: tree]]];
+};
+
+QualifyIdentifierNode: PUBLIC PROC [tree: Tree, qualifier: ROPE]  = {
+IF qualifier # NIL THEN AddAttribute[NARROW[tree], $QUAL, qualifier];
+};
+
+QualifiedName: TYPE = RECORD [qualifier, shortName: ROPE];
+GetTypeName: PUBLIC PROC [context: Context, typeCode: TypeCode, retainInitalValue: BOOL] RETURNS [LIST OF REF] = {
+tc: TypeCode ¬ typeCode;
+defaultName: QualifiedName ¬ ["THRUTHEDESERT", "NONAME"];
+name: QualifiedName ¬ defaultName;
+list: LIST OF REF ¬ NIL;
+tags: LIST OF REF ¬ NIL;
+initTree: Tree ¬ NIL;
+DO
+WITH TypeFromTypeCode[context.types, tc] SELECT FROM
+d: REF TypeRep.definition => {
+name ¬ [d.qualifier, d.shortName];
+tc ¬ d.groundType;
+};
+i: REF TypeRep.initial => {
+IF initTree = NIL THEN initTree ¬ i.tree;
+tc ¬ i.groundType;
+};
+q: REF TypeRep.qualifiedVariant => {
+tc ¬ q.groundType;
+tags ¬ List.Nconc1[tags, q.qualifier];
+};
+r: REF TypeRep.reference => {
+list ¬ CONS[$PTR, list];
+tc ¬ r.referentType;
+};
+r: REF TypeRep.record => {
+IF name = defaultName AND r.fieldList # NIL AND r.fieldList.rest = NIL
+THEN tc ¬ r.fieldList.first.rangeType
+ELSE EXIT;
+};
+ENDCASE => EXIT;
+ENDLOOP;
+IF name = defaultName THEN {
+list ¬ NIL;
+WITH UnderType[context.types, typeCode] SELECT FROM
+q: REF TypeRep.reference => {
+name ¬ ["BUILTIN", "REF"];
+};
+q: REF TypeRep.scalar => {
+name ¬ ["BUILTIN", Atom.GetPName[q.class]];
+};
+q: REF TypeRep.control => {
+name ¬ ["BUILTIN", Atom.GetPName[q.class]];
+};
+ENDCASE => NULL;
+};
+IF tags # NIL THEN list ¬ List.Nconc1[list, CONS[$TAGS, tags]];
+IF initTree # NIL AND retainInitalValue THEN list ¬ List.Nconc1[list, LIST[$INIT, initTree]];
+RETURN [CONS[name.qualifier, CONS[name.shortName, list]]];
+};
+
+GenSym: PUBLIC PROC [typeGraph: TypeGraph, prefix: ROPE] RETURNS [ROPE] = {
+n: INT = typeGraph.gensym;
+typeGraph.gensym ¬ n + 1;
+RETURN [IO.PutFR["%g%g", [rope[prefix]], [integer[n]]]]
+};
+
+DIntFromRef: PUBLIC PROC [ref: REF] RETURNS [DINT ¬ 0] = {
+WITH ref SELECT FROM
+r: REF INT => RETURN [r­];
+r: REF INTEGER => RETURN [r­];
+r: REF DINT => RETURN [r­];
+r: REF CARD => RETURN [r­];
+r: REF CARDINAL => RETURN [r­];
+r: REF DCARD => RETURN [r­];
+ENDCASE;
+ref ¬ Help[format: "Expected number here", tree: ref];
+WITH ref SELECT FROM
+r: REF DINT => RETURN [r­];
+ENDCASE;
+};
+
+GetSimpleConstant: PUBLIC PROC [context: Context, tree: Tree] RETURNS [result: DINT ¬ 0] = {
+aNode: AttributedNode = NARROW[tree];
+WITH GetAttribute[aNode, $ORDINALVALUE] SELECT FROM
+r: REF INT => RETURN [r­];
+r: REF DINT => RETURN [r­];
+r: REF CARD => RETURN [r­];
+r: REF DCARD => RETURN [r­];
+ENDCASE => NULL;
+WITH aNode.syntaxNode SELECT FROM
+node: REF MPTree.Node => {
+Child: PROC [index: NAT] RETURNS [DINT] = {
+RETURN [GetSimpleConstant[context, node.son[index]]]
+};
+IF node.name = mwconst THEN RETURN [Child[1]];
+IF node.name = uminus THEN RETURN [-Child[1]];
+IF node.name = plus THEN RETURN [Child[1]+Child[2]];
+IF node.name = minus THEN RETURN [Child[1]-Child[2]];
+IF node.name = times THEN RETURN [Child[1]*Child[2]];
+IF node.name = succ THEN RETURN [Child[1]+1];
+IF node.name = pred THEN RETURN [Child[1]-1];
+IF node.name = first THEN {
+RETURN [GetTypeRange[context, node.son[1]].first];
+};
+IF node.name = last THEN {
+RETURN [GetTypeRange[context, node.son[1]].last];
+};
+};
+ht: REF MPLeaves.LTNode => {
+WITH ht.value SELECT FROM
+r: REF INT => RETURN [r­];
+r: REF INTEGER => RETURN [r­];
+r: REF DINT => RETURN [r­];
+r: REF CARD => RETURN [r­];
+r: REF CARDINAL => RETURN [r­];
+r: REF DCARD => RETURN [r­];
+ENDCASE => NULL;
+};
+ENDCASE => NULL;
+{r: REF INT ¬ NARROW[Help[format: "Expected number here", tree: tree], REF INT];
+IF r#NIL THEN result ¬ r­;
+};
+};
+
+GetRopeLiteral: PUBLIC PROC [tree: Tree] RETURNS [ROPE] = {
+aNode: AttributedNode = NARROW[tree];
+WITH aNode.syntaxNode SELECT FROM
+lt: REF MPLeaves.LTNode => RETURN [NARROW[lt.value, REF ROPE]­];
+ENDCASE => RETURN [NARROW[Help[format: "Expected rope literal here", tree: tree]]];
+};
+
+GetNodeName: PUBLIC PROC [tree: Tree] RETURNS [ATOM] = {
+aNode: AttributedNode = NARROW[tree];
+RETURN [aNode.syntaxNodeName]
+};
+
+DoList: PUBLIC PROC [listOrItem: Tree, action: PROC [Tree]] = {
+aNode: AttributedNode = NARROW[listOrItem];
+IF listOrItem = NIL THEN RETURN;
+WITH aNode.syntaxNode SELECT FROM
+node: REF MPTree.Node => {
+IF node.name = list THEN {
+FOR i: NAT IN [1..node.sonLimit) DO
+action[node.son[i]];
+ENDLOOP;
+RETURN;
+};
+};
+ENDCASE => NULL;
+recursionDepthLimit ¬ recursionDepthLimit - 1;
+action[listOrItem];
+recursionDepthLimit ¬ recursionDepthLimit + 1;
+};
+
+WithId: PUBLIC PROC [tree: Tree, action: PROC [id: ROPE]] RETURNS [BOOL] = {
+aNode: AttributedNode = NARROW[tree];
+WITH aNode.syntaxNode SELECT FROM
+rope: ROPE => { action[rope]; RETURN [TRUE] };
+ht: REF MPLeaves.HTNode => { action[ht.name]; RETURN [TRUE] };
+ENDCASE => NULL;
+RETURN [FALSE];
+};
+
+WithLiteral: PUBLIC PROC [tree: Tree, action: PROC [literal: REF MPLeaves.LTNode]] RETURNS [BOOL] = {
+aNode: AttributedNode = NARROW[tree];
+WITH aNode.syntaxNode SELECT FROM
+lt: REF MPLeaves.LTNode => { action[lt]; RETURN [TRUE] };
+ENDCASE => NULL;
+RETURN [FALSE];
+};
+
+GetNodeNameCode: PUBLIC PROC [tree: Tree] RETURNS [MPTree.NodeName] = {
+aNode: AttributedNode = NARROW[tree];
+WITH aNode.syntaxNode SELECT FROM
+node: REF MPTree.Node => RETURN [node.name];
+ENDCASE => RETURN [none];
+};
+
+With0: PUBLIC PROC [tree: Tree, nodeName: MPTree.NodeName, action: PROC] RETURNS [BOOL] = {
+aNode: AttributedNode = NARROW[tree];
+WITH aNode.syntaxNode SELECT FROM
+node: REF MPTree.Node => {
+IF node.name = nodeName THEN {
+Assert[node.sonLimit-1=0, "Expecting 0 sons",, tree];
+recursionDepthLimit ¬ recursionDepthLimit - 1;
+action[];
+recursionDepthLimit ¬ recursionDepthLimit + 1;
+RETURN [TRUE];
+};
+};
+ENDCASE => NULL;
+RETURN [FALSE];
+};
+
+DoWith1: PUBLIC PROC [tree: Tree, action: PROC [REF]] = {
+[] ¬ With1[tree, GetNodeNameCode[tree], action];
+};
+
+With1: PUBLIC PROC [tree: Tree, nodeName: MPTree.NodeName, action: PROC [REF]] RETURNS [BOOL] = {
+aNode: AttributedNode = NARROW[tree];
+WITH aNode.syntaxNode SELECT FROM
+node: REF MPTree.Node => {
+IF node.name = nodeName THEN {
+Assert[node.sonLimit-1=1, "Expecting 1 son",, tree];
+recursionDepthLimit ¬ recursionDepthLimit - 1;
+action[node.son[1]];
+recursionDepthLimit ¬ recursionDepthLimit + 1;
+RETURN [TRUE];
+};
+};
+ENDCASE => NULL;
+RETURN [FALSE];
+};
+
+DoWith2: PUBLIC PROC [tree: Tree, action: PROC [REF, REF]] = {
+[] ¬ With2[tree, GetNodeNameCode[tree], action];
+};
+
+With2: PUBLIC PROC [tree: Tree, nodeName: MPTree.NodeName, action: PROC [REF, REF]] RETURNS [BOOL] = {
+aNode: AttributedNode = NARROW[tree];
+WITH aNode.syntaxNode SELECT FROM
+node: REF MPTree.Node => {
+IF node.name = nodeName THEN {
+Assert[node.sonLimit-1=2, "Expecting 2 sons",, tree];
+recursionDepthLimit ¬ recursionDepthLimit - 1;
+action[node.son[1], node.son[2]];
+recursionDepthLimit ¬ recursionDepthLimit + 1;
+RETURN [TRUE];
+};
+};
+ENDCASE => NULL;
+RETURN [FALSE];
+};
+
+DoWith3: PUBLIC PROC [tree: Tree, action: PROC [REF, REF, REF]] = {
+[] ¬ With3[tree, GetNodeNameCode[tree], action];
+};
+
+With3: PUBLIC PROC [tree: Tree, nodeName: MPTree.NodeName, action: PROC [REF, REF, REF]] RETURNS [BOOL] = {
+aNode: AttributedNode = NARROW[tree];
+WITH aNode.syntaxNode SELECT FROM
+node: REF MPTree.Node => {
+IF node.name = nodeName THEN {
+Assert[node.sonLimit-1=3 OR (node.sonLimit-1=2 AND nodeName = apply), "Expecting 3 sons",, tree];
+recursionDepthLimit ¬ recursionDepthLimit - 1;
+action[node.son[1], node.son[2], IF node.sonLimit-1 = 3 THEN node.son[3] ELSE NIL];
+recursionDepthLimit ¬ recursionDepthLimit + 1;
+RETURN [TRUE];
+};
+};
+ENDCASE => NULL;
+RETURN [FALSE];
+};
+
+DoWith4: PUBLIC PROC [tree: Tree, action: PROC [REF, REF, REF, REF]] = {
+[] ¬ With4[tree, GetNodeNameCode[tree], action];
+};
+
+With4: PUBLIC PROC [tree: Tree, nodeName: MPTree.NodeName, action: PROC [REF, REF, REF, REF]] RETURNS [BOOL] = {
+aNode: AttributedNode = NARROW[tree];
+WITH aNode.syntaxNode SELECT FROM
+node: REF MPTree.Node => {
+IF node.name = nodeName THEN {
+Assert[node.sonLimit-1=4, "Expecting 4 sons",, tree];
+recursionDepthLimit ¬ recursionDepthLimit - 1;
+action[node.son[1], node.son[2], node.son[3], node.son[4]];
+recursionDepthLimit ¬ recursionDepthLimit + 1;
+RETURN [TRUE];
+};
+};
+ENDCASE => NULL;
+RETURN [FALSE];
+};
+
+DoWith5: PUBLIC PROC [tree: Tree, action: PROC [REF, REF, REF, REF, REF]] = {
+[] ¬ With5[tree, GetNodeNameCode[tree], action];
+};
+
+With5: PUBLIC PROC [tree: Tree, nodeName: MPTree.NodeName, action: PROC [REF, REF, REF, REF, REF]] RETURNS [BOOL] = {
+aNode: AttributedNode = NARROW[tree];
+WITH aNode.syntaxNode SELECT FROM
+node: REF MPTree.Node => {
+IF node.name = nodeName THEN {
+Assert[node.sonLimit-1=5, "Expecting 5 sons",, tree];
+recursionDepthLimit ¬ recursionDepthLimit - 1;
+action[node.son[1], node.son[2], node.son[3], node.son[4], node.son[5]];
+recursionDepthLimit ¬ recursionDepthLimit + 1;
+RETURN [TRUE];
+};
+};
+ENDCASE => NULL;
+RETURN [FALSE];
+};
+
+DoWith6: PUBLIC PROC [tree: Tree, action: PROC [REF, REF, REF, REF, REF, REF]] = {
+[] ¬ With6[tree, GetNodeNameCode[tree], action];
+};
+
+With6: PUBLIC PROC [tree: Tree, nodeName: MPTree.NodeName, action: PROC [REF, REF, REF, REF, REF, REF]] RETURNS [BOOL] = {
+aNode: AttributedNode = NARROW[tree];
+WITH aNode.syntaxNode SELECT FROM
+node: REF MPTree.Node => {
+IF node.name = nodeName THEN {
+Assert[node.sonLimit-1=6, "Expecting 6 sons",, tree];
+recursionDepthLimit ¬ recursionDepthLimit - 1;
+action[node.son[1], node.son[2], node.son[3], node.son[4], node.son[5], node.son[6]];
+recursionDepthLimit ¬ recursionDepthLimit + 1;
+RETURN [TRUE];
+};
+};
+ENDCASE => NULL;
+RETURN [FALSE];
+};
+
+END. 
+  Ä  
+CrankOpsImpl.mesa
+Copyright Ó 1987, 1991 by Xerox Corporation.  All rights reserved.
+Michael Plass, March 23, 1993 11:17 am PST
+
+Attribute management
+It is questionable as to whether we should do this.
+Type-graph management
+IF t.ext = $ILLEGALRECURSION THEN ERROR;
+Symbol table management
+Tries to pull the range out of a numeric type.
+FieldProc: TYPE = PROC [fieldIndex: INT, fieldName: ROPE, fieldTypeCode: TypeCode, tagName: ROPE, tagTypeCode: TypeCode] RETURNS [quit: BOOL _ FALSE];
+A discriminated union; the tag becomes an ordinary field, hiding the union's field name, and the fields of the union become visible.
+overlaid variant record; all the fields are visible, but the tag is not.
+Attributed tree support
+GetID: PROC [tree: Tree] RETURNS [r: ROPE _ NIL] = {
+Identifier: PROC [id: ROPE] = {r _ id};
+IF GetNodeName[tree] = $ID THEN [] _ WithId[tree, Identifier];
+};
+IF Rope.Equal[qualifier, "Imager"] AND  Rope.Equal[GetID[tree], "VEC"] THEN [] _ Help[NIL,,tree];
+This is used for evaluation the values in machine-dependent types.  We restrict these a bit more than we ought, for simplicity.
+Many of the abstract productions allow either an item or list of items.  This enumerates them in either case.
+ Ê Õ  –(cedarcode) style•NewlineDelimiter
+™ code™Kšœ
+Ïeœ7™BK™*K™ —šÏk	œ&žœžœB˜ŒK˜ —KšÐlnœžœž˜Kšžœžœ%˜IKšžœ	˜šœžœžœ˜K˜ šžœžœžœ˜K˜ —šÏnœžœžœžœžœžœ˜7K˜ —š œžœžœžœ
+žœžœ	žœžœžœ˜hšžœžœžœ˜Kšœžœžœ˜%šžœ(žœž˜7˜Kšžœ(˜*Kšžœ˜KšžœE˜GK˜1K˜—Kšžœ˜—K˜K˜—K˜K˜ —š œžœžœ
+žœ	žœžœžœžœ
+žœžœ˜mKšžœžœÏc"˜PK˜——head™š
+ œžœžœžœ	žœ˜Mšžœžœžœžœ$žœžœž˜LKšžœžœžœ¡ ˜AKšžœ˜—Kšœžœžœ˜=K˜K˜ —š œžœžœžœžœ	žœ˜LKšœžœ˜&šžœžœžœžœ$žœžœž˜LKšžœžœžœ˜3Kšžœ˜—Kšžœžœ˜K˜K˜ —š
+ œžœžœžœ	žœ˜QK™3šžœžœžœžœ$žœžœž˜LKšžœžœžœ˜>Kšžœ˜—Kšžœ¡˜K˜K˜ —š
+ œžœžœžœžœ˜ZKšœžœžœ˜CK˜K˜ —š œžœžœžœžœžœ˜YKšžœžœžœ˜6šžœ#žœž˜2Kšœžœžœ˜!Kšžœžœ˜!—K˜K˜ —š
+ œžœžœžœžœ˜[šžœ=žœž˜LKšœžœžœ˜*Kšžœžœ˜5—Kšžœ˜K˜K˜ ——™š œžœžœžœ˜1K•StartOfExpansion&[mod: NAT _ 17, case: BOOL _ TRUE]šœžœRžœ˜uKšœ+¡L˜wKšžœ˜K˜K˜ —š œžœžœ$žœ˜WK˜'K–:[x: CardTab.Ref, key: CardTab.Key, val: CardTab.Val]˜CK˜K˜K˜ —š œžœžœ#žœžœžœ˜„Kšœ"žœ€˜¥Kšžœ˜K˜K˜ —š
+ œžœžœ+žœ$žœ˜„Kšœ"žœ}˜¢Kšžœ˜K˜K˜ —š
+ œžœžœ7žœžœ˜pKšœ"žœP˜uKšžœ˜K˜K˜ —š œžœžœ)žœ˜WKšœ"žœ8˜]Kšžœ˜K˜K˜ —š œžœžœ,žœ˜[K–&[x: CardTab.Ref, key: CardTab.Key]šžœžœ5˜CK˜K˜ —Kšœžœ˜š œžœžœ˜>šžœžœžœž˜"š œžœžœ˜AKšœžœžœžœžœžœ˜,K˜
+Kšœžœ˜%K˜—š œžœžœžœžœžœ˜BKš	œžœžœžœžœ˜šžœ(žœžœž˜>Kš	œžœžœžœžœ,˜DKšœžœ˜Kšžœ˜—K–[list: LIST OF REF ANY]šžœ˜K˜—š œžœžœžœžœžœ˜HKš	œžœžœžœžœ˜šžœ,žœžœž˜BKš	œžœžœžœžœ4˜LKšœžœ˜Kšžœ˜—K–[list: LIST OF REF ANY]šžœ˜K˜—š œžœžœžœ˜/K˜0Kš	œžœžœžœžœ˜Kšžœžœžœžœ˜"Kšžœžœžœ™(Kšžœ	žœžœžœ	˜#K˜K˜.šžœžœž˜Kšœžœžœ ˜DKšœžœ/˜5Kšœžœ!žœžœ˜fKšœžœ%˜+KšœžœB˜HKšœžœ$žœ˜Išœžœ˜Kšœžœ˜Kšœžœ˜Kšœžœ˜K˜—šœžœ˜Kšœžœ˜šžœžœžœ&žœžœž˜JKšœžœ˜Kšžœ˜—K˜Kšœžœ˜K˜—šœžœ˜Kšœžœ˜Kšœ
+žœ˜,K˜—šœžœ˜Kš	œžœžœžœžœ˜3Kšœ
+žœ.˜<K˜—šœžœ˜Kšœžœ9˜EK˜—Kšœžœžœ%˜Kšœžœ˜Kšœžœ˜Kšœžœ˜Kšœ
+žœ˜K˜—Kšœžœ%˜+Kšœžœžœ˜<Kšžœžœ˜—K˜.Kšžœ˜K˜—K˜Kšžœ˜—K˜K˜ —š œžœžœžœ˜)K˜GK˜K˜ —š œžœžœžœžœ,žœ˜yKšœžœ*˜0Kšžœžœžœžœ˜BK˜——™š œžœžœžœ˜7K˜3K˜K˜ —š œžœžœžœ˜:Kšžœžœžœžœ˜?Kšžœ
+˜K˜K˜ —š
+ œžœžœžœžœ˜Ošžœžœž˜*šœžœ˜%šžœ-žœž˜<Kšœžœžœ˜(Kšžœžœ˜—K˜—Kšžœžœ˜—Kšœžœ=˜IKšžœ˜K˜K˜ —š 	œžœžœ,žœ˜Tšž˜K˜3šžœžœž˜Kšœžœ/˜5Kšœžœ,˜2Kšžœžœ˜—Kšžœ˜—K˜K˜ —š œžœžœ,žœ˜Sšž˜K˜3šžœžœž˜Kšœžœ/˜5Kšœžœ,˜2Kšœžœ-˜3Kšžœžœ˜—Kšžœ˜—K˜K˜ —Kš œžœžœžœžœžœ˜0š  	œžœžœ žœ	žœžœ˜lK™.Kšœžœ˜%šžœžœž˜!šœžœ˜K˜Jšžœžœž˜šœžœ˜šžœ	ž˜Kšœžœ
+˜ Kšœžœ˜"Kšœžœ˜Kšœ
+žœ˜"Kšœ	žœžœžœžœžœ˜(Kšœ
+žœžœžœ¡%˜FKšžœ˜—K˜—šœ
+žœ˜#KšžœG˜MK˜—Kšžœ˜—K˜—Kšžœ˜—šœžœžœžœ9žœžœ˜VKšžœžœžœ˜K˜—K˜K˜ —Kšœžœžœžœžœ$žœžœžœžœ™–š œžœ?žœžœžœžœžœžœ˜žKšœžœ˜"šžœ(žœžœž˜>Kšœ	žœžœ˜K˜%šžœžœžœ˜šžœ,žœž˜;šœžœ˜K˜K˜šžœžœžœ˜šžœ(žœžœž˜;šžœžœžœ˜7K™„Kš
+žœYžœžœžœžœ˜ŽKšžœS˜YK˜—Kšžœ˜—K˜<Kšžœžœ˜K˜—šžœžœžœ˜K™Hšžœ(žœžœž˜;Kš
+žœ<žœ
+žœžœžœ˜^Kšžœ˜—K˜—K˜—šœžœ˜K˜K˜K˜—Kšžœžœ˜—K˜—Kšžœžœžœžœ˜¢K˜Kšžœ˜—Kšžœžœ˜K˜K˜ —š
+ œžœžœHžœžœ˜vKš	œžœžœžœžœ˜K˜šž˜šžœžœž˜)Kšœžœ%žœ(˜WKšœžœžœ?˜^Kšžœžœžœ˜3—Kšžœ˜—K˜K˜ —š
+ œžœžœ7žœžœ˜nK˜Kšœžœz˜”Kšžœ˜K˜K˜ —š 
+œžœžœžœ˜?Kš+œžœ&žœ
+žœžœžœ5žœ
+žœžœžœžœ#žœžœ
+žœžœžœžœ$žœ
+žœžœžœžœ˜áKšžœ˜K˜K˜ —š 	œžœžœžœ˜NK–1[x: SymTab.Ref, key: ROPE, val: SymTab.Val]˜lK˜K˜ —š œžœžœ-˜Ošžœ(žœžœž˜>šžœžœžœ˜Kšœ$žœNžœžœ˜“K˜—Kšžœ˜—K˜K˜ —š
+ œžœžœžœžœ˜Ušžœ&žœžœž˜<Kšœžœžœžœ˜K–[x: SymTab.Ref, key: ROPE]˜6Kšžœžœžœžœ˜"Kšžœ˜—Kšžœžœ/˜=K˜K˜ —š 
+œžœžœ3˜JKšœžœ0˜PK˜K˜ —š œžœžœ(žœ˜^šžœžœžœ:žœžœž˜^Kšžœžœžœ˜AKšžœ˜—Kšžœ˜K˜——™š
+ œžœžœžœžœ˜:Kšœžœ˜%šžœžœž˜!Kšœžœžœ˜Kšœžœžœ˜,Kšžœžœžœ8˜Q—K˜K˜ —š
+ œžœžœžœžœ™4Kš 
+œžœžœ™'Kšžœžœ™>K™—š œžœžœžœ˜EKšžœ!žœ!žœžœ™aKšžœžœžœžœ˜EK˜K˜ —Kšœžœžœžœ˜:š œžœžœ;žœžœžœžœžœ˜rK˜K˜9K˜"Kš	œžœžœžœžœ˜Kš	œžœžœžœžœ˜Kšœžœ˜šž˜šžœ%žœž˜4šœžœ˜K˜"K˜K˜—šœžœ˜Kšžœžœžœ˜)K˜K˜—šœžœ˜$K˜K˜&K˜—šœžœ˜Kšœžœ˜K˜K˜—šœžœ˜š	žœžœžœžœž˜FKšžœ!˜%Kšžœžœ˜
+—K˜—Kšžœžœ˜—Kšžœ˜—šžœžœ˜Kšœžœ˜šžœ$žœž˜3šœžœ˜K˜K˜—šœžœ˜K˜+K˜—šœžœ˜K˜+K˜—Kšžœžœ˜—K˜—Kšžœžœžœžœ˜?Kš
+žœžœžœžœžœ˜]Kšžœžœžœ˜:K˜K˜ —š œžœžœ žœžœžœ˜KKšœžœ˜K˜Kšžœžœ-˜7K˜K˜ —š œžœžœžœžœžœ	˜:šžœžœž˜Kšœžœžœžœ˜Kšœžœžœžœ˜Kšœžœžœžœ˜Kšœžœžœžœ˜Kšœžœžœžœ˜Kšœžœžœžœ˜Kšžœ˜—K˜6šžœžœž˜Kšœžœžœžœ˜Kšžœ˜—K˜K˜ —š
+ œžœžœ žœ
+žœ	˜\K™Kšœžœ˜%šžœ$žœž˜3Kšœžœžœžœ˜Kšœžœžœžœ˜Kšœžœžœžœ˜Kšœžœžœžœ˜Kšžœžœ˜—šžœžœž˜!šœžœ˜š
+ œžœ	žœžœžœ˜+Kšžœ.˜4Kšœ˜—Kšžœžœžœ˜.Kšžœžœžœ˜.Kšžœžœžœ˜4Kšžœžœžœ˜5Kšžœžœžœ˜5Kšžœžœžœ˜-Kšžœžœžœ˜-šžœžœ˜Kšžœ,˜2K˜—šžœžœ˜Kšžœ+˜1K˜—K˜—šœžœ˜šžœ
+žœž˜Kšœžœžœžœ˜Kšœžœžœžœ˜Kšœžœžœžœ˜Kšœžœžœžœ˜Kšœžœžœžœ˜Kšœžœžœžœ˜Kšžœžœ˜—K˜—Kšžœžœ˜—šœžœžœžœ3žœžœ˜PKšžœžœžœ˜K˜—K˜K˜ —š
+ œžœžœžœžœ˜;Kšœžœ˜%šžœžœž˜!Kšœžœžœžœžœžœ˜@Kšžœžœžœ:˜S—K˜K˜ —š
+ œžœžœžœžœ˜8Kšœžœ˜%Kšžœ˜K˜K˜ —š œžœžœžœ˜?K™mKšœžœ˜+Kšžœžœžœžœ˜ šžœžœž˜!šœžœ˜šžœžœ˜šžœžœžœž˜#K˜Kšžœ˜—Kšžœ˜K˜—K˜—Kšžœžœ˜—K˜.K˜K˜.K˜K˜ —š œžœžœžœžœžœžœ˜LKšœžœ˜%šžœžœž˜!Kšœžœžœžœ˜.Kšœžœ'žœžœ˜>Kšžœžœ˜—Kšžœžœ˜K˜K˜ —š œžœžœžœžœžœžœ˜eKšœžœ˜%šžœžœž˜!Kšœžœ"žœžœ˜9Kšžœžœ˜—Kšžœžœ˜K˜K˜ —š œžœžœžœ˜GKšœžœ˜%šžœžœž˜!Kšœžœžœ˜,Kšžœžœ˜—K˜K˜ —š œžœžœ1žœžœžœ˜[Kšœžœ˜%šžœžœž˜!šœžœ˜šžœžœ˜K˜5K˜.K˜	K˜.Kšžœžœ˜K˜—K˜—Kšžœžœ˜—Kšžœžœ˜K˜K˜ —š
+ œžœžœžœžœ˜9K˜0K˜K˜ —š œžœžœ1žœžœžœžœ˜aKšœžœ˜%šžœžœž˜!šœžœ˜šžœžœ˜K˜4K˜.K˜K˜.Kšžœžœ˜K˜—K˜—Kšžœžœ˜—Kšžœžœ˜K˜K˜ —š œžœžœžœžœžœ˜>K˜0K˜K˜ —š œžœžœ1žœžœžœžœžœ˜fKšœžœ˜%šžœžœž˜!šœžœ˜šžœžœ˜K˜5K˜.K˜!K˜.Kšžœžœ˜K˜—K˜—Kšžœžœ˜—Kšžœžœ˜K˜K˜ —š œžœžœžœžœžœžœ˜CK˜0K˜K˜ —š œžœžœ1žœžœžœžœžœžœ˜kKšœžœ˜%šžœžœž˜!šœžœ˜šžœžœ˜Kšœžœžœ/˜aK˜.Kš	œ!žœžœžœžœ˜SK˜.Kšžœžœ˜K˜—K˜—Kšžœžœ˜—Kšžœžœ˜K˜K˜ —š œžœžœžœžœžœžœžœ˜HK˜0K˜K˜ —š œžœžœ1žœžœžœžœžœžœžœ˜pKšœžœ˜%šžœžœž˜!šœžœ˜šžœžœ˜K˜5K˜.K˜;K˜.Kšžœžœ˜K˜—K˜—Kšžœžœ˜—Kšžœžœ˜K˜K˜ —š œžœžœžœžœžœžœžœžœ˜MK˜0K˜K˜ —š œžœžœ1žœžœžœžœžœžœžœžœ˜uKšœžœ˜%šžœžœž˜!šœžœ˜šžœžœ˜K˜5K˜.K˜HK˜.Kšžœžœ˜K˜—K˜—Kšžœžœ˜—Kšžœžœ˜K˜K˜ —š œžœžœžœžœžœžœžœžœžœ˜RK˜0K˜K˜ —š œžœžœ1žœžœžœžœžœžœžœžœžœ˜zKšœžœ˜%šžœžœž˜!šœžœ˜šžœžœ˜K˜5K˜.K˜UK˜.Kšžœžœ˜K˜—K˜—Kšžœžœ˜—Kšžœžœ˜K˜K˜ ——Kšžœ˜— …—    [^  €÷  

@@ -1,0 +1,485 @@
+DIRECTORY
+Alloc USING [addrSpan, Base, BaseSeq, Index, Notifier, OrderedIndex, Selector, TableInfo],
+MimZones USING [permZone],
+OSMiscOps USING [Copy, Fill],
+VM USING [AddressForPageNumber, Free, Interval, PagesForWords, PageNumberForAddress, SimpleAllocate, WordsForPages];
+AllocImpl: MONITOR LOCKS h.LOCK USING h: Handle
+IMPORTS MimZones, OSMiscOps, VM 
+EXPORTS Alloc = { OPEN Alloc;
+
+
+Handle: TYPE = REF InstanceData;
+
+InstanceData: PUBLIC TYPE = MONITORED RECORD [
+notifiers: NotifyChainHandle ¬ NIL,
+bases: REF BaseSeq,		-- tag codes subtracted
+offsets: REF OffsetSeq,		-- (shifted) tag codes
+vm: REF SpaceSeq,
+chunks: REF ChunkSeq,
+top: REF SizeSeq,		-- tag codes added
+limit: REF BoundSeq,		-- tag codes added
+vmPages: REF SizeSeq,
+maxPages: REF PageSeq,
+nTables: NAT];
+
+OffsetSeq: TYPE = RECORD [SEQUENCE length: NAT OF CARD];
+SizeSeq: TYPE = RECORD [SEQUENCE length: NAT OF CARD];
+Bound: TYPE = CARD;
+BoundSeq: TYPE = RECORD [SEQUENCE length: NAT OF Bound];
+PageCount: TYPE = CARD;
+PageSeq: TYPE = RECORD [SEQUENCE length: NAT OF PageCount];
+SpaceSeq: TYPE = RECORD [SEQUENCE length: NAT OF LocalInterval];
+ChunkSeq: TYPE = RECORD [SEQUENCE length: NAT OF ChunkHandle];
+
+unitsPerWord: NAT = WORD.SIZE;
+
+clearObjects: BOOL = TRUE;
+
+
+Failure: PUBLIC ERROR [h: Handle, table: Selector] = CODE;
+Overflow: PUBLIC SIGNAL [h: Handle, table: Selector] RETURNS [extra: CARD] = CODE;
+
+
+wordsPerPage: NAT = 256;
+unitsPerPage: NAT = wordsPerPage*unitsPerWord;
+LocalInterval: TYPE = RECORD [base: LONG POINTER ¬ NIL, units: CARD ¬ 0];
+
+UnitsForPages: PROC [pages: PageCount] RETURNS [CARD] = {
+units: CARD = CARD[pages]*unitsPerPage;
+RETURN [units];
+};
+
+PagesForUnits: PROC [units: CARD] RETURNS [PageCount] = {
+pages: CARD = CARD[units+unitsPerPage-1]/unitsPerPage;
+RETURN [pages];
+};
+
+AllocateVM: PROC [units: CARD] RETURNS [LocalInterval] = {
+words: CARD = units/unitsPerWord;
+vmInterval: VM.Interval ¬ VM.SimpleAllocate[VM.PagesForWords[words]];
+interval: LocalInterval ¬ [
+VM.AddressForPageNumber[vmInterval.page],
+VM.WordsForPages[vmInterval.count]*unitsPerWord];
+RETURN [interval];
+};
+
+FreeVM: PROC [interval: LocalInterval] = {
+IF interval.units # 0 THEN {
+vmInterval: VM.Interval ¬ [
+VM.PageNumberForAddress[interval.base],
+VM.PagesForWords[interval.units/unitsPerWord]
+];
+VM.Free[vmInterval];
+};
+};
+
+
+Units: PUBLIC ENTRY PROC [h: Handle, table: Selector, size: CARDINAL]
+RETURNS [x: OrderedIndex] = {
+ENABLE UNWIND => {};
+RETURN [UnitsInternal[h, table, size ! Failure => {GO TO Fail}]]
+EXITS Fail => {RETURN WITH ERROR Failure[h, table]}
+};
+
+UnitsInternal: INTERNAL PROC [h: Handle, table: Selector, size: CARDINAL]
+RETURNS [OrderedIndex] = {
+index: CARD = h.top[table];
+newTop: Bound = index + size;
+IF unitsPerWord # 1 AND (size MOD unitsPerWord) # 0 THEN ERROR;
+IF newTop > h.limit[table] THEN {
+IF newTop-h.offsets[table] > UnitsForPages[h.maxPages[table]] THEN
+ERROR Failure[h, table];
+GrowTable[h, table, newTop];
+};
+h.top[table] ¬ newTop;
+IF clearObjects THEN {
+ptr: LONG POINTER ¬ @h.bases[table][OrderedIndex.FIRST + index];
+OSMiscOps.Fill[ptr, size / unitsPerWord, 0];
+};
+RETURN [OrderedIndex.FIRST + index];
+};
+
+GrowTable: INTERNAL PROC [h: Handle, table: Selector, newTop: Bound] = {
+newPages: CARD = PagesForUnits[newTop-h.offsets[table]];
+IF newPages > h.vmPages[table] THEN {
+extra: CARD = MAX[newPages/2, 16];
+newVMPages: CARD = MIN[h.maxPages[table], newPages + extra];
+newVM: LocalInterval = AllocateVM[UnitsForPages[newVMPages]];
+oldVM: LocalInterval = h.vm[table];
+IF oldVM # [NIL, 0] THEN {
+OSMiscOps.Copy[
+from: oldVM.base, nwords: oldVM.units/unitsPerWord, to: newVM.base];
+FreeVM[oldVM];
+};
+h.vm[table] ¬ newVM;
+h.bases[table] ¬ LOOPHOLE[newVM.base-h.offsets[table]];
+h.limit[table] ¬ newVM.units+h.offsets[table];
+h.vmPages[table] ¬ newVMPages;
+RunNotifierChain[h];
+};
+};
+
+
+Chunk: TYPE = MACHINE DEPENDENT RECORD [
+free: BOOL,
+size: NAT15,
+pad: CARD16 ¬ 0,
+fLink: CIndex,
+bLink: CIndex
+];
+chunkSize: NAT = SIZE[Chunk];
+
+CIndex: TYPE = Base RELATIVE LONG POINTER TO Chunk;	-- tag codes added
+
+ChunkHandle: TYPE = REF ChunkObject;
+ChunkObject: TYPE = RECORD [
+chunkRover: CIndex,
+nullChunkIndex: CIndex,
+firstSmall: NAT,
+smallLists: SEQUENCE nSmall: NAT OF CIndex
+];
+
+GetChunk: PUBLIC ENTRY PROC
+[h: Handle, size: CARDINAL, table: Selector] RETURNS [Index] = {
+ENABLE UNWIND => {};
+ch: ChunkHandle = h.chunks[table];
+cb: Base = h.bases[table];
+q: CIndex ¬ ch.nullChunkIndex;
+IF ch = NIL THEN RETURN WITH ERROR Failure[h, table];
+size ¬ MAX[size, chunkSize];
+{
+IF size IN [ch.firstSmall..NAT[ch.firstSmall+ch.nSmall]) THEN { 
+offset: CARDINAL = size - ch.firstSmall;
+q ¬ ch.smallLists[offset];
+IF q # ch.nullChunkIndex THEN {ch.smallLists[offset] ¬ cb[q].fLink; GO TO old};
+};
+q ¬ GetRoverChunk[cb, h.top[table], ch, size];
+IF q # ch.nullChunkIndex THEN GO TO old;
+{
+q ¬ UnitsInternal[h: h, table: table, size: size ! Failure => GO TO oops];
+EXITS oops => {
+FOR s: NAT IN [ch.firstSmall.. ch.firstSmall+ch.nSmall) DO
+offset: NAT = s - ch.firstSmall;
+r: CIndex ¬ ch.smallLists[offset];
+WHILE r # ch.nullChunkIndex DO
+next: CIndex = cb[r].fLink;
+FreeRoverChunk[cb, ch, r, s];
+r ¬ next;
+ENDLOOP;
+ch.smallLists[offset] ¬ ch.nullChunkIndex;
+ENDLOOP;
+q ¬ GetRoverChunk[cb, h.top[table], ch, size];
+IF q # ch.nullChunkIndex THEN GO TO old;
+RETURN WITH ERROR Failure[h, table];
+};
+};
+EXITS
+old => IF clearObjects THEN {
+ptr: LONG POINTER ¬ @h.bases[table][q];
+OSMiscOps.Fill[ptr, size / unitsPerWord, 0];
+};
+};
+IF LOOPHOLE[FALSE, CARDINAL] # 0 OR NOT clearObjects THEN
+h.bases[table][q].free ¬ FALSE;
+RETURN [q];
+};
+
+GetRoverChunk: INTERNAL PROC
+[cb: Base, top: Bound, ch: ChunkHandle, size: CARDINAL] RETURNS [Index] = {
+p, q, next: CIndex;
+nodeSize: INTEGER;
+n: INTEGER;
+{
+IF (p ¬ ch.chunkRover) = ch.nullChunkIndex THEN GO TO notFound;
+DO
+nodeSize ¬ cb[p].size;
+WHILE CARD[(next ¬ p + nodeSize) - CIndex.FIRST] # top AND cb[next].free DO
+cb[cb[next].bLink].fLink ¬ cb[next].fLink;
+cb[cb[next].fLink].bLink ¬ cb[next].bLink;
+cb[p].size ¬ nodeSize ¬ nodeSize + cb[next].size;
+ch.chunkRover ¬ p; -- in case next = chunkRover
+ENDLOOP;
+SELECT (n ¬ nodeSize-size) FROM
+= 0 => {
+IF cb[p].fLink = p
+THEN ch.chunkRover ¬ ch.nullChunkIndex
+ELSE {
+ch.chunkRover ¬ cb[cb[p].bLink].fLink ¬ cb[p].fLink;
+cb[cb[p].fLink].bLink ¬ cb[p].bLink;
+};
+q ¬ p;
+GO TO found;
+};
+>= chunkSize => {
+cb[p].size ¬ n;
+ch.chunkRover ¬ p;
+q ¬ p + n;
+GO TO found;
+};
+ENDCASE;
+IF (p ¬ cb[p].fLink) = ch.chunkRover THEN GO TO notFound;
+ENDLOOP;
+EXITS
+found => NULL;
+notFound => q ¬ ch.nullChunkIndex;
+};
+RETURN [q];
+};
+
+neverFree: BOOL ¬ FALSE;
+FreeChunk: PUBLIC ENTRY PROC [h: Handle, index: Index, size: CARDINAL, table: Selector] = {
+ENABLE UNWIND => {};
+ch: ChunkHandle = h.chunks[table];
+cb: Base = h.bases[table];
+p: CIndex = LOOPHOLE[index];
+IF ch = NIL THEN RETURN WITH ERROR Failure[h, table];
+IF neverFree THEN RETURN;
+cb[p].size ¬ size ¬ MAX[size, chunkSize];
+IF size IN [ch.firstSmall..NAT[ch.firstSmall+ch.nSmall])
+THEN {
+offset: NAT = size - ch.firstSmall;
+cb[p].fLink ¬ ch.smallLists[offset];
+ch.smallLists[offset] ¬ p;
+cb[p].bLink ¬ ch.nullChunkIndex; -- note, only singly linked
+}
+ELSE FreeRoverChunk[cb, ch, index, size];
+};
+
+FreeRoverChunk: INTERNAL PROC
+[cb: Base, ch: ChunkHandle, index: Index, size: CARDINAL] = {
+p: CIndex = LOOPHOLE[index];
+cb[p].size ¬ size ¬ MAX[size, chunkSize];
+IF ch.chunkRover = ch.nullChunkIndex
+THEN
+ch.chunkRover ¬ cb[p].fLink ¬ cb[p].bLink ¬ p
+ELSE {
+rover: CIndex = ch.chunkRover;
+cb[p].fLink ¬ cb[rover].fLink;
+cb[cb[p].fLink].bLink ¬ p;
+cb[p].bLink ¬ rover;
+cb[rover].fLink ¬ p};
+cb[p].free ¬ TRUE;
+};
+
+
+Bounds: PUBLIC ENTRY PROC [h: Handle, table: Selector] RETURNS [base: Base, size: CARD] = {
+RETURN [h.bases[table], h.top[table]-h.offsets[table]];
+};
+
+Top: PUBLIC ENTRY PROC [h: Handle, table: Selector] RETURNS [OrderedIndex] = {
+RETURN [OrderedIndex.FIRST + h.top[table]];
+};
+
+Bias: PUBLIC ENTRY PROC [h: Handle, table: Selector] RETURNS [CARD] = {
+RETURN [h.offsets[table]];
+};
+
+
+Create: PUBLIC PROC
+[weights: DESCRIPTOR FOR ARRAY OF TableInfo] RETURNS [h: Handle] = {
+cnt: CARDINAL = weights.LENGTH;
+h ¬ MimZones.permZone.NEW[InstanceData ¬ [
+nTables: cnt,
+notifiers: NIL,
+bases: MimZones.permZone.NEW[BaseSeq[cnt]],
+offsets: MimZones.permZone.NEW[OffsetSeq[cnt]],
+vm: MimZones.permZone.NEW[SpaceSeq[cnt]],
+chunks: MimZones.permZone.NEW[ChunkSeq[cnt]],
+top: MimZones.permZone.NEW[SizeSeq[cnt]],
+limit: MimZones.permZone.NEW[BoundSeq[cnt]],
+vmPages: MimZones.permZone.NEW[SizeSeq[cnt]],
+maxPages: MimZones.permZone.NEW[PageSeq[cnt]]]];
+FOR i: CARDINAL IN [0..cnt) DO InitTable[h, i, weights[i]] ENDLOOP;
+};
+
+InitTable: PROC [h: Handle, table: Selector, info: TableInfo] = {
+base: Base ¬ NIL;
+units: CARD ¬ 0;
+interval: LocalInterval ¬ h.vm[table];
+iPages: CARD = info.initialPages;
+h.maxPages[table] ¬ MIN[CARD[info.maxPages], CARD[PagesForUnits[addrSpan]]];
+IF iPages > h.maxPages[table] THEN ERROR Failure[h, table];
+IF iPages*unitsPerPage > interval.units THEN {
+h.vm[table] ¬ [];
+FreeVM[interval];
+interval ¬ AllocateVM[UnitsForPages[iPages]];
+h.vm[table] ¬ interval;
+h.vmPages[table] ¬ iPages;
+};
+h.offsets[table] ¬ info.tag*addrSpan;
+h.top[table] ¬ 0 + h.offsets[table];
+h.limit[table] ¬ interval.units + h.offsets[table];
+h.bases[table] ¬ LOOPHOLE[interval.base - h.offsets[table]];
+h.chunks[table] ¬ NIL;
+};
+
+ResetTable: PUBLIC ENTRY PROC [h: Handle, table: Selector, info: TableInfo] = {
+ENABLE UNWIND => {};
+InitTable[h, table, info];
+RunNotifierChain[h];
+};
+
+Destroy: PUBLIC ENTRY PROC [h: Handle] = {
+ENABLE UNWIND => {};
+FOR i: NAT IN [0..h.nTables) DO h.bases[i] ¬ Base.NIL-h.offsets[i] ENDLOOP;
+RunNotifierChain[h];
+FOR i: NAT IN [0..h.nTables) DO
+interval: LocalInterval = h.vm[i];
+IF interval # [] THEN {
+h.vm[i] ¬ [];
+h.vmPages[i] ¬ 0;
+FreeVM[interval];
+};
+ENDLOOP;
+};
+
+Reset: PUBLIC ENTRY PROC [h: Handle] = {
+ENABLE UNWIND => {};
+FOR i: NAT IN [0..h.nTables) DO 
+h.top[i] ¬ 0 + h.offsets[i];
+ResetChunkInternal[h, i];
+ENDLOOP;
+};
+
+Chunkify: PUBLIC ENTRY PROC [h: Handle, table: Selector, firstSmall, nSmall: NAT] = {
+ENABLE UNWIND => {};
+ch: ChunkHandle ¬ h.chunks[table];
+IF ch # NIL THEN RETURN WITH ERROR Failure[h, table];
+ch ¬ MimZones.permZone.NEW[ChunkObject[nSmall]];
+ch.firstSmall ¬ firstSmall;
+ch.nullChunkIndex ¬ CIndex.FIRST + h.offsets[table];	-- set tag
+h.chunks[table] ¬ ch;
+ResetChunkInternal[h, table];
+};
+
+UnChunkify: PUBLIC ENTRY PROC [h: Handle, table: Selector] = {
+ENABLE UNWIND => {};
+h.chunks[table] ¬ NIL;
+};
+
+Trim: PUBLIC ENTRY PROC [h: Handle, table: Selector, size: CARD] = {
+ENABLE UNWIND => {};
+newTop: CARD = size + h.offsets[table];
+IF newTop <= h.top[table]
+THEN {h.top[table] ¬ newTop; ResetChunkInternal[h, table]}
+ELSE RETURN WITH ERROR Failure[h, table];
+};
+
+ResetChunk: PUBLIC ENTRY PROC [h: Handle, table: Selector] = {
+ResetChunkInternal[h, table ! UNWIND => {}];
+};
+
+ResetChunkInternal: INTERNAL PROC [h: Handle, table: Selector] = {
+ch: ChunkHandle = h.chunks[table];
+IF ch # NIL THEN {
+ch.chunkRover ¬ ch.nullChunkIndex;
+FOR i: NAT IN [0..ch.nSmall) DO ch.smallLists[i] ¬ ch.nullChunkIndex ENDLOOP;
+}
+};
+
+
+NotifyNode: TYPE = RECORD [notifier: Notifier, link: NotifyChainHandle];
+NotifyChainHandle: TYPE = REF NotifyNode;
+
+AddNotify: PUBLIC ENTRY PROC [h: Handle, proc: Notifier] = {
+ENABLE UNWIND => {};
+p: NotifyChainHandle = MimZones.permZone.NEW[NotifyNode ¬
+[notifier: proc, link: h.notifiers]];
+h.notifiers ¬ p;
+proc[h.bases];
+};
+
+DropNotify: PUBLIC ENTRY PROC [h: Handle, proc: Notifier] = {
+ENABLE UNWIND => {};
+IF h.notifiers # NIL THEN {
+p: NotifyChainHandle ¬ h.notifiers;
+IF p.notifier = proc
+THEN h.notifiers ¬ p.link
+ELSE
+DO
+lag: NotifyChainHandle ¬ p;
+p ¬ p.link;
+IF p = NIL THEN RETURN;
+IF p.notifier = proc THEN {lag.link ¬ p.link; EXIT};
+ENDLOOP;
+MimZones.permZone.FREE[@p];
+};
+};
+
+RunNotifierChain: INTERNAL PROC [h: Handle] = {
+FOR p: NotifyChainHandle ¬ h.notifiers, p.link UNTIL p = NIL DO
+p.notifier[h.bases];
+ENDLOOP
+};
+
+}.
+
+  ¬  
+AllocImpl.mesa
+Copyright Ó 1985, 1986, 1987, 1988, 1989, 1991 by Xerox Corporation.  All rights reserved.
+Sweet, 19-Aug-81 12:15:12
+Satterthwaite, June 10, 1986 3:02:12 pm PDT
+Russ Atkinson (RRA) July 11, 1989 2:06:34 pm PDT
+JKF October 13, 1988 12:34:28 pm PDT
+
+types
+signals
+VM utilities
+Don't use the VM page size since that can cause funny swings in the amount allocated.
+
+stack allocation from subzones
+No one should ask to be put on a non-word boundary!
+linked list allocation
+A new object which does not need to be cleared.
+none the right size, no space at the end, and no big ones to split
+now all possible merges of free nodes can happen
+Old object needs to be cleared
+RRA: just to be silly.  FALSE had better be 0!
+search for a chunk to allocate
+Useful for debugging
+don't set cb[p].free _ TRUE; to avoid coalescing nodes
+queries
+initialization, expansion and termination
+We need to allocate a new interval
+Notifier stuff
+ Ê  •NewlineDelimiter
+–(cedarcode) style™ codešœ™Kšœ
+ÏeœO™ZKšÏy™Kšž+™+J™0K™$K™ šÏk	˜	KšœŸœO˜ZKšœ	Ÿœ˜Kšœ
+Ÿœ˜KšŸœŸœl˜t——headš
+Ïn	œŸœŸœŸœŸœ
+˜/KšŸœŸœ˜ KšŸœŸœ˜K˜ —Kšœ™˜ KšœŸœŸœ˜ K˜ š	œŸœŸœŸ	œŸœ˜.KšœŸœ˜#KšœŸœÏc˜,Kšœ	Ÿœ¡˜/KšœŸœ
+˜KšœŸœ
+˜KšœŸœ¡˜%KšœŸœ¡˜(Kšœ	Ÿœ	˜Kšœ
+Ÿœ	˜Kšœ	Ÿœ˜K˜ —KšœŸœŸœŸœ	ŸœŸœŸœ˜8Kšœ	ŸœŸœŸœ	ŸœŸœŸœ˜6KšœŸœŸœ˜Kšœ
+ŸœŸœŸœ	ŸœŸœ˜8KšœŸœŸœ˜Kšœ	ŸœŸœŸœ	ŸœŸœ˜;Kšœ
+ŸœŸœŸœ	ŸœŸœ˜@Kšœ
+ŸœŸœŸœ	ŸœŸœ˜>K˜ KšœŸœŸœŸœ˜K˜ KšœŸœŸœ˜K˜ —šœ™K˜ Kš œŸœŸœ Ÿœ˜:Kš œŸœŸœŸœ	ŸœŸœ˜RK˜ —™K˜ KšœŸœ˜šœŸœ˜.K™UK™ —šœŸœŸœŸœŸœŸœ	Ÿœ˜IK˜ —š œŸœŸœŸœ˜9KšœŸœŸœ˜'KšŸœ	˜Kšœ˜K˜ —š œŸœ	ŸœŸœ˜9KšœŸœŸœ$˜6KšŸœ	˜Kšœ˜K˜ —š 
+œŸœ	ŸœŸœ˜:KšœŸœ˜!KšœŸœŸœ˜Ešœ˜KšŸœ'˜)KšŸœ/˜1—KšŸœ˜K˜K˜ —š œŸœ˜*šŸœŸœ˜šœŸœ˜KšŸœ%˜'KšŸœ+˜-Kšœ˜—KšŸœ˜K˜—K˜K˜ ——Kšœ™˜ š œŸœŸœŸœ$ŸœŸœ˜cKšŸœŸœ˜KšŸœ-ŸœŸœ˜@KšŸœ
+ŸœŸœŸœ˜3K˜K˜ —š
+ œŸœŸœ$ŸœŸœ˜dKšœŸœ˜Kšœ˜š
+ŸœŸœŸœŸœŸœ˜?K™3—šŸœŸœ˜!šŸœ<Ÿ˜BKšŸœ˜—K˜K˜—K˜šŸœŸœ˜KšœŸœŸœ Ÿœ
+˜@Kšœ,˜,K˜—KšŸœŸœ
+˜$Kšœ˜K˜ —š 	œŸœŸœ0˜HKšœ
+Ÿœ*˜8šŸœŸœ˜%KšœŸœŸœ˜"KšœŸœŸœ&˜<Kšœ=˜=Kšœ#˜#šŸœ
+ŸœŸœ˜KšœT˜TKšœ˜Kšœ˜—Kšœ˜KšœŸœ˜7Kšœ.˜.Kšœ˜Kšœ˜Kšœ˜—Kšœ˜K˜ ——šœ™K˜ š	œŸœŸœŸ	œŸœ˜(KšœŸœ˜KšœŸœ˜KšœŸœ˜K˜K˜K˜KšœŸœŸœ˜K˜ —KšœŸœŸœŸœŸœŸœ¡˜FK˜ KšœŸœŸœ˜$šœŸœŸœ˜Kšœ˜Kšœ˜KšœŸœ˜KšœŸœ	ŸœŸœ˜*Kšœ˜K˜ —š œŸœŸœŸœŸœŸœ˜\KšŸœŸœ˜K˜"K˜Kšœ˜KšŸœŸœŸœŸœ˜5KšœŸœ˜šœ˜šŸœŸœŸœŸœ˜@KšœŸœ˜(K˜KšŸœŸœ'ŸœŸœ˜OKšœ˜—K˜.KšŸœŸœŸœŸœ˜(˜Kšœ>ŸœŸœ˜JK™/šŸœ
+˜KšœB™BšŸœŸœŸœ+Ÿ˜:KšœŸœ˜ K˜"šŸœŸ˜K˜K˜K˜	KšŸœ˜—K˜*KšŸœ˜—Kšœ0™0K˜.KšŸœŸœŸœŸœ˜(KšŸœŸœŸœ˜$Kšœ˜—K˜—šŸ˜šœŸœŸœ˜K™KšœŸœŸœ˜'Kšœ,˜,Kšœ˜——Kšœ˜—šŸœŸœŸœŸœŸœŸœŸ˜9K™.KšœŸœ˜—KšŸœ˜Kšœ˜K˜ —š
+ œŸ	œŸœ.ŸœŸœ˜hK˜Kšœ
+Ÿœ˜KšœŸœ˜šœ˜KšŸœ)ŸœŸœŸœ
+˜?Kšœ™šŸ˜K˜š	ŸœŸœ ŸœŸœŸ˜KK˜*K˜*K˜1Kšœ¡˜/KšŸœ˜—šŸœŸ˜˜šŸœ˜KšŸœ"˜&šŸœ˜K˜4K˜$K˜——K˜KšŸœŸœ˜Kšœ˜—šœ˜Kšœ˜Kšœ˜Kšœ
+˜
+KšŸœŸœ˜Kšœ˜—KšŸœ˜—KšŸœ#ŸœŸœŸœ
+˜9KšŸœ˜—šŸ˜Kšœ	Ÿœ˜K˜"—Kšœ˜—KšŸœ˜Kšœ˜K˜ —šœŸœŸœ˜K™—š
+ 	œŸœŸœŸœ!Ÿœ˜[KšŸœŸœ˜K˜"K˜KšœŸœ˜KšŸœŸœŸœŸœ˜5KšŸœŸœŸœ˜KšœŸœ˜)šŸœŸœŸœ˜8šŸœ˜KšœŸœ˜#K˜$K˜Kšœ6™6Kšœ!¡˜<Kšœ˜—KšŸœ%˜)—Kšœ˜K˜ —š œŸœŸœ0Ÿœ˜[KšœŸœ˜KšœŸœ˜)šŸœ"˜$šŸ˜Kšœ-˜-—šŸœ˜K˜K˜K˜K˜K˜——KšœŸœ˜Kšœ˜K˜ ——Kšœ™˜ š œŸœŸœŸœŸœŸœ˜[KšŸœ1˜7Kšœ˜K˜ —š
+ œŸœŸœŸœŸœ˜NKšŸœŸœ˜+Kšœ˜K˜ —š œŸœŸœŸœŸœŸœ˜GKšŸœ˜Kšœ˜K˜ ——šœ)™)K˜ š œŸœŸœ
+Ÿ
+œŸœŸœŸœŸœ˜XKšœŸœŸœ˜šœŸœ˜*K˜KšœŸœ˜KšœŸœ˜+KšœŸœ˜/KšœŸœ˜)KšœŸœ˜-KšœŸœ˜)KšœŸœ˜,KšœŸœ˜-KšœŸœ˜0—Kš
+ŸœŸœŸœ
+ŸœŸœ˜Cšœ˜K˜ ——š 	œŸœ2˜AKšœŸœ˜KšœŸœ˜Kšœ&˜&KšœŸœ˜!KšœŸœŸœŸœ˜LKšŸœŸœŸœ˜;šŸœ%Ÿœ˜.K™"Kšœ˜Kšœ˜Kšœ-˜-Kšœ˜Kšœ˜K˜—Kšœ%˜%Kšœ$˜$Kšœ3˜3KšœŸœ#˜<KšœŸœ˜šœ˜K˜ ——š 
+œŸœŸœŸœ2˜OKšŸœŸœ˜K˜K˜K˜K˜ —š œŸœŸœŸœ˜*KšŸœŸœ˜KšŸœŸœŸœŸœŸœŸœ˜KK˜šŸœŸœŸœŸ˜Kšœ"˜"šŸœŸœ˜Kšœ˜Kšœ˜Kšœ˜Kšœ˜—KšŸœ˜—Kšœ˜K˜ —š œŸœŸœŸœ˜(KšŸœŸœ˜šŸœŸœŸœŸœ˜ K˜K˜KšŸœ˜—šœ˜K˜ ——š
+ œŸœŸœŸœ2Ÿœ˜UKšŸœŸœ˜K˜"KšŸœŸœŸœŸœ˜5KšœŸœ˜0K˜KšœŸœ¡
+˜?K˜K˜K˜K˜ —š 
+œŸœŸœŸœ!˜>KšŸœŸœ˜KšœŸœ˜Kšœ˜K˜ —š
+ œŸœŸœŸœ$Ÿœ˜DKšŸœŸœ˜KšœŸœ˜'šŸœ˜KšŸœ6˜:KšŸœŸœŸœŸœ˜)—Kšœ˜K˜ —š 
+œŸœŸœŸœ!˜>KšœŸœ˜,Kšœ˜K˜ —š œŸœŸœ!˜BK˜"šŸœŸœŸœ˜K˜"Kš
+ŸœŸœŸœŸœ&Ÿœ˜MKšœ˜—Kšœ˜K˜ ——šœ™K˜ KšœŸœŸœ/˜HKšœŸœŸœ˜)K˜ š 	œŸœŸœŸœ ˜<KšŸœŸœ˜Kšœ)Ÿœ3˜_K˜Kšœ˜Kšœ˜K˜ —š 
+œŸœŸœŸœ ˜=KšŸœŸœ˜šŸœŸœŸœ˜K˜#šŸœ˜KšŸœ˜šŸ˜šŸ˜K˜K˜KšŸœŸœŸœŸœ˜KšŸœŸœŸœ˜4KšŸœ˜———KšœŸœ˜Kšœ˜—šœ˜K˜ ——š œŸœŸœ˜/šŸœ,ŸœŸœŸ˜?Kšœ˜KšŸ˜—šœ˜K˜ ———˜K˜ —— …—    .T  C  

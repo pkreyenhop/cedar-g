@@ -1,0 +1,1605 @@
+
+DIRECTORY
+AmpersandContext USING[CreateAnAmpersandContext, MakeNodeFromNode, StripAMNode],
+Atom USING [GetPName],
+Basics USING[BITLSHIFT, BITOR, BITRSHIFT],
+BasicTime USING[Now],
+CCTypes USING[CCError, CCErrorCase, CreateCedarCompilerContext, CreateNodeFromRefAny],
+CedarCode USING[GetNodeRepresentation, GetTypeOfNode, LoadThroughIndirectNode, SelectFieldFromNode, StoreThroughIndirectNode],
+CirioBackstop USING[Protect],
+CirioBreakAccess USING[CirioBreakSet, CreateCirioBreakSet, ClearAllBreaks, ClearBreakAtAbsAddr, ClearBreakAtIndex, ListBreaks, SetBreakAtAbsAddr, BreakSetBroken],
+CirioDeltaFace USING[IsDMachine],
+CirioNub USING [Error],
+CirioNubAccess USING[CreateRemoteNub, DbgMsgNone, DbgMsgNoHandlerRequest, DbgMsgHandlerRequest, DbgMsgAbort, DbgMsgBadProceedRequest, DbgMsgBreakRequest, DbgMsgClientRequest, DbgMsgExit, DbgMsgProceed, DestroyNub, Error, FileEntry, GetFileEntry, GetThreads, Handle, IssueThreadCommand, KillWorld, LookupSymEntryByName, LookupSymEntryByValue, LookupSymEntryByID, Null, PCInfo, PCtoInfo, Read32BitsAsCard, SchedStateFree, SchedStateReady, SchedStateRun, SchedStateWaitML, SchedStateWaitCV, SchedStateHandlee, SetDBStat, SymEntry, ThreadInfo, WaitSig],
+CirioTargets USING[Target],
+CirioTypes USING[CirioAddress, CirioAddressBody, CompilerContext, Node, Type],
+Commander USING[CommandProc, Register],
+CommanderOps USING[ArgumentVector, Parse],
+Convert USING[CardFromRope, RopeFromCard],
+FileNames USING[CurrentWorkingDirectory],
+IO USING[card, char, Close, Error, PutF, PutF1, PutFLR, PutFR1, PutRope, RopeFromROS, ROS, rope, STREAM],
+LoadStateAccess USING[CreateLoadStateHandle, LoadStateHandle],
+LocalCirio USING[Connection, ExtractCcFromConnection, GetConnection, nilBreakDest],
+NewAmpersandProcs USING[Handle, HandleBody, InstallItems],
+NewRMTW USING[CedarModuleSet, CreateCedarModuleSet, CreateRemoteMimosaTargetWorld, FlushUnknownFileCache, FlushUnknownSymbolCache, FlushUnknownTypeCodes, RemoteMimosaTargetWorld, ResetSearchPaths],
+ObjectFiles USING[CreateParsed, GetLineNumForPC, GetPCForLineNum, Module, ModuleFromParsedAndPC, Parsed],
+OneCasabaParser USING[ParserTable],
+PFS USING [AbsoluteName, RopeFromPath, PathFromRope],
+PFSNames USING [PATH, Equal],
+Process USING [Detach, PauseMsec, priorityBackground, SetPriority],
+RemoteCirio USING[ThreadProperty],
+Rope USING[Cat, Concat, Equal, FromChar, Length, Map, Substr, ROPE],
+SourceFileOps USING [OpenSource, Position],
+StackCirio USING[FrameDiagnosticInfo, InterpretTextLine, NoteFileCacheFlush, OpenDummyStack, OpenStack, QuickGenPossibleModuleNames, ResetStack, ShowCurrentFrame, ShowQuickSummary, Stack, WalkStack, WalkStackToCProcedure],
+SystemInterface USING [ShowReport, CloseFileSet, CirioFile, CreateFileSet, FileSet, GetCirioFileFromDebuggee];
+
+RemoteCirioImpl: CEDAR MONITOR
+LOCKS connection USING connection: Connection
+IMPORTS AmpersandContext, Atom, Basics, BasicTime, CCTypes, CedarCode, CirioBackstop, CirioBreakAccess, CirioDeltaFace, CirioNub, CirioNubAccess, Commander, CommanderOps, Convert, FileNames, IO, LoadStateAccess, LocalCirio, NewAmpersandProcs, NewRMTW, ObjectFiles, PFS, PFSNames, Process, Rope, SourceFileOps, StackCirio, SystemInterface
+EXPORTS RemoteCirio =
+BEGIN OPEN ObjF: ObjectFiles, LSA: LoadStateAccess;
+
+
+DebugFlag: BOOLEAN ¨ FALSE;
+
+CC: TYPE = CirioTypes.CompilerContext;
+CCE: ERROR[case: CCTypes.CCErrorCase, msg: Rope.ROPE ¨ NIL] ¨ CCTypes.CCError;
+
+Connection: TYPE = REF ConnectionBody;
+ConnectionBody: PUBLIC TYPE = MONITORED RECORD[
+open: BOOLEAN,
+doradoWorkingDirectory: Rope.ROPE,
+serverName: Rope.ROPE,
+searchDirectories: LIST OF PFSNames.PATH,
+tsOut: IO.STREAM, -- WARNING: this field is very transient.  It is only valid during an interpretation of an expression, and was placed here for the convenience of ampersand routines and (local target wrld) user routines called through the interpreter.
+ampersandContext1: CirioTypes.Node,
+ampersandContext2: CirioTypes.Node,
+cc, localCc: CC,
+localConnection: LocalCirio.Connection,
+rmtw: NewRMTW.RemoteMimosaTargetWorld,
+cedarModules: NewRMTW.CedarModuleSet,
+nub: CirioNubAccess.Handle,
+target: CirioTargets.Target,
+daemon: PROCESS,
+daemonKillFlag: BOOLEAN,
+breaks: CirioBreakAccess.CirioBreakSet,
+fileSet: SystemInterface.FileSet,
+lsh: LoadStateAccess.LoadStateHandle,
+aph: NewAmpersandProcs.Handle,
+cParserTable: OneCasabaParser.ParserTable,
+remoteWorldRunning: BOOLEAN ¨ TRUE,
+dbxActive: BOOLEAN ¨ FALSE,
+currentThread: CARD ¨ 0,
+threads: REF ThreadSet];
+
+ThreadSet: TYPE = RECORD[SEQUENCE nThreads: CARDINAL OF REF ThreadData];
+ThreadData: TYPE = RECORD[
+thread: REF CirioNubAccess.ThreadInfo,
+stack: StackCirio.Stack
+];
+
+
+OpenConnection: PUBLIC PROC[remoteName: Rope.ROPE, portNum: CARD, workingDirectories: LIST OF Rope.ROPE, reports: IO.STREAM] RETURNS[connection: Connection] = {
+outerMsg: Rope.ROPE ¨ CirioBackstop.Protect[Openit, reports];
+Openit: PROC RETURNS[Rope.ROPE] ~ {
+connection ¨ FunctionalOpen[];
+RETURN[NIL]};
+FunctionalOpen: PROC RETURNS[Connection] ~ {
+nub: CirioNubAccess.Handle ¨ NIL;
+target: CirioTargets.Target ¨ NIL;
+fileSet: SystemInterface.FileSet;
+breaks: CirioBreakAccess.CirioBreakSet;
+searchDirs: LIST OF PFSNames.PATH ¨ NIL;
+lastSearchDir: LIST OF PFSNames.PATH ¨ NIL;
+defaultSearchDirs: LIST OF PFSNames.PATH ¨ LIST[
+PFS.PathFromRope["/PCedar/Cirio/"],
+PFS.PathFromRope["/PCedar/CirioThings/"],
+PFS.PathFromRope["/PCedar/Atom/"],
+PFS.PathFromRope["/PCedar/Rope/"] ];
+ClearBreaksForOpen: PROC RETURNS[Rope.ROPE] = {
+CirioBreakAccess.ClearAllBreaks[breaks];
+RETURN[NIL]};
+
+searchDirs ¨ LIST [PFS.PathFromRope["-compiled:/CirioCompiledData/"]];
+lastSearchDir ¨ searchDirs;
+FOR thisDir: LIST OF Rope.ROPE ¨ workingDirectories, thisDir.rest WHILE thisDir # NIL DO
+lastSearchDir.rest ¨ LIST [PFS.AbsoluteName[PFS.PathFromRope[thisDir.first]]];
+lastSearchDir ¨ lastSearchDir.rest;
+ENDLOOP;
+
+lastSearchDir.rest ¨ defaultSearchDirs;
+
+nub ¨ CirioNubAccess.CreateRemoteNub[debuggee: remoteName, port: portNum, timeoutMsec: 10000
+!CirioNub.Error => {
+reports.PutF["Failed to open DebugNub connection to port %g on %g.\n", [cardinal[portNum]], [rope[remoteName]] ];
+CONTINUE}];
+IF nub=NIL THEN RETURN [NIL];
+target ¨ NARROW[nub.target];
+
+fileSet ¨ SystemInterface.CreateFileSet[];
+breaks ¨ CirioBreakAccess.CreateCirioBreakSet[nub, "CirioThingsImpl", "CallDebugger"];
+IF breaks.BreakSetBroken[] THEN reports.PutRope["You won't be able to set breakpoints in the debuggee, because I was unable to find CirioThingsImpl.CallDebugger in the debuggee.  Are you sure you loaded an unoptimized version of CirioThingsImpl into the debuggee somewhere along the line?\n"];
+
+{
+ENABLE UNWIND => { -- all attempts to give a report will be ignored
+finalMsg: Rope.ROPE ¨ CirioBackstop.Protect[ClearBreaksForOpen, reports];
+CirioNubAccess.DestroyNub[nub];
+SystemInterface.CloseFileSet[fileSet];
+IF Rope.Length[finalMsg] # 0 THEN IO.PutF1[reports, "%g\N", IO.rope[finalMsg]];
+};
+cc, lcc: CC;
+cedarModules: NewRMTW.CedarModuleSet;
+lsh: LoadStateAccess.LoadStateHandle;
+rmtw: NewRMTW.RemoteMimosaTargetWorld;
+ampersandContext1, ampersandContext2: CirioTypes.Node;
+aph: NewAmpersandProcs.Handle;
+connection: Connection;
+IF NOT CirioNubAccess.Null[nub, 7] THEN CCE[cirioError, "debuggee doesn't implement debug nub protocol version 7"];
+cc ¨ CCTypes.CreateCedarCompilerContext[];
+cedarModules ¨ NewRMTW.CreateCedarModuleSet[fileSet, remoteName];
+NewRMTW.ResetSearchPaths[cedarModules, searchDirs, BasicTime.Now[]];
+lsh ¨ LoadStateAccess.CreateLoadStateHandle[remoteName, nub, fileSet];
+rmtw ¨ NewRMTW.CreateRemoteMimosaTargetWorld[remoteName, nub, cc, cedarModules, lsh, reports, TRUE];
+aph ¨ NEW[NewAmpersandProcs.HandleBody¨[
+out: NIL, -- filled in during a line interpretation in StackCirioImpl
+rmtw: rmtw,
+cedarModules: cedarModules,
+nub: nub,
+fileSet: fileSet, 
+lsh: lsh]];
+connection¨ NEW[ConnectionBody¨[
+open: TRUE,
+doradoWorkingDirectory: workingDirectories.first,
+serverName: remoteName,
+searchDirectories: searchDirs,
+cc: cc,
+localCc: lcc,
+localConnection: LocalCirio.GetConnection[LocalCirio.nilBreakDest, reports],
+rmtw: rmtw,
+cedarModules: cedarModules,
+nub: nub,
+target: target,
+daemon: NIL,
+daemonKillFlag: FALSE,
+breaks: breaks,
+fileSet: fileSet,
+lsh: lsh,
+aph: aph,
+cParserTable: NIL]];
+
+connection.localCc ¨ LocalCirio.ExtractCcFromConnection[connection.localConnection];
+connection.ampersandContext1 ¨ AmpersandContext.CreateAnAmpersandContext[connection.localCc];
+connection.ampersandContext2 ¨ AmpersandContext.CreateAnAmpersandContext[connection.localCc];
+ampersandContext1 ¨ connection.ampersandContext1;
+ampersandContext2 ¨ connection.ampersandContext2;
+
+NewAmpersandProcs.InstallItems[connection.ampersandContext2, aph, connection.localCc];
+
+
+IF CirioDeltaFace.IsDMachine[] = FALSE THEN RETURN[connection];
+
+IF TRUE THEN RETURN[connection];
+InstallOneAmpersandItem[ampersandContext2, "&&H", CCTypes.CreateNodeFromRefAny[NEW[Connection ¨ connection], cc], cc];
+InstallOneAmpersandItem[ampersandContext2, "&&RdCards", CCTypes.CreateNodeFromRefAny[NEW[PROC[a: CirioTypes.CirioAddress, nCards: CARD] ¨ RdCards], cc], cc];
+InstallOneAmpersandItem[ampersandContext2, "&&RdHexCards", CCTypes.CreateNodeFromRefAny[NEW[PROC[a: CirioTypes.CirioAddress, nCards: CARD] ¨ RdHexCards], cc], cc];
+InstallOneAmpersandItem[ampersandContext2, "&&RdBytes", CCTypes.CreateNodeFromRefAny[NEW[PROC[a: CirioTypes.CirioAddress, nBytes: CARD] ¨ RdBytes], cc], cc];
+InstallOneAmpersandItem[ampersandContext2, "&&RdChars", CCTypes.CreateNodeFromRefAny[NEW[PROC[a: CirioTypes.CirioAddress, nChars: CARD] ¨ RdChars], cc], cc];
+InstallOneAmpersandItem[ampersandContext2, "&&RdRope", CCTypes.CreateNodeFromRefAny[NEW[PROC[a: CirioTypes.CirioAddress, nChars: CARD ¨ 100] ¨ RdRope], cc], cc];
+InstallOneAmpersandItem[ampersandContext2, "&&MkAddress", CCTypes.CreateNodeFromRefAny[NEW[PROC[byteAddress: CARD, h: Connection] RETURNS[CirioTypes.CirioAddress] ¨ MkAddress], cc], cc];
+InstallOneAmpersandItem[ampersandContext2, "&&FrameDiagnosticInfo", CCTypes.CreateNodeFromRefAny[NEW[PROC[h: Connection] ¨ FrameDiagnosticInfo], cc], cc];
+
+InstallOneAmpersandItem[ampersandContext2, "&&SetBreakAtAbsAddr", CCTypes.CreateNodeFromRefAny[NEW[PROC[h: Connection, absAddr: CARD32, mesaPos: SourceFileOps.Position, stopAll: BOOLEAN] ¨ SetBreakAtAbsAddr], cc], cc];
+InstallOneAmpersandItem[ampersandContext2, "&&ListBreaks", CCTypes.CreateNodeFromRefAny[NEW[PROC[h: Connection] ¨ ListBreaks], cc], cc];
+InstallOneAmpersandItem[ampersandContext2, "&&ClearBreakAtAbsAddr", CCTypes.CreateNodeFromRefAny[NEW[PROC[h: Connection, absAddr: CARD32] ¨ ClearBreakAtAbsAddr], cc], cc];
+InstallOneAmpersandItem[ampersandContext2, "&&ClearBreakAtIndex", CCTypes.CreateNodeFromRefAny[NEW[PROC[h: Connection, index: CARD] ¨ ClearBreakAtIndex], cc], cc];
+InstallOneAmpersandItem[ampersandContext2, "&&ClearAllBreaks", CCTypes.CreateNodeFromRefAny[NEW[PROC[h: Connection] ¨ ClearAllBreaks], cc], cc];
+InstallOneAmpersandItem[ampersandContext2, "&&AddDir", CCTypes.CreateNodeFromRefAny[NEW[PROC[h: Connection, dirName: Rope.ROPE, reports: IO.STREAM] ¨ AddDir], cc], cc];
+InstallOneAmpersandItem[ampersandContext2, "&&ListDir", CCTypes.CreateNodeFromRefAny[NEW[PROC[h: Connection] ¨ ListDir], cc], cc];
+InstallOneAmpersandItem[ampersandContext2, "&&ClearDir", CCTypes.CreateNodeFromRefAny[NEW[PROC[h: Connection] ¨ ClearDir], cc], cc];
+
+InstallOneAmpersandItem[ampersandContext2, "&&LookupSym", CCTypes.CreateNodeFromRefAny[NEW[PROC[h: Connection, name: Rope.ROPE, numToSkip: INT ¨ 0, externOnly: BOOL ¨ TRUE] RETURNS[CirioNubAccess.SymEntry] ¨ LookupSym], cc], cc];
+InstallOneAmpersandItem[ampersandContext2, "&&LookupAddr", CCTypes.CreateNodeFromRefAny[NEW[PROC[h: Connection, val: CARD, numToSkip: INT ¨ 0] RETURNS[CirioNubAccess.SymEntry] ¨ LookupAddr], cc], cc];
+InstallOneAmpersandItem[ampersandContext2, "&&LookupID", CCTypes.CreateNodeFromRefAny[NEW[PROC[h: Connection, symID: CARD] RETURNS[CirioNubAccess.SymEntry] ¨ LookupID], cc], cc];
+InstallOneAmpersandItem[ampersandContext2, "&&LookupFile", CCTypes.CreateNodeFromRefAny[NEW[PROC[h: Connection, seqNum: CARD] RETURNS[entry: CirioNubAccess.FileEntry] ¨ LookupFile], cc], cc];
+InstallOneAmpersandItem[ampersandContext2, "&&GetPCInfo", CCTypes.CreateNodeFromRefAny[NEW[PROC[h: Connection, absPC: CARD] RETURNS[CirioNubAccess.PCInfo] ¨ GetPCInfo], cc], cc];
+
+
+InstallOneAmpersandItem[ampersandContext2, "&&GetRelPCForCLine", CCTypes.CreateNodeFromRefAny[NEW[PROC[dotOName: Rope.ROPE, cLineNum: CARD, h: Connection] RETURNS[CARD] ¨ GetRelPCForCLine], cc], cc];
+InstallOneAmpersandItem[ampersandContext2, "&&GetCLineForRelPC", CCTypes.CreateNodeFromRefAny[NEW[PROC[dotOName: Rope.ROPE, relPC: CARD, h: Connection] RETURNS[CARD] ¨ GetCLineForRelPC], cc], cc];
+
+InstallOneAmpersandItem[ampersandContext2, "&&DebugOn", CCTypes.CreateNodeFromRefAny[NEW[PROC[] ¨ DebugOn], cc], cc];
+InstallOneAmpersandItem[ampersandContext2, "&&DebugOff", CCTypes.CreateNodeFromRefAny[NEW[PROC[] ¨ DebugOff], cc], cc];
+
+RETURN[connection]}};
+IF outerMsg#NIL THEN reports.PutF["debug connection not opened with %g (port %g) because of uncaught error (%g).\n", [rope[remoteName]], [cardinal[portNum]], [rope[outerMsg]] ];
+RETURN};
+
+FlushUnknownFileCache: PUBLIC ENTRY PROC[connection: Connection, reports: IO.STREAM] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT connection.open THEN RETURN;
+NewRMTW.FlushUnknownFileCache[connection.cedarModules, BasicTime.Now[]];
+NewRMTW.FlushUnknownSymbolCache[connection.rmtw, BasicTime.Now[], reports];
+NewRMTW.FlushUnknownTypeCodes[connection.rmtw];
+IF connection.threads # NIL THEN
+FOR ti: CARDINAL IN [0..connection.threads.nThreads) DO
+td: REF ThreadData ¨ connection.threads[ti];
+StackCirio.NoteFileCacheFlush[td.stack];
+ENDLOOP;
+END;
+
+CloseConnection: PUBLIC ENTRY PROC[connection: Connection, reports: IO.STREAM] = {
+ENABLE UNWIND => NULL;
+InerCloseConnection[connection, reports]};
+
+InerCloseConnection: INTERNAL PROC[connection: Connection, reports: IO.STREAM] = {
+ClearBreaksForClose: PROC RETURNS[Rope.ROPE] =
+{CirioBreakAccess.ClearAllBreaks[connection.breaks]; RETURN[NIL]};
+finalMsg: Rope.ROPE ¨ NIL;
+IF connection = NIL OR NOT connection.open THEN RETURN;
+StopBreakCheckDaemon[connection, reports];
+connection.open ¨ FALSE;
+finalMsg ¨ CirioBackstop.Protect[ClearBreaksForClose, reports];
+CirioNubAccess.DestroyNub[connection.nub];
+SystemInterface.CloseFileSet[connection.fileSet];
+IF Rope.Length[finalMsg] # 0 THEN IO.PutF1[reports, "%g\N", IO.rope[finalMsg]];
+};
+
+DestroyRemoteWorld: PUBLIC ENTRY PROC[connection: Connection] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT connection.open THEN RETURN;
+CirioNubAccess.KillWorld[connection.nub];
+connection.open ¨ FALSE;
+CirioNubAccess.DestroyNub[connection.nub];
+SystemInterface.CloseFileSet[connection.fileSet];
+END;
+
+StopRemoteWorld: PUBLIC ENTRY PROC[connection: Connection, reports: IO.STREAM] RETURNS[nThreads: CARD] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT CirioNubAccess.SetDBStat[connection.nub, -2, 5000] THEN CCE[cirioError];
+nThreads ¨ AcquireThreadInfo[connection, reports];
+connection.remoteWorldRunning ¨ FALSE;
+RETURN[nThreads];
+END;
+
+AcquireThreadInfo: PROC[connection: Connection, reports: IO.STREAM] RETURNS[nThreads: CARD] =
+BEGIN
+threads: LIST OF REF CirioNubAccess.ThreadInfo;
+threadX: CARD ¨ 0;
+threads ¨ CirioNubAccess.GetThreads[connection.nub, 0, 100];
+nThreads ¨ 0;
+FOR ths: LIST OF REF CirioNubAccess.ThreadInfo ¨ threads, ths.rest WHILE ths # NIL DO nThreads ¨ nThreads+1 ENDLOOP;
+
+connection.threads ¨ NEW[ThreadSet[nThreads]];
+
+FOR ths: LIST OF REF CirioNubAccess.ThreadInfo ¨ threads, ths.rest WHILE ths # NIL DO 
+td: REF ThreadData ¨ connection.threads[threadX] ¨ NEW[ThreadData];
+td.thread ¨ ths.first;
+td.stack ¨ StackCirio.OpenStack[
+ampersandContext1: connection.ampersandContext1,
+ampersandContext2: connection.ampersandContext2,
+cc: connection.cc,
+rmtw: connection.rmtw,
+cedarModules: connection.cedarModules,
+nub: connection.nub,
+target: connection.target,
+fileSet: connection.fileSet,
+breaks: connection.breaks,
+lsh: connection.lsh,
+aph: connection.aph,
+cParserTable: connection.cParserTable,
+
+hotFramePC: ths.first.pc,
+hotFrameSP: ths.first.stackPointer,
+
+skipKFrames: 0,
+ShowSource: SourceFileOps.OpenSource,
+reports: reports];
+threadX ¨ threadX + 1;
+ENDLOOP;
+RETURN[nThreads];
+END;
+
+FindThreadsWithProperty: PUBLIC ENTRY PROC[connection: Connection, property: RemoteCirio.ThreadProperty, reports: IO.STREAM] RETURNS[LIST OF -- threadIndex -- CARD] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT connection.open THEN CCE[cirioError];
+IF connection.remoteWorldRunning THEN CCE[cirioError];
+BEGIN
+newThreads: LIST OF CARD ¨ NIL;
+lastNewThread: LIST OF CARD ¨ NIL;
+IO.PutRope[reports, "\N\Tchecking thread with index "];
+FOR x: CARD IN [0..connection.threads.nThreads) DO
+IF ThreadSatisfies[connection.threads[x], property, reports] THEN
+BEGIN
+cell: LIST OF CARD ¨ LIST[x];
+IF newThreads = NIL THEN newThreads ¨ cell ELSE lastNewThread.rest ¨ cell;
+lastNewThread ¨ cell;
+END;
+ENDLOOP;
+IO.PutRope[reports, "\N"];
+RETURN[newThreads];
+END;
+END;
+
+
+ThreadSatisfies: PROC[thread: REF ThreadData, property: RemoteCirio.ThreadProperty, reports: IO.STREAM] RETURNS[BOOLEAN] =
+BEGIN
+WITH property SELECT FROM
+tp: any RemoteCirio.ThreadProperty => RETURN[TRUE];
+tp: callingDebugger RemoteCirio.ThreadProperty => RETURN[thread.thread.dbgMsg # 0];
+tp: ready RemoteCirio.ThreadProperty => RETURN[thread.thread.schedState = CirioNubAccess.SchedStateReady OR thread.thread.schedState = CirioNubAccess.SchedStateRun];
+tp: context RemoteCirio.ThreadProperty => 
+BEGIN
+found: BOOLEAN ¨ FALSE; -- tentative
+CheckName: PROC[name: PFSNames.PATH] RETURNS[--stop-- BOOLEAN] =
+BEGIN
+found ¨ Rope.Equal[PFS.RopeFromPath[name], tp.name, FALSE];
+RETURN[found];
+END;
+IO.PutF1[reports, "%g ", IO.card[thread.thread.index]];
+StackCirio.QuickGenPossibleModuleNames[thread.stack, CheckName, reports];
+IF found THEN IO.PutRope[reports, "(bingo )"];
+RETURN[found];
+END;
+ENDCASE => CCE[cirioError];
+END;
+
+GetThreadTitleText: PUBLIC ENTRY PROC[connection: Connection, threadIndex: CARD] RETURNS[Rope.ROPE] =
+BEGIN
+ENABLE UNWIND => NULL;
+RETURN[ConstructThreadTitleText[connection, threadIndex]];
+END;
+
+ConstructThreadTitleText: PROC[connection: Connection, threadIndex: CARD] RETURNS[Rope.ROPE] =
+BEGIN
+threadData: REF ThreadData ¨ connection.threads[threadIndex];
+remoteIndex: CARD ¨ threadData.thread.index;
+schedStateText: Rope.ROPE ¨ RopeForSchedState[threadData.thread.schedState];
+dbgMsgText: Rope.ROPE ¨ RopeForDbgMsg[threadData.thread.dbgMsg];
+freezeText: Rope.ROPE ¨ IF threadData.thread.frozen THEN " (frozen)" ELSE NIL;
+RETURN[IO.PutFLR["%g: (%g) (%g)%g (%g)", LIST[IO.card[remoteIndex], IO.card[threadData.thread.priority], IO.rope[schedStateText], IO.rope[freezeText], IO.rope[dbgMsgText]] ]];
+END;
+
+ThreadIndexFromID: PUBLIC PROC[ID: CARD, connection: Connection] RETURNS [index: CARD ¨ LAST[CARD]] ~ {
+FOR i: CARDINAL IN [0..connection.threads.nThreads) DO
+IF connection.threads[i].thread.index = ID THEN
+RETURN[i];
+ENDLOOP;
+};
+
+ThreadIDFromIndex: PUBLIC PROC[index: CARD, connection: Connection] RETURNS [ID: CARD ¨ LAST[CARD]] ~ {
+IF index < connection.threads.nThreads THEN
+RETURN[connection.threads[index].thread.index];
+};
+
+ShowQuickSummary: PUBLIC ENTRY PROC[connection: Connection, threadIndex: CARD, stopFlag: REF BOOLEAN, on: IO.STREAM, long: BOOL] =
+BEGIN 
+ENABLE UNWIND => NULL;
+threadData: REF ThreadData ¨ connection.threads[threadIndex];
+
+IO.PutF1[on, "quick summary for thread with index %g\N", IO.card[connection.threads[threadIndex].thread.index]];
+IO.PutF1[on, "\Tdebug message = %g\N", IO.rope[RopeForDbgMsg[threadData.thread.dbgMsg]]];
+
+StackCirio.ShowQuickSummary[threadData.stack, stopFlag, on, long];
+END;
+
+
+GetThreadDebuggingBanner: PUBLIC ENTRY PROC[connection: Connection, threadIndex: CARD, reports: IO.STREAM] RETURNS[Rope.ROPE] =
+BEGIN
+ENABLE UNWIND => NULL;
+inner: PROC RETURNS[Rope.ROPE] =
+BEGIN
+RETURN[IO.PutFR1["debugging thread with index %g", IO.card[connection.threads[threadIndex].thread.index]]];
+END;
+RETURN[CirioBackstop.Protect[inner, reports]];
+END;
+
+AbortThread: PUBLIC ENTRY PROC[connection: Connection, threadIndex: CARD, reports: IO.STREAM] RETURNS[newThreadTitleText: Rope.ROPE] =
+BEGIN
+ENABLE UNWIND => NULL;
+inner: PROC RETURNS[Rope.ROPE] =
+BEGIN
+RETURN[IssueFullThreadCommand[connection, threadIndex, TRUE, FALSE, TRUE, -3]];
+END;
+RETURN[CirioBackstop.Protect[inner, reports]];
+END;
+
+KillThread: PUBLIC ENTRY PROC[connection: Connection, threadIndex: CARD, reports: IO.STREAM] RETURNS[newThreadTitleText: Rope.ROPE] =
+BEGIN
+ENABLE UNWIND => NULL;
+inner: PROC RETURNS[Rope.ROPE] =
+BEGIN
+RETURN[IssueFullThreadCommand[connection, threadIndex, TRUE, FALSE, TRUE, -2]];
+END;
+RETURN[CirioBackstop.Protect[inner, reports]];
+END;
+
+FreezeThread: PUBLIC ENTRY PROC[connection: Connection, threadIndex: CARD, reports: IO.STREAM] RETURNS[newThreadTitleText: Rope.ROPE] =
+BEGIN
+ENABLE UNWIND => NULL;
+inner: PROC RETURNS[Rope.ROPE] =
+BEGIN
+RETURN[IssueFullThreadCommand[connection, threadIndex, TRUE, TRUE, FALSE, connection.threads[threadIndex].thread.dbgMsg]];
+END;
+RETURN[CirioBackstop.Protect[inner, reports]];
+END;
+
+ProceedThread: PUBLIC ENTRY PROC[connection: Connection, threadIndex: CARD, reports: IO.STREAM] RETURNS[newThreadTitleText: Rope.ROPE] =
+BEGIN
+ENABLE UNWIND => NULL;
+inner: PROC RETURNS[Rope.ROPE] =
+BEGIN
+RETURN[IssueFullThreadCommand[connection, threadIndex, TRUE, FALSE, TRUE, -1]];
+END;
+RETURN[CirioBackstop.Protect[inner, reports]];
+END;
+
+IssueFullThreadCommand: PROC[connection: Connection, threadIndex: CARD, setFreeze: BOOL, freeze: BOOLEAN, setMsg: BOOLEAN, msg: INT] RETURNS[--new title text-- Rope.ROPE] =
+BEGIN
+remoteIndex: CARD ¨ connection.threads[threadIndex].thread.index;
+IF NOT CirioNubAccess.IssueThreadCommand[connection.nub, remoteIndex, setFreeze, freeze, setMsg, msg]
+THEN CCE[cirioError];
+BEGIN
+threads: LIST OF REF CirioNubAccess.ThreadInfo ¨ CirioNubAccess.GetThreads[connection.nub, 0, 100];
+FOR ths: LIST OF REF CirioNubAccess.ThreadInfo ¨ threads, ths.rest WHILE ths # NIL DO
+IF ths.first.index = remoteIndex THEN -- here we are
+BEGIN
+connection.threads[threadIndex].thread ¨ ths.first;
+EXIT;
+END; 
+ENDLOOP; 
+RETURN[ConstructThreadTitleText[connection, threadIndex]];
+END;
+END;
+
+DbxExamineThread: PUBLIC ENTRY PROC[connection: Connection, threadIndex: CARD, reports: IO.STREAM] RETURNS[nThreads: CARD] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT connection.remoteWorldRunning THEN
+BEGIN
+remoteIndex: CARD ¨ connection.threads[threadIndex].thread.index;
+connection.remoteWorldRunning ¨ TRUE;
+connection.dbxActive ¨ TRUE;
+connection.threads ¨ NIL;
+IF NOT CirioNubAccess.SetDBStat[connection.nub, remoteIndex, 5000] THEN CCE[cirioError];
+WHILE NOT CirioNubAccess.SetDBStat[connection.nub, -2, 5000] DO ENDLOOP;
+nThreads ¨ AcquireThreadInfo[connection, reports];
+connection.dbxActive ¨ FALSE;
+connection.remoteWorldRunning ¨ FALSE;
+RETURN[nThreads];
+END
+ ELSE CCE[cirioError];
+END;
+
+
+ResumeRemoteWorldWithOnlyVP0: PUBLIC ENTRY PROC[connection: Connection] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT connection.remoteWorldRunning THEN
+BEGIN
+IF NOT CirioNubAccess.SetDBStat[connection.nub, -1, 5000] THEN CCE[cirioError];
+connection.threads ¨ NIL;
+connection.remoteWorldRunning ¨ TRUE;
+END;
+END;
+
+ResumeRemoteWorld: PUBLIC ENTRY PROC[connection: Connection] =
+BEGIN
+ENABLE UNWIND => NULL;
+IF NOT connection.remoteWorldRunning THEN
+BEGIN
+IF NOT CirioNubAccess.SetDBStat[connection.nub, 0, 5000] THEN CCE[cirioError];
+connection.threads ¨ NIL;
+connection.remoteWorldRunning ¨ TRUE;
+END;
+END;
+
+
+GetDummyStack: PUBLIC ENTRY PROC[connection: Connection, reports: IO.STREAM]RETURNS[StackCirio.Stack] = {
+ENABLE UNWIND => NULL;
+RETURN StackCirio.OpenDummyStack[
+ampersandContext1: connection.ampersandContext1,
+ampersandContext2: connection.ampersandContext2,
+cc: connection.cc,
+rmtw: connection.rmtw,
+cedarModules: connection.cedarModules,
+nub: connection.nub,
+target: connection.target,
+fileSet: connection.fileSet,
+breaks: connection.breaks,
+lsh: connection.lsh,
+aph: connection.aph,
+cParserTable: connection.cParserTable,
+ShowSource: SourceFileOps.OpenSource,
+reports: reports]};
+
+FocusOnThread: PUBLIC ENTRY PROC[connection: Connection, threadIndex: CARD, reports: IO.STREAM] RETURNS[newRemoteThreadIndex: CARD] = {
+ENABLE UNWIND => NULL;
+connection.currentThread ¨ IF threadIndex < connection.threads.nThreads THEN threadIndex ELSE 0;
+RETURN[connection.threads[connection.currentThread].thread.index];
+};
+
+GetStackForCurrentThread: PUBLIC ENTRY PROC[connection: Connection, reports: IO.STREAM] RETURNS[StackCirio.Stack] =
+BEGIN
+ENABLE UNWIND => NULL;
+threadData: REF ThreadData ¨ connection.threads[connection.currentThread];
+RETURN[threadData.stack];
+END;
+
+
+RopeForDbgMsg: PROC[msg: INT] RETURNS[Rope.ROPE] =
+BEGIN
+RETURN[SELECT msg FROM
+CirioNubAccess.DbgMsgNone => "None",
+CirioNubAccess.DbgMsgNoHandlerRequest => "NoHandlerRequest",
+CirioNubAccess.DbgMsgHandlerRequest => "HandlerRequest",
+CirioNubAccess.DbgMsgBadProceedRequest => "BadProceedRequest",
+CirioNubAccess.DbgMsgBreakRequest => "BreakRequest",
+CirioNubAccess.DbgMsgClientRequest => "ClientRequest",
+CirioNubAccess.DbgMsgProceed => "Proceed",
+CirioNubAccess.DbgMsgExit => "Kill",
+CirioNubAccess.DbgMsgAbort => "Abort",
+ENDCASE => "??"];
+END;
+
+RopeForSchedState: PROC[state: CARD] RETURNS[Rope.ROPE] =
+BEGIN
+RETURN[SELECT state FROM
+CirioNubAccess.SchedStateFree => "Free",
+CirioNubAccess.SchedStateReady => "Ready",
+CirioNubAccess.SchedStateRun => "Run",
+CirioNubAccess.SchedStateWaitML => "MLWait",
+CirioNubAccess.SchedStateWaitCV => "CVWait",
+CirioNubAccess.SchedStateHandlee => "Handlee",
+ENDCASE => IO.PutFR1["??: %g", IO.card[state]]];
+END;
+
+
+
+InstallOneAmpersandItem: PROC[ampersandContext: CirioTypes.Node, name: Rope.ROPE, item: CirioTypes.Node, cc: CC] =
+BEGIN
+IF NOT Rope.Equal[Rope.Substr[name, 0, 2], "&&"] THEN ERROR
+ELSE
+BEGIN
+ampersandContextType: CirioTypes.Type ¨ CedarCode.GetTypeOfNode[ampersandContext];
+indirect: CirioTypes.Node ¨ CedarCode.SelectFieldFromNode[name, ampersandContextType, ampersandContext, cc];
+indirectType: CirioTypes.Type ¨ CedarCode.GetTypeOfNode[indirect];
+encapsulatedItem: CirioTypes.Node ¨ AmpersandContext.MakeNodeFromNode[item, cc];
+encapsulatedType: CirioTypes.Type ¨ CedarCode.GetTypeOfNode[encapsulatedItem];
+CedarCode.StoreThroughIndirectNode[encapsulatedType, encapsulatedItem, indirectType, indirect, cc];
+END
+END;
+
+ReadOneAmpersandItem: PROC[name: Rope.ROPE, nameScope: CirioTypes.Node, cc: CC] RETURNS[CirioTypes.Node] =
+BEGIN
+IF NOT Rope.Equal[Rope.Substr[name, 0, 2], "&&"] THEN ERROR
+ELSE
+BEGIN
+nameScopeType: CirioTypes.Type ¨ CedarCode.GetTypeOfNode[nameScope];
+indirect: CirioTypes.Node ¨ CedarCode.SelectFieldFromNode[name, nameScopeType, nameScope, cc];
+indirectType: CirioTypes.Type ¨ CedarCode.GetTypeOfNode[indirect];
+encapsulatedItem: CirioTypes.Node ¨ CedarCode.LoadThroughIndirectNode[indirectType, indirect, cc];
+RETURN[AmpersandContext.StripAMNode[encapsulatedItem]]
+END;
+END;
+
+ReadOneAmpersandInt: PROC[name: Rope.ROPE, defaultVal: INT, nameScope: CirioTypes.Node, cc: CC] RETURNS[INT] =
+BEGIN
+valNode: CirioTypes.Node ¨ NIL;
+valNode ¨ ReadOneAmpersandItem[name, nameScope, cc
+! CCTypes.CCError => {valNode ¨ NIL; CONTINUE}];
+IF valNode = NIL THEN RETURN[defaultVal]
+ELSE
+BEGIN
+val: REF INT ¨ NARROW[CedarCode.GetNodeRepresentation[valNode, cc]];
+RETURN[val≠];
+END;
+END;
+AddSearchDirectory: PUBLIC PROC [connection: Connection, directoryPath: Rope.ROPE, reports: IO.STREAM]  =
+BEGIN
+
+inner: PROC RETURNS[Rope.ROPE] =
+BEGIN
+AddDir[connection, directoryPath, reports];
+IO.PutF1[reports, " %g added to search directories\n", IO.rope[directoryPath]];
+RETURN [NIL];
+END;
+
+eMsg: Rope.ROPE;
+eMsg ¨ CirioBackstop.Protect[inner, reports];
+IF eMsg # NIL THEN IO.PutF1[reports, "%g\N", [rope[eMsg]]];
+END;
+
+RemoveSearchDirectory: PUBLIC PROC [connection: Connection, directoryPath: Rope.ROPE, reports: IO.STREAM]  =
+BEGIN
+
+inner: PROC RETURNS[Rope.ROPE] =
+BEGIN
+RemoveDir[connection, directoryPath, reports];
+IO.PutF1[reports, " %g removed from search directories\n", IO.rope[directoryPath]];
+RETURN [NIL];
+END;
+
+eMsg: Rope.ROPE;
+eMsg ¨ CirioBackstop.Protect[inner, reports];
+IF eMsg # NIL THEN IO.PutF1[reports, "%g\N", [rope[eMsg]]];
+END;
+
+ListSearchDirectory: PUBLIC PROC [connection: Connection, reports: IO.STREAM] =
+BEGIN
+
+inner: PROC RETURNS[Rope.ROPE] =
+BEGIN
+ListDir[connection];
+RETURN [" done"];
+END;
+
+eMsg: Rope.ROPE;
+eMsg ¨ CirioBackstop.Protect[inner, reports];
+IF eMsg # NIL THEN IO.PutF1[reports, "%g\N", [rope[eMsg]]];
+END;
+
+ClearSearchDirectory: PUBLIC PROC [connection: Connection, reports: IO.STREAM] =
+BEGIN
+
+inner: PROC RETURNS[Rope.ROPE] =
+BEGIN
+ClearDir[connection];
+RETURN [" done"];
+END;
+
+eMsg: Rope.ROPE;
+eMsg ¨ CirioBackstop.Protect[inner, reports];
+IF eMsg # NIL THEN IO.PutF1[reports, "%g\N", [rope[eMsg]]];
+END;
+
+
+AddressData: TYPE = RECORD[byteAddress: CARD, h: Connection];
+
+MkAddress: PROC[byteAddress: CARD, h: Connection] RETURNS[CirioTypes.CirioAddress] =
+BEGIN
+addressData: REF AddressData ¨ NEW[AddressData¨[byteAddress, h]];
+RETURN[NEW[CirioTypes.CirioAddressBody¨[CirioAddressIsNil, ReadRemoteBits, WriteRemoteBits, FollowRemotePointer, AsCardForRemote, addressData]]];
+END;
+
+ByteBitSize: CARD = 8;
+CardByteSize: CARD = 4;
+
+
+CirioAddressIsNil: PROC [data: CirioTypes.CirioAddress] RETURNS [BOOL] ~ {
+addressData: REF AddressData ¨ NARROW[data.data];
+RETURN [addressData.byteAddress=0]};
+
+ReadRemoteBits: PROC[byteOffset: INT ¨ 0, bitOffset: INT ¨ 0, bitSize: CARD, data: CirioTypes.CirioAddress] RETURNS[CARD] =
+BEGIN
+addressData: REF AddressData ¨ NARROW[data.data];
+byteAddress: INT ¨ addressData.byteAddress + byteOffset + bitOffset/8;
+remainingBitOffset: INT ¨ bitOffset MOD 8;
+IF bitSize > 32 THEN CCE[operation];
+
+BEGIN
+cardAddr: INT ¨ (byteAddress/CardByteSize)*CardByteSize;
+finalBitOffset: INT ¨ (byteAddress MOD CardByteSize )*ByteBitSize + remainingBitOffset;
+nextBitOffset: INT ¨ finalBitOffset+bitSize;
+
+IF nextBitOffset <= 32 THEN -- no word crossing
+BEGIN
+container: CARD ¨ CirioNubAccess.Read32BitsAsCard[[
+addressData.h.nub,
+cardAddr,
+0,
+FALSE,
+TRUE]];
+RETURN[Basics.BITRSHIFT[Basics.BITLSHIFT[container, finalBitOffset], 32-bitSize]];
+END
+ ELSE -- splits across 4 byte boundary (I am not sure if this will even get tested in the near future, since the rumor is that Mimosa prevents such splits).
+BEGIN
+lContainer: CARD ¨ CirioNubAccess.Read32BitsAsCard[[
+addressData.h.nub,
+cardAddr,
+0,
+FALSE,
+TRUE]];
+rContainer: CARD ¨ CirioNubAccess.Read32BitsAsCard[[
+addressData.h.nub,
+cardAddr+1,
+0,
+FALSE,
+TRUE]];
+RETURN[Basics.BITOR[
+Basics.BITLSHIFT[lContainer, finalBitOffset],
+Basics.BITRSHIFT[rContainer, (32*2)-(finalBitOffset+bitSize)]]];
+END;
+END;
+
+END;
+WriteRemoteBits: PROC[byteOffset: INT ¨ 0, bitOffset: INT ¨ 0, bitSize: CARD, data: CirioTypes.CirioAddress, bits: CARD] =
+BEGIN
+addressData: REF AddressData ¨ NARROW[data.data];
+CCE[unimplemented];
+END;
+
+FollowRemotePointer: PROC[byteOffset: INT ¨ 0, data: CirioTypes.CirioAddress] RETURNS[CirioTypes.CirioAddress] =
+BEGIN
+addressData: REF AddressData ¨ NARROW[data.data];
+newAddressVal: CARD ¨ ReadRemoteBits[0, 0, 32, data];
+RETURN[MkAddress[newAddressVal, addressData.h]];
+END;
+
+AsCardForRemote: PROC[data: CirioTypes.CirioAddress] RETURNS[CARD] =
+BEGIN
+addressData: REF AddressData ¨ NARROW[data.data];
+RETURN[addressData.byteAddress];
+END;
+
+
+
+RdCards: PROC[a: CirioTypes.CirioAddress, nCards: CARD] =
+BEGIN
+CardsPerLine: CARD = 10;
+FOR x: CARD IN [0..(nCards+CardsPerLine-1)/CardsPerLine) DO
+n: CARD ¨ MIN[CardsPerLine, nCards - CardsPerLine*x];
+textLine: IO.STREAM ¨ IO.ROS[];
+IO.PutRope[textLine, "\T"];
+FOR I: CARD IN [0..n) DO
+oneCard: CARD ¨ a.readBits[CardsPerLine*4*x+4*I, 0, 32, a];
+IO.PutF1[textLine, " %g", IO.card[oneCard]];
+ENDLOOP;
+SystemInterface.ShowReport[IO.RopeFromROS[textLine], $urgent];
+ENDLOOP;
+END;
+
+RdHexCards: PROC[a: CirioTypes.CirioAddress, nCards: CARD] =
+BEGIN
+CardsPerLine: CARD = 10;
+FOR x: CARD IN [0..(nCards+CardsPerLine-1)/CardsPerLine) DO
+n: CARD ¨ MIN[CardsPerLine, nCards - CardsPerLine*x];
+textLine: IO.STREAM ¨ IO.ROS[];
+IO.PutRope[textLine, "\T"];
+FOR I: CARD IN [0..n) DO
+oneCard: CARD ¨ a.readBits[CardsPerLine*4*x+4*I, 0, 32, a];
+IO.PutF1[textLine, " %g", IO.rope[Convert.RopeFromCard[oneCard, 16]]];
+ENDLOOP;
+SystemInterface.ShowReport[IO.RopeFromROS[textLine], $urgent];
+ENDLOOP;
+END;
+
+
+RdBytes: PROC[a: CirioTypes.CirioAddress, nBytes: CARD] =
+BEGIN
+BytesPerLine: CARD = 20;
+FOR x: CARD IN [0..(nBytes+BytesPerLine-1)/BytesPerLine) DO
+n: CARD ¨ MIN[BytesPerLine, nBytes - BytesPerLine*x];
+textLine: IO.STREAM ¨ IO.ROS[];
+IO.PutRope[textLine, "\T"];
+FOR I: CARD IN [0..n) DO
+oneByte: CARD ¨ a.readBits[BytesPerLine*x+I, 0, 8, a];
+IO.PutF1[textLine, " %g", IO.rope[Convert.RopeFromCard[oneByte, 16]]];
+ENDLOOP;
+SystemInterface.ShowReport[IO.RopeFromROS[textLine], $urgent];
+ENDLOOP;
+END;
+
+RdChars: PROC[a: CirioTypes.CirioAddress, nChars: CARD] =
+BEGIN
+CharsPerLine: CARD = 20;
+FOR x: CARD IN [0..(nChars+CharsPerLine-1)/CharsPerLine) DO
+n: CARD ¨ MIN[CharsPerLine, nChars - CharsPerLine*x];
+textLine: IO.STREAM ¨ IO.ROS[];
+IO.PutRope[textLine, "\T"];
+FOR I: CARD IN [0..n) DO
+oneChar: CARD ¨ a.readBits[CharsPerLine*x+I, 0, 8, a];
+IO.PutF1[textLine, " %g", IO.char[VAL[BYTE[oneChar]]]];
+ENDLOOP;
+SystemInterface.ShowReport[IO.RopeFromROS[textLine], $urgent];
+ENDLOOP;
+END;
+
+RdRope: PROC[a: CirioTypes.CirioAddress, nChars: CARD ¨ 100] =
+BEGIN
+ropeBodyAddr: CirioTypes.CirioAddress ¨ a.followPointer[0, a];
+ropeBodyContents: CARD ¨ ropeBodyAddr.readBits[0, 0, 32, ropeBodyAddr];
+rope: Rope.ROPE ¨ NIL;
+SeeOneChar: PROC[c: CHAR] =
+{rope ¨ Rope.Concat[rope, Rope.FromChar[c]]};
+GenCharsForRope[a.followPointer[0, a], 0, nChars, SeeOneChar];
+SystemInterface.ShowReport[rope, $urgent];
+END;
+
+
+Field: TYPE = RECORD[offset: INT, size: CARD];
+
+
+
+
+
+GenCharsForRope: PROC[a: CirioTypes.CirioAddress, first: CARD, nChars: CARD, for: PROC[CHAR]] =
+BEGIN
+tagF: Field = [0, 1];
+tag: CARD ¨ a.readBits[tagF.offset, 0, tagF.size, a];
+ShowClient: PROC[c: CHAR] RETURNS[quit: BOOL] =
+{for[c]; RETURN[FALSE]};
+
+SystemInterface.ShowReport[IO.PutFR1["tag = %g",  IO.rope[Convert.RopeFromCard[tag, 16]]], $urgent];
+SELECT tag FROM
+0 => -- we are looking at a text
+BEGIN
+lengthF: Field = [1, 15];
+maxF: Field = [16, 16];
+length: CARD ¨ a.readBits[0, lengthF.offset, lengthF.size, a];
+max: CARD ¨ a.readBits[0, maxF.offset, maxF.size, a];
+n: CARD ¨ IF first >= length THEN 0 ELSE MIN[length-first, nChars];
+
+FOR I: CARD IN [0..n) DO
+byte: CARD ¨ a.readBits[4+first+I, 0, 8, a];
+for[VAL[BYTE[byte]]];
+ENDLOOP;
+END;
+1 => -- we are looking at a node
+BEGIN
+sizeF: Field = [1, 31];
+depthF: Field = [32, 30];
+casesF: Field = [62, 2];
+size: CARD ¨ a.readBits[0, sizeF.offset, sizeF.size, a];
+depth: CARD ¨ a.readBits[0, depthF.offset, depthF.size, a];
+cases: CARD ¨ a.readBits[0, casesF.offset, casesF.size, a];
+n: CARD ¨ IF first >= size THEN 0 ELSE MIN[size-first, nChars];
+IF n > 0 THEN
+SELECT cases FROM
+0 =>  -- substr
+BEGIN
+baseF: Field = [64, 32];
+startF: Field = [96, 32];
+base: CirioTypes.CirioAddress ¨ a.followPointer[baseF.offset/8, a];
+start: CARD ¨ a.readBits[0, startF.offset, startF.size, a];
+[] ¨ Rope.Map[base: "??substr??", action: ShowClient];
+GenCharsForRope[base, start, n, for];
+END;
+1 =>  -- concat
+BEGIN
+baseF: Field = [64, 32];
+restF: Field = [96, 32];
+posF: Field = [128, 32];
+base: CirioTypes.CirioAddress ¨ a.followPointer[baseF.offset/8, a];
+rest: CirioTypes.CirioAddress ¨ a.followPointer[restF.offset/8, a];
+pos: CARD ¨ a.readBits[0, posF.offset, posF.size, a];
+[] ¨ Rope.Map[base: "??concat??", action: ShowClient];
+IF first < pos THEN
+BEGIN
+GenCharsForRope[base, first, MIN[pos-first, n], for];
+IF n > pos-first THEN GenCharsForRope[rest, 0, n-pos+first, for];
+END
+ ELSE
+GenCharsForRope[rest, first-pos, n, for];
+END;
+2 => 
+BEGIN
+baseF: Field = [64, 32];
+replaceF: Field = [96, 32];
+startF: Field = [128, 32];
+oldPosF: Field = [160, 32];
+newPosF: Field = [192, 32];
+base: CirioTypes.CirioAddress ¨ a.followPointer[baseF.offset/8, a];
+replace: CirioTypes.CirioAddress ¨ a.followPointer[replaceF.offset/8, a];
+start: CARD ¨  a.readBits[0, startF.offset, startF.size, a];
+oldPos: CARD ¨  a.readBits[0, oldPosF.offset, oldPosF.size, a];
+newPos: CARD ¨  a.readBits[0, newPosF.offset, newPosF.size, a];
+[] ¨ Rope.Map[base: "??replace??", action: ShowClient];
+
+IF n > 0 AND first < start THEN
+BEGIN
+GenCharsForRope[base, first, MIN[n, start-first], for];
+first ¨ start;
+n ¨ n-MIN[n, start-first];
+END;
+
+IF n > 0 AND first < newPos THEN
+BEGIN
+GenCharsForRope[replace, first-start, MIN[n, newPos-first], for];
+first ¨ newPos;
+n ¨ n - MIN[n, newPos-first];
+END;
+
+IF n > 0 AND first < size THEN
+GenCharsForRope[base, first-newPos+oldPos, n, for];
+
+END;
+3 => [] ¨ Rope.Map[base: "??ObjectRope??", action: ShowClient];
+ENDCASE => CCE[cirioError];
+END;
+ENDCASE => CCE[cirioError];
+END;
+
+
+
+FrameDiagnosticInfo: PROC[h: Connection] =
+BEGIN
+threadIndex: CARD ¨ h.currentThread;
+td: REF ThreadData ¨ h.threads[threadIndex];
+StackCirio.FrameDiagnosticInfo[td.stack, h.tsOut];
+END;
+
+
+SetBreakAtAbsAddr: PROC[h: Connection, absAddr: CARD32, mesaPos: SourceFileOps.Position, stopAll: BOOLEAN] =
+{CirioBreakAccess.SetBreakAtAbsAddr[h.breaks, absAddr, mesaPos, stopAll]};
+
+ListBreaks: PROC[h: Connection] =
+{CirioBreakAccess.ListBreaks[h.breaks]};
+
+ClearBreakAtAbsAddr: PROC[h: Connection, absAddr: CARD32] =
+{CirioBreakAccess.ClearBreakAtAbsAddr[h.breaks, absAddr]};
+
+ClearBreakAtIndex: PROC[h: Connection, index: CARD] =
+{CirioBreakAccess.ClearBreakAtIndex[h.breaks, index]};
+
+ClearAllBreaks: PROC[h: Connection] =
+{CirioBreakAccess.ClearAllBreaks[h.breaks]};
+
+AddDir: PROC [h: Connection, dirName: Rope.ROPE, reports: IO.STREAM] =
+BEGIN
+properDirName: PFSNames.PATH ¨ PFS.PathFromRope[dirName];
+prev: LIST OF PFSNames.PATH ¨ NIL;
+WHILE TRUE DO
+current: LIST OF PFSNames.PATH ¨ IF prev # NIL THEN prev.rest ELSE h.searchDirectories;
+IF current = NIL THEN EXIT;
+IF current.first.Equal[properDirName] THEN
+BEGIN
+IF prev = NIL THEN h.searchDirectories ¨ current.rest ELSE prev.rest ¨ current.rest;
+EXIT;
+END;
+prev ¨ current;
+ENDLOOP;
+h.searchDirectories ¨ CONS[properDirName, h.searchDirectories];
+NewRMTW.ResetSearchPaths[h.cedarModules, h.searchDirectories, BasicTime.Now[]];
+IF h.rmtw#NIL THEN NewRMTW.FlushUnknownSymbolCache[h.rmtw, BasicTime.Now[], reports];
+IF h.threads # NIL THEN
+FOR ti: CARDINAL IN [0..h.threads.nThreads) DO
+td: REF ThreadData ¨ h.threads[ti];
+StackCirio.NoteFileCacheFlush[td.stack];
+ENDLOOP;
+END;
+
+RemoveDir: PROC [h: Connection, dirName: Rope.ROPE, reports: IO.STREAM] =
+BEGIN
+properDirName: PFSNames.PATH ¨ PFS.PathFromRope[dirName];
+prev: LIST OF PFSNames.PATH ¨ NIL;
+WHILE TRUE DO
+current: LIST OF PFSNames.PATH ¨ IF prev # NIL THEN prev.rest ELSE h.searchDirectories;
+IF current = NIL THEN EXIT;
+IF current.first.Equal[properDirName] THEN
+BEGIN
+IF prev = NIL THEN h.searchDirectories ¨ current.rest ELSE prev.rest ¨ current.rest;
+EXIT;
+END;
+prev ¨ current;
+ENDLOOP;
+NewRMTW.ResetSearchPaths[h.cedarModules, h.searchDirectories, BasicTime.Now[]];
+NewRMTW.FlushUnknownSymbolCache[h.rmtw, BasicTime.Now[], reports];
+IF h.threads # NIL THEN
+FOR ti: CARDINAL IN [0..h.threads.nThreads) DO
+td: REF ThreadData ¨ h.threads[ti];
+StackCirio.NoteFileCacheFlush[td.stack];
+ENDLOOP;
+END;
+
+ListDir: PROC [h: Connection] =
+BEGIN
+searchDirectories: Rope.ROPE ¨ NIL;
+FOR paths: LIST OF PFSNames.PATH ¨ h.searchDirectories, paths.rest WHILE paths # NIL DO
+searchDirectories ¨ Rope.Cat[searchDirectories, PFS.RopeFromPath[paths.first], "  "];
+ENDLOOP;
+SystemInterface.ShowReport[searchDirectories, $urgent];
+END;
+
+ClearDir: PROC [h: Connection] =
+BEGIN
+SystemInterface.ShowReport["Clearing search directory list", $urgent];
+SystemInterface.ShowReport["Was: ", $urgent];
+ListDir[h];
+h.searchDirectories ¨ NIL;
+NewRMTW.ResetSearchPaths[h.cedarModules, h.searchDirectories, BasicTime.Now[]];
+END;
+
+LookupSym: PROC[h: Connection, name: Rope.ROPE, numToSkip: INT ¨ 0, externOnly: BOOL ¨ TRUE] RETURNS[CirioNubAccess.SymEntry] =
+{RETURN[CirioNubAccess.LookupSymEntryByName[h.nub, name, FALSE, externOnly, numToSkip]]};
+
+LookupAddr: PROC[h: Connection, val: CARD, numToSkip: INT ¨ 0] RETURNS[CirioNubAccess.SymEntry] =
+{RETURN[CirioNubAccess.LookupSymEntryByValue[h.nub, val, numToSkip]]};
+
+LookupID: PROC[h: Connection, symID: CARD] RETURNS[CirioNubAccess.SymEntry] =
+{RETURN[CirioNubAccess.LookupSymEntryByID[h.nub, symID]]};
+
+LookupFile: PROC[h: Connection, seqNum: CARD] RETURNS[entry: CirioNubAccess.FileEntry] =
+{RETURN[CirioNubAccess.GetFileEntry[h.nub, seqNum]]};
+
+GetPCInfo: PROC[h: Connection, absPC: CARD] RETURNS[CirioNubAccess.PCInfo] =
+{RETURN[CirioNubAccess.PCtoInfo[h.nub, absPC]]};
+
+
+DebugOn: PROC =
+BEGIN
+DebugFlag ¨ TRUE;
+END;
+
+DebugOff: PROC =
+BEGIN
+DebugFlag ¨ FALSE;
+END;
+
+
+GetRelPCForCLine: PROC[dotOName: Rope.ROPE, cLineNum: CARD, h: Connection] RETURNS[CARD] =
+BEGIN
+dotOPath: PFSNames.PATH ¨ PFS.PathFromRope[dotOName];
+file: SystemInterface.CirioFile ¨ SystemInterface.GetCirioFileFromDebuggee[h.fileSet, dotOPath, h.serverName];
+IF file=NIL THEN CCE[cirioError, IO.PutFR1["Couldn't access %g", [rope[dotOName]] ]];
+{container: ObjF.Parsed ¨ ObjF.CreateParsed[file];
+AcquireModule: PROC RETURNS[ObjF.Module] =
+BEGIN
+RETURN[ObjF.ModuleFromParsedAndPC[container, [[0, ""], 1]]];
+END; 
+dotO: ObjF.Module ¨ AcquireModule[];
+relPC: CARD ¨ ObjF.GetPCForLineNum[dotO, cLineNum].relPC;
+RETURN[relPC];}
+END;
+
+GetCLineForRelPC: PROC[dotOName: Rope.ROPE, relPC: CARD, h: Connection] RETURNS[CARD] =
+BEGIN
+dotOPath: PFSNames.PATH ¨ PFS.PathFromRope[dotOName];
+file: SystemInterface.CirioFile ¨ SystemInterface.GetCirioFileFromDebuggee[h.fileSet, dotOPath, h.serverName];
+IF file=NIL THEN CCE[cirioError, IO.PutFR1["Couldn't access %g", [rope[dotOName]] ]];
+{container: ObjF.Parsed ¨ ObjF.CreateParsed[file];
+AcquireModule: PROC RETURNS[ObjF.Module] =
+BEGIN
+RETURN[ObjF.ModuleFromParsedAndPC[container, [[0, ""], 1]]];
+END; 
+dotO: ObjF.Module ¨ AcquireModule[];
+cLine: CARD ¨ ObjF.GetLineNumForPC[dotO, [[0, ""], relPC]];
+RETURN[cLine];}
+END;
+
+
+
+
+
+
+
+keyName: Rope.ROPE ¨ "_CirioDebuggeeTestFrame_";
+
+
+RemoteCirioTest: Commander.CommandProc =
+BEGIN
+args: CommanderOps.ArgumentVector ¨ CommanderOps.Parse[cmd];
+serverName: Rope.ROPE ¨ args[1];
+portNum: CARDINAL ¨ IF args.argc <= 2 THEN 4815 ELSE CARDINAL[Convert.CardFromRope[args[2]]];
+reports: IO.STREAM ¨ IO.ROS[];
+connection: Connection ¨ OpenConnection[serverName, portNum, LIST[FileNames.CurrentWorkingDirectory[]], reports];
+remoteWorldStopped: BOOLEAN ¨ FALSE;
+
+CleanUp: PROC =
+BEGIN
+IF remoteWorldStopped THEN ResumeRemoteWorld[connection];
+remoteWorldStopped ¨ FALSE;
+CloseConnection[connection, reports];
+IO.Close[reports]
+END;
+
+BEGIN
+ENABLE UNWIND => CleanUp[];
+
+TestInner: PROC =
+BEGIN
+nThreads: CARD ¨ StopRemoteWorld[connection, reports];
+remoteWorldStopped ¨ TRUE;
+BEGIN
+interestingThreads: LIST OF CARD ¨ FindThreadsWithProperty[connection, [callingDebugger[]], cmd.out];
+
+FOR ts: LIST OF CARD ¨ interestingThreads, ts.rest WHILE ts # NIL DO
+x: CARD ¨ ts.first;
+stack: StackCirio.Stack;
+
+[] ¨ FocusOnThread[connection, x, cmd.out];
+stack ¨ GetStackForCurrentThread[connection, cmd.out];
+[] ¨ StackCirio.ResetStack[stack, cmd.out];
+
+IO.PutF1[cmd.out, "searching thread %g\N", IO.rope[GetThreadTitleText[connection, x]]];
+
+
+IF StackCirio.WalkStackToCProcedure[stack, keyName, "", cmd.out] THEN
+BEGIN
+nUnexpectedResults: CARD ¨ 0;
+
+BEGIN
+frameText: Rope.ROPE ¨ StackCirio.ShowCurrentFrame[stack, cmd.out];
+IO.PutF1[cmd.out, "\n\n%g\n\n", IO.rope[frameText]];
+END;
+BEGIN
+frame1Tests: LIST OF TestDescriptor ¨ LIST[
+["key", "44444"],
+["inner", "(invalid proc descriptor address)"],
+["result", "237864", 0, uninitializedVar],
+["b", "[a:6, b:7]"],
+["w", "[x:[a:4, b:5], y:[u:6, v:7]]"],
+["y", "failure due to illegal operation: y undefined"],
+["action", "???"],
+["foo", "test.(no name)(pc=D30C4Ch, descr at C7BCC0h, src=1412)", 18],
+["bar", "???"],
+["x", "10"],
+["veryBad", "???"],
+["CallDebugger", "failure due to illegal operation: CallDebugger undefined"]];
+nUnexpectedResults ¨ ExamineOneFrame[connection, frame1Tests, cmd.out] + nUnexpectedResults;
+END;
+
+[] ¨ StackCirio.WalkStack[stack, 1, cmd.out];
+
+BEGIN
+frameText: Rope.ROPE ¨ StackCirio.ShowCurrentFrame[stack, cmd.out];
+IO.PutF1[cmd.out, "\n\n%g\n\n", IO.rope[frameText]];
+END;
+
+BEGIN
+frame2Tests: LIST OF TestDescriptor ¨ LIST[
+["c", "'a"],	["quit", "FALSE"],	["bool1", "FALSE"],	["bool2", "TRUE"],	["charA", "'A"],	["charB", "'b"],	["array1", "(7)[6, 8, 10, 12, 14, 16, 18]"],	["array2", "(6)[11, 13, 15, 17, 19, 21]"],	["refR", "^[a:7, b:8]"],
+	["bb", "[ref:^[ref:NIL, a:45, b:46], a:47, b:48]"],	["refSeq", "^[x:10, (5)[3, 7, 11, 15, 19]]"],	["refSeq2", "^[y:45, (7)[TRUE, TRUE, FALSE, TRUE, FALSE, FALSE, TRUE]]"],	["ref2Seq2", "^[y:77, (32)[TRUE, FALSE, FALSE, FALSE, FALSE, TRUE, FALSE, FALSE, TRUE, TRUE, FALSE, FALSE, FALSE, FALSE, TRUE, FALSE, TRUE, FALSE, TRUE, FALSE, FALSE, TRUE, TRUE, FALSE, TRUE, TRUE, TRUE, FALSE, FALSE, FALSE, FALSE, ...]]"],	["b", "[a:6, b:7]"],	["w", "[x:[a:4, b:5], y:[u:6, v:7]]"],	["y", "failure due to illegal operation: y undefined"],	["action", "???"],	["foo", "test.(no name)(pc=D3217Ch, descr at C7BE90h, src=1412)", 18],	["bar", "???"],	["x", "10"],	["veryBad", "???"],	["CallDebugger", "failure due to illegal operation: CallDebugger undefined"]];
+nUnexpectedResults ¨ ExamineOneFrame[connection, frame2Tests, cmd.out] + nUnexpectedResults;
+END;
+
+[] ¨ StackCirio.WalkStack[stack, 2, cmd.out];
+
+BEGIN
+frameText: Rope.ROPE ¨ StackCirio.ShowCurrentFrame[stack, cmd.out];
+IO.PutF1[cmd.out, "\n\n%g\n\n", IO.rope[frameText]];
+END;
+
+BEGIN
+frame3Tests: LIST OF TestDescriptor ¨ LIST[
+["a", "22222"],	["deep", "1606016"],	["rope", "failure due to internal Cirio error"],	["arg1", "1234"],	["arg2", "5678"],	["res1", "node?"],	["res2", "node?"],	["z", "8518320"],	["yy", "3807"],	["ll", "x"],	["mm", "f"],	["q", "(invalid proc descriptor address)"],	["b", "[a:6, b:7]"],	["w", "[x:[a:4, b:5], y:[u:6, v:7]]"],	["y", "failure due to illegal operation: y undefined"],	["action", "???"],	["foo", "test.(no name)(pc=D3217Ch, descr at C7BE90h, src=1412)", 18],	["bar", "???"],	["x", "10"],	["veryBad", "???"],	["CallDebugger", "failure due to illegal operation: CallDebugger undefined"]];
+nUnexpectedResults ¨ ExamineOneFrame[connection, frame3Tests, cmd.out] + nUnexpectedResults;
+END;
+
+IF nUnexpectedResults = 0 THEN IO.PutRope[cmd.out, "\N\NThere were NO unexpected results\N\N"]
+  ELSE IO.PutF1[cmd.out, "\N\NThere were %g unexpected results\N\N", IO.card[nUnexpectedResults]];
+
+EXIT;
+END;
+ENDLOOP;
+END;
+END;
+
+TestInner[]; -- so that unwinds from aborts from breakpoints will be caught
+END;
+CleanUp[]
+END;
+
+TestDescriptor: TYPE = RECORD[
+expression: Rope.ROPE,
+expectedResult: Rope.ROPE,
+compareNCharsOnly: CARD ¨ 0,
+validity: Validity ¨ valid];
+
+Validity: TYPE = {valid, uninitializedVar, WRONG};
+
+ExamineOneFrame: PROC[connection: Connection, tryThis: LIST OF TestDescriptor, reports: IO.STREAM] RETURNS[--nUnexpectedResults-- CARD] =
+BEGIN
+ResultDescriptor: TYPE = RECORD[
+expression: Rope.ROPE,
+expectedResult: Rope.ROPE,
+actualResult: Rope.ROPE];
+deltas: LIST OF ResultDescriptor ¨ NIL;
+lastDelta: LIST OF ResultDescriptor ¨ NIL;
+news: LIST OF TestDescriptor ¨ NIL;
+lastNew: LIST OF TestDescriptor ¨ NIL;
+nUnexpectedResults: CARD ¨ 0;
+stack: StackCirio.Stack ¨ GetStackForCurrentThread[connection, reports];
+
+FOR tests: LIST OF TestDescriptor ¨ tryThis, tests.rest WHILE tests # NIL DO
+result: Rope.ROPE ¨ StackCirio.InterpretTextLine[stack, tests.first.expression, reports];
+new: LIST OF TestDescriptor ¨ LIST[[tests.first.expression, result, tests.first.compareNCharsOnly, tests.first.validity]];
+nChars: CARD ¨ IF tests.first.compareNCharsOnly > 0 THEN tests.first.compareNCharsOnly ELSE Rope.Length[tests.first.expectedResult];
+IF news = NIL THEN news ¨ new ELSE lastNew.rest ¨ new;
+lastNew ¨ new;
+IO.PutF[reports, "for expression: %g we get\N\T%g\N", IO.rope[tests.first.expression], IO.rope[result]];
+IF (tests.first.validity # uninitializedVar) AND NOT Rope.Equal[Rope.Substr[result, 0, nChars], Rope.Substr[tests.first.expectedResult, 0, nChars]] THEN
+BEGIN
+delta: LIST OF ResultDescriptor ¨ LIST[[tests.first.expression, tests.first.expectedResult, result]];
+IO.PutF1[reports, "  THIS IS WRONG, we expected\N\T%g\N\N", IO.rope[tests.first.expectedResult]];
+IF deltas = NIL THEN deltas ¨ delta ELSE lastDelta.rest ¨ delta;
+lastDelta ¨ delta;
+nUnexpectedResults ¨ nUnexpectedResults + 1;
+END;
+ENDLOOP;
+
+IO.PutRope[reports, "\N\Nhere is a list of expressions with their actual results\N"];
+FOR items: LIST OF TestDescriptor ¨ news, items.rest WHILE items # NIL DO
+IO.PutF[reports, "\T[\"%g\", \"%g\"", IO.rope[items.first.expression], IO.rope[items.first.expectedResult]];
+IF items.first.compareNCharsOnly > 0 OR items.first.validity # valid THEN
+IO.PutF1[reports, ", %g", IO.card[items.first.compareNCharsOnly]];
+IF items.first.validity # valid THEN
+IO.PutF1[reports, ", %g", IO.rope[SELECT items.first.validity FROM
+uninitializedVar => "uninitializedVar",
+WRONG => "WRONG",
+ENDCASE => ERROR]];
+IO.PutRope[reports, "],\N"];
+ENDLOOP;
+
+IF deltas # NIL THEN
+BEGIN
+IO.PutRope[reports, "\N\Nthere were unexpected results\N"];
+FOR items: LIST OF ResultDescriptor ¨ deltas, items.rest WHILE items # NIL DO
+IO.PutF1[reports, "\Texpression: %g\N", IO.rope[items.first.expression]];
+IO.PutF1[reports, "\Texpected result: %g\N", IO.rope[items.first.expectedResult]];
+IO.PutF1[reports, "\Tactual result: %g\N", IO.rope[items.first.actualResult]];
+ENDLOOP;
+END
+ ELSE IO.PutRope[reports, "\N\Nthere were NO unexpected results\N\N"];
+RETURN[nUnexpectedResults];
+END;
+
+InstallBreakCheckDaemon: PUBLIC PROC [connection: Connection, reports: IO.STREAM] =
+BEGIN
+IO.PutRope[reports, "Installing daemon for breakpoint hit ...\n"];
+connection.daemonKillFlag ¨ FALSE;
+connection.daemon ¨ FORK BreakCheckDaemon[connection: connection, reports: reports];
+Process.Detach[connection.daemon];
+IO.PutRope[reports, " fork finished.\n"];
+END;
+
+StopBreakCheckDaemon: PUBLIC PROC [connection: Connection, reports: IO.STREAM] = 
+BEGIN
+connection.remoteWorldRunning ¨ FALSE;
+IO.PutRope[reports, "killing BreakCheckDaemon...\n"];
+connection.daemonKillFlag ¨ TRUE;
+Process.PauseMsec[3000];
+END;
+
+BreakCheckDaemon: PROC [connection: Connection, reports: IO.STREAM] = 
+BEGIN 
+whichError: Rope.ROPE ¨ "$unkown";
+{
+Process.SetPriority[Process.priorityBackground];
+DO
+IF connection.daemonKillFlag = TRUE THEN GOTO terminate;
+WHILE connection.remoteWorldRunning = FALSE DO
+Process.PauseMsec[2000];
+IF connection.daemonKillFlag = TRUE THEN GOTO terminate;
+ENDLOOP;
+IF CirioNubAccess.WaitSig[h: connection.nub, timeoutMilliSec: 100 
+! 
+CirioNub.Error => {
+whichError ¨ Rope.Cat["CirioNub (", Atom.GetPName[code], ")"];
+GOTO connectionError; };
+CirioNubAccess.Error => {
+l: LIST OF ATOM ¨ codes;
+didAny: CARD ¨ 0;
+whichError ¨ Rope.Cat["CirioNubAccess: ", msg, " ("];
+WHILE l # NIL DO
+IF didAny # 0 THEN
+whichError ¨ whichError.Concat[", "];
+whichError ¨ whichError.Concat[Atom.GetPName[l.first]];
+l ¨ l.rest;
+ENDLOOP;
+GOTO connectionError; };] = FALSE THEN
+IO.PutRope[reports, "SIGINT: Debuggee needs attention.\n"! IO.Error => GOTO ret];
+Process.PauseMsec[2000];
+ENDLOOP;
+EXITS
+terminate => {IO.PutRope[reports, "BreakCheckDaemon killed.\n"! IO.Error => CONTINUE];RETURN};
+connectionError => {
+IO.PutF1[reports, "connection lost!  %g  BreakCheckDaemon exited.\n", [rope[whichError]]]; connection.open ¨ FALSE; RETURN};
+ret => RETURN;
+};
+END;
+
+
+
+Commander.Register["RemoteCirioTest", RemoteCirioTest];
+
+END..
+   %ä  
+RemoteCirioImpl.mesa
+Copyright ” 1990, 1991, 1992 by Xerox Corporation.  All rights reserved.
+Sturgis, April 20, 1990 2:29 pm PDT
+Last changed by Theimer on November 28, 1989 3:36:23 pm PST
+Last tweaked by Mike Spreitzer on July 24, 1992 6:20 pm PDT
+Linda Howe January 8, 1990 11:02:07 am PST
+Coolidge, July 29, 1990 1:51 pm PDT
+Laurie Horton, March 31, 1992 12:48 pm PST
+Philip James, February 3, 1992 10:41 am PST
+Udagawa, February 12, 1991 8:57 pm PST
+Willie-s, July 27, 1992 6:06 pm PDT
+Debugging aids
+This variable can be set/reset by the ampersand routines &&DebugOn and &&DebugOff.
+Types
+
+
+Connections
+The caller is responsible for eventually calling CloseConnection.  No subsequent connections can be made to the same <remoteName, portNum> pair until Close has been called.  Note: closing the connection invalidates all RemoteAddresses held for connection.nub.
+Question: how much of the items constructed below can/should we reused?
+A remote world needs to have the navel examination in CreateRemoteMimosaTargetWorld succeed; that requires finding CirioThings/CirioRopeHelper.mob, Rope/Rope.mob, and Atom/AtomPrivate.mob (on August 17, 1991).
+Build the list of search directories, starting with the user supplied directories.
+Join the user supplied and default search directories.
+target _ CirioTargets.CreateTarget[nub];
+We nest a block so that we can provide an unwind catch phrase to close the nub in the event of trouble before we hand responsibility to our caller.  (We also close the file set and clear all breaks.)
+ampersandContext1 _ AmpersandContext.CreateAnAmpersandContext[cc];
+ampersandContext2 _ AmpersandContext.CreateAnAmpersandContext[cc];
+ampersandContext1: ampersandContext1,
+ampersandContext2: ampersandContext2,
+InstallBreakCheckDaemon[connection, reports];
+disables the following ampersand routines.  Should move any useful ones to NewAmpersandProcs.
+
+Threads
+
+WHILE NOT WaitSig[nub, 1000] DO ENDLOOP;
+also resets the thread data as needed.
+from [palain-uX]<>jaune>xrhome>DEVELOPMENT>INCLUDE>xr>Threads.h we have:
+XR_DB_MSG_PROCEED_REPLY	(-1)
+XR_DB_MSG_EXIT_REPLY		(-2)
+XR_DB_MSG_ABORT_REPLY	(-3)
+now we have to reconstruct our thread info for this thread
+Stack Frames
+support
+
+
+Temporary access to C frame nodes etc.
+
+This procedure interfaces to RCTWImpl.GetCCAndFrameFromDotO.
+GetCFrameNode: PROC[serverName: Rope.ROPE, frameInfo: May4Exp.ProcedureFrameInfo, nub: CirioNubAccess.Handle, symbols: REF SymbolFinding.FoundSymbols] RETURNS[CC, CirioTypes.Node] =
+BEGIN
+cFrameInfo: RCTW.ProcedureFrameInfo _ NEW[RCTW.ProcedureFrameInfoBody_[
+dotOLongName: frameInfo.dotOInfo.fileName,
+mTime: frameInfo.dotOInfo.mtime,
+size: frameInfo.dotOInfo.size,
+fmagic: frameInfo.dotOInfo.fmagic,
+smagic: frameInfo.dotOInfo.smagic,
+stamp: frameInfo.dotOInfo.stamp,
+codeBase: frameInfo.dotOInfo.textReloc,
+dataBase: frameInfo.dotOInfo.dataReloc,
+bssBase: frameInfo.dotOInfo.bssReloc,
+relativePC: frameInfo.relativePC,
+framePointer: frameInfo.framePointer,
+stackPointer: frameInfo.stackPointer]];
+cc: CC; node: CirioTypes.Node;
+[cc, node] _ RCTW.GetCCAndFrameFromDotO[serverName, cFrameInfo, nub, symbols.embeddedDotO
+! CCTypes.CCError =>
+BEGIN
+cc _ NIL;
+node _ NIL;
+May4Exp.ShowReport[RopeForCCError[case, msg]];
+CONTINUE
+END];
+RETURN[cc, node];
+
+END;
+ampersand support
+
+need to install a catch phrase for NARROW fault
+
+
+source and break positions
+
+Queries the user for a directory name and adds it to the front of the list of search directories.
+Set the search directory.
+Queries the user for a directory name and removes it from the list of search directories.
+Remove the search directory.
+List all current search directories.
+Clear all search directories.
+ampersand procedures
+
+experimental
+this is adapted from NewRMTWImplA.NRFBFReadBits
+perhaps we could define some common code somewhere?
+
+as per our charter, 32 bits at most
+here is where we do the read
+
+This procedure assumes that a is the address of a variable holding a rope.
+That is, the contents of the 32 bits at address a is (roughly) a pointer to a rope body.
+The field declarations in the following procedures must agree with Rope.RopeRep in the PCedar world (see [PCedar2.0]<Rope>Rope.mesa)
+This procedure assumes that a is the address of a rope body.
+breakpoints  (tentative, using ampersand procedures)
+properDirName: Rope.ROPE _ CirioDeltaFace.ConvertToLocalDirectoryFormat[dirName];
+first, we remove any existing entry for the path
+now we install the path at the front of the list
+now we inform those who need to know
+first, we remove any existing entry for the path
+now we inform those who need to know
+now we inform those who need to know
+note: we need not do a NewRMTW.FlushUnknownSymbolCache[h.rmtw, BasicTime.Now[]], because that need only be called when new definition mobs become accessible, not when some become inaccessible.
+symbols
+
+misc
+dotOName1: Rope.ROPE _ CirioDeltaFace.ConvertFileNameToLocalFormat[dotOName];
+range: ObjF.StabRange _ ObjF.AlternativeFindModuleStabRange[container, 1];
+another Kludge
+range: ObjF.StabRange _ ObjF.AlternativeFindModuleStabRange[container, 1];
+GetMesaPosForCLine: PROC[mesaFileName: Rope.ROPE, cLine: CARD, h: Connection] =
+BEGIN
+reports: IO.STREAM _ IO.ROS[];
+cFileName: Rope.ROPE _ SystemInterface.MesaFileNameToCFileName[mesaFileName, reports];
+reportsText: Rope.ROPE _ IO.RopeFromROS[reports];
+IF Rope.Length[reportsText] # 0 THEN May4Exp.ShowReport[reportsText];
+IF cFileName = NIL THEN CCE[cirioError];
+
+BEGIN
+cFile: SystemInterface.CirioFile _ SystemInterface.GetCirioFile[h.fileSet, cFileName];
+cFileInfo: May4Exp.CFileInfo _ May4Exp.CreateCFileInfo[cFile];
+resultingMesaSourcePos: CARD _ May4Exp.LookupCLineNum[cFileInfo, cLine];
+mesaFileStream: IO.STREAM; -- to test for the presence of the file
+
+May4Exp.ShowReport[IO.PutFR["corresponding position is %g in %g", IO.card[resultingMesaSourcePos], IO.rope[mesaFileName]]];
+
+lets test to see if the mesa file is around
+mesaFileStream _ FS.StreamOpen[cFileName
+! FS.Error => CONTINUE];
+
+IF mesaFileStream = NIL THEN
+{May4Exp.ShowReport["unable to open mesa file"]; RETURN};
+IO.Close[mesaFileStream];
+
+SystemInterface.ShowSource[fileName: mesaFileName, index: resultingMesaSourcePos, feedBack: reports];
+END;
+END;
+Misc support
+GetCurrentFrameInfo: PROC [connection: Connection, reports: IO.STREAM] RETURNS [dotOFileName: Rope.ROPE, procName: Rope.ROPE, relPC: CARD] =
+BEGIN
+ENABLE UNWIND => NULL;
+inner: PROC RETURNS[Rope.ROPE] =
+BEGIN
+td: REF ThreadData _ connection.threads[connection.currentThread];
+
+IF td.currentFrameSymbols = NIL THEN td.currentFrameSymbols _ FindFrameSymbols[connection, td];
+
+BEGIN
+embeddedDotOInfo: REF ObjectFiles.ModuleInfo _ ObjectFiles.GetModuleInfo[td.currentFrameSymbols.embeddedDotO];
+frame: May4Exp.ProcedureFrameInfo _ td.currentFrame;
+dotOFileName1: Rope.ROPE;
+frameDotOFileName: Rope.ROPE _ frame.dotOInfo.fileName;
+loc: INT _ Rope.FindBackward[frameDotOFileName, "/"] + 1;
+dotOFileName _ Rope.Replace[base: frameDotOFileName, start: loc, with: LoadStateRootFileName[connection, frame]];
+Convert to the standard file system format.
+dotOFileName _ SystemInterface.ConvertFileNameToLocalFormat[dotOFileName];
+Find out which file system view we need for this file.
+dotOFileName1 _ SystemInterface.DetermineFileSystemView[dotOFileName, reports];
+IF dotOFileName1 # NIL THEN 
+BEGIN
+dotOFileName _ dotOFileName1;
+END
+ELSE 
+BEGIN
+May4Exp.ShowReport[IO.PutFR["File %g can't be found.", IO.rope[dotOFileName]]];
+CCE[cirioError];
+END;
+
+procName _ frame.pcInfo.procName;
+relPC _ frame.relativePC - embeddedDotOInfo.startPC;
+
+RETURN [dotOFileName];
+END;
+END;
+[] _ CirioBackstop.Protect[inner, reports];
+RETURN;
+END;
+LoadStateRootFileName: PROC [connection: Connection, frame: May4Exp.ProcedureFrameInfo] RETURNS [dotOFileName: Rope.ROPE] =
+BEGIN
+frameDotOFileName: Rope.ROPE _ frame.dotOInfo.fileName;
+loc: INT _ Rope.FindBackward[frameDotOFileName, "/"] + 1;
+frameDotORootFileName: Rope.ROPE _ Rope.Substr[frameDotOFileName, loc];
+rootDotOName: Rope.ROPE _ frame.pcInfo.guessedEmbeddedFileName;
+symEntryResult: CirioNubAccess.LookupSymEntryResult;
+symValue: CARD;
+numToSkip: INT;
+IF Rope.IsEmpty[rootDotOName] THEN RETURN [NIL];
+symEntryResult _ LookupID[connection, frame.pcInfo.guessedEmbeddedFileSymID];
+WITH symEntryResult SELECT FROM
+ser: REF CirioNubAccess.LookupSymEntryResultBody.case0 => symValue _ ser.symEntry.value;
+ENDCASE => CCE[cirioError, "Bad args to LookupID"];
+IF Rope.Equal[frameDotORootFileName, rootDotOName] THEN 
+dotOFileName _ rootDotOName
+ELSE 
+BEGIN
+numToSkip _ -1;
+DO
+symEntryResult _ LookupAddr[connection, symValue, numToSkip];
+WITH symEntryResult SELECT FROM
+ser: REF CirioNubAccess.LookupSymEntryResultBody.case0 => dotOFileName _ ser.symEntry.name;
+ENDCASE => CCE[cirioError, "Bad args to LookupAddr"];
+IF NOT Rope.Equal[dotOFileName, rootDotOName] THEN EXIT;
+numToSkip _ numToSkip - 1;
+ENDLOOP;
+END;
+RETURN [dotOFileName];
+END;
+
+Test driver
+use
+RemoteCirioTest menhir 4816
+
+the subject is [Cirio]<development>sturgis>test>test.mesa
+and lives in [Cirio]<development>sturgis>SturgisLocalSun.df
+
+the test lists were last updated: December 12, 1989 2:03:22 pm PST
+open a block to so that unwind catches can cleanup
+(note: we need not lock a monitor, since only one thread has access to the connection data.)
+
+now we examine the frame
+
+now we perform the individual expression tests
+lets look at the next frame
+and examine
+now we perform the individual expression tests
+lets skip a frame and look at the following frame
+and examine
+now we perform the individual expression tests
+overall result:
+finally, lets end the test
+ELSE 
+IO.PutF[reports, "W"];
+main code
+ ù >  ïNewlineDelimiter
+ñ"cedarcode" styleô codeöúôKöú
+œeú=ôHKöú#ô#Kô;Kô;Kô*Kô#Kô*Kô+Kô&Kô#óKò öœk	ò	Köúûú:òPKöúûúòKö	úûúû	úûúû	úò*Köú
+ûúòKöúûúIòVKöú
+ûúoò~Köúûú
+òKöúûúåò¢Köúûúò!Köú	ûú	òKöúûúëò•Köúûú	òKöúûú>òNKöú
+ûúò'Köúûúò*Köúûúò*Köú
+ûúò)KöûúûúNûúûúòiKöúûú)ò>KöúûúCòSKöúûú#ò:Köúûú∏ò≈KöúûúXòiKöúûúò#Köûúûú,ò5Köú	ûúûú	òKöúûú6òCKöúûúò"Köúûú4ûúòDKöúûúò+KöúûúŒòﬁKöúûúYònKò óöœnúûúûòKöûúûúò-Köûú∏ûúHûúEò—KöûúòóKöûúûúüúûúò3Kò ôKò öü	úûúûúòKôRóóKò Kôô Köûúûúò&Köûúûú&ûúûúòNóò Kô Köúûúûúò&ö	úûúûúû	úûúò/KöúûúòKöúûúò"KöúûúòKöúûúûú
+ûúò)KöúûúûúœcÍò¸Kò#Kò#KöúûúòKò'Köú&ò&Köú%ò%KöúòKòKöúûúòKöúûúòKöú'ò'Kò!Kò%KòKöú*ò*Köúûúûúò#KöúûúûúòKöúûúòKöú	ûúòóKò KöúûúûúûúûúûúûúòHöúûúûúòKöúûúò&KòKöúòKò óóôò KôÉKôGóöüúûúûúûúûúûúûúûúûúûúûúò†Köúûú*ò=öüúûúûúûúò#KòKöûúûúòóöüúûúûúò,Köúûúò!Köúûúò"Kò!Köú'ò'Kö	úûúûú
+ûúûúò(Kö	úûúûú
+ûúûúò+ö	úûúûú
+ûúûúò0Köûú ò#Köûú&ò)Köûúò"Köûú!ò$Köú—ô—óöüúûúûúûúò/Köú(ò(KöûúûúòKò óKöúRôRKöúûúûú0òFKòöûú
+ûúûúûú$ûúûúûòXKöúûúûúûúòNKò#KöûúòóKò Köú6ô6Kò'Kò ò\öúòKöúqòqKöûúòóóKö
+ûúûúûúûúûúòKöú(ô(Köú	ûúòKò Kò*KòVKöûúûúÜò•Kò Kô«Köúòöûúûú†0òCKöúûú6òIKöúòKöú&ò&KöûúûúûúûúòOKöúòóKöú	ûúòKöú%ò%Kò%Köú&ò&Kò6KöúòKöúòKöûúûúûúûúHòsKò*KòAKöúDòDKòFKöú^ûúòdKôBKôBöúûúò(Köúûú†;òEKòKòKò	KòKòóöúûúò KöúûúòKöú1ò1KòKöúòKô%Kô%KöúòKöúòKöúLòLKöúòKöúòKò	KòKöúûúòKöúûúòKòKòKò	Kò	KöúûúòóKò KòTKò]Kò]Kò1Kò1Kò KöúVòVKò Köú-ô-Kò Köûúûúûúûúò?Kò öûúûúûúûúò Kô]óKô KöúOûú$òvKöúUûúûú%ûúòùKöúXûúûú%ûúò£KöúUûúûú%ûúòùKöúUûúûú%ûúòùKöúTûúûú%ûúò°Kö	úWûúûúûúûú1ò∫Köúaûúûú1òöKò Kö	ú_ûúûúûú,ûú!ò⁄KöúXûúûú(òàKöúaûúûúûú#ò´Köú_ûúûúûú!ò£Köú\ûúûú,òêKöúTûúûúûúûúûúò®KöúUûúûú%òÇKöúVûúûú&òÑKò KöúWûúûúûúûúûúûúûú1òÂKöúXûúûúûúûúûú2ò»Kö	úVûúûúûúûú0ò≤Kö	úXûúûúûúûú:òøKö	úWûúûúûúûú/ò≤Kò Kò Köú^ûúûúûúûúûúûú ò«Köú^ûúûúûú	ûúûúûú òƒKò KöúUûúûúòuKöúVûúûúòwKò KöûúòóKöûú
+ûúûúùò±KöûúòóKò öüúûúûúûú"ûúûúòVKöûòKöûúûúûúòKöûúûúûúûúò#KöúHòHKöúKòKKöú/ò/öûúûúûò öûúûúûú"ûò7Köúûú%ò,Köú(ò(KöûúòóóKöûúòóKò öüúûúûúûú"ûúûúòRKöûúûúûúòKöú*ò*óKò ö
+üúûúûú"ûúûúòRöüúûúûúûúò.Köú5ûúûúòBóKöúûúûúòKöûúûúûúûúûúûúò7Köú*ò*KöúûúòKò?Köú*ò*Kò1KöûúûúûúûúòOKöúòóKò öüúûúûúûúò?KöûòKöûúûúûúòKöûúûúûúûúò#Köú)ò)KöúûúòKöú*ò*Kò1KöûúòóKò óôKô öüúûúûúûú"ûúûúûúûúòhKöûòKöûúûúûúòKöûúûúûúûúô(Köûúûú4ûúûúòOKöœt	ú°(ò2Köú ûúò&KöûúòKöûúòóKò öüúûú"ûúûúûúûúò]KöûòKöú	ûúûúûúò/Köú	ûúòKò<KòKöûúûúûúûú/ûúûúûúûúòtKò Köúûúò.óò öûúûúûúûú/ûúûúûúòVKöúûú,ûúòCKòò Köú0ò0Köú0ò0KöúòKöúòKöú&ò&KöúòKöúòKöúòKòKöúòKòKöú&ò&Kò KöúòKöú#ò#Kò KöúòKöü
+úò%KöúòóKòKö–kt°òóKöûúòKöûúòKò óöüúûúûúûúHûúûúûúûúûú†úûúò¶KöûòKöûúûúûúòKöûúûúûúûúò,öûúûúûúò6KöûòKö	úûúûúûúûúòKö	úûúûúûúûúò"Köûú5ò7öûúûúûú"ûò2öûú;ûòAKöûòKö	úûúûúûúûúòKöûúûúûúûúòJKòKöûúòóKöûúòóKöûúòKöûúòKöûúòóKöûúòóKò Kò öüúûú	ûú<ûúûúûúûúòzKöûòöûú
+ûúûòKöú&ûúûúò3Köú2ûúòSKöú(ûú;ûú:ò•öú*ò*KöûòKöúûúûú†ò$öü	úûúûúûú†úûúò@KöûòKöúûúûúò;KöûúòKöûúòóKöûúûúò7KöúIòIKöûúûúûúò.KöûúòKöûúòóKöûúûúòóöûúòKò óóöüúûúûúûú&ûúûúûúòeKöûòKöûúûúûúòKöûú4ò:KöûúòóKò ö
+üúûú&ûúûúûúò^KöûòKöúûú.ò=Köúûúò,Köúûú3òLKöúûú+ò@KöúûúûúûúûúûúòNKöûúûú ûúûúûú#ûúûúûúòØKöûúòóKò öüúûúûúûúûúûú	ûúûúûúògöûúûúûú"ûò6öûú&ûúûò/Köûúò
+óKöûúòóKòKò óöüúûúûúûúûúûúûúûúûúògöûú%ûò+Köûú)ò/óKòKò óöüúûúûúûú&ûúûúûúûúûúûúòÇKöûúòKöûúûúûúòKöúûú.ò=Kò Köûú7ûú5òpKöûú%ûú0òYKò KòBKöûúòóKò Kò öüúûúûúûú&ûúûúûúûúûúòKöûòKöûúûúûúòöúûúûúûúò KöûòKöûúûú*ûú6òkKöûúòóKöûú(ò.öûúòKò óóöüúûúûúûú&ûúûúûúûúûúòÜKöûòKöûúûúûúòöúûúûúûúò KöûòKöûú1ûúûúûúòOKöûúòóKöûú(ò.KöûúòóKò öü
+úûúûúûú&ûúûúûúûúûúòÖKöûòKöûúûúûúòöúûúûúûúò KöûòKöûú1ûúûúûúòOKöûúòóKöûú(ò.KöûúòóKò öüúûúûúûú&ûúûúûúûúûúòáKöûòKöûúûúûúòöúûúûúûúò KöûòKöûú1ûúûúûú2òzKöûúòóKöûú(ò.KöûúòóKò öüúûúûúûú&ûúûúûúûúûúòàKöûòKöûúûúûúòöúûúûúûúò KöûòKöûú1ûúûúûúòOKöûúòóKöûú(ò.Köûúòóò ô&öúûúûúôHKö
+ûúûúûúûúûúôKö
+ûúûúûúûúûúôKö
+ûúûúûúûúûúôóóóöüúûú&ûúûú
+ûú
+ûúûúûú†úûúò¨KöûòKöúûú0òAöûúûú_òeKöûúûúòóô:KöûòKöú	ûúûúûúOòcöûúûúûúûú/ûúûúûòUöûúûú†ò4KöûòKò3KöûúòKöûúòóKöûúò	óKöûú4ò:KöûúòóKöûúòóKò öüúûúûúûú&ûúûúûúûúûúò|KöûòKöûúûúûúòöûúûúûò)KöûòKöúûú0òAKöú ûúò%KöúûúòKöúûúòKöûúûú=ûúûúòXKöûúûú4ûúûúòHKò2KöúûúòKöú ûúò&KöûúòKöûòóKöúûúûúòKöûúòóKò Kò öüúûúûúûúòIKöûòKöûúûúûúòöûúûúûò)KöûòKöûúûú4ûúûúòOKöúûúòKöú ûúò%KöûúòóKöûúòKò óöüúûúûúûúò>KöûòKöûúûúûúòöûúûúûò)KöûòKöûúûú3ûúûúòNKöúûúòKöú ûúò%KöûúòóKöûúòóKò óôKò öüúûúûúûú"ûúûúûúòiKöûúûúûúòöûúò!Köú0ò0Köú0ò0KöúòKöúòKöú&ò&KöúòKöúòKöúòKòKöúòKòKöú&ò&Köü
+úò%KöúòóóKò öüúûúûúûú&ûúûúûúûúûúòáKöûúûúûúòKöúûú+ûúûúò`Köûú<òBKöúòóKò öüúûúûúûú"ûúûúûúòsKöûòKöûúûúûúòKöúûú;òJKöûúòKöûúòKò óKò ôKô ö
+üúûúûúûúûúò2KöûòöûúûúûòKöú$ò$Köú<ò<Köú8ò8Köú>ò>Köú4ò4Köú6ò6Köú*ò*Köú$ò$Köú&ò&Köûú
+òóKöûúòóKò ö
+üúûúûúûúûúò9KöûòöûúûúûòKöú(ò(Köú*ò*Köú&ò&Köú,ò,Köú,ò,Köú.ò.Köûúûúûúò0óöûúòKò óóóóKô ô&Kò Köú=ô=öüúûúûúNûúûúûúôµKöûôöúûúûúûúôGKöú*ô*Köú ô KöúôKöú"ô"Köú"ô"Köú ô Köú'ô'Köú'ô'Köú%ô%Köú!ô!Köú%ô%Köú'ô'óKöúûúôöúûúHôYöúôKöûôKöúûúô	KöúûúôKöú.ô.KöûôKöûúôóóKöûúôKô KöûúôóóKò öüúûú/ûúûúòrKöûòöûúûú+ûúûò;öûòKöûòKòRKòlKòBKòPKòNKòcKöûòóóKöûúòóKò öúôKô Kö
+üúûúûú"ûúûúòjKöûòöûúûú+ûúûò;öûòKöûòKòDKò^KòBKòbKöûú0ò6KöûúòóóKöûúòKò Köüúûúûúûú"ûúûúûúònKöûòKöúûúòò2Köú ûúûúò0óöûúûúûúûúò(öûòKöûòöúûúûúûú/òDKöú/ô/óKöûúòKöûúòóóKöûúòóKô Kô Kôô öüúûúûú.ûúûúûúòiKôaKöûòKò öúûúûúûúò KöûòôKöú+ò+Köûú5ûúòOóKöûúûúòKöûúòóKò KöúûúòKò-Köûúûúûúûú&ò;KöûúòKò óöüúûúûú.ûúûúûúòlKôYKöûòKò öúûúûúûúò KöûòôKöú.ò.Köûú9ûúòSóKöûúûúòKöûúòóKò KöúûúòKò-Köûúûúûúûú&ò;KöûúòKò óö
+üúûúûú#ûúûúòOKô$KöûòKò öúûúûúûúò KöûòKöúòKöûúòKöûúòóKò KöúûúòKò-Köûúûúûúûú&ò;KöûúòKò óö
+üúûúûú#ûúûúòPKôKöûòKò öúûúûúûúò KöûòKöúòKöûúòKöûúòóKò KöúûúòKò-Köûúûúûúûú&ò;KöûúòKò óóôKô KôKò Köúûúûúûúò=Kò öü	úûúûúûúòTKöûòKöúûúûúòAKöûúûúáòëKöûúòóKò KöüúûúòKöüúûúòKò Kò öüúûú!ûúûúòJKöúûúûúò1Köûúò$óò Kô/Kô3óöüúûúûúûúûú!ûúûúò{KöûòKöúûúûúò1Köúûú6òFKöúûúûúò*Kô Kô#Köûúûúûúò$Kò ôKöûòKöú
+ûú+ò8Köúûúûú1òWKöúûúò,Kò öûúûú†ò/Köûòöúûú$ò3KöúòKò	KòKöûúòKöûúòóKöûúû	úû	ú*òRKöûòóöúûú†ñòúKöûòöúûú$ò4KöúòKò	KòKöûúòKöûúòóöúûú$ò4KöúòKòKòKöûúòKöûúòóöûúûúòKöúû	úò-Köúû	ú0ò@óKöûúòóKöûúòóKò KöûúòKô óöüúûúûúûúûú'ûúòzKöûòKöúûúûúò1KöûúòKöûúòóKò öüúûúûú%ûúòpKöûòKöúûúûúò1Köúûú"ò5Köûú*ò0KöûúòóKò öüúûú ûúûúòDKöûòKöúûúûúò1Köûúò KöûúòóKò Kò Kò öüúûú%ûúò9KöûòKöüúûúòöûúûúûú+ûò;Köúûúûú(ò5Kö	ú
+ûúûúûúûúòKöûúòö	ûúüúûúûúûòKöú	ûú.ò;Köûúûúò,KöûúòóKöúûú!ò>KöûúòóKöûúòóKò öü
+úûú%ûúò<KöûòKöüúûúòöûúûúûú+ûò;Köúûúûú(ò5Kö	ú
+ûúûúûúûúòKöûúòö	ûúüúûúûúûòKöú	ûú.ò;Köûúûú*òFKöûúòóKöúûú!ò>KöûúòóKöûúòóKò Kò öüúûú%ûúò9KöûòKöüúûúòöûúûúûú+ûò;Köúûúûú(ò5Kö	ú
+ûúûúûúûúòKöûúòö	ûúüúûúûúûòKöú	ûú)ò6Köûúûú*òFKöûúòóKöúûú!ò>KöûúòóöûúòKò óóöüúûú%ûúò9KöûòKöüúûúòöûúûúûú+ûò;Köúûúûú(ò5Kö	ú
+ûúûúûúûúòKöûúòö	ûúüúûúûúûòKöú	ûú)ò6Köûúûúûúûúò7KöûúòóKöúûú!ò>KöûúòóKöûúòóò KöúJôJKôXóöüúûú%ûú	ò>KöûòKò>Köúûú1òGKöúûúûúòöü
+úûúûúòKò-óKöú>ò>Kò*KöûúòóKò Kò Kö	úûúûú	ûúûúò.Kò Kò Kò ò KöúÑôÑóò Köú<ô<óöüúûú$ûú
+ûúûúûúò_KöûòKòKöúûú,ò5ö
+ü
+úûúûúûúûúò/Köú	ûúûúòKò óKöúûúûú0òdöûúûòöú†ò KöûòKòKòKöúûú2ò>Köúûú,ò5KöúûúûúûúûúûúòCKò ö	ûúüúûúûúûòKöúûú"ò,Köúûúûú	òKöûúòóKöûúòóöú†ò KöûòKòKòKòKöúûú.ò8Köúûú0ò;Köúûú0ò;Köúûúûúûúûúûúò?öûúûòöûúûòöú†	òKöûòKöúòKöúòKòCKöúûú0ò;Kò6Kò%Köûúòóöú†	òKöûòKöúòKöúòKöúòKòCKòCKöúûú,ò5Kò6öûúûòKöûòKöúûúò5Köûúûú,òAKöûòóöúûòKò)óKöûúòóöúòKöûòKöúòKöúòKöúòKöúòKöúòKòCKòIKöúûú1ò<Köúûú3ò?Köúûú3ò?Kò7Kò öûúûúûòKöûòKöúûúò7KòKöúûúòöûúòKò óóöûúûúûò KöûòKöú&ûúòAKòKöúûúòKöûúòóKò öûúûúûòKöú3ò3Kò óKöûúòóKò?KöûúûúòóóKöûúòóKöûúûúòóKöûúòóKò Kò Kò öüúûúò*KöûòKöúûúò$Köúûú%ò,Köú2ò2KöûúòóóKò ô4Kò öüúûúûú,ûúòlKöúJòJKò óöü
+úûúò!Köú(ò(Kò óöüúûúûúò;Köú:ò:Kò óöüúûúûúò5Köú6ò6óKò öüúûúò%Köú,ò,óKò ö
+üúûúûúûúûúòFKöûòKöúûú9ôQKöúûúûúò9ö	úûúûú
+ûúûúò"Kô0óöûúûúûòKöú	ûúûú
+ûúûúûúûúûúòWKöûúûúûúûúòöûú$ûò*KöûòKöûúûúûú$ûúòTKöûúòKöûúòóKòKöûúòóKô0Köúûú%ò?Kô$KöúOòOKöûúûúûúCòUöûúûúûòöûúûúûúûò.Köúûúò#Köú(ò(KöûúòóóKöûúòóKò ö
+ü	úûúûúûúûúòIKöûòKöúûúûúò9ö	úûúûú
+ûúûúò"Kô0óöûúûúûòKöú	ûúûú
+ûúûúûúûúûúòWKöûúûúûúûúòöûú$ûò*KöûòKöûúûúûú$ûúòTKöûúòKöûúòóKòKöûúòóKô$KöúOòOKöúBòBöûúûúûòöûúûúûúûò.Köúûúò#Köú(ò(KöûúòóóKöûúòKò óö–bnúûúòKöûòKöúûúûúò#öûúûúûú
+ûú#ûú	ûúûòWKöú0ûú"òUKöûúòóKò7KöûúòóKò ö£úûúò KöûòKòFKò-KòKöúûúòKô$KöúOòOKöú¿ô¿KöûúòóóKò ôKô öü	úûúûúûúûúûúûúòKöúûú2ûúòYóKò ö
+ü
+úûúûúûúûúòaKöúûú?òFóKò öüúûúûúûúòMKöúûú3ò:óKò öü
+úûúûúûú#òXKöúûú.ò5óKò öü	úûúûúûúòLKöúûú)ò0óKò KôKò öüúûúòKöûòKöúûúòKöûúòóKò öüúûúòKöûòKöúûúòKöûúòóò Kò óöüúûúûúûúûúûúòZKöûòKöúûú9ôMKöúûúûúò5KònKö
+ûúûúûúûúûú2òUKò2öüúûúûúò*KöûòKöúûúûú-ôJKöûú6ò<KöûúòóKò$Köúûú.ò9Köûú	òKöûúòóò Kôóöüúûúûú	ûúûúûúòWKöûòKöúûúûúò5KònKö
+ûúûúûúûúûú2òUKò2öüúûúûúò*KöûòKöúûúûú-ôJKöûú6ò<KöûúòóKò$Köúûú0ò;Köûú	òKöûúòóKò öüúûúûú	ûúôOKöûôKö	ú	ûúûúûúûúôKöúûúBôVKöúûúûúô1Köûúûú!ôEKöûúûúûúûúô(ô KöûôKôVKô>Köúûú,ôHKöúûúûú†'ôBKô Köúûú-ûúûúô{Kô ô+öúûúô(Köúûú
+ûúôóKô öûúûúûôKöú1ûúô9óKöûúôóKô KöúeôeKöûúôóKöûúôóKò Kò óôKò Kò ö£úûú#ûúûúûúûúûú	ûúôåKöûôKöûúûúûúôöúûúûúûúô KöûôKöúûú;ôBKô Köûúûúûú;ô_ô KöûôKöúûúYônKöú4ô4KöúûúôKöúûúô7Köúûú1ô9Köúqôqô+KöúJôJóô6KöúOôOöûúûúûúôKöûôKöúôKöûôóöûúôKöûôKöúûú"ûúôOKöûúôKöûúôóóKô Köú!ô!Köú4ô4Kô KöûúôKöûúôóKöûúôóKöú+ô+KöûúôKöûúôóKò ö£úûú=ûúûúô{KöûôKöúûúô7Köúûú1ô9Köúûú'ôGKöúûú(ô?Köú4ô4Köú
+ûúôKöúûúôKöûúûúûúûúô0KöúMôMöûúûúûôKöúûúPôXKöûúûú%ô3óöûú1ûúô8KöúôóöûúôKöûôKôöûôKöú=ô=öûúûúûôKöúûúSô[Köûúûú'ô5óKöûúûú(ûúûúô8KôKöûúôóKöûúôóKöûúôKöûúôóóKô ôKò Köúûúò0Kò ôKôKô Kô9Kô;Kô KôBóKò öüúò(KöûòKò<Köúûúò Köú	ûúûúûúûúûú ò]Kö	ú	ûúûúûúûúòKöú=ûú0òqKöúûúûúò$Kò öüúûúòKöûòKöûúûúò9KöúûúòKöú%ò%KöûúòKöûúòKò óô2Kô\KöûòKöûúûúòKò öü	úûúòKöûòKöú
+ûú(ò6öúûúòKöûòKöúûúûúûúEòeKò öûúûúûúûúûúûúûòDKöúûúòKòKò Kò+Kò6Kò+Kò Köûú)ûú*òWò Kò óöûú?ûòEKöûòKöúûúòKò Kô ôKöûòKöúûú/òCKöûúûúò4KöûúòóKô ô.Köûòöúûúûúûúò+Köú∫ò∫óKò\KöûúòóKò ôKò-óKò ôKöûòKöúûú/òCKöûúûúò4KöûúòóKò ô.Köûòöúûúûúûúò+KöúŸòŸóKò\KöûúòóKò ô1Kò-óKò ôKöûòKöúûú/òCKöûúûúò4KöûúòóKò ô.Köûòöúûúûúûúò+KöúÈòÈóKò\KöûúòóKò ôKöûúûúûú=ò^Köúûúûú<ûúòbóKò ôKöûúòóKöûúòóKöûúòóKöûúòóKöûúòKò óKöú†>òKKöûúòóKöú	ò	KöûúòóKò öúûúûúòKöúûúòKöúûúòKöúûúòKòóKò Köú
+ûúûúò2Kò öüúûú"ûúûúûúûúûú†úûúòâKöûòöúûúûúò KöúûúòKöúûúòKöúûúòóKöúûúûúûúò'Köúûúûúûúò*Köúûúûúûúò#Köú	ûúûúûúò&KöúûúòòHKò óöûúûúûú&ûú	ûúûòLKöúûúHòYKöúûúûúûúXòzKö	úûúûú#ûúûú)òÑKöûúûúûúûúò6KòKöûú4ûúûúòhöûú+ûúûú`ûòòKöûòKöúûúûúûú?òeKöûú:ûú#òaKöûú
+ûúûúûúò@KòKò,KöûúòóKöûúòóKò KöûúSòUöûúûúûú#ûú	ûúûòIKöûú$ûúûú#òlöûú#ûúûòIKöûúûú&òBóöûúûò$öûúûúûúûòBKò'KöûúòKöûúûúòóóKöûúòKöûúòóKò öûú
+ûúûòKöûòKöûú9ò;öûúûúûú'ûú	ûúûòMKöûú&ûúòIKöûú+ûú#òRKöûú)ûú!òNKöûúòóKöûòóKöúûúûú>òFKöûúòKöûúòóKò ö
+üúûúûú#ûúûúòSKöûòKöûú@òBKöúûúò"Köúûú<òTKöú"ò"Köûú'ò)KöûúòóKò ö
+üúûúûú#ûúûúòQKöûòKöú ûúò&Köûú3ò5Köúûúò!KöúòKöûúòKò óöüúûú#ûúûúòFKöûúòKöúûúò"KöúòKöú0ò0öûòKöûúûúûúûúò8öûú!ûúûò.KöúòKöûúûúûúûúò8Köûúòóöûú@òBöúòöúòKò>KöûúòóöúòKöúûúûúûú	òKöúûúòKò5öûúûúûòöûúûòKò%óKò7KòKöûúòóKöûúûúûò&óóKöûú9ûú
+ûúòQóöûúôKöûúûôóKöúòKöûúòóöûòKö	úûú0ûú
+ûúûúò^öúòKöûúkûúûúò|óKöúûúòóKòKöûúòóóKò Kò Köú	ô	ò Köú7ò7Kò óKöûúòó Öó    »ﬁ  ,z 
