@@ -42,8 +42,32 @@ Inside the app use **File → Open Directory** (Ctrl+O) or **Open File**. The tr
 lists `*.tioga`, `*.mesa`, `*.df`, `*.require`, `*.profile`, `*.depends` files
 and their versioned `!N` variants.
 
-**Zoom** (whole-UI font size) via the **View** menu or keyboard — `Cmd`/`Alt`
-plus `+`/`=` to enlarge, `-` to shrink, and `0` to reset.
+The workspace uses Cedar's **two-column tiled "Viewers"** model: files open as
+bordered panes that **stack vertically within a column and partition its full
+height** (no overlapping windows). A **global bar** runs across the top and a
+reserved **icon tray** across the bottom. Each Viewer's header carries the Cedar
+action buttons:
+
+- **Destroy** — close it; the column reflows to reclaim the space.
+- **Grow** — maximise it to the whole column (toggles back).
+- **Icon** — minimise it to the bottom icon tray (click the icon to restore).
+- **Switch** — move it to the other column.
+- **Split** — open a second Viewer of the same file directly below.
+
+Column widths and the boundaries between stacked Viewers are draggable. Opening
+an already-open file focuses it instead of duplicating.
+
+The UI is styled after the Xerox Cedar / Tioga environment: monochrome black-on-
+white "viewers" with thin black rules, a caption/command strip, a serif body
+font (system Georgia, falling back to Times/DejaVu) and a monospace code font.
+
+**View menu / keyboard:**
+
+- **Zoom** (whole-UI font size) — `Cmd`/`Alt` with `+`/`=` to enlarge, `-` to
+  shrink (up to 6×), `0` to reset.
+- **Monochrome** (`Cmd`/`Alt`+`M`) — toggles code highlighting between colour and
+  a colourless mode that distinguishes tokens with **bold**/*italic* only, in the
+  spirit of Tioga's text "looks".
 
 ## Downloader
 

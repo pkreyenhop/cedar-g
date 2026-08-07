@@ -15,10 +15,10 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/driver/desktop"
-	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
 	"cedarg/internal/cedar"
@@ -47,20 +47,36 @@ var builtinList = []string{
 	"INTERNAL", "OVERLAID", "SHARES", "TRUE", "FALSE", "CARD",
 }
 
-type ui struct {
-	win   fyne.Window
-	tree  *widget.Tree
-	title *widget.Label
+// numColumns is the number of Cedar workspace columns.
+const numColumns = 2
 
-	doc        *widget.RichText
-	docScroll  *container.Scroll
-	code       *widget.TextGrid
-	codeScroll *container.Scroll
+type ui struct {
+	win  fyne.Window
+	tree *widget.Tree
+
+	colHolder  [numColumns]*fyne.Container // one stack holder per column
+	columns    [numColumns][]*viewer       // viewers stacked top→bottom per column
+	grown      [numColumns]*viewer         // the grown (maximised) viewer, if any
+	minimized  []*viewer                   // viewers parked in the icon tray
+	iconTray   *fyne.Container             // bottom strip of minimized-viewer icons
+	statusText *canvas.Text                // status readout in the global bar
 
 	rootPath   string
 	builtins   map[string]bool
 	childCache map[string][]string
 	fontScale  float32 // theme text-size multiplier for zoom
+	mono       bool    // monochrome highlighting: bold/italic, no colour
+}
+
+// viewer is one Cedar "Viewer": a document/code pane living in a column.
+type viewer struct {
+	ui       *ui
+	path     string
+	col      int              // which column it belongs to
+	code     *widget.TextGrid // set for code files
+	doc      *widget.RichText // set for document files
+	lastCode string           // decoded source, for restyling on mono toggle
+	root     fyne.CanvasObject
 }
 
 // newUI builds all widgets and the layout, and installs them as the window's
@@ -76,31 +92,73 @@ func newUI(w fyne.Window) *ui {
 		u.builtins[b] = true
 	}
 
-	u.title = widget.NewLabel("")
-	u.title.Wrapping = fyne.TextWrapWord
-
-	u.doc = widget.NewRichText()
-	u.doc.Wrapping = fyne.TextWrapWord
-	u.docScroll = container.NewScroll(u.doc)
-
-	u.code = widget.NewTextGrid()
-	u.codeScroll = container.NewScroll(u.code)
-	u.codeScroll.Hide()
-
-	viewers := container.NewStack(u.docScroll, u.codeScroll)
-
 	u.tree = widget.NewTree(u.childUIDs, u.isBranch, u.createNode, u.updateNode)
 	u.tree.OnSelected = u.onSelected
+	treePane := container.NewBorder(cedarStrip("Files"), nil, nil, nil, u.tree)
 
-	right := container.NewBorder(u.title, nil, nil, nil, viewers)
-	split := container.NewHSplit(u.tree, right)
-	split.SetOffset(0.28)
-	w.SetContent(split)
+	// Two Cedar workspace columns, each a holder we refill on every reflow.
+	for c := range u.colHolder {
+		u.colHolder[c] = container.NewStack(emptyColumn())
+	}
+	workspace := container.NewHSplit(u.colHolder[0], u.colHolder[1])
+	workspace.SetOffset(0.5)
+
+	main := container.NewHSplit(treePane, workspace)
+	main.SetOffset(0.18)
+
+	u.iconTray = container.NewHBox()
+	content := container.NewBorder(
+		u.globalBar(),
+		cedarIconTrayBar(u.iconTray),
+		nil, nil,
+		main,
+	)
+	w.SetContent(content)
 	return u
+}
+
+// globalBar is the system-wide control strip across the top (black), with a few
+// primary actions, like Cedar's message/command row.
+func (u *ui) globalBar() fyne.CanvasObject {
+	rect := canvas.NewRectangle(cedarBlack)
+	rect.SetMinSize(fyne.NewSize(0, 26))
+	title := canvas.NewText("Cedar  Viewers", cedarWhite)
+	title.TextStyle = fyne.TextStyle{Bold: true}
+	title.TextSize = 13
+	u.statusText = canvas.NewText("", cedarWhite)
+	u.statusText.TextSize = 12
+	open := widget.NewButton("Open…", func() { u.openFileDialog() })
+	openDir := widget.NewButton("Dir…", func() { u.openDirDialog() })
+	bar := container.NewBorder(nil, nil,
+		container.NewHBox(container.NewPadded(title), open, openDir),
+		container.NewPadded(u.statusText),
+		nil)
+	return container.NewStack(rect, bar)
+}
+
+// cedarStrip is a horizontal command/label strip: black text over a grey fill.
+func cedarStrip(text string) fyne.CanvasObject {
+	rect := canvas.NewRectangle(cedarGrey)
+	lbl := canvas.NewText(text, cedarBlack)
+	lbl.TextSize = 12
+	return container.NewStack(rect, container.NewPadded(lbl))
+}
+
+// cedarIconTrayBar is the reserved grey bottom strip holding minimized viewers.
+func cedarIconTrayBar(tray *fyne.Container) fyne.CanvasObject {
+	rect := canvas.NewRectangle(cedarGreyMid)
+	rect.SetMinSize(fyne.NewSize(0, 30))
+	return container.NewStack(rect, container.NewHScroll(tray))
+}
+
+// emptyColumn is the placeholder shown when a column holds no viewers.
+func emptyColumn() fyne.CanvasObject {
+	return canvas.NewRectangle(cedarWhite)
 }
 
 func main() {
 	a := app.NewWithID("ch.rochus-keller.tiogaviewer.go")
+	a.Settings().SetTheme(newCedarTheme(1.0))
 	w := a.NewWindow("TiogaViewer")
 
 	u := newUI(w)
@@ -127,25 +185,29 @@ func main() {
 	w.ShowAndRun()
 }
 
+func (u *ui) openDirDialog() {
+	dialog.ShowFolderOpen(func(list fyne.ListableURI, err error) {
+		if err != nil || list == nil {
+			return
+		}
+		u.setRoot(list.Path())
+	}, u.win)
+}
+
+func (u *ui) openFileDialog() {
+	dialog.ShowFileOpen(func(rc fyne.URIReadCloser, err error) {
+		if err != nil || rc == nil {
+			return
+		}
+		path := rc.URI().Path()
+		rc.Close()
+		u.openFile(path)
+	}, u.win)
+}
+
 func (u *ui) buildMenu(a fyne.App) {
-	openDir := func() {
-		dialog.ShowFolderOpen(func(list fyne.ListableURI, err error) {
-			if err != nil || list == nil {
-				return
-			}
-			u.setRoot(list.Path())
-		}, u.win)
-	}
-	openFile := func() {
-		dialog.ShowFileOpen(func(rc fyne.URIReadCloser, err error) {
-			if err != nil || rc == nil {
-				return
-			}
-			path := rc.URI().Path()
-			rc.Close()
-			u.openFile(path)
-		}, u.win)
-	}
+	openDir := u.openDirDialog
+	openFile := u.openFileDialog
 
 	zoomIn := func() { u.zoomBy(+0.1) }
 	zoomOut := func() { u.zoomBy(-0.1) }
@@ -159,13 +221,28 @@ func (u *ui) buildMenu(a fyne.App) {
 	miZoomReset := fyne.NewMenuItem("Reset Zoom", zoomReset)
 	miZoomReset.Shortcut = &desktop.CustomShortcut{KeyName: fyne.Key0, Modifier: fyne.KeyModifierSuper}
 
+	// Monochrome toggle: bold/italic instead of colour.
+	miMono := fyne.NewMenuItem("Monochrome (bold/italic)", nil)
+	miMono.Checked = u.mono
+	miMono.Action = func() {
+		miMono.Checked = !miMono.Checked
+		u.setMono(miMono.Checked)
+		u.win.MainMenu().Refresh()
+	}
+	miMono.Shortcut = &desktop.CustomShortcut{KeyName: fyne.KeyM, Modifier: fyne.KeyModifierSuper}
+
 	u.win.SetMainMenu(fyne.NewMainMenu(
 		fyne.NewMenu("File",
 			fyne.NewMenuItem("Open Directory…", openDir),
 			fyne.NewMenuItem("Open File…", openFile),
 		),
-		fyne.NewMenu("View", miZoomIn, miZoomOut, miZoomReset),
+		fyne.NewMenu("View", miZoomIn, miZoomOut, miZoomReset, fyne.NewMenuItemSeparator(), miMono),
 	))
+	// Cmd/Super+M is handled by the menu item above; add the Alt variant too.
+	u.win.Canvas().AddShortcut(
+		&desktop.CustomShortcut{KeyName: fyne.KeyM, Modifier: fyne.KeyModifierAlt},
+		func(fyne.Shortcut) { miMono.Action() },
+	)
 	u.win.Canvas().AddShortcut(
 		&desktop.CustomShortcut{KeyName: fyne.KeyO, Modifier: fyne.KeyModifierControl},
 		func(fyne.Shortcut) { openDir() },
@@ -182,31 +259,23 @@ func (u *ui) buildMenu(a fyne.App) {
 	}
 }
 
-// zoomTheme wraps a base theme and scales every size by a factor, so changing it
-// resizes all text (both viewers, tree and menus) as a whole-UI zoom.
-type zoomTheme struct {
-	base  fyne.Theme
-	scale float32
-}
-
-func (z *zoomTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
-	return z.base.Color(n, v)
-}
-func (z *zoomTheme) Font(s fyne.TextStyle) fyne.Resource     { return z.base.Font(s) }
-func (z *zoomTheme) Icon(n fyne.ThemeIconName) fyne.Resource { return z.base.Icon(n) }
-func (z *zoomTheme) Size(n fyne.ThemeSizeName) float32       { return z.base.Size(n) * z.scale }
-
 func (u *ui) applyZoom() {
-	fyne.CurrentApp().Settings().SetTheme(&zoomTheme{base: theme.DefaultTheme(), scale: u.fontScale})
+	fyne.CurrentApp().Settings().SetTheme(newCedarTheme(u.fontScale))
 }
+
+// Zoom bounds — a wide range so text can be made large for readability.
+const (
+	minFontScale = 0.5
+	maxFontScale = 6.0
+)
 
 func (u *ui) zoomBy(delta float32) {
 	u.fontScale += delta
-	if u.fontScale < 0.6 {
-		u.fontScale = 0.6
+	if u.fontScale < minFontScale {
+		u.fontScale = minFontScale
 	}
-	if u.fontScale > 3.0 {
-		u.fontScale = 3.0
+	if u.fontScale > maxFontScale {
+		u.fontScale = maxFontScale
 	}
 	u.applyZoom()
 }
@@ -222,10 +291,37 @@ func (u *ui) setRoot(path string) {
 	u.rootPath = path
 	u.childCache = make(map[string][]string)
 	u.win.SetTitle(path + " - TiogaViewer")
-	u.title.SetText("")
-	u.doc.Segments = nil
-	u.doc.Refresh()
+	u.setStatus("Root: " + path)
+	u.clearViewers()
 	u.tree.Refresh()
+}
+
+// clearViewers removes all open and minimized viewers.
+func (u *ui) clearViewers() {
+	for c := range u.columns {
+		u.columns[c] = nil
+		u.grown[c] = nil
+	}
+	u.minimized = nil
+	u.rebuildColumn(0)
+	u.rebuildColumn(1)
+	u.rebuildTray()
+}
+
+// relPath returns path relative to the current root, when possible.
+func (u *ui) relPath(path string) string {
+	if u.rootPath != "" {
+		return strings.TrimPrefix(path, u.rootPath)
+	}
+	return path
+}
+
+// setStatus updates the readout in the global bar.
+func (u *ui) setStatus(s string) {
+	if u.statusText != nil {
+		u.statusText.Text = s
+		u.statusText.Refresh()
+	}
 }
 
 func (u *ui) childUIDs(uid widget.TreeNodeID) []widget.TreeNodeID {
@@ -299,31 +395,262 @@ func (u *ui) onSelected(uid widget.TreeNodeID) {
 
 // ---- file rendering ----
 
+// openFile opens path as a new Viewer at the bottom of the shorter column, or
+// focuses/restores an existing Viewer for the same file.
 func (u *ui) openFile(path string) {
-	data, err := os.ReadFile(path)
-	rel := path
-	if u.rootPath != "" {
-		rel = strings.TrimPrefix(path, u.rootPath)
-	}
-	if err != nil {
-		u.title.SetText("cannot open file: " + rel)
+	if v := u.findViewer(path); v != nil {
+		if u.isMinimized(v) {
+			u.restoreViewer(v)
+		}
+		u.setStatus(u.relPath(path))
 		return
 	}
-	u.title.SetText(rel)
+	c := u.shorterColumn()
+	v := u.newViewer(path, c)
+	u.grown[c] = nil // a new viewer needs to be visible
+	u.columns[c] = append(u.columns[c], v)
+	u.rebuildColumn(c)
+	u.setStatus(u.relPath(path))
+}
 
-	isCode := strings.HasSuffix(path, ".mesa") || strings.Contains(path, ".mesa!")
-	docModel := tioga.Read(data, isCode)
-	if docModel.IsCode {
-		u.showCode(docModel.Code)
-	} else {
-		u.showDoc(docModel.Blocks)
+// ---- viewer lifecycle within columns ----
+
+func (u *ui) allViewers() []*viewer {
+	var all []*viewer
+	for c := range u.columns {
+		all = append(all, u.columns[c]...)
+	}
+	return append(all, u.minimized...)
+}
+
+func (u *ui) findViewer(path string) *viewer {
+	for _, v := range u.allViewers() {
+		if v.path == path {
+			return v
+		}
+	}
+	return nil
+}
+
+func (u *ui) isMinimized(v *viewer) bool {
+	for _, m := range u.minimized {
+		if m == v {
+			return true
+		}
+	}
+	return false
+}
+
+// shorterColumn returns the column with fewer active viewers (ties → column 0).
+func (u *ui) shorterColumn() int {
+	if len(u.columns[1]) < len(u.columns[0]) {
+		return 1
+	}
+	return 0
+}
+
+func (u *ui) removeFromColumn(v *viewer) {
+	col := u.columns[v.col]
+	for i, x := range col {
+		if x == v {
+			u.columns[v.col] = append(col[:i], col[i+1:]...)
+			break
+		}
+	}
+	if u.grown[v.col] == v {
+		u.grown[v.col] = nil
 	}
 }
 
-func (u *ui) showCode(text string) {
-	u.code.SetText(text)
-	for _, s := range cedar.Highlight(text, u.builtins) {
-		st := cedar.CategoryStyle(s.Cat)
+// destroyViewer removes a viewer entirely; the column reflows to reclaim space.
+func (u *ui) destroyViewer(v *viewer) {
+	if u.isMinimized(v) {
+		u.removeMinimized(v)
+		u.rebuildTray()
+		return
+	}
+	u.removeFromColumn(v)
+	u.rebuildColumn(v.col)
+}
+
+// growViewer toggles a viewer occupying its whole column (others hidden).
+func (u *ui) growViewer(v *viewer) {
+	if u.grown[v.col] == v {
+		u.grown[v.col] = nil
+	} else {
+		u.grown[v.col] = v
+	}
+	u.rebuildColumn(v.col)
+}
+
+// minimizeViewer parks a viewer in the icon tray.
+func (u *ui) minimizeViewer(v *viewer) {
+	if u.isMinimized(v) {
+		return
+	}
+	u.removeFromColumn(v)
+	u.minimized = append(u.minimized, v)
+	u.rebuildColumn(v.col)
+	u.rebuildTray()
+}
+
+// restoreViewer returns a minimized viewer to the bottom of its column.
+func (u *ui) restoreViewer(v *viewer) {
+	u.removeMinimized(v)
+	u.grown[v.col] = nil
+	u.columns[v.col] = append(u.columns[v.col], v)
+	u.rebuildColumn(v.col)
+	u.rebuildTray()
+}
+
+func (u *ui) removeMinimized(v *viewer) {
+	for i, m := range u.minimized {
+		if m == v {
+			u.minimized = append(u.minimized[:i], u.minimized[i+1:]...)
+			return
+		}
+	}
+}
+
+// switchViewer moves a viewer to the other column, reflowing both.
+func (u *ui) switchViewer(v *viewer) {
+	old := v.col
+	u.removeFromColumn(v)
+	v.col = (old + 1) % numColumns
+	u.columns[v.col] = append(u.columns[v.col], v)
+	u.rebuildColumn(old)
+	u.rebuildColumn(v.col)
+}
+
+// splitViewer inserts a second Viewer of the same file directly below this one.
+func (u *ui) splitViewer(v *viewer) {
+	nv := u.newViewer(v.path, v.col)
+	col := u.columns[v.col]
+	for i, x := range col {
+		if x == v {
+			u.columns[v.col] = append(col[:i+1], append([]*viewer{nv}, col[i+1:]...)...)
+			break
+		}
+	}
+	u.grown[v.col] = nil
+	u.rebuildColumn(v.col)
+}
+
+// rebuildColumn refills a column holder: the grown viewer alone, or all viewers
+// stacked and height-partitioned via nested splits.
+func (u *ui) rebuildColumn(c int) {
+	var content fyne.CanvasObject
+	switch {
+	case u.grown[c] != nil:
+		content = u.grown[c].root
+	case len(u.columns[c]) > 0:
+		roots := make([]fyne.CanvasObject, len(u.columns[c]))
+		for i, v := range u.columns[c] {
+			roots[i] = v.root
+		}
+		content = stackSplit(roots)
+	default:
+		content = emptyColumn()
+	}
+	u.colHolder[c].Objects = []fyne.CanvasObject{content}
+	u.colHolder[c].Refresh()
+}
+
+// stackSplit stacks items top→bottom in nested vertical splits with equal
+// heights, giving draggable boundaries and full-height partitioning.
+func stackSplit(items []fyne.CanvasObject) fyne.CanvasObject {
+	if len(items) == 1 {
+		return items[0]
+	}
+	s := container.NewVSplit(items[0], stackSplit(items[1:]))
+	s.SetOffset(1.0 / float64(len(items))) // top item gets 1/n of the height
+	return s
+}
+
+// rebuildTray refills the bottom icon tray with a button per minimized viewer.
+func (u *ui) rebuildTray() {
+	u.iconTray.Objects = nil
+	for _, v := range u.minimized {
+		mv := v
+		b := widget.NewButton(filepath.Base(v.path), func() { u.restoreViewer(mv) })
+		u.iconTray.Add(b)
+	}
+	u.iconTray.Refresh()
+}
+
+// newViewer reads path, decodes it, and builds a bordered Viewer with a Cedar
+// header (title + Destroy/Grow/Icon/Switch/Split) over the rendered content.
+func (u *ui) newViewer(path string, col int) *viewer {
+	v := &viewer{ui: u, path: path, col: col}
+	rel := u.relPath(path)
+	data, err := os.ReadFile(path)
+
+	var content fyne.CanvasObject
+	switch {
+	case err != nil:
+		content = widget.NewLabel("cannot open file: " + rel)
+	case strings.HasSuffix(path, ".mesa") || strings.Contains(path, ".mesa!"):
+		doc := tioga.Read(data, true)
+		v.code = widget.NewTextGrid()
+		v.lastCode = doc.Code
+		v.code.SetText(doc.Code)
+		v.styleCode()
+		content = container.NewScroll(v.code)
+	default:
+		doc := tioga.Read(data, false)
+		v.doc = widget.NewRichText()
+		v.doc.Wrapping = fyne.TextWrapWord
+		segs := make([]widget.RichTextSegment, 0, len(doc.Blocks))
+		for _, b := range doc.Blocks {
+			segs = append(segs, blockSegment(b))
+		}
+		v.doc.Segments = segs
+		content = container.NewScroll(v.doc)
+	}
+
+	title := widget.NewLabel(rel)
+	title.TextStyle = fyne.TextStyle{Bold: true}
+	title.Truncation = fyne.TextTruncateEllipsis
+
+	// Header action buttons, as on a Cedar Viewer.
+	buttons := container.NewHBox(
+		hdrButton("Destroy", func() { u.destroyViewer(v) }),
+		hdrButton("Grow", func() { u.growViewer(v) }),
+		hdrButton("Icon", func() { u.minimizeViewer(v) }),
+		hdrButton("Switch", func() { u.switchViewer(v) }),
+		hdrButton("Split", func() { u.splitViewer(v) }),
+	)
+	header := container.NewVBox(
+		container.NewStack(canvas.NewRectangle(cedarGrey),
+			container.NewBorder(nil, nil, buttons, nil, title)),
+		widget.NewSeparator(),
+	)
+
+	inner := container.NewBorder(header, nil, nil, nil, content)
+	v.root = tileFrame(inner)
+	return v
+}
+
+// hdrButton is a compact, low-importance header action button.
+func hdrButton(label string, tapped func()) *widget.Button {
+	b := widget.NewButton(label, tapped)
+	b.Importance = widget.LowImportance
+	return b
+}
+
+// styleCode applies syntax styling to the Viewer's TextGrid, in colour or
+// monochrome (bold/italic) mode.
+func (v *viewer) styleCode() {
+	if v.code == nil {
+		return
+	}
+	for _, s := range cedar.Highlight(v.lastCode, v.ui.builtins) {
+		var st cedar.Style
+		if v.ui.mono {
+			st = cedar.CategoryStyleMono(s.Cat)
+		} else {
+			st = cedar.CategoryStyle(s.Cat)
+		}
 		style := &widget.CustomTextGridStyle{}
 		if st.HasFG {
 			style.FGColor = color.Color(st.FG)
@@ -331,27 +658,29 @@ func (u *ui) showCode(text string) {
 		if st.HasBG {
 			style.BGColor = color.Color(st.BG)
 		}
-		if st.Bold {
-			style.TextStyle = fyne.TextStyle{Bold: true}
-		}
-		u.code.SetStyleRange(s.Row, s.Col, s.Row, s.Col+s.Len-1, style)
+		style.TextStyle = fyne.TextStyle{Bold: st.Bold, Italic: st.Italic}
+		v.code.SetStyleRange(s.Row, s.Col, s.Row, s.Col+s.Len-1, style)
 	}
-	u.code.Refresh()
-	u.docScroll.Hide()
-	u.codeScroll.Show()
-	u.codeScroll.ScrollToTop()
+	v.code.Refresh()
 }
 
-func (u *ui) showDoc(blocks []tioga.Block) {
-	segs := make([]widget.RichTextSegment, 0, len(blocks))
-	for _, b := range blocks {
-		segs = append(segs, blockSegment(b))
+// setMono switches highlighting mode and restyles every open code Viewer.
+func (u *ui) setMono(on bool) {
+	u.mono = on
+	for _, v := range u.allViewers() {
+		if v.code != nil {
+			v.code.SetText(v.lastCode) // clears old per-cell styles
+			v.styleCode()
+		}
 	}
-	u.doc.Segments = segs
-	u.doc.Refresh()
-	u.codeScroll.Hide()
-	u.docScroll.Show()
-	u.docScroll.ScrollToTop()
+}
+
+// tileFrame wraps content in a 1px black border, like a Cedar viewer edge.
+func tileFrame(content fyne.CanvasObject) fyne.CanvasObject {
+	border := canvas.NewRectangle(cedarWhite)
+	border.StrokeColor = cedarBlack
+	border.StrokeWidth = 1
+	return container.NewStack(border, content)
 }
 
 // Block-level variants of Fyne's heading/quote styles. The predefined styles
