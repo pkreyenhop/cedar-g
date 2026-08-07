@@ -37,6 +37,21 @@ func TestHighlightBasics(t *testing.T) {
 	}
 }
 
+func TestCategoryStyleMono(t *testing.T) {
+	if s := CategoryStyleMono(C_Kw); !s.Bold || s.Italic || s.HasFG {
+		t.Errorf("keyword mono = %+v, want bold only", s)
+	}
+	if s := CategoryStyleMono(C_Cmt); !s.Italic || s.Bold || s.HasFG {
+		t.Errorf("comment mono = %+v, want italic only", s)
+	}
+	if s := CategoryStyleMono(C_Type); !s.Bold || !s.Italic {
+		t.Errorf("type mono = %+v, want bold+italic", s)
+	}
+	if s := CategoryStyleMono(C_Ident); s.Bold || s.Italic || s.HasFG {
+		t.Errorf("ident mono = %+v, want plain", s)
+	}
+}
+
 func TestHighlightKeyword(t *testing.T) {
 	spans := Highlight("RETURN[x]", nil)
 	if c, ok := catAt(spans, 0, 0); !ok || c != C_Kw {

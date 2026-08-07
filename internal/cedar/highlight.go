@@ -39,11 +39,12 @@ type Span struct {
 // Style describes how a category is drawn. Foreground/background are only
 // applied when their Has* flag is set, so identifiers keep the theme default.
 type Style struct {
-	FG    color.RGBA
-	HasFG bool
-	BG    color.RGBA
-	HasBG bool
-	Bold  bool
+	FG     color.RGBA
+	HasFG  bool
+	BG     color.RGBA
+	HasBG  bool
+	Bold   bool
+	Italic bool
 }
 
 func rgb(r, g, b uint8) color.RGBA { return color.RGBA{r, g, b, 0xff} }
@@ -71,6 +72,22 @@ func CategoryStyle(c Category) Style {
 	case C_Label:
 		return Style{FG: rgb(251, 138, 0), HasFG: true, BG: rgb(253, 217, 165), HasBG: true}
 	default: // C_Ident and anything else: theme default colour.
+		return Style{}
+	}
+}
+
+// CategoryStyleMono returns a colourless style that distinguishes categories by
+// weight and slant only (bold/italic), for a monochrome view in the spirit of
+// Tioga's text "looks". Colour is never set, so all text stays the theme's.
+func CategoryStyleMono(c Category) Style {
+	switch c {
+	case C_Kw, C_Op, C_Pp, C_Label:
+		return Style{Bold: true}
+	case C_Type:
+		return Style{Bold: true, Italic: true}
+	case C_Cmt, C_Str:
+		return Style{Italic: true}
+	default: // numbers, symbols, identifiers: plain.
 		return Style{}
 	}
 }
