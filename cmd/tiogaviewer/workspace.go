@@ -8,6 +8,7 @@ import (
 	"gioui.org/io/pointer"
 	"gioui.org/layout"
 	"gioui.org/op/clip"
+	"gioui.org/unit"
 )
 
 const (
@@ -272,6 +273,54 @@ func (s *gioUI) vdivider(gtx C, w int) D {
 	fillAt(gtx, cedarBlack, image.Rect(0, 0, 1, sz.Y))
 	fillAt(gtx, cedarBlack, image.Rect(w-1, 0, w, sz.Y))
 	return D{Size: sz}
+}
+
+// hsplitW is like hsplit but the left pane has a fixed width in dp (kept small
+// even on wide displays), adjusted by dragging the divider.
+func (s *gioUI) hsplitW(gtx C, widthDp *float32, active *bool, left, right layout.Widget) D {
+	dividerW := gtx.Dp(dividerDp)
+	leftW := gtx.Dp(unit.Dp(*widthDp))
+	for {
+		ev, ok := gtx.Event(pointer.Filter{Target: widthDp, Kinds: pointer.Press | pointer.Drag | pointer.Release | pointer.Cancel})
+		if !ok {
+			break
+		}
+		pe, ok := ev.(pointer.Event)
+		if !ok {
+			continue
+		}
+		switch pe.Kind {
+		case pointer.Press:
+			if abs(int(pe.Position.X)-leftW) <= gtx.Dp(8) {
+				*active = true
+			}
+		case pointer.Drag:
+			if *active {
+				*widthDp = clampf(float32(gtx.Metric.PxToDp(int(pe.Position.X))), 120, 520)
+				leftW = gtx.Dp(unit.Dp(*widthDp))
+			}
+		case pointer.Release, pointer.Cancel:
+			*active = false
+		}
+	}
+	return layout.Stack{}.Layout(gtx,
+		layout.Expanded(func(gtx C) D {
+			sz := gtx.Constraints.Min
+			defer clip.Rect{Max: sz}.Push(gtx.Ops).Pop()
+			event.Op(gtx.Ops, widthDp)
+			pointer.CursorColResize.Add(gtx.Ops)
+			return D{Size: sz}
+		}),
+		layout.Stacked(func(gtx C) D {
+			return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
+				layout.Rigid(func(gtx C) D {
+					return sized(gtx, leftW, gtx.Constraints.Max.Y, left)
+				}),
+				layout.Rigid(func(gtx C) D { return s.vdivider(gtx, dividerW) }),
+				layout.Flexed(1, right),
+			)
+		}),
+	)
 }
 
 // hsplit lays out left | divider | right with a draggable vertical divider that

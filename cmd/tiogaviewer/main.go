@@ -39,7 +39,7 @@ type gioUI struct {
 
 	bUp, bZoomIn, bZoomOut, bZoomReset widget.Clickable
 
-	treeSplit float32 // tree's fraction of the workspace width
+	treeWidth float32 // tree column width, in dp
 	colSplit  float32 // column 0's fraction of the columns area
 	treeDrag  bool
 	colDrag   bool
@@ -53,7 +53,7 @@ func newUI() *gioUI {
 		sh:        loadShaper(),
 		builtins:  map[string]bool{},
 		scale:     1.0,
-		treeSplit: 0.2,
+		treeWidth: 210,
 		colSplit:  0.5,
 	}
 	s.th = material.NewTheme()
@@ -103,7 +103,7 @@ func main() {
 
 	go func() {
 		w := new(app.Window)
-		w.Option(app.Title("Cedar Viewers (Gio)"), app.Size(unit.Dp(1200), unit.Dp(820)))
+		w.Option(app.Title("Cedar Viewers (Gio)"), app.Size(unit.Dp(1200), unit.Dp(820)), app.Fullscreen.Option())
 		// Background directory reads wake the render loop when they complete.
 		s.tree.invalidate = w.Invalidate
 		if err := s.loop(w); err != nil {
@@ -240,7 +240,7 @@ func (s *gioUI) globalBar(gtx C) D {
 // workspace is the file tree beside the two Cedar columns, with draggable
 // vertical dividers between the tree and the columns, and between the columns.
 func (s *gioUI) workspace(gtx C) D {
-	return s.hsplit(gtx, &s.treeSplit, &s.treeDrag,
+	return s.hsplitW(gtx, &s.treeWidth, &s.treeDrag,
 		func(gtx C) D { return s.layoutTree(gtx, s.tree) },
 		func(gtx C) D {
 			return s.hsplit(gtx, &s.colSplit, &s.colDrag,
