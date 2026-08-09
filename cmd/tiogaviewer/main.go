@@ -155,12 +155,12 @@ func (s *gioUI) update(gtx C) {
 
 func (s *gioUI) zoomBy(d float32) { s.scale = clampf(s.scale+d, 0.5, 6.0) }
 
-// processKeys handles the Alt +/=/- /0 zoom shortcuts.
+// processKeys handles the Cmd +/=/- /0 zoom shortcuts.
 func (s *gioUI) processKeys(gtx C) {
 	names := []key.Name{"=", "+", "-", "0"}
 	filters := make([]event.Filter, len(names))
 	for i, nm := range names {
-		filters[i] = key.Filter{Focus: &s.keyTag, Name: nm, Required: key.ModAlt, Optional: key.ModShift}
+		filters[i] = key.Filter{Focus: &s.keyTag, Name: nm, Required: key.ModCommand, Optional: key.ModShift}
 	}
 	for {
 		ev, ok := gtx.Event(filters...)
@@ -246,8 +246,9 @@ func (s *gioUI) workspace(gtx C) D {
 	if !s.showTree {
 		return cols(gtx)
 	}
-	// File selector on the right, columns fill the rest (both draggable).
-	return s.hsplitWR(gtx, &s.treeWidth, &s.treeDrag, cols,
+	// File selector on the left, columns fill the rest (both draggable).
+	return s.hsplitW(gtx, &s.treeWidth, &s.treeDrag,
 		func(gtx C) D { return s.layoutTree(gtx, s.tree) },
+		cols,
 	)
 }
