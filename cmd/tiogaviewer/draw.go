@@ -7,6 +7,8 @@ import (
 
 	"gioui.org/font"
 	"gioui.org/font/opentype"
+	"gioui.org/io/event"
+	"gioui.org/io/pointer"
 	"gioui.org/layout"
 	"gioui.org/op"
 	"gioui.org/op/clip"
@@ -140,13 +142,113 @@ func (s *gioUI) captionStrip(gtx C, txt string) D {
 	)
 }
 
-// scrollList lays out a scrollable list with a Cedar-styled scrollbar.
-func (s *gioUI) scrollList(gtx C, list *widget.List, n int, el layout.ListElement) D {
-	ls := material.List(s.th, list)
-	ls.Track.Color = cedarGrey
-	ls.Indicator.Color = cedarGreyMid
-	ls.Indicator.HoverColor = cedarBlack
-	return ls.Layout(gtx, n, el)
+// scroller is a scrollable list with a Cedar-style scrollbar: on the left,
+// wide, and only visible while the pointer hovers the far-left gutter.
+type scroller struct {
+	list    widget.List
+	hovered bool
+}
+
+// scrollGutterDp is the reserved left column the scrollbar lives in.
+const scrollGutterDp = 18
+
+func (s *gioUI) scrollList(gtx C, sc *scroller, n int, el layout.ListElement) D {
+	sc.list.Axis = layout.Vertical
+
+	// Hover state from the left gutter (events registered on the previous frame).
+	for {
+		ev, ok := gtx.Event(pointer.Filter{Target: sc, Kinds: pointer.Enter | pointer.Leave})
+		if !ok {
+			break
+		}
+		if pe, ok := ev.(pointer.Event); ok {
+			switch pe.Kind {
+			case pointer.Enter:
+				sc.hovered = true
+			case pointer.Leave:
+				sc.hovered = false
+			}
+		}
+	}
+
+	full := gtx.Constraints.Max
+	gutter := gtx.Dp(scrollGutterDp)
+	if gutter > full.X {
+		gutter = full.X
+	}
+
+	// Content, shifted right of the reserved gutter so the scrollbar never
+	// covers text.
+	cgtx := gtx
+	cgtx.Constraints.Max.X = full.X - gutter
+	cgtx.Constraints.Min = cgtx.Constraints.Max
+	trans := op.Offset(image.Pt(gutter, 0)).Push(gtx.Ops)
+	dims := sc.list.List.Layout(cgtx, n, el)
+	trans.Pop()
+
+	totalH := dims.Size.Y
+	if totalH == 0 {
+		totalH = full.Y
+	}
+
+	// Left gutter hover area (only watches Enter/Leave, so it doesn't eat clicks).
+	st := clip.Rect{Max: image.Pt(gutter, totalH)}.Push(gtx.Ops)
+	event.Op(gtx.Ops, sc)
+	st.Pop()
+
+	// Draw the wide left scrollbar only while hovering the gutter or dragging.
+	if sc.hovered || sc.list.Scrollbar.Dragging() {
+		start, end := viewportFraction(sc.list.Position, n, totalH)
+		bar := material.Scrollbar(s.th, &sc.list.Scrollbar)
+		bar.Indicator.MinorWidth = 16
+		bar.Indicator.CornerRadius = 0
+		bar.Indicator.Color = cedarGreyMid
+		bar.Indicator.HoverColor = cedarBlack
+		bar.Track.Color = cedarGrey
+		bar.Track.MajorPadding = 0
+		bar.Track.MinorPadding = 0
+		bgtx := gtx
+		bgtx.Constraints.Min = image.Pt(gutter, totalH)
+		bgtx.Constraints.Max = image.Pt(gutter, totalH)
+		layout.W.Layout(bgtx, func(gtx C) D {
+			return bar.Layout(gtx, layout.Vertical, start, end)
+		})
+	}
+	if d := sc.list.ScrollDistance(); d != 0 {
+		sc.list.List.ScrollBy(d * float32(n))
+	}
+	return D{Size: image.Pt(full.X, totalH)}
+}
+
+func clamp01(v float32) float32 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
+// viewportFraction computes the scrollbar indicator span [start,end] from a
+// list Position (a port of material's unexported fromListPosition).
+func viewportFraction(lp layout.Position, elements, majorAxisSize int) (start, end float32) {
+	if elements == 0 || lp.Length == 0 {
+		return 0, 1
+	}
+	lengthEstPx := float32(lp.Length)
+	elementLenEstPx := lengthEstPx / float32(elements)
+	viewportStart := clamp01((float32(lp.First)*elementLenEstPx + float32(lp.Offset)) / lengthEstPx)
+	viewportEnd := clamp01((float32(lp.First+lp.Count)*elementLenEstPx + float32(lp.OffsetLast)) / lengthEstPx)
+	viewportFrac := viewportEnd - viewportStart
+	visibleFraction := float32(majorAxisSize) / lengthEstPx
+	err := visibleFraction - viewportFrac
+	adjStart, adjEnd := viewportStart, viewportEnd
+	if viewportFrac < 1 {
+		adjStart -= (viewportStart / (1 - viewportFrac)) * err
+		adjEnd += ((1 - viewportEnd) / (1 - viewportFrac)) * err
+	}
+	return adjStart, adjEnd
 }
 
 // bordered wraps a widget in a 1px black frame over a white background.

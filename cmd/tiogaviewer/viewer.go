@@ -52,7 +52,7 @@ type viewer struct {
 	isCode bool
 	lines  [][]run       // code
 	blocks []tioga.Block // documents
-	list   widget.List
+	sc     scroller
 
 	bDestroy, bGrow, bIcon, bSwitch, bSplit widget.Clickable
 	bRestore                                widget.Clickable // in the icon tray
@@ -60,7 +60,6 @@ type viewer struct {
 
 func (s *gioUI) newViewer(path string, col int) *viewer {
 	v := &viewer{path: path, rel: s.relPath(path), col: col}
-	v.list.Axis = layout.Vertical
 	data, err := os.ReadFile(path)
 	switch {
 	case err != nil:
@@ -113,18 +112,18 @@ func (s *gioUI) header(gtx C, v *viewer) D {
 }
 
 func (s *gioUI) body(gtx C, v *viewer) D {
+	// The left margin comes from the scroll gutter; add top/right/bottom only.
 	if v.isCode {
-		gtx.Constraints.Min = gtx.Constraints.Max
-		return layout.UniformInset(4).Layout(gtx, func(gtx C) D {
-			return s.scrollList(gtx, &v.list, len(v.lines), func(gtx C, i int) D {
+		return layout.Inset{Top: 4, Right: 4, Bottom: 4}.Layout(gtx, func(gtx C) D {
+			gtx.Constraints.Min = gtx.Constraints.Max
+			return s.scrollList(gtx, &v.sc, len(v.lines), func(gtx C, i int) D {
 				return s.codeLine(gtx, v.lines[i])
 			})
 		})
 	}
-	// Documents get a little left/right margin; the text fills the viewer width.
-	return layout.Inset{Left: 12, Right: 12, Top: 4, Bottom: 4}.Layout(gtx, func(gtx C) D {
+	return layout.Inset{Top: 4, Right: 12, Bottom: 4}.Layout(gtx, func(gtx C) D {
 		gtx.Constraints.Min = gtx.Constraints.Max
-		return s.scrollList(gtx, &v.list, len(v.blocks), func(gtx C, i int) D {
+		return s.scrollList(gtx, &v.sc, len(v.blocks), func(gtx C, i int) D {
 			return s.docBlock(gtx, v.blocks[i])
 		})
 	})

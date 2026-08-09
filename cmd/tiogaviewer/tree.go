@@ -38,7 +38,7 @@ type tree struct {
 	root     string
 	expanded map[string]bool // UI-thread only
 	clicks   map[string]*widget.Clickable
-	list     widget.List
+	sc       scroller
 	onOpen   func(path string)
 
 	invalidate func() // wakes the render loop when a background read completes
@@ -65,7 +65,6 @@ func newTree(onOpen func(string)) *tree {
 		loading:    map[string]bool{},
 		onOpen:     onOpen,
 	}
-	t.list.Axis = layout.Vertical
 	return t
 }
 
@@ -214,7 +213,7 @@ func (s *gioUI) layoutTree(gtx C, t *tree) D {
 			return layout.Stack{}.Layout(gtx,
 				layout.Expanded(func(gtx C) D { return fill(gtx, cedarWhite, gtx.Constraints.Min) }),
 				layout.Stacked(func(gtx C) D {
-					return s.scrollList(gtx, &t.list, len(rows), func(gtx C, i int) D {
+					return s.scrollList(gtx, &t.sc, len(rows), func(gtx C, i int) D {
 						return s.treeRow(gtx, t, rows[i])
 					})
 				}),
