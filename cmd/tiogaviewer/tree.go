@@ -16,6 +16,12 @@ import (
 // fileSuffixes are the file kinds shown in the tree.
 var fileSuffixes = []string{"tioga", "mesa", "df", "require", "profile", "depends"}
 
+// isTiogaName reports whether a path is a .tioga document (incl. versioned !N).
+func isTiogaName(path string) bool {
+	b := filepath.Base(path)
+	return strings.HasSuffix(b, ".tioga") || strings.Contains(b, ".tioga!")
+}
+
 func matchFile(name string) bool {
 	for _, sfx := range fileSuffixes {
 		if strings.HasSuffix(name, "."+sfx) || strings.Contains(name, "."+sfx+"!") {
@@ -252,8 +258,8 @@ func (s *gioUI) treeRow(gtx C, t *tree, r treeRow) D {
 					}
 				}
 				weight := font.Normal
-				if r.isDir {
-					weight = font.Bold
+				if r.isDir || isTiogaName(r.path) {
+					weight = font.Bold // .tioga documents stand out
 				}
 				return layout.Inset{Left: indent, Top: 1, Bottom: 1}.Layout(gtx, func(gtx C) D {
 					return s.label(gtx, serifFont, weight, font.Regular, 13, marker+filepath.Base(r.path), cedarBlack, 1)
