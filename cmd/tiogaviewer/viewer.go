@@ -33,6 +33,10 @@ var builtinList = []string{
 	"INTERNAL", "OVERLAID", "SHARES", "TRUE", "FALSE", "CARD",
 }
 
+// codeTextSize is the default code font size (larger than the doc body for
+// readability; scaled further by zoom).
+const codeTextSize = 17
+
 // run is a styled slice of a code line.
 type run struct {
 	text string
@@ -134,7 +138,7 @@ func (s *gioUI) codeLine(gtx C, runs []run) D {
 			style = font.Italic
 		}
 		children[i] = layout.Rigid(func(gtx C) D {
-			return s.label(gtx, monoFont, weight, style, 13, r.text, cedarBlack, 1)
+			return s.label(gtx, monoFont, weight, style, codeTextSize, r.text, cedarBlack, 1)
 		})
 	}
 	return layout.Flex{Axis: layout.Horizontal}.Layout(gtx, children...)
@@ -153,7 +157,7 @@ func (s *gioUI) docBlock(gtx C, b tioga.Block) D {
 	case tioga.Quote:
 		style = font.Italic
 	case tioga.Code:
-		fnt, size = monoFont, 13
+		fnt, size = monoFont, codeTextSize
 	}
 	return layout.Inset{Top: 2, Bottom: 2}.Layout(gtx, func(gtx C) D {
 		return s.label(gtx, fnt, weight, style, size, b.Text, cedarBlack, 0)

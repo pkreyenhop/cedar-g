@@ -46,18 +46,43 @@ func loadShaper() *text.Shaper {
 			}
 		}
 	}
+	// addCollection loads all faces from a .ttc, re-tagging them under typeface.
+	addCollection := func(path, typeface string) bool {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return false
+		}
+		fs, err := opentype.ParseCollection(b)
+		if err != nil || len(fs) == 0 {
+			return false
+		}
+		for i := range fs {
+			fs[i].Font.Typeface = font.Typeface(typeface)
+			faces = append(faces, fs[i])
+		}
+		return true
+	}
+
 	const mac = "/System/Library/Fonts/Supplemental/"
+	// Serif body font (Georgia, a heavy screen serif; DejaVu Serif on Linux).
 	add(mac+"Georgia.ttf", "Serif", font.Regular, font.Normal)
 	add("/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf", "Serif", font.Regular, font.Normal)
 	add(mac+"Georgia Bold.ttf", "Serif", font.Regular, font.Bold)
 	add("/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf", "Serif", font.Regular, font.Bold)
 	add(mac+"Georgia Italic.ttf", "Serif", font.Italic, font.Normal)
 	add(mac+"Georgia Bold Italic.ttf", "Serif", font.Italic, font.Bold)
-	add(mac+"Courier New.ttf", "Mono", font.Regular, font.Normal)
-	add("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", "Mono", font.Regular, font.Normal)
-	add(mac+"Courier New Bold.ttf", "Mono", font.Regular, font.Bold)
-	add(mac+"Courier New Italic.ttf", "Mono", font.Italic, font.Normal)
-	add(mac+"Courier New Bold Italic.ttf", "Mono", font.Italic, font.Bold)
+
+	// Monospace code font: prefer Menlo (a heavier, very readable mono with all
+	// four faces), falling back to Courier New / DejaVu Sans Mono.
+	if !addCollection("/System/Library/Fonts/Menlo.ttc", "Mono") &&
+		!addCollection("/System/Library/Fonts/PTMono.ttc", "Mono") {
+		add(mac+"Courier New.ttf", "Mono", font.Regular, font.Normal)
+		add("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", "Mono", font.Regular, font.Normal)
+		add("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", "Mono", font.Regular, font.Bold)
+		add(mac+"Courier New Bold.ttf", "Mono", font.Regular, font.Bold)
+		add(mac+"Courier New Italic.ttf", "Mono", font.Italic, font.Normal)
+		add(mac+"Courier New Bold Italic.ttf", "Mono", font.Italic, font.Bold)
+	}
 	return text.NewShaper(text.WithCollection(faces))
 }
 
