@@ -7,7 +7,10 @@ import (
 	"strings"
 
 	"gioui.org/font"
+	"gioui.org/io/event"
+	"gioui.org/io/pointer"
 	"gioui.org/layout"
+	"gioui.org/op/clip"
 	"gioui.org/unit"
 	"gioui.org/widget"
 
@@ -56,6 +59,7 @@ type viewer struct {
 
 	bDestroy, bGrow, bIcon, bSwitch, bSplit widget.Clickable
 	bRestore                                widget.Clickable // in the icon tray
+	headerHovered                           bool
 }
 
 func (s *gioUI) newViewer(path string, col int) *viewer {
@@ -91,7 +95,26 @@ func (s *gioUI) layoutViewer(gtx C, v *viewer) D {
 
 func (s *gioUI) header(gtx C, v *viewer) D {
 	gtx.Constraints.Min.X = gtx.Constraints.Max.X
-	return layout.Stack{}.Layout(gtx,
+
+	// Header hover state (from the pass-through zone registered last frame).
+	for {
+		ev, ok := gtx.Event(pointer.Filter{Target: &v.headerHovered, Kinds: pointer.Enter | pointer.Leave})
+		if !ok {
+			break
+		}
+		if pe, ok := ev.(pointer.Event); ok {
+			switch pe.Kind {
+			case pointer.Enter:
+				v.headerHovered = true
+			case pointer.Leave:
+				v.headerHovered = false
+			}
+		}
+	}
+
+	// The command menu (action buttons + title) is always laid out, so the header
+	// height is the same whether the black title bar or the menu is shown.
+	dims := layout.Stack{}.Layout(gtx,
 		layout.Expanded(func(gtx C) D { return fill(gtx, cedarGrey, gtx.Constraints.Min) }),
 		layout.Stacked(func(gtx C) D {
 			return layout.UniformInset(2).Layout(gtx, func(gtx C) D {
@@ -109,6 +132,29 @@ func (s *gioUI) header(gtx C, v *viewer) D {
 			})
 		}),
 	)
+
+	// When not hovered, cover the menu with a black title bar showing the path.
+	if !v.headerHovered {
+		fillAt(gtx, cedarBlack, image.Rectangle{Max: dims.Size})
+		cgtx := gtx
+		cgtx.Constraints.Min = dims.Size
+		cgtx.Constraints.Max = dims.Size
+		layout.W.Layout(cgtx, func(gtx C) D {
+			return layout.Inset{Left: 6}.Layout(gtx, func(gtx C) D {
+				return s.label(gtx, serifFont, font.Bold, font.Regular, 13, v.rel, cedarWhite, 1)
+			})
+		})
+	}
+
+	// Header-wide hover zone on top (pass-through) so hovering reveals the menu
+	// without stealing button clicks.
+	pass := pointer.PassOp{}.Push(gtx.Ops)
+	hst := clip.Rect{Max: dims.Size}.Push(gtx.Ops)
+	event.Op(gtx.Ops, &v.headerHovered)
+	hst.Pop()
+	pass.Pop()
+
+	return dims
 }
 
 func (s *gioUI) body(gtx C, v *viewer) D {
