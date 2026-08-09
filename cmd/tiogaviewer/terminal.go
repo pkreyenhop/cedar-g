@@ -4,26 +4,50 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/creack/pty"
 )
 
-// terminal runs a shell in a pty and captures its output. It is intentionally
-// simple: ANSI escape sequences are stripped rather than interpreted, so it is a
-// readable log of a real interactive shell, not a full terminal emulator.
+// termScrollback caps how many lines of history the terminal keeps.
+const termScrollback = 5000
+
+// pmode is the escape-sequence parser state.
+type pmode int
+
+const (
+	pNormal pmode = iota
+	pEsc          // saw ESC
+	pEscInt       // saw ESC ( / ) / * / + — consume the charset designator
+	pCSI          // inside ESC [ …
+	pOSC          // inside ESC ] …
+	pOSCEsc       // saw ESC inside an OSC (looking for the ST terminator)
+)
+
+// terminal runs a shell in a pty and interprets its output into a grid of
+// lines with a cursor. It is a small emulator: it honours carriage returns,
+// backspaces, tabs and the common CSI cursor/erase codes so that shell line
+// editing (echo, redraw, backspace) displays correctly. It does not implement
+// scroll regions, colours or alternate screens.
 type terminal struct {
 	ptmx       *os.File
 	cmd        *exec.Cmd
 	invalidate func()
 	home       string
 
-	mu     sync.Mutex
-	buf    []byte
-	rawAcc []byte // recent raw bytes, scanned for the cwd (OSC 7) sequence
-	cwd    string
+	mu    sync.Mutex
+	lines [][]rune
+	row   int
+	col   int
+	cwd   string
+
+	mode pmode
+	csi  []byte
+	osc  []byte
+	utf  []byte
 }
 
 func newTerminal(invalidate func()) *terminal {
@@ -39,7 +63,7 @@ func newTerminal(invalidate func()) *terminal {
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color", "TERM_PROGRAM=Apple_Terminal")
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
-		t.buf = []byte("cannot start shell: " + err.Error() + "\n")
+		t.lines = [][]rune{[]rune("cannot start shell: " + err.Error())}
 		return t
 	}
 	t.cmd = cmd
@@ -53,13 +77,8 @@ func (t *terminal) readLoop() {
 	for {
 		n, err := t.ptmx.Read(b)
 		if n > 0 {
-			clean := stripANSI(b[:n])
 			t.mu.Lock()
-			t.scanCwd(b[:n])
-			t.buf = append(t.buf, clean...)
-			if len(t.buf) > 200000 { // cap the scrollback
-				t.buf = t.buf[len(t.buf)-200000:]
-			}
+			t.feed(b[:n])
 			t.mu.Unlock()
 			if t.invalidate != nil {
 				t.invalidate()
@@ -71,20 +90,235 @@ func (t *terminal) readLoop() {
 	}
 }
 
-// osc7Re matches OSC 7 cwd reports: ESC ] 7 ; file://host/PATH (BEL or ST).
-var osc7Re = regexp.MustCompile(`\x1b\]7;file://[^/]*([^\x07\x1b]*)(?:\x07|\x1b\\)`)
-
-// scanCwd updates t.cwd from any OSC 7 sequence in the raw stream. Called with
-// t.mu held.
-func (t *terminal) scanCwd(raw []byte) {
-	t.rawAcc = append(t.rawAcc, raw...)
-	if m := osc7Re.FindAllSubmatch(t.rawAcc, -1); len(m) > 0 {
-		if p, err := url.PathUnescape(string(m[len(m)-1][1])); err == nil && p != "" {
-			t.cwd = p
+// feed advances the emulator by the given raw bytes. Called with t.mu held.
+func (t *terminal) feed(p []byte) {
+	for _, b := range p {
+		switch t.mode {
+		case pNormal:
+			switch {
+			case b == 0x1b:
+				t.flushUTF()
+				t.mode = pEsc
+			case b == '\r':
+				t.flushUTF()
+				t.col = 0
+			case b == '\n':
+				t.flushUTF()
+				t.lineFeed()
+			case b == '\b':
+				t.flushUTF()
+				if t.col > 0 {
+					t.col--
+				}
+			case b == '\t':
+				t.flushUTF()
+				next := (t.col/8 + 1) * 8
+				for t.col < next {
+					t.putRune(' ')
+				}
+			case b >= 0x20 && b != 0x7f:
+				t.utf = append(t.utf, b)
+				if utf8.FullRune(t.utf) {
+					r, _ := utf8.DecodeRune(t.utf)
+					t.putRune(r)
+					t.utf = t.utf[:0]
+				} else if len(t.utf) >= utf8.UTFMax {
+					t.putRune('?')
+					t.utf = t.utf[:0]
+				}
+			}
+		case pEsc:
+			switch b {
+			case '[':
+				t.mode, t.csi = pCSI, t.csi[:0]
+			case ']':
+				t.mode, t.osc = pOSC, t.osc[:0]
+			case '(', ')', '*', '+':
+				t.mode = pEscInt
+			default:
+				t.mode = pNormal
+			}
+		case pEscInt:
+			t.mode = pNormal
+		case pCSI:
+			if b >= 0x40 && b <= 0x7e {
+				t.handleCSI(b)
+				t.mode = pNormal
+			} else {
+				t.csi = append(t.csi, b)
+			}
+		case pOSC:
+			switch b {
+			case 0x07:
+				t.handleOSC()
+				t.mode = pNormal
+			case 0x1b:
+				t.mode = pOSCEsc
+			default:
+				t.osc = append(t.osc, b)
+			}
+		case pOSCEsc:
+			t.handleOSC()
+			t.mode = pNormal
 		}
 	}
-	if len(t.rawAcc) > 4096 { // keep a small tail to catch split sequences
-		t.rawAcc = t.rawAcc[len(t.rawAcc)-4096:]
+}
+
+func (t *terminal) flushUTF() {
+	if len(t.utf) > 0 {
+		r, _ := utf8.DecodeRune(t.utf)
+		if r == utf8.RuneError {
+			r = '?'
+		}
+		t.putRune(r)
+		t.utf = t.utf[:0]
+	}
+}
+
+func (t *terminal) ensureRow() {
+	if t.row < 0 {
+		t.row = 0
+	}
+	for t.row >= len(t.lines) {
+		t.lines = append(t.lines, []rune{})
+	}
+}
+
+// putRune writes r at the cursor (padding with spaces / overwriting as needed).
+func (t *terminal) putRune(r rune) {
+	t.ensureRow()
+	line := t.lines[t.row]
+	for len(line) < t.col {
+		line = append(line, ' ')
+	}
+	if t.col < len(line) {
+		line[t.col] = r
+	} else {
+		line = append(line, r)
+	}
+	t.lines[t.row] = line
+	t.col++
+}
+
+func (t *terminal) lineFeed() {
+	t.row++
+	t.ensureRow()
+	if len(t.lines) > termScrollback {
+		drop := len(t.lines) - termScrollback
+		t.lines = append([][]rune(nil), t.lines[drop:]...)
+		t.row -= drop
+		if t.row < 0 {
+			t.row = 0
+		}
+	}
+}
+
+func (t *terminal) eraseLine(mode int) {
+	t.ensureRow()
+	line := t.lines[t.row]
+	switch mode {
+	case 0: // cursor to end
+		if t.col < len(line) {
+			t.lines[t.row] = line[:t.col]
+		}
+	case 1: // start to cursor
+		for i := 0; i < t.col && i < len(line); i++ {
+			line[i] = ' '
+		}
+	case 2: // whole line
+		t.lines[t.row] = line[:0]
+	}
+}
+
+func (t *terminal) eraseDisplay(mode int) {
+	switch mode {
+	case 0: // cursor to end of screen
+		t.ensureRow()
+		if t.col < len(t.lines[t.row]) {
+			t.lines[t.row] = t.lines[t.row][:t.col]
+		}
+		t.lines = t.lines[:t.row+1]
+	case 2, 3: // whole screen
+		t.lines = [][]rune{{}}
+		t.row, t.col = 0, 0
+	}
+}
+
+func (t *terminal) handleCSI(final byte) {
+	params := parseCSIParams(t.csi)
+	p0 := 0
+	if len(params) > 0 {
+		p0 = params[0]
+	}
+	n := p0
+	if n < 1 {
+		n = 1
+	}
+	switch final {
+	case 'C': // cursor forward
+		t.col += n
+	case 'D': // cursor back
+		if t.col -= n; t.col < 0 {
+			t.col = 0
+		}
+	case 'G': // cursor to column
+		if t.col = p0 - 1; t.col < 0 {
+			t.col = 0
+		}
+	case 'A': // cursor up
+		if t.row -= n; t.row < 0 {
+			t.row = 0
+		}
+	case 'B': // cursor down
+		t.row += n
+		t.ensureRow()
+	case 'H', 'f': // cursor position — honour the column, keep the row to avoid
+		// jumping around the scrollback grid.
+		col := 1
+		if len(params) >= 2 {
+			col = params[1]
+		}
+		if t.col = col - 1; t.col < 0 {
+			t.col = 0
+		}
+	case 'K': // erase in line
+		t.eraseLine(p0)
+	case 'J': // erase in display
+		t.eraseDisplay(p0)
+	}
+	t.csi = t.csi[:0]
+}
+
+func parseCSIParams(b []byte) []int {
+	s := strings.TrimPrefix(string(b), "?")
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ";")
+	out := make([]int, len(parts))
+	for i, p := range parts {
+		out[i], _ = strconv.Atoi(p)
+	}
+	return out
+}
+
+// handleOSC parses the buffered OSC payload, extracting the cwd from OSC 7.
+func (t *terminal) handleOSC() {
+	s := string(t.osc)
+	t.osc = t.osc[:0]
+	if !strings.HasPrefix(s, "7;") {
+		return
+	}
+	u := strings.TrimPrefix(s, "7;")
+	i := strings.Index(u, "file://")
+	if i < 0 {
+		return
+	}
+	rest := u[i+len("file://"):]
+	if slash := strings.IndexByte(rest, '/'); slash >= 0 {
+		if p, err := url.PathUnescape(rest[slash:]); err == nil && p != "" {
+			t.cwd = p
+		}
 	}
 }
 
@@ -118,29 +352,16 @@ func (t *terminal) close() {
 	}
 }
 
-// lines returns the current output split into display lines (tabs expanded).
-func (t *terminal) lines() []string {
+// snapshot returns the current screen lines and cursor position.
+func (t *terminal) snapshot() (out []string, row, col int) {
 	t.mu.Lock()
-	s := string(t.buf)
-	t.mu.Unlock()
-	s = strings.ReplaceAll(s, "\r\n", "\n")
-	s = strings.ReplaceAll(s, "\r", "\n")
-	raw := strings.Split(s, "\n")
-	out := make([]string, len(raw))
-	for i, l := range raw {
-		out[i] = expandTabs(l)
+	defer t.mu.Unlock()
+	if len(t.lines) == 0 {
+		return []string{""}, 0, 0
 	}
-	return out
-}
-
-// ansiRe matches ANSI/VT escape sequences and control characters (keeping tab,
-// newline and carriage return, which lines() handles).
-var ansiRe = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]` +
-	`|\x1b[()][0-9A-Za-z]` +
-	`|\x1b[=>]` +
-	`|\x1b\][^\x07]*\x07` +
-	`|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]`)
-
-func stripANSI(b []byte) []byte {
-	return ansiRe.ReplaceAll(b, nil)
+	out = make([]string, len(t.lines))
+	for i, l := range t.lines {
+		out[i] = string(l)
+	}
+	return out, t.row, t.col
 }

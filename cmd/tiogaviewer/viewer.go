@@ -253,25 +253,32 @@ func (s *gioUI) termBody(gtx C, v *viewer) D {
 	t := v.term
 	gtx.Constraints.Min = gtx.Constraints.Max
 
-	lines := t.lines()
+	lines, crow, ccol := t.snapshot()
 	// Follow the newest output, but only bottom-anchor once it overflows the
 	// viewport; while the output still fits, keep it top-aligned like a real
 	// terminal (OffsetLast is the leftover space from the previous layout).
 	v.sc.list.List.ScrollToEnd = v.sc.list.List.Position.OffsetLast <= 0
 
-	// A Cedar-style caret marks the insertion point on the last line: blinking
+	// A Cedar-style caret marks the insertion point at the cursor: blinking
 	// while focused, steady otherwise.
 	caretOn := true
 	if gtx.Focused(&v.termFocus) {
 		caretOn = (gtx.Now.UnixNano()/int64(blinkHalf))%2 == 0
 		gtx.Execute(op.InvalidateCmd{At: gtx.Now.Add(blinkHalf)})
 	}
+	caretRow := -1
+	if caretOn {
+		caretRow = crow
+	}
 
 	dims := layout.Inset{Top: 4, Right: 12, Bottom: 4}.Layout(gtx, func(gtx C) D {
 		gtx.Constraints.Min = gtx.Constraints.Max
 		return s.scrollList(gtx, &v.sc, len(lines), func(gtx C, i int) D {
-			last := i == len(lines)-1
-			return s.termLine(gtx, lines[i], last && caretOn)
+			caretCol := -1
+			if i == caretRow {
+				caretCol = ccol
+			}
+			return s.termLine(gtx, lines[i], caretCol)
 		})
 	})
 
@@ -370,37 +377,49 @@ func termBytes(e key.Event) string {
 	return ""
 }
 
-// termLine draws one terminal output line, optionally followed by the caret.
-func (s *gioUI) termLine(gtx C, text string, caret bool) D {
-	line := func(gtx C) D {
-		return s.label(gtx, monoFont, font.Normal, font.Regular, termTextSize, text, cedarBlack, 1)
+// termLabel draws a run of terminal text.
+func (s *gioUI) termLabel(gtx C, text string) D {
+	return s.label(gtx, monoFont, font.Normal, font.Regular, termTextSize, text, cedarBlack, 1)
+}
+
+// termLine draws one terminal output line. caretCol >= 0 places the insertion
+// caret at that rune column (splitting the line around it).
+func (s *gioUI) termLine(gtx C, text string, caretCol int) D {
+	if caretCol < 0 {
+		return s.termLabel(gtx, text)
 	}
-	if !caret {
-		return line(gtx)
+	r := []rune(text)
+	prefix := text
+	suffix := ""
+	if caretCol < len(r) {
+		prefix, suffix = string(r[:caretCol]), string(r[caretCol:])
+	} else if caretCol > len(r) {
+		prefix = text + strings.Repeat(" ", caretCol-len(r)) // cursor past line end
 	}
 	return layout.Flex{Axis: layout.Horizontal, Alignment: layout.End}.Layout(gtx,
-		layout.Rigid(line),
+		layout.Rigid(func(gtx C) D { return s.termLabel(gtx, prefix) }),
 		layout.Rigid(func(gtx C) D { return s.termCaret(gtx) }),
+		layout.Rigid(func(gtx C) D { return s.termLabel(gtx, suffix) }),
 	)
 }
 
-// termCaret draws the Cedar insertion caret: a small up-pointing wedge sitting
-// on the text baseline.
+// termCaret draws the Cedar insertion caret: a small, bold up-pointing wedge
+// sitting on the text baseline.
 func (s *gioUI) termCaret(gtx C) D {
-	em := gtx.Sp(s.sp(termTextSize))
-	w := int(float32(em) * 0.62)
-	h := int(float32(em) * 0.42)
-	pad := int(float32(em) * 0.28) // drop to roughly the baseline
+	em := float32(gtx.Sp(s.sp(termTextSize)))
+	w := int(em * 0.6)
+	h := int(em * 0.44)
+	pad := int(em * 0.26) // drop to roughly the baseline
 	var p clip.Path
 	p.Begin(gtx.Ops)
 	p.MoveTo(f32.Pt(0, float32(h)))
 	p.LineTo(f32.Pt(float32(w)/2, 0))
 	p.LineTo(f32.Pt(float32(w), float32(h)))
-	stroke := clip.Stroke{Path: p.End(), Width: float32(em) * 0.09}.Op()
-	off := op.Offset(image.Pt(int(float32(em)*0.15), pad)).Push(gtx.Ops)
+	stroke := clip.Stroke{Path: p.End(), Width: em * 0.18}.Op() // bold
+	off := op.Offset(image.Pt(0, pad)).Push(gtx.Ops)
 	paint.FillShape(gtx.Ops, cedarBlack, stroke)
 	off.Pop()
-	return D{Size: image.Pt(w+int(float32(em)*0.3), h+pad)}
+	return D{Size: image.Pt(w, h+pad)}
 }
 
 func (s *gioUI) codeLine(gtx C, runs []run) D {
