@@ -264,6 +264,68 @@ func (s *gioUI) divider(gtx C, h int) D {
 	return D{Size: sz}
 }
 
+// vdivider is the vertical counterpart of divider: a grey grab-bar with black
+// edges between two horizontally-tiled panes.
+func (s *gioUI) vdivider(gtx C, w int) D {
+	sz := image.Pt(w, gtx.Constraints.Max.Y)
+	fill(gtx, cedarGreyMid, sz)
+	fillAt(gtx, cedarBlack, image.Rect(0, 0, 1, sz.Y))
+	fillAt(gtx, cedarBlack, image.Rect(w-1, 0, w, sz.Y))
+	return D{Size: sz}
+}
+
+// hsplit lays out left | divider | right with a draggable vertical divider that
+// adjusts *frac (left's fraction of the width). The pointer input covers the
+// whole area with a fixed origin, so dragging is stable as the boundary moves;
+// content inputs (lists, buttons) sit on top and are unaffected.
+func (s *gioUI) hsplit(gtx C, frac *float32, active *bool, left, right layout.Widget) D {
+	W := gtx.Constraints.Max.X
+	dividerW := gtx.Dp(dividerDp)
+	divX := int(*frac * float32(W))
+	for {
+		ev, ok := gtx.Event(pointer.Filter{Target: frac, Kinds: pointer.Press | pointer.Drag | pointer.Release | pointer.Cancel})
+		if !ok {
+			break
+		}
+		pe, ok := ev.(pointer.Event)
+		if !ok {
+			continue
+		}
+		switch pe.Kind {
+		case pointer.Press:
+			if abs(int(pe.Position.X)-divX) <= gtx.Dp(8) {
+				*active = true
+			}
+		case pointer.Drag:
+			if *active {
+				*frac = clampf(pe.Position.X/float32(W), 0.12, 0.88)
+			}
+		case pointer.Release, pointer.Cancel:
+			*active = false
+		}
+	}
+
+	leftW := int(*frac * float32(W-dividerW))
+	return layout.Stack{}.Layout(gtx,
+		layout.Expanded(func(gtx C) D {
+			sz := gtx.Constraints.Min
+			defer clip.Rect{Max: sz}.Push(gtx.Ops).Pop()
+			event.Op(gtx.Ops, frac)
+			pointer.CursorColResize.Add(gtx.Ops)
+			return D{Size: sz}
+		}),
+		layout.Stacked(func(gtx C) D {
+			return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
+				layout.Rigid(func(gtx C) D {
+					return sized(gtx, leftW, gtx.Constraints.Max.Y, left)
+				}),
+				layout.Rigid(func(gtx C) D { return s.vdivider(gtx, dividerW) }),
+				layout.Flexed(1, right),
+			)
+		}),
+	)
+}
+
 // processColumnDrag adjusts weights when a boundary is dragged.
 func (s *gioUI) processColumnDrag(gtx C, col *column, H, dividerH int) {
 	n := len(col.viewers)

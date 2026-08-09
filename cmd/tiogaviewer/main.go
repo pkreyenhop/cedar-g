@@ -39,15 +39,22 @@ type gioUI struct {
 
 	bUp, bZoomIn, bZoomOut, bZoomReset widget.Clickable
 
+	treeSplit float32 // tree's fraction of the workspace width
+	colSplit  float32 // column 0's fraction of the columns area
+	treeDrag  bool
+	colDrag   bool
+
 	keyTag  int
 	focused bool
 }
 
 func newUI() *gioUI {
 	s := &gioUI{
-		sh:       loadShaper(),
-		builtins: map[string]bool{},
-		scale:    1.0,
+		sh:        loadShaper(),
+		builtins:  map[string]bool{},
+		scale:     1.0,
+		treeSplit: 0.2,
+		colSplit:  0.5,
 	}
 	s.th = material.NewTheme()
 	s.th.Shaper = s.sh
@@ -230,26 +237,16 @@ func (s *gioUI) globalBar(gtx C) D {
 	)
 }
 
-// workspace is the file tree beside the two Cedar columns.
+// workspace is the file tree beside the two Cedar columns, with draggable
+// vertical dividers between the tree and the columns, and between the columns.
 func (s *gioUI) workspace(gtx C) D {
-	treeW := gtx.Dp(260)
-	return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
-		layout.Rigid(func(gtx C) D {
-			return sized(gtx, treeW, gtx.Constraints.Max.Y, func(gtx C) D { return s.layoutTree(gtx, s.tree) })
-		}),
-		layout.Rigid(vrule),
-		layout.Flexed(1, func(gtx C) D {
-			return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
-				layout.Flexed(1, func(gtx C) D { return s.layoutColumn(gtx, 0) }),
-				layout.Rigid(vrule),
-				layout.Flexed(1, func(gtx C) D { return s.layoutColumn(gtx, 1) }),
+	return s.hsplit(gtx, &s.treeSplit, &s.treeDrag,
+		func(gtx C) D { return s.layoutTree(gtx, s.tree) },
+		func(gtx C) D {
+			return s.hsplit(gtx, &s.colSplit, &s.colDrag,
+				func(gtx C) D { return s.layoutColumn(gtx, 0) },
+				func(gtx C) D { return s.layoutColumn(gtx, 1) },
 			)
-		}),
+		},
 	)
-}
-
-func vrule(gtx C) D {
-	sz := image.Pt(1, gtx.Constraints.Max.Y)
-	fill(gtx, cedarBlack, sz)
-	return D{Size: sz}
 }
