@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"gioui.org/gpu/headless"
 	"gioui.org/io/input"
@@ -35,6 +36,17 @@ func TestCapture(t *testing.T) {
 	}
 	if os.Getenv("CAP_MIN") != "" && len(s.cols[0].viewers) > 0 {
 		s.minimizeViewer(s.cols[0].viewers[0])
+	}
+	if os.Getenv("CAP_TERM") != "" {
+		s.openTerminal()
+		for _, c := range s.cols {
+			for _, v := range c.viewers {
+				if v.term != nil {
+					v.term.write("ls -la | head\r")
+				}
+			}
+		}
+		time.Sleep(700 * time.Millisecond) // let the shell produce output
 	}
 
 	const W, H = 1200, 820

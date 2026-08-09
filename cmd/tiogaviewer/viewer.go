@@ -9,6 +9,7 @@ import (
 
 	"gioui.org/font"
 	"gioui.org/io/event"
+	"gioui.org/io/key"
 	"gioui.org/io/pointer"
 	"gioui.org/layout"
 	"gioui.org/op/clip"
@@ -42,6 +43,7 @@ var builtinList = []string{
 // codeTextSize is the default code font size (larger than the doc body for
 // readability; scaled further by zoom).
 const codeTextSize = 17
+const termTextSize = 15
 
 // run is a styled slice of a code line.
 type run struct {
@@ -74,9 +76,16 @@ type viewer struct {
 	bDestroy, bGrow, bIcon, bSwitch, bSplit widget.Clickable
 	bRestore                                widget.Clickable // in the icon tray
 	headerHovered                           bool
+	termFocus                               int // key/pointer focus tag for the terminal
 }
 
 func (v *viewer) headerTitle() string {
+	if v.kind == vkTerm && v.term != nil {
+		if d := v.term.dir(); d != "" {
+			return d
+		}
+		return "Terminal"
+	}
 	if v.title != "" {
 		return v.title
 	}
@@ -230,53 +239,110 @@ func (s *gioUI) editorBody(gtx C, v *viewer) D {
 	})
 }
 
-// termBody renders the shell terminal: output above, an input line below.
+// termBody renders the shell terminal: output fills the whole body and you type
+// straight into it (there is no separate command line). Keystrokes are sent raw
+// to the pty, which echoes them, so input appears inline with the output.
 func (s *gioUI) termBody(gtx C, v *viewer) D {
 	t := v.term
-	v.editor.SingleLine = true
-	v.editor.Submit = true
-	// Send submitted input lines to the shell.
+	gtx.Constraints.Min = gtx.Constraints.Max
+
+	// A full-body input area: click to focus, then keys go to the shell.
+	area := clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops)
+	event.Op(gtx.Ops, &v.termFocus)
+	area.Pop()
+	s.processTermKeys(gtx, v)
+
+	lines := t.lines()
+	v.sc.list.List.ScrollToEnd = true // newest output stays in view (top→bottom)
+
+	return layout.Inset{Top: 4, Right: 12, Bottom: 4}.Layout(gtx, func(gtx C) D {
+		gtx.Constraints.Min = gtx.Constraints.Max
+		return s.scrollList(gtx, &v.sc, len(lines), func(gtx C, i int) D {
+			return s.label(gtx, monoFont, font.Normal, font.Regular, termTextSize, lines[i], cedarBlack, 1)
+		})
+	})
+}
+
+// processTermKeys forwards keystrokes to the shell. Printable text arrives as
+// EditEvents; control keys and Ctrl-combos as key.Events mapped to bytes.
+func (s *gioUI) processTermKeys(gtx C, v *viewer) {
+	t := v.term
+	tag := &v.termFocus
+	ctrlNames := []key.Name{
+		key.NameReturn, key.NameEnter, key.NameDeleteBackward, key.NameDeleteForward,
+		key.NameTab, key.NameEscape, key.NameLeftArrow, key.NameRightArrow,
+		key.NameUpArrow, key.NameDownArrow, key.NameHome, key.NameEnd,
+		key.NamePageUp, key.NamePageDown,
+	}
+	filters := []event.Filter{
+		key.FocusFilter{Target: tag},
+		pointer.Filter{Target: tag, Kinds: pointer.Press},
+		// Ctrl-combos (Ctrl-C, Ctrl-D, Ctrl-L, ...) produce no text of their own.
+		key.Filter{Focus: tag, Name: "", Required: key.ModCtrl, Optional: key.ModShift | key.ModAlt},
+	}
+	for _, nm := range ctrlNames {
+		filters = append(filters, key.Filter{Focus: tag, Name: nm, Optional: key.ModShift | key.ModCtrl | key.ModAlt})
+	}
 	for {
-		ev, ok := v.editor.Update(gtx)
+		ev, ok := gtx.Event(filters...)
 		if !ok {
 			break
 		}
-		if _, ok := ev.(widget.SubmitEvent); ok {
-			t.send(v.editor.Text())
-			v.editor.SetText("")
+		switch e := ev.(type) {
+		case pointer.Event:
+			if e.Kind == pointer.Press {
+				gtx.Execute(key.FocusCmd{Tag: tag})
+			}
+		case key.EditEvent:
+			t.write(e.Text)
+		case key.Event:
+			if e.State == key.Press {
+				t.write(termBytes(e))
+			}
 		}
 	}
+}
 
-	gtx.Constraints.Min = gtx.Constraints.Max
-	lines := t.lines()
-	// Keep the newest output in view.
-	v.sc.list.List.ScrollToEnd = true
-
-	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-		layout.Flexed(1, func(gtx C) D {
-			gtx.Constraints.Min = gtx.Constraints.Max
-			return s.scrollList(gtx, &v.sc, len(lines), func(gtx C, i int) D {
-				return s.label(gtx, monoFont, font.Normal, font.Regular, 13, lines[i], cedarBlack, 1)
-			})
-		}),
-		layout.Rigid(hrule),
-		layout.Rigid(func(gtx C) D {
-			return layout.Stack{}.Layout(gtx,
-				layout.Expanded(func(gtx C) D { return fill(gtx, cedarGrey, gtx.Constraints.Min) }),
-				layout.Stacked(func(gtx C) D {
-					gtx.Constraints.Min.X = gtx.Constraints.Max.X
-					return layout.UniformInset(4).Layout(gtx, func(gtx C) D {
-						ed := material.Editor(s.th, &v.editor, "command…")
-						ed.Color = cedarBlack
-						ed.HintColor = cedarGreyMid
-						ed.Font = monoFont
-						ed.TextSize = s.sp(13)
-						return ed.Layout(gtx)
-					})
-				}),
-			)
-		}),
-	)
+// termBytes maps a control key event to the bytes a terminal would send.
+func termBytes(e key.Event) string {
+	if e.Modifiers.Contain(key.ModCtrl) && len(e.Name) == 1 {
+		c := e.Name[0]
+		switch {
+		case c >= 'A' && c <= 'Z':
+			return string([]byte{c - 'A' + 1})
+		case c >= 'a' && c <= 'z':
+			return string([]byte{c - 'a' + 1})
+		}
+	}
+	switch e.Name {
+	case key.NameReturn, key.NameEnter:
+		return "\r"
+	case key.NameDeleteBackward:
+		return "\x7f"
+	case key.NameDeleteForward:
+		return "\x1b[3~"
+	case key.NameTab:
+		return "\t"
+	case key.NameEscape:
+		return "\x1b"
+	case key.NameLeftArrow:
+		return "\x1b[D"
+	case key.NameRightArrow:
+		return "\x1b[C"
+	case key.NameUpArrow:
+		return "\x1b[A"
+	case key.NameDownArrow:
+		return "\x1b[B"
+	case key.NameHome:
+		return "\x1b[H"
+	case key.NameEnd:
+		return "\x1b[F"
+	case key.NamePageUp:
+		return "\x1b[5~"
+	case key.NamePageDown:
+		return "\x1b[6~"
+	}
+	return ""
 }
 
 func (s *gioUI) codeLine(gtx C, runs []run) D {
