@@ -5,12 +5,14 @@ C++/Qt), plus a recursive downloader for the Xerox PARC archive it studies.
 
 The viewer browses a Cedar source tree, decodes the Xerox **Tioga** editor file
 format, renders documentation natively, and shows syntax-highlighted Cedar/Mesa
-source. The GUI is built with [Fyne](https://fyne.io) (pure-Go, cross-platform).
+source. The GUI is built with [Gio](https://gioui.org) (pure-Go, immediate-mode),
+which gives the pixel-precise 1-bit look and the custom tiled-window layout the
+Cedar environment needs.
 
 ## Layout
 
 ```
-cmd/tiogaviewer   Fyne GUI: file tree + document/code viewers
+cmd/tiogaviewer   Gio GUI: file tree + two-column tiled Viewers
 cmd/xeroxdl       Recursive archive downloader (mirrors *.index.html trees)
 cmd/xeroxsrc      Downloader variant: only *.mesa/*.tioga sources → download-src
 internal/mirror   Shared recursive-crawler engine
@@ -18,6 +20,10 @@ internal/tioga    Tioga format decoder      (port of TiogaReader.cpp)
 internal/cedar    Lexer, token types, and syntax highlighter
                   (port of CedarLexer/CedarToken/CedarTokenType/CedarHighlighter)
 ```
+
+The GUI (`cmd/tiogaviewer`) is toolkit code only; the decoder, lexer and
+highlighter under `internal/` are UI-agnostic and shared. (An earlier Fyne
+implementation lives in git history before the Gio port.)
 
 The Coco/R-generated Cedar parser from the original was left out: it was marked
 work-in-progress by the author, is not compiled into the shipped GUI
@@ -38,9 +44,10 @@ go run ./cmd/tiogaviewer /path/to/cedar/source/tree
 With no argument it opens `./download-src` if that directory exists (the mirror
 produced by `xeroxsrc`, see below).
 
-Inside the app use **File → Open Directory** (Ctrl+O) or **Open File**. The tree
-lists `*.tioga`, `*.mesa`, `*.df`, `*.require`, `*.profile`, `*.depends` files
-and their versioned `!N` variants.
+Browse the **file tree** on the left (click `+`/`-` to expand directories, a file
+to open it; the **Up** button re-roots to the parent). The tree lists `*.tioga`,
+`*.mesa`, `*.df`, `*.require`, `*.profile`, `*.depends` files and their versioned
+`!N` variants.
 
 The workspace uses Cedar's **two-column tiled "Viewers"** model: files open as
 bordered panes that **stack vertically within a column and partition its full
@@ -54,20 +61,17 @@ action buttons:
 - **Switch** — move it to the other column.
 - **Split** — open a second Viewer of the same file directly below.
 
-Column widths and the boundaries between stacked Viewers are draggable. Opening
-an already-open file focuses it instead of duplicating.
+The boundaries between stacked Viewers are draggable (proportional resize).
+Opening an already-open file focuses it instead of duplicating.
 
-The UI is styled after the Xerox Cedar / Tioga environment: monochrome black-on-
-white "viewers" with thin black rules, a caption/command strip, a serif body
-font (system Georgia, falling back to Times/DejaVu) and a monospace code font.
+The look is monochrome — white background, black text, thin black rules and
+square 1px borders — after the Xerox Cedar / Tioga screen. Body text uses a serif
+(system Georgia, falling back to DejaVu Serif); code uses a monospace. Syntax is
+shown **without colour**, using **bold** (keywords) and *italic* (comments,
+strings) only, in the spirit of Tioga's text "looks".
 
-**View menu / keyboard:**
-
-- **Zoom** (whole-UI font size) — `Cmd`/`Alt` with `+`/`=` to enlarge, `-` to
-  shrink (up to 6×), `0` to reset.
-- **Monochrome** (`Cmd`/`Alt`+`M`) — toggles code highlighting between colour and
-  a colourless mode that distinguishes tokens with **bold**/*italic* only, in the
-  spirit of Tioga's text "looks".
+**Zoom** the whole UI with the global-bar buttons or `Cmd`/`Ctrl` `+`/`=`/`-`/`0`
+(up to 6×).
 
 ## Downloader
 
@@ -99,8 +103,10 @@ go test ./...
 ```
 
 Covers the lexer, the highlighter (including multi-line `<< >>` comments and
-`←`/Latin-1 column alignment), the Tioga decoder's fallbacks, and a headless
-smoke test of the GUI render paths.
+`←`/Latin-1 column alignment), the Tioga decoder's fallbacks, and the viewer's
+tiling logic (open/split/switch/minimize/restore/destroy and weight
+partitioning). The GUI also has an offscreen render check gated behind the
+`CAP_OUT` env var (uses Gio's `gpu/headless`).
 
 ## Notes on the port
 
