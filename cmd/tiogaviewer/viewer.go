@@ -246,24 +246,30 @@ func (s *gioUI) termBody(gtx C, v *viewer) D {
 	t := v.term
 	gtx.Constraints.Min = gtx.Constraints.Max
 
-	// A full-body input area: click to focus, then keys go to the shell.
-	area := clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops)
-	event.Op(gtx.Ops, &v.termFocus)
-	area.Pop()
-	s.processTermKeys(gtx, v)
-
 	lines := t.lines()
 	// Follow the newest output, but only bottom-anchor once it overflows the
 	// viewport; while the output still fits, keep it top-aligned like a real
 	// terminal (OffsetLast is the leftover space from the previous layout).
 	v.sc.list.List.ScrollToEnd = v.sc.list.List.Position.OffsetLast <= 0
 
-	return layout.Inset{Top: 4, Right: 12, Bottom: 4}.Layout(gtx, func(gtx C) D {
+	dims := layout.Inset{Top: 4, Right: 12, Bottom: 4}.Layout(gtx, func(gtx C) D {
 		gtx.Constraints.Min = gtx.Constraints.Max
 		return s.scrollList(gtx, &v.sc, len(lines), func(gtx C, i int) D {
 			return s.label(gtx, monoFont, font.Normal, font.Regular, termTextSize, lines[i], cedarBlack, 1)
 		})
 	})
+
+	// Full-body input zone on top (pass-through, so the scrollbar/wheel still
+	// work): click to focus, then keys go to the shell.
+	pass := pointer.PassOp{}.Push(gtx.Ops)
+	area := clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops)
+	event.Op(gtx.Ops, &v.termFocus)
+	key.InputHintOp{Tag: &v.termFocus, Hint: key.HintAny}.Add(gtx.Ops)
+	area.Pop()
+	pass.Pop()
+	s.processTermKeys(gtx, v)
+
+	return dims
 }
 
 // processTermKeys forwards keystrokes to the shell. Printable text arrives as
