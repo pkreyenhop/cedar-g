@@ -121,11 +121,8 @@ func (s *gioUI) body(gtx C, v *viewer) D {
 			})
 		})
 	}
-	// Documents get more margin and a capped line length for readability.
+	// Documents get a little left/right margin; the text fills the viewer width.
 	return layout.Inset{Left: 12, Right: 12, Top: 4, Bottom: 4}.Layout(gtx, func(gtx C) D {
-		if maxW := gtx.Dp(760); gtx.Constraints.Max.X > maxW {
-			gtx.Constraints.Max.X = maxW
-		}
 		gtx.Constraints.Min = gtx.Constraints.Max
 		return s.scrollList(gtx, &v.list, len(v.blocks), func(gtx C, i int) D {
 			return s.docBlock(gtx, v.blocks[i])
