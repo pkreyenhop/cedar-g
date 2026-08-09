@@ -253,7 +253,10 @@ func (s *gioUI) termBody(gtx C, v *viewer) D {
 	s.processTermKeys(gtx, v)
 
 	lines := t.lines()
-	v.sc.list.List.ScrollToEnd = true // newest output stays in view (top→bottom)
+	// Follow the newest output, but only bottom-anchor once it overflows the
+	// viewport; while the output still fits, keep it top-aligned like a real
+	// terminal (OffsetLast is the leftover space from the previous layout).
+	v.sc.list.List.ScrollToEnd = v.sc.list.List.Position.OffsetLast <= 0
 
 	return layout.Inset{Top: 4, Right: 12, Bottom: 4}.Layout(gtx, func(gtx C) D {
 		gtx.Constraints.Min = gtx.Constraints.Max
