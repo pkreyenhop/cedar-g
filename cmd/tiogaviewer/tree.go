@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"gioui.org/font"
 	"gioui.org/layout"
@@ -24,26 +25,30 @@ func matchFile(name string) bool {
 	return false
 }
 
-// treeEntry is a cached directory child (its kind known from ReadDir, so we
-// never re-stat).
+// treeEntry is a cached directory child (kind known from ReadDir, never re-stat).
 type treeEntry struct {
 	path  string
 	isDir bool
 }
 
-// tree is a lazy file browser: a flattened list of visible rows driven by an
-// expanded-set and a directory-listing cache. The flattened rows are cached and
-// only rebuilt when the expanded-set or root changes (not every frame).
+// tree is a lazy file browser. Directory listings are read on background
+// goroutines so a slow filesystem never blocks the UI; the flattened visible
+// rows are cached and rebuilt only when the tree changes.
 type tree struct {
-	root       string
-	expanded   map[string]bool
-	childCache map[string][]treeEntry
-	clicks     map[string]*widget.Clickable
-	list       widget.List
-	onOpen     func(path string)
+	root     string
+	expanded map[string]bool // UI-thread only
+	clicks   map[string]*widget.Clickable
+	list     widget.List
+	onOpen   func(path string)
 
-	rowCache  []treeRow
-	rowsValid bool
+	invalidate func() // wakes the render loop when a background read completes
+
+	mu         sync.Mutex // guards the fields below (touched by goroutines)
+	childCache map[string][]treeEntry
+	loading    map[string]bool
+	rowCache   []treeRow
+	rowsValid  bool
+	gen        int // bumped on any change; guards stale row caching
 }
 
 type treeRow struct {
@@ -55,8 +60,9 @@ type treeRow struct {
 func newTree(onOpen func(string)) *tree {
 	t := &tree{
 		expanded:   map[string]bool{},
-		childCache: map[string][]treeEntry{},
 		clicks:     map[string]*widget.Clickable{},
+		childCache: map[string][]treeEntry{},
+		loading:    map[string]bool{},
 		onOpen:     onOpen,
 	}
 	t.list.Axis = layout.Vertical
@@ -64,27 +70,35 @@ func newTree(onOpen func(string)) *tree {
 }
 
 func (t *tree) setRoot(path string) {
-	t.root = path
 	t.expanded = map[string]bool{path: true}
+	t.mu.Lock()
+	t.root = path
 	t.childCache = map[string][]treeEntry{}
+	t.loading = map[string]bool{}
 	t.rowsValid = false
+	t.gen++
+	t.mu.Unlock()
+}
+
+func (t *tree) rootPath() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.root
 }
 
 // toggle expands/collapses a directory and invalidates the flattened rows.
 func (t *tree) toggle(path string) {
 	t.expanded[path] = !t.expanded[path]
+	t.mu.Lock()
 	t.rowsValid = false
+	t.gen++
+	t.mu.Unlock()
 }
 
-// children lists a directory once and caches it, taking the file/dir kind from
-// the directory entry (no per-child stat).
-func (t *tree) children(dir string) []treeEntry {
-	if c, ok := t.childCache[dir]; ok {
-		return c
-	}
+// readDirEntries lists a directory (off the UI thread), filtered and sorted.
+func readDirEntries(dir string) []treeEntry {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		t.childCache[dir] = nil
 		return nil
 	}
 	var dirs, files []treeEntry
@@ -98,31 +112,86 @@ func (t *tree) children(dir string) []treeEntry {
 	}
 	sort.Slice(dirs, func(i, j int) bool { return dirs[i].path < dirs[j].path })
 	sort.Slice(files, func(i, j int) bool { return files[i].path < files[j].path })
-	c := append(dirs, files...)
-	t.childCache[dir] = c
-	return c
+	return append(dirs, files...)
+}
+
+// children returns a directory's cached listing, or nil while it loads in the
+// background (the read never blocks the caller).
+func (t *tree) children(dir string) []treeEntry {
+	t.mu.Lock()
+	if c, ok := t.childCache[dir]; ok {
+		t.mu.Unlock()
+		return c
+	}
+	if t.loading[dir] {
+		t.mu.Unlock()
+		return nil
+	}
+	t.loading[dir] = true
+	t.mu.Unlock()
+
+	store := func(c []treeEntry) {
+		t.mu.Lock()
+		t.childCache[dir] = c
+		delete(t.loading, dir)
+		t.rowsValid = false
+		t.gen++
+		t.mu.Unlock()
+	}
+
+	// Without a render loop to wake (tests/headless), read synchronously so the
+	// result is available immediately.
+	if t.invalidate == nil {
+		c := readDirEntries(dir)
+		store(c)
+		return c
+	}
+
+	go func() {
+		store(readDirEntries(dir))
+		t.invalidate()
+	}()
+	return nil
 }
 
 // rows returns the flattened visible tree, rebuilding only when invalidated.
 func (t *tree) rows() []treeRow {
+	t.mu.Lock()
 	if t.rowsValid {
-		return t.rowCache
+		c := t.rowCache
+		t.mu.Unlock()
+		return c
+	}
+	gen := t.gen
+	t.mu.Unlock()
+
+	out := t.buildRows()
+
+	t.mu.Lock()
+	if t.gen == gen { // nothing changed while we built: safe to cache
+		t.rowCache = out
+		t.rowsValid = true
+	}
+	t.mu.Unlock()
+	return out
+}
+
+func (t *tree) buildRows() []treeRow {
+	root := t.rootPath()
+	if root == "" {
+		return nil
 	}
 	var out []treeRow
-	if t.root != "" {
-		var walk func(dir string, depth int)
-		walk = func(dir string, depth int) {
-			for _, e := range t.children(dir) {
-				out = append(out, treeRow{path: e.path, depth: depth, isDir: e.isDir})
-				if e.isDir && t.expanded[e.path] {
-					walk(e.path, depth+1)
-				}
+	var walk func(dir string, depth int)
+	walk = func(dir string, depth int) {
+		for _, e := range t.children(dir) {
+			out = append(out, treeRow{path: e.path, depth: depth, isDir: e.isDir})
+			if e.isDir && t.expanded[e.path] {
+				walk(e.path, depth+1)
 			}
 		}
-		walk(t.root, 0)
 	}
-	t.rowCache = out
-	t.rowsValid = true
+	walk(root, 0)
 	return out
 }
 
@@ -135,23 +204,8 @@ func (t *tree) click(path string) *widget.Clickable {
 	return c
 }
 
-// update processes row clicks: toggling directories and opening files.
-func (t *tree) update(gtx C, rows []treeRow) {
-	for _, r := range rows {
-		c := t.click(r.path)
-		if c.Clicked(gtx) {
-			if r.isDir {
-				t.toggle(r.path)
-			} else if t.onOpen != nil {
-				t.onOpen(r.path)
-			}
-		}
-	}
-}
-
 func (s *gioUI) layoutTree(gtx C, t *tree) D {
 	rows := t.rows()
-	t.update(gtx, rows)
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 		layout.Rigid(func(gtx C) D { return s.captionStrip(gtx, "Files") }),
 		layout.Rigid(hrule),
@@ -169,8 +223,17 @@ func (s *gioUI) layoutTree(gtx C, t *tree) D {
 	)
 }
 
+// treeRow draws (and handles the click for) one visible row, so click handling
+// is O(visible rows) rather than O(all rows).
 func (s *gioUI) treeRow(gtx C, t *tree, r treeRow) D {
 	c := t.click(r.path)
+	if c.Clicked(gtx) {
+		if r.isDir {
+			t.toggle(r.path)
+		} else if t.onOpen != nil {
+			t.onOpen(r.path)
+		}
+	}
 	return c.Layout(gtx, func(gtx C) D {
 		gtx.Constraints.Min.X = gtx.Constraints.Max.X
 		bg := cedarWhite

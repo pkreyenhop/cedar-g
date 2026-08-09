@@ -97,6 +97,8 @@ func main() {
 	go func() {
 		w := new(app.Window)
 		w.Option(app.Title("Cedar Viewers (Gio)"), app.Size(unit.Dp(1200), unit.Dp(820)))
+		// Background directory reads wake the render loop when they complete.
+		s.tree.invalidate = w.Invalidate
 		if err := s.loop(w); err != nil {
 			os.Exit(1)
 		}
