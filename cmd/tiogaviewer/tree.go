@@ -91,6 +91,16 @@ func (t *tree) setRoot(path string) {
 	t.mu.Unlock()
 }
 
+// refresh drops cached directory listings so newly written files appear.
+func (t *tree) refresh() {
+	t.mu.Lock()
+	t.childCache = map[string][]treeEntry{}
+	t.loading = map[string]bool{}
+	t.rowsValid = false
+	t.gen++
+	t.mu.Unlock()
+}
+
 func (t *tree) rootPath() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()

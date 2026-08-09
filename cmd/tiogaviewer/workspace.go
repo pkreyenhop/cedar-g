@@ -2,13 +2,17 @@ package main
 
 import (
 	"image"
+	"os"
 	"path/filepath"
+	"strings"
 
 	"gioui.org/io/event"
 	"gioui.org/io/pointer"
 	"gioui.org/layout"
 	"gioui.org/op/clip"
 	"gioui.org/unit"
+
+	"cedarg/internal/tioga"
 )
 
 const (
@@ -223,6 +227,40 @@ func (s *gioUI) processHeaderActions(gtx C) {
 			s.restoreViewer(v)
 			return
 		}
+		if v.kind == vkEditor && v.bSave.Clicked(gtx) {
+			s.saveEditor(v)
+		}
+	}
+}
+
+// saveEditor encodes the editor's text as a Tioga file and writes it to disk.
+func (s *gioUI) saveEditor(v *viewer) {
+	name := strings.TrimSpace(v.nameEd.Text())
+	if name == "" {
+		name = "Untitled.tioga"
+	}
+	if !strings.HasSuffix(name, ".tioga") {
+		name += ".tioga"
+	}
+	dir := s.root
+	if dir == "" {
+		dir, _ = os.Getwd()
+	}
+	path := name
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(dir, name)
+	}
+	if err := os.WriteFile(path, tioga.Encode(v.editor.Text()), 0o644); err != nil {
+		v.saveMsg = "save failed: " + err.Error()
+		return
+	}
+	v.path = path
+	v.rel = s.relPath(path)
+	v.title = filepath.Base(path)
+	v.saveMsg = "saved " + v.rel
+	s.tree.refresh() // reveal the new file in the tree
+	if s.invalidate != nil {
+		s.invalidate()
 	}
 }
 

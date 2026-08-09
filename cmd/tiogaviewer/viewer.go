@@ -84,6 +84,10 @@ type viewer struct {
 	bRestore                                widget.Clickable // in the icon tray
 	headerHovered                           bool
 	termFocus                               int // key/pointer focus tag for the terminal
+
+	bSave   widget.Clickable // editor: save to disk
+	nameEd  widget.Editor    // editor: target filename
+	saveMsg string           // editor: last save status
 }
 
 func (v *viewer) headerTitle() string {
@@ -125,6 +129,7 @@ var newDocCount int
 func (s *gioUI) newEditorViewer() *viewer {
 	newDocCount++
 	v := &viewer{kind: vkEditor, title: fmt.Sprintf("New Document %d", newDocCount)}
+	v.nameEd.SetText(fmt.Sprintf("Untitled-%d.tioga", newDocCount))
 	return v
 }
 
@@ -235,15 +240,64 @@ func (s *gioUI) body(gtx C, v *viewer) D {
 // editorBody renders an editable document (a serif multiline editor).
 func (s *gioUI) editorBody(gtx C, v *viewer) D {
 	gtx.Constraints.Min = gtx.Constraints.Max
-	return layout.Inset{Top: 6, Left: 10, Right: 10, Bottom: 6}.Layout(gtx, func(gtx C) D {
-		ed := material.Editor(s.th, &v.editor, "Type a new Tioga document…")
-		ed.Color = cedarBlack
-		ed.HintColor = cedarGreyMid
-		ed.SelectionColor = cedarGreyMid
-		ed.Font = serifFont
-		ed.TextSize = s.sp(docTextSize)
-		return ed.Layout(gtx)
-	})
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Rigid(func(gtx C) D { return s.editorToolbar(gtx, v) }),
+		layout.Rigid(hrule),
+		layout.Flexed(1, func(gtx C) D {
+			gtx.Constraints.Min = gtx.Constraints.Max
+			return layout.Inset{Top: 6, Left: 10, Right: 10, Bottom: 6}.Layout(gtx, func(gtx C) D {
+				ed := material.Editor(s.th, &v.editor, "Type a new Tioga document…")
+				ed.Color = cedarBlack
+				ed.HintColor = cedarGreyMid
+				ed.SelectionColor = cedarGreyMid
+				ed.Font = serifFont
+				ed.TextSize = s.sp(docTextSize)
+				return ed.Layout(gtx)
+			})
+		}),
+	)
+}
+
+// editorToolbar is the grey bar above the editor: a filename field, a Save
+// button and the last save status.
+func (s *gioUI) editorToolbar(gtx C, v *viewer) D {
+	v.nameEd.SingleLine = true
+	gtx.Constraints.Min.X = gtx.Constraints.Max.X
+	return layout.Stack{}.Layout(gtx,
+		layout.Expanded(func(gtx C) D { return fill(gtx, cedarGrey, gtx.Constraints.Min) }),
+		layout.Stacked(func(gtx C) D {
+			gtx.Constraints.Min.X = gtx.Constraints.Max.X
+			return layout.UniformInset(4).Layout(gtx, func(gtx C) D {
+				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+					layout.Rigid(func(gtx C) D {
+						return layout.Inset{Right: 6}.Layout(gtx, func(gtx C) D {
+							return s.label(gtx, serifFont, font.Bold, font.Regular, 13, "File:", cedarBlack, 1)
+						})
+					}),
+					layout.Flexed(1, func(gtx C) D {
+						ned := material.Editor(s.th, &v.nameEd, "filename.tioga")
+						ned.Color = cedarBlack
+						ned.HintColor = cedarGreyMid
+						ned.SelectionColor = cedarGreyMid
+						ned.Font = monoFont
+						ned.TextSize = s.sp(13)
+						return ned.Layout(gtx)
+					}),
+					layout.Rigid(func(gtx C) D {
+						return layout.Inset{Left: 8, Right: 8}.Layout(gtx, func(gtx C) D {
+							return s.flatButton(gtx, &v.bSave, "Save")
+						})
+					}),
+					layout.Rigid(func(gtx C) D {
+						if v.saveMsg == "" {
+							return D{}
+						}
+						return s.label(gtx, serifFont, font.Normal, font.Regular, 12, v.saveMsg, cedarBlack, 1)
+					}),
+				)
+			})
+		}),
+	)
 }
 
 // termBody renders the shell terminal: output fills the whole body and you type

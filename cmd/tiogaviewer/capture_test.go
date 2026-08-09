@@ -37,6 +37,16 @@ func TestCapture(t *testing.T) {
 	if os.Getenv("CAP_MIN") != "" && len(s.cols[0].viewers) > 0 {
 		s.minimizeViewer(s.cols[0].viewers[0])
 	}
+	if os.Getenv("CAP_NEW") != "" {
+		s.openNewDocument()
+		for _, c := range s.cols {
+			for _, v := range c.viewers {
+				if v.kind == vkEditor {
+					v.editor.SetText("Weiser, August 4, 1993\n\nUsing Threads in Interactive Systems: A Case Study\n\nWe describe the results of examining two large systems.")
+				}
+			}
+		}
+	}
 	if os.Getenv("CAP_TERM") != "" {
 		s.openTerminal()
 		for _, c := range s.cols {
