@@ -5,7 +5,21 @@
 // code), so a native GUI can render it directly.
 package tioga
 
-import "strings"
+import (
+	"strings"
+	"unicode/utf8"
+)
+
+// decodeFallback decodes a file that is not in the Tioga container format. If the
+// bytes are already valid UTF-8 (e.g. a modern source that literally contains
+// "←"), they are kept as text; otherwise they are treated as Latin-1 via
+// toString. In both cases Cedar's "_" assignment alias is displayed as "←".
+func decodeFallback(data []byte) string {
+	if utf8.Valid(data) {
+		return strings.ReplaceAll(string(data), "_", "←")
+	}
+	return toString(data)
+}
 
 // BlockKind classifies a rendered document block.
 type BlockKind int
@@ -117,7 +131,7 @@ func Read(data []byte, isCode bool) Document {
 		r.doWork()
 	} else {
 		// Not a Tioga container: fall back to the decoded raw bytes.
-		txt := toString(data)
+		txt := decodeFallback(data)
 		if isCode {
 			return Document{IsCode: true, Code: txt}
 		}

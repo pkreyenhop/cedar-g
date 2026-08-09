@@ -1,6 +1,9 @@
 package tioga
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestNonTiogaCodeFallback(t *testing.T) {
 	doc := Read([]byte("hello\nworld"), true)
@@ -13,6 +16,28 @@ func TestNonTiogaDocFallback(t *testing.T) {
 	doc := Read([]byte("just text"), false)
 	if doc.IsCode || len(doc.Blocks) != 1 || doc.Blocks[0].Text != "just text" {
 		t.Fatalf("doc fallback: %+v", doc)
+	}
+}
+
+func TestUTF8FallbackKeepsArrow(t *testing.T) {
+	// A plain UTF-8 source containing the assignment arrow must render it as a
+	// single "←", not the mojibake "â" + boxes from Latin-1 mis-decoding.
+	doc := Read([]byte("a: CARDINAL ← 0;"), true)
+	if !doc.IsCode {
+		t.Fatalf("expected code doc")
+	}
+	if !strings.Contains(doc.Code, "←") {
+		t.Fatalf("arrow lost: %q", doc.Code)
+	}
+	if strings.Contains(doc.Code, "â") {
+		t.Fatalf("mojibake in output: %q", doc.Code)
+	}
+}
+
+func TestUnderscoreShownAsArrow(t *testing.T) {
+	doc := Read([]byte("a _ 0;"), true)
+	if !strings.Contains(doc.Code, "←") {
+		t.Fatalf("underscore not shown as arrow: %q", doc.Code)
 	}
 }
 
