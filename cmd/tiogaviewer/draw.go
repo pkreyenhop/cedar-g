@@ -150,8 +150,12 @@ type scroller struct {
 	scrollDir int // -1 up (left button), +1 down (right button), 0 idle
 }
 
-// scrollGutterDp is the reserved left column the scrollbar lives in.
-const scrollGutterDp = 16
+const (
+	// scrollGutterDp is the reserved left column the scrollbar occupies.
+	scrollGutterDp = 16
+	// scrollHoverDp is the wider left band that reveals the scrollbar on hover.
+	scrollHoverDp = 52
+)
 
 func (s *gioUI) scrollList(gtx C, sc *scroller, n int, el layout.ListElement) D {
 	sc.list.Axis = layout.Vertical
@@ -160,44 +164,54 @@ func (s *gioUI) scrollList(gtx C, sc *scroller, n int, el layout.ListElement) D 
 	if gutter > full.X {
 		gutter = full.X
 	}
+	hoverW := gtx.Dp(scrollHoverDp)
+	if hoverW > full.X {
+		hoverW = full.X
+	}
 
-	// Handle gutter pointer events registered on the previous frame.
+	// Scrollbar press events (left = up, right = down).
 	for {
-		ev, ok := gtx.Event(pointer.Filter{
-			Target: sc,
-			Kinds:  pointer.Enter | pointer.Leave | pointer.Press | pointer.Release,
-		})
+		ev, ok := gtx.Event(pointer.Filter{Target: sc, Kinds: pointer.Press | pointer.Release})
 		if !ok {
 			break
 		}
-		pe, ok := ev.(pointer.Event)
-		if !ok {
-			continue
-		}
-		switch pe.Kind {
-		case pointer.Enter:
-			sc.hovered = true
-		case pointer.Leave:
-			sc.hovered = false
-			sc.scrollDir = 0
-		case pointer.Press:
-			switch {
-			case pe.Buttons.Contain(pointer.ButtonPrimary):
-				sc.scrollDir = -1 // left → up
-			case pe.Buttons.Contain(pointer.ButtonSecondary):
-				sc.scrollDir = 1 // right → down
+		if pe, ok := ev.(pointer.Event); ok {
+			switch pe.Kind {
+			case pointer.Press:
+				switch {
+				case pe.Buttons.Contain(pointer.ButtonPrimary):
+					sc.scrollDir = -1 // left → up
+				case pe.Buttons.Contain(pointer.ButtonSecondary):
+					sc.scrollDir = 1 // right → down
+				}
+			case pointer.Release:
+				sc.scrollDir = 0
 			}
-		case pointer.Release:
-			sc.scrollDir = 0
+		}
+	}
+	// Hover-zone events (a wider band, so the bar appears as you approach the left).
+	for {
+		ev, ok := gtx.Event(pointer.Filter{Target: &sc.hovered, Kinds: pointer.Enter | pointer.Leave})
+		if !ok {
+			break
+		}
+		if pe, ok := ev.(pointer.Event); ok {
+			switch pe.Kind {
+			case pointer.Enter:
+				sc.hovered = true
+			case pointer.Leave:
+				sc.hovered = false
+				sc.scrollDir = 0
+			}
 		}
 	}
 
-	// While a button is held over the gutter, scroll continuously in that
-	// direction (relative to a fraction of the visible page), and keep animating.
+	// While a button is held, scroll slowly and continuously so the position is
+	// easy to follow, re-rendering each frame.
 	if sc.scrollDir != 0 && n > 0 {
-		step := float32(sc.list.Position.Count) * 0.035
-		if step < 0.3 {
-			step = 0.3
+		step := float32(sc.list.Position.Count) * 0.01
+		if step < 0.1 {
+			step = 0.1
 		}
 		sc.list.List.ScrollBy(float32(sc.scrollDir) * step)
 		gtx.Execute(op.InvalidateCmd{})
@@ -228,11 +242,19 @@ func (s *gioUI) scrollList(gtx C, sc *scroller, n int, el layout.ListElement) D 
 		fillAt(gtx, cedarGreyMid, image.Rect(0, ty0, gutter, ty1))
 	}
 
-	// Register the gutter pointer area every frame (stable → no flicker).
-	st := clip.Rect{Max: image.Pt(gutter, totalH)}.Push(gtx.Ops)
+	// Narrow scrollbar press area (opaque; handles the button scroll).
+	pst := clip.Rect{Max: image.Pt(gutter, totalH)}.Push(gtx.Ops)
 	event.Op(gtx.Ops, sc)
 	pointer.CursorPointer.Add(gtx.Ops)
-	st.Pop()
+	pst.Pop()
+
+	// Wider hover band on top, pass-through so it only reveals the bar and never
+	// eats clicks or wheel-scroll from the content.
+	pass := pointer.PassOp{}.Push(gtx.Ops)
+	hst := clip.Rect{Max: image.Pt(hoverW, totalH)}.Push(gtx.Ops)
+	event.Op(gtx.Ops, &sc.hovered)
+	hst.Pop()
+	pass.Pop()
 
 	return D{Size: image.Pt(full.X, totalH)}
 }
