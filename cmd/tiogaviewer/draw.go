@@ -178,6 +178,13 @@ func (s *gioUI) scrollList(gtx C, sc *scroller, n int, el layout.ListElement) D 
 		if pe, ok := ev.(pointer.Event); ok {
 			switch pe.Kind {
 			case pointer.Press:
+				// A click jumps to the clicked location (its fraction of the track).
+				if full.Y > 0 && n > 0 {
+					f := clamp01(float32(pe.Position.Y) / float32(full.Y))
+					sc.list.List.Position.First = int(f * float32(n))
+					sc.list.List.Position.Offset = 0
+				}
+				// Holding then keeps scrolling in the button's direction.
 				switch {
 				case pe.Buttons.Contain(pointer.ButtonPrimary):
 					sc.scrollDir = -1 // left → up
