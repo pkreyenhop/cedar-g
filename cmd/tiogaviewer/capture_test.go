@@ -30,7 +30,7 @@ func TestCapture(t *testing.T) {
 	}
 	if os.Getenv("CAP_EXPAND") != "" && s.root != "" {
 		if kids := s.tree.children(s.root); len(kids) > 0 {
-			s.tree.expanded[kids[0]] = true
+			s.tree.toggle(kids[0].path)
 		}
 	}
 	if os.Getenv("CAP_MIN") != "" && len(s.cols[0].viewers) > 0 {

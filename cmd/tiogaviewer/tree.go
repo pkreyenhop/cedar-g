@@ -24,15 +24,26 @@ func matchFile(name string) bool {
 	return false
 }
 
+// treeEntry is a cached directory child (its kind known from ReadDir, so we
+// never re-stat).
+type treeEntry struct {
+	path  string
+	isDir bool
+}
+
 // tree is a lazy file browser: a flattened list of visible rows driven by an
-// expanded-set and a directory-listing cache.
+// expanded-set and a directory-listing cache. The flattened rows are cached and
+// only rebuilt when the expanded-set or root changes (not every frame).
 type tree struct {
 	root       string
 	expanded   map[string]bool
-	childCache map[string][]string
+	childCache map[string][]treeEntry
 	clicks     map[string]*widget.Clickable
 	list       widget.List
 	onOpen     func(path string)
+
+	rowCache  []treeRow
+	rowsValid bool
 }
 
 type treeRow struct {
@@ -44,7 +55,7 @@ type treeRow struct {
 func newTree(onOpen func(string)) *tree {
 	t := &tree{
 		expanded:   map[string]bool{},
-		childCache: map[string][]string{},
+		childCache: map[string][]treeEntry{},
 		clicks:     map[string]*widget.Clickable{},
 		onOpen:     onOpen,
 	}
@@ -55,10 +66,19 @@ func newTree(onOpen func(string)) *tree {
 func (t *tree) setRoot(path string) {
 	t.root = path
 	t.expanded = map[string]bool{path: true}
-	t.childCache = map[string][]string{}
+	t.childCache = map[string][]treeEntry{}
+	t.rowsValid = false
 }
 
-func (t *tree) children(dir string) []string {
+// toggle expands/collapses a directory and invalidates the flattened rows.
+func (t *tree) toggle(path string) {
+	t.expanded[path] = !t.expanded[path]
+	t.rowsValid = false
+}
+
+// children lists a directory once and caches it, taking the file/dir kind from
+// the directory entry (no per-child stat).
+func (t *tree) children(dir string) []treeEntry {
 	if c, ok := t.childCache[dir]; ok {
 		return c
 	}
@@ -67,40 +87,42 @@ func (t *tree) children(dir string) []string {
 		t.childCache[dir] = nil
 		return nil
 	}
-	var dirs, files []string
+	var dirs, files []treeEntry
 	for _, e := range entries {
 		full := filepath.Join(dir, e.Name())
 		if e.IsDir() {
-			dirs = append(dirs, full)
+			dirs = append(dirs, treeEntry{full, true})
 		} else if matchFile(e.Name()) {
-			files = append(files, full)
+			files = append(files, treeEntry{full, false})
 		}
 	}
-	sort.Strings(dirs)
-	sort.Strings(files)
+	sort.Slice(dirs, func(i, j int) bool { return dirs[i].path < dirs[j].path })
+	sort.Slice(files, func(i, j int) bool { return files[i].path < files[j].path })
 	c := append(dirs, files...)
 	t.childCache[dir] = c
 	return c
 }
 
-// rows flattens the currently-visible tree.
+// rows returns the flattened visible tree, rebuilding only when invalidated.
 func (t *tree) rows() []treeRow {
-	if t.root == "" {
-		return nil
+	if t.rowsValid {
+		return t.rowCache
 	}
 	var out []treeRow
-	var walk func(dir string, depth int)
-	walk = func(dir string, depth int) {
-		for _, p := range t.children(dir) {
-			info, err := os.Stat(p)
-			isDir := err == nil && info.IsDir()
-			out = append(out, treeRow{path: p, depth: depth, isDir: isDir})
-			if isDir && t.expanded[p] {
-				walk(p, depth+1)
+	if t.root != "" {
+		var walk func(dir string, depth int)
+		walk = func(dir string, depth int) {
+			for _, e := range t.children(dir) {
+				out = append(out, treeRow{path: e.path, depth: depth, isDir: e.isDir})
+				if e.isDir && t.expanded[e.path] {
+					walk(e.path, depth+1)
+				}
 			}
 		}
+		walk(t.root, 0)
 	}
-	walk(t.root, 0)
+	t.rowCache = out
+	t.rowsValid = true
 	return out
 }
 
@@ -119,7 +141,7 @@ func (t *tree) update(gtx C, rows []treeRow) {
 		c := t.click(r.path)
 		if c.Clicked(gtx) {
 			if r.isDir {
-				t.expanded[r.path] = !t.expanded[r.path]
+				t.toggle(r.path)
 			} else if t.onOpen != nil {
 				t.onOpen(r.path)
 			}
