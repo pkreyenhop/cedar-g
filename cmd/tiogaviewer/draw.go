@@ -91,13 +91,19 @@ func (s *gioUI) sp(v float32) unit.Sp { return unit.Sp(v * s.scale) }
 
 // label draws a single string with the given face/style/colour. maxLines 0 wraps.
 func (s *gioUI) label(gtx C, base font.Font, weight font.Weight, style font.Style, size float32, txt string, col color.NRGBA, maxLines int) D {
+	return s.labelLH(gtx, base, weight, style, size, txt, col, maxLines, 0)
+}
+
+// labelLH is label with an explicit line-height scale (0 = default). A value
+// above 1 opens up the leading, making wrapped paragraphs more readable.
+func (s *gioUI) labelLH(gtx C, base font.Font, weight font.Weight, style font.Style, size float32, txt string, col color.NRGBA, maxLines int, lineHeight float32) D {
 	fnt := base
 	fnt.Weight = weight
 	fnt.Style = style
 	macro := op.Record(gtx.Ops)
 	paint.ColorOp{Color: col}.Add(gtx.Ops)
 	cl := macro.Stop()
-	l := widget.Label{MaxLines: maxLines}
+	l := widget.Label{MaxLines: maxLines, LineHeightScale: lineHeight}
 	return l.Layout(gtx, s.sh, fnt, s.sp(size), txt, cl)
 }
 

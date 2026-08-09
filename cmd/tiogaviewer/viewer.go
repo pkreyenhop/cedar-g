@@ -8,6 +8,7 @@ import (
 
 	"gioui.org/font"
 	"gioui.org/layout"
+	"gioui.org/unit"
 	"gioui.org/widget"
 
 	"cedarg/internal/cedar"
@@ -112,13 +113,20 @@ func (s *gioUI) header(gtx C, v *viewer) D {
 }
 
 func (s *gioUI) body(gtx C, v *viewer) D {
-	gtx.Constraints.Min = gtx.Constraints.Max
-	return layout.UniformInset(4).Layout(gtx, func(gtx C) D {
-		if v.isCode {
+	if v.isCode {
+		gtx.Constraints.Min = gtx.Constraints.Max
+		return layout.UniformInset(4).Layout(gtx, func(gtx C) D {
 			return s.scrollList(gtx, &v.list, len(v.lines), func(gtx C, i int) D {
 				return s.codeLine(gtx, v.lines[i])
 			})
+		})
+	}
+	// Documents get more margin and a capped line length for readability.
+	return layout.Inset{Left: 12, Right: 12, Top: 4, Bottom: 4}.Layout(gtx, func(gtx C) D {
+		if maxW := gtx.Dp(760); gtx.Constraints.Max.X > maxW {
+			gtx.Constraints.Max.X = maxW
 		}
+		gtx.Constraints.Min = gtx.Constraints.Max
 		return s.scrollList(gtx, &v.list, len(v.blocks), func(gtx C, i int) D {
 			return s.docBlock(gtx, v.blocks[i])
 		})
@@ -144,23 +152,32 @@ func (s *gioUI) codeLine(gtx C, runs []run) D {
 	return layout.Flex{Axis: layout.Horizontal}.Layout(gtx, children...)
 }
 
+// docTextSize / docLineHeight tune document readability (roomier than the old
+// cramped defaults); both scale further with zoom.
+const (
+	docTextSize   = 18
+	docLineHeight = 1.3
+)
+
 func (s *gioUI) docBlock(gtx C, b tioga.Block) D {
-	fnt, weight, style, size := serifFont, font.Normal, font.Regular, float32(16)
+	fnt, weight, style, size := serifFont, font.Normal, font.Regular, float32(docTextSize)
+	top, bottom := unit.Dp(3), unit.Dp(3)
 	switch b.Kind {
 	case tioga.Heading:
 		weight = font.Bold
 		if b.Level <= 1 {
-			size = 26
+			size = 28
 		} else {
-			size = 20
+			size = 22
 		}
+		top, bottom = unit.Dp(10), unit.Dp(6)
 	case tioga.Quote:
 		style = font.Italic
 	case tioga.Code:
-		fnt, size = monoFont, codeTextSize
+		fnt, size = monoFont, docTextSize
 	}
-	return layout.Inset{Top: 2, Bottom: 2}.Layout(gtx, func(gtx C) D {
-		return s.label(gtx, fnt, weight, style, size, b.Text, cedarBlack, 0)
+	return layout.Inset{Top: top, Bottom: bottom}.Layout(gtx, func(gtx C) D {
+		return s.labelLH(gtx, fnt, weight, style, size, b.Text, cedarBlack, 0, docLineHeight)
 	})
 }
 
