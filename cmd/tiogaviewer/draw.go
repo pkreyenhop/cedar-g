@@ -7,6 +7,8 @@ import (
 
 	"gioui.org/font"
 	"gioui.org/font/opentype"
+	"gioui.org/io/event"
+	"gioui.org/io/pointer"
 	"gioui.org/layout"
 	"gioui.org/op"
 	"gioui.org/op/clip"
@@ -14,7 +16,6 @@ import (
 	"gioui.org/text"
 	"gioui.org/unit"
 	"gioui.org/widget"
-	"gioui.org/widget/material"
 )
 
 type (
@@ -140,15 +141,16 @@ func (s *gioUI) captionStrip(gtx C, txt string) D {
 	)
 }
 
-// scroller is a scrollable list with a Cedar-style scrollbar: on the left, wide,
-// and only visible while the pointer is over the far-left gutter (or dragging).
+// scroller is a scrollable list with a Cedar-style scrollbar living in a
+// reserved left gutter. It shows only while hovered, and scrolls on mouse
+// buttons: hold the left button to scroll up, the right button to scroll down.
 type scroller struct {
-	list widget.List
+	list      widget.List
+	hovered   bool
+	scrollDir int // -1 up (left button), +1 down (right button), 0 idle
 }
 
-// scrollGutterDp is the reserved left column the scrollbar lives in. The bar is
-// laid out there every frame (so it never flickers and drag always works); it is
-// simply painted transparent until the track is hovered.
+// scrollGutterDp is the reserved left column the scrollbar lives in.
 const scrollGutterDp = 16
 
 func (s *gioUI) scrollList(gtx C, sc *scroller, n int, el layout.ListElement) D {
@@ -157,6 +159,48 @@ func (s *gioUI) scrollList(gtx C, sc *scroller, n int, el layout.ListElement) D 
 	gutter := gtx.Dp(scrollGutterDp)
 	if gutter > full.X {
 		gutter = full.X
+	}
+
+	// Handle gutter pointer events registered on the previous frame.
+	for {
+		ev, ok := gtx.Event(pointer.Filter{
+			Target: sc,
+			Kinds:  pointer.Enter | pointer.Leave | pointer.Press | pointer.Release,
+		})
+		if !ok {
+			break
+		}
+		pe, ok := ev.(pointer.Event)
+		if !ok {
+			continue
+		}
+		switch pe.Kind {
+		case pointer.Enter:
+			sc.hovered = true
+		case pointer.Leave:
+			sc.hovered = false
+			sc.scrollDir = 0
+		case pointer.Press:
+			switch {
+			case pe.Buttons.Contain(pointer.ButtonPrimary):
+				sc.scrollDir = -1 // left → up
+			case pe.Buttons.Contain(pointer.ButtonSecondary):
+				sc.scrollDir = 1 // right → down
+			}
+		case pointer.Release:
+			sc.scrollDir = 0
+		}
+	}
+
+	// While a button is held over the gutter, scroll continuously in that
+	// direction (relative to a fraction of the visible page), and keep animating.
+	if sc.scrollDir != 0 && n > 0 {
+		step := float32(sc.list.Position.Count) * 0.035
+		if step < 0.3 {
+			step = 0.3
+		}
+		sc.list.List.ScrollBy(float32(sc.scrollDir) * step)
+		gtx.Execute(op.InvalidateCmd{})
 	}
 
 	// Content, shifted right of the reserved gutter so the bar never covers text.
@@ -172,31 +216,24 @@ func (s *gioUI) scrollList(gtx C, sc *scroller, n int, el layout.ListElement) D 
 		totalH = full.Y
 	}
 
-	// Always lay out the scrollbar in the gutter; visible only when hovered/dragged.
-	start, end := viewportFraction(sc.list.Position, n, totalH)
-	bar := material.Scrollbar(s.th, &sc.list.Scrollbar)
-	bar.Indicator.MinorWidth = unit.Dp(scrollGutterDp)
-	bar.Indicator.CornerRadius = 0
-	bar.Track.MajorPadding = 0
-	bar.Track.MinorPadding = 0
-	if sc.list.Scrollbar.TrackHovered() || sc.list.Scrollbar.IndicatorHovered() || sc.list.Scrollbar.Dragging() {
-		bar.Indicator.Color = cedarGreyMid
-		bar.Indicator.HoverColor = cedarBlack
-		bar.Track.Color = cedarGrey
-	} else {
-		clear := color.NRGBA{}
-		bar.Indicator.Color, bar.Indicator.HoverColor, bar.Track.Color = clear, clear, clear
+	// Paint the wide grey track and darker thumb only while hovered.
+	if sc.hovered {
+		fillAt(gtx, cedarGrey, image.Rect(0, 0, gutter, totalH))
+		start, end := viewportFraction(sc.list.Position, n, totalH)
+		ty0 := int(clamp01(start) * float32(totalH))
+		ty1 := int(clamp01(end) * float32(totalH))
+		if ty1 <= ty0 {
+			ty1 = ty0 + 2
+		}
+		fillAt(gtx, cedarGreyMid, image.Rect(0, ty0, gutter, ty1))
 	}
-	bgtx := gtx
-	bgtx.Constraints.Min = image.Pt(gutter, totalH)
-	bgtx.Constraints.Max = image.Pt(gutter, totalH)
-	layout.W.Layout(bgtx, func(gtx C) D {
-		return bar.Layout(gtx, layout.Vertical, start, end)
-	})
 
-	if d := sc.list.ScrollDistance(); d != 0 {
-		sc.list.List.ScrollBy(d * float32(n))
-	}
+	// Register the gutter pointer area every frame (stable → no flicker).
+	st := clip.Rect{Max: image.Pt(gutter, totalH)}.Push(gtx.Ops)
+	event.Op(gtx.Ops, sc)
+	pointer.CursorPointer.Add(gtx.Ops)
+	st.Pop()
+
 	return D{Size: image.Pt(full.X, totalH)}
 }
 
