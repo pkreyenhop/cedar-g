@@ -128,20 +128,6 @@ func (s *gioUI) flatButton(gtx C, btn *widget.Clickable, label string) D {
 	})
 }
 
-// captionStrip is a black header strip with a white label (e.g. "Files"),
-// matching the viewer title bars.
-func (s *gioUI) captionStrip(gtx C, txt string) D {
-	gtx.Constraints.Min.X = gtx.Constraints.Max.X
-	return layout.Stack{}.Layout(gtx,
-		layout.Expanded(func(gtx C) D { return fill(gtx, cedarBlack, gtx.Constraints.Min) }),
-		layout.Stacked(func(gtx C) D {
-			return layout.Inset{Left: 6, Top: 3, Bottom: 3}.Layout(gtx, func(gtx C) D {
-				return s.label(gtx, serifFont, font.Bold, font.Regular, 13, txt, cedarWhite, 1)
-			})
-		}),
-	)
-}
-
 // scroller is a scrollable list with a Cedar-style scrollbar living in a
 // reserved left gutter. It shows only while hovered, and scrolls on mouse
 // buttons: hold the left button to scroll up, the right button to scroll down.

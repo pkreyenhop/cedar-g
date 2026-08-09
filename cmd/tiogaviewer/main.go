@@ -203,7 +203,7 @@ func (s *gioUI) layout(gtx C) D {
 	)
 }
 
-// globalBar is the black system row: title, an Up button and zoom controls.
+// globalBar is the black system row: the title and the Cmd/Open/New actions.
 func (s *gioUI) globalBar(gtx C) D {
 	h := gtx.Dp(28)
 	gtx.Constraints.Min = image.Pt(gtx.Constraints.Max.X, h)
@@ -215,9 +215,6 @@ func (s *gioUI) globalBar(gtx C) D {
 					return layout.UniformInset(6).Layout(gtx, func(gtx C) D {
 						return s.label(gtx, serifFont, font.Bold, font.Regular, 13, "Cedar  Viewers", cedarWhite, 1)
 					})
-				}),
-				layout.Rigid(func(gtx C) D {
-					return layout.UniformInset(3).Layout(gtx, func(gtx C) D { return s.flatButton(gtx, &s.bUp, "Up") })
 				}),
 				layout.Flexed(1, func(gtx C) D { return D{Size: image.Pt(gtx.Constraints.Max.X, 1)} }),
 				layout.Rigid(func(gtx C) D {

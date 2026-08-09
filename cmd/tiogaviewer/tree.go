@@ -1,6 +1,7 @@
 package main
 
 import (
+	"image"
 	"os"
 	"path/filepath"
 	"sort"
@@ -8,7 +9,10 @@ import (
 	"sync"
 
 	"gioui.org/font"
+	"gioui.org/io/event"
+	"gioui.org/io/pointer"
 	"gioui.org/layout"
+	"gioui.org/op/clip"
 	"gioui.org/unit"
 	"gioui.org/widget"
 )
@@ -46,6 +50,8 @@ type tree struct {
 	clicks   map[string]*widget.Clickable
 	sc       scroller
 	onOpen   func(path string)
+
+	headerHovered bool // reveals the header menu (UI-thread only)
 
 	invalidate func() // wakes the render loop when a background read completes
 
@@ -209,10 +215,69 @@ func (t *tree) click(path string) *widget.Clickable {
 	return c
 }
 
+// treeHeader is the file column's slider header: a black "Files" bar that, when
+// hovered, reveals a command menu (the Up button), matching the viewer headers.
+func (s *gioUI) treeHeader(gtx C, t *tree) D {
+	gtx.Constraints.Min.X = gtx.Constraints.Max.X
+
+	for {
+		ev, ok := gtx.Event(pointer.Filter{Target: &t.headerHovered, Kinds: pointer.Enter | pointer.Leave})
+		if !ok {
+			break
+		}
+		if pe, ok := ev.(pointer.Event); ok {
+			switch pe.Kind {
+			case pointer.Enter:
+				t.headerHovered = true
+			case pointer.Leave:
+				t.headerHovered = false
+			}
+		}
+	}
+
+	// The menu is always laid out so the header height stays constant.
+	dims := layout.Stack{}.Layout(gtx,
+		layout.Expanded(func(gtx C) D { return fill(gtx, cedarGrey, gtx.Constraints.Min) }),
+		layout.Stacked(func(gtx C) D {
+			return layout.UniformInset(2).Layout(gtx, func(gtx C) D {
+				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+					layout.Rigid(func(gtx C) D { return s.flatButton(gtx, &s.bUp, "Up") }),
+					layout.Rigid(func(gtx C) D { return D{Size: image.Pt(gtx.Dp(6), 0)} }),
+					layout.Flexed(1, func(gtx C) D {
+						return s.label(gtx, serifFont, font.Bold, font.Regular, 13, "Files", cedarBlack, 1)
+					}),
+				)
+			})
+		}),
+	)
+
+	// When not hovered, cover the menu with a black "Files" title bar.
+	if !t.headerHovered {
+		fillAt(gtx, cedarBlack, image.Rectangle{Max: dims.Size})
+		cgtx := gtx
+		cgtx.Constraints.Min = dims.Size
+		cgtx.Constraints.Max = dims.Size
+		layout.W.Layout(cgtx, func(gtx C) D {
+			return layout.Inset{Left: 6}.Layout(gtx, func(gtx C) D {
+				return s.label(gtx, serifFont, font.Bold, font.Regular, 13, "Files", cedarWhite, 1)
+			})
+		})
+	}
+
+	// Header-wide pass-through hover zone (reveals the menu without stealing clicks).
+	pass := pointer.PassOp{}.Push(gtx.Ops)
+	hst := clip.Rect{Max: dims.Size}.Push(gtx.Ops)
+	event.Op(gtx.Ops, &t.headerHovered)
+	hst.Pop()
+	pass.Pop()
+
+	return dims
+}
+
 func (s *gioUI) layoutTree(gtx C, t *tree) D {
 	rows := t.rows()
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-		layout.Rigid(func(gtx C) D { return s.captionStrip(gtx, "Files") }),
+		layout.Rigid(func(gtx C) D { return s.treeHeader(gtx, t) }),
 		layout.Rigid(hrule),
 		layout.Flexed(1, func(gtx C) D {
 			gtx.Constraints.Min = gtx.Constraints.Max
