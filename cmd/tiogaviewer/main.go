@@ -31,13 +31,15 @@ type gioUI struct {
 	builtins map[string]bool
 	scale    float32
 
-	root string
-	tree *tree
+	root       string
+	tree       *tree
+	showTree   bool
+	invalidate func() // wakes the render loop (background readers, terminals)
 
 	cols      [numColumns]*column
 	minimized []*viewer
 
-	bUp, bZoomIn, bZoomOut, bZoomReset widget.Clickable
+	bUp, bCmd, bOpen, bNew widget.Clickable
 
 	treeWidth float32 // tree column width, in dp
 	colSplit  float32 // column 0's fraction of the columns area
@@ -53,8 +55,9 @@ func newUI() *gioUI {
 		sh:        loadShaper(),
 		builtins:  map[string]bool{},
 		scale:     1.0,
-		treeWidth: 210,
+		treeWidth: 240,
 		colSplit:  0.5,
+		showTree:  true,
 	}
 	s.th = material.NewTheme()
 	s.th.Shaper = s.sh
@@ -104,7 +107,8 @@ func main() {
 	go func() {
 		w := new(app.Window)
 		w.Option(app.Title("Cedar Viewers (Gio)"), app.Size(unit.Dp(1200), unit.Dp(820)), app.Fullscreen.Option())
-		// Background directory reads wake the render loop when they complete.
+		// Background directory reads / terminal output wake the render loop.
+		s.invalidate = w.Invalidate
 		s.tree.invalidate = w.Invalidate
 		if err := s.loop(w); err != nil {
 			os.Exit(1)
@@ -136,14 +140,14 @@ func (s *gioUI) update(gtx C) {
 			s.setRoot(parent)
 		}
 	}
-	if s.bZoomIn.Clicked(gtx) {
-		s.zoomBy(0.1)
+	if s.bCmd.Clicked(gtx) {
+		s.openTerminal()
 	}
-	if s.bZoomOut.Clicked(gtx) {
-		s.zoomBy(-0.1)
+	if s.bOpen.Clicked(gtx) {
+		s.showTree = !s.showTree // toggle the file selector
 	}
-	if s.bZoomReset.Clicked(gtx) {
-		s.scale = 1.0
+	if s.bNew.Clicked(gtx) {
+		s.openNewDocument()
 	}
 	s.processHeaderActions(gtx)
 	s.processKeys(gtx)
@@ -151,20 +155,13 @@ func (s *gioUI) update(gtx C) {
 
 func (s *gioUI) zoomBy(d float32) { s.scale = clampf(s.scale+d, 0.5, 6.0) }
 
-// processKeys handles Cmd/Ctrl +/-/0 zoom shortcuts.
+// processKeys handles the Alt +/=/- /0 zoom shortcuts.
 func (s *gioUI) processKeys(gtx C) {
-	mods := key.ModCommand | key.ModCtrl
-	filters := []event.Filter{
-		key.Filter{Focus: &s.keyTag, Name: "=", Required: key.ModCommand, Optional: key.ModShift | key.ModAlt | key.ModCtrl},
-		key.Filter{Focus: &s.keyTag, Name: "+", Required: key.ModCommand, Optional: key.ModShift | key.ModAlt | key.ModCtrl},
-		key.Filter{Focus: &s.keyTag, Name: "-", Required: key.ModCommand, Optional: key.ModShift | key.ModAlt | key.ModCtrl},
-		key.Filter{Focus: &s.keyTag, Name: "0", Required: key.ModCommand, Optional: key.ModShift | key.ModAlt | key.ModCtrl},
-		key.Filter{Focus: &s.keyTag, Name: "=", Required: key.ModCtrl, Optional: key.ModShift | key.ModAlt | key.ModCommand},
-		key.Filter{Focus: &s.keyTag, Name: "+", Required: key.ModCtrl, Optional: key.ModShift | key.ModAlt | key.ModCommand},
-		key.Filter{Focus: &s.keyTag, Name: "-", Required: key.ModCtrl, Optional: key.ModShift | key.ModAlt | key.ModCommand},
-		key.Filter{Focus: &s.keyTag, Name: "0", Required: key.ModCtrl, Optional: key.ModShift | key.ModAlt | key.ModCommand},
+	names := []key.Name{"=", "+", "-", "0"}
+	filters := make([]event.Filter, len(names))
+	for i, nm := range names {
+		filters[i] = key.Filter{Focus: &s.keyTag, Name: nm, Required: key.ModAlt, Optional: key.ModShift}
 	}
-	_ = mods
 	for {
 		ev, ok := gtx.Event(filters...)
 		if !ok {
@@ -224,13 +221,13 @@ func (s *gioUI) globalBar(gtx C) D {
 				}),
 				layout.Flexed(1, func(gtx C) D { return D{Size: image.Pt(gtx.Constraints.Max.X, 1)} }),
 				layout.Rigid(func(gtx C) D {
-					return layout.UniformInset(3).Layout(gtx, func(gtx C) D { return s.flatButton(gtx, &s.bZoomOut, "Zoom −") })
+					return layout.UniformInset(3).Layout(gtx, func(gtx C) D { return s.flatButton(gtx, &s.bCmd, "Cmd") })
 				}),
 				layout.Rigid(func(gtx C) D {
-					return layout.UniformInset(3).Layout(gtx, func(gtx C) D { return s.flatButton(gtx, &s.bZoomReset, "100%") })
+					return layout.UniformInset(3).Layout(gtx, func(gtx C) D { return s.flatButton(gtx, &s.bOpen, "Open") })
 				}),
 				layout.Rigid(func(gtx C) D {
-					return layout.UniformInset(3).Layout(gtx, func(gtx C) D { return s.flatButton(gtx, &s.bZoomIn, "Zoom +") })
+					return layout.UniformInset(3).Layout(gtx, func(gtx C) D { return s.flatButton(gtx, &s.bNew, "New") })
 				}),
 			)
 		}),
@@ -240,13 +237,17 @@ func (s *gioUI) globalBar(gtx C) D {
 // workspace is the file tree beside the two Cedar columns, with draggable
 // vertical dividers between the tree and the columns, and between the columns.
 func (s *gioUI) workspace(gtx C) D {
-	return s.hsplitW(gtx, &s.treeWidth, &s.treeDrag,
+	cols := func(gtx C) D {
+		return s.hsplit(gtx, &s.colSplit, &s.colDrag,
+			func(gtx C) D { return s.layoutColumn(gtx, 0) },
+			func(gtx C) D { return s.layoutColumn(gtx, 1) },
+		)
+	}
+	if !s.showTree {
+		return cols(gtx)
+	}
+	// File selector on the right, columns fill the rest (both draggable).
+	return s.hsplitWR(gtx, &s.treeWidth, &s.treeDrag, cols,
 		func(gtx C) D { return s.layoutTree(gtx, s.tree) },
-		func(gtx C) D {
-			return s.hsplit(gtx, &s.colSplit, &s.colDrag,
-				func(gtx C) D { return s.layoutColumn(gtx, 0) },
-				func(gtx C) D { return s.layoutColumn(gtx, 1) },
-			)
-		},
 	)
 }

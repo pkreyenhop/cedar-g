@@ -71,11 +71,21 @@ func (s *gioUI) openFile(path string) {
 		}
 		return
 	}
+	s.addViewer(s.newViewer(path))
+}
+
+// addViewer places a freshly-created viewer at the bottom of the shorter column.
+func (s *gioUI) addViewer(v *viewer) {
 	c := s.shorterColumn()
-	v := s.newViewer(path, c)
 	s.cols[c].grown = nil
 	s.addToColumn(c, v)
 }
+
+// openTerminal opens a shell in a new viewer.
+func (s *gioUI) openTerminal() { s.addViewer(s.newTerminalViewer()) }
+
+// openNewDocument opens a blank editable document in a new viewer.
+func (s *gioUI) openNewDocument() { s.addViewer(s.newEditorViewer()) }
 
 // addToColumn appends v, shrinking existing viewers proportionally.
 func (s *gioUI) addToColumn(c int, v *viewer) {
@@ -129,6 +139,9 @@ func (s *gioUI) removeMinimized(v *viewer) {
 }
 
 func (s *gioUI) destroyViewer(v *viewer) {
+	if v.term != nil {
+		v.term.close()
+	}
 	if s.isMinimized(v) {
 		s.removeMinimized(v)
 		return
@@ -167,12 +180,16 @@ func (s *gioUI) switchViewer(v *viewer) {
 // splitViewer inserts a sibling of the same file directly below v, sharing its
 // height.
 func (s *gioUI) splitViewer(v *viewer) {
+	if v.kind != vkContent {
+		return // only file viewers can be split
+	}
 	col := s.cols[v.col]
 	i := indexOfViewer(col.viewers, v)
 	if i < 0 {
 		return
 	}
-	nv := s.newViewer(v.path, v.col)
+	nv := s.newViewer(v.path)
+	nv.col = v.col
 	half := col.weights[i] / 2
 	col.weights[i] = half
 	col.viewers = append(col.viewers[:i+1], append([]*viewer{nv}, col.viewers[i+1:]...)...)
@@ -318,6 +335,58 @@ func (s *gioUI) hsplitW(gtx C, widthDp *float32, active *bool, left, right layou
 				}),
 				layout.Rigid(func(gtx C) D { return s.vdivider(gtx, dividerW) }),
 				layout.Flexed(1, right),
+			)
+		}),
+	)
+}
+
+// hsplitWR is like hsplitW but the RIGHT pane has the fixed dp width.
+func (s *gioUI) hsplitWR(gtx C, widthDp *float32, active *bool, left, right layout.Widget) D {
+	W := gtx.Constraints.Max.X
+	dividerW := gtx.Dp(dividerDp)
+	rightW := gtx.Dp(unit.Dp(*widthDp))
+	if rightW > W-dividerW {
+		rightW = W - dividerW
+	}
+	divCenter := W - rightW - dividerW/2
+	for {
+		ev, ok := gtx.Event(pointer.Filter{Target: widthDp, Kinds: pointer.Press | pointer.Drag | pointer.Release | pointer.Cancel})
+		if !ok {
+			break
+		}
+		pe, ok := ev.(pointer.Event)
+		if !ok {
+			continue
+		}
+		switch pe.Kind {
+		case pointer.Press:
+			if abs(int(pe.Position.X)-divCenter) <= gtx.Dp(8) {
+				*active = true
+			}
+		case pointer.Drag:
+			if *active {
+				*widthDp = clampf(float32(gtx.Metric.PxToDp(W-int(pe.Position.X))), 120, 560)
+				rightW = gtx.Dp(unit.Dp(*widthDp))
+			}
+		case pointer.Release, pointer.Cancel:
+			*active = false
+		}
+	}
+	return layout.Stack{}.Layout(gtx,
+		layout.Expanded(func(gtx C) D {
+			sz := gtx.Constraints.Min
+			defer clip.Rect{Max: sz}.Push(gtx.Ops).Pop()
+			event.Op(gtx.Ops, widthDp)
+			pointer.CursorColResize.Add(gtx.Ops)
+			return D{Size: sz}
+		}),
+		layout.Stacked(func(gtx C) D {
+			return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
+				layout.Flexed(1, left),
+				layout.Rigid(func(gtx C) D { return s.vdivider(gtx, dividerW) }),
+				layout.Rigid(func(gtx C) D {
+					return sized(gtx, rightW, gtx.Constraints.Max.Y, right)
+				}),
 			)
 		}),
 	)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"image"
 	"os"
 	"sort"
@@ -13,6 +14,7 @@ import (
 	"gioui.org/op/clip"
 	"gioui.org/unit"
 	"gioui.org/widget"
+	"gioui.org/widget/material"
 
 	"cedarg/internal/cedar"
 	"cedarg/internal/tioga"
@@ -47,14 +49,26 @@ type run struct {
 	cat  cedar.Category
 }
 
-// viewer is one Cedar "Viewer": a document/code pane living in a column.
+type viewerKind int
+
+const (
+	vkContent viewerKind = iota // a decoded document or code file
+	vkEditor                    // a blank/editable Tioga document
+	vkTerm                      // a shell terminal
+)
+
+// viewer is one Cedar "Viewer": a pane living in a column.
 type viewer struct {
+	kind   viewerKind
 	path   string
 	rel    string
+	title  string // header title override (editor/terminal)
 	col    int
 	isCode bool
 	lines  [][]run       // code
 	blocks []tioga.Block // documents
+	editor widget.Editor // vkEditor
+	term   *terminal     // vkTerm
 	sc     scroller
 
 	bDestroy, bGrow, bIcon, bSwitch, bSplit widget.Clickable
@@ -62,8 +76,15 @@ type viewer struct {
 	headerHovered                           bool
 }
 
-func (s *gioUI) newViewer(path string, col int) *viewer {
-	v := &viewer{path: path, rel: s.relPath(path), col: col}
+func (v *viewer) headerTitle() string {
+	if v.title != "" {
+		return v.title
+	}
+	return v.rel
+}
+
+func (s *gioUI) newViewer(path string) *viewer {
+	v := &viewer{path: path, rel: s.relPath(path)}
 	data, err := os.ReadFile(path)
 	switch {
 	case err != nil:
@@ -80,6 +101,20 @@ func (s *gioUI) newViewer(path string, col int) *viewer {
 		v.blocks = doc.Blocks
 	}
 	return v
+}
+
+var newDocCount int
+
+// newEditorViewer opens a blank editable document.
+func (s *gioUI) newEditorViewer() *viewer {
+	newDocCount++
+	v := &viewer{kind: vkEditor, title: fmt.Sprintf("New Document %d", newDocCount)}
+	return v
+}
+
+// newTerminalViewer opens a shell terminal.
+func (s *gioUI) newTerminalViewer() *viewer {
+	return &viewer{kind: vkTerm, title: "Terminal", term: newTerminal(s.invalidate)}
 }
 
 // layoutViewer draws one bordered Viewer: header (actions + title), rule, body.
@@ -126,7 +161,7 @@ func (s *gioUI) header(gtx C, v *viewer) D {
 					layout.Rigid(func(gtx C) D { return s.flatButton(gtx, &v.bSplit, "Split") }),
 					layout.Rigid(func(gtx C) D { return D{Size: image.Pt(gtx.Dp(6), 0)} }),
 					layout.Flexed(1, func(gtx C) D {
-						return s.label(gtx, serifFont, font.Bold, font.Regular, 13, v.rel, cedarBlack, 1)
+						return s.label(gtx, serifFont, font.Bold, font.Regular, 13, v.headerTitle(), cedarBlack, 1)
 					}),
 				)
 			})
@@ -141,7 +176,7 @@ func (s *gioUI) header(gtx C, v *viewer) D {
 		cgtx.Constraints.Max = dims.Size
 		layout.W.Layout(cgtx, func(gtx C) D {
 			return layout.Inset{Left: 6}.Layout(gtx, func(gtx C) D {
-				return s.label(gtx, serifFont, font.Bold, font.Regular, 13, v.rel, cedarWhite, 1)
+				return s.label(gtx, serifFont, font.Bold, font.Regular, 13, v.headerTitle(), cedarWhite, 1)
 			})
 		})
 	}
@@ -158,6 +193,12 @@ func (s *gioUI) header(gtx C, v *viewer) D {
 }
 
 func (s *gioUI) body(gtx C, v *viewer) D {
+	switch v.kind {
+	case vkEditor:
+		return s.editorBody(gtx, v)
+	case vkTerm:
+		return s.termBody(gtx, v)
+	}
 	// The left margin comes from the scroll gutter; add top/right/bottom only.
 	if v.isCode {
 		return layout.Inset{Top: 4, Right: 4, Bottom: 4}.Layout(gtx, func(gtx C) D {
@@ -173,6 +214,69 @@ func (s *gioUI) body(gtx C, v *viewer) D {
 			return s.docBlock(gtx, v.blocks[i])
 		})
 	})
+}
+
+// editorBody renders an editable document (a serif multiline editor).
+func (s *gioUI) editorBody(gtx C, v *viewer) D {
+	gtx.Constraints.Min = gtx.Constraints.Max
+	return layout.Inset{Top: 6, Left: 10, Right: 10, Bottom: 6}.Layout(gtx, func(gtx C) D {
+		ed := material.Editor(s.th, &v.editor, "Type a new Tioga document…")
+		ed.Color = cedarBlack
+		ed.HintColor = cedarGreyMid
+		ed.SelectionColor = cedarGreyMid
+		ed.Font = serifFont
+		ed.TextSize = s.sp(docTextSize)
+		return ed.Layout(gtx)
+	})
+}
+
+// termBody renders the shell terminal: output above, an input line below.
+func (s *gioUI) termBody(gtx C, v *viewer) D {
+	t := v.term
+	v.editor.SingleLine = true
+	v.editor.Submit = true
+	// Send submitted input lines to the shell.
+	for {
+		ev, ok := v.editor.Update(gtx)
+		if !ok {
+			break
+		}
+		if _, ok := ev.(widget.SubmitEvent); ok {
+			t.send(v.editor.Text())
+			v.editor.SetText("")
+		}
+	}
+
+	gtx.Constraints.Min = gtx.Constraints.Max
+	lines := t.lines()
+	// Keep the newest output in view.
+	v.sc.list.List.ScrollToEnd = true
+
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Flexed(1, func(gtx C) D {
+			gtx.Constraints.Min = gtx.Constraints.Max
+			return s.scrollList(gtx, &v.sc, len(lines), func(gtx C, i int) D {
+				return s.label(gtx, monoFont, font.Normal, font.Regular, 13, lines[i], cedarBlack, 1)
+			})
+		}),
+		layout.Rigid(hrule),
+		layout.Rigid(func(gtx C) D {
+			return layout.Stack{}.Layout(gtx,
+				layout.Expanded(func(gtx C) D { return fill(gtx, cedarGrey, gtx.Constraints.Min) }),
+				layout.Stacked(func(gtx C) D {
+					gtx.Constraints.Min.X = gtx.Constraints.Max.X
+					return layout.UniformInset(4).Layout(gtx, func(gtx C) D {
+						ed := material.Editor(s.th, &v.editor, "command…")
+						ed.Color = cedarBlack
+						ed.HintColor = cedarGreyMid
+						ed.Font = monoFont
+						ed.TextSize = s.sp(13)
+						return ed.Layout(gtx)
+					})
+				}),
+			)
+		}),
+	)
 }
 
 func (s *gioUI) codeLine(gtx C, runs []run) D {
