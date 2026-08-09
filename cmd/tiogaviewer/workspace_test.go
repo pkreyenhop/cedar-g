@@ -100,6 +100,21 @@ func TestSplitAndSwitch(t *testing.T) {
 	}
 }
 
+func TestExpandTabs(t *testing.T) {
+	cases := map[string]string{
+		"a\tb":       "a       b",            // col 1 -> next stop at 8: 7 spaces
+		"\tx":        "        x",            // 8 spaces
+		"ab\tc":      "ab      c",            // col 2 -> 6 spaces
+		"a\tb\nc\td": "a       b\nc       d", // newline resets the column
+		"no tabs":    "no tabs",
+	}
+	for in, want := range cases {
+		if got := expandTabs(in); got != want {
+			t.Errorf("expandTabs(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestGrowToggle(t *testing.T) {
 	s := newUI()
 	dir := t.TempDir()

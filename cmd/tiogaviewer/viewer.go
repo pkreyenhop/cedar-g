@@ -63,9 +63,12 @@ func (s *gioUI) newViewer(path string, col int) *viewer {
 	case strings.HasSuffix(path, ".mesa") || strings.Contains(path, ".mesa!"):
 		v.isCode = true
 		doc := tioga.Read(data, true)
-		v.lines = codeToRuns(doc.Code, s.builtins)
+		v.lines = codeToRuns(expandTabs(doc.Code), s.builtins)
 	default:
 		doc := tioga.Read(data, false)
+		for i := range doc.Blocks {
+			doc.Blocks[i].Text = expandTabs(doc.Blocks[i].Text)
+		}
 		v.blocks = doc.Blocks
 	}
 	return v
@@ -155,6 +158,36 @@ func (s *gioUI) docBlock(gtx C, b tioga.Block) D {
 	return layout.Inset{Top: 2, Bottom: 2}.Layout(gtx, func(gtx C) D {
 		return s.label(gtx, fnt, weight, style, size, b.Text, cedarBlack, 0)
 	})
+}
+
+// expandTabs replaces tab characters with spaces to the next 8-column stop
+// (per line). Gio's text renderer draws a raw tab as a missing-glyph box, so
+// Tioga's tab-aligned blocks (e.g. address lists) would otherwise show boxes.
+func expandTabs(s string) string {
+	if !strings.ContainsRune(s, '\t') {
+		return s
+	}
+	const tw = 8
+	var b strings.Builder
+	b.Grow(len(s))
+	col := 0
+	for _, r := range s {
+		switch r {
+		case '\t':
+			n := tw - col%tw
+			for i := 0; i < n; i++ {
+				b.WriteByte(' ')
+			}
+			col += n
+		case '\n':
+			b.WriteByte('\n')
+			col = 0
+		default:
+			b.WriteRune(r)
+			col++
+		}
+	}
+	return b.String()
 }
 
 // styleFor returns emphasis for a category: black text, distinguished by
