@@ -475,6 +475,14 @@ func (p *Parser) parseType() TypeExpr {
 		case "ANY":
 			p.advance()
 			return &NamedType{Name: "ANY"}
+		case "DESCRIPTOR":
+			// DESCRIPTOR [FOR] ARRAY [index] OF elem — a bounds-carrying array ref.
+			p.advance()
+			p.acceptKw("FOR") // FOR is a reserved word
+			if p.startsType() {
+				p.parseType()
+			}
+			return &NamedType{Name: "DESCRIPTOR"}
 		case "ERROR", "SIGNAL", "PROCESS", "PORT":
 			// Signal/error/process types: like a procedure type.
 			p.advance()
@@ -779,9 +787,17 @@ func (p *Parser) parseFieldList(closer string) []Field {
 			break
 		}
 		if p.namedGroupAhead() {
-			names := p.parseIdList()
-			if p.isPunct("(") { // a field position spec, e.g. (0:0..15)
-				p.skipParens()
+			// A comma-separated name list where each name may carry a MACHINE
+			// DEPENDENT position spec: a(0:0..5), b(0:6..6): T.
+			var names []string
+			for {
+				names = append(names, p.expectIdent())
+				if p.isPunct("(") {
+					p.skipParens()
+				}
+				if !p.acceptPunct(",") {
+					break
+				}
 			}
 			p.expectPunct(":")
 			ft := p.parseType()
@@ -1119,6 +1135,14 @@ func (p *Parser) parseLoop() Stmt {
 			p.fail("expected IN or '<-' in FOR loop")
 		}
 	case p.acceptKw("THROUGH"):
+		// THROUGH [Type][lo..hi] — an optional type prefix before the interval.
+		if !p.isPunct("[") && !p.isPunct("(") && p.cur().Kind == TIdent {
+			p.advance()
+			for p.isPunct(".") {
+				p.advance()
+				p.expectIdent()
+			}
+		}
 		l.Interval = p.parseInterval()
 	case p.acceptKw("WHILE"):
 		l.While = p.parseValueExpr()
@@ -1339,7 +1363,10 @@ var exprRaiseWords = map[string]bool{"ERROR": true, "SIGNAL": true, "RAISE": tru
 
 // typeValPrefix words prefix a type used as a value (LONG CARDINAL, REF INT),
 // e.g. as a NARROW/LAST/SIZE argument; they are consumed as no-ops.
-var typeValPrefix = map[string]bool{"LONG": true, "SHORT": true, "REF": true}
+var typeValPrefix = map[string]bool{
+	"LONG": true, "SHORT": true, "REF": true,
+	"UNCOUNTED": true, "SAFE": true, "UNSAFE": true, "PACKED": true,
+}
 
 // parseWithSelectExpr consumes a WITH … SELECT used as a value; not executed.
 func (p *Parser) parseWithSelectExpr() Expr {
@@ -1538,6 +1565,11 @@ func (p *Parser) parseUnary() Expr {
 			return p.parseUnary()
 		}
 		return &Ident{Name: "NIL", Line: p.cur().Line}
+	case (p.isKw("PROC") || p.isKw("PROCEDURE")) && p.peek().Kind == TPunct && p.peek().Text == "[":
+		// A procedure type as a value: LOOPHOLE[proc, PROC [a, b: POINTER]].
+		line := p.advance().Line
+		p.parseProcType()
+		return &Ident{Name: "NIL", Line: line}
 	}
 	return p.parsePostfix()
 }

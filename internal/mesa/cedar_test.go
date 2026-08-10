@@ -292,3 +292,37 @@ func TestTier2ParsesCleanly(t *testing.T) {
 		}
 	}
 }
+
+// TestTier3ParsesCleanly covers the third batch of (diffuse) constructs.
+func TestTier3ParsesCleanly(t *testing.T) {
+	cases := map[string]string{
+		"DESCRIPTOR FOR ARRAY": `Foo: CEDAR DEFINITIONS ~ {
+		  Create: PROC [w: DESCRIPTOR FOR ARRAY OF Info] RETURNS [Handle];
+		  Rec: TYPE ~ RECORD [y: LONG DESCRIPTOR FOR ARRAY {u, v, w} OF STRING];
+		}.`,
+		"per-name field position specs": `Foo: CEDAR DEFINITIONS ~ {
+		  Bits: TYPE ~ MACHINE DEPENDENT RECORD [
+		    a(0: 9..9), b(0: 10..10), c(0: 11..11): BOOL ];
+		}.`,
+		"THROUGH typed interval": `FooImpl: CEDAR PROGRAM ~ {
+		  Go: PROC ~ { THROUGH DayOfWeek[FIRST[DayOfWeek]..last) DO x ← x + 1; ENDLOOP; };
+		}.`,
+		"PROC / qualified types as arguments": `FooImpl: CEDAR PROGRAM ~ {
+		  Go: PROC ~ {
+		    p ← LOOPHOLE[proc, PROC [retPtr, argPtr: POINTER]];
+		    n ← SIZE[UNCOUNTED ZONE];
+		    q ← LOOPHOLE[Process.GetCurrent[], SAFE PROCESS];
+		  };
+		}.`,
+	}
+	for name, src := range cases {
+		m, err := ParseSource(src)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		if m.Recovered != 0 {
+			t.Errorf("%s: parsed with %d recoveries, want clean", name, m.Recovered)
+		}
+	}
+}
