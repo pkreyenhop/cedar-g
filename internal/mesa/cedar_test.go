@@ -253,3 +253,42 @@ func TestTier1ParsesCleanly(t *testing.T) {
 		}
 	}
 }
+
+// TestTier2ParsesCleanly covers the second batch of constructs (all must parse
+// with no error recovery).
+func TestTier2ParsesCleanly(t *testing.T) {
+	cases := map[string]string{
+		"leading-dot reals": `FooImpl: CEDAR PROGRAM ~ {
+		  a: REAL ~ .5;
+		  Go: PROC ~ { x ← .9999 * y - .5; };
+		}.`,
+		"NULL as a value": `Foo: CEDAR DEFINITIONS ~ {
+		  Rec: TYPE ~ RECORD [break: CHAR ← NULL, u: PROCESS ← NULL];
+		}.`,
+		"LIST OF T argument": `FooImpl: CEDAR PROGRAM ~ {
+		  Go: PROC [x: REF ANY] ~ {
+		    IF ISTYPE[x, LIST OF REF] THEN RETURN;
+		    IF NOT ISTYPE[x, LIST OF REF ANY] THEN RETURN;
+		  };
+		}.`,
+		"proc value bound with arrow": `FooImpl: CEDAR PROGRAM ~ {
+		  moveTo: ImagerPath.MoveToProc ← {};
+		  foo: PROC ← {NULL};
+		  Bar: PROCEDURE RETURNS [INTEGER] ← {i: INTEGER ← 10; RETURN[i]};
+		}.`,
+		"empty type default": `Foo: CEDAR DEFINITIONS ~ {
+		  ErrorAtom: TYPE ~ ATOM ←;
+		  Req: TYPE ~ ROPE ←;
+		}.`,
+	}
+	for name, src := range cases {
+		m, err := ParseSource(src)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		if m.Recovered != 0 {
+			t.Errorf("%s: parsed with %d recoveries, want clean", name, m.Recovered)
+		}
+	}
+}

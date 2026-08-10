@@ -358,19 +358,19 @@ func (p *Parser) parseDecl() Stmt {
 			return &TypeDecl{Name: names[0], Type: &NamedType{Name: names[0]}, Line: line}
 		}
 		t := p.parseType()
-		if p.acceptPunct("<-") { // an optional type default value
-			p.parseExpr()
+		if p.acceptPunct("<-") && p.startsValue() { // an optional type default value
+			p.parseValueExpr()
 		}
 		return &TypeDecl{Name: names[0], Type: t, Line: line}
 	}
 
 	t := p.parseType()
 
-	// Procedure declaration: NAME: <procType> [= | ~] [qualifiers] body. The type
-	// may be an inline PROC[..] or a named/qualified proc type; the binding may be
-	// followed by body qualifiers (INLINE, ENTRY, TRUSTED, MACHINE CODE, …) before
-	// the block. It is a proc decl when a block ultimately follows.
-	if p.isPunct("=") || p.isPunct("~") {
+	// Procedure declaration: NAME: <procType> [= | ~ | ←] [qualifiers] body. The
+	// type may be an inline PROC[..] or a named/qualified proc type; the binding
+	// may be followed by body qualifiers (INLINE, ENTRY, TRUSTED, MACHINE CODE, …)
+	// before the block. It is a proc decl when a block ultimately follows.
+	if p.isPunct("=") || p.isPunct("~") || p.isPunct("<-") {
 		j := p.pos + 1
 		for j < len(p.toks) && p.toks[j].Kind == TIdent && bodyQualifiers[p.toks[j].Text] {
 			j++
@@ -1522,11 +1522,22 @@ func (p *Parser) parseUnary() Expr {
 		// A type used as a value: LAST[LONG CARDINAL], NARROW[x, REF INT].
 		p.advance()
 		return p.parseUnary()
-	case p.cur().Kind == TIdent && p.cur().Text == "POINTER":
-		// A pointer type used as a value: LOOPHOLE[x, POINTER TO CARD].
-		p.advance()
-		p.acceptWord("TO")
+	case p.cur().Kind == TIdent && p.cur().Text == "POINTER" &&
+		p.peek().Kind == TIdent && p.peek().Text == "TO":
+		// A pointer type used as a value: LOOPHOLE[x, POINTER TO CARD]. Gated on
+		// "TO" so a bare "POINTER" identifier elsewhere is unaffected.
+		p.advance() // POINTER
+		p.advance() // TO
 		return p.parseUnary()
+	case p.cur().Kind == TIdent && p.cur().Text == "LIST" &&
+		p.peek().Kind == TKeyword && p.peek().Text == "OF":
+		// A list type used as a value: ISTYPE[x, LIST OF REF].
+		p.advance() // LIST
+		p.advance() // OF
+		if p.cur().Kind == TIdent {
+			return p.parseUnary()
+		}
+		return &Ident{Name: "NIL", Line: p.cur().Line}
 	}
 	return p.parsePostfix()
 }
@@ -1597,7 +1608,7 @@ func (p *Parser) parsePrimary() Expr {
 		return &Ident{Name: t.Text, Line: t.Line}
 	case TKeyword:
 		switch t.Text {
-		case "NIL":
+		case "NIL", "NULL":
 			p.advance()
 			return &NilLit{Line: t.Line}
 		case "NEW":

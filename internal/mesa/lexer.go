@@ -160,8 +160,8 @@ func (l *Lexer) next() (Token, error) {
 		return Token{Kind: TIdent, Text: text, Line: line, Col: col}, nil
 	}
 
-	// Numbers
-	if unicode.IsDigit(r) {
+	// Numbers, including a leading-dot real such as ".5" (but not "..").
+	if unicode.IsDigit(r) || (r == '.' && unicode.IsDigit(l.peek2())) {
 		return l.lexNumber(line, col)
 	}
 
