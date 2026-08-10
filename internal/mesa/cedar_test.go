@@ -314,6 +314,9 @@ func TestTier3ParsesCleanly(t *testing.T) {
 		    q ← LOOPHOLE[Process.GetCurrent[], SAFE PROCESS];
 		  };
 		}.`,
+		"aggregate with omitted named value": `FooImpl: CEDAR PROGRAM ~ {
+		  Go: PROC ~ { r ← NEW[Rec ← [link: , firstSon: BTNull, type: rSei]]; };
+		}.`,
 	}
 	for name, src := range cases {
 		m, err := ParseSource(src)

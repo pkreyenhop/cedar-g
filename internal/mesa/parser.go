@@ -1696,7 +1696,9 @@ func (p *Parser) parseAggregate() Expr {
 			el.Name = p.expectIdent()
 			p.advance() // ':' or '~'
 		}
-		el.Val = p.parseValueExpr()
+		if p.startsValue() { // an omitted value ([name: , …]) uses the default
+			el.Val = p.parseValueExpr()
+		}
 		agg.Elems = append(agg.Elems, el)
 		if !p.acceptPunct(",") {
 			break
