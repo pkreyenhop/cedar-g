@@ -10,8 +10,9 @@ import (
 // small fixed lookaheads (e.g. declaration vs. statement) without a
 // separate scanner buffer.
 type Parser struct {
-	toks []Token
-	pos  int
+	toks      []Token
+	pos       int
+	recovered int // statements skipped by error recovery
 }
 
 func NewParser(toks []Token) *Parser { return &Parser{toks: toks} }
@@ -128,6 +129,7 @@ func (p *Parser) ParseModule() (m *Module, err error) {
 	}
 	m.Body = p.parseBlock()
 	p.acceptPunct(".") // trailing '.' after END is optional
+	m.Recovered = p.recovered
 	return m, nil
 }
 
@@ -202,10 +204,20 @@ func (p *Parser) parseBlock() *Block {
 			p.acceptPunct(";")
 		}
 	}
+	// Close the block, tolerating a mismatched/missing closer (which a skip or a
+	// nested-block boundary may have consumed): resync to it, and if it is still
+	// absent, treat that as a recovery rather than aborting the whole module.
+	if !p.atStop(closer) {
+		p.resync(closer)
+	}
+	var closed bool
 	if closer == "END" {
-		p.expectKw("END")
+		closed = p.acceptKw("END")
 	} else {
-		p.expectPunct("}")
+		closed = p.acceptPunct("}")
+	}
+	if !closed {
+		p.recovered++
 	}
 	return &Block{Items: items, Line: line}
 }
@@ -224,13 +236,60 @@ func (p *Parser) parseStmtSeq(closer string) []Stmt {
 			(p.cur().Kind == TIdent && p.cur().Text == "EXITS") {
 			break
 		}
-		items = append(items, p.parseItem())
+		start := p.pos
+		stmt, ok := p.tryParseItem()
+		if !ok {
+			// Error recovery: skip the unparseable statement and continue, so one
+			// unsupported construct does not fail the whole module.
+			p.recovered++
+			p.resync(closer)
+			if p.pos == start {
+				p.advance() // guarantee forward progress
+			}
+			continue
+		}
+		items = append(items, stmt)
 		if !p.acceptPunct(";") {
-			// no separator: next must be the closer
 			break
 		}
 	}
 	return items
+}
+
+// tryParseItem parses one item, converting a parse error into ok=false so the
+// caller can recover instead of aborting the whole parse.
+func (p *Parser) tryParseItem() (stmt Stmt, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			if _, isPE := r.(parseError); isPE {
+				stmt, ok = nil, false
+				return
+			}
+			panic(r)
+		}
+	}()
+	return p.parseItem(), true
+}
+
+// resync advances to the next synchronisation point after a failed statement:
+// a ';' or the block closer at the current depth, or an enclosing closer.
+func (p *Parser) resync(closer string) {
+	depth := 0
+	for p.cur().Kind != TEOF {
+		if depth == 0 {
+			if p.isPunct(";") || p.atStop(closer) ||
+				p.isPunct("}") || p.isPunct("]") || p.isPunct(")") || p.isKw("END") {
+				return
+			}
+		}
+		switch {
+		case p.isPunct("[") || p.isPunct("(") || p.isPunct("{"):
+			depth++
+		case p.isPunct("]") || p.isPunct(")") || p.isPunct("}"):
+			depth--
+		}
+		p.advance()
+	}
 }
 
 // ---- Declaration vs. statement ----

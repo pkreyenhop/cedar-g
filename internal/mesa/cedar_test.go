@@ -166,3 +166,45 @@ func TestCedarProgramRuns(t *testing.T) {
 		t.Fatalf("output = %q", out.String())
 	}
 }
+
+// TestErrorRecovery checks that one unparseable statement is skipped rather than
+// failing the whole module, and that the surrounding declarations survive.
+func TestErrorRecovery(t *testing.T) {
+	src := `Demo: CEDAR PROGRAM ~ {
+	  a: INT ← 1;
+	  broken: RECORD;   -- unparseable: RECORD without a field list
+	  b: INT ← 2;
+	}.`
+	m, err := ParseSource(src)
+	if err != nil {
+		t.Fatalf("recovery should avoid a top-level error: %v", err)
+	}
+	if m.Recovered == 0 {
+		t.Fatalf("expected recovery to be recorded")
+	}
+	var names []string
+	for _, it := range m.Body.Items {
+		if vd, ok := it.(*VarDecl); ok {
+			names = append(names, vd.Names...)
+		}
+	}
+	if len(names) != 2 || names[0] != "a" || names[1] != "b" {
+		t.Fatalf("surrounding decls not preserved: %v", names)
+	}
+}
+
+// TestCleanParseHasNoRecovery guards that a well-formed program never triggers
+// recovery (so the clean-parse metric stays meaningful).
+func TestCleanParseHasNoRecovery(t *testing.T) {
+	src := `Demo: CEDAR PROGRAM ~ {
+	  x: INT ← 1;
+	  IO.PutLine["ok"];
+	}.`
+	m, err := ParseSource(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Recovered != 0 {
+		t.Fatalf("clean program reported %d recoveries", m.Recovered)
+	}
+}

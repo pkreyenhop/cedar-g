@@ -25,23 +25,30 @@ func TestCedarParseRate(t *testing.T) {
 		return nil
 	})
 	sort.Strings(files)
-	ok, fail := 0, 0
+	clean, recov, fail := 0, 0, 0
 	errs := map[string]int{}
 	var samples []string
 	for _, f := range files {
 		data, _ := os.ReadFile(f)
 		doc := tioga.Read(data, true)
-		if _, err := ParseSource(doc.Code); err != nil {
+		m, err := ParseSource(doc.Code)
+		switch {
+		case err != nil:
 			fail++
 			errs[classify(err.Error())]++
 			if len(samples) < 12 {
 				samples = append(samples, filepath.Base(f)+": "+err.Error())
 			}
-		} else {
-			ok++
+		case m.Recovered == 0:
+			clean++
+		default:
+			recov++
 		}
 	}
-	t.Logf("parsed %d/%d (%.0f%%)", ok, ok+fail, 100*float64(ok)/float64(ok+fail+1))
+	tot := clean + recov + fail
+	t.Logf("clean %d/%d (%.0f%%);  parsed incl. recovery %d/%d (%.0f%%);  hard-fail %d",
+		clean, tot, 100*float64(clean)/float64(tot+1),
+		clean+recov, tot, 100*float64(clean+recov)/float64(tot+1), fail)
 	type kv struct{ k string; n int }
 	var top []kv
 	for k, n := range errs {

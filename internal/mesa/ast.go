@@ -271,4 +271,7 @@ type Module struct {
 	Name string
 	Kind string // "PROGRAM", "DEFINITIONS", "MODULE"
 	Body *Block
+	// Recovered counts statements skipped by error recovery; 0 means a clean
+	// parse, > 0 means some fragments were not understood but were tolerated.
+	Recovered int
 }
