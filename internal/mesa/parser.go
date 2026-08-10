@@ -550,16 +550,15 @@ func (p *Parser) parseType() TypeExpr {
 			qual += "." + p.expectIdent()
 		}
 		nt := &NamedType{Name: qual, Line: name.Line}
-		// A base-relative pointer: <base> RELATIVE [ORDERED] POINTER TO <elem>.
+		// A base-relative type: <base> RELATIVE [ORDERED] [POINTER TO] <elem>.
 		if p.cur().Kind == TIdent && (typeQualifiers[p.cur().Text] || p.cur().Text == "POINTER") {
 			for p.cur().Kind == TIdent && typeQualifiers[p.cur().Text] {
 				p.advance()
 			}
-			if p.acceptWord("POINTER") {
-				p.acceptWord("TO")
-				if p.startsType() {
-					p.parseType()
-				}
+			p.acceptWord("POINTER")
+			p.acceptWord("TO")
+			if p.startsType() {
+				p.parseType()
 			}
 			return nt
 		}
@@ -1128,9 +1127,9 @@ func (p *Parser) parseLoop() Stmt {
 				p.parseType() // FOR x IN EnumType (iterate a whole type)
 			}
 		} else if p.acceptPunct("<-") {
-			l.Start = p.parseExpr()
+			l.Start = p.parseValueExpr()
 			p.expectPunct(",")
-			l.Next = p.parseExpr()
+			l.Next = p.parseValueExpr() // the step may reassign: edge ← edge.next
 		} else {
 			p.fail("expected IN or '<-' in FOR loop")
 		}
@@ -1288,6 +1287,12 @@ func (p *Parser) parseSelect() Stmt {
 // relational operator or IN and is relative to the subject (< x, IN [a..b]); a
 // plain expression is an equality test.
 func (p *Parser) parseSelectGuard(subject Expr) Expr {
+	if p.isPunct("<-") {
+		// "< -n" mis-lexes as the arrow "<-": recover a less-than-negative guard.
+		line := p.advance().Line
+		neg := &Unary{Op: "-", X: p.parseAdd(), Line: line}
+		return &Binary{Op: "<", L: subject, R: neg, Line: line}
+	}
 	if p.cur().Kind == TPunct && relOps[p.cur().Text] {
 		op := p.advance()
 		return &Binary{Op: op.Text, L: subject, R: p.parseAdd(), Line: op.Line}
@@ -1570,6 +1575,11 @@ func (p *Parser) parseUnary() Expr {
 		line := p.advance().Line
 		p.parseProcType()
 		return &Ident{Name: "NIL", Line: line}
+	case p.isKw("ARRAY") || p.isKw("RECORD"):
+		// An array/record type as a value: NEW[ARRAY I OF T], SIZE[ARRAY[0..4) OF W].
+		line := p.cur().Line
+		p.parseType()
+		return &Ident{Name: "NIL", Line: line}
 	}
 	return p.parsePostfix()
 }
@@ -1591,7 +1601,9 @@ func (p *Parser) parsePostfix() Expr {
 					p.advance() // keyword-argument name
 					p.advance() // ':' or '~'
 				}
-				args = append(args, p.parseValueExpr())
+				if p.startsValue() { // an omitted value ([name: ]) uses the default
+					args = append(args, p.parseValueExpr())
+				}
 				if !p.acceptPunct(",") {
 					break
 				}
@@ -1612,6 +1624,16 @@ func (p *Parser) parsePostfix() Expr {
 				p.fail("expected a field name")
 			}
 			x = &FieldAccess{X: x, Field: field, Line: line}
+			if field == "NEW" && p.isPunct("[") {
+				// zone.NEW[Type ← init]: the brackets hold a type, not arguments.
+				p.advance()
+				nt := p.parseType()
+				if p.acceptPunct("<-") || p.acceptBind() {
+					p.parseValueExpr()
+				}
+				p.expectPunct("]")
+				x = &NewExpr{Type: nt, Line: line}
+			}
 		case p.isPunct("^"):
 			p.advance() // dereference: identity in this model
 		default:

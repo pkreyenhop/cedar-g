@@ -193,6 +193,25 @@ func (l *Lexer) lexNumber(line, col int) (Token, error) {
 		l.advance()
 	}
 
+	// Hex-literal lookahead: <hexdigits>H is hex, so the 'E' in 36E9H is a hex
+	// digit, not an exponent. Scan ahead and, if an H terminates the run, take it.
+	j := l.pos
+	for j < len(l.src) && isHexByte(l.src[j]) {
+		j++
+	}
+	if j < len(l.src) && (l.src[j] == 'H' || l.src[j] == 'h') {
+		for l.pos < j {
+			l.advance()
+		}
+		body := l.src[start:l.pos]
+		l.advance() // consume 'H'
+		n, err := strconv.ParseInt(body, 16, 64)
+		if err != nil {
+			return Token{}, l.errorf("bad hex literal %q", l.src[start:l.pos])
+		}
+		return Token{Kind: TInt, Int: n, Text: l.src[start:l.pos], Line: line, Col: col}, nil
+	}
+
 	// Real number: a fractional part (possibly a bare trailing dot, "1.") or an
 	// exponent. A ".." is the range operator, not a fraction.
 	isReal := false
@@ -301,6 +320,10 @@ func (l *Lexer) charEscape() rune {
 func isHexDigit(r rune) bool {
 	return unicode.IsDigit(r) ||
 		(r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')
+}
+
+func isHexByte(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
 }
 
 func (l *Lexer) lexString(line, col int) (Token, error) {

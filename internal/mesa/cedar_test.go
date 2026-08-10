@@ -329,3 +329,45 @@ func TestTier3ParsesCleanly(t *testing.T) {
 		}
 	}
 }
+
+// TestTier4ParsesCleanly covers the fourth grammar batch.
+func TestTier4ParsesCleanly(t *testing.T) {
+	cases := map[string]string{
+		"hex with E, and other numeric forms": `Foo: CEDAR DEFINITIONS ~ {
+		  red: CARD ~ 36E9H;  green: CARD ~ 85A1H;  blue: CARD ~ 0EBB5H;
+		  oct: INT ~ 377B;  ch: CHAR ~ 101C;  scaled: INT ~ 1D3;  r: REAL ~ 1.5E6;
+		}.`,
+		"ARRAY / RECORD type as value": `FooImpl: CEDAR PROGRAM ~ {
+		  Go: PROC ~ {
+		    a ← zone.NEW[ARRAY LitHVIndex OF LTIndex];
+		    n ← SIZE[ARRAY [0..4) OF WORD];
+		  };
+		}.`,
+		"zone.NEW with type and variant-bound tag": `FooImpl: CEDAR PROGRAM ~ {
+		  Go: PROC ~ {
+		    n ← z.NEW[apply NodeRep ← apply^];
+		    m ← z.NEW[module NodeRep ← [details: d]];
+		  };
+		}.`,
+		"negative SELECT guard, omitted call value, FOR step": `FooImpl: CEDAR PROGRAM ~ {
+		  Go: PROC [x: REAL] ~ {
+		    SELECT x FROM <-2. => RETURN; <-.5 => RETURN; ENDCASE => NULL;
+		    s ← StringBody[length: 0, maxlength: 0, text: ];
+		    FOR edge ← d.first, edge ← edge.next UNTIL edge = NIL DO NULL; ENDLOOP;
+		  };
+		}.`,
+		"base-relative type without POINTER": `Foo: CEDAR DEFINITIONS ~ {
+		  Rec: TYPE ~ RECORD [rcMapBase: RTBase RELATIVE RCMap.Base];
+		}.`,
+	}
+	for name, src := range cases {
+		m, err := ParseSource(src)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		if m.Recovered != 0 {
+			t.Errorf("%s: parsed with %d recoveries, want clean", name, m.Recovered)
+		}
+	}
+}
