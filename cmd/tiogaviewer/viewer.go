@@ -5,6 +5,7 @@ import (
 	"image"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -133,23 +134,39 @@ func (s *gioUI) newViewer(path string) *viewer {
 		return s.newTextEditorViewer(path, string(data), ext)
 	}
 	v := &viewer{path: path, rel: s.relPath(path)}
-	switch {
-	case err != nil:
+	if err != nil {
 		v.blocks = []tioga.Block{{Kind: tioga.Paragraph, Text: "cannot open: " + v.rel}}
-	case ext == ".mesa":
-		v.isCode = true
-		doc := tioga.Read(data, true)
-		v.lines = codeToRuns(expandTabs(doc.Code), s.builtins)
-		v.src = doc.Code // keep the source so the Run button can execute it
-		v.runnable = true
-	default:
-		doc := tioga.Read(data, false)
-		for i := range doc.Blocks {
-			doc.Blocks[i].Text = expandTabs(doc.Blocks[i].Text)
-		}
-		v.blocks = doc.Blocks
+		return v
 	}
+	// A .mesa file is always code. Other Tioga files (e.g. a .tioga saved by the
+	// editor) are shown as code too when their content is a Mesa module, so the
+	// syntax highlighter applies; genuine prose documents fall through.
+	code := tioga.Read(data, true).Code
+	if ext == ".mesa" || looksLikeMesa(code) {
+		v.isCode = true
+		v.src = code // keep the source so the Run button can execute it
+		v.runnable = true
+		v.lines = codeToRuns(expandTabs(code), s.builtins)
+		return v
+	}
+	doc := tioga.Read(data, false)
+	for i := range doc.Blocks {
+		doc.Blocks[i].Text = expandTabs(doc.Blocks[i].Text)
+	}
+	v.blocks = doc.Blocks
 	return v
+}
+
+// mesaModuleRe matches a Mesa/Cedar module declaration header, e.g.
+// "Foo: CEDAR PROGRAM" or "Bar: DEFINITIONS".
+var mesaModuleRe = regexp.MustCompile(
+	`(?m)^\s*\w+\s*:\s*(PUBLIC\s+|PRIVATE\s+)?(CEDAR\s+|MACHINE\s+DEPENDENT\s+)?` +
+		`(PROGRAM|DEFINITIONS|MONITOR|MODULE|IMPLEMENTATION)\b`)
+
+// looksLikeMesa reports whether decoded text is a Mesa/Cedar source module,
+// distinguishing editor-saved code from prose Tioga documents.
+func looksLikeMesa(code string) bool {
+	return mesaModuleRe.MatchString(code)
 }
 
 // newTextEditorViewer opens an existing plain-text file (txt/md/go/c) for
