@@ -88,15 +88,18 @@ type viewer struct {
 	headerHovered                           bool
 	termFocus                               int // key/pointer focus tag for the terminal
 
-	bSave     widget.Clickable // editor: save to disk
-	bRun      widget.Clickable // run as Mesa
-	nameEd    widget.Editor    // editor: target filename
-	saveMsg   string           // editor: last save status
-	runOut    *viewer          // its output viewer, reused across runs
-	plainText bool             // editor: save raw text (else encode as Tioga)
-	codeEdit  bool             // editor: use a monospace face
-	runnable  bool             // show the Run (Mesa) button
-	src       string           // vkContent .mesa: decoded source, for running
+	bSave      widget.Clickable // editor: save to disk
+	bRun       widget.Clickable // run as Mesa
+	bEdit      widget.Clickable // code viewer: toggle edit/view
+	nameEd     widget.Editor    // editor: target filename
+	saveMsg    string           // editor: last save status
+	runOut     *viewer          // its output viewer, reused across runs
+	plainText  bool             // editor: save raw text (else encode as Tioga)
+	codeEdit   bool             // editor: use a monospace face
+	runnable   bool             // show the Run (Mesa) button
+	src        string           // vkContent .mesa: decoded source, for running
+	editing    bool             // code viewer: editing (vs highlighted view)
+	editorInit bool             // code viewer: the edit buffer has been loaded
 
 	outText string // vkOutput: the captured program output
 }
@@ -256,6 +259,22 @@ func (s *gioUI) header(gtx C, v *viewer) D {
 						}
 						return s.flatButton(gtx, &v.bRun, "Run") // run a .mesa file
 					}),
+					layout.Rigid(func(gtx C) D {
+						if v.kind != vkContent || !v.isCode {
+							return D{}
+						}
+						label := "Edit"
+						if v.editing {
+							label = "View"
+						}
+						return s.flatButton(gtx, &v.bEdit, label)
+					}),
+					layout.Rigid(func(gtx C) D {
+						if v.kind != vkContent || !v.editing {
+							return D{}
+						}
+						return s.flatButton(gtx, &v.bSave, "Save")
+					}),
 					layout.Rigid(func(gtx C) D { return D{Size: image.Pt(gtx.Dp(6), 0)} }),
 					layout.Flexed(1, func(gtx C) D {
 						return s.label(gtx, serifFont, font.Bold, font.Regular, 13, v.headerTitle(), cedarBlack, 1)
@@ -300,6 +319,17 @@ func (s *gioUI) body(gtx C, v *viewer) D {
 	}
 	// The left margin comes from the scroll gutter; add top/right/bottom only.
 	if v.isCode {
+		if v.editing { // an editable monospace buffer (no highlighting while typing)
+			return layout.Inset{Top: 4, Left: 6, Right: 6, Bottom: 4}.Layout(gtx, func(gtx C) D {
+				gtx.Constraints.Min = gtx.Constraints.Max
+				ed := material.Editor(s.th, &v.editor, "")
+				ed.Color = cedarBlack
+				ed.SelectionColor = cedarGreyMid
+				ed.Font = monoFont
+				ed.TextSize = s.sp(codeTextSize)
+				return ed.Layout(gtx)
+			})
+		}
 		return layout.Inset{Top: 4, Right: 4, Bottom: 4}.Layout(gtx, func(gtx C) D {
 			gtx.Constraints.Min = gtx.Constraints.Max
 			return s.scrollList(gtx, &v.sc, len(v.lines), func(gtx C, i int) D {

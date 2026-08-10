@@ -230,11 +230,46 @@ func (s *gioUI) processHeaderActions(gtx C) {
 		if v.kind == vkEditor && v.bSave.Clicked(gtx) {
 			s.saveEditor(v)
 		}
+		if v.kind == vkContent && v.isCode && v.bEdit.Clicked(gtx) {
+			s.toggleEdit(v)
+		}
+		if v.kind == vkContent && v.editing && v.bSave.Clicked(gtx) {
+			s.saveCode(v)
+		}
 		if v.runnable && v.bRun.Clicked(gtx) {
 			s.runViewer(v)
 			return // added a viewer; re-evaluate next frame
 		}
 	}
+}
+
+// toggleEdit switches a code viewer between the highlighted read-only view and
+// an editable monospace buffer, re-highlighting on the way back to view.
+func (s *gioUI) toggleEdit(v *viewer) {
+	if v.editing {
+		v.src = v.editor.Text()
+		v.lines = codeToRuns(expandTabs(v.src), s.builtins)
+		v.editing = false
+	} else {
+		if !v.editorInit {
+			v.editor.SetText(v.src)
+			v.editorInit = true
+		}
+		v.editing = true
+	}
+	if s.invalidate != nil {
+		s.invalidate()
+	}
+}
+
+// saveCode writes an edited code viewer back to its file as a Tioga document.
+func (s *gioUI) saveCode(v *viewer) {
+	v.src = v.editor.Text()
+	if err := os.WriteFile(v.path, tioga.Encode(v.src), 0o644); err != nil {
+		v.saveMsg = "save failed: " + err.Error()
+		return
+	}
+	v.saveMsg = "saved " + v.rel
 }
 
 // runViewer evaluates a viewer's Mesa source — the editor buffer for a scratch
@@ -247,8 +282,8 @@ func (s *gioUI) runViewer(v *viewer) {
 	}
 	title := "Run: " + name
 	code := v.src // a .mesa content viewer runs its decoded source
-	if v.kind == vkEditor {
-		code = v.editor.Text()
+	if v.kind == vkEditor || v.editorInit {
+		code = v.editor.Text() // run the edited buffer once editing has started
 	}
 	out := runMesa(code)
 	if v.runOut != nil && s.viewerAlive(v.runOut) {
