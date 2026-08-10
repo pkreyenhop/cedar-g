@@ -450,6 +450,9 @@ func (p *Parser) parseType() TypeExpr {
 	case p.isKw("PROCEDURE") || p.isKw("PROC"):
 		p.advance()
 		return p.parseProcType()
+	case p.isKw("PROGRAM"), p.isKw("MONITOR"):
+		p.advance()
+		return &NamedType{Name: "PROGRAM"}
 	case p.isKw("SELECT"):
 		return p.parseVariant()
 	case p.isPunct("{"):
@@ -475,6 +478,19 @@ func (p *Parser) parseType() TypeExpr {
 			qual += "." + p.expectIdent()
 		}
 		nt := &NamedType{Name: qual, Line: name.Line}
+		// A base-relative pointer: <base> RELATIVE [ORDERED] POINTER TO <elem>.
+		if p.cur().Kind == TIdent && (typeQualifiers[p.cur().Text] || p.cur().Text == "POINTER") {
+			for p.cur().Kind == TIdent && typeQualifiers[p.cur().Text] {
+				p.advance()
+			}
+			if p.acceptWord("POINTER") {
+				p.acceptWord("TO")
+				if p.startsType() {
+					p.parseType()
+				}
+			}
+			return nt
+		}
 		if p.isPunct("(") {
 			iv := p.parseInterval()
 			return &SubrangeType{Base: nt, Ival: iv}
@@ -842,11 +858,22 @@ func (p *Parser) startsValue() bool {
 	}
 	if t.Kind == TPunct {
 		switch t.Text {
-		case ",", "]", ")", "}", ";":
+		case ",", "]", ")", "}", ";", "=>":
 			return false
 		}
 	}
+	if t.Kind == TKeyword && clauseKeywords[t.Text] {
+		return false // ELSE/THEN/DO/… end a value, they don't start one
+	}
 	return true
+}
+
+// clauseKeywords end an expression/statement; they never begin a value, so a
+// bracketless RETURN (etc.) must not consume them.
+var clauseKeywords = map[string]bool{
+	"ELSE": true, "THEN": true, "DO": true, "FROM": true, "END": true,
+	"ENDCASE": true, "ENDLOOP": true, "EXITS": true, "REPEAT": true,
+	"UNTIL": true, "WHILE": true,
 }
 
 // startsExprStmt reports whether the current token can begin an expression
@@ -1531,10 +1558,11 @@ func (p *Parser) parseAggregate() Expr {
 			continue
 		}
 		var el AggElem
-		// named element: name: value
-		if p.cur().Kind == TIdent && p.peek().Kind == TPunct && p.peek().Text == ":" {
+		// named element: name: value  or  Cedar's  name~value
+		if p.cur().Kind == TIdent && p.peek().Kind == TPunct &&
+			(p.peek().Text == ":" || p.peek().Text == "~") {
 			el.Name = p.expectIdent()
-			p.expectPunct(":")
+			p.advance() // ':' or '~'
 		}
 		el.Val = p.parseValueExpr()
 		agg.Elems = append(agg.Elems, el)

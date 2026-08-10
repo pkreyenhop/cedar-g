@@ -115,6 +115,19 @@ func TestCedarSyntaxParses(t *testing.T) {
 			  bits: INT ~ 2 ** 10;
 			  rope: ROPE ~ WITH prop SELECT FROM r: ROPE => r, ENDCASE => NIL;
 			};`,
+		"tilde aggregates, := assign, D-scaled, bare RETURN, PROGRAM, relative ptr": `
+			FooImpl: CEDAR PROGRAM ~ {
+			  Sched: TYPE ~ RECORD [
+			    p: PageOffset,
+			    fault: SIGNAL [dest: PROGRAM] ];
+			  PageOffset: TYPE ~ BasePtr RELATIVE ORDERED POINTER TO Entry;
+			  rec: Schedule ← [date~nullGMT, permittedDumps~ALL[[size~0, days~3]]];
+			  Go: PROC [x: INT] RETURNS [INT] ~ {
+			    pause: INT ~ 1D3;
+			    x := x + 1;
+			    IF x = 0 THEN RETURN ELSE RETURN x;
+			  };
+			};`,
 		"exits, repeat, goto, fork, new[type[n]]": `
 			FooImpl: CEDAR PROGRAM ~ {
 			  Go: PROC [n: NAT] RETURNS [REF Seq] ~ {

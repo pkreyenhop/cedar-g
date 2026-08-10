@@ -203,17 +203,28 @@ func (l *Lexer) lexNumber(line, col int) (Token, error) {
 			l.advance()
 		}
 	}
-	if (l.peek() == 'e' || l.peek() == 'E') &&
+	// An exponent — 'E' as usual, or Cedar's 'D' scaling (1D3 == 1×10³) — but
+	// only when a digit or sign follows, so a hex literal like 0EH is not one.
+	scaled := false
+	if (l.peek() == 'e' || l.peek() == 'E' || l.peek() == 'D' || l.peek() == 'd') &&
 		(unicode.IsDigit(l.peek2()) || l.peek2() == '+' || l.peek2() == '-') {
-		// An exponent — but only when a digit or sign follows, so a hex literal
-		// like 0EH is not mistaken for one.
+		scaled = l.peek() == 'D' || l.peek() == 'd'
 		isReal = true
+		expStart := l.pos
 		l.advance()
 		if l.peek() == '+' || l.peek() == '-' {
 			l.advance()
 		}
 		for unicode.IsDigit(l.peek()) {
 			l.advance()
+		}
+		if scaled { // rewrite 'D' to 'e' so ParseFloat accepts it
+			s := l.src[start:expStart] + "e" + l.src[expStart+1:l.pos]
+			f, err := strconv.ParseFloat(s, 64)
+			if err != nil {
+				return Token{}, l.errorf("bad scaled literal %q", l.src[start:l.pos])
+			}
+			return Token{Kind: TReal, Real: f, Text: l.src[start:l.pos], Line: line, Col: col}, nil
 		}
 	}
 	if isReal {
@@ -331,8 +342,9 @@ func (l *Lexer) lexString(line, col int) (Token, error) {
 	return Token{Kind: TString, Str: sb.String(), Text: sb.String(), Line: line, Col: col}, nil
 }
 
-// multi-character punctuation, longest match first
-var multiPunct = []string{"<=", ">=", "<-", "..", "=>", "**", "~=", "#="}
+// multi-character punctuation, longest match first. ":=" is Pascal-style
+// assignment, treated the same as Mesa's "←".
+var multiPunct = []string{":=", "<=", ">=", "<-", "..", "=>", "**", "~=", "#="}
 
 func (l *Lexer) lexPunct(line, col int) (Token, error) {
 	// Mesa left-arrow assignment (unicode ←) and up-arrow dereference. The Tioga
@@ -352,7 +364,11 @@ func (l *Lexer) lexPunct(line, col int) (Token, error) {
 			for range p {
 				l.advance()
 			}
-			return Token{Kind: TPunct, Text: p, Line: line, Col: col}, nil
+			text := p
+			if text == ":=" { // Pascal-style assignment == "←"
+				text = "<-"
+			}
+			return Token{Kind: TPunct, Text: text, Line: line, Col: col}, nil
 		}
 	}
 	r := l.advance()
