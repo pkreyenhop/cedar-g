@@ -95,27 +95,65 @@ func (p *Parser) ParseModule() (m *Module, err error) {
 		}
 	}()
 	m = &Module{}
+	// Cedar files may open with a DIRECTORY clause listing imported interfaces.
+	p.skipDirectory()
 	m.Name = p.expectIdent()
 	p.expectPunct(":")
-	switch {
-	case p.acceptKw("PROGRAM"):
-		m.Kind = "PROGRAM"
-	case p.acceptKw("DEFINITIONS"):
-		m.Kind = "DEFINITIONS"
-	case p.acceptKw("MODULE"):
-		m.Kind = "MODULE"
-	default:
-		p.fail("expected PROGRAM, DEFINITIONS or MODULE")
-	}
-	// Skip an optional interface/parameter clause up to '='. Real Mesa
-	// allows IMPORTS/EXPORTS/[params] here; the subset ignores them.
-	for !p.isPunct("=") && p.cur().Kind != TEOF {
+	// The head runs up to the binding ('=' or Cedar's '~'). It carries optional
+	// qualifiers (CEDAR, SAFE, ...), the module kind, and IMPORTS/EXPORTS/params;
+	// we record the kind and skip the rest (tracking bracket depth so a '=' in a
+	// default value doesn't end the head early).
+	m.Kind = "MODULE"
+	depth := 0
+	for p.cur().Kind != TEOF {
+		if depth == 0 && (p.isPunct("=") || p.isPunct("~")) {
+			break
+		}
+		switch {
+		case p.isKw("PROGRAM"):
+			m.Kind = "PROGRAM"
+		case p.isKw("DEFINITIONS"):
+			m.Kind = "DEFINITIONS"
+		case p.isKw("MONITOR"):
+			m.Kind = "MONITOR"
+		case p.isPunct("[") || p.isPunct("("):
+			depth++
+		case p.isPunct("]") || p.isPunct(")"):
+			depth--
+		}
 		p.advance()
 	}
-	p.expectPunct("=")
+	if !p.acceptBind() {
+		p.fail("expected '=' or '~'")
+	}
 	m.Body = p.parseBlock()
 	p.acceptPunct(".") // trailing '.' after END is optional
 	return m, nil
+}
+
+// acceptBind accepts a binding operator: Mesa '=' or Cedar '~'.
+func (p *Parser) acceptBind() bool {
+	return p.acceptPunct("=") || p.acceptPunct("~")
+}
+
+// skipDirectory skips a leading "DIRECTORY … ;" import clause, if present.
+func (p *Parser) skipDirectory() {
+	if !p.acceptKw("DIRECTORY") {
+		return
+	}
+	depth := 0
+	for p.cur().Kind != TEOF {
+		switch {
+		case p.isPunct("[") || p.isPunct("("):
+			depth++
+		case p.isPunct("]") || p.isPunct(")"):
+			depth--
+		case depth == 0 && p.isPunct(";"):
+			p.advance()
+			return
+		}
+		p.advance()
+	}
 }
 
 // parseBlock handles BEGIN..END and {..} bodies.
@@ -129,6 +167,28 @@ func (p *Parser) parseBlock() *Block {
 		closer = "}"
 	default:
 		p.fail("expected BEGIN or '{'")
+	}
+	// Cedar blocks may begin with "OPEN interfaces;" and/or "ENABLE handlers;".
+	for {
+		if p.acceptWord("OPEN") {
+			for p.cur().Kind != TEOF && !p.isPunct(";") {
+				p.advance()
+			}
+			p.acceptPunct(";")
+			continue
+		}
+		if p.acceptWord("ENABLE") {
+			if p.isPunct("{") {
+				p.skipBraces()
+			} else {
+				for p.cur().Kind != TEOF && !p.isPunct(";") {
+					p.advance()
+				}
+			}
+			p.acceptPunct(";")
+			continue
+		}
+		break
 	}
 	items := p.parseStmtSeq(closer)
 	if closer == "END" {
@@ -209,7 +269,7 @@ func (p *Parser) parseDecl() Stmt {
 
 	// TYPE declaration: NAME: TYPE = typeExpr
 	if p.acceptKw("TYPE") {
-		if !p.acceptPunct("=") {
+		if !p.acceptBind() {
 			p.acceptPunct("<-")
 		}
 		t := p.parseType()
@@ -219,7 +279,7 @@ func (p *Parser) parseDecl() Stmt {
 	t := p.parseType()
 
 	// Procedure declaration: NAME: PROCEDURE[..] RETURNS[..] = body
-	if pt, ok := t.(*ProcType); ok && p.isPunct("=") {
+	if pt, ok := t.(*ProcType); ok && (p.isPunct("=") || p.isPunct("~")) {
 		p.advance()
 		body := p.parseBlock()
 		return &ProcDecl{Name: names[0], Type: pt, Body: body, Line: line}
@@ -227,7 +287,7 @@ func (p *Parser) parseDecl() Stmt {
 
 	var init Expr
 	isConst := false
-	if p.acceptPunct("=") {
+	if p.acceptBind() {
 		isConst = true
 		init = p.parseExpr()
 	} else if p.acceptPunct("<-") {
@@ -238,7 +298,69 @@ func (p *Parser) parseDecl() Stmt {
 
 // ---- Types ----
 
+// typeQualifiers are leading words that decorate a type; we accept and drop
+// them so the underlying type still parses.
+var typeQualifiers = map[string]bool{
+	"PACKED": true, "ORDERED": true, "BASE": true, "LONG": true,
+	"READONLY": true, "VAR": true, "MONITORED": true, "RELATIVE": true,
+	"PRIVATE": true, "PUBLIC": true,
+}
+
 func (p *Parser) parseType() TypeExpr {
+	// Skip decorating qualifiers (PACKED ARRAY, LONG POINTER, MACHINE DEPENDENT…).
+	for p.cur().Kind == TIdent && typeQualifiers[p.cur().Text] {
+		p.advance()
+	}
+	if p.cur().Kind == TIdent && p.cur().Text == "MACHINE" {
+		p.advance()
+		p.acceptWord("DEPENDENT")
+	}
+
+	// Cedar reference and collection types. These are interface-level types the
+	// interpreter does not execute, so we consume their shape and return a
+	// placeholder named type.
+	if p.cur().Kind == TIdent {
+		switch p.cur().Text {
+		case "REF":
+			p.advance()
+			p.acceptWord("READONLY")
+			if p.startsType() {
+				p.parseType()
+			}
+			return &NamedType{Name: "REF"}
+		case "LIST":
+			p.advance()
+			p.acceptKw("OF")
+			if p.startsType() {
+				p.parseType()
+			}
+			return &NamedType{Name: "LIST"}
+		case "POINTER":
+			p.advance()
+			p.acceptWord("TO")
+			for p.cur().Kind == TIdent && typeQualifiers[p.cur().Text] {
+				p.advance()
+			}
+			if p.startsType() {
+				p.parseType()
+			}
+			return &NamedType{Name: "POINTER"}
+		case "SEQUENCE":
+			p.advance()
+			for !p.isKw("OF") && p.cur().Kind != TEOF && !p.isPunct("]") {
+				p.advance() // skip the length/tag clause
+			}
+			p.acceptKw("OF")
+			if p.startsType() {
+				p.parseType()
+			}
+			return &NamedType{Name: "SEQUENCE"}
+		case "ANY":
+			p.advance()
+			return &NamedType{Name: "ANY"}
+		}
+	}
+
 	switch {
 	case p.acceptKw("ARRAY"):
 		var iv *Interval
@@ -258,13 +380,27 @@ func (p *Parser) parseType() TypeExpr {
 		return p.parseProcType()
 	case p.isPunct("{"):
 		return p.parseEnumType()
-	case p.isPunct("[") || p.isPunct("("):
-		// bare interval => subrange of INTEGER
+	case p.isPunct("["):
+		// "[a: T, ...]" is an anonymous record; "[lo..hi]" is a subrange.
+		if p.recordTypeAhead() {
+			p.advance()
+			fields := p.parseFieldList("]")
+			p.expectPunct("]")
+			return &RecordType{Fields: fields}
+		}
+		iv := p.parseInterval()
+		return &SubrangeType{Base: &NamedType{Name: "INTEGER"}, Ival: iv}
+	case p.isPunct("("):
 		iv := p.parseInterval()
 		return &SubrangeType{Base: &NamedType{Name: "INTEGER"}, Ival: iv}
 	case p.cur().Kind == TIdent:
 		name := p.advance()
-		nt := &NamedType{Name: name.Text, Line: name.Line}
+		qual := name.Text
+		for p.isPunct(".") { // qualified name: Pkg.Type
+			p.advance()
+			qual += "." + p.expectIdent()
+		}
+		nt := &NamedType{Name: qual, Line: name.Line}
 		if p.isPunct("[") || p.isPunct("(") {
 			iv := p.parseInterval()
 			return &SubrangeType{Base: nt, Ival: iv}
@@ -273,6 +409,65 @@ func (p *Parser) parseType() TypeExpr {
 	}
 	p.fail("expected a type")
 	return nil
+}
+
+// acceptWord accepts a specific identifier (a non-reserved Cedar word).
+func (p *Parser) acceptWord(w string) bool {
+	if p.cur().Kind == TIdent && p.cur().Text == w {
+		p.advance()
+		return true
+	}
+	return false
+}
+
+// recordTypeAhead reports whether the '[' at the cursor opens an anonymous
+// record "[name: T, …]" (or "[]") rather than an interval "[lo..hi]".
+func (p *Parser) recordTypeAhead() bool {
+	j := p.pos + 1 // just past '['
+	if j < len(p.toks) && p.toks[j].Kind == TPunct && p.toks[j].Text == "]" {
+		return true // empty record []
+	}
+	depth := 0
+	for ; j < len(p.toks); j++ {
+		t := p.toks[j]
+		if t.Kind == TEOF {
+			return false
+		}
+		if t.Kind == TPunct {
+			switch t.Text {
+			case "[", "(":
+				depth++
+			case "]", ")":
+				if depth == 0 {
+					return false
+				}
+				depth--
+			case "..":
+				if depth == 0 {
+					return false // interval
+				}
+			case ":":
+				if depth == 0 {
+					return true // field declaration
+				}
+			}
+		}
+	}
+	return false
+}
+
+// startsType reports whether the current token can begin a type expression.
+func (p *Parser) startsType() bool {
+	t := p.cur()
+	switch t.Kind {
+	case TIdent:
+		return true
+	case TKeyword:
+		return t.Text == "ARRAY" || t.Text == "RECORD" || t.Text == "PROCEDURE" || t.Text == "PROC"
+	case TPunct:
+		return t.Text == "{" || t.Text == "[" || t.Text == "("
+	}
+	return false
 }
 
 func (p *Parser) parseProcType() *ProcType {
@@ -326,9 +521,18 @@ func (p *Parser) namedGroupAhead() bool {
 	}
 }
 
+// fieldQualifiers precede a record field or parameter in Cedar.
+var fieldQualifiers = map[string]bool{"PRIVATE": true, "PUBLIC": true, "READONLY": true}
+
 func (p *Parser) parseFieldList(closer string) []Field {
 	var fields []Field
 	for !p.isPunct(closer) && p.cur().Kind != TEOF {
+		for p.cur().Kind == TIdent && fieldQualifiers[p.cur().Text] {
+			p.advance()
+		}
+		if p.isPunct(closer) {
+			break
+		}
 		if p.namedGroupAhead() {
 			names := p.parseIdList()
 			p.expectPunct(":")
@@ -389,6 +593,10 @@ func (p *Parser) parseStmt() Stmt {
 		return p.parseLoop()
 	case p.isKw("BEGIN"), p.isPunct("{"):
 		return p.parseBlock()
+	case p.cur().Kind == TIdent && safetyBlockWords[p.cur().Text]:
+		// TRUSTED / CHECKED / UNCHECKED prefix a block.
+		p.advance()
+		return p.parseBlock()
 	case p.isKw("RETURN"):
 		return p.parseReturn()
 	case p.acceptKw("EXIT"):
@@ -400,11 +608,57 @@ func (p *Parser) parseStmt() Stmt {
 	}
 	// expression statement or assignment
 	x := p.parseExpr()
+	var stmt Stmt = &ExprStmt{X: x, Line: line}
 	if p.acceptPunct("<-") {
 		rhs := p.parseExpr()
-		return &Assign{Lhs: x, Rhs: rhs, Line: line}
+		stmt = &Assign{Lhs: x, Rhs: rhs, Line: line}
 	}
-	return &ExprStmt{X: x, Line: line}
+	// A trailing "! handler => …" catch clause is skipped (no signal runtime).
+	if p.isPunct("!") {
+		p.skipCatch()
+	}
+	return stmt
+}
+
+// safetyBlockWords prefix a block with a Cedar safety qualifier.
+var safetyBlockWords = map[string]bool{"TRUSTED": true, "CHECKED": true, "UNCHECKED": true}
+
+// skipBraces consumes a balanced { … } group at the cursor.
+func (p *Parser) skipBraces() {
+	if !p.acceptPunct("{") {
+		return
+	}
+	depth := 1
+	for depth > 0 && p.cur().Kind != TEOF {
+		switch {
+		case p.isPunct("{"):
+			depth++
+		case p.isPunct("}"):
+			depth--
+		}
+		p.advance()
+	}
+}
+
+// skipCatch consumes a "! …" exception-handler clause up to the end of the
+// enclosing statement (a ';' or block closer at depth 0).
+func (p *Parser) skipCatch() {
+	p.advance() // '!'
+	depth := 0
+	for p.cur().Kind != TEOF {
+		switch {
+		case p.isPunct("[") || p.isPunct("(") || p.isPunct("{"):
+			depth++
+		case p.isPunct("]") || p.isPunct(")") || p.isPunct("}"):
+			if depth == 0 {
+				return
+			}
+			depth--
+		case depth == 0 && (p.isPunct(";") || p.isKw("END")):
+			return
+		}
+		p.advance()
+	}
 }
 
 func (p *Parser) parseIfStmt() Stmt {
@@ -549,7 +803,7 @@ func (p *Parser) parseAnd() Expr {
 	return x
 }
 
-var relOps = map[string]bool{"=": true, "#": true, "<": true, "<=": true, ">": true, ">=": true}
+var relOps = map[string]bool{"=": true, "#": true, "~=": true, "#=": true, "<": true, "<=": true, ">": true, ">=": true}
 
 func (p *Parser) parseRel() Expr {
 	x := p.parseAdd()
@@ -583,7 +837,7 @@ func (p *Parser) parseMul() Expr {
 
 func (p *Parser) parseUnary() Expr {
 	switch {
-	case p.isKw("NOT"):
+	case p.isKw("NOT") || p.isPunct("~"):
 		line := p.advance().Line
 		return &Unary{Op: "NOT", X: p.parseUnary(), Line: line}
 	case p.isPunct("-"):
@@ -603,11 +857,17 @@ func (p *Parser) parsePostfix() Expr {
 		case p.isPunct("["):
 			line := p.advance().Line
 			var args []Expr
-			if !p.isPunct("]") {
+			if !p.isPunct("]") && !p.isPunct("!") {
 				args = append(args, p.parseExpr())
 				for p.acceptPunct(",") {
+					if p.isPunct("]") || p.isPunct("!") {
+						break
+					}
 					args = append(args, p.parseExpr())
 				}
+			}
+			if p.isPunct("!") { // a call-site catch clause: proc[args ! handler]
+				p.skipCatch()
 			}
 			p.expectPunct("]")
 			x = &Apply{Fun: x, Args: args, Line: line}
@@ -648,6 +908,15 @@ func (p *Parser) parsePrimary() Expr {
 			return &NilLit{Line: t.Line}
 		case "NEW":
 			p.advance()
+			// Cedar NEW[Type] or NEW[Type ← init]; Mesa also allows a bare type.
+			if p.acceptPunct("[") {
+				nt := p.parseType()
+				if p.acceptPunct("<-") || p.acceptBind() {
+					p.parseExpr() // discard the initialiser
+				}
+				p.expectPunct("]")
+				return &NewExpr{Type: nt, Line: t.Line}
+			}
 			return &NewExpr{Type: p.parseType(), Line: t.Line}
 		case "IF":
 			return p.parseIfExpr()

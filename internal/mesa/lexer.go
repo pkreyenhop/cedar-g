@@ -84,13 +84,43 @@ func (l *Lexer) skipSpaceAndComments() error {
 			return nil
 		case unicode.IsSpace(r):
 			l.advance()
+		case r == '<' && l.peek2() == '<':
+			// Cedar block comment: << ... >>, nestable.
+			depth := 0
+			for {
+				c := l.peek()
+				if c == 0 {
+					break
+				}
+				if c == '<' && l.peek2() == '<' {
+					l.advance()
+					l.advance()
+					depth++
+					continue
+				}
+				if c == '>' && l.peek2() == '>' {
+					l.advance()
+					l.advance()
+					depth--
+					if depth == 0 {
+						break
+					}
+					continue
+				}
+				l.advance()
+			}
 		case r == '-' && l.peek2() == '-':
-			// line comment: -- ... to end of line
+			// Mesa comment: -- ... terminated by another -- or end of line.
 			l.advance()
 			l.advance()
 			for {
 				c := l.peek()
 				if c == 0 || c == '\n' {
+					break
+				}
+				if c == '-' && l.peek2() == '-' {
+					l.advance()
+					l.advance()
 					break
 				}
 				l.advance()
@@ -152,8 +182,9 @@ func (l *Lexer) lexNumber(line, col int) (Token, error) {
 	for unicode.IsDigit(l.peek()) {
 		l.advance()
 	}
+
+	// Real number: a fractional part or an exponent.
 	isReal := false
-	// fractional part: only if '.' not followed by another '.' (range op)
 	if l.peek() == '.' && l.peek2() != '.' && unicode.IsDigit(l.peek2()) {
 		isReal = true
 		l.advance()
@@ -161,7 +192,6 @@ func (l *Lexer) lexNumber(line, col int) (Token, error) {
 			l.advance()
 		}
 	}
-	// exponent
 	if l.peek() == 'e' || l.peek() == 'E' {
 		isReal = true
 		l.advance()
@@ -172,19 +202,51 @@ func (l *Lexer) lexNumber(line, col int) (Token, error) {
 			l.advance()
 		}
 	}
-	text := l.src[start:l.pos]
 	if isReal {
+		text := l.src[start:l.pos]
 		f, err := strconv.ParseFloat(text, 64)
 		if err != nil {
 			return Token{}, l.errorf("bad real literal %q", text)
 		}
 		return Token{Kind: TReal, Real: f, Text: text, Line: line, Col: col}, nil
 	}
-	n, err := strconv.ParseInt(text, 10, 64)
+
+	// Integer, possibly with a Mesa base/char suffix. Hex digits may follow the
+	// decimal run; the suffix letter (H hex, B octal, C octal char code, D
+	// decimal) is not itself a hex digit except when it is 'H' (which is not).
+	for isHexDigit(l.peek()) {
+		l.advance()
+	}
+	body := l.src[start:l.pos]
+	base := 10
+	isChar := false
+	if c := l.peek(); c == 'H' || c == 'h' {
+		l.advance()
+		base = 16
+	} else if n := len(body); n > 0 {
+		switch body[n-1] {
+		case 'B', 'b':
+			body, base = body[:n-1], 8
+		case 'C', 'c':
+			body, base, isChar = body[:n-1], 8, true // octal character code
+		case 'D', 'd':
+			body, base = body[:n-1], 10
+		}
+	}
+	text := l.src[start:l.pos]
+	n, err := strconv.ParseInt(body, base, 64)
 	if err != nil {
 		return Token{}, l.errorf("bad integer literal %q", text)
 	}
+	if isChar {
+		return Token{Kind: TChar, Char: rune(n), Text: text, Line: line, Col: col}, nil
+	}
 	return Token{Kind: TInt, Int: n, Text: text, Line: line, Col: col}, nil
+}
+
+func isHexDigit(r rune) bool {
+	return unicode.IsDigit(r) ||
+		(r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')
 }
 
 func (l *Lexer) lexString(line, col int) (Token, error) {
@@ -224,13 +286,18 @@ func (l *Lexer) lexString(line, col int) (Token, error) {
 }
 
 // multi-character punctuation, longest match first
-var multiPunct = []string{"<=", ">=", "<-", "..", "=>", "**"}
+var multiPunct = []string{"<=", ">=", "<-", "..", "=>", "**", "~=", "#="}
 
 func (l *Lexer) lexPunct(line, col int) (Token, error) {
-	// Mesa left-arrow assignment (unicode ←)
+	// Mesa left-arrow assignment (unicode ←) and up-arrow dereference. The Tioga
+	// decoder yields U+00AD for the Xerox up-arrow, which Cedar uses like '^'.
 	if l.peek() == '←' {
 		l.advance()
 		return Token{Kind: TPunct, Text: "<-", Line: line, Col: col}, nil
+	}
+	if l.peek() == '↑' || l.peek() == '­' {
+		l.advance()
+		return Token{Kind: TPunct, Text: "^", Line: line, Col: col}, nil
 	}
 	// Multi-char ASCII operators
 	rest := l.src[l.pos:]
@@ -245,8 +312,19 @@ func (l *Lexer) lexPunct(line, col int) (Token, error) {
 	r := l.advance()
 	switch r {
 	case '+', '-', '*', '/', '=', '#', '<', '>',
-		'(', ')', '[', ']', '{', '}', ',', ';', ':', '.', '@', '^':
+		'(', ')', '[', ']', '{', '}', ',', ';', ':', '.', '@', '^',
+		'~', '!', '&', '|':
 		return Token{Kind: TPunct, Text: string(r), Line: line, Col: col}, nil
+	case '$':
+		// Cedar atom literal: $Name. The name is optional in odd positions.
+		if isIdentStart(l.peek()) {
+			var sb strings.Builder
+			for isIdentPart(l.peek()) {
+				sb.WriteRune(l.advance())
+			}
+			return Token{Kind: TString, Str: sb.String(), Text: "$" + sb.String(), Line: line, Col: col}, nil
+		}
+		return Token{Kind: TPunct, Text: "$", Line: line, Col: col}, nil
 	}
 	return Token{}, l.errorf("unexpected character %q", string(r))
 }

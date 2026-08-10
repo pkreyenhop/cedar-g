@@ -49,7 +49,8 @@ func (t Token) String() string {
 // (INTEGER, REAL, ...) and TRUE/FALSE are predefined identifiers, not
 // keywords, so they live in the interpreter's global environment.
 var keywords = map[string]bool{
-	"PROGRAM": true, "DEFINITIONS": true, "MODULE": true,
+	"PROGRAM": true, "DEFINITIONS": true, "MODULE": true, "MONITOR": true,
+	"DIRECTORY": true,
 	"BEGIN": true, "END": true,
 	"IF": true, "THEN": true, "ELSE": true,
 	"DO": true, "ENDLOOP": true, "FOR": true, "WHILE": true,
