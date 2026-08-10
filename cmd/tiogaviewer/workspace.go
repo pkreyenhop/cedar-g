@@ -262,10 +262,12 @@ func (s *gioUI) toggleEdit(v *viewer) {
 	}
 }
 
-// saveCode writes an edited code viewer back to its file as a Tioga document.
+// saveCode writes an edited code viewer back to its file as plain text. (Code
+// is kept as text, not Tioga-encoded, so it stays readable and diffable; the
+// viewer still highlights it on reopen via content detection.)
 func (s *gioUI) saveCode(v *viewer) {
 	v.src = v.editor.Text()
-	if err := os.WriteFile(v.path, tioga.Encode(v.src), 0o644); err != nil {
+	if err := os.WriteFile(v.path, []byte(v.src), 0o644); err != nil {
 		v.saveMsg = "save failed: " + err.Error()
 		return
 	}
