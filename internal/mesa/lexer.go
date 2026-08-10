@@ -159,12 +159,16 @@ func (l *Lexer) next() (Token, error) {
 		return l.lexNumber(line, col)
 	}
 
-	// Character literal: 'c  (Mesa style, no closing quote)
+	// Character literal: 'c  (Mesa style, no closing quote); supports escapes
+	// like '\n, '\\ and octal '\177.
 	if r == '\'' {
 		l.advance()
 		c := l.advance()
 		if c == 0 {
 			return Token{}, l.errorf("unterminated character literal")
+		}
+		if c == '\\' {
+			c = l.charEscape()
 		}
 		return Token{Kind: TChar, Char: c, Text: "'" + string(c), Line: line, Col: col}, nil
 	}
@@ -183,16 +187,20 @@ func (l *Lexer) lexNumber(line, col int) (Token, error) {
 		l.advance()
 	}
 
-	// Real number: a fractional part or an exponent.
+	// Real number: a fractional part (possibly a bare trailing dot, "1.") or an
+	// exponent. A ".." is the range operator, not a fraction.
 	isReal := false
-	if l.peek() == '.' && l.peek2() != '.' && unicode.IsDigit(l.peek2()) {
+	if l.peek() == '.' && l.peek2() != '.' {
 		isReal = true
 		l.advance()
 		for unicode.IsDigit(l.peek()) {
 			l.advance()
 		}
 	}
-	if l.peek() == 'e' || l.peek() == 'E' {
+	if (l.peek() == 'e' || l.peek() == 'E') &&
+		(unicode.IsDigit(l.peek2()) || l.peek2() == '+' || l.peek2() == '-') {
+		// An exponent — but only when a digit or sign follows, so a hex literal
+		// like 0EH is not mistaken for one.
 		isReal = true
 		l.advance()
 		if l.peek() == '+' || l.peek() == '-' {
@@ -244,6 +252,35 @@ func (l *Lexer) lexNumber(line, col int) (Token, error) {
 	return Token{Kind: TInt, Int: n, Text: text, Line: line, Col: col}, nil
 }
 
+// charEscape decodes the character after a backslash in a char literal.
+func (l *Lexer) charEscape() rune {
+	e := l.advance()
+	switch e {
+	case 'n':
+		return '\n'
+	case 't':
+		return '\t'
+	case 'r':
+		return '\r'
+	case 'b':
+		return '\b'
+	case 'f':
+		return '\f'
+	case 'l':
+		return '\n'
+	case '\\', '\'', '"':
+		return e
+	}
+	if e >= '0' && e <= '7' { // octal escape \ddd
+		v := int(e - '0')
+		for i := 0; i < 2 && l.peek() >= '0' && l.peek() <= '7'; i++ {
+			v = v*8 + int(l.advance()-'0')
+		}
+		return rune(v)
+	}
+	return e
+}
+
 func isHexDigit(r rune) bool {
 	return unicode.IsDigit(r) ||
 		(r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')
@@ -259,6 +296,9 @@ func (l *Lexer) lexString(line, col int) (Token, error) {
 		}
 		if c == '"' {
 			l.advance()
+			if l.peek() == 'L' { // a "…"L long-string literal suffix
+				l.advance()
+			}
 			break
 		}
 		if c == '\\' {

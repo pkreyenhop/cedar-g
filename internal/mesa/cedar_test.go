@@ -53,6 +53,66 @@ func TestCedarSyntaxParses(t *testing.T) {
 			    IF ~done THEN IO.PutRope[msg ! Error => CONTINUE];
 			  };
 			};`,
+		"errors/signals as types and statements": `
+			Foo: CEDAR DEFINITIONS ~ {
+			  Error: ERROR [why: INT];
+			  Warn: SIGNAL ANY RETURNS ANY;
+			  Raise: PROC ~ { ERROR Error[why: 3]; SIGNAL Warn };
+			};`,
+		"inline/entry proc bodies and keyword args": `
+			FooImpl: CEDAR MONITOR ~ {
+			  Len: ENTRY PROC [r: Rope.ROPE] RETURNS [n: INT ← 0] = INLINE {
+			    RETURN [r.Length[]] };
+			  Go: PROC ~ { x: INT ← f[key: 1, other~2, , 3]; };
+			};`,
+		"variant records and WITH SELECT": `
+			Foo: CEDAR DEFINITIONS ~ {
+			  Node: TYPE ~ RECORD [
+			    name: Rope.ROPE,
+			    body: SELECT tag: * FROM
+			      leaf => [value: INT],
+			      inner => [kids: LIST OF Node],
+			      ENDCASE ];
+			  Walk: PROC [n: REF Node] ~ {
+			    WITH n SELECT FROM
+			      x: INT => RETURN,
+			      ENDCASE => NULL;
+			  };
+			};`,
+		"select expr, relational guards, IN, loops": `
+			FooImpl: CEDAR PROGRAM ~ {
+			  Classify: PROC [c: CHAR] RETURNS [INT] ~ {
+			    SELECT c FROM
+			      < '0, > '9 => RETURN [0];
+			      IN ['0..'9] => RETURN [1];
+			      ENDCASE => RETURN [2];
+			  };
+			  Sum: PROC ~ {
+			    total: INT ← 0;
+			    FOR i: NAT DECREASING IN [0..10) DO total ← total + i; ENDLOOP;
+			    IF total NOT IN [1..5] THEN total ← 0;
+			  };
+			};`,
+		"literals: octal, hex, char escapes, long string, machine record": `
+			Foo: CEDAR DEFINITIONS ~ {
+			  mask: CARD ~ 377B + 0FFH;
+			  nl: CHAR ~ '\n;
+			  bs: CHAR ~ '\\;
+			  del: CHAR ~ 177C;
+			  msg: Rope.ROPE ~ "hello"L;
+			  Packed: TYPE ~ MACHINE DEPENDENT RECORD [
+			    op (0: 0..5): NAT, flag (0: 6..6): BOOL ];
+			};`,
+		"exits, repeat, goto, fork, new[type[n]]": `
+			FooImpl: CEDAR PROGRAM ~ {
+			  Go: PROC [n: NAT] RETURNS [REF Seq] ~ {
+			    s: REF Seq ← NEW[Seq[n]];
+			    DO IF n = 0 THEN GO TO done; n ← n - 1; REPEAT done => EXIT; ENDLOOP;
+			    Process.Detach[FORK Worker[s]];
+			    RETURN [s ! ABORTED => CONTINUE];
+			    EXITS oops => RETURN [NIL];
+			  };
+			};`,
 	}
 	for name, src := range cases {
 		if _, err := ParseSource(src); err != nil {
