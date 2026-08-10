@@ -38,19 +38,25 @@ const (
 	Quote
 )
 
-// Block is one rendered piece of a Tioga document.
+// Block is one rendered piece of a Tioga document. Runs is Text split into
+// look-runs (bold/italic/underline/…); it is nil when the text carries no looks,
+// in which case a renderer should draw Text plainly.
 type Block struct {
 	Kind  BlockKind
 	Level int // heading level 1..6 (Heading only)
 	Text  string
+	Runs  []Run
 }
 
 // Document is the decoded result. When IsCode is true, Code holds the
 // reconstructed, indented source; otherwise Blocks holds the document body.
+// Root is the full node tree (nesting + per-run looks) the document was parsed
+// from; Blocks is a flattened view of it kept for the current renderer.
 type Document struct {
 	IsCode bool
 	Code   string
 	Blocks []Block
+	Root   *Node
 }
 
 // Format-table sizing, matching the original constants.
@@ -125,6 +131,12 @@ type reader struct {
 
 	level []string // stack of node format names (indent level)
 
+	// tree being built
+	root        *Node
+	nodeStack   []*Node   // open path; nodeStack[len-1] is the current parent
+	cur         *Node     // node most recently started (receives text)
+	pendingRuns []runSpan // look-runs read for the next rope (runs precede rope)
+
 	// output
 	code   strings.Builder
 	blocks []Block
@@ -145,9 +157,9 @@ func Read(data []byte, isCode bool) Document {
 		return Document{Blocks: []Block{{Kind: Paragraph, Text: txt}}}
 	}
 	if isCode {
-		return Document{IsCode: true, Code: r.code.String()}
+		return Document{IsCode: true, Code: r.code.String(), Root: r.root}
 	}
-	return Document{Blocks: r.blocks}
+	return Document{Blocks: r.blocks, Root: r.root}
 }
 
 func checkID(buf []byte, p int, id []byte) bool {
@@ -227,6 +239,10 @@ func (r *reader) init(buf []byte) bool {
 	r.props[0] = ""
 	r.addProp("prefix")
 	r.addProp("postfix")
+
+	r.root = &Node{}
+	r.nodeStack = []*Node{r.root}
+	r.cur = r.root
 	return true
 }
 
@@ -235,7 +251,6 @@ func (r *reader) doWork() {
 	lastWasTerminal := false
 	level := 0
 	var iFormat int
-	var runLen int64
 
 	op := r.getOp()
 	for {
@@ -278,12 +293,13 @@ func (r *reader) doWork() {
 				}
 				fixNewlines(r.str)
 				r.insertText(r.str, length, op == opComment)
-				runLen = 0
 				op = r.getOp()
 				continue
 			case opRuns:
+				// A runs record precedes the rope it describes; buffer the
+				// (look, length) spans so insertText can split that rope.
 				nRuns := r.getInt()
-				runLen = 0
+				r.pendingRuns = r.pendingRuns[:0]
 				for i := int64(0); i < nRuns; i++ {
 					iLook := 0
 					op = r.getOp()
@@ -303,7 +319,7 @@ func (r *reader) doWork() {
 						iLook = 0
 					}
 					rl := r.getInt()
-					runLen += rl
+					r.pendingRuns = append(r.pendingRuns, runSpan{look: Look(uint32(r.looks[iLook])), n: rl})
 				}
 				op = r.getOp()
 				continue
@@ -484,11 +500,21 @@ func (r *reader) addProp(name string) int {
 	return 0
 }
 
-func (r *reader) startNode(format string) { r.level = append(r.level, format) }
+func (r *reader) startNode(format string) {
+	r.level = append(r.level, format)
+	n := &Node{Format: format}
+	parent := r.nodeStack[len(r.nodeStack)-1]
+	parent.Children = append(parent.Children, n)
+	r.nodeStack = append(r.nodeStack, n)
+	r.cur = n
+}
 
 func (r *reader) endNode() {
 	if len(r.level) > 0 {
 		r.level = r.level[:len(r.level)-1]
+	}
+	if len(r.nodeStack) > 1 {
+		r.nodeStack = r.nodeStack[:len(r.nodeStack)-1]
 	}
 }
 
@@ -526,6 +552,19 @@ func (r *reader) insertText(raw []byte, length int64, comment bool) {
 	}
 	s := toString(raw[:length])
 
+	// Split the text into look-runs (buffered by the preceding opRuns) and attach
+	// them to the current tree node. pendingRuns is consumed here so a subsequent
+	// rope without its own runs record renders plainly.
+	runs := splitRuns(s, r.pendingRuns)
+	r.pendingRuns = r.pendingRuns[:0]
+	if r.cur != nil {
+		if comment {
+			r.cur.Comment = append(r.cur.Comment, runs...)
+		} else {
+			r.cur.Runs = append(r.cur.Runs, runs...)
+		}
+	}
+
 	if r.isCode {
 		lines := strings.Split(s, "\n")
 		indent := (len(r.level) - 2) * 4
@@ -549,11 +588,14 @@ func (r *reader) insertText(raw []byte, length int64, comment bool) {
 		return
 	}
 
-	// Document rendering: map the node format to a block kind.
+	// Document rendering: map the node format to a block kind. styled is the run
+	// list only when it carries real looks, so plain paragraphs render (and wrap)
+	// as a single string.
+	styled := styledRuns(runs)
 	f := r.curFormat()
 	switch {
 	case strings.HasPrefix(f, "code"):
-		r.blocks = append(r.blocks, Block{Kind: Code, Text: s})
+		r.blocks = append(r.blocks, Block{Kind: Code, Text: s, Runs: styled})
 	case f == "head":
 		level := len(r.level) - 1
 		if level < 1 {
@@ -562,12 +604,23 @@ func (r *reader) insertText(raw []byte, length int64, comment bool) {
 		if level > 6 {
 			level = 6
 		}
-		r.blocks = append(r.blocks, Block{Kind: Heading, Level: level, Text: s})
+		r.blocks = append(r.blocks, Block{Kind: Heading, Level: level, Text: s, Runs: styled})
 	case strings.HasPrefix(f, "head") && len(f) > 4 && f[4] >= '1' && f[4] <= '6':
-		r.blocks = append(r.blocks, Block{Kind: Heading, Level: int(f[4] - '0'), Text: s})
+		r.blocks = append(r.blocks, Block{Kind: Heading, Level: int(f[4] - '0'), Text: s, Runs: styled})
 	case comment:
-		r.blocks = append(r.blocks, Block{Kind: Quote, Text: s})
+		r.blocks = append(r.blocks, Block{Kind: Quote, Text: s, Runs: styled})
 	default:
-		r.blocks = append(r.blocks, Block{Kind: Paragraph, Text: s})
+		r.blocks = append(r.blocks, Block{Kind: Paragraph, Text: s, Runs: styled})
 	}
+}
+
+// styledRuns returns runs only when at least one carries a look; otherwise nil,
+// signalling the renderer to draw the block's plain Text.
+func styledRuns(runs []Run) []Run {
+	for _, r := range runs {
+		if r.Look != 0 {
+			return runs
+		}
+	}
+	return nil
 }

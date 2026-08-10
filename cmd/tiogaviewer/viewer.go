@@ -653,6 +653,14 @@ func (s *gioUI) docBlock(gtx C, b tioga.Block) D {
 		fnt, size = monoFont, docTextSize
 	}
 	return layout.Inset{Top: top, Bottom: bottom}.Layout(gtx, func(gtx C) D {
+		// When the block carries real looks, render its runs so the file's own
+		// bold/italic/underline show through; the format still sets the base face.
+		if hasLooks(b.Runs) {
+			base := fnt
+			base.Weight = weight
+			base.Style = style
+			return s.richText(gtx, b.Runs, base, size, cedarBlack, docLineHeight)
+		}
 		return s.labelLH(gtx, fnt, weight, style, size, b.Text, cedarBlack, 0, docLineHeight)
 	})
 }
