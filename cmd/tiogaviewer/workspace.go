@@ -230,22 +230,27 @@ func (s *gioUI) processHeaderActions(gtx C) {
 		if v.kind == vkEditor && v.bSave.Clicked(gtx) {
 			s.saveEditor(v)
 		}
-		if v.kind == vkEditor && v.bRun.Clicked(gtx) {
-			s.runEditor(v)
+		if v.runnable && v.bRun.Clicked(gtx) {
+			s.runViewer(v)
 			return // added a viewer; re-evaluate next frame
 		}
 	}
 }
 
-// runEditor evaluates the editor's buffer as Mesa and shows the output in a
-// companion viewer (reused across runs).
-func (s *gioUI) runEditor(v *viewer) {
+// runViewer evaluates a viewer's Mesa source — the editor buffer for a scratch
+// document, or the decoded file source for a .mesa viewer — and shows the
+// output in a companion viewer (reused across runs).
+func (s *gioUI) runViewer(v *viewer) {
 	name := strings.TrimSpace(v.nameEd.Text())
 	if name == "" {
-		name = v.title
+		name = v.headerTitle()
 	}
 	title := "Run: " + name
-	out := runMesa(v.editor.Text())
+	code := v.src // a .mesa content viewer runs its decoded source
+	if v.kind == vkEditor {
+		code = v.editor.Text()
+	}
+	out := runMesa(code)
 	if v.runOut != nil && s.viewerAlive(v.runOut) {
 		v.runOut.title = title
 		v.runOut.outText = out

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -29,18 +31,36 @@ func TestRunEditorReusesOutputViewer(t *testing.T) {
 	v := s.newEditorViewer()
 	v.editor.SetText(helloMesa)
 
-	s.runEditor(v)
+	s.runViewer(v)
 	if v.runOut == nil || !strings.Contains(v.runOut.outText, "Hello from Mesa!") {
 		t.Fatalf("first run: %+v", v.runOut)
 	}
 	before := len(s.allViewers())
 	first := v.runOut
 
-	s.runEditor(v) // second run should reuse the same output viewer
+	s.runViewer(v) // second run should reuse the same output viewer
 	if v.runOut != first {
 		t.Fatalf("output viewer not reused")
 	}
 	if got := len(s.allViewers()); got != before {
 		t.Fatalf("viewer count changed on rerun: %d -> %d", before, got)
+	}
+}
+
+func TestOpenMesaFileIsRunnable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "Hi.mesa")
+	if err := os.WriteFile(path, []byte(helloMesa), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := newUI()
+	s.setRoot(dir)
+	v := s.newViewer(path)
+	if v.kind != vkContent || !v.runnable || v.src == "" {
+		t.Fatalf(".mesa viewer should be read-only content but runnable: %+v kind/runnable/src", v.kind)
+	}
+	s.runViewer(v)
+	if v.runOut == nil || !strings.Contains(v.runOut.outText, "Hello from Mesa!") {
+		t.Fatalf("running the opened .mesa did not produce output: %+v", v.runOut)
 	}
 }

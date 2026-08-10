@@ -63,7 +63,7 @@ func TestCapture(t *testing.T) {
 		if ed != nil {
 			ed.nameEd.SetText("Factorial.mesa")
 			ed.editor.SetText("Factorial: PROGRAM =\nBEGIN\n  Fact: PROCEDURE [n: INTEGER] RETURNS [INTEGER] =\n    BEGIN\n      IF n <= 1 THEN RETURN [1];\n      RETURN [n * Fact[n - 1]];\n    END;\n  i: INTEGER;\n  FOR i IN [1..8] DO\n    IO.PutF[\"%g! = %g\\n\", i, Fact[i]];\n  ENDLOOP;\nEND.")
-			s.runEditor(ed)
+			s.runViewer(ed)
 		}
 	}
 	if os.Getenv("CAP_TERM") != "" {

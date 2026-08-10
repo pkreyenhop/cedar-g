@@ -88,13 +88,14 @@ type viewer struct {
 	termFocus                               int // key/pointer focus tag for the terminal
 
 	bSave     widget.Clickable // editor: save to disk
-	bRun      widget.Clickable // editor: run as Mesa
+	bRun      widget.Clickable // run as Mesa
 	nameEd    widget.Editor    // editor: target filename
 	saveMsg   string           // editor: last save status
-	runOut    *viewer          // editor: its output viewer, reused across runs
+	runOut    *viewer          // its output viewer, reused across runs
 	plainText bool             // editor: save raw text (else encode as Tioga)
 	codeEdit  bool             // editor: use a monospace face
-	runnable  bool             // editor: show the Run (Mesa) button
+	runnable  bool             // show the Run (Mesa) button
+	src       string           // vkContent .mesa: decoded source, for running
 
 	outText string // vkOutput: the captured program output
 }
@@ -139,6 +140,8 @@ func (s *gioUI) newViewer(path string) *viewer {
 		v.isCode = true
 		doc := tioga.Read(data, true)
 		v.lines = codeToRuns(expandTabs(doc.Code), s.builtins)
+		v.src = doc.Code // keep the source so the Run button can execute it
+		v.runnable = true
 	default:
 		doc := tioga.Read(data, false)
 		for i := range doc.Blocks {
@@ -230,6 +233,12 @@ func (s *gioUI) header(gtx C, v *viewer) D {
 					layout.Rigid(func(gtx C) D { return s.flatButton(gtx, &v.bIcon, "Icon") }),
 					layout.Rigid(func(gtx C) D { return s.flatButton(gtx, &v.bSwitch, "Switch") }),
 					layout.Rigid(func(gtx C) D { return s.flatButton(gtx, &v.bSplit, "Split") }),
+					layout.Rigid(func(gtx C) D {
+						if v.kind != vkContent || !v.runnable {
+							return D{}
+						}
+						return s.flatButton(gtx, &v.bRun, "Run") // run a .mesa file
+					}),
 					layout.Rigid(func(gtx C) D { return D{Size: image.Pt(gtx.Dp(6), 0)} }),
 					layout.Flexed(1, func(gtx C) D {
 						return s.label(gtx, serifFont, font.Bold, font.Regular, 13, v.headerTitle(), cedarBlack, 1)
