@@ -16,6 +16,7 @@ import (
 	"gioui.org/font"
 	"gioui.org/io/event"
 	"gioui.org/io/key"
+	"gioui.org/io/system"
 	"gioui.org/layout"
 	"gioui.org/op"
 	"gioui.org/op/clip"
@@ -39,7 +40,8 @@ type gioUI struct {
 	cols      [numColumns]*column
 	minimized []*viewer
 
-	bUp, bCmd, bOpen, bNew widget.Clickable
+	bUp, bQuit, bCmd, bOpen, bNew widget.Clickable
+	quit                          func() // closes the window
 
 	treeWidth float32 // tree column width, in dp
 	colSplit  float32 // column 0's fraction of the columns area
@@ -110,6 +112,7 @@ func main() {
 		// Background directory reads / terminal output wake the render loop.
 		s.invalidate = w.Invalidate
 		s.tree.invalidate = w.Invalidate
+		s.quit = func() { w.Perform(system.ActionClose) }
 		if err := s.loop(w); err != nil {
 			os.Exit(1)
 		}
@@ -138,6 +141,13 @@ func (s *gioUI) update(gtx C) {
 	if s.bUp.Clicked(gtx) && s.root != "" {
 		if parent := filepath.Dir(s.root); parent != s.root {
 			s.setRoot(parent)
+		}
+	}
+	if s.bQuit.Clicked(gtx) {
+		if s.quit != nil {
+			s.quit()
+		} else {
+			os.Exit(0)
 		}
 	}
 	if s.bCmd.Clicked(gtx) {
@@ -203,7 +213,7 @@ func (s *gioUI) layout(gtx C) D {
 	)
 }
 
-// globalBar is the black system row: the title and the Cmd/Open/New actions.
+// globalBar is the black system row: the title and the Quit/Cmd/Open/New actions.
 func (s *gioUI) globalBar(gtx C) D {
 	h := gtx.Dp(28)
 	gtx.Constraints.Min = image.Pt(gtx.Constraints.Max.X, h)
@@ -217,6 +227,9 @@ func (s *gioUI) globalBar(gtx C) D {
 					})
 				}),
 				layout.Flexed(1, func(gtx C) D { return D{Size: image.Pt(gtx.Constraints.Max.X, 1)} }),
+				layout.Rigid(func(gtx C) D {
+					return layout.UniformInset(3).Layout(gtx, func(gtx C) D { return s.flatButton(gtx, &s.bQuit, "Quit") })
+				}),
 				layout.Rigid(func(gtx C) D {
 					return layout.UniformInset(3).Layout(gtx, func(gtx C) D { return s.flatButton(gtx, &s.bCmd, "Cmd") })
 				}),
