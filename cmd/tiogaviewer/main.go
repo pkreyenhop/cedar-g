@@ -16,7 +16,6 @@ import (
 	"gioui.org/font"
 	"gioui.org/io/event"
 	"gioui.org/io/key"
-	"gioui.org/io/system"
 	"gioui.org/layout"
 	"gioui.org/op"
 	"gioui.org/op/clip"
@@ -41,7 +40,6 @@ type gioUI struct {
 	minimized []*viewer
 
 	bUp, bQuit, bCmd, bOpen, bNew widget.Clickable
-	quit                          func() // closes the window
 
 	treeWidth float32 // tree column width, in dp
 	colSplit  float32 // column 0's fraction of the columns area
@@ -112,7 +110,6 @@ func main() {
 		// Background directory reads / terminal output wake the render loop.
 		s.invalidate = w.Invalidate
 		s.tree.invalidate = w.Invalidate
-		s.quit = func() { w.Perform(system.ActionClose) }
 		if err := s.loop(w); err != nil {
 			os.Exit(1)
 		}
@@ -144,11 +141,7 @@ func (s *gioUI) update(gtx C) {
 		}
 	}
 	if s.bQuit.Clicked(gtx) {
-		if s.quit != nil {
-			s.quit()
-		} else {
-			os.Exit(0)
-		}
+		os.Exit(0) // terminate the process (closing the window alone leaves it alive on macOS)
 	}
 	if s.bCmd.Clicked(gtx) {
 		s.openTerminal()
