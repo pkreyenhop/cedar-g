@@ -18,7 +18,7 @@ import (
 )
 
 // fileSuffixes are the file kinds shown in the tree.
-var fileSuffixes = []string{"tioga", "mesa", "df", "require", "profile", "depends"}
+var fileSuffixes = []string{"tioga", "mesa", "df", "require", "profile", "depends", "txt", "md", "go", "c"}
 
 // isTiogaName reports whether a path is a .tioga document (incl. versioned !N).
 func isTiogaName(path string) bool {

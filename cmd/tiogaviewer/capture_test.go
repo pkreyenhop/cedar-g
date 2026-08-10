@@ -37,6 +37,9 @@ func TestCapture(t *testing.T) {
 	if os.Getenv("CAP_MIN") != "" && len(s.cols[0].viewers) > 0 {
 		s.minimizeViewer(s.cols[0].viewers[0])
 	}
+	if p := os.Getenv("CAP_TEXT"); p != "" {
+		s.openFile(p)
+	}
 	if os.Getenv("CAP_NEW") != "" {
 		s.openNewDocument()
 		for _, c := range s.cols {

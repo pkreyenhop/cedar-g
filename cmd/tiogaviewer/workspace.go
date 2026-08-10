@@ -274,7 +274,9 @@ func (s *gioUI) saveEditor(v *viewer) {
 	if name == "" {
 		name = "Untitled.tioga"
 	}
-	if !strings.HasSuffix(name, ".tioga") {
+	// Tioga scratch buffers are encoded and default to a .tioga extension; plain
+	// text files keep whatever name (and extension) they already have.
+	if !v.plainText && !strings.HasSuffix(name, ".tioga") {
 		name += ".tioga"
 	}
 	dir := s.root
@@ -285,7 +287,11 @@ func (s *gioUI) saveEditor(v *viewer) {
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(dir, name)
 	}
-	if err := os.WriteFile(path, tioga.Encode(v.editor.Text()), 0o644); err != nil {
+	data := tioga.Encode(v.editor.Text())
+	if v.plainText {
+		data = []byte(v.editor.Text())
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
 		v.saveMsg = "save failed: " + err.Error()
 		return
 	}

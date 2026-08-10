@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"image"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -86,13 +87,29 @@ type viewer struct {
 	headerHovered                           bool
 	termFocus                               int // key/pointer focus tag for the terminal
 
-	bSave   widget.Clickable // editor: save to disk
-	bRun    widget.Clickable // editor: run as Mesa
-	nameEd  widget.Editor    // editor: target filename
-	saveMsg string           // editor: last save status
-	runOut  *viewer          // editor: its output viewer, reused across runs
+	bSave     widget.Clickable // editor: save to disk
+	bRun      widget.Clickable // editor: run as Mesa
+	nameEd    widget.Editor    // editor: target filename
+	saveMsg   string           // editor: last save status
+	runOut    *viewer          // editor: its output viewer, reused across runs
+	plainText bool             // editor: save raw text (else encode as Tioga)
+	codeEdit  bool             // editor: use a monospace face
+	runnable  bool             // editor: show the Run (Mesa) button
 
 	outText string // vkOutput: the captured program output
+}
+
+// editableExts are the plain-text file formats opened in an editable viewer.
+var editableExts = map[string]bool{".txt": true, ".md": true, ".go": true, ".c": true}
+
+// fileExt returns a path's lower-case extension, ignoring any Cedar "!N"
+// version suffix.
+func fileExt(path string) string {
+	b := filepath.Base(path)
+	if i := strings.IndexByte(b, '!'); i >= 0 {
+		b = b[:i]
+	}
+	return strings.ToLower(filepath.Ext(b))
 }
 
 func (v *viewer) headerTitle() string {
@@ -109,12 +126,16 @@ func (v *viewer) headerTitle() string {
 }
 
 func (s *gioUI) newViewer(path string) *viewer {
-	v := &viewer{path: path, rel: s.relPath(path)}
 	data, err := os.ReadFile(path)
+	ext := fileExt(path)
+	if err == nil && editableExts[ext] {
+		return s.newTextEditorViewer(path, string(data), ext)
+	}
+	v := &viewer{path: path, rel: s.relPath(path)}
 	switch {
 	case err != nil:
 		v.blocks = []tioga.Block{{Kind: tioga.Paragraph, Text: "cannot open: " + v.rel}}
-	case strings.HasSuffix(path, ".mesa") || strings.Contains(path, ".mesa!"):
+	case ext == ".mesa":
 		v.isCode = true
 		doc := tioga.Read(data, true)
 		v.lines = codeToRuns(expandTabs(doc.Code), s.builtins)
@@ -128,12 +149,31 @@ func (s *gioUI) newViewer(path string) *viewer {
 	return v
 }
 
+// newTextEditorViewer opens an existing plain-text file (txt/md/go/c) for
+// editing. Saving writes raw text; code files use a monospace face. Tabs are
+// expanded to spaces on load because Gio's editor cannot render tab stops; a
+// consequence is that saved source uses spaces rather than tabs.
+func (s *gioUI) newTextEditorViewer(path, content, ext string) *viewer {
+	v := &viewer{
+		kind:      vkEditor,
+		path:      path,
+		rel:       s.relPath(path),
+		title:     filepath.Base(path),
+		plainText: true,
+		codeEdit:  ext == ".go" || ext == ".c",
+	}
+	v.editor.SetText(expandTabs(content))
+	v.nameEd.SetText(filepath.Base(path))
+	return v
+}
+
 var newDocCount int
 
-// newEditorViewer opens a blank editable document.
+// newEditorViewer opens a blank editable document. It is a scratch buffer that
+// saves as Tioga and can be run as Mesa.
 func (s *gioUI) newEditorViewer() *viewer {
 	newDocCount++
-	v := &viewer{kind: vkEditor, title: fmt.Sprintf("New Document %d", newDocCount)}
+	v := &viewer{kind: vkEditor, title: fmt.Sprintf("New Document %d", newDocCount), runnable: true}
 	v.nameEd.SetText(fmt.Sprintf("Untitled-%d.tioga", newDocCount))
 	return v
 }
@@ -249,21 +289,26 @@ func (s *gioUI) body(gtx C, v *viewer) D {
 	})
 }
 
-// editorBody renders an editable document (a serif multiline editor).
+// editorBody renders an editable buffer: a serif document editor, or a
+// monospace code editor for source files.
 func (s *gioUI) editorBody(gtx C, v *viewer) D {
 	gtx.Constraints.Min = gtx.Constraints.Max
+	fnt, size := serifFont, float32(docTextSize)
+	if v.codeEdit {
+		fnt, size = monoFont, float32(codeTextSize)
+	}
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 		layout.Rigid(func(gtx C) D { return s.editorToolbar(gtx, v) }),
 		layout.Rigid(hrule),
 		layout.Flexed(1, func(gtx C) D {
 			gtx.Constraints.Min = gtx.Constraints.Max
 			return layout.Inset{Top: 6, Left: 10, Right: 10, Bottom: 6}.Layout(gtx, func(gtx C) D {
-				ed := material.Editor(s.th, &v.editor, "Type a new Tioga document…")
+				ed := material.Editor(s.th, &v.editor, "Type here…")
 				ed.Color = cedarBlack
 				ed.HintColor = cedarGreyMid
 				ed.SelectionColor = cedarGreyMid
-				ed.Font = serifFont
-				ed.TextSize = s.sp(docTextSize)
+				ed.Font = fnt
+				ed.TextSize = s.sp(size)
 				return ed.Layout(gtx)
 			})
 		}),
@@ -296,6 +341,9 @@ func (s *gioUI) editorToolbar(gtx C, v *viewer) D {
 						return ned.Layout(gtx)
 					}),
 					layout.Rigid(func(gtx C) D {
+						if !v.runnable {
+							return D{}
+						}
 						return layout.Inset{Left: 8}.Layout(gtx, func(gtx C) D {
 							return s.flatButton(gtx, &v.bRun, "Run")
 						})
