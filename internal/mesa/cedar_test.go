@@ -103,6 +103,18 @@ func TestCedarSyntaxParses(t *testing.T) {
 			  Packed: TYPE ~ MACHINE DEPENDENT RECORD [
 			    op (0: 0..5): NAT, flag (0: 6..6): BOOL ];
 			};`,
+		"full-line comment with inner -- vs inline comment": `
+			-- $Tioga -- sends a list of events -- all one comment
+			Foo: CEDAR DEFINITIONS ~ {
+			  n: INT ~ 0 --inline-- + 1;  -- $Gargoyle -- trailing
+			};`,
+		"bracketless return, NARROW type args, power, with-expr value": `
+			FooImpl: CEDAR PROGRAM ~ {
+			  Cmp: PROC [a, b: REF ANY] RETURNS [INT] ~ {
+			    RETURN Basics.CompareInt[NARROW[a, REF INT]^, NARROW[b, REF INT]^] };
+			  bits: INT ~ 2 ** 10;
+			  rope: ROPE ~ WITH prop SELECT FROM r: ROPE => r, ENDCASE => NIL;
+			};`,
 		"exits, repeat, goto, fork, new[type[n]]": `
 			FooImpl: CEDAR PROGRAM ~ {
 			  Go: PROC [n: NAT] RETURNS [REF Seq] ~ {

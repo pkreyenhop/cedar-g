@@ -358,8 +358,10 @@ var bodyQualifiers = map[string]bool{
 }
 
 func (p *Parser) parseType() TypeExpr {
-	// Skip decorating qualifiers (PACKED ARRAY, LONG POINTER, MACHINE DEPENDENT…).
-	for p.cur().Kind == TIdent && typeQualifiers[p.cur().Text] {
+	// Skip decorating qualifiers (PACKED ARRAY, LONG POINTER, MACHINE DEPENDENT…)
+	// and a representation prefix before MACHINE, e.g. WORD32 MACHINE DEPENDENT.
+	for (p.cur().Kind == TIdent && typeQualifiers[p.cur().Text]) ||
+		(p.cur().Kind == TIdent && p.peek().Kind == TIdent && p.peek().Text == "MACHINE") {
 		p.advance()
 	}
 	if p.cur().Kind == TIdent && p.cur().Text == "MACHINE" {
@@ -699,16 +701,16 @@ func (p *Parser) parseFieldList(closer string) []Field {
 			p.expectPunct(":")
 			ft := p.parseType()
 			// ignore an optional default value
-			if p.acceptPunct("<-") || p.acceptPunct("=") {
-				p.parseExpr()
+			if (p.acceptPunct("<-") || p.acceptPunct("=")) && p.startsValue() {
+				p.parseValueExpr()
 			}
 			for _, n := range names {
 				fields = append(fields, Field{Name: n, Type: ft})
 			}
 		} else {
 			ft := p.parseType()
-			if p.acceptPunct("<-") || p.acceptPunct("=") { // anonymous field default
-				p.parseExpr()
+			if (p.acceptPunct("<-") || p.acceptPunct("=")) && p.startsValue() { // anonymous field default
+				p.parseValueExpr()
 			}
 			fields = append(fields, Field{Name: "", Type: ft})
 		}
@@ -729,9 +731,9 @@ func (p *Parser) parseInterval() *Interval {
 	default:
 		p.fail("expected '[' or '(' to start interval")
 	}
-	iv.Lo = p.parseExpr()
+	iv.Lo = p.parseValueExpr()
 	p.expectPunct("..")
-	iv.Hi = p.parseExpr()
+	iv.Hi = p.parseValueExpr()
 	switch {
 	case p.acceptPunct("]"):
 		iv.IncHi = true
@@ -830,6 +832,23 @@ var raiseWords = map[string]bool{
 	"WAIT": true, "NOTIFY": true, "BROADCAST": true,
 }
 
+// startsValue reports whether a value follows (i.e. the cursor is not at a
+// separator/closer), used to skip empty "← ," defaults while still accepting
+// keyword values like NIL, NEW and IF.
+func (p *Parser) startsValue() bool {
+	t := p.cur()
+	if t.Kind == TEOF {
+		return false
+	}
+	if t.Kind == TPunct {
+		switch t.Text {
+		case ",", "]", ")", "}", ";":
+			return false
+		}
+	}
+	return true
+}
+
 // startsExprStmt reports whether the current token can begin an expression
 // operand (used to decide if a raise word has an argument).
 func (p *Parser) startsExprStmt() bool {
@@ -841,6 +860,28 @@ func (p *Parser) startsExprStmt() bool {
 		return t.Text == "(" || t.Text == "[" || t.Text == "@" || t.Text == "-" || t.Text == "~"
 	}
 	return false
+}
+
+// skipCatchArgs skips a "! handler" clause inside a call's brackets, up to the
+// enclosing ']' or ')' (its arms are ';'-separated, so ';' is not a terminator).
+func (p *Parser) skipCatchArgs() {
+	depth := 0
+	for p.cur().Kind != TEOF {
+		switch {
+		case p.isPunct("[") || p.isPunct("(") || p.isPunct("{"):
+			depth++
+		case p.isPunct("]") || p.isPunct(")"):
+			if depth == 0 {
+				return
+			}
+			depth--
+		case p.isPunct("}"):
+			if depth > 0 {
+				depth--
+			}
+		}
+		p.advance()
+	}
 }
 
 // skipCatch2 skips a handler clause up to the end of the statement.
@@ -1058,7 +1099,11 @@ func (p *Parser) parseWithSelect() Stmt {
 		p.advance() // binding name
 		p.advance() // ':'
 	}
-	s.Subject = p.parseExpr()
+	if p.cur().Kind == TIdent && p.peek().Kind == TPunct && p.peek().Text == "~" {
+		p.advance() // binding name (WITH name ~ value SELECT)
+		p.advance() // '~'
+	}
+	s.Subject = p.parseValueExpr()
 	p.expectKw("SELECT")
 	for !p.isKw("FROM") && p.cur().Kind != TEOF { // an optional discriminator tag
 		p.advance()
@@ -1085,7 +1130,7 @@ func (p *Parser) parseSelect() Stmt {
 	line := p.cur().Line
 	p.expectKw("SELECT")
 	s := &SelectStmt{Line: line}
-	s.Subject = p.parseExpr()
+	s.Subject = p.parseValueExpr()
 	p.expectKw("FROM")
 	for !p.isKw("ENDCASE") && p.cur().Kind != TEOF {
 		var arm SelectArm
@@ -1150,9 +1195,11 @@ func (p *Parser) parseReturn() Stmt {
 			}
 		}
 		if p.isPunct("!") { // a catch clause on the returned call
-			p.skipCatch()
+			p.skipCatchArgs()
 		}
 		p.expectPunct("]")
+	} else if p.startsValue() { // bracketless return: RETURN expr
+		r.Values = append(r.Values, p.parseValueExpr())
 	}
 	return r
 }
@@ -1166,7 +1213,53 @@ func (p *Parser) parseExpr() Expr {
 	if p.isKw("SELECT") {
 		return p.parseSelectExpr()
 	}
+	if p.cur().Kind == TIdent && p.cur().Text == "WITH" {
+		return p.parseWithSelectExpr()
+	}
+	if p.cur().Kind == TIdent && exprRaiseWords[p.cur().Text] {
+		// ERROR/SIGNAL/RAISE used as a value (e.g. IF c THEN ERROR Foo ELSE x).
+		line := p.advance().Line
+		if p.startsExprStmt() {
+			p.parseValueExpr()
+		}
+		return &Ident{Name: "NIL", Line: line}
+	}
 	return p.parseOr()
+}
+
+// exprRaiseWords may raise from an expression position.
+var exprRaiseWords = map[string]bool{"ERROR": true, "SIGNAL": true, "RAISE": true}
+
+// typeValPrefix words prefix a type used as a value (LONG CARDINAL, REF INT),
+// e.g. as a NARROW/LAST/SIZE argument; they are consumed as no-ops.
+var typeValPrefix = map[string]bool{"LONG": true, "SHORT": true, "REF": true}
+
+// parseWithSelectExpr consumes a WITH … SELECT used as a value; not executed.
+func (p *Parser) parseWithSelectExpr() Expr {
+	line := p.cur().Line
+	p.advance() // WITH
+	for !p.isKw("FROM") && p.cur().Kind != TEOF { // consume the subject and SELECT
+		p.advance()
+	}
+	p.acceptKw("FROM")
+	depth := 0
+	for p.cur().Kind != TEOF {
+		if depth == 0 && p.isKw("ENDCASE") {
+			p.advance()
+			break
+		}
+		switch {
+		case p.isKw("SELECT"):
+			depth++
+		case p.isKw("ENDCASE"):
+			depth--
+		}
+		p.advance()
+	}
+	if p.acceptPunct("=>") {
+		p.parseValueExpr()
+	}
+	return &Ident{Name: "NIL", Line: line}
 }
 
 // parseValueExpr parses an expression that may itself be an assignment, as
@@ -1213,9 +1306,9 @@ func (p *Parser) parseIfExpr() Expr {
 	p.expectKw("IF")
 	cond := p.parseValueExpr()
 	p.expectKw("THEN")
-	then := p.parseExpr()
+	then := p.parseValueExpr()
 	p.expectKw("ELSE")
-	els := p.parseExpr()
+	els := p.parseValueExpr()
 	return &IfExpr{Cond: cond, Then: then, Else: els, Line: line}
 }
 
@@ -1293,7 +1386,7 @@ func (p *Parser) parseAdd() Expr {
 
 func (p *Parser) parseMul() Expr {
 	x := p.parseUnary()
-	for p.isPunct("*") || p.isPunct("/") || p.isKw("MOD") {
+	for p.isPunct("*") || p.isPunct("/") || p.isPunct("**") || p.isKw("MOD") {
 		op := p.advance()
 		y := p.parseUnary()
 		x = &Binary{Op: op.Text, L: x, R: y, Line: op.Line}
@@ -1318,9 +1411,8 @@ func (p *Parser) parseUnary() Expr {
 	case p.isPunct("@"):
 		line := p.advance().Line
 		return &Unary{Op: "@", X: p.parseUnary(), Line: line}
-	case p.cur().Kind == TIdent && (p.cur().Text == "LONG" || p.cur().Text == "SHORT") &&
-		p.peek().Kind == TIdent:
-		// A size prefix on a type used as a value, e.g. LAST[LONG CARDINAL].
+	case p.cur().Kind == TIdent && typeValPrefix[p.cur().Text] && p.peek().Kind == TIdent:
+		// A type used as a value: LAST[LONG CARDINAL], NARROW[x, REF INT].
 		p.advance()
 		return p.parseUnary()
 	}
@@ -1350,7 +1442,7 @@ func (p *Parser) parsePostfix() Expr {
 				}
 			}
 			if p.isPunct("!") { // a call-site catch clause: proc[args ! handler]
-				p.skipCatch()
+				p.skipCatchArgs()
 			}
 			p.expectPunct("]")
 			x = &Apply{Fun: x, Args: args, Line: line}

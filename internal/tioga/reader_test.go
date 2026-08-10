@@ -57,3 +57,13 @@ func TestShortBufferIsNotTioga(t *testing.T) {
 		t.Fatalf("unexpected code doc")
 	}
 }
+
+func TestFallbackNormalizesCR(t *testing.T) {
+	// A non-Tioga file with classic CR (and CRLF) line endings must decode with
+	// "\n" separators so line structure and comment termination survive.
+	got := decodeFallback([]byte("-- a\rb: INT;\r\n-- c"))
+	want := "-- a\nb: INT;\n-- c"
+	if got != want {
+		t.Fatalf("decodeFallback = %q, want %q", got, want)
+	}
+}

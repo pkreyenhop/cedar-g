@@ -13,12 +13,19 @@ import (
 // decodeFallback decodes a file that is not in the Tioga container format. If the
 // bytes are already valid UTF-8 (e.g. a modern source that literally contains
 // "←"), they are kept as text; otherwise they are treated as Latin-1 via
-// toString. In both cases Cedar's "_" assignment alias is displayed as "←".
+// toString. In both cases Cedar's "_" assignment alias is displayed as "←", and
+// classic CR / CRLF line endings are normalised to "\n" so line structure (and
+// comment termination) survives.
 func decodeFallback(data []byte) string {
+	var s string
 	if utf8.Valid(data) {
-		return strings.ReplaceAll(string(data), "_", "←")
+		s = strings.ReplaceAll(string(data), "_", "←")
+	} else {
+		s = toString(data)
 	}
-	return toString(data)
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	return s
 }
 
 // BlockKind classifies a rendered document block.

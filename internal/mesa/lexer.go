@@ -12,14 +12,15 @@ import (
 // front makes the parser's occasional backtracking (declaration vs.
 // statement) trivial.
 type Lexer struct {
-	src  string
-	pos  int
-	line int
-	col  int
+	src       string
+	pos       int
+	line      int
+	col       int
+	lineStart bool // no code token yet on the current line
 }
 
 func NewLexer(src string) *Lexer {
-	return &Lexer{src: src, line: 1, col: 1}
+	return &Lexer{src: src, line: 1, col: 1, lineStart: true}
 }
 
 func (l *Lexer) errorf(format string, a ...any) error {
@@ -55,6 +56,7 @@ func (l *Lexer) advance() rune {
 	if r == '\n' {
 		l.line++
 		l.col = 1
+		l.lineStart = true
 	} else {
 		l.col++
 	}
@@ -110,7 +112,10 @@ func (l *Lexer) skipSpaceAndComments() error {
 				l.advance()
 			}
 		case r == '-' && l.peek2() == '-':
-			// Mesa comment: -- ... terminated by another -- or end of line.
+			// A '--' comment: at the start of a line it runs to end of line (so a
+			// full-line comment whose text contains '--' stays a comment); after
+			// code it is an inline comment bounded by the next '--'.
+			fullLine := l.lineStart
 			l.advance()
 			l.advance()
 			for {
@@ -118,7 +123,7 @@ func (l *Lexer) skipSpaceAndComments() error {
 				if c == 0 || c == '\n' {
 					break
 				}
-				if c == '-' && l.peek2() == '-' {
+				if !fullLine && c == '-' && l.peek2() == '-' {
 					l.advance()
 					l.advance()
 					break
@@ -140,6 +145,7 @@ func (l *Lexer) next() (Token, error) {
 	if r == 0 {
 		return Token{Kind: TEOF, Line: line, Col: col}, nil
 	}
+	l.lineStart = false // a real token now sits on this line
 
 	// Identifiers / keywords
 	if isIdentStart(r) {
