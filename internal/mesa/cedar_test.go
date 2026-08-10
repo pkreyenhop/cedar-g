@@ -208,3 +208,48 @@ func TestCleanParseHasNoRecovery(t *testing.T) {
 		t.Fatalf("clean program reported %d recoveries", m.Recovered)
 	}
 }
+
+// TestTier1ParsesCleanly checks the four constructs added in the tier-1 batch
+// parse with no error recovery (a plain err==nil check would be masked by
+// recovery).
+func TestTier1ParsesCleanly(t *testing.T) {
+	cases := map[string]string{
+		"type-valued arguments": `FooImpl: CEDAR PROGRAM ~ {
+		  n: NAT ~ BITS[[0..8)];
+		  Go: PROC [x: REF ANY] ~ {
+		    p: LONG POINTER TO CARD ← LOOPHOLE[x, LONG POINTER TO CARD];
+		    sz: INT ~ SIZE[POINTER TO Foo];
+		  };
+		}.`,
+		"variant-bound REF type": `FooImpl: CEDAR PROGRAM ~ {
+		  Get: PROC RETURNS [res: REF Base] ~ {
+		    v: REF Success MS.MaintainObject ← NEW[Success MS.MaintainObject];
+		    res ← v;
+		  };
+		}.`,
+		"OPEN and ENABLE in loop bodies": `FooImpl: CEDAR PROGRAM ~ {
+		  Go: PROC ~ {
+		    DO OPEN old: mobh.bases.ntb[nti];
+		      ENABLE Err => CONTINUE;
+		      x ← old.next;
+		    ENDLOOP;
+		  };
+		}.`,
+		"doubled-quote strings": `FooImpl: CEDAR PROGRAM ~ {
+		  q: ROPE ~ """";
+		  s: ROPE ~ "a""b";
+		  Sep: PROC [c: CHAR] RETURNS [ROPE] ~ {
+		    RETURN [IF c = '" THEN """" ELSE ">"] };
+		}.`,
+	}
+	for name, src := range cases {
+		m, err := ParseSource(src)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		if m.Recovered != 0 {
+			t.Errorf("%s: parsed with %d recoveries, want a clean parse", name, m.Recovered)
+		}
+	}
+}

@@ -170,28 +170,7 @@ func (p *Parser) parseBlock() *Block {
 	default:
 		p.fail("expected BEGIN or '{'")
 	}
-	// Cedar blocks may begin with "OPEN interfaces;" and/or "ENABLE handlers;".
-	for {
-		if p.acceptWord("OPEN") {
-			for p.cur().Kind != TEOF && !p.isPunct(";") {
-				p.advance()
-			}
-			p.acceptPunct(";")
-			continue
-		}
-		if p.acceptWord("ENABLE") {
-			if p.isPunct("{") {
-				p.skipBraces()
-			} else {
-				for p.cur().Kind != TEOF && !p.isPunct(";") {
-					p.advance()
-				}
-			}
-			p.acceptPunct(";")
-			continue
-		}
-		break
-	}
+	p.skipBlockPrologue()
 	items := p.parseStmtSeq(closer)
 	// A trailing "EXITS label => stmt; …" clause names block-exit handlers.
 	if p.acceptWord("EXITS") {
@@ -225,6 +204,32 @@ func (p *Parser) parseBlock() *Block {
 // atStop reports whether the current token ends the current sequence.
 func (p *Parser) atStop(closer string) bool {
 	return p.isKw(closer) || p.isPunct(closer)
+}
+
+// skipBlockPrologue skips leading "OPEN interfaces;" and "ENABLE handlers;"
+// clauses that may open a block or loop body.
+func (p *Parser) skipBlockPrologue() {
+	for {
+		if p.acceptWord("OPEN") {
+			for p.cur().Kind != TEOF && !p.isPunct(";") {
+				p.advance()
+			}
+			p.acceptPunct(";")
+			continue
+		}
+		if p.acceptWord("ENABLE") {
+			if p.isPunct("{") {
+				p.skipBraces()
+			} else {
+				for p.cur().Kind != TEOF && !p.isPunct(";") {
+					p.advance()
+				}
+			}
+			p.acceptPunct(";")
+			continue
+		}
+		break
+	}
 }
 
 func (p *Parser) parseStmtSeq(closer string) []Stmt {
@@ -560,6 +565,11 @@ func (p *Parser) parseType() TypeExpr {
 				return &SubrangeType{Base: nt, Ival: iv}
 			}
 			p.skipBrackets() // Foo[n] — a dimension/size argument
+		}
+		// A variant-bound type names the variant tag then the base type:
+		// REF Success MS.MaintainreturnObject.
+		if p.cur().Kind == TIdent && !typeQualifiers[p.cur().Text] {
+			return p.parseType()
 		}
 		return nt
 	}
@@ -1125,6 +1135,7 @@ func (p *Parser) parseLoop() Stmt {
 		l.Until = p.parseExpr()
 	}
 	p.expectKw("DO")
+	p.skipBlockPrologue() // a loop body may also open with OPEN/ENABLE
 	// The body runs up to ENDLOOP or a REPEAT (loop-exit handler) clause.
 	var items []Stmt
 	for {
@@ -1134,7 +1145,17 @@ func (p *Parser) parseLoop() Stmt {
 			(p.cur().Kind == TIdent && p.cur().Text == "REPEAT") {
 			break
 		}
-		items = append(items, p.parseItem())
+		start := p.pos
+		stmt, ok := p.tryParseItem()
+		if !ok { // recover within the loop body too
+			p.recovered++
+			p.resync("ENDLOOP")
+			if p.pos == start {
+				p.advance()
+			}
+			continue
+		}
+		items = append(items, stmt)
 		if !p.acceptPunct(";") {
 			break
 		}
@@ -1150,7 +1171,7 @@ func (p *Parser) parseLoop() Stmt {
 			p.acceptPunct(";")
 		}
 	}
-	p.expectKw("ENDLOOP")
+	p.acceptKw("ENDLOOP") // tolerant: recovery may have consumed it
 	return l
 }
 
@@ -1501,6 +1522,11 @@ func (p *Parser) parseUnary() Expr {
 		// A type used as a value: LAST[LONG CARDINAL], NARROW[x, REF INT].
 		p.advance()
 		return p.parseUnary()
+	case p.cur().Kind == TIdent && p.cur().Text == "POINTER":
+		// A pointer type used as a value: LOOPHOLE[x, POINTER TO CARD].
+		p.advance()
+		p.acceptWord("TO")
+		return p.parseUnary()
 	}
 	return p.parsePostfix()
 }
@@ -1600,6 +1626,10 @@ func (p *Parser) parsePrimary() Expr {
 			p.expectPunct(")")
 			return x
 		case "[":
+			if p.bracketHasRange() { // a subrange type as a value: BITS[[0..n)]
+				p.parseInterval() // handles the mixed [lo..hi) bracket form
+				return &Ident{Name: "NIL", Line: t.Line}
+			}
 			return p.parseAggregate()
 		}
 	}

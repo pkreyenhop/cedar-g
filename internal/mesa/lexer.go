@@ -313,6 +313,10 @@ func (l *Lexer) lexString(line, col int) (Token, error) {
 		}
 		if c == '"' {
 			l.advance()
+			if l.peek() == '"' { // "" is an escaped quote inside the string
+				sb.WriteRune(l.advance())
+				continue
+			}
 			if l.peek() == 'L' { // a "…"L long-string literal suffix
 				l.advance()
 			}
