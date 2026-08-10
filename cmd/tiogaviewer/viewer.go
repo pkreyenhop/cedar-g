@@ -64,6 +64,7 @@ const (
 	vkContent viewerKind = iota // a decoded document or code file
 	vkEditor                    // a blank/editable Tioga document
 	vkTerm                      // a shell terminal
+	vkOutput                    // read-only program output (e.g. a Mesa run)
 )
 
 // viewer is one Cedar "Viewer": a pane living in a column.
@@ -86,8 +87,12 @@ type viewer struct {
 	termFocus                               int // key/pointer focus tag for the terminal
 
 	bSave   widget.Clickable // editor: save to disk
+	bRun    widget.Clickable // editor: run as Mesa
 	nameEd  widget.Editor    // editor: target filename
 	saveMsg string           // editor: last save status
+	runOut  *viewer          // editor: its output viewer, reused across runs
+
+	outText string // vkOutput: the captured program output
 }
 
 func (v *viewer) headerTitle() string {
@@ -136,6 +141,11 @@ func (s *gioUI) newEditorViewer() *viewer {
 // newTerminalViewer opens a shell terminal.
 func (s *gioUI) newTerminalViewer() *viewer {
 	return &viewer{kind: vkTerm, title: "Terminal", term: newTerminal(s.invalidate)}
+}
+
+// newOutputViewer shows read-only program output.
+func (s *gioUI) newOutputViewer(title, text string) *viewer {
+	return &viewer{kind: vkOutput, title: title, outText: text}
 }
 
 // layoutViewer draws one bordered Viewer: header (actions + title), rule, body.
@@ -219,6 +229,8 @@ func (s *gioUI) body(gtx C, v *viewer) D {
 		return s.editorBody(gtx, v)
 	case vkTerm:
 		return s.termBody(gtx, v)
+	case vkOutput:
+		return s.outputBody(gtx, v)
 	}
 	// The left margin comes from the scroll gutter; add top/right/bottom only.
 	if v.isCode {
@@ -284,7 +296,12 @@ func (s *gioUI) editorToolbar(gtx C, v *viewer) D {
 						return ned.Layout(gtx)
 					}),
 					layout.Rigid(func(gtx C) D {
-						return layout.Inset{Left: 8, Right: 8}.Layout(gtx, func(gtx C) D {
+						return layout.Inset{Left: 8}.Layout(gtx, func(gtx C) D {
+							return s.flatButton(gtx, &v.bRun, "Run")
+						})
+					}),
+					layout.Rigid(func(gtx C) D {
+						return layout.Inset{Left: 6, Right: 8}.Layout(gtx, func(gtx C) D {
 							return s.flatButton(gtx, &v.bSave, "Save")
 						})
 					}),
@@ -298,6 +315,18 @@ func (s *gioUI) editorToolbar(gtx C, v *viewer) D {
 			})
 		}),
 	)
+}
+
+// outputBody renders read-only program output as monospace lines.
+func (s *gioUI) outputBody(gtx C, v *viewer) D {
+	gtx.Constraints.Min = gtx.Constraints.Max
+	lines := strings.Split(v.outText, "\n")
+	return layout.Inset{Top: 4, Right: 12, Bottom: 4}.Layout(gtx, func(gtx C) D {
+		gtx.Constraints.Min = gtx.Constraints.Max
+		return s.scrollList(gtx, &v.sc, len(lines), func(gtx C, i int) D {
+			return s.label(gtx, monoFont, font.Normal, font.Regular, termTextSize, lines[i], cedarBlack, 1)
+		})
+	})
 }
 
 // termBody renders the shell terminal: output fills the whole body and you type

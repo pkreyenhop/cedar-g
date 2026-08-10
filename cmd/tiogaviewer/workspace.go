@@ -230,7 +230,42 @@ func (s *gioUI) processHeaderActions(gtx C) {
 		if v.kind == vkEditor && v.bSave.Clicked(gtx) {
 			s.saveEditor(v)
 		}
+		if v.kind == vkEditor && v.bRun.Clicked(gtx) {
+			s.runEditor(v)
+			return // added a viewer; re-evaluate next frame
+		}
 	}
+}
+
+// runEditor evaluates the editor's buffer as Mesa and shows the output in a
+// companion viewer (reused across runs).
+func (s *gioUI) runEditor(v *viewer) {
+	name := strings.TrimSpace(v.nameEd.Text())
+	if name == "" {
+		name = v.title
+	}
+	title := "Run: " + name
+	out := runMesa(v.editor.Text())
+	if v.runOut != nil && s.viewerAlive(v.runOut) {
+		v.runOut.title = title
+		v.runOut.outText = out
+	} else {
+		v.runOut = s.newOutputViewer(title, out)
+		s.addViewer(v.runOut)
+	}
+	if s.invalidate != nil {
+		s.invalidate()
+	}
+}
+
+// viewerAlive reports whether v is still on screen (in a column or minimized).
+func (s *gioUI) viewerAlive(v *viewer) bool {
+	for _, x := range s.allViewers() {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 // saveEditor encodes the editor's text as a Tioga file and writes it to disk.
