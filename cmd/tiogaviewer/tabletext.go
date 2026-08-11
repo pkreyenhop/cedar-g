@@ -274,6 +274,7 @@ func (s *gioUI) tableBlock(gtx C, b tioga.Block) D {
 		rightAlign[c] = c > 0 && numTot[c] > 0 && numHits[c]*2 >= numTot[c]
 	}
 
+	col := blockColor(b)
 	gap := gtx.Dp(16)
 	lineH := s.tokMeasure(gtx, st.fnt, st.size, "Ag").Size.Y
 	pitch := lineH + gtx.Dp(3)
@@ -302,7 +303,7 @@ func (s *gioUI) tableBlock(gtx C, b tioga.Block) D {
 					cw := s.cellWidth(gtx, cell, st.fnt, st.size)
 					cx := colX[c0] + (colX[c1]+colW[c1]-colX[c0]-cw)/2
 					off := op.Offset(image.Pt(cx, y)).Push(gtx.Ops)
-					s.cellDraw(gtx, cell, st.fnt, st.size, cedarBlack)
+					s.cellDraw(gtx, cell, st.fnt, st.size, col)
 					off.Pop()
 				}
 				y += pitch
@@ -315,7 +316,7 @@ func (s *gioUI) tableBlock(gtx C, b tioga.Block) D {
 					cx = colX[c] + colW[c] - s.cellWidth(gtx, cell, st.fnt, st.size)
 				}
 				off := op.Offset(image.Pt(cx, y)).Push(gtx.Ops)
-				s.cellDraw(gtx, cell, st.fnt, st.size, cedarBlack)
+				s.cellDraw(gtx, cell, st.fnt, st.size, col)
 				off.Pop()
 			}
 			y += pitch

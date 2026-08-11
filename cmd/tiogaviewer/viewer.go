@@ -781,14 +781,33 @@ func (s *gioUI) docBlock(gtx C, b tioga.Block) D {
 	if b.Kind == tioga.Quote && b.Format == "" {
 		st.fnt.Style = font.Italic
 	}
+	col := blockColor(b)
 	return layout.Inset{Top: st.above, Bottom: st.below, Left: st.indent}.Layout(gtx, func(gtx C) D {
 		// When the block carries real looks, render its runs so the file's own
 		// bold/italic/underline show through; the format still sets the base face.
 		if hasLooks(b.Runs) {
-			return s.richText(gtx, b.Runs, st.fnt, st.size, cedarBlack, docLineHeight, st.align)
+			return s.richText(gtx, b.Runs, st.fnt, st.size, col, docLineHeight, st.align)
 		}
-		return s.paraLabel(gtx, st.fnt, st.size, st.align, docLineHeight, b.Text, cedarBlack)
+		return s.paraLabel(gtx, st.fnt, st.size, st.align, docLineHeight, b.Text, col)
 	})
+}
+
+// blockColor is a block's text colour: its CharProps text colour if set (a
+// postfix property), else the default black.
+func blockColor(b tioga.Block) color.NRGBA {
+	if b.Fg == nil {
+		return cedarBlack
+	}
+	cl := func(f float32) uint8 {
+		if f < 0 {
+			f = 0
+		}
+		if f > 1 {
+			f = 1
+		}
+		return uint8(f*255 + 0.5)
+	}
+	return color.NRGBA{R: cl(b.Fg.R), G: cl(b.Fg.G), B: cl(b.Fg.B), A: 0xff}
 }
 
 // paraLabel draws a wrapped, aligned plain-text paragraph (the no-looks path).

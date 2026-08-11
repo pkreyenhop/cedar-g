@@ -51,6 +51,7 @@ type Block struct {
 	Format string
 	Depth  int
 	Art    []byte // Gargoyle scene bytes for an artwork node (else nil)
+	Fg     *RGB   // node text colour from a CharProps textColor property (else nil)
 }
 
 // Document is the decoded result. When IsCode is true, Code holds the
@@ -143,8 +144,9 @@ type reader struct {
 	pendingRuns []runSpan // look-runs read for the next rope (runs precede rope)
 
 	// output
-	code   strings.Builder
-	blocks []Block
+	code       strings.Builder
+	blocks     []Block
+	blockNodes []*Node // node each block came from (parallel to blocks)
 }
 
 // Read decodes data. If the buffer is not a valid Tioga file it is treated as
@@ -165,7 +167,21 @@ func Read(data []byte, isCode bool) Document {
 		return Document{IsCode: true, Code: r.code.String(), Root: r.root}
 	}
 	r.attachArtwork()
+	r.attachColors()
 	return Document{Blocks: r.blocks, Root: r.root}
+}
+
+// attachColors sets each block's text colour from its node's CharProps textColor
+// property, using the node recorded for each block.
+func (r *reader) attachColors() {
+	for i := range r.blocks {
+		if i < len(r.blockNodes) && r.blockNodes[i] != nil {
+			if rgb, ok := TextColorOf(r.blockNodes[i].Props); ok {
+				c := rgb
+				r.blocks[i].Fg = &c
+			}
+		}
+	}
 }
 
 // GGFileOf returns a node's Gargoyle scene bytes (its "GGFile"/"ggfile"
@@ -654,6 +670,7 @@ func (r *reader) insertText(raw []byte, length int64, comment bool) {
 	depth := len(r.level)
 	kind, level := blockKind(f, depth, comment)
 	r.blocks = append(r.blocks, Block{Text: s, Runs: styled, Format: f, Depth: depth, Kind: kind, Level: level})
+	r.blockNodes = append(r.blockNodes, r.cur)
 }
 
 // blockKind maps a node's format (and nesting depth / comment flag) to a
