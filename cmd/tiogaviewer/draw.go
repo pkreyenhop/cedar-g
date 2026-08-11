@@ -174,8 +174,11 @@ func (s *gioUI) scrollList(gtx C, sc *scroller, n int, el layout.ListElement) D 
 					sc.list.List.Position.First = int(f * float32(n))
 					sc.list.List.Position.Offset = 0
 				}
-				// Holding then keeps scrolling in the button's direction.
+				// Cedar button semantics: left holds scrolling up, right down; the
+				// middle button just thumbs to the absolute position (no hold).
 				switch {
+				case pe.Buttons.Contain(pointer.ButtonTertiary):
+					sc.scrollDir = 0
 				case pe.Buttons.Contain(pointer.ButtonPrimary):
 					sc.scrollDir = -1 // left → up
 				case pe.Buttons.Contain(pointer.ButtonSecondary):
@@ -227,17 +230,20 @@ func (s *gioUI) scrollList(gtx C, sc *scroller, n int, el layout.ListElement) D 
 		totalH = full.Y
 	}
 
-	// Paint the wide grey track and darker thumb only while hovered.
+	// A Cedar scrollbar: the position thumb is always shown on the left edge
+	// (thin when idle), and the full grey track appears on hover.
+	start, end := viewportFraction(sc.list.Position, n, totalH)
+	ty0 := int(clamp01(start) * float32(totalH))
+	ty1 := int(clamp01(end) * float32(totalH))
+	if ty1 <= ty0 {
+		ty1 = ty0 + 2
+	}
+	thumbW := gutter / 3
 	if sc.hovered {
 		fillAt(gtx, cedarGrey, image.Rect(0, 0, gutter, totalH))
-		start, end := viewportFraction(sc.list.Position, n, totalH)
-		ty0 := int(clamp01(start) * float32(totalH))
-		ty1 := int(clamp01(end) * float32(totalH))
-		if ty1 <= ty0 {
-			ty1 = ty0 + 2
-		}
-		fillAt(gtx, cedarGreyMid, image.Rect(0, ty0, gutter, ty1))
+		thumbW = gutter
 	}
+	fillAt(gtx, cedarGreyMid, image.Rect(0, ty0, thumbW, ty1))
 
 	// Narrow scrollbar press area (opaque; handles the button scroll).
 	pst := clip.Rect{Max: image.Pt(gutter, totalH)}.Push(gtx.Ops)
