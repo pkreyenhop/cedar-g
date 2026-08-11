@@ -41,6 +41,18 @@ func TestCapture(t *testing.T) {
 	if p := os.Getenv("CAP_TEXT"); p != "" {
 		s.openFile(p)
 	}
+	if kw := os.Getenv("CAP_SCROLLTO"); kw != "" {
+		for _, c := range s.cols {
+			for _, v := range c.viewers {
+				for i, b := range v.blocks {
+					if strings.Contains(b.Text, kw) {
+						v.sc.list.List.Position.First = i
+						break
+					}
+				}
+			}
+		}
+	}
 	if os.Getenv("CAP_STRUCT") != "" {
 		for _, c := range s.cols {
 			for _, v := range c.viewers {

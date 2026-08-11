@@ -79,3 +79,29 @@ func renderLines(lines [][]tok) string {
 	}
 	return strings.Join(out, "|")
 }
+
+func TestExpandRunTabs(t *testing.T) {
+	bold := tioga.Look(1 << (31 - ('b' - 'a')))
+	runs := []tioga.Run{{Text: "Idle Cedar", Look: bold}, {Text: "\t\t0.9\t"}, {Text: "132"}}
+	out := expandRunTabs(runs)
+	var joined string
+	for _, r := range out {
+		joined = joined + r.Text
+	}
+	if strings.ContainsRune(joined, '\t') {
+		t.Fatalf("tab survived expansion: %q", joined)
+	}
+	// Column tracking is cross-run: "Idle Cedar" is 10 cols, so the first tab
+	// fills to col 16 (6 spaces) and the second to col 24 (8 spaces).
+	if out[1].Text != "      0.9     " && !strings.HasPrefix(out[1].Text, "      ") {
+		t.Fatalf("unexpected expansion: %q", out[1].Text)
+	}
+	if !out[0].Look.Bold() {
+		t.Fatalf("look lost during expansion")
+	}
+	// No tabs -> the same slice is returned untouched.
+	plain := []tioga.Run{{Text: "no tabs here"}}
+	if got := expandRunTabs(plain); &got[0] != &plain[0] {
+		t.Fatalf("tab-free runs should be returned unchanged")
+	}
+}

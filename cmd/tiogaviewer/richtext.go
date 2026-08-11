@@ -3,6 +3,7 @@ package main
 import (
 	"image"
 	"image/color"
+	"strings"
 
 	"gioui.org/font"
 	"gioui.org/op"
@@ -109,6 +110,7 @@ type tok struct {
 // buildTokens flattens runs into measured tokens, splitting each run at
 // whitespace and newlines so wrapTokens can break between them.
 func (s *gioUI) buildTokens(gtx C, runs []tioga.Run, base font.Font, size float32) []tok {
+	runs = expandRunTabs(runs)
 	var toks []tok
 	for _, r := range runs {
 		fnt := base
@@ -133,6 +135,50 @@ func (s *gioUI) buildTokens(gtx C, runs []tioga.Run, base font.Font, size float3
 		}
 	}
 	return toks
+}
+
+// expandRunTabs replaces tab characters in styled runs with spaces to the next
+// 8-column stop, tracking the column across run boundaries (a table row's label
+// and value are separate runs) and resetting at newlines. Without this, Gio
+// draws a raw tab as a missing-glyph box — the same reason expandTabs exists for
+// plain text, but here applied to the look-carrying rich-text path (e.g. the
+// bold, tab-aligned rows of a Tioga table).
+func expandRunTabs(runs []tioga.Run) []tioga.Run {
+	hasTab := false
+	for _, r := range runs {
+		if strings.ContainsRune(r.Text, '\t') {
+			hasTab = true
+			break
+		}
+	}
+	if !hasTab {
+		return runs
+	}
+	const tw = 8
+	out := make([]tioga.Run, len(runs))
+	col := 0
+	for i, r := range runs {
+		var b strings.Builder
+		b.Grow(len(r.Text))
+		for _, ch := range r.Text {
+			switch ch {
+			case '\t':
+				n := tw - col%tw
+				for k := 0; k < n; k++ {
+					b.WriteByte(' ')
+				}
+				col += n
+			case '\n':
+				b.WriteByte('\n')
+				col = 0
+			default:
+				b.WriteRune(ch)
+				col++
+			}
+		}
+		out[i] = tioga.Run{Text: b.String(), Look: r.Look}
+	}
+	return out
 }
 
 type segment struct {
