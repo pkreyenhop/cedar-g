@@ -41,6 +41,15 @@ func TestCapture(t *testing.T) {
 	if p := os.Getenv("CAP_TEXT"); p != "" {
 		s.openFile(p)
 	}
+	if os.Getenv("CAP_STRUCT") != "" {
+		for _, c := range s.cols {
+			for _, v := range c.viewers {
+				if v.isDoc() {
+					s.enterStruct(v)
+				}
+			}
+		}
+	}
 	if lv := os.Getenv("CAP_LEVELS"); lv != "" {
 		for _, c := range s.cols {
 			for _, v := range c.viewers {

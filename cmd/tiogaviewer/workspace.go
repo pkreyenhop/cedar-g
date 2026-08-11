@@ -241,6 +241,7 @@ func (s *gioUI) processHeaderActions(gtx C) {
 			return // added a viewer; re-evaluate next frame
 		}
 		s.processLevels(gtx, v)
+		s.processStruct(gtx, v)
 	}
 }
 

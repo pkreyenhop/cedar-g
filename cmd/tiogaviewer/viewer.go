@@ -110,6 +110,16 @@ type viewer struct {
 	showLevels                              bool
 	levelCap                                int // 0 = all levels; else show Depth <= levelCap
 	bLvlFirst, bLvlFewer, bLvlMore, bLvlAll widget.Clickable
+
+	// Structure editing: edit the node tree (nest/unnest, insert, looks).
+	bStruct                                  widget.Clickable // header: toggle structure editing
+	structEdit                               bool
+	doc                                      *tioga.Doc                     // the mutable tree (== root, wrapped)
+	sel                                      *tioga.Node                    // selected node
+	focusNode                                *tioga.Node                    // request keyboard focus here next frame
+	nodeEds                                  map[*tioga.Node]*widget.Editor // per-node text editors
+	bNewSib, bNewChild, bNest, bUnnest, bDel widget.Clickable
+	bBold, bItalic, bStructSave              widget.Clickable
 }
 
 // editableExts are the plain-text file formats opened in an editable viewer.
@@ -307,6 +317,16 @@ func (s *gioUI) header(gtx C, v *viewer) D {
 						}
 						return s.flatButton(gtx, &v.bLevels, "Levels") // outline view
 					}),
+					layout.Rigid(func(gtx C) D {
+						if !v.isDoc() {
+							return D{}
+						}
+						label := "Structure"
+						if v.structEdit {
+							label = "Done"
+						}
+						return s.flatButton(gtx, &v.bStruct, label) // node-tree editor
+					}),
 					layout.Rigid(func(gtx C) D { return D{Size: image.Pt(gtx.Dp(6), 0)} }),
 					layout.Flexed(1, func(gtx C) D {
 						return s.label(gtx, serifFont, font.Bold, font.Regular, 13, v.headerTitle(), cedarBlack, 1)
@@ -369,8 +389,11 @@ func (s *gioUI) body(gtx C, v *viewer) D {
 			})
 		})
 	}
-	// Documents: an optional Levels bar on top, then the (optionally depth-capped)
-	// blocks.
+	// Documents: the structure editor, or an optional Levels bar over the
+	// (optionally depth-capped) blocks.
+	if v.structEdit {
+		return s.structBody(gtx, v)
+	}
 	blocks := v.visibleBlocks()
 	docList := func(gtx C) D {
 		return layout.Inset{Top: 4, Right: 12, Bottom: 4}.Layout(gtx, func(gtx C) D {

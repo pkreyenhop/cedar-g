@@ -599,11 +599,18 @@ func (r *reader) insertText(raw []byte, length int64, comment bool) {
 	styled := styledRuns(runs)
 	f := r.curFormat()
 	depth := len(r.level)
-	base := Block{Text: s, Runs: styled, Format: f, Depth: depth}
+	kind, level := blockKind(f, depth, comment)
+	r.blocks = append(r.blocks, Block{Text: s, Runs: styled, Format: f, Depth: depth, Kind: kind, Level: level})
+}
+
+// blockKind maps a node's format (and nesting depth / comment flag) to a
+// rendered block kind and heading level. It is the single source of truth used
+// by both the reader and FlattenBlocks.
+func blockKind(format string, depth int, comment bool) (BlockKind, int) {
 	switch {
-	case strings.HasPrefix(f, "code"):
-		base.Kind = Code
-	case f == "head":
+	case strings.HasPrefix(format, "code"):
+		return Code, 0
+	case format == "head":
 		level := depth - 1
 		if level < 1 {
 			level = 1
@@ -611,17 +618,14 @@ func (r *reader) insertText(raw []byte, length int64, comment bool) {
 		if level > 6 {
 			level = 6
 		}
-		base.Kind = Heading
-		base.Level = level
-	case strings.HasPrefix(f, "head") && len(f) > 4 && f[4] >= '1' && f[4] <= '6':
-		base.Kind = Heading
-		base.Level = int(f[4] - '0')
+		return Heading, level
+	case strings.HasPrefix(format, "head") && len(format) > 4 && format[4] >= '1' && format[4] <= '6':
+		return Heading, int(format[4] - '0')
 	case comment:
-		base.Kind = Quote
+		return Quote, 0
 	default:
-		base.Kind = Paragraph
+		return Paragraph, 0
 	}
-	r.blocks = append(r.blocks, base)
 }
 
 // styledRuns returns runs only when at least one carries a look; otherwise nil,
