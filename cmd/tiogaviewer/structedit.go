@@ -3,6 +3,7 @@ package main
 import (
 	"image"
 	"os"
+	"strings"
 
 	"gioui.org/font"
 	"gioui.org/io/event"
@@ -77,16 +78,83 @@ func (s *gioUI) structBody(gtx C, v *viewer) D {
 		s.enterStruct(v)
 	}
 	nodes := v.orderedNodes()
-	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+	children := []layout.FlexChild{
 		layout.Rigid(func(gtx C) D { return s.structBar(gtx, v) }),
 		layout.Rigid(hrule),
-		layout.Flexed(1, func(gtx C) D {
+	}
+	if v.showEditTool {
+		children = append(children,
+			layout.Rigid(func(gtx C) D { return s.editToolBar(gtx, v) }),
+			layout.Rigid(hrule))
+	}
+	children = append(children, layout.Flexed(1, func(gtx C) D {
+		gtx.Constraints.Min = gtx.Constraints.Max
+		return layout.Inset{Top: 4, Right: 12, Bottom: 4}.Layout(gtx, func(gtx C) D {
 			gtx.Constraints.Min = gtx.Constraints.Max
-			return layout.Inset{Top: 4, Right: 12, Bottom: 4}.Layout(gtx, func(gtx C) D {
-				gtx.Constraints.Min = gtx.Constraints.Max
-				return s.scrollList(gtx, &v.sc, len(nodes), func(gtx C, i int) D {
-					return s.nodeRow(gtx, v, nodes[i].n, nodes[i].depth)
-				})
+			return s.scrollList(gtx, &v.sc, len(nodes), func(gtx C, i int) D {
+				return s.nodeRow(gtx, v, nodes[i].n, nodes[i].depth)
+			})
+		})
+	}))
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
+}
+
+// editToolBar is the Cedar EditTool: the selected node's format (Get/Set) and a
+// palette of looks to apply.
+func (s *gioUI) editToolBar(gtx C, v *viewer) D {
+	v.formatEd.SingleLine = true
+	// Load the selected node's format into the field when the selection changes.
+	if v.sel != v.fmtSel {
+		v.formatEd.SetText("")
+		if v.sel != nil {
+			v.formatEd.SetText(v.sel.Format)
+		}
+		v.fmtSel = v.sel
+	}
+	gtx.Constraints.Min.X = gtx.Constraints.Max.X
+	btn := func(b *widget.Clickable, label string) layout.FlexChild {
+		return layout.Rigid(func(gtx C) D {
+			return layout.Inset{Right: 3}.Layout(gtx, func(gtx C) D { return s.flatButton(gtx, b, label) })
+		})
+	}
+	return layout.Stack{}.Layout(gtx,
+		layout.Expanded(func(gtx C) D { return fill(gtx, cedarGrey, gtx.Constraints.Min) }),
+		layout.Stacked(func(gtx C) D {
+			gtx.Constraints.Min.X = gtx.Constraints.Max.X
+			return layout.UniformInset(3).Layout(gtx, func(gtx C) D {
+				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+					layout.Rigid(func(gtx C) D {
+						return layout.Inset{Right: 4}.Layout(gtx, func(gtx C) D {
+							return s.label(gtx, serifFont, font.Bold, font.Regular, 12, "Format:", cedarBlack, 1)
+						})
+					}),
+					layout.Rigid(func(gtx C) D {
+						gtx.Constraints.Min.X, gtx.Constraints.Max.X = gtx.Dp(150), gtx.Dp(150)
+						return bordered(gtx, func(gtx C) D {
+							return layout.UniformInset(2).Layout(gtx, func(gtx C) D {
+								fe := material.Editor(s.th, &v.formatEd, "format")
+								fe.Color = cedarBlack
+								fe.Font = monoFont
+								fe.TextSize = s.sp(12)
+								return fe.Layout(gtx)
+							})
+						})
+					}),
+					btn(&v.bFmtGet, "Get"),
+					btn(&v.bFmtSet, "Set"),
+					layout.Rigid(func(gtx C) D { return D{Size: image.Pt(gtx.Dp(10), 0)} }),
+					layout.Rigid(func(gtx C) D {
+						return layout.Inset{Right: 4}.Layout(gtx, func(gtx C) D {
+							return s.label(gtx, serifFont, font.Bold, font.Regular, 12, "Looks:", cedarBlack, 1)
+						})
+					}),
+					btn(&v.bLkU, "Under"),
+					btn(&v.bLkE, "SmallCap"),
+					btn(&v.bLkK, "Code"),
+					btn(&v.bLkX, "Strike"),
+					btn(&v.bLkH, "Super"),
+					btn(&v.bLkL, "Sub"),
+				)
 			})
 		}),
 	)
@@ -129,6 +197,7 @@ func (s *gioUI) structBar(gtx C, v *viewer) D {
 					btn(&v.bUndo, "Undo"),
 					btn(&v.bRedo, "Redo"),
 					layout.Rigid(func(gtx C) D { return D{Size: image.Pt(gtx.Dp(8), 0)} }),
+					btn(&v.bEditTool, "EditTool"),
 					btn(&v.bStructSave, "Save"),
 					layout.Rigid(func(gtx C) D {
 						if v.saveMsg == "" {
@@ -275,7 +344,39 @@ func (s *gioUI) processStruct(gtx C, v *viewer) {
 	case v.bStructSave.Clicked(gtx):
 		act()
 		s.saveStruct(v)
+	case v.bEditTool.Clicked(gtx):
+		v.showEditTool = !v.showEditTool
+	case v.bFmtGet.Clicked(gtx):
+		if v.sel != nil {
+			v.formatEd.SetText(v.sel.Format)
+		}
+	case v.bFmtSet.Clicked(gtx):
+		if v.sel != nil {
+			act()
+			v.doc.SetFormat(v.sel, strings.TrimSpace(v.formatEd.Text()))
+		}
+	case v.bLkU.Clicked(gtx):
+		s.toggleLook(v, 'u')
+	case v.bLkE.Clicked(gtx):
+		s.toggleLook(v, 'e')
+	case v.bLkK.Clicked(gtx):
+		s.toggleLook(v, 'k')
+	case v.bLkX.Clicked(gtx):
+		s.toggleLook(v, 'x')
+	case v.bLkH.Clicked(gtx):
+		s.toggleLook(v, 'h')
+	case v.bLkL.Clicked(gtx):
+		s.toggleLook(v, 'l')
 	}
+}
+
+// toggleLook applies a look to the selected node (undoable).
+func (s *gioUI) toggleLook(v *viewer, letter byte) {
+	if v.sel == nil {
+		return
+	}
+	s.beginEdit(v)
+	v.doc.ToggleLook(v.sel, letter)
 }
 
 // beginEdit records the tree for undo just before a mutation, after folding in

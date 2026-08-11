@@ -137,6 +137,14 @@ type viewer struct {
 	bBold, bItalic, bStructSave              widget.Clickable
 	bUndo, bRedo                             widget.Clickable
 	undoStack, redoStack                     []*tioga.Node // tree snapshots
+
+	// EditTool: a Cedar-style panel to Get/Set the node format and apply looks.
+	bEditTool                          widget.Clickable
+	showEditTool                       bool
+	formatEd                           widget.Editor
+	fmtSel                             *tioga.Node // node whose format is loaded in formatEd
+	bFmtSet, bFmtGet                   widget.Clickable
+	bLkU, bLkE, bLkK, bLkX, bLkH, bLkL widget.Clickable
 }
 
 // editableExts are the plain-text file formats opened in an editable viewer.
