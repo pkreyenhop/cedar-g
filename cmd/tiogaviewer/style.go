@@ -1,6 +1,8 @@
 package main
 
 import (
+	"strings"
+
 	"gioui.org/font"
 	"gioui.org/text"
 	"gioui.org/unit"
@@ -76,7 +78,9 @@ func docStyle(format string, depth int) blockStyle {
 		st.fnt = mono
 		st.size = 14
 		st.above, st.below = 1, 1
-	case format == "block", format == "indent", format == "quotation", format == "display":
+	case format == "block", format == "indent", format == "quotation", format == "display",
+		strings.HasPrefix(format, "table"):
+		// Tables indent like body blocks so they line up with the surrounding text.
 		st.indent = 24
 	case format == "item", format == "lead1":
 		st.indent = 18

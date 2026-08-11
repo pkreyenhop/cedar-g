@@ -287,7 +287,7 @@ func (s *gioUI) tableBlock(gtx C, b tioga.Block) D {
 	}
 	total := x - gap
 
-	return layout.Inset{Top: st.above, Bottom: st.below}.Layout(gtx, func(gtx C) D {
+	return layout.Inset{Top: st.above, Bottom: st.below, Left: st.indent}.Layout(gtx, func(gtx C) D {
 		y := 0
 		for _, row := range grid {
 			if labels, span := groupHeader(row, ncol); span > 0 {
