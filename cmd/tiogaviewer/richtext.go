@@ -5,7 +5,10 @@ import (
 	"image/color"
 
 	"gioui.org/font"
+	"gioui.org/io/event"
+	"gioui.org/io/pointer"
 	"gioui.org/op"
+	"gioui.org/op/clip"
 	"gioui.org/op/paint"
 	"gioui.org/text"
 	"gioui.org/widget"
@@ -21,7 +24,7 @@ import (
 // Wrapping is greedy at whitespace; a word that itself spans several runs (a
 // look change with no intervening space) is kept together. Embedded newlines are
 // hard breaks.
-func (s *gioUI) richText(gtx C, runs []tioga.Run, base font.Font, size float32, col color.NRGBA, lineHeight float32, align text.Alignment) D {
+func (s *gioUI) richText(gtx C, runs []tioga.Run, base font.Font, size float32, col color.NRGBA, lineHeight float32, align text.Alignment, v *viewer) D {
 	maxW := gtx.Constraints.Max.X
 
 	toks := s.buildTokens(gtx, runs, base, size)
@@ -45,7 +48,11 @@ func (s *gioUI) richText(gtx C, runs []tioga.Run, base font.Font, size float32, 
 		x := lineStartX(line, maxW, align)
 		for _, t := range line {
 			off := op.Offset(image.Pt(x, y)).Push(gtx.Ops)
-			s.tokDraw(gtx, t, col)
+			if t.link != "" && v != nil {
+				s.linkToken(gtx, v, t)
+			} else {
+				s.tokDraw(gtx, t, col)
+			}
 			off.Pop()
 			x += t.w
 		}
@@ -116,8 +123,18 @@ type tok struct {
 	ul     bool
 	strike bool
 	dy     float32 // baseline shift as a fraction of size (super/subscript)
+	link   string  // a file-reference target if this token is a link
 	w      int
 	kind   segKind
+}
+
+// linkColor is the inline cross-reference colour.
+var linkColor = color.NRGBA{R: 0x1a, G: 0x3a, B: 0xcc, A: 0xff}
+
+// linkTag identifies a link hit-area for pointer routing.
+type linkTag struct {
+	v    *viewer
+	name string
 }
 
 // buildTokens flattens runs into measured tokens, splitting each run at
@@ -136,6 +153,11 @@ func (s *gioUI) buildTokens(gtx C, runs []tioga.Run, base font.Font, size float3
 				continue
 			}
 			t := tok{text: seg.text, fnt: v.fnt, size: fsize, ul: v.underline, strike: v.strike, dy: v.dy, kind: seg.kind}
+			if seg.kind == segWord {
+				if m := refRe.FindString(seg.text); m != "" {
+					t.link = m // a file reference: render as an inline link
+				}
+			}
 			if seg.kind != segBreak {
 				t.w = s.tokMeasure(gtx, v.fnt, fsize, seg.text).Size.X
 			}
@@ -262,6 +284,28 @@ func wrapTokens(toks []tok, maxW, tabStop int) [][]tok {
 	return lines
 }
 
+// linkToken draws a cross-reference token in link colour with an underline, and
+// registers a click area that opens the reference.
+func (s *gioUI) linkToken(gtx C, v *viewer, t tok) {
+	lt := linkTag{v, t.link}
+	for {
+		ev, ok := gtx.Event(pointer.Filter{Target: lt, Kinds: pointer.Press})
+		if !ok {
+			break
+		}
+		if pe, ok := ev.(pointer.Event); ok && pe.Kind == pointer.Press {
+			v.pendingRef = t.link
+		}
+	}
+	lk := t
+	lk.ul = true
+	d := s.tokDraw(gtx, lk, linkColor)
+	st := clip.Rect{Max: image.Pt(d.Size.X, d.Size.Y)}.Push(gtx.Ops)
+	event.Op(gtx.Ops, lt)
+	pointer.CursorPointer.Add(gtx.Ops)
+	st.Pop()
+}
+
 // tokMeasure shapes txt without drawing, returning its dimensions.
 func (s *gioUI) tokMeasure(gtx C, fnt font.Font, size float32, txt string) D {
 	g := gtx
@@ -284,6 +328,10 @@ func (s *gioUI) tokDraw(gtx C, t tok, col color.NRGBA) D {
 	if shifted {
 		shift = op.Offset(image.Pt(0, int(t.dy*t.size))).Push(gtx.Ops)
 	}
+	// Lay the token out unbounded so its width (used for the underline/strike
+	// rule) is the text's own width, not the full available width.
+	gtx.Constraints.Min = image.Point{}
+	gtx.Constraints.Max = image.Pt(1<<20, 1<<20)
 	cm := op.Record(gtx.Ops)
 	paint.ColorOp{Color: col}.Add(gtx.Ops)
 	cl := cm.Stop()

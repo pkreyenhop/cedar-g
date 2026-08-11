@@ -73,6 +73,16 @@ func (s *gioUI) resolveRef(v *viewer, name string) (string, bool) {
 
 // processRefs handles the Refs/Print buttons and reference clicks.
 func (s *gioUI) processRefs(gtx C, v *viewer) {
+	if v.pendingRef != "" {
+		name := v.pendingRef
+		v.pendingRef = ""
+		if p, ok := s.resolveRef(v, name); ok {
+			s.openFile(p)
+			s.setMessage("opened " + name)
+		} else {
+			s.setMessage("not found: " + name)
+		}
+	}
 	if v.bPrint.Clicked(gtx) {
 		s.exportDoc(v)
 	}

@@ -141,6 +141,7 @@ type viewer struct {
 	bRefs, bPrint widget.Clickable
 	showRefs      bool
 	refs          []*docRef // file references found in the document
+	pendingRef    string    // an inline link clicked this frame
 
 	// Structure editing: edit the node tree (nest/unnest, insert, looks).
 	bStruct                                  widget.Clickable // header: toggle structure editing
@@ -504,12 +505,12 @@ func (s *gioUI) body(gtx C, v *viewer) D {
 				}
 				block := func(gtx C) D {
 					sel := i == v.selBlock
-					inner := func(gtx C) D { return s.docBlock(gtx, blocks[i], sel) }
+					inner := func(gtx C) D { return s.docBlock(gtx, blocks[i], sel, v) }
 					if i == match { // tint the current search-match block
 						inner = func(gtx C) D {
 							return layout.Stack{}.Layout(gtx,
 								layout.Expanded(func(gtx C) D { return fill(gtx, findBg, gtx.Constraints.Min) }),
-								layout.Stacked(func(gtx C) D { return s.docBlock(gtx, blocks[i], sel) }),
+								layout.Stacked(func(gtx C) D { return s.docBlock(gtx, blocks[i], sel, v) }),
 							)
 						}
 					}
@@ -881,7 +882,7 @@ const (
 	docLineHeight = 1.3
 )
 
-func (s *gioUI) docBlock(gtx C, b tioga.Block, selected bool) D {
+func (s *gioUI) docBlock(gtx C, b tioga.Block, selected bool, v *viewer) D {
 	// A tab-aligned, multi-row block is a table: lay it out as an aligned grid
 	// rather than approximating the document's tab ruler.
 	if looksLikeTable(b) {
@@ -903,12 +904,12 @@ func (s *gioUI) docBlock(gtx C, b tioga.Block, selected bool) D {
 			for i := range runs {
 				runs[i].Look |= uLook
 			}
-			return s.richText(gtx, runs, st.fnt, st.size, col, docLineHeight, st.align)
+			return s.richText(gtx, runs, st.fnt, st.size, col, docLineHeight, st.align, v)
 		}
 		// When the block carries real looks, render its runs so the file's own
 		// bold/italic/underline show through; the format still sets the base face.
 		if hasLooks(b.Runs) {
-			return s.richText(gtx, b.Runs, st.fnt, st.size, col, docLineHeight, st.align)
+			return s.richText(gtx, b.Runs, st.fnt, st.size, col, docLineHeight, st.align, v)
 		}
 		return s.paraLabel(gtx, st.fnt, st.size, st.align, docLineHeight, b.Text, col)
 	})
