@@ -115,9 +115,9 @@ type viewer struct {
 	blockClicks []widget.Clickable // per-visible-block click targets
 
 	// Right-button pop-up menu.
-	menuOpen                                         bool
-	menuPos                                          f32.Point
-	bmLevels, bmFind, bmRefs, bmEdit, bmPrint, bmArt widget.Clickable
+	menuOpen                                                          bool
+	menuPos                                                           f32.Point
+	bmLevels, bmFind, bmRefs, bmEdit, bmPrint, bmArt, bmCopy, bmReset widget.Clickable
 
 	cmdLog []string      // vkCommander: the command/output log
 	cmdEd  widget.Editor // vkCommander: the command input line

@@ -380,8 +380,10 @@ func (s *gioUI) popupMenu(gtx C, v *viewer) {
 		{&v.bmFind, "Find…"},
 		{&v.bmRefs, "References"},
 		{&v.bmEdit, "Edit structure"},
+		{&v.bmCopy, "Copy node"},
 		{&v.bmPrint, "Print (HTML)"},
 		{&v.bmArt, "Artwork on/off"},
+		{&v.bmReset, "Reset"},
 	}
 	// Drawn after the content, so it is on top; the offset positions it at the
 	// click. Width is bounded so the buttons fill a tidy menu.
@@ -426,6 +428,10 @@ func (s *gioUI) processMenu(gtx C, v *viewer) {
 		act(func() { s.exportDoc(v) })
 	case v.bmArt.Clicked(gtx):
 		act(func() { s.artworkOff = !s.artworkOff })
+	case v.bmCopy.Clicked(gtx):
+		act(func() { s.copyNode(gtx, v) })
+	case v.bmReset.Clicked(gtx):
+		act(func() { s.reloadViewer(v) })
 	}
 }
 
