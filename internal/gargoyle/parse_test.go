@@ -81,17 +81,38 @@ func TestParseFig3(t *testing.T) {
 
 func TestParseFig12(t *testing.T) {
 	sc := load(t, "fig12.gargoyle")
-	if len(sc.Paths) < 10 {
-		t.Fatalf("expected paths, got %d", len(sc.Paths))
+	// The scene has 75 trajectories and 2 single-child outlines, so the path
+	// count must be modest — not inflated by an outline swallowing its siblings.
+	if len(sc.Paths) < 10 || len(sc.Paths) > 90 {
+		t.Fatalf("unexpected path count %d (outline over-consumption?)", len(sc.Paths))
 	}
-	// This scene has filled outlines.
-	filled := 0
-	for _, p := range sc.Paths {
+}
+
+// TestOutlineChildCount is the regression test for the bug where an Outline
+// consumed every following Traj instead of just its declared children.
+func TestOutlineChildCount(t *testing.T) {
+	src := `Entities: [2]:
+Outline fillColor: [1 0.5] ow: T fillText: T 0
+Children: [1]
+Traj  (open) [1] arrows: 0 j: round e: T butt w: 6.0 c: T [0 1.0 0.0 0.0] d: T F
+[0.0,0.0] (Line  ) [10.0,0.0] fwd: T pList: ( )
+
+Traj  (open) [1] arrows: 0 j: round e: T butt w: 1.0 c: T [0 0.0 0.0 0.0] d: T F
+[0.0,5.0] (Line  ) [10.0,5.0] fwd: T pList: ( )
+`
+	sc := Parse([]byte(src))
+	if len(sc.Paths) != 2 {
+		t.Fatalf("want 2 paths (1 child + 1 sibling), got %d", len(sc.Paths))
+	}
+	for i, p := range sc.Paths {
 		if p.Filled {
-			filled++
+			t.Fatalf("path %d: open outline child must not be filled", i)
 		}
 	}
-	if filled == 0 {
-		t.Fatalf("expected some filled outlines")
+	if sc.Paths[0].Width != 6 || sc.Paths[1].Width != 1 {
+		t.Fatalf("child/sibling widths swapped or wrong: %v %v", sc.Paths[0].Width, sc.Paths[1].Width)
+	}
+	if sc.Paths[0].Stroke.R != 1 { // the child kept its own red stroke
+		t.Fatalf("outline child lost its stroke colour: %+v", sc.Paths[0].Stroke)
 	}
 }

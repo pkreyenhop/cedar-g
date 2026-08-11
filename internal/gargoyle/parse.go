@@ -151,7 +151,7 @@ func (p *parser) parse() *Scene {
 		}
 		switch t.s {
 		case "Traj":
-			if path, ok := p.parseTraj(Color{}, false); ok {
+			if path, ok := p.parseTraj(); ok {
 				sc.Paths = append(sc.Paths, path)
 			}
 		case "Outline":
@@ -181,11 +181,11 @@ func isEntityStart(t token) bool {
 	return false
 }
 
-// parseTraj reads a trajectory starting at the current "Traj" token. If filled
-// is set, the path is a fill boundary painted with fill.
-func (p *parser) parseTraj(fill Color, filled bool) (Path, bool) {
+// parseTraj reads a trajectory starting at the current "Traj" token, capturing
+// its stroke width, colour, open/closed flag and points.
+func (p *parser) parseTraj() (Path, bool) {
 	p.i++ // past "Traj"
-	path := Path{Width: 1, Stroke: Color{0, 0, 0, 1}, Filled: filled, Fill: fill}
+	path := Path{Width: 1, Stroke: Color{0, 0, 0, 1}}
 	// Attributes, up to the first point (a bracket containing a comma).
 	for p.i < len(p.toks) {
 		t := p.toks[p.i]
@@ -236,17 +236,18 @@ func (p *parser) parseTraj(fill Color, filled bool) (Path, bool) {
 		p.i++
 	}
 	p.skipToEntity()
-	if filled {
-		path.Closed = true
-	}
 	return path, len(path.Pts) > 0
 }
 
-// parseOutline reads an Outline and its child boundary trajectories, appending
-// the filled paths to sc.
+// parseOutline reads an Outline and exactly its declared number of child
+// trajectories. A child is filled with the outline's fillColor only when it is a
+// closed polygon; open children (e.g. the thick "has-CPU" bars) keep their own
+// stroke. Honouring the Children count is essential — the trajectories that
+// follow the outline in the stream are siblings, not children.
 func (p *parser) parseOutline(sc *Scene) {
 	p.i++ // past "Outline"
 	fill := Color{0.5, 0.5, 0.5, 1}
+	n := 0
 	for p.i < len(p.toks) {
 		t := p.toks[p.i]
 		if t.kind == tWord && t.s == "fillColor:" {
@@ -262,20 +263,27 @@ func (p *parser) parseOutline(sc *Scene) {
 		}
 		if t.kind == tWord && t.s == "Children:" {
 			p.i++
+			if p.i < len(p.toks) && p.toks[p.i].kind == tBrack {
+				n = int(atof(p.toks[p.i].s)) // the [N] child count
+				p.i++
+			}
 			break
 		}
-		if isEntityStart(t) && t.s != "Children:" {
-			return // malformed: no children
+		if isEntityStart(t) {
+			return // malformed: no children section
 		}
 		p.i++
 	}
-	if p.i < len(p.toks) && p.toks[p.i].kind == tBrack {
-		p.i++ // the [n] count
-	}
-	for p.i < len(p.toks) && p.toks[p.i].kind == tWord && p.toks[p.i].s == "Traj" {
-		if path, ok := p.parseTraj(fill, true); ok {
-			sc.Paths = append(sc.Paths, path)
+	for k := 0; k < n && p.i < len(p.toks) && p.toks[p.i].kind == tWord && p.toks[p.i].s == "Traj"; k++ {
+		path, ok := p.parseTraj()
+		if !ok {
+			continue
 		}
+		if path.Closed && len(path.Pts) >= 3 {
+			path.Filled = true
+			path.Fill = fill
+		}
+		sc.Paths = append(sc.Paths, path)
 	}
 }
 
