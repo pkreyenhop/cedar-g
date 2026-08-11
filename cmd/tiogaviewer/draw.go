@@ -5,6 +5,7 @@ import (
 	"image/color"
 	"os"
 
+	"gioui.org/f32"
 	"gioui.org/font"
 	"gioui.org/font/opentype"
 	"gioui.org/io/event"
@@ -284,6 +285,74 @@ func viewportFraction(lp layout.Position, elements, majorAxisSize int) (start, e
 		adjEnd += ((1 - viewportEnd) / (1 - viewportFrac)) * err
 	}
 	return adjStart, adjEnd
+}
+
+// circlePath builds a circle outline path (four cubic segments).
+func circlePath(ops *op.Ops, cx, cy, r float32) clip.PathSpec {
+	const k = 0.5522847498
+	var p clip.Path
+	p.Begin(ops)
+	p.MoveTo(f32.Pt(cx+r, cy))
+	p.CubeTo(f32.Pt(cx+r, cy+r*k), f32.Pt(cx+r*k, cy+r), f32.Pt(cx, cy+r))
+	p.CubeTo(f32.Pt(cx-r*k, cy+r), f32.Pt(cx-r, cy+r*k), f32.Pt(cx-r, cy))
+	p.CubeTo(f32.Pt(cx-r, cy-r*k), f32.Pt(cx-r*k, cy-r), f32.Pt(cx, cy-r))
+	p.CubeTo(f32.Pt(cx+r*k, cy-r), f32.Pt(cx+r, cy-r*k), f32.Pt(cx+r, cy))
+	p.Close()
+	return p.End()
+}
+
+// bullseye draws Cedar's bull's-eye cursor centred at p: a ring, a centre dot and
+// a crosshair. Drawn in black with a thin white halo so it reads on any content.
+func (s *gioUI) bullseye(gtx C, p f32.Point) {
+	cx, cy := p.X, p.Y
+	r := float32(gtx.Dp(7))
+	arm := float32(gtx.Dp(11))
+	ring := func(col color.NRGBA, w float32) {
+		paint.FillShape(gtx.Ops, col, clip.Stroke{Path: circlePath(gtx.Ops, cx, cy, r), Width: w}.Op())
+	}
+	bar := func(col color.NRGBA, x0, y0, x1, y1 float32) {
+		fillAt(gtx, col, image.Rect(int(x0), int(y0), int(x1), int(y1)))
+	}
+	// White halo first, then the black cursor over it.
+	ring(cedarWhite, 3)
+	bar(cedarWhite, cx-arm-1, cy-2, cx+arm+1, cy+2)
+	bar(cedarWhite, cx-2, cy-arm-1, cx+2, cy+arm+1)
+	ring(cedarBlack, 1.5)
+	bar(cedarBlack, cx-arm, cy, cx+arm, cy+1)
+	bar(cedarBlack, cx, cy-arm, cx+1, cy+arm)
+	paint.FillShape(gtx.Ops, cedarBlack, clip.Ellipse{Min: image.Pt(int(cx-2), int(cy-2)), Max: image.Pt(int(cx+2), int(cy+2))}.Op(gtx.Ops))
+}
+
+// withBullseye lays out content, tracks the pointer over it, hides the OS cursor
+// and draws the Cedar bull's-eye following the pointer.
+func (s *gioUI) withBullseye(gtx C, v *viewer, content layout.Widget) D {
+	for {
+		ev, ok := gtx.Event(pointer.Filter{Target: &v.ptrPos, Kinds: pointer.Move | pointer.Drag | pointer.Enter | pointer.Leave})
+		if !ok {
+			break
+		}
+		if pe, ok := ev.(pointer.Event); ok {
+			switch pe.Kind {
+			case pointer.Leave:
+				v.ptrIn = false
+			default:
+				v.ptrPos, v.ptrIn = pe.Position, true
+			}
+		}
+	}
+	dims := content(gtx)
+	// Pass-through pointer zone: receive Move without stealing scroll/clicks, and
+	// hide the OS cursor so our drawn bull's-eye stands in for it.
+	pass := pointer.PassOp{}.Push(gtx.Ops)
+	area := clip.Rect{Max: dims.Size}.Push(gtx.Ops)
+	event.Op(gtx.Ops, &v.ptrPos)
+	pointer.CursorNone.Add(gtx.Ops)
+	area.Pop()
+	pass.Pop()
+	if v.ptrIn {
+		s.bullseye(gtx, v.ptrPos)
+	}
+	return dims
 }
 
 // bordered wraps a widget in a 1px black frame over a white background.

@@ -108,6 +108,9 @@ type viewer struct {
 
 	outText string // vkOutput: the captured program output
 
+	ptrPos f32.Point // bull's-eye cursor position
+	ptrIn  bool      // pointer is over the content
+
 	cmdLog []string      // vkCommander: the command/output log
 	cmdEd  widget.Editor // vkCommander: the command input line
 
@@ -289,7 +292,14 @@ func (s *gioUI) layoutViewer(gtx C, v *viewer) D {
 		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 			layout.Rigid(func(gtx C) D { return s.header(gtx, v) }),
 			layout.Rigid(hrule),
-			layout.Flexed(1, func(gtx C) D { return s.body(gtx, v) }),
+			layout.Flexed(1, func(gtx C) D {
+				// The bull's-eye cursor stands in over reading content (documents and
+				// code); editors, terminals and the commander keep the text cursor.
+				if v.kind == vkContent {
+					return s.withBullseye(gtx, v, func(gtx C) D { return s.body(gtx, v) })
+				}
+				return s.body(gtx, v)
+			}),
 		)
 	})
 }

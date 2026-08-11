@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"gioui.org/f32"
 	"gioui.org/gpu/headless"
 	"gioui.org/io/input"
 	"gioui.org/layout"
@@ -56,6 +57,14 @@ func TestCapture(t *testing.T) {
 						break
 					}
 				}
+			}
+		}
+	}
+	if os.Getenv("CAP_CURSOR") != "" {
+		for _, c := range s.cols {
+			for _, v := range c.viewers {
+				v.ptrIn = true
+				v.ptrPos = f32.Pt(460, 300)
 			}
 		}
 	}
