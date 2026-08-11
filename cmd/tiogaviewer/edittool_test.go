@@ -23,7 +23,7 @@ func TestEditToolFormatAndLooks(t *testing.T) {
 	}
 
 	// Apply a look and confirm it lands on the node's runs.
-	s.toggleLook(v, 'e')
+	s.applyLook(v, 'e')
 	if len(v.sel.Runs) == 0 || !v.sel.Runs[0].Look.Has('e') {
 		t.Fatalf("small-caps look not applied: %+v", v.sel.Runs)
 	}

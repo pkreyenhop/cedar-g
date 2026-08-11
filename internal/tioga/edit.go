@@ -232,6 +232,56 @@ func (d *Doc) ToggleLook(n *Node, letter byte) {
 	}
 }
 
+// ApplyLookRange toggles a look over the character range [start,end) of a node's
+// text (rune offsets), splitting its runs at the boundaries. If every character
+// in the range already has the look it is cleared, otherwise it is set — matching
+// Tioga's Looks-key behaviour on a selection.
+func (d *Doc) ApplyLookRange(n *Node, start, end int, letter byte) {
+	bit := lookBit(letter)
+	if bit == 0 || start >= end {
+		return
+	}
+	type rl struct {
+		r    rune
+		look Look
+	}
+	var chars []rl
+	for _, run := range n.Runs {
+		for _, r := range run.Text {
+			chars = append(chars, rl{r, run.Look})
+		}
+	}
+	if start < 0 {
+		start = 0
+	}
+	if end > len(chars) {
+		end = len(chars)
+	}
+	all := true
+	for i := start; i < end; i++ {
+		if chars[i].look&bit == 0 {
+			all = false
+			break
+		}
+	}
+	for i := start; i < end; i++ {
+		if all {
+			chars[i].look &^= bit
+		} else {
+			chars[i].look |= bit
+		}
+	}
+	var runs []Run
+	for _, c := range chars {
+		if m := len(runs); m > 0 && runs[m-1].Look == c.look {
+			runs[m-1].Text += string(c.r)
+		} else {
+			runs = append(runs, Run{Text: string(c.r), Look: c.look})
+		}
+	}
+	n.Runs = runs
+}
+
 // lookBit returns the Look bit for a code letter, or 0 if out of range.
 func lookBit(letter byte) Look {
 	if letter < 'a' || letter > 'a'+31 {

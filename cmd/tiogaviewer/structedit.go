@@ -332,15 +332,9 @@ func (s *gioUI) processStruct(gtx C, v *viewer) {
 			v.sel, v.focusNode = next, next
 		}
 	case v.bBold.Clicked(gtx):
-		act()
-		if v.sel != nil {
-			v.doc.ToggleLook(v.sel, 'b')
-		}
+		s.applyLook(v, 'b')
 	case v.bItalic.Clicked(gtx):
-		act()
-		if v.sel != nil {
-			v.doc.ToggleLook(v.sel, 'i')
-		}
+		s.applyLook(v, 'i')
 	case v.bStructSave.Clicked(gtx):
 		act()
 		s.saveStruct(v)
@@ -356,27 +350,36 @@ func (s *gioUI) processStruct(gtx C, v *viewer) {
 			v.doc.SetFormat(v.sel, strings.TrimSpace(v.formatEd.Text()))
 		}
 	case v.bLkU.Clicked(gtx):
-		s.toggleLook(v, 'u')
+		s.applyLook(v, 'u')
 	case v.bLkE.Clicked(gtx):
-		s.toggleLook(v, 'e')
+		s.applyLook(v, 'e')
 	case v.bLkK.Clicked(gtx):
-		s.toggleLook(v, 'k')
+		s.applyLook(v, 'k')
 	case v.bLkX.Clicked(gtx):
-		s.toggleLook(v, 'x')
+		s.applyLook(v, 'x')
 	case v.bLkH.Clicked(gtx):
-		s.toggleLook(v, 'h')
+		s.applyLook(v, 'h')
 	case v.bLkL.Clicked(gtx):
-		s.toggleLook(v, 'l')
+		s.applyLook(v, 'l')
 	}
 }
 
-// toggleLook applies a look to the selected node (undoable).
-func (s *gioUI) toggleLook(v *viewer, letter byte) {
+// applyLook toggles a look on the current text selection in the selected node's
+// editor, or on the whole node when nothing is selected (both undoable).
+func (s *gioUI) applyLook(v *viewer, letter byte) {
 	if v.sel == nil {
 		return
 	}
+	start, end := v.editorFor(v.sel).Selection()
+	if start > end {
+		start, end = end, start
+	}
 	s.beginEdit(v)
-	v.doc.ToggleLook(v.sel, letter)
+	if end > start {
+		v.doc.ApplyLookRange(v.sel, start, end, letter)
+	} else {
+		v.doc.ToggleLook(v.sel, letter)
+	}
 }
 
 // beginEdit records the tree for undo just before a mutation, after folding in
