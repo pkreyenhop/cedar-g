@@ -7,6 +7,7 @@ import (
 	"gioui.org/font"
 	"gioui.org/op"
 	"gioui.org/op/paint"
+	"gioui.org/text"
 	"gioui.org/widget"
 
 	"cedarg/internal/tioga"
@@ -20,7 +21,7 @@ import (
 // Wrapping is greedy at whitespace; a word that itself spans several runs (a
 // look change with no intervening space) is kept together. Embedded newlines are
 // hard breaks.
-func (s *gioUI) richText(gtx C, runs []tioga.Run, base font.Font, size float32, col color.NRGBA, lineHeight float32) D {
+func (s *gioUI) richText(gtx C, runs []tioga.Run, base font.Font, size float32, col color.NRGBA, lineHeight float32, align text.Alignment) D {
 	maxW := gtx.Constraints.Max.X
 
 	toks := s.buildTokens(gtx, runs, base, size)
@@ -37,7 +38,7 @@ func (s *gioUI) richText(gtx C, runs []tioga.Run, base font.Font, size float32, 
 		if li > 0 {
 			y += lineH + gap
 		}
-		x := 0
+		x := lineStartX(line, maxW, align)
 		for _, t := range line {
 			off := op.Offset(image.Pt(x, y)).Push(gtx.Ops)
 			s.tokDraw(gtx, t, col)
@@ -50,6 +51,30 @@ func (s *gioUI) richText(gtx C, runs []tioga.Run, base font.Font, size float32, 
 		h = y + lineH
 	}
 	return D{Size: image.Pt(maxW, h)}
+}
+
+// lineStartX returns the x offset a line starts at for the given alignment,
+// centring or right-aligning by the line's rendered width (trailing spaces on a
+// wrapped line were already trimmed).
+func lineStartX(line []tok, maxW int, align text.Alignment) int {
+	if align == text.Start {
+		return 0
+	}
+	w := 0
+	for _, t := range line {
+		w += t.w
+	}
+	switch align {
+	case text.Middle:
+		if x := (maxW - w) / 2; x > 0 {
+			return x
+		}
+	case text.End:
+		if x := maxW - w; x > 0 {
+			return x
+		}
+	}
+	return 0
 }
 
 // hasLooks reports whether any run carries a look worth styling. (A renderer can
@@ -92,6 +117,11 @@ func (s *gioUI) buildTokens(gtx C, runs []tioga.Run, base font.Font, size float3
 		}
 		if r.Look.Italic() {
 			fnt.Style = font.Italic
+		}
+		// The "k" look is the default Cedar style's inline code look: fixed-pitch
+		// (e.g. FORK/JOIN set in mono within running prose).
+		if r.Look.Has('k') {
+			fnt.Typeface = "Mono"
 		}
 		ul := r.Look.Underline()
 		for _, seg := range splitSegments(r.Text) {

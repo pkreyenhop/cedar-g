@@ -122,6 +122,33 @@ func TestLooksLandOnWholeWords(t *testing.T) {
 	}
 }
 
+// TestBlockFormatAndDepth verifies Phase 2 inputs: blocks carry their named
+// Tioga format and a nesting depth, so a style-aware renderer can format by
+// format and indent by depth.
+func TestBlockFormatAndDepth(t *testing.T) {
+	d := readReal(t)
+	formats := map[string]bool{}
+	maxDepth := 0
+	for _, b := range d.Blocks {
+		if b.Format != "" {
+			formats[b.Format] = true
+		}
+		if b.Depth > maxDepth {
+			maxDepth = b.Depth
+		}
+		if b.Depth < 1 {
+			t.Fatalf("block depth not set: %+v", b)
+		}
+	}
+	// A real paper uses several distinct named formats and nests.
+	if len(formats) < 3 {
+		t.Fatalf("expected several formats, got %v", formats)
+	}
+	if maxDepth < 2 {
+		t.Fatalf("blocks did not record nesting (maxDepth=%d)", maxDepth)
+	}
+}
+
 func treeStats(n *Node, depth int) (count, maxDepth int) {
 	count = 1
 	maxDepth = depth

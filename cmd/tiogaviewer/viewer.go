@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"image"
+	"image/color"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -19,7 +20,7 @@ import (
 	"gioui.org/op"
 	"gioui.org/op/clip"
 	"gioui.org/op/paint"
-	"gioui.org/unit"
+	"gioui.org/text"
 	"gioui.org/widget"
 	"gioui.org/widget/material"
 
@@ -636,33 +637,30 @@ const (
 )
 
 func (s *gioUI) docBlock(gtx C, b tioga.Block) D {
-	fnt, weight, style, size := serifFont, font.Normal, font.Regular, float32(docTextSize)
-	top, bottom := unit.Dp(3), unit.Dp(3)
-	switch b.Kind {
-	case tioga.Heading:
-		weight = font.Bold
-		if b.Level <= 1 {
-			size = 28
-		} else {
-			size = 22
-		}
-		top, bottom = unit.Dp(10), unit.Dp(6)
-	case tioga.Quote:
-		style = font.Italic
-	case tioga.Code:
-		fnt, size = monoFont, docTextSize
+	// The node's named Tioga format (resolved through the default Cedar style)
+	// sets the face, size, alignment, spacing and base indent; a comment node
+	// falls back to italic like the old Quote rendering.
+	st := docStyle(b.Format, b.Depth)
+	if b.Kind == tioga.Quote && b.Format == "" {
+		st.fnt.Style = font.Italic
 	}
-	return layout.Inset{Top: top, Bottom: bottom}.Layout(gtx, func(gtx C) D {
+	return layout.Inset{Top: st.above, Bottom: st.below, Left: st.indent}.Layout(gtx, func(gtx C) D {
 		// When the block carries real looks, render its runs so the file's own
 		// bold/italic/underline show through; the format still sets the base face.
 		if hasLooks(b.Runs) {
-			base := fnt
-			base.Weight = weight
-			base.Style = style
-			return s.richText(gtx, b.Runs, base, size, cedarBlack, docLineHeight)
+			return s.richText(gtx, b.Runs, st.fnt, st.size, cedarBlack, docLineHeight, st.align)
 		}
-		return s.labelLH(gtx, fnt, weight, style, size, b.Text, cedarBlack, 0, docLineHeight)
+		return s.paraLabel(gtx, st.fnt, st.size, st.align, docLineHeight, b.Text, cedarBlack)
 	})
+}
+
+// paraLabel draws a wrapped, aligned plain-text paragraph (the no-looks path).
+func (s *gioUI) paraLabel(gtx C, fnt font.Font, size float32, align text.Alignment, lineHeight float32, txt string, col color.NRGBA) D {
+	macro := op.Record(gtx.Ops)
+	paint.ColorOp{Color: col}.Add(gtx.Ops)
+	cl := macro.Stop()
+	l := widget.Label{MaxLines: 0, LineHeightScale: lineHeight, Alignment: align}
+	return l.Layout(gtx, s.sh, fnt, s.sp(size), txt, cl)
 }
 
 // expandTabs replaces tab characters with spaces to the next 8-column stop

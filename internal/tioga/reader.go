@@ -40,12 +40,16 @@ const (
 
 // Block is one rendered piece of a Tioga document. Runs is Text split into
 // look-runs (bold/italic/underline/…); it is nil when the text carries no looks,
-// in which case a renderer should draw Text plainly.
+// in which case a renderer should draw Text plainly. Format is the node's named
+// Tioga format ("title", "head", "body", "block", …); Depth is its nesting depth
+// (1 = top level). A style-aware renderer formats by Format and indents by Depth.
 type Block struct {
-	Kind  BlockKind
-	Level int // heading level 1..6 (Heading only)
-	Text  string
-	Runs  []Run
+	Kind   BlockKind
+	Level  int // heading level 1..6 (Heading only)
+	Text   string
+	Runs   []Run
+	Format string
+	Depth  int
 }
 
 // Document is the decoded result. When IsCode is true, Code holds the
@@ -590,28 +594,34 @@ func (r *reader) insertText(raw []byte, length int64, comment bool) {
 
 	// Document rendering: map the node format to a block kind. styled is the run
 	// list only when it carries real looks, so plain paragraphs render (and wrap)
-	// as a single string.
+	// as a single string. Format and Depth are retained so a style-aware renderer
+	// can format each block by its named Tioga format and nesting.
 	styled := styledRuns(runs)
 	f := r.curFormat()
+	depth := len(r.level)
+	base := Block{Text: s, Runs: styled, Format: f, Depth: depth}
 	switch {
 	case strings.HasPrefix(f, "code"):
-		r.blocks = append(r.blocks, Block{Kind: Code, Text: s, Runs: styled})
+		base.Kind = Code
 	case f == "head":
-		level := len(r.level) - 1
+		level := depth - 1
 		if level < 1 {
 			level = 1
 		}
 		if level > 6 {
 			level = 6
 		}
-		r.blocks = append(r.blocks, Block{Kind: Heading, Level: level, Text: s, Runs: styled})
+		base.Kind = Heading
+		base.Level = level
 	case strings.HasPrefix(f, "head") && len(f) > 4 && f[4] >= '1' && f[4] <= '6':
-		r.blocks = append(r.blocks, Block{Kind: Heading, Level: int(f[4] - '0'), Text: s, Runs: styled})
+		base.Kind = Heading
+		base.Level = int(f[4] - '0')
 	case comment:
-		r.blocks = append(r.blocks, Block{Kind: Quote, Text: s, Runs: styled})
+		base.Kind = Quote
 	default:
-		r.blocks = append(r.blocks, Block{Kind: Paragraph, Text: s, Runs: styled})
+		base.Kind = Paragraph
 	}
+	r.blocks = append(r.blocks, base)
 }
 
 // styledRuns returns runs only when at least one carries a look; otherwise nil,
