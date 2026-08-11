@@ -2,6 +2,7 @@ package main
 
 import (
 	"image"
+	"os"
 
 	"gioui.org/font"
 	"gioui.org/io/key"
@@ -122,6 +123,16 @@ func (s *gioUI) structBar(gtx C, v *viewer) D {
 					layout.Rigid(func(gtx C) D { return D{Size: image.Pt(gtx.Dp(8), 0)} }),
 					btn(&v.bBold, "Bold"),
 					btn(&v.bItalic, "Italic"),
+					layout.Rigid(func(gtx C) D { return D{Size: image.Pt(gtx.Dp(8), 0)} }),
+					btn(&v.bStructSave, "Save"),
+					layout.Rigid(func(gtx C) D {
+						if v.saveMsg == "" {
+							return D{}
+						}
+						return layout.Inset{Left: 4}.Layout(gtx, func(gtx C) D {
+							return s.label(gtx, serifFont, font.Normal, font.Regular, 12, v.saveMsg, cedarBlack, 1)
+						})
+					}),
 				)
 			})
 		}),
@@ -242,5 +253,22 @@ func (s *gioUI) processStruct(gtx C, v *viewer) {
 		if v.sel != nil {
 			v.doc.ToggleLook(v.sel, 'i')
 		}
+	case v.bStructSave.Clicked(gtx):
+		act()
+		s.saveStruct(v)
 	}
+}
+
+// saveStruct writes the edited node tree back to disk as a real Tioga file
+// (nesting, formats and looks preserved).
+func (s *gioUI) saveStruct(v *viewer) {
+	if v.root == nil || v.path == "" {
+		v.saveMsg = "nothing to save"
+		return
+	}
+	if err := os.WriteFile(v.path, tioga.EncodeDoc(v.root), 0o644); err != nil {
+		v.saveMsg = "save failed: " + err.Error()
+		return
+	}
+	v.saveMsg = "saved " + v.rel
 }

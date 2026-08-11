@@ -1,6 +1,9 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"cedarg/internal/tioga"
@@ -62,4 +65,58 @@ func TestStructEditFlow(t *testing.T) {
 	if maxDepth < 2 {
 		t.Fatalf("nesting not reflected in rebuilt blocks (maxDepth=%d)", maxDepth)
 	}
+}
+
+// TestStructSaveReopen edits a document in the structure editor, saves it as a
+// real Tioga file, and reopens it — the edits (text + bold look + nesting) must
+// survive the on-disk round trip.
+func TestStructSaveReopen(t *testing.T) {
+	dir := t.TempDir()
+	// Seed a real Tioga file on disk via EncodeDoc of a small tree.
+	d0 := tioga.NewDoc(nil)
+	a := d0.InsertSibling(nil, tioga.NewNode("head", "Alpha"))
+	d0.InsertChild(a, tioga.NewNode("body", "child"))
+	path := filepath.Join(dir, "Doc.tioga")
+	if err := os.WriteFile(path, tioga.EncodeDoc(d0.Root), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := newUI()
+	s.setRoot(dir)
+	v := s.newViewer(path)
+	if !v.isDoc() {
+		t.Fatalf("expected a document viewer, got kind=%d isCode=%v", v.kind, v.isCode)
+	}
+	s.enterStruct(v)
+	first := v.doc.Nodes()[0]
+	v.editorFor(first).SetText("Alpha-2")
+	s.syncEditors(v)
+	v.sel = first
+	v.doc.ToggleLook(first, 'b')
+	s.saveStruct(v)
+	if !strings.HasPrefix(v.saveMsg, "saved") {
+		t.Fatalf("save failed: %q", v.saveMsg)
+	}
+
+	// Reopen from disk and confirm the edits persisted.
+	re := tioga.Read(mustRead(t, path), false)
+	got := re.Root.Children[0]
+	if got.Text() != "Alpha-2" {
+		t.Fatalf("text not persisted: %q", got.Text())
+	}
+	if len(got.Runs) == 0 || !got.Runs[0].Look.Bold() {
+		t.Fatalf("bold look not persisted: %+v", got.Runs)
+	}
+	if len(got.Children) != 1 || got.Children[0].Text() != "child" {
+		t.Fatalf("nesting not persisted: %+v", got.Children)
+	}
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }

@@ -31,6 +31,105 @@ func Encode(text string) []byte {
 	return assemble(textSec, nil, control)
 }
 
+// EncodeDoc serialises a full node tree — nesting, per-node formats, and per-run
+// looks — into a Tioga container file. It is the inverse of Read for documents:
+// re-reading its output reproduces the same tree. Every node is written as an
+// explicit opStartNode…opEndNode pair (so structure is unambiguous), with an
+// opRuns record preceding a node's rope whenever that text carries looks.
+func EncodeDoc(root *Node) []byte {
+	if root == nil {
+		root = &Node{}
+	}
+	e := &encoder{}
+	// The reader supplies its own synthetic root, so emit this root's children as
+	// the top-level nodes rather than wrapping them (which would add a level).
+	for _, c := range root.Children {
+		e.node(c)
+	}
+	return assemble(e.text, e.comment, e.control)
+}
+
+// encoder accumulates the three on-disk sections while walking the tree.
+type encoder struct {
+	text    []byte
+	comment []byte
+	control []byte
+}
+
+func (e *encoder) node(n *Node) {
+	e.control = append(e.control, opStartNode)
+	e.control = appendStr(e.control, n.Format)
+
+	// A node's own text: written for any node that carries text, and for leaves
+	// even when empty (so blank leaf nodes keep their place). Pure container
+	// nodes (children, no text) emit no rope.
+	leaf := len(n.Children) == 0
+	if len(n.Runs) > 0 || leaf {
+		e.emitRuns(n.Runs)
+		e.emitRope(n.Runs, false)
+	}
+	if len(n.Comment) > 0 {
+		e.emitRuns(n.Comment)
+		e.emitRope(n.Comment, true)
+	}
+
+	for _, c := range n.Children {
+		e.node(c)
+	}
+	e.control = append(e.control, opEndNode)
+}
+
+// emitRuns writes an opRuns record describing the runs, but only when at least
+// one run carries a look (a plain rope needs none). Run lengths are in Latin-1
+// bytes, matching how the reader splits the rope.
+func (e *encoder) emitRuns(runs []Run) {
+	any := false
+	for _, r := range runs {
+		if r.Look != 0 {
+			any = true
+			break
+		}
+	}
+	if !any {
+		return
+	}
+	e.control = append(e.control, opRuns)
+	e.control = appendVarint(e.control, int64(len(runs)))
+	for _, r := range runs {
+		e.control = append(e.control, opLooks)
+		v := uint32(r.Look)
+		e.control = append(e.control, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
+		e.control = appendVarint(e.control, int64(len(toLatin1(r.Text))))
+	}
+}
+
+// emitRope writes the rope opcode plus length, and appends the node's text (with
+// the CR node separator) to the text or comment section.
+func (e *encoder) emitRope(runs []Run, comment bool) {
+	b := toLatin1(runsText(runs))
+	op := byte(opRope)
+	if comment {
+		op = opComment
+	}
+	e.control = append(e.control, op)
+	e.control = appendVarint(e.control, int64(len(b)))
+	if comment {
+		e.comment = append(append(e.comment, b...), '\r')
+	} else {
+		e.text = append(append(e.text, b...), '\r')
+	}
+}
+
+// appendStr writes a Tioga control string: a one-byte length then Latin-1 bytes.
+func appendStr(out []byte, s string) []byte {
+	b := toLatin1(s)
+	if len(b) > 255 {
+		b = b[:255]
+	}
+	out = append(out, byte(len(b)))
+	return append(out, b...)
+}
+
 // splitParagraphs normalises newlines and splits into paragraphs, dropping a
 // single trailing empty paragraph produced by a trailing newline.
 func splitParagraphs(text string) []string {
