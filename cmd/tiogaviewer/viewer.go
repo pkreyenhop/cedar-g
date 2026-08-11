@@ -174,7 +174,11 @@ func (s *gioUI) newViewer(path string) *viewer {
 	}
 	doc := tioga.Read(data, false)
 	for i := range doc.Blocks {
-		doc.Blocks[i].Text = expandTabs(doc.Blocks[i].Text)
+		// Table blocks keep their tabs — the grid renderer needs them; every other
+		// block expands tabs to spaces so Gio does not draw missing-glyph boxes.
+		if !looksLikeTable(doc.Blocks[i]) {
+			doc.Blocks[i].Text = expandTabs(doc.Blocks[i].Text)
+		}
 	}
 	v.blocks = doc.Blocks
 	v.root = doc.Root

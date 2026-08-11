@@ -24,14 +24,30 @@ import (
 // tab-runs (which absorbs the varying tab counts and their padding) and lay the
 // cells out as a real grid with per-column widths and alignment.
 
+// tabSource returns the block text that still has its tabs: the concatenated
+// run text when the block carries looks (runs are never tab-expanded), else the
+// block's Text. This matters because the viewer expands tabs in Block.Text for
+// the prose path, which would otherwise hide a table from looksLikeTable.
+func tabSource(b tioga.Block) string {
+	if len(b.Runs) == 0 {
+		return b.Text
+	}
+	var sb strings.Builder
+	for _, r := range b.Runs {
+		sb.WriteString(r.Text)
+	}
+	return sb.String()
+}
+
 // looksLikeTable reports whether a block is a tab-aligned table: two or more of
 // its lines contain a tab.
 func looksLikeTable(b tioga.Block) bool {
-	if !strings.ContainsRune(b.Text, '\t') {
+	src := tabSource(b)
+	if !strings.ContainsRune(src, '\t') {
 		return false
 	}
 	n := 0
-	for _, ln := range strings.Split(b.Text, "\n") {
+	for _, ln := range strings.Split(src, "\n") {
 		if strings.ContainsRune(ln, '\t') {
 			n++
 			if n >= 2 {
@@ -156,7 +172,11 @@ func isNumericText(s string) bool {
 // tableBlock lays a table block out as an aligned grid.
 func (s *gioUI) tableBlock(gtx C, b tioga.Block) D {
 	st := docStyle(b.Format, b.Depth)
-	grid := tableGrid(b.Runs)
+	runs := b.Runs
+	if len(runs) == 0 { // a table with no looks: split from its (tab-bearing) text
+		runs = []tioga.Run{{Text: b.Text}}
+	}
+	grid := tableGrid(runs)
 
 	ncol := 0
 	for _, row := range grid {
