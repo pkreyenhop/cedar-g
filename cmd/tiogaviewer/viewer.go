@@ -763,6 +763,11 @@ const (
 )
 
 func (s *gioUI) docBlock(gtx C, b tioga.Block) D {
+	// A tab-aligned, multi-row block is a table: lay it out as an aligned grid
+	// rather than approximating the document's tab ruler.
+	if looksLikeTable(b) {
+		return s.tableBlock(gtx, b)
+	}
 	// The node's named Tioga format (resolved through the default Cedar style)
 	// sets the face, size, alignment, spacing and base indent; a comment node
 	// falls back to italic like the old Quote rendering.
