@@ -126,6 +126,11 @@ type viewer struct {
 	findIdx              int
 	bFindNext, bFindPrev widget.Clickable
 
+	// Cross-references and export.
+	bRefs, bPrint widget.Clickable
+	showRefs      bool
+	refs          []*docRef // file references found in the document
+
 	// Structure editing: edit the node tree (nest/unnest, insert, looks).
 	bStruct                                  widget.Clickable // header: toggle structure editing
 	structEdit                               bool
@@ -358,6 +363,18 @@ func (s *gioUI) header(gtx C, v *viewer) D {
 						if !v.isDoc() {
 							return D{}
 						}
+						return s.flatButton(gtx, &v.bRefs, "Refs") // cross-references
+					}),
+					layout.Rigid(func(gtx C) D {
+						if !v.isDoc() {
+							return D{}
+						}
+						return s.flatButton(gtx, &v.bPrint, "Print") // export to HTML
+					}),
+					layout.Rigid(func(gtx C) D {
+						if !v.isDoc() {
+							return D{}
+						}
 						label := "Structure"
 						if v.structEdit {
 							label = "Done"
@@ -472,6 +489,11 @@ func (s *gioUI) body(gtx C, v *viewer) D {
 	if v.findOpen {
 		bars = append(bars,
 			layout.Rigid(func(gtx C) D { return s.findBar(gtx, v) }),
+			layout.Rigid(hrule))
+	}
+	if v.showRefs {
+		bars = append(bars,
+			layout.Rigid(func(gtx C) D { return s.refsBar(gtx, v) }),
 			layout.Rigid(hrule))
 	}
 	if len(bars) == 0 {
