@@ -116,3 +116,44 @@ Traj  (open) [1] arrows: 0 j: round e: T butt w: 1.0 c: T [0 0.0 0.0 0.0] d: T F
 		t.Fatalf("outline child lost its stroke colour: %+v", sc.Paths[0].Stroke)
 	}
 }
+
+func TestParseSegment(t *testing.T) {
+	typ, pts := parseSegment("Arc [329.675,255.6741]")
+	if typ != "Arc" || len(pts) != 1 || pts[0].X != 329.675 {
+		t.Fatalf("arc seg: %q %+v", typ, pts)
+	}
+	typ, pts = parseSegment("Bezier [1,2] [3,4]")
+	if typ != "Bezier" || len(pts) != 2 || pts[1].Y != 4 {
+		t.Fatalf("bezier seg: %q %+v", typ, pts)
+	}
+	if typ, _ := parseSegment("Line"); typ != "Line" {
+		t.Fatalf("line seg: %q", typ)
+	}
+}
+
+func TestArcPoints(t *testing.T) {
+	// Quarter circle through (1,0), (0.707,0.707), (0,1): all on the unit circle.
+	pts := arcPoints(Point{1, 0}, Point{0.7071, 0.7071}, Point{0, 1})
+	if len(pts) != curveSteps {
+		t.Fatalf("want %d points, got %d", curveSteps, len(pts))
+	}
+	for _, p := range pts {
+		if r := (p.X*p.X + p.Y*p.Y); r < 0.98 || r > 1.02 {
+			t.Fatalf("point %v not on unit circle (r^2=%v)", p, r)
+		}
+	}
+	if last := pts[len(pts)-1]; last.X > 0.02 || last.Y < 0.98 {
+		t.Fatalf("arc did not end at (0,1): %v", last)
+	}
+	// Collinear points degenerate to a straight line (just the endpoint).
+	if got := arcPoints(Point{0, 0}, Point{1, 1}, Point{2, 2}); len(got) != 1 {
+		t.Fatalf("collinear arc should be a line: %+v", got)
+	}
+}
+
+func TestBezierPoints(t *testing.T) {
+	pts := bezierPoints(Point{0, 0}, Point{0, 1}, Point{1, 1}, Point{1, 0})
+	if len(pts) != curveSteps || pts[len(pts)-1] != (Point{1, 0}) {
+		t.Fatalf("bezier: %d pts, last %v", len(pts), pts[len(pts)-1])
+	}
+}

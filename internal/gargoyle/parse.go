@@ -218,15 +218,29 @@ func (p *parser) parseTraj() (Path, bool) {
 		}
 		p.i++
 	}
-	// Points: [x,y] segments, separated by (Line) tokens, until "fwd:".
+	// Points and segments: anchor points are [x,y]; the (…) token before an anchor
+	// names the segment reaching it — "Line", "Arc [mid]" (a 3-point circular arc)
+	// or "Bezier [c1] [c2]" (a cubic). Curves are tessellated into short lines so
+	// the polyline model still applies.
+	seg, ctrl := "Line", []Point(nil)
+	haveAnchor := false
+	var prev Point
 	for p.i < len(p.toks) {
 		t := p.toks[p.i]
 		if t.kind == tBrack && strings.Contains(t.s, ",") {
-			path.Pts = append(path.Pts, parsePoint(t.s))
+			pt := parsePoint(t.s)
+			if !haveAnchor {
+				path.Pts = append(path.Pts, pt)
+			} else {
+				path.Pts = append(path.Pts, curvePoints(prev, ctrl, pt, seg)...)
+			}
+			prev, haveAnchor = pt, true
+			seg, ctrl = "Line", nil
 			p.i++
 			continue
 		}
-		if t.kind == tParen { // "Line" segment separator
+		if t.kind == tParen { // segment descriptor for the next anchor
+			seg, ctrl = parseSegment(t.s)
 			p.i++
 			continue
 		}
@@ -237,6 +251,120 @@ func (p *parser) parseTraj() (Path, bool) {
 	}
 	p.skipToEntity()
 	return path, len(path.Pts) > 0
+}
+
+// parseSegment reads a segment descriptor like "Arc [x,y]" or "Bezier [c1] [c2]"
+// from a paren token's content, returning the segment type and its inner points.
+func parseSegment(content string) (string, []Point) {
+	fields := strings.Fields(content)
+	typ := "Line"
+	if len(fields) > 0 {
+		typ = fields[0]
+	}
+	var pts []Point
+	i := 0
+	for i < len(content) {
+		if content[i] == '[' {
+			j := i + 1
+			for j < len(content) && content[j] != ']' {
+				j++
+			}
+			if strings.Contains(content[i+1:j], ",") {
+				pts = append(pts, parsePoint(content[i+1:j]))
+			}
+			i = j + 1
+			continue
+		}
+		i++
+	}
+	return typ, pts
+}
+
+// curvePoints tessellates a segment from a to b into the intermediate+end points
+// a line-based renderer needs. Line returns just b; Arc bends through a midpoint;
+// Bezier is a cubic with two controls. Unknown types fall back to a line.
+func curvePoints(a Point, ctrl []Point, b Point, seg string) []Point {
+	switch {
+	case strings.HasPrefix(seg, "Arc") && len(ctrl) >= 1:
+		return arcPoints(a, ctrl[0], b)
+	case strings.HasPrefix(seg, "Bezier") && len(ctrl) >= 2:
+		return bezierPoints(a, ctrl[0], ctrl[1], b)
+	default:
+		return []Point{b}
+	}
+}
+
+const curveSteps = 16
+
+// bezierPoints tessellates a cubic Bézier a→b with controls c1,c2.
+func bezierPoints(a, c1, c2, b Point) []Point {
+	out := make([]Point, 0, curveSteps)
+	for k := 1; k <= curveSteps; k++ {
+		t := float64(k) / curveSteps
+		u := 1 - t
+		w0 := u * u * u
+		w1 := 3 * u * u * t
+		w2 := 3 * u * t * t
+		w3 := t * t * t
+		out = append(out, Point{
+			X: w0*a.X + w1*c1.X + w2*c2.X + w3*b.X,
+			Y: w0*a.Y + w1*c1.Y + w2*c2.Y + w3*b.Y,
+		})
+	}
+	return out
+}
+
+// arcPoints tessellates the circular arc through a, mid and b. If the three
+// points are (nearly) collinear it degenerates to a straight line.
+func arcPoints(a, mid, b Point) []Point {
+	cx, cy, ok := circumcenter(a, mid, b)
+	if !ok {
+		return []Point{b}
+	}
+	ang := func(p Point) float64 { return math.Atan2(p.Y-cy, p.X-cx) }
+	a0, am, a1 := ang(a), ang(mid), ang(b)
+	// Choose the sweep direction that passes through the midpoint.
+	norm := func(x float64) float64 {
+		for x <= -math.Pi {
+			x += 2 * math.Pi
+		}
+		for x > math.Pi {
+			x -= 2 * math.Pi
+		}
+		return x
+	}
+	d1 := norm(a1 - a0)
+	dm := norm(am - a0)
+	if d1 != 0 && (dm/d1 < 0 || math.Abs(dm) > math.Abs(d1)) {
+		if d1 > 0 {
+			d1 -= 2 * math.Pi
+		} else {
+			d1 += 2 * math.Pi
+		}
+	}
+	r := math.Hypot(a.X-cx, a.Y-cy)
+	out := make([]Point, 0, curveSteps)
+	for k := 1; k <= curveSteps; k++ {
+		t := float64(k) / curveSteps
+		th := a0 + d1*t
+		out = append(out, Point{X: cx + r*math.Cos(th), Y: cy + r*math.Sin(th)})
+	}
+	return out
+}
+
+// circumcenter returns the centre of the circle through three points, or ok=false
+// when they are collinear.
+func circumcenter(a, b, c Point) (float64, float64, bool) {
+	d := 2 * (a.X*(b.Y-c.Y) + b.X*(c.Y-a.Y) + c.X*(a.Y-b.Y))
+	if math.Abs(d) < 1e-9 {
+		return 0, 0, false
+	}
+	a2 := a.X*a.X + a.Y*a.Y
+	b2 := b.X*b.X + b.Y*b.Y
+	c2 := c.X*c.X + c.Y*c.Y
+	ux := (a2*(b.Y-c.Y) + b2*(c.Y-a.Y) + c2*(a.Y-b.Y)) / d
+	uy := (a2*(c.X-b.X) + b2*(a.X-c.X) + c2*(b.X-a.X)) / d
+	return ux, uy, true
 }
 
 // parseOutline reads an Outline and exactly its declared number of child
