@@ -173,9 +173,11 @@ func (s *gioUI) newViewer(path string) *viewer {
 		return v
 	}
 	doc := tioga.Read(data, false)
+	// Join a table split across header / data / TOTAL blocks into one grid, then
+	// keep tabs on table blocks (the grid renderer needs them) while expanding
+	// tabs to spaces elsewhere so Gio does not draw missing-glyph boxes.
+	doc.Blocks = mergeTableBlocks(doc.Blocks)
 	for i := range doc.Blocks {
-		// Table blocks keep their tabs — the grid renderer needs them; every other
-		// block expands tabs to spaces so Gio does not draw missing-glyph boxes.
 		if !looksLikeTable(doc.Blocks[i]) {
 			doc.Blocks[i].Text = expandTabs(doc.Blocks[i].Text)
 		}

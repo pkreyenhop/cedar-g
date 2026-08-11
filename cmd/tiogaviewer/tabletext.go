@@ -39,6 +39,54 @@ func tabSource(b tioga.Block) string {
 	return sb.String()
 }
 
+// runsOf returns a block's look-runs, synthesising a single plain run from its
+// text when the block carries no looks.
+func runsOf(b tioga.Block) []tioga.Run {
+	if len(b.Runs) > 0 {
+		return b.Runs
+	}
+	if b.Text == "" {
+		return nil
+	}
+	return []tioga.Run{{Text: b.Text}}
+}
+
+// mergeTableBlocks joins runs of consecutive blocks that share the same "table…"
+// format into one block, so a table split across a header row, its data rows and
+// a TOTAL row (each a separate Tioga node) is laid out as a single grid with
+// shared columns. Must run before tabs are expanded.
+func mergeTableBlocks(blocks []tioga.Block) []tioga.Block {
+	isTab := func(b tioga.Block) bool {
+		return strings.Contains(strings.ToLower(b.Format), "table") &&
+			strings.ContainsRune(tabSource(b), '\t')
+	}
+	var out []tioga.Block
+	for i := 0; i < len(blocks); {
+		b := blocks[i]
+		if !isTab(b) {
+			out = append(out, b)
+			i++
+			continue
+		}
+		runs := append([]tioga.Run(nil), runsOf(b)...)
+		j := i + 1
+		for j < len(blocks) && isTab(blocks[j]) && blocks[j].Format == b.Format {
+			runs = append(runs, tioga.Run{Text: "\n"})
+			runs = append(runs, runsOf(blocks[j])...)
+			j++
+		}
+		b.Runs = runs
+		var sb strings.Builder
+		for _, r := range runs {
+			sb.WriteString(r.Text)
+		}
+		b.Text = sb.String()
+		out = append(out, b)
+		i = j
+	}
+	return out
+}
+
 // looksLikeTable reports whether a block is a tab-aligned table: two or more of
 // its lines contain a tab.
 func looksLikeTable(b tioga.Block) bool {
@@ -118,10 +166,14 @@ func tableGrid(runs []tioga.Run) [][]tcell {
 				}
 				j++
 			}
-			if hasTab {
+			// A separator is a run containing a tab, or a gap of 2+ spaces that
+			// comes after content (some rows, e.g. a TOTAL line, separate columns
+			// with padding spaces instead of a tab). Leading indent — spaces before
+			// any content in the cell — is kept.
+			if hasTab || (j-i >= 2 && hasContent(cell)) {
 				emitCell()
 			} else {
-				cell = append(cell, cs[i:j]...) // spaces only: keep as content
+				cell = append(cell, cs[i:j]...)
 			}
 			i = j
 		default:
@@ -131,6 +183,17 @@ func tableGrid(runs []tioga.Run) [][]tcell {
 	}
 	emitRow()
 	return grid
+}
+
+// hasContent reports whether a cell has any non-whitespace rune yet (so leading
+// indent is not mistaken for a completed cell).
+func hasContent(cell []charLook) bool {
+	for _, cl := range cell {
+		if cl.r != ' ' && cl.r != '\t' {
+			return true
+		}
+	}
+	return false
 }
 
 // mergeCell trims trailing spaces and coalesces adjacent same-look runes.
@@ -215,35 +278,75 @@ func (s *gioUI) tableBlock(gtx C, b tioga.Block) D {
 	lineH := s.tokMeasure(gtx, st.fnt, st.size, "Ag").Size.Y
 	pitch := lineH + gtx.Dp(3)
 
-	total := 0
+	// Column start positions and total width.
+	colX := make([]int, ncol)
+	x := 0
 	for c := 0; c < ncol; c++ {
-		total += colW[c]
-		if c < ncol-1 {
-			total += gap
-		}
+		colX[c] = x
+		x += colW[c] + gap
 	}
+	total := x - gap
 
 	return layout.Inset{Top: st.above, Bottom: st.below}.Layout(gtx, func(gtx C) D {
 		y := 0
 		for _, row := range grid {
-			x := 0
-			for c := 0; c < ncol; c++ {
-				if c < len(row) {
-					cell := row[c]
-					cx := x
-					if rightAlign[c] {
-						cx = x + colW[c] - s.cellWidth(gtx, cell, st.fnt, st.size)
+			if labels, span := groupHeader(row, ncol); span > 0 {
+				// A group header (e.g. "Cedar" / "GVX") labels spans of columns:
+				// centre each label over its group of data columns.
+				for i, cell := range labels {
+					c0 := 1 + i*span
+					c1 := c0 + span - 1
+					if c1 >= ncol {
+						c1 = ncol - 1
 					}
+					cw := s.cellWidth(gtx, cell, st.fnt, st.size)
+					cx := colX[c0] + (colX[c1]+colW[c1]-colX[c0]-cw)/2
 					off := op.Offset(image.Pt(cx, y)).Push(gtx.Ops)
 					s.cellDraw(gtx, cell, st.fnt, st.size, cedarBlack)
 					off.Pop()
 				}
-				x += colW[c] + gap
+				y += pitch
+				continue
+			}
+			for c := 0; c < ncol && c < len(row); c++ {
+				cell := row[c]
+				cx := colX[c]
+				if rightAlign[c] {
+					cx = colX[c] + colW[c] - s.cellWidth(gtx, cell, st.fnt, st.size)
+				}
+				off := op.Offset(image.Pt(cx, y)).Push(gtx.Ops)
+				s.cellDraw(gtx, cell, st.fnt, st.size, cedarBlack)
+				off.Pop()
 			}
 			y += pitch
 		}
 		return D{Size: image.Pt(total, y)}
 	})
+}
+
+// groupHeader detects a spanning header row — an empty first column followed by
+// non-numeric labels that are fewer than the data columns and divide them evenly
+// (so each label spans the same number of columns). It returns the label cells
+// and the span, or (nil, 0) for an ordinary row.
+func groupHeader(row []tcell, ncol int) ([]tcell, int) {
+	if ncol < 3 || len(row) < 2 || !row[0].empty() {
+		return nil, 0
+	}
+	var labels []tcell
+	for c := 1; c < len(row); c++ {
+		if row[c].empty() {
+			continue
+		}
+		if isNumericText(row[c].text()) {
+			return nil, 0 // a real data row, not a header
+		}
+		labels = append(labels, row[c])
+	}
+	dataCols := ncol - 1
+	if n := len(labels); n > 0 && n < dataCols && dataCols%n == 0 {
+		return labels, dataCols / n
+	}
+	return nil, 0
 }
 
 // cellWidth measures a cell's rendered width (fragments in their look fonts).

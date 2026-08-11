@@ -77,3 +77,63 @@ func TestLooksLikeTable(t *testing.T) {
 		t.Fatal("no tabs is not a table")
 	}
 }
+
+func TestSpaceSeparatedColumns(t *testing.T) {
+	// A TOTAL-style row separates its last two values with padding spaces, not a
+	// tab; a 2+-space gap after content must still split them into cells.
+	runs := []tioga.Run{{Text: "TOTAL\t\t\t348\t100%\t234          100%"}}
+	grid := tableGrid(runs)
+	got := cellsOf(grid[0])
+	want := []string{"TOTAL", "348", "100%", "234", "100%"}
+	if len(got) != len(want) {
+		t.Fatalf("cells = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("cell %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+	// Leading indent (spaces before any content) must be preserved, not split.
+	g2 := tableGrid([]tioga.Run{{Text: "    General pumps\t48"}})
+	if c := g2[0][0].text(); !strings.HasPrefix(c, "    ") {
+		t.Fatalf("indent lost: %q", c)
+	}
+}
+
+func TestGroupHeaderSpan(t *testing.T) {
+	// Header: empty first column, then two labels over four data columns.
+	header := []tcell{{}, {runs: []tioga.Run{{Text: "Cedar"}}}, {runs: []tioga.Run{{Text: "GVX"}}}}
+	labels, span := groupHeader(header, 5)
+	if span != 2 || len(labels) != 2 {
+		t.Fatalf("group header: span=%d labels=%d", span, len(labels))
+	}
+	// A normal data row is not a group header.
+	data := []tcell{
+		{runs: []tioga.Run{{Text: "Defer work"}}},
+		{runs: []tioga.Run{{Text: "108"}}}, {runs: []tioga.Run{{Text: "31%"}}},
+		{runs: []tioga.Run{{Text: "77"}}}, {runs: []tioga.Run{{Text: "33%"}}},
+	}
+	if _, span := groupHeader(data, 5); span != 0 {
+		t.Fatalf("data row mistaken for header (span=%d)", span)
+	}
+}
+
+func TestMergeTableBlocks(t *testing.T) {
+	blocks := []tioga.Block{
+		{Format: "block", Text: "prose"},
+		{Format: "table3", Text: "\t\tCedar\tGVX", Runs: []tioga.Run{{Text: "\t\tCedar\tGVX"}}},
+		{Format: "table3", Text: "A\t1\t2", Runs: []tioga.Run{{Text: "A\t1\t2"}}},
+		{Format: "table3", Text: "TOTAL\t3\t4", Runs: []tioga.Run{{Text: "TOTAL\t3\t4"}}},
+		{Format: "block", Text: "after"},
+	}
+	out := mergeTableBlocks(blocks)
+	if len(out) != 3 {
+		t.Fatalf("want 3 blocks after merge, got %d", len(out))
+	}
+	if !looksLikeTable(out[1]) {
+		t.Fatalf("merged block should be a table")
+	}
+	if !strings.Contains(out[1].Text, "Cedar") || !strings.Contains(out[1].Text, "TOTAL") {
+		t.Fatalf("merged text missing rows: %q", out[1].Text)
+	}
+}
