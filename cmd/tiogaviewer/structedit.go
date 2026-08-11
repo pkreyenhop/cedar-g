@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"gioui.org/font"
+	"gioui.org/io/event"
 	"gioui.org/io/key"
 	"gioui.org/layout"
 	"gioui.org/unit"
@@ -149,7 +150,10 @@ func (s *gioUI) nodeRow(gtx C, v *viewer, n *tioga.Node, depth int) D {
 		gtx.Execute(key.FocusCmd{Tag: ed})
 		v.focusNode = nil
 	}
-	if gtx.Focused(ed) {
+	// Sync selection to keyboard focus, but not while a programmatic focus move is
+	// pending — the old editor is still focused for one frame and would otherwise
+	// revert the selection.
+	if v.focusNode == nil && gtx.Focused(ed) {
 		v.sel = n
 	}
 
@@ -209,6 +213,7 @@ func (s *gioUI) processStruct(gtx C, v *viewer) {
 	if !v.structEdit || v.doc == nil {
 		return
 	}
+	s.processStructKeys(gtx, v)
 	act := func() { s.syncEditors(v) }
 
 	switch {
@@ -256,6 +261,51 @@ func (s *gioUI) processStruct(gtx C, v *viewer) {
 	case v.bStructSave.Clicked(gtx):
 		act()
 		s.saveStruct(v)
+	}
+}
+
+// processStructKeys handles Tioga's structural keyboard gestures on the selected
+// node's editor: CTRL-RETURN new sibling, CTRL-I new child (insert+nest),
+// CTRL-SHIFT-I new unnested node, CTRL-N nest, CTRL-SHIFT-N unnest.
+func (s *gioUI) processStructKeys(gtx C, v *viewer) {
+	if v.sel == nil {
+		return
+	}
+	ed := v.editorFor(v.sel)
+	filters := []event.Filter{
+		key.Filter{Focus: ed, Name: key.NameReturn, Required: key.ModCtrl, Optional: key.ModShift},
+		key.Filter{Focus: ed, Name: "I", Required: key.ModCtrl, Optional: key.ModShift},
+		key.Filter{Focus: ed, Name: "N", Required: key.ModCtrl, Optional: key.ModShift},
+	}
+	for {
+		ev, ok := gtx.Event(filters...)
+		if !ok {
+			break
+		}
+		ke, ok := ev.(key.Event)
+		if !ok || ke.State != key.Press {
+			continue
+		}
+		s.syncEditors(v)
+		shift := ke.Modifiers.Contain(key.ModShift)
+		switch ke.Name {
+		case key.NameReturn:
+			n := v.doc.InsertSibling(v.sel, tioga.NewNode(v.sel.Format, ""))
+			v.sel, v.focusNode = n, n
+		case "I":
+			n := v.doc.InsertChild(v.sel, tioga.NewNode("body", ""))
+			if shift { // insert unnested: move it out to the parent's level
+				v.doc.Unnest(n)
+			}
+			v.sel, v.focusNode = n, n
+		case "N":
+			if shift {
+				v.doc.Unnest(v.sel)
+			} else {
+				v.doc.Nest(v.sel)
+			}
+			v.focusNode = v.sel
+		}
 	}
 }
 
