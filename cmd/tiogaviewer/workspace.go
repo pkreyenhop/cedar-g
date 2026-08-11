@@ -390,7 +390,7 @@ func (s *gioUI) saveEditor(v *viewer) {
 func (s *gioUI) layoutColumn(gtx C, c int) D {
 	col := s.cols[c]
 	gtx.Constraints.Min = gtx.Constraints.Max
-	fill(gtx, cedarWhite, gtx.Constraints.Min)
+	fill(gtx, cedarDesktop, gtx.Constraints.Min)
 
 	if col.grown != nil {
 		return s.layoutViewer(gtx, col.grown)

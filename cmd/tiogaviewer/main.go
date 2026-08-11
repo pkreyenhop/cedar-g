@@ -190,7 +190,7 @@ func (s *gioUI) processKeys(gtx C) {
 }
 
 func (s *gioUI) layout(gtx C) D {
-	fill(gtx, cedarWhite, gtx.Constraints.Max)
+	fill(gtx, cedarDesktop, gtx.Constraints.Max)
 
 	// Register a window-wide key focus so the zoom shortcuts are delivered.
 	area := clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops)
