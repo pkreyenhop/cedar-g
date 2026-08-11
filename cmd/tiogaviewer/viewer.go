@@ -404,8 +404,14 @@ func (s *gioUI) body(gtx C, v *viewer) D {
 				// An artwork node renders its Gargoyle figure in place of the
 				// "[Artwork node …]" caption; fall back to the caption if the scene
 				// is empty or unparseable.
-				if len(blocks[i].Art) > 0 {
-					if dims, ok := s.artworkBlock(gtx, v.scene(blocks[i].Art)); ok {
+				if sc := v.scene(blocks[i].Art); sc != nil && !sc.Empty() {
+					ok := false
+					dims := layout.Center.Layout(gtx, func(gtx C) D {
+						d, o := s.artworkBlock(gtx, sc)
+						ok = o
+						return d
+					})
+					if ok {
 						return dims
 					}
 				}
