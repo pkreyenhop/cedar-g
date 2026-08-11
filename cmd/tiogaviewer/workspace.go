@@ -244,6 +244,7 @@ func (s *gioUI) processHeaderActions(gtx C) {
 		s.processStruct(gtx, v)
 		s.updateFind(gtx, v)
 		s.processRefs(gtx, v)
+		s.processMenu(gtx, v)
 		if v.kind == vkCommander {
 			s.processCommander(gtx, v)
 		}

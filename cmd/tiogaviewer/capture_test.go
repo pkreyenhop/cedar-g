@@ -60,6 +60,16 @@ func TestCapture(t *testing.T) {
 			}
 		}
 	}
+	if os.Getenv("CAP_MENU") != "" {
+		for _, c := range s.cols {
+			for _, v := range c.viewers {
+				if v.isDoc() {
+					v.menuOpen = true
+					v.menuPos = f32.Pt(300, 200)
+				}
+			}
+		}
+	}
 	if os.Getenv("CAP_SEL") != "" {
 		for _, c := range s.cols {
 			for _, v := range c.viewers {

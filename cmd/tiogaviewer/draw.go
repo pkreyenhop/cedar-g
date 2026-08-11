@@ -9,6 +9,7 @@ import (
 	"gioui.org/font"
 	"gioui.org/font/opentype"
 	"gioui.org/io/event"
+	"gioui.org/io/key"
 	"gioui.org/io/pointer"
 	"gioui.org/layout"
 	"gioui.org/op"
@@ -333,20 +334,28 @@ func (s *gioUI) bullseye(gtx C, p f32.Point) {
 // and draws the Cedar bull's-eye following the pointer.
 func (s *gioUI) withBullseye(gtx C, v *viewer, content layout.Widget) D {
 	for {
-		ev, ok := gtx.Event(pointer.Filter{Target: &v.ptrPos, Kinds: pointer.Move | pointer.Drag | pointer.Enter | pointer.Leave})
+		ev, ok := gtx.Event(pointer.Filter{Target: &v.ptrPos, Kinds: pointer.Move | pointer.Drag | pointer.Enter | pointer.Leave | pointer.Press})
 		if !ok {
 			break
 		}
 		if pe, ok := ev.(pointer.Event); ok {
-			switch pe.Kind {
-			case pointer.Leave:
+			switch {
+			case pe.Kind == pointer.Leave:
 				v.ptrIn = false
+			case pe.Kind == pointer.Press && pe.Buttons.Contain(pointer.ButtonSecondary):
+				v.menuOpen, v.menuPos = true, pe.Position // right button: pop up the menu
+			case pe.Kind == pointer.Press:
+				v.menuOpen = false // any other press dismisses it
+				v.ptrPos, v.ptrIn = pe.Position, true
 			default:
 				v.ptrPos, v.ptrIn = pe.Position, true
 			}
 		}
 	}
 	dims := content(gtx)
+	if v.menuOpen {
+		s.popupMenu(gtx, v)
+	}
 	// Pass-through pointer zone: receive Move without stealing scroll/clicks, and
 	// hide the OS cursor so our drawn bull's-eye stands in for it.
 	pass := pointer.PassOp{}.Push(gtx.Ops)
@@ -359,6 +368,65 @@ func (s *gioUI) withBullseye(gtx C, v *viewer, content layout.Widget) D {
 		s.bullseye(gtx, v.ptrPos)
 	}
 	return dims
+}
+
+// popupMenu draws the right-button context menu at the click position.
+func (s *gioUI) popupMenu(gtx C, v *viewer) {
+	items := []struct {
+		b     *widget.Clickable
+		label string
+	}{
+		{&v.bmLevels, "Levels"},
+		{&v.bmFind, "Find…"},
+		{&v.bmRefs, "References"},
+		{&v.bmEdit, "Edit structure"},
+		{&v.bmPrint, "Print (HTML)"},
+		{&v.bmArt, "Artwork on/off"},
+	}
+	// Drawn after the content, so it is on top; the offset positions it at the
+	// click. Width is bounded so the buttons fill a tidy menu.
+	off := op.Offset(image.Pt(int(v.menuPos.X), int(v.menuPos.Y))).Push(gtx.Ops)
+	gtx.Constraints.Min = image.Point{}
+	gtx.Constraints.Max.X = gtx.Dp(150)
+	bordered(gtx, func(gtx C) D {
+		children := make([]layout.FlexChild, len(items))
+		for i, it := range items {
+			it := it
+			children[i] = layout.Rigid(func(gtx C) D {
+				gtx.Constraints.Min.X = gtx.Dp(148)
+				return s.flatButton(gtx, it.b, it.label)
+			})
+		}
+		return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
+	})
+	off.Pop()
+}
+
+// processMenu handles the pop-up menu's item clicks.
+func (s *gioUI) processMenu(gtx C, v *viewer) {
+	act := func(f func()) { f(); v.menuOpen = false }
+	switch {
+	case v.bmLevels.Clicked(gtx):
+		act(func() { v.showLevels = !v.showLevels })
+	case v.bmFind.Clicked(gtx):
+		act(func() {
+			v.findOpen = true
+			gtx.Execute(key.FocusCmd{Tag: &v.findEd})
+		})
+	case v.bmRefs.Clicked(gtx):
+		act(func() {
+			v.showRefs = !v.showRefs
+			if v.showRefs {
+				v.computeRefs()
+			}
+		})
+	case v.bmEdit.Clicked(gtx):
+		act(func() { s.enterStruct(v) })
+	case v.bmPrint.Clicked(gtx):
+		act(func() { s.exportDoc(v) })
+	case v.bmArt.Clicked(gtx):
+		act(func() { s.artworkOff = !s.artworkOff })
+	}
 }
 
 // bordered wraps a widget in a 1px black frame over a white background.
