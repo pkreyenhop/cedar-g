@@ -91,6 +91,18 @@ func TestPropsPreserved(t *testing.T) {
 	t.Logf("captured %d distinct property names", len(names))
 }
 
+// TestMultiPlainRunsPreserved checks that a node's run subdivision survives even
+// when no run carries a look (as in the look sample-sheet documents).
+func TestMultiPlainRunsPreserved(t *testing.T) {
+	d := NewDoc(nil)
+	d.InsertSibling(nil, &Node{Runs: []Run{{Text: "A"}, {Text: "B"}, {Text: "C"}}})
+	re := Read(EncodeDoc(d.Root), false)
+	got := re.Root.Children[0].Runs
+	if len(got) != 3 || got[0].Text != "A" || got[2].Text != "C" {
+		t.Fatalf("plain run structure not preserved: %+v", got)
+	}
+}
+
 // TestEncodeDocRoundTripPropsSynthetic round-trips a node carrying properties.
 func TestEncodeDocRoundTripPropsSynthetic(t *testing.T) {
 	d := NewDoc(nil)

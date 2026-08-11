@@ -94,18 +94,19 @@ func (e *encoder) emitProps(props []Prop) {
 	}
 }
 
-// emitRuns writes an opRuns record describing the runs, but only when at least
-// one run carries a look (a plain rope needs none). Run lengths are in Latin-1
-// bytes, matching how the reader splits the rope.
+// emitRuns writes an opRuns record describing the runs. It is skipped only for a
+// single plain run (a bare rope needs none); a node with looks, or with multiple
+// runs, keeps its exact run structure. Run lengths are in Latin-1 bytes, matching
+// how the reader splits the rope.
 func (e *encoder) emitRuns(runs []Run) {
-	any := false
+	anyLook := false
 	for _, r := range runs {
 		if r.Look != 0 {
-			any = true
+			anyLook = true
 			break
 		}
 	}
-	if !any {
+	if !anyLook && len(runs) <= 1 {
 		return
 	}
 	e.control = append(e.control, opRuns)
