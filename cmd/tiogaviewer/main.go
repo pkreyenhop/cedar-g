@@ -49,7 +49,12 @@ type gioUI struct {
 
 	keyTag  int
 	focused bool
+
+	message string // the Cedar message line at the bottom
 }
+
+// setMessage posts feedback to the message line.
+func (s *gioUI) setMessage(m string) { s.message = m }
 
 func newUI() *gioUI {
 	s := &gioUI{
@@ -59,6 +64,7 @@ func newUI() *gioUI {
 		treeWidth: 240,
 		colSplit:  0.5,
 		showTree:  true,
+		message:   "Cedar Viewers ready.",
 	}
 	s.th = material.NewTheme()
 	s.th.Shaper = s.sh
@@ -206,7 +212,23 @@ func (s *gioUI) layout(gtx C) D {
 		layout.Rigid(hrule),
 		layout.Flexed(1, s.workspace),
 		layout.Rigid(hrule),
+		layout.Rigid(s.messageLine),
+		layout.Rigid(hrule),
 		layout.Rigid(s.layoutIconTray),
+	)
+}
+
+// messageLine is the Cedar feedback strip: it shows the last posted message.
+func (s *gioUI) messageLine(gtx C) D {
+	h := gtx.Dp(20)
+	gtx.Constraints.Min = image.Pt(gtx.Constraints.Max.X, h)
+	return layout.Stack{}.Layout(gtx,
+		layout.Expanded(func(gtx C) D { return fill(gtx, cedarWhite, gtx.Constraints.Min) }),
+		layout.Stacked(func(gtx C) D {
+			return layout.Inset{Left: 6, Top: 2}.Layout(gtx, func(gtx C) D {
+				return s.label(gtx, serifFont, font.Normal, font.Regular, 12, s.message, cedarBlack, 1)
+			})
+		}),
 	)
 }
 

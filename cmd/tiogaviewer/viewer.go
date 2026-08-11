@@ -500,6 +500,7 @@ func (s *gioUI) body(gtx C, v *viewer) D {
 				// Click selects a node (shown underlined by docBlock).
 				if i < len(v.blockClicks) && v.blockClicks[i].Clicked(gtx) {
 					v.selBlock = i
+					s.setMessage("selected " + selDesc(blocks[i]))
 				}
 				block := func(gtx C) D {
 					sel := i == v.selBlock
@@ -911,6 +912,22 @@ func (s *gioUI) docBlock(gtx C, b tioga.Block, selected bool) D {
 		}
 		return s.paraLabel(gtx, st.fnt, st.size, st.align, docLineHeight, b.Text, col)
 	})
+}
+
+// selDesc describes a selected block for the message line.
+func selDesc(b tioga.Block) string {
+	f := b.Format
+	if f == "" {
+		f = "node"
+	}
+	t := strings.TrimSpace(b.Text)
+	if len(t) > 40 {
+		t = t[:40] + "…"
+	}
+	if t == "" {
+		return f
+	}
+	return f + ": " + t
 }
 
 // uLook is the underline look bit.

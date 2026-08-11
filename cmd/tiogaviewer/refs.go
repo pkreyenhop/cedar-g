@@ -87,8 +87,10 @@ func (s *gioUI) processRefs(gtx C, v *viewer) {
 			if p, ok := s.resolveRef(v, r.name); ok {
 				s.openFile(p)
 				v.saveMsg = "opened " + r.name
+				s.setMessage(v.saveMsg)
 			} else {
 				v.saveMsg = "not found: " + r.name
+				s.setMessage(v.saveMsg)
 			}
 		}
 	}

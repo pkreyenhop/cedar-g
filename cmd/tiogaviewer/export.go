@@ -187,7 +187,9 @@ func (s *gioUI) exportDoc(v *viewer) {
 	path := v.path + ".html"
 	if err := os.WriteFile(path, []byte(exportHTML(v.headerTitle(), v.blocks)), 0o644); err != nil {
 		v.saveMsg = "export failed: " + err.Error()
+		s.setMessage(v.saveMsg)
 		return
 	}
 	v.saveMsg = "exported " + s.relPath(path)
+	s.setMessage(v.saveMsg)
 }

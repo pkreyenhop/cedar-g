@@ -495,4 +495,5 @@ func (s *gioUI) saveStruct(v *viewer) {
 		return
 	}
 	v.saveMsg = "saved " + v.rel
+	s.setMessage(v.saveMsg)
 }
