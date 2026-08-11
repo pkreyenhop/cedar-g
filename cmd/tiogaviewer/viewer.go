@@ -462,6 +462,10 @@ func (s *gioUI) body(gtx C, v *viewer) D {
 	}
 	blocks := v.visibleBlocks()
 	match := v.currentMatchBlock()
+	var markers []string
+	if v.showLevels {
+		markers = outlineMarkers(blocks)
+	}
 	docList := func(gtx C) D {
 		return layout.Inset{Top: 4, Right: 12, Bottom: 4}.Layout(gtx, func(gtx C) D {
 			gtx.Constraints.Min = gtx.Constraints.Max
@@ -480,13 +484,19 @@ func (s *gioUI) body(gtx C, v *viewer) D {
 						return dims
 					}
 				}
-				if i == match { // tint the current search-match block
-					return layout.Stack{}.Layout(gtx,
-						layout.Expanded(func(gtx C) D { return fill(gtx, findBg, gtx.Constraints.Min) }),
-						layout.Stacked(func(gtx C) D { return s.docBlock(gtx, blocks[i]) }),
-					)
+				block := func(gtx C) D {
+					if i == match { // tint the current search-match block
+						return layout.Stack{}.Layout(gtx,
+							layout.Expanded(func(gtx C) D { return fill(gtx, findBg, gtx.Constraints.Min) }),
+							layout.Stacked(func(gtx C) D { return s.docBlock(gtx, blocks[i]) }),
+						)
+					}
+					return s.docBlock(gtx, blocks[i])
 				}
-				return s.docBlock(gtx, blocks[i])
+				if markers != nil && markers[i] != "" {
+					return s.outlineRow(gtx, markers[i], block)
+				}
+				return block(gtx)
 			})
 		})
 	}
