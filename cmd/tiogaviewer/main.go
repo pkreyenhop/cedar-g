@@ -39,7 +39,8 @@ type gioUI struct {
 	cols      [numColumns]*column
 	minimized []*viewer
 
-	bUp, bQuit, bCmd, bOpen, bNew widget.Clickable
+	bUp, bQuit, bCmd, bCmdr, bOpen, bNew widget.Clickable
+	artworkOff                           bool // "Artwork off" hides embedded figures
 
 	treeWidth float32 // tree column width, in dp
 	colSplit  float32 // column 0's fraction of the columns area
@@ -146,6 +147,9 @@ func (s *gioUI) update(gtx C) {
 	if s.bCmd.Clicked(gtx) {
 		s.openTerminal()
 	}
+	if s.bCmdr.Clicked(gtx) {
+		s.openCommander()
+	}
 	if s.bOpen.Clicked(gtx) {
 		s.showTree = !s.showTree // toggle the file selector
 	}
@@ -225,6 +229,9 @@ func (s *gioUI) globalBar(gtx C) D {
 				}),
 				layout.Rigid(func(gtx C) D {
 					return layout.UniformInset(3).Layout(gtx, func(gtx C) D { return s.flatButton(gtx, &s.bCmd, "Cmd") })
+				}),
+				layout.Rigid(func(gtx C) D {
+					return layout.UniformInset(3).Layout(gtx, func(gtx C) D { return s.flatButton(gtx, &s.bCmdr, "Commander") })
 				}),
 				layout.Rigid(func(gtx C) D {
 					return layout.UniformInset(3).Layout(gtx, func(gtx C) D { return s.flatButton(gtx, &s.bOpen, "Open") })

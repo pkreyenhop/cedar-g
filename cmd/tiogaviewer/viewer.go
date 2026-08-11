@@ -65,10 +65,11 @@ type run struct {
 type viewerKind int
 
 const (
-	vkContent viewerKind = iota // a decoded document or code file
-	vkEditor                    // a blank/editable Tioga document
-	vkTerm                      // a shell terminal
-	vkOutput                    // read-only program output (e.g. a Mesa run)
+	vkContent   viewerKind = iota // a decoded document or code file
+	vkEditor                      // a blank/editable Tioga document
+	vkTerm                        // a shell terminal
+	vkOutput                      // read-only program output (e.g. a Mesa run)
+	vkCommander                   // a Cedar command interpreter (CommandTool)
 )
 
 // viewer is one Cedar "Viewer": a pane living in a column.
@@ -106,6 +107,9 @@ type viewer struct {
 	editorInit bool             // code viewer: the edit buffer has been loaded
 
 	outText string // vkOutput: the captured program output
+
+	cmdLog []string      // vkCommander: the command/output log
+	cmdEd  widget.Editor // vkCommander: the command input line
 
 	// Levels: an outline view that shows only nodes up to a nesting depth.
 	bLevels                                 widget.Clickable // header: reveal the levels bar
@@ -393,6 +397,8 @@ func (s *gioUI) body(gtx C, v *viewer) D {
 		return s.termBody(gtx, v)
 	case vkOutput:
 		return s.outputBody(gtx, v)
+	case vkCommander:
+		return s.commanderBody(gtx, v)
 	}
 	// The left margin comes from the scroll gutter; add top/right/bottom only.
 	if v.isCode {
@@ -428,7 +434,7 @@ func (s *gioUI) body(gtx C, v *viewer) D {
 				// An artwork node renders its Gargoyle figure in place of the
 				// "[Artwork node …]" caption; fall back to the caption if the scene
 				// is empty or unparseable.
-				if sc := v.scene(blocks[i].Art); sc != nil && !sc.Empty() {
+				if sc := v.scene(blocks[i].Art); !s.artworkOff && sc != nil && !sc.Empty() {
 					ok := false
 					dims := layout.Center.Layout(gtx, func(gtx C) D {
 						d, o := s.artworkBlock(gtx, sc)
