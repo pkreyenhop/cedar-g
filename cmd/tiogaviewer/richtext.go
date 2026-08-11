@@ -3,7 +3,6 @@ package main
 import (
 	"image"
 	"image/color"
-	"strings"
 
 	"gioui.org/font"
 	"gioui.org/op"
@@ -26,7 +25,11 @@ func (s *gioUI) richText(gtx C, runs []tioga.Run, base font.Font, size float32, 
 	maxW := gtx.Constraints.Max.X
 
 	toks := s.buildTokens(gtx, runs, base, size)
-	lines := wrapTokens(toks, maxW)
+	tabStop := s.tokMeasure(gtx, base, size, "0").Size.X * tabStopEms
+	if tabStop <= 0 {
+		tabStop = 40
+	}
+	lines := wrapTokens(toks, maxW, tabStop)
 
 	lineH := s.tokMeasure(gtx, base, size, "Ag").Size.Y
 	gap := int(float32(gtx.Sp(s.sp(size))) * (lineHeight - 1))
@@ -95,7 +98,15 @@ const (
 	segWord segKind = iota
 	segSpace
 	segBreak
+	segTab
 )
+
+// tabStopEms sets the tab-stop interval as a multiple of the figure ("0") width.
+// A tab advances to the next stop, so value columns line up across rows with the
+// common tab count. The document's true (non-uniform) tab ruler is not exposed by
+// the format, so this uniform approximation cannot align every row exactly; 8
+// figures keeps a typical table's rows on one line while lining up most columns.
+const tabStopEms = 8
 
 // tok is one measured, styled, non-breaking piece of text.
 type tok struct {
@@ -110,7 +121,6 @@ type tok struct {
 // buildTokens flattens runs into measured tokens, splitting each run at
 // whitespace and newlines so wrapTokens can break between them.
 func (s *gioUI) buildTokens(gtx C, runs []tioga.Run, base font.Font, size float32) []tok {
-	runs = expandRunTabs(runs)
 	var toks []tok
 	for _, r := range runs {
 		fnt := base
@@ -127,6 +137,12 @@ func (s *gioUI) buildTokens(gtx C, runs []tioga.Run, base font.Font, size float3
 		}
 		ul := r.Look.Underline()
 		for _, seg := range splitSegments(r.Text) {
+			// A tab is a zero-glyph token; its width is computed at wrap time as the
+			// advance to the next tab stop, so it never draws a missing-glyph box.
+			if seg.kind == segTab {
+				toks = append(toks, tok{kind: segTab})
+				continue
+			}
 			t := tok{text: seg.text, fnt: fnt, size: size, ul: ul, kind: seg.kind}
 			if seg.kind != segBreak {
 				t.w = s.tokMeasure(gtx, fnt, size, seg.text).Size.X
@@ -137,77 +153,35 @@ func (s *gioUI) buildTokens(gtx C, runs []tioga.Run, base font.Font, size float3
 	return toks
 }
 
-// expandRunTabs replaces tab characters in styled runs with spaces to the next
-// 8-column stop, tracking the column across run boundaries (a table row's label
-// and value are separate runs) and resetting at newlines. Without this, Gio
-// draws a raw tab as a missing-glyph box — the same reason expandTabs exists for
-// plain text, but here applied to the look-carrying rich-text path (e.g. the
-// bold, tab-aligned rows of a Tioga table).
-func expandRunTabs(runs []tioga.Run) []tioga.Run {
-	hasTab := false
-	for _, r := range runs {
-		if strings.ContainsRune(r.Text, '\t') {
-			hasTab = true
-			break
-		}
-	}
-	if !hasTab {
-		return runs
-	}
-	const tw = 8
-	out := make([]tioga.Run, len(runs))
-	col := 0
-	for i, r := range runs {
-		var b strings.Builder
-		b.Grow(len(r.Text))
-		for _, ch := range r.Text {
-			switch ch {
-			case '\t':
-				n := tw - col%tw
-				for k := 0; k < n; k++ {
-					b.WriteByte(' ')
-				}
-				col += n
-			case '\n':
-				b.WriteByte('\n')
-				col = 0
-			default:
-				b.WriteRune(ch)
-				col++
-			}
-		}
-		out[i] = tioga.Run{Text: b.String(), Look: r.Look}
-	}
-	return out
-}
-
 type segment struct {
 	text string
 	kind segKind
 }
 
-// splitSegments divides text into maximal word / whitespace segments, with each
-// newline emitted as its own hard-break segment. Tabs count as whitespace.
+// splitSegments divides text into maximal word / space segments, with each
+// newline a hard break and each tab its own tab-advance segment.
 func splitSegments(text string) []segment {
 	var segs []segment
 	rs := []rune(text)
 	i := 0
-	isSpace := func(r rune) bool { return r == ' ' || r == '\t' }
 	for i < len(rs) {
 		switch {
 		case rs[i] == '\n':
 			segs = append(segs, segment{"\n", segBreak})
 			i++
-		case isSpace(rs[i]):
+		case rs[i] == '\t':
+			segs = append(segs, segment{"\t", segTab})
+			i++
+		case rs[i] == ' ':
 			j := i
-			for j < len(rs) && isSpace(rs[j]) {
+			for j < len(rs) && rs[j] == ' ' {
 				j++
 			}
 			segs = append(segs, segment{string(rs[i:j]), segSpace})
 			i = j
 		default:
 			j := i
-			for j < len(rs) && rs[j] != '\n' && !isSpace(rs[j]) {
+			for j < len(rs) && rs[j] != '\n' && rs[j] != '\t' && rs[j] != ' ' {
 				j++
 			}
 			segs = append(segs, segment{string(rs[i:j]), segWord})
@@ -221,10 +195,11 @@ func splitSegments(text string) []segment {
 // word tokens (a word split across runs) are measured together so a look change
 // never forces a mid-word break. Leading spaces on a wrapped line are dropped;
 // a hard break starts a new line.
-func wrapTokens(toks []tok, maxW int) [][]tok {
+func wrapTokens(toks []tok, maxW, tabStop int) [][]tok {
 	var lines [][]tok
 	var cur []tok
 	curW := 0
+	lineHasTab := false // a tabbed (table) row is kept on one line, never wrapped
 	trimTrailing := func() {
 		for len(cur) > 0 && cur[len(cur)-1].kind == segSpace {
 			curW -= cur[len(cur)-1].w
@@ -235,6 +210,7 @@ func wrapTokens(toks []tok, maxW int) [][]tok {
 		lines = append(lines, cur)
 		cur = nil
 		curW = 0
+		lineHasTab = false
 	}
 
 	i := 0
@@ -244,6 +220,19 @@ func wrapTokens(toks []tok, maxW int) [][]tok {
 		case segBreak:
 			trimTrailing()
 			flush()
+			i++
+		case segTab:
+			// Advance to the next tab stop measured from the line's left edge, so
+			// value columns line up regardless of the (proportional) label width.
+			if tabStop <= 0 {
+				i++
+				continue
+			}
+			lineHasTab = true
+			w := (curW/tabStop+1)*tabStop - curW
+			t.w = w
+			cur = append(cur, t)
+			curW += w
 			i++
 		case segSpace:
 			if len(cur) == 0 { // drop leading whitespace on a line
@@ -259,7 +248,9 @@ func wrapTokens(toks []tok, maxW int) [][]tok {
 				wordW += toks[j].w
 				j++
 			}
-			if curW+wordW > maxW && len(cur) > 0 {
+			// A tabbed row is a table line: never fragment it (let it overflow the
+			// column rather than splitting a row across lines).
+			if !lineHasTab && curW+wordW > maxW && len(cur) > 0 {
 				trimTrailing()
 				flush()
 			}

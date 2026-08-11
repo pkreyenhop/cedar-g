@@ -41,6 +41,12 @@ func TestCapture(t *testing.T) {
 	if p := os.Getenv("CAP_TEXT"); p != "" {
 		s.openFile(p)
 	}
+	if os.Getenv("CAP_NOTREE") != "" {
+		s.showTree = false
+		if len(s.cols[1].viewers) == 0 {
+			s.colSplit = 0.98 // give the single populated column nearly all the width
+		}
+	}
 	if kw := os.Getenv("CAP_SCROLLTO"); kw != "" {
 		for _, c := range s.cols {
 			for _, v := range c.viewers {
