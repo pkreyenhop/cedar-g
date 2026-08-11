@@ -25,6 +25,7 @@ import (
 	"gioui.org/widget/material"
 
 	"cedarg/internal/cedar"
+	"cedarg/internal/gargoyle"
 	"cedarg/internal/tioga"
 )
 
@@ -72,18 +73,19 @@ const (
 
 // viewer is one Cedar "Viewer": a pane living in a column.
 type viewer struct {
-	kind   viewerKind
-	path   string
-	rel    string
-	title  string // header title override (editor/terminal)
-	col    int
-	isCode bool
-	lines  [][]run       // code
-	blocks []tioga.Block // documents
-	root   *tioga.Node   // documents: the full node tree
-	editor widget.Editor // vkEditor
-	term   *terminal     // vkTerm
-	sc     scroller
+	kind     viewerKind
+	path     string
+	rel      string
+	title    string // header title override (editor/terminal)
+	col      int
+	isCode   bool
+	lines    [][]run                   // code
+	blocks   []tioga.Block             // documents
+	root     *tioga.Node               // documents: the full node tree
+	artCache map[*byte]*gargoyle.Scene // parsed artwork scenes, by Art bytes
+	editor   widget.Editor             // vkEditor
+	term     *terminal                 // vkTerm
+	sc       scroller
 
 	bDestroy, bGrow, bIcon, bSwitch, bSplit widget.Clickable
 	bRestore                                widget.Clickable // in the icon tray
@@ -399,6 +401,14 @@ func (s *gioUI) body(gtx C, v *viewer) D {
 		return layout.Inset{Top: 4, Right: 12, Bottom: 4}.Layout(gtx, func(gtx C) D {
 			gtx.Constraints.Min = gtx.Constraints.Max
 			return s.scrollList(gtx, &v.sc, len(blocks), func(gtx C, i int) D {
+				// An artwork node renders its Gargoyle figure in place of the
+				// "[Artwork node …]" caption; fall back to the caption if the scene
+				// is empty or unparseable.
+				if len(blocks[i].Art) > 0 {
+					if dims, ok := s.artworkBlock(gtx, v.scene(blocks[i].Art)); ok {
+						return dims
+					}
+				}
 				return s.docBlock(gtx, blocks[i])
 			})
 		})

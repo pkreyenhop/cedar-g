@@ -50,6 +50,7 @@ type Block struct {
 	Runs   []Run
 	Format string
 	Depth  int
+	Art    []byte // Gargoyle scene bytes for an artwork node (else nil)
 }
 
 // Document is the decoded result. When IsCode is true, Code holds the
@@ -163,7 +164,47 @@ func Read(data []byte, isCode bool) Document {
 	if isCode {
 		return Document{IsCode: true, Code: r.code.String(), Root: r.root}
 	}
+	r.attachArtwork()
 	return Document{Blocks: r.blocks, Root: r.root}
+}
+
+// GGFileOf returns a node's Gargoyle scene bytes (its "GGFile"/"ggfile"
+// property), or nil if it is not an artwork node.
+func GGFileOf(n *Node) []byte {
+	for _, p := range n.Props {
+		if p.Name == "GGFile" || p.Name == "ggfile" {
+			return []byte(p.Value)
+		}
+	}
+	return nil
+}
+
+// attachArtwork gives each artwork block (an "artworkFigure" node, which renders
+// as a placeholder caption) the Gargoyle scene from its node, so the viewer can
+// draw the figure. Nodes and their blocks are both in document order, so the
+// artwork nodes' scenes map one-to-one onto the artworkFigure blocks.
+func (r *reader) attachArtwork() {
+	var scenes [][]byte
+	var walk func(*Node)
+	walk = func(n *Node) {
+		for _, c := range n.Children {
+			if gg := GGFileOf(c); gg != nil {
+				scenes = append(scenes, gg)
+			}
+			walk(c)
+		}
+	}
+	walk(r.root)
+	if len(scenes) == 0 {
+		return
+	}
+	ai := 0
+	for i := range r.blocks {
+		if r.blocks[i].Format == "artworkFigure" && ai < len(scenes) {
+			r.blocks[i].Art = scenes[ai]
+			ai++
+		}
+	}
 }
 
 func checkID(buf []byte, p int, id []byte) bool {
