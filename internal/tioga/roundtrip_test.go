@@ -21,6 +21,9 @@ func treeSig(n *Node, depth int, out *[]string) {
 		if len(c.Comment) > 0 {
 			line += "//" + runsText(c.Comment)
 		}
+		for _, p := range c.Props {
+			line += "<" + p.Name + "=" + p.Value + ">"
+		}
 		*out = append(*out, line)
 		treeSig(c, depth+1, out)
 	}
@@ -67,6 +70,47 @@ func TestEncodeDocRoundTripSynthetic(t *testing.T) {
 	}
 }
 
+// TestPropsPreserved confirms Phase 6 actually captures node properties from a
+// real document (the round-trip test would pass vacuously if none were read).
+func TestPropsPreserved(t *testing.T) {
+	doc := readReal(t)
+	names := map[string]int{}
+	var count func(n *Node)
+	count = func(n *Node) {
+		for _, p := range n.Props {
+			names[p.Name]++
+		}
+		for _, c := range n.Children {
+			count(c)
+		}
+	}
+	count(doc.Root)
+	if len(names) == 0 {
+		t.Fatal("no properties captured from a real document")
+	}
+	t.Logf("captured %d distinct property names", len(names))
+}
+
+// TestEncodeDocRoundTripPropsSynthetic round-trips a node carrying properties.
+func TestEncodeDocRoundTripPropsSynthetic(t *testing.T) {
+	d := NewDoc(nil)
+	n := d.InsertSibling(nil, NewNode("body", "text"))
+	n.Props = []Prop{{Name: "postfix", Value: "\x01\x02\x03"}, {Name: "Mark", Value: "x"}}
+	d.Root.Props = []Prop{{Name: "StyleDef", Value: "cedar"}}
+
+	re := Read(EncodeDoc(d.Root), false)
+	if i, ok := eqSig(sig(d.Root), sig(re.Root)); !ok {
+		t.Fatalf("prop round-trip differs at %d", i)
+	}
+	if len(re.Root.Props) != 1 || re.Root.Props[0].Name != "StyleDef" {
+		t.Fatalf("root prop lost: %+v", re.Root.Props)
+	}
+	got := re.Root.Children[0].Props
+	if len(got) != 2 || got[0].Value != "\x01\x02\x03" || got[1].Name != "Mark" {
+		t.Fatalf("node props lost: %+v", got)
+	}
+}
+
 // TestEncodeDocRoundTripReal round-trips genuine Cedar documents: read → encode
 // → read must reproduce the same tree signature.
 func TestEncodeDocRoundTripReal(t *testing.T) {
@@ -95,7 +139,7 @@ func TestEncodeDocRoundTripReal(t *testing.T) {
 			t.Fatalf("%s: round-trip differs at line %d\n before=%q\n after =%q", filepath.Base(f), i, b, a)
 		}
 		tested++
-		if tested >= 40 {
+		if tested >= 120 {
 			break
 		}
 	}

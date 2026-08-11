@@ -44,6 +44,16 @@ type Run struct {
 	Look Look
 }
 
+// Prop is a Tioga node property: a name (e.g. "postfix", "NewlineDelimiter",
+// "Mark", "StyleDef") and its opaque value bytes. Properties carry style-beyond-
+// style effects (colours, boxes, artwork references, …); the viewer does not
+// interpret them, but preserves them so documents round-trip losslessly. Value
+// holds the raw property bytes verbatim.
+type Prop struct {
+	Name  string
+	Value string
+}
+
 // Node is one node of a Tioga document tree. A document is a tree of nodes;
 // nesting (a node's Children) is what the editor shows as indentation. Format is
 // the node's named structural format ("" for the default/root, else "title",
@@ -54,6 +64,7 @@ type Node struct {
 	Runs     []Run
 	Comment  []Run
 	Children []*Node
+	Props    []Prop
 }
 
 // Text returns the node's text with looks flattened away.

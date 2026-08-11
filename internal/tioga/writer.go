@@ -41,8 +41,11 @@ func EncodeDoc(root *Node) []byte {
 		root = &Node{}
 	}
 	e := &encoder{}
-	// The reader supplies its own synthetic root, so emit this root's children as
-	// the top-level nodes rather than wrapping them (which would add a level).
+	// Document-level properties (attached to the root) come first, so re-reading
+	// re-attaches them before any node starts. The reader supplies its own
+	// synthetic root, so emit this root's children as the top-level nodes rather
+	// than wrapping them (which would add a level).
+	e.emitProps(root.Props)
 	for _, c := range root.Children {
 		e.node(c)
 	}
@@ -72,11 +75,23 @@ func (e *encoder) node(n *Node) {
 		e.emitRuns(n.Comment)
 		e.emitRope(n.Comment, true)
 	}
+	e.emitProps(n.Props)
 
 	for _, c := range n.Children {
 		e.node(c)
 	}
 	e.control = append(e.control, opEndNode)
+}
+
+// emitProps writes each property as a named opProp record (name + length-
+// prefixed value) into the control stream.
+func (e *encoder) emitProps(props []Prop) {
+	for _, p := range props {
+		e.control = append(e.control, opProp)
+		e.control = appendStr(e.control, p.Name)
+		e.control = appendVarint(e.control, int64(len(p.Value)))
+		e.control = append(e.control, p.Value...)
+	}
 }
 
 // emitRuns writes an opRuns record describing the runs, but only when at least

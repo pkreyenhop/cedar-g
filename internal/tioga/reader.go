@@ -329,9 +329,11 @@ func (r *reader) doWork() {
 				continue
 			case opProp:
 				r.getStr()
-				r.addProp(string(r.str))
+				name := string(r.str)
+				r.addProp(name)
 				n := r.getInt()
 				r.sGetRope(&r.ctrl, n)
+				r.attachProp(name, string(r.str))
 				op = r.getOp()
 				continue
 			case opPropShort:
@@ -339,9 +341,10 @@ func (r *reader) doWork() {
 				if iProp >= r.nProps {
 					iProp = 0
 				}
-				_ = iProp
+				name := r.props[iProp]
 				n := r.getInt()
 				r.sGetRope(&r.ctrl, n)
+				r.attachProp(name, string(r.str))
 				op = r.getOp()
 				continue
 			case opEndOfFile:
@@ -520,6 +523,15 @@ func (r *reader) endNode() {
 	if len(r.nodeStack) > 1 {
 		r.nodeStack = r.nodeStack[:len(r.nodeStack)-1]
 	}
+}
+
+// attachProp records a property on the node currently receiving content, so it
+// round-trips. Emission re-attaches it at the same point (see EncodeDoc).
+func (r *reader) attachProp(name, value string) {
+	if r.cur == nil {
+		r.cur = r.root
+	}
+	r.cur.Props = append(r.cur.Props, Prop{Name: name, Value: value})
 }
 
 // toString decodes Latin-1 bytes to a UTF-8 string, applying the two glyph
