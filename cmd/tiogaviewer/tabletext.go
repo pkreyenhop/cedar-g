@@ -353,17 +353,20 @@ func groupHeader(row []tcell, ncol int) ([]tcell, int) {
 func (s *gioUI) cellWidth(gtx C, cell tcell, base font.Font, size float32) int {
 	w := 0
 	for _, r := range cell.runs {
-		w += s.tokMeasure(gtx, fragFont(base, r.Look), size, r.Text).Size.X
+		v := lookVisual(base, r.Look)
+		w += s.tokMeasure(gtx, v.fnt, size*v.sizeScale, applyCaps(r.Text, v)).Size.X
 	}
 	return w
 }
 
-// cellDraw paints a cell's fragments left to right at the current origin.
+// cellDraw paints a cell's fragments left to right at the current origin,
+// honouring each fragment's looks.
 func (s *gioUI) cellDraw(gtx C, cell tcell, base font.Font, size float32, col color.NRGBA) {
 	x := 0
 	for _, r := range cell.runs {
+		v := lookVisual(base, r.Look)
 		off := op.Offset(image.Pt(x, 0)).Push(gtx.Ops)
-		w := s.drawFrag(gtx, r.Text, fragFont(base, r.Look), size, col)
+		w := s.drawFrag(gtx, applyCaps(r.Text, v), v.fnt, size*v.sizeScale, col, v.underline, v.strike)
 		off.Pop()
 		x += w
 	}
@@ -372,27 +375,26 @@ func (s *gioUI) cellDraw(gtx C, cell tcell, base font.Font, size float32, col co
 // drawFrag draws one styled fragment and returns its advance width. The layout
 // is unbounded so the returned width is the text's own width (not the full cell
 // constraint), which is what the caller advances by.
-func (s *gioUI) drawFrag(gtx C, txt string, fnt font.Font, size float32, col color.NRGBA) int {
+func (s *gioUI) drawFrag(gtx C, txt string, fnt font.Font, size float32, col color.NRGBA, underline, strike bool) int {
 	gtx.Constraints.Min = image.Point{}
 	gtx.Constraints.Max = image.Pt(1<<20, 1<<20)
 	macro := op.Record(gtx.Ops)
 	paint.ColorOp{Color: col}.Add(gtx.Ops)
 	cl := macro.Stop()
-	return widget.Label{MaxLines: 1, Alignment: text.Start}.Layout(gtx, s.sh, fnt, s.sp(size), txt, cl).Size.X
-}
-
-// fragFont applies a run's looks (bold/italic, and the "k" inline-code look) to
-// the base face.
-func fragFont(base font.Font, lk tioga.Look) font.Font {
-	f := base
-	if lk.Bold() {
-		f.Weight = font.Bold
+	d := widget.Label{MaxLines: 1, Alignment: text.Start}.Layout(gtx, s.sh, fnt, s.sp(size), txt, cl)
+	if underline && d.Size.X > 0 {
+		uy := d.Size.Y - d.Baseline + 2
+		if uy >= d.Size.Y {
+			uy = d.Size.Y - 1
+		}
+		fillAt(gtx, col, image.Rect(0, uy, d.Size.X, uy+1))
 	}
-	if lk.Italic() {
-		f.Style = font.Italic
+	if strike && d.Size.X > 0 {
+		sy := d.Size.Y - d.Baseline - int(0.28*size)
+		if sy < 0 {
+			sy = 0
+		}
+		fillAt(gtx, col, image.Rect(0, sy, d.Size.X, sy+1))
 	}
-	if lk.Has('k') {
-		f.Typeface = "Mono"
-	}
-	return f
+	return d.Size.X
 }

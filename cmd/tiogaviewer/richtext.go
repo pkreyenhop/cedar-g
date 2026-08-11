@@ -110,12 +110,14 @@ const tabStopEms = 8
 
 // tok is one measured, styled, non-breaking piece of text.
 type tok struct {
-	text string
-	fnt  font.Font
-	size float32
-	ul   bool
-	w    int
-	kind segKind
+	text   string
+	fnt    font.Font
+	size   float32
+	ul     bool
+	strike bool
+	dy     float32 // baseline shift as a fraction of size (super/subscript)
+	w      int
+	kind   segKind
 }
 
 // buildTokens flattens runs into measured tokens, splitting each run at
@@ -123,29 +125,19 @@ type tok struct {
 func (s *gioUI) buildTokens(gtx C, runs []tioga.Run, base font.Font, size float32) []tok {
 	var toks []tok
 	for _, r := range runs {
-		fnt := base
-		if r.Look.Bold() {
-			fnt.Weight = font.Bold
-		}
-		if r.Look.Italic() {
-			fnt.Style = font.Italic
-		}
-		// The "k" look is the default Cedar style's inline code look: fixed-pitch
-		// (e.g. FORK/JOIN set in mono within running prose).
-		if r.Look.Has('k') {
-			fnt.Typeface = "Mono"
-		}
-		ul := r.Look.Underline()
-		for _, seg := range splitSegments(r.Text) {
+		v := lookVisual(base, r.Look)
+		fsize := size * v.sizeScale
+		text := applyCaps(r.Text, v)
+		for _, seg := range splitSegments(text) {
 			// A tab is a zero-glyph token; its width is computed at wrap time as the
 			// advance to the next tab stop, so it never draws a missing-glyph box.
 			if seg.kind == segTab {
 				toks = append(toks, tok{kind: segTab})
 				continue
 			}
-			t := tok{text: seg.text, fnt: fnt, size: size, ul: ul, kind: seg.kind}
+			t := tok{text: seg.text, fnt: v.fnt, size: fsize, ul: v.underline, strike: v.strike, dy: v.dy, kind: seg.kind}
 			if seg.kind != segBreak {
-				t.w = s.tokMeasure(gtx, fnt, size, seg.text).Size.X
+				t.w = s.tokMeasure(gtx, v.fnt, fsize, seg.text).Size.X
 			}
 			toks = append(toks, t)
 		}
@@ -284,8 +276,14 @@ func (s *gioUI) tokMeasure(gtx C, fnt font.Font, size float32, txt string) D {
 	return d
 }
 
-// tokDraw renders one token and its underline (if any).
+// tokDraw renders one token, its baseline shift (super/subscript) and any
+// underline or strikeout.
 func (s *gioUI) tokDraw(gtx C, t tok, col color.NRGBA) D {
+	var shift op.TransformStack
+	shifted := t.dy != 0
+	if shifted {
+		shift = op.Offset(image.Pt(0, int(t.dy*t.size))).Push(gtx.Ops)
+	}
 	cm := op.Record(gtx.Ops)
 	paint.ColorOp{Color: col}.Add(gtx.Ops)
 	cl := cm.Stop()
@@ -296,6 +294,16 @@ func (s *gioUI) tokDraw(gtx C, t tok, col color.NRGBA) D {
 			uy = d.Size.Y - 1
 		}
 		fillAt(gtx, col, image.Rect(0, uy, d.Size.X, uy+1))
+	}
+	if t.strike && d.Size.X > 0 {
+		sy := d.Size.Y - d.Baseline - int(0.28*t.size)
+		if sy < 0 {
+			sy = 0
+		}
+		fillAt(gtx, col, image.Rect(0, sy, d.Size.X, sy+1))
+	}
+	if shifted {
+		shift.Pop()
 	}
 	return d
 }
