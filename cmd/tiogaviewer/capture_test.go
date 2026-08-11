@@ -60,6 +60,15 @@ func TestCapture(t *testing.T) {
 			}
 		}
 	}
+	if os.Getenv("CAP_SEL") != "" {
+		for _, c := range s.cols {
+			for _, v := range c.viewers {
+				if v.isDoc() {
+					v.selBlock = 4
+				}
+			}
+		}
+	}
 	if os.Getenv("CAP_CURSOR") != "" {
 		for _, c := range s.cols {
 			for _, v := range c.viewers {

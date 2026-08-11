@@ -40,6 +40,8 @@ func (s *gioUI) exitStruct(v *viewer) {
 		blocks[i].Text = expandTabs(blocks[i].Text)
 	}
 	v.blocks = blocks
+	v.selBlock = -1
+	v.blockClicks = nil
 	v.structEdit = false
 }
 

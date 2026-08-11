@@ -111,6 +111,9 @@ type viewer struct {
 	ptrPos f32.Point // bull's-eye cursor position
 	ptrIn  bool      // pointer is over the content
 
+	selBlock    int                // selected block in the read-only view (-1 none)
+	blockClicks []widget.Clickable // per-visible-block click targets
+
 	cmdLog []string      // vkCommander: the command/output log
 	cmdEd  widget.Editor // vkCommander: the command input line
 
@@ -190,6 +193,7 @@ func (s *gioUI) newViewer(path string) *viewer {
 	v := &viewer{path: path, rel: s.relPath(path)}
 	if err != nil {
 		v.blocks = []tioga.Block{{Kind: tioga.Paragraph, Text: "cannot open: " + v.rel}}
+		v.selBlock = -1
 		return v
 	}
 	// A .mesa file is always code. Other Tioga files (e.g. a .tioga saved by the
@@ -215,6 +219,7 @@ func (s *gioUI) newViewer(path string) *viewer {
 	}
 	v.blocks = doc.Blocks
 	v.root = doc.Root
+	v.selBlock = -1
 	return v
 }
 
@@ -466,6 +471,9 @@ func (s *gioUI) body(gtx C, v *viewer) D {
 	if v.showLevels {
 		markers = outlineMarkers(blocks)
 	}
+	if len(v.blockClicks) < len(blocks) {
+		v.blockClicks = make([]widget.Clickable, len(blocks))
+	}
 	docList := func(gtx C) D {
 		return layout.Inset{Top: 4, Right: 12, Bottom: 4}.Layout(gtx, func(gtx C) D {
 			gtx.Constraints.Min = gtx.Constraints.Max
@@ -484,14 +492,25 @@ func (s *gioUI) body(gtx C, v *viewer) D {
 						return dims
 					}
 				}
+				// Click selects a node (shown underlined by docBlock).
+				if i < len(v.blockClicks) && v.blockClicks[i].Clicked(gtx) {
+					v.selBlock = i
+				}
 				block := func(gtx C) D {
+					sel := i == v.selBlock
+					inner := func(gtx C) D { return s.docBlock(gtx, blocks[i], sel) }
 					if i == match { // tint the current search-match block
-						return layout.Stack{}.Layout(gtx,
-							layout.Expanded(func(gtx C) D { return fill(gtx, findBg, gtx.Constraints.Min) }),
-							layout.Stacked(func(gtx C) D { return s.docBlock(gtx, blocks[i]) }),
-						)
+						inner = func(gtx C) D {
+							return layout.Stack{}.Layout(gtx,
+								layout.Expanded(func(gtx C) D { return fill(gtx, findBg, gtx.Constraints.Min) }),
+								layout.Stacked(func(gtx C) D { return s.docBlock(gtx, blocks[i], sel) }),
+							)
+						}
 					}
-					return s.docBlock(gtx, blocks[i])
+					if i < len(v.blockClicks) {
+						return v.blockClicks[i].Layout(gtx, inner)
+					}
+					return inner(gtx)
 				}
 				if markers != nil && markers[i] != "" {
 					return s.outlineRow(gtx, markers[i], block)
@@ -856,7 +875,7 @@ const (
 	docLineHeight = 1.3
 )
 
-func (s *gioUI) docBlock(gtx C, b tioga.Block) D {
+func (s *gioUI) docBlock(gtx C, b tioga.Block, selected bool) D {
 	// A tab-aligned, multi-row block is a table: lay it out as an aligned grid
 	// rather than approximating the document's tab ruler.
 	if looksLikeTable(b) {
@@ -871,6 +890,15 @@ func (s *gioUI) docBlock(gtx C, b tioga.Block) D {
 	}
 	col := blockColor(b)
 	return layout.Inset{Top: st.above, Bottom: st.below, Left: st.indent}.Layout(gtx, func(gtx C) D {
+		// A selected node is shown fully underlined (Tioga's selection feedback), so
+		// route it through the rich-text path with underline forced on every run.
+		if selected {
+			runs := runsForBlock(b)
+			for i := range runs {
+				runs[i].Look |= uLook
+			}
+			return s.richText(gtx, runs, st.fnt, st.size, col, docLineHeight, st.align)
+		}
 		// When the block carries real looks, render its runs so the file's own
 		// bold/italic/underline show through; the format still sets the base face.
 		if hasLooks(b.Runs) {
@@ -878,6 +906,19 @@ func (s *gioUI) docBlock(gtx C, b tioga.Block) D {
 		}
 		return s.paraLabel(gtx, st.fnt, st.size, st.align, docLineHeight, b.Text, col)
 	})
+}
+
+// uLook is the underline look bit.
+const uLook = tioga.Look(1 << (31 - ('u' - 'a')))
+
+// runsForBlock returns a block's runs, or a single plain run from its text.
+func runsForBlock(b tioga.Block) []tioga.Run {
+	if len(b.Runs) > 0 {
+		out := make([]tioga.Run, len(b.Runs))
+		copy(out, b.Runs)
+		return out
+	}
+	return []tioga.Run{{Text: b.Text}}
 }
 
 // blockColor is a block's text colour: its CharProps text colour if set (a
