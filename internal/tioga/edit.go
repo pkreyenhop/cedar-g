@@ -22,6 +22,27 @@ func NewDoc(root *Node) *Doc {
 	return &Doc{Root: root}
 }
 
+// CloneNode returns a deep copy of a node subtree, for editor undo snapshots.
+func CloneNode(n *Node) *Node {
+	if n == nil {
+		return nil
+	}
+	c := &Node{Format: n.Format}
+	if len(n.Runs) > 0 {
+		c.Runs = append([]Run(nil), n.Runs...)
+	}
+	if len(n.Comment) > 0 {
+		c.Comment = append([]Run(nil), n.Comment...)
+	}
+	if len(n.Props) > 0 {
+		c.Props = append([]Prop(nil), n.Props...)
+	}
+	for _, ch := range n.Children {
+		c.Children = append(c.Children, CloneNode(ch))
+	}
+	return c
+}
+
 // NewNode makes a terminal text node with the given format and plain text.
 func NewNode(format, text string) *Node {
 	n := &Node{Format: format}

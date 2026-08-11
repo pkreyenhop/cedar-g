@@ -122,6 +122,8 @@ type viewer struct {
 	nodeEds                                  map[*tioga.Node]*widget.Editor // per-node text editors
 	bNewSib, bNewChild, bNest, bUnnest, bDel widget.Clickable
 	bBold, bItalic, bStructSave              widget.Clickable
+	bUndo, bRedo                             widget.Clickable
+	undoStack, redoStack                     []*tioga.Node // tree snapshots
 }
 
 // editableExts are the plain-text file formats opened in an editable viewer.

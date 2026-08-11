@@ -23,6 +23,7 @@ func (s *gioUI) enterStruct(v *viewer) {
 	}
 	v.doc = tioga.NewDoc(v.root)
 	v.nodeEds = map[*tioga.Node]*widget.Editor{}
+	v.undoStack, v.redoStack = nil, nil
 	if ns := v.doc.Nodes(); len(ns) > 0 {
 		v.sel = ns[0]
 	}
@@ -125,6 +126,9 @@ func (s *gioUI) structBar(gtx C, v *viewer) D {
 					btn(&v.bBold, "Bold"),
 					btn(&v.bItalic, "Italic"),
 					layout.Rigid(func(gtx C) D { return D{Size: image.Pt(gtx.Dp(8), 0)} }),
+					btn(&v.bUndo, "Undo"),
+					btn(&v.bRedo, "Redo"),
+					layout.Rigid(func(gtx C) D { return D{Size: image.Pt(gtx.Dp(8), 0)} }),
 					btn(&v.bStructSave, "Save"),
 					layout.Rigid(func(gtx C) D {
 						if v.saveMsg == "" {
@@ -214,7 +218,17 @@ func (s *gioUI) processStruct(gtx C, v *viewer) {
 		return
 	}
 	s.processStructKeys(gtx, v)
-	act := func() { s.syncEditors(v) }
+	if v.bUndo.Clicked(gtx) {
+		s.undo(v)
+		return
+	}
+	if v.bRedo.Clicked(gtx) {
+		s.redo(v)
+		return
+	}
+	// beginEdit syncs pending editor text into the tree and snapshots it for undo,
+	// just before a structural or look change.
+	act := func() { s.beginEdit(v) }
 
 	switch {
 	case v.bNewSib.Clicked(gtx):
@@ -264,6 +278,51 @@ func (s *gioUI) processStruct(gtx C, v *viewer) {
 	}
 }
 
+// beginEdit records the tree for undo just before a mutation, after folding in
+// any pending editor text.
+func (s *gioUI) beginEdit(v *viewer) {
+	s.syncEditors(v)
+	const maxUndo = 100
+	v.undoStack = append(v.undoStack, tioga.CloneNode(v.root))
+	if len(v.undoStack) > maxUndo {
+		v.undoStack = v.undoStack[len(v.undoStack)-maxUndo:]
+	}
+	v.redoStack = nil
+}
+
+// restore swaps the current tree for snap and rebuilds the editing state.
+func (s *gioUI) restore(v *viewer, snap *tioga.Node) {
+	v.root = snap
+	v.doc = tioga.NewDoc(v.root)
+	v.nodeEds = map[*tioga.Node]*widget.Editor{}
+	if ns := v.doc.Nodes(); len(ns) > 0 {
+		v.sel, v.focusNode = ns[0], ns[0]
+	} else {
+		v.sel, v.focusNode = nil, nil
+	}
+}
+
+func (s *gioUI) undo(v *viewer) {
+	if len(v.undoStack) == 0 {
+		return
+	}
+	s.syncEditors(v)
+	v.redoStack = append(v.redoStack, tioga.CloneNode(v.root))
+	snap := v.undoStack[len(v.undoStack)-1]
+	v.undoStack = v.undoStack[:len(v.undoStack)-1]
+	s.restore(v, snap)
+}
+
+func (s *gioUI) redo(v *viewer) {
+	if len(v.redoStack) == 0 {
+		return
+	}
+	v.undoStack = append(v.undoStack, tioga.CloneNode(v.root))
+	snap := v.redoStack[len(v.redoStack)-1]
+	v.redoStack = v.redoStack[:len(v.redoStack)-1]
+	s.restore(v, snap)
+}
+
 // processStructKeys handles Tioga's structural keyboard gestures on the selected
 // node's editor: CTRL-RETURN new sibling, CTRL-I new child (insert+nest),
 // CTRL-SHIFT-I new unnested node, CTRL-N nest, CTRL-SHIFT-N unnest.
@@ -276,6 +335,7 @@ func (s *gioUI) processStructKeys(gtx C, v *viewer) {
 		key.Filter{Focus: ed, Name: key.NameReturn, Required: key.ModCtrl, Optional: key.ModShift},
 		key.Filter{Focus: ed, Name: "I", Required: key.ModCtrl, Optional: key.ModShift},
 		key.Filter{Focus: ed, Name: "N", Required: key.ModCtrl, Optional: key.ModShift},
+		key.Filter{Focus: ed, Name: "Z", Required: key.ModCtrl, Optional: key.ModShift},
 	}
 	for {
 		ev, ok := gtx.Event(filters...)
@@ -286,8 +346,16 @@ func (s *gioUI) processStructKeys(gtx C, v *viewer) {
 		if !ok || ke.State != key.Press {
 			continue
 		}
-		s.syncEditors(v)
 		shift := ke.Modifiers.Contain(key.ModShift)
+		if ke.Name == "Z" { // undo / redo
+			if shift {
+				s.redo(v)
+			} else {
+				s.undo(v)
+			}
+			continue
+		}
+		s.beginEdit(v)
 		switch ke.Name {
 		case key.NameReturn:
 			n := v.doc.InsertSibling(v.sel, tioga.NewNode(v.sel.Format, ""))
