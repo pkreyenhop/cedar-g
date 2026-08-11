@@ -59,6 +59,18 @@ func TestCapture(t *testing.T) {
 			}
 		}
 	}
+	if q := os.Getenv("CAP_FIND"); q != "" {
+		for _, c := range s.cols {
+			for _, v := range c.viewers {
+				if v.isDoc() {
+					v.findOpen = true
+					v.findEd.SetText(q)
+					v.findQuery = q
+					v.recomputeMatches(v.visibleBlocks())
+				}
+			}
+		}
+	}
 	if os.Getenv("CAP_STRUCT") != "" {
 		for _, c := range s.cols {
 			for _, v := range c.viewers {

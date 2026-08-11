@@ -242,6 +242,7 @@ func (s *gioUI) processHeaderActions(gtx C) {
 		}
 		s.processLevels(gtx, v)
 		s.processStruct(gtx, v)
+		s.updateFind(gtx, v)
 	}
 }
 

@@ -113,6 +113,15 @@ type viewer struct {
 	levelCap                                int // 0 = all levels; else show Depth <= levelCap
 	bLvlFirst, bLvlFewer, bLvlMore, bLvlAll widget.Clickable
 
+	// Find: incremental search over the (level-filtered) blocks.
+	bFind                widget.Clickable
+	findOpen             bool
+	findEd               widget.Editor
+	findQuery            string
+	findMatches          []int // indices into the visible blocks
+	findIdx              int
+	bFindNext, bFindPrev widget.Clickable
+
 	// Structure editing: edit the node tree (nest/unnest, insert, looks).
 	bStruct                                  widget.Clickable // header: toggle structure editing
 	structEdit                               bool
@@ -331,6 +340,12 @@ func (s *gioUI) header(gtx C, v *viewer) D {
 						if !v.isDoc() {
 							return D{}
 						}
+						return s.flatButton(gtx, &v.bFind, "Find") // incremental search
+					}),
+					layout.Rigid(func(gtx C) D {
+						if !v.isDoc() {
+							return D{}
+						}
 						label := "Structure"
 						if v.structEdit {
 							label = "Done"
@@ -405,6 +420,7 @@ func (s *gioUI) body(gtx C, v *viewer) D {
 		return s.structBody(gtx, v)
 	}
 	blocks := v.visibleBlocks()
+	match := v.currentMatchBlock()
 	docList := func(gtx C) D {
 		return layout.Inset{Top: 4, Right: 12, Bottom: 4}.Layout(gtx, func(gtx C) D {
 			gtx.Constraints.Min = gtx.Constraints.Max
@@ -423,18 +439,32 @@ func (s *gioUI) body(gtx C, v *viewer) D {
 						return dims
 					}
 				}
+				if i == match { // tint the current search-match block
+					return layout.Stack{}.Layout(gtx,
+						layout.Expanded(func(gtx C) D { return fill(gtx, findBg, gtx.Constraints.Min) }),
+						layout.Stacked(func(gtx C) D { return s.docBlock(gtx, blocks[i]) }),
+					)
+				}
 				return s.docBlock(gtx, blocks[i])
 			})
 		})
 	}
-	if !v.showLevels {
+	bars := make([]layout.FlexChild, 0, 4)
+	if v.showLevels {
+		bars = append(bars,
+			layout.Rigid(func(gtx C) D { return s.levelsBar(gtx, v) }),
+			layout.Rigid(hrule))
+	}
+	if v.findOpen {
+		bars = append(bars,
+			layout.Rigid(func(gtx C) D { return s.findBar(gtx, v) }),
+			layout.Rigid(hrule))
+	}
+	if len(bars) == 0 {
 		return docList(gtx)
 	}
-	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-		layout.Rigid(func(gtx C) D { return s.levelsBar(gtx, v) }),
-		layout.Rigid(hrule),
-		layout.Flexed(1, docList),
-	)
+	bars = append(bars, layout.Flexed(1, docList))
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx, bars...)
 }
 
 // visibleBlocks is the document's blocks filtered to the current level cap
