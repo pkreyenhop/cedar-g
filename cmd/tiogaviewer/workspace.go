@@ -240,6 +240,38 @@ func (s *gioUI) processHeaderActions(gtx C) {
 			s.runViewer(v)
 			return // added a viewer; re-evaluate next frame
 		}
+		s.processLevels(gtx, v)
+	}
+}
+
+// processLevels handles the outline (Levels) controls: revealing the bar and
+// collapsing/expanding the document by nesting depth.
+func (s *gioUI) processLevels(gtx C, v *viewer) {
+	if v.bLevels.Clicked(gtx) {
+		v.showLevels = !v.showLevels
+	}
+	max := v.maxBlockDepth()
+	if v.bLvlFirst.Clicked(gtx) {
+		v.levelCap = 1
+	}
+	if v.bLvlFewer.Clicked(gtx) {
+		if v.levelCap == 0 { // "all" → one below the deepest
+			v.levelCap = max
+		}
+		if v.levelCap > 1 {
+			v.levelCap--
+		}
+	}
+	if v.bLvlMore.Clicked(gtx) {
+		if v.levelCap > 0 {
+			v.levelCap++
+			if v.levelCap >= max {
+				v.levelCap = 0 // reached the bottom: show all
+			}
+		}
+	}
+	if v.bLvlAll.Clicked(gtx) {
+		v.levelCap = 0
 	}
 }
 

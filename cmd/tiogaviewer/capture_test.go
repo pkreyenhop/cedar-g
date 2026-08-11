@@ -4,6 +4,7 @@ import (
 	"image"
 	"image/png"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -39,6 +40,18 @@ func TestCapture(t *testing.T) {
 	}
 	if p := os.Getenv("CAP_TEXT"); p != "" {
 		s.openFile(p)
+	}
+	if lv := os.Getenv("CAP_LEVELS"); lv != "" {
+		for _, c := range s.cols {
+			for _, v := range c.viewers {
+				if v.isDoc() {
+					v.showLevels = true
+					if n, err := strconv.Atoi(lv); err == nil {
+						v.levelCap = n
+					}
+				}
+			}
+		}
 	}
 	if os.Getenv("CAP_NEW") != "" {
 		s.openNewDocument()

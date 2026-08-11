@@ -80,6 +80,7 @@ type viewer struct {
 	isCode bool
 	lines  [][]run       // code
 	blocks []tioga.Block // documents
+	root   *tioga.Node   // documents: the full node tree
 	editor widget.Editor // vkEditor
 	term   *terminal     // vkTerm
 	sc     scroller
@@ -103,6 +104,12 @@ type viewer struct {
 	editorInit bool             // code viewer: the edit buffer has been loaded
 
 	outText string // vkOutput: the captured program output
+
+	// Levels: an outline view that shows only nodes up to a nesting depth.
+	bLevels                                 widget.Clickable // header: reveal the levels bar
+	showLevels                              bool
+	levelCap                                int // 0 = all levels; else show Depth <= levelCap
+	bLvlFirst, bLvlFewer, bLvlMore, bLvlAll widget.Clickable
 }
 
 // editableExts are the plain-text file formats opened in an editable viewer.
@@ -158,7 +165,25 @@ func (s *gioUI) newViewer(path string) *viewer {
 		doc.Blocks[i].Text = expandTabs(doc.Blocks[i].Text)
 	}
 	v.blocks = doc.Blocks
+	v.root = doc.Root
 	return v
+}
+
+// isDoc reports whether v is a rendered prose document (not code, terminal,
+// editor or output) — the viewers the Levels outline applies to.
+func (v *viewer) isDoc() bool {
+	return v.kind == vkContent && !v.isCode && len(v.blocks) > 0
+}
+
+// maxBlockDepth is the deepest nesting among the document's blocks.
+func (v *viewer) maxBlockDepth() int {
+	m := 1
+	for _, b := range v.blocks {
+		if b.Depth > m {
+			m = b.Depth
+		}
+	}
+	return m
 }
 
 // mesaModuleRe matches a Mesa/Cedar module declaration header, e.g.
@@ -276,6 +301,12 @@ func (s *gioUI) header(gtx C, v *viewer) D {
 						}
 						return s.flatButton(gtx, &v.bSave, "Save")
 					}),
+					layout.Rigid(func(gtx C) D {
+						if !v.isDoc() {
+							return D{}
+						}
+						return s.flatButton(gtx, &v.bLevels, "Levels") // outline view
+					}),
 					layout.Rigid(func(gtx C) D { return D{Size: image.Pt(gtx.Dp(6), 0)} }),
 					layout.Flexed(1, func(gtx C) D {
 						return s.label(gtx, serifFont, font.Bold, font.Regular, 13, v.headerTitle(), cedarBlack, 1)
@@ -338,12 +369,68 @@ func (s *gioUI) body(gtx C, v *viewer) D {
 			})
 		})
 	}
-	return layout.Inset{Top: 4, Right: 12, Bottom: 4}.Layout(gtx, func(gtx C) D {
-		gtx.Constraints.Min = gtx.Constraints.Max
-		return s.scrollList(gtx, &v.sc, len(v.blocks), func(gtx C, i int) D {
-			return s.docBlock(gtx, v.blocks[i])
+	// Documents: an optional Levels bar on top, then the (optionally depth-capped)
+	// blocks.
+	blocks := v.visibleBlocks()
+	docList := func(gtx C) D {
+		return layout.Inset{Top: 4, Right: 12, Bottom: 4}.Layout(gtx, func(gtx C) D {
+			gtx.Constraints.Min = gtx.Constraints.Max
+			return s.scrollList(gtx, &v.sc, len(blocks), func(gtx C, i int) D {
+				return s.docBlock(gtx, blocks[i])
+			})
 		})
-	})
+	}
+	if !v.showLevels {
+		return docList(gtx)
+	}
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Rigid(func(gtx C) D { return s.levelsBar(gtx, v) }),
+		layout.Rigid(hrule),
+		layout.Flexed(1, docList),
+	)
+}
+
+// visibleBlocks is the document's blocks filtered to the current level cap
+// (levelCap 0 shows everything).
+func (v *viewer) visibleBlocks() []tioga.Block {
+	if v.levelCap <= 0 {
+		return v.blocks
+	}
+	out := make([]tioga.Block, 0, len(v.blocks))
+	for _, b := range v.blocks {
+		if b.Depth <= v.levelCap {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// levelsBar is the outline control revealed by the Levels button: it collapses
+// or expands the document by nesting depth (Tioga's FirstLevelOnly / FewerLevels
+// / MoreLevels / AllLevels).
+func (s *gioUI) levelsBar(gtx C, v *viewer) D {
+	gtx.Constraints.Min.X = gtx.Constraints.Max.X
+	label := "All levels"
+	if v.levelCap > 0 {
+		label = fmt.Sprintf("Level ≤ %d", v.levelCap)
+	}
+	return layout.Stack{}.Layout(gtx,
+		layout.Expanded(func(gtx C) D { return fill(gtx, cedarGrey, gtx.Constraints.Min) }),
+		layout.Stacked(func(gtx C) D {
+			return layout.UniformInset(3).Layout(gtx, func(gtx C) D {
+				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+					layout.Rigid(func(gtx C) D { return s.flatButton(gtx, &v.bLvlFirst, "FirstLevelOnly") }),
+					layout.Rigid(func(gtx C) D { return s.flatButton(gtx, &v.bLvlFewer, "FewerLevels") }),
+					layout.Rigid(func(gtx C) D { return s.flatButton(gtx, &v.bLvlMore, "MoreLevels") }),
+					layout.Rigid(func(gtx C) D { return s.flatButton(gtx, &v.bLvlAll, "AllLevels") }),
+					layout.Rigid(func(gtx C) D { return D{Size: image.Pt(gtx.Dp(8), 0)} }),
+					layout.Rigid(func(gtx C) D {
+						return s.label(gtx, serifFont, font.Normal, font.Regular, 12, label, cedarBlack, 1)
+					}),
+				)
+			})
+		}),
+	)
 }
 
 // editorBody renders an editable buffer: a serif document editor, or a
