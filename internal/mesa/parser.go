@@ -1638,14 +1638,16 @@ func (p *Parser) parsePostfix() Expr {
 				// zone.NEW[Type ← init]: the brackets hold a type, not arguments.
 				p.advance()
 				nt := p.parseType()
+				var init Expr
 				if p.acceptPunct("<-") || p.acceptBind() {
-					p.parseValueExpr()
+					init = p.parseValueExpr()
 				}
 				p.expectPunct("]")
-				x = &NewExpr{Type: nt, Line: line}
+				x = &NewExpr{Type: nt, Init: init, Line: line}
 			}
 		case p.isPunct("^"):
-			p.advance() // dereference: identity in this model
+			line := p.advance().Line // dereference p^
+			x = &Deref{X: x, Line: line}
 		default:
 			return x
 		}
@@ -1680,11 +1682,12 @@ func (p *Parser) parsePrimary() Expr {
 			// Cedar NEW[Type] or NEW[Type ← init]; Mesa also allows a bare type.
 			if p.acceptPunct("[") {
 				nt := p.parseType()
+				var init Expr
 				if p.acceptPunct("<-") || p.acceptBind() {
-					p.parseExpr() // discard the initialiser
+					init = p.parseExpr()
 				}
 				p.expectPunct("]")
-				return &NewExpr{Type: nt, Line: t.Line}
+				return &NewExpr{Type: nt, Init: init, Line: t.Line}
 			}
 			return &NewExpr{Type: p.parseType(), Line: t.Line}
 		case "IF":

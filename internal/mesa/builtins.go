@@ -83,10 +83,31 @@ func (i *Interp) installBuiltins() {
 	def("VAL", func(in *Interp, a []any) any { return Char(rune(toInt(arg0(a), 0))) })
 	def("CHAR", func(in *Interp, a []any) any { return Char(rune(toInt(arg0(a), 0))) })
 
-	// ---- Length of STRING or ARRAY ----
+	// ---- Length of STRING, ARRAY or LIST ----
 	def("LENGTH", func(in *Interp, a []any) any { return lengthOf(arg0(a)) })
 	def("Length", func(in *Interp, a []any) any { return lengthOf(arg0(a)) })
 	def("SIZE", func(in *Interp, a []any) any { return lengthOf(arg0(a)) })
+
+	// ---- LIST OF T constructors: LIST[a, b, …] and CONS[head, tail] ----
+	def("LIST", func(in *Interp, a []any) any {
+		var head *Cons
+		for k := len(a) - 1; k >= 0; k-- {
+			head = &Cons{First: a[k], Rest: head}
+		}
+		if head == nil {
+			return nil // an empty list is NIL
+		}
+		return head
+	})
+	def("CONS", func(in *Interp, a []any) any {
+		var rest *Cons
+		if len(a) >= 2 {
+			if c, ok := deref(a[1]).(*Cons); ok {
+				rest = c
+			}
+		}
+		return &Cons{First: arg0(a), Rest: rest}
+	})
 
 	// ---- The IO interface record (IO.PutRope, IO.PutInt, ...) ----
 	io := &RecordVal{TypeName: "IO", Fields: map[string]any{}}
@@ -125,13 +146,21 @@ func joinArgs(a []any) string {
 }
 
 func lengthOf(v any) int64 {
-	switch x := v.(type) {
+	switch x := deref(v).(type) {
 	case string:
 		return int64(len([]rune(x)))
 	case *ArrayVal:
 		return int64(len(x.Elems))
+	case *Cons:
+		var n int64
+		for c := x; c != nil; c = c.Rest {
+			n++
+		}
+		return n
+	case nil:
+		return 0 // an empty list / NIL has length 0
 	}
-	rerr(0, "LENGTH needs a STRING or ARRAY")
+	rerr(0, "LENGTH needs a STRING, ARRAY or LIST")
 	return 0
 }
 

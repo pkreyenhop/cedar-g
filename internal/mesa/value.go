@@ -63,6 +63,29 @@ func (r *RecordVal) clone() *RecordVal {
 	return &RecordVal{TypeName: r.TypeName, Names: names, Fields: nf}
 }
 
+// Ref is a heap cell allocated by NEW — the referent of a REF or POINTER.
+// Copies of the *Ref share the cell, so a write through one is seen through all.
+// A nil *Ref is NIL.
+type Ref struct{ Elem any }
+
+// Cons is one cell of a LIST OF T: First is the element, Rest is the tail
+// (a *Cons or nil). NIL terminates the list.
+type Cons struct {
+	First any
+	Rest  *Cons
+}
+
+// deref unwraps a chain of REFs to the underlying value; non-refs pass through.
+func deref(v any) any {
+	for {
+		r, ok := v.(*Ref)
+		if !ok || r == nil {
+			return v
+		}
+		v = r.Elem
+	}
+}
+
 // Closure is a procedure value bound to its defining environment.
 type Closure struct {
 	Name string
@@ -157,6 +180,17 @@ func FormatValue(v any) string {
 			parts = append(parts, n+": "+FormatValue(x.Fields[n]))
 		}
 		return "[" + strings.Join(parts, ", ") + "]"
+	case *Ref:
+		if x == nil {
+			return "NIL"
+		}
+		return FormatValue(x.Elem)
+	case *Cons:
+		parts := []string{}
+		for c := x; c != nil; c = c.Rest {
+			parts = append(parts, FormatValue(c.First))
+		}
+		return "(" + strings.Join(parts, " ") + ")"
 	case *Closure:
 		return "PROCEDURE " + x.Name
 	case *Builtin:

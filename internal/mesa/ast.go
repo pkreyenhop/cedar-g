@@ -140,9 +140,18 @@ type IfExpr struct {
 	Line             int
 }
 
-// NewExpr is NEW type — allocate a default value of the type.
+// NewExpr is NEW[type] or NEW[type ← init] — allocate a heap cell (a REF) whose
+// referent is a value of the type, optionally initialised.
 type NewExpr struct {
 	Type TypeExpr
+	Init Expr // nil if none
+	Line int
+}
+
+// Deref is p^ — dereference a REF/POINTER to read (or, as an assignment target,
+// write) its referent.
+type Deref struct {
+	X    Expr
 	Line int
 }
 
@@ -160,6 +169,7 @@ func (*FieldAccess) exprNode() {}
 func (*Aggregate) exprNode()   {}
 func (*IfExpr) exprNode()      {}
 func (*NewExpr) exprNode()     {}
+func (*Deref) exprNode()       {}
 
 // ---- Statements ----
 

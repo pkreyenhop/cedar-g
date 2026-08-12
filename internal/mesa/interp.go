@@ -325,17 +325,40 @@ func (i *Interp) assignTo(lhs Expr, val any, env *Env) {
 			rerr(t.Line, "assignment to undeclared variable %q", t.Name)
 		}
 	case *FieldAccess:
-		base := i.eval(t.X, env)
-		rec, ok := base.(*RecordVal)
-		if !ok {
+		base := deref(i.eval(t.X, env)) // p.field on a REF mutates the referent
+		switch b := base.(type) {
+		case *RecordVal:
+			if _, ok := b.Fields[t.Field]; !ok {
+				rerr(t.Line, "record has no field %q", t.Field)
+			}
+			b.Fields[t.Field] = val
+		case *Cons:
+			switch t.Field {
+			case "first":
+				b.First = val
+			case "rest":
+				if val == nil {
+					b.Rest = nil
+				} else if c, ok := deref(val).(*Cons); ok {
+					b.Rest = c
+				} else {
+					rerr(t.Line, "list .rest must be a list")
+				}
+			default:
+				rerr(t.Line, "list has no field %q", t.Field)
+			}
+		default:
 			rerr(t.Line, "cannot assign field .%s of non-record", t.Field)
 		}
-		if _, ok := rec.Fields[t.Field]; !ok {
-			rerr(t.Line, "record has no field %q", t.Field)
+	case *Deref:
+		base := i.eval(t.X, env)
+		r, ok := base.(*Ref)
+		if !ok || r == nil {
+			rerr(t.Line, "cannot assign through a non-REF or NIL value")
 		}
-		rec.Fields[t.Field] = val
+		r.Elem = val
 	case *Apply:
-		base := i.eval(t.Fun, env)
+		base := deref(i.eval(t.Fun, env))
 		arr, ok := base.(*ArrayVal)
 		if !ok {
 			rerr(t.Line, "cannot index-assign into non-array")
@@ -384,16 +407,27 @@ func (i *Interp) eval(e Expr, env *Env) any {
 	case *Apply:
 		return i.evalApply(x, env)
 	case *FieldAccess:
-		base := i.eval(x.X, env)
-		rec, ok := base.(*RecordVal)
-		if !ok {
-			rerr(x.Line, "cannot access field .%s of non-record value", x.Field)
+		base := deref(i.eval(x.X, env)) // a REF to a record auto-dereferences
+		switch b := base.(type) {
+		case *RecordVal:
+			v, ok := b.Fields[x.Field]
+			if !ok {
+				rerr(x.Line, "record has no field %q", x.Field)
+			}
+			return v
+		case *Cons: // LIST OF T: .first is the head, .rest the tail
+			switch x.Field {
+			case "first":
+				return b.First
+			case "rest":
+				if b.Rest == nil {
+					return nil
+				}
+				return b.Rest
+			}
+			rerr(x.Line, "list has no field %q", x.Field)
 		}
-		v, ok := rec.Fields[x.Field]
-		if !ok {
-			rerr(x.Line, "record has no field %q", x.Field)
-		}
-		return v
+		rerr(x.Line, "cannot access field .%s of non-record value", x.Field)
 	case *Aggregate:
 		return i.evalAggregate(x, env)
 	case *IfExpr:
@@ -402,7 +436,24 @@ func (i *Interp) eval(e Expr, env *Env) any {
 		}
 		return i.eval(x.Else, env)
 	case *NewExpr:
-		return i.defaultValue(i.resolveType(x.Type, env))
+		t := i.resolveType(x.Type, env)
+		var elem any
+		if x.Init != nil {
+			elem = i.coerce(i.eval(x.Init, env), t)
+		} else {
+			elem = i.defaultValue(t)
+		}
+		return &Ref{Elem: elem}
+	case *Deref:
+		v := i.eval(x.X, env)
+		r, ok := v.(*Ref)
+		if !ok {
+			return v // tolerant: p^ on a non-REF is the value itself
+		}
+		if r == nil {
+			rerr(x.Line, "attempt to dereference NIL")
+		}
+		return r.Elem
 	}
 	rerr(0, "cannot evaluate expression %T", e)
 	return nil
@@ -536,7 +587,7 @@ func (i *Interp) arith(op string, l, r any, line int) any {
 }
 
 func (i *Interp) evalApply(x *Apply, env *Env) any {
-	fn := i.eval(x.Fun, env)
+	fn := deref(i.eval(x.Fun, env)) // a REF to an array/proc auto-dereferences
 	switch f := fn.(type) {
 	case *Closure:
 		return i.callClosure(f, x.Args, env, x.Line)
@@ -915,6 +966,12 @@ func valueEqual(a, b any) bool {
 	case EnumVal:
 		y, ok := b.(EnumVal)
 		return ok && x.TypeName == y.TypeName && x.Ord == y.Ord
+	case *Ref: // REF equality is cell identity
+		y, ok := b.(*Ref)
+		return ok && x == y
+	case *Cons: // list identity (empty lists are represented by untyped nil)
+		y, ok := b.(*Cons)
+		return ok && x == y
 	case nil:
 		return b == nil
 	}
