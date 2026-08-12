@@ -109,21 +109,8 @@ func (i *Interp) installBuiltins() {
 		return &Cons{First: arg0(a), Rest: rest}
 	})
 
-	// ---- The IO interface record (IO.PutRope, IO.PutInt, ...) ----
-	io := &RecordVal{TypeName: "IO", Fields: map[string]any{}}
-	addIO := func(name string, fn func(*Interp, []any) any) {
-		io.Names = append(io.Names, name)
-		io.Fields[name] = bi("IO."+name, fn)
-	}
-	addIO("PutRope", put)
-	addIO("PutText", put)
-	addIO("PutString", put)
-	addIO("PutLine", putln)
-	addIO("PutInt", func(in *Interp, a []any) any { in.printf("%d", toInt(arg0(a), 0)); return nil })
-	addIO("PutReal", func(in *Interp, a []any) any { in.printf("%s", formatReal(asFloat(arg0(a), 0))); return nil })
-	addIO("PutChar", func(in *Interp, a []any) any { in.printf("%c", rune(toInt(arg0(a), 0))); return nil })
-	addIO("PutF", func(in *Interp, a []any) any { in.printf("%s", mesaFormat(a)); return nil })
-	g.define("IO", io)
+	// The core Cedar interfaces (IO, Rope, Convert, …) are seeded separately.
+	i.installLibraries()
 }
 
 func (i *Interp) printf(format string, a ...any) {
@@ -179,46 +166,4 @@ func reduce(a []any, max bool) any {
 		}
 	}
 	return best
-}
-
-// mesaFormat implements a tiny subset of IO.PutF's format string: %g / %d
-// / %r / %c consume successive arguments; everything else is literal.
-func mesaFormat(a []any) string {
-	if len(a) == 0 {
-		return ""
-	}
-	format, ok := a[0].(string)
-	if !ok {
-		return joinArgs(a)
-	}
-	rest := a[1:]
-	var sb strings.Builder
-	ai := 0
-	nextArg := func() any {
-		if ai < len(rest) {
-			v := rest[ai]
-			ai++
-			return v
-		}
-		return ""
-	}
-	runes := []rune(format)
-	for k := 0; k < len(runes); k++ {
-		c := runes[k]
-		if c == '%' && k+1 < len(runes) {
-			k++
-			switch runes[k] {
-			case 'd', 'g', 'r', 'c', 's':
-				sb.WriteString(FormatValue(nextArg()))
-			case '%':
-				sb.WriteByte('%')
-			default:
-				sb.WriteByte('%')
-				sb.WriteRune(runes[k])
-			}
-			continue
-		}
-		sb.WriteRune(c)
-	}
-	return sb.String()
 }

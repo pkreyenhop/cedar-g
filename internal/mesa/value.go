@@ -63,6 +63,10 @@ func (r *RecordVal) clone() *RecordVal {
 	return &RecordVal{TypeName: r.TypeName, Names: names, Fields: nf}
 }
 
+// Stream is an IO.STREAM. When Buf is non-nil the stream captures output into a
+// rope (IO.ROS / PutFR); otherwise it writes to the interpreter's output.
+type Stream struct{ Buf *strings.Builder }
+
 // Ref is a heap cell allocated by NEW — the referent of a REF or POINTER.
 // Copies of the *Ref share the cell, so a write through one is seen through all.
 // A nil *Ref is NIL.
@@ -185,6 +189,8 @@ func FormatValue(v any) string {
 			return "NIL"
 		}
 		return FormatValue(x.Elem)
+	case *Stream:
+		return "STREAM"
 	case *Cons:
 		parts := []string{}
 		for c := x; c != nil; c = c.Rest {
