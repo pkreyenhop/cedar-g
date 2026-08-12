@@ -65,15 +65,39 @@ func rerr(line int, format string, a ...any) {
 // ---- Interpreter ----
 
 type Interp struct {
-	global *Env
-	types  map[string]Type
-	out    io.Writer
+	global   *Env
+	types    map[string]Type
+	out      io.Writer
+	steps    int64 // executed statements/evaluations, bounded by maxSteps
+	maxSteps int64
 }
 
+// defaultMaxSteps bounds a single run. The interpreter has no cancellation, so a
+// runaway program (infinite loop or recursion) would otherwise leak a goroutine
+// past the caller's wall-clock timeout; this stops it deterministically. The
+// budget is generous — real sample programs execute well under a million steps.
+const defaultMaxSteps = 50_000_000
+
 func NewInterp(out io.Writer) *Interp {
-	i := &Interp{global: newEnv(nil), types: map[string]Type{}, out: out}
+	i := &Interp{global: newEnv(nil), types: map[string]Type{}, out: out, maxSteps: defaultMaxSteps}
 	i.installBuiltins()
 	return i
+}
+
+// SetMaxSteps overrides the execution budget (0 keeps the default). Useful for
+// bulk surveys that want a tighter bound per module.
+func (i *Interp) SetMaxSteps(n int64) {
+	if n > 0 {
+		i.maxSteps = n
+	}
+}
+
+// tick charges one unit against the execution budget, aborting a runaway run.
+func (i *Interp) tick() {
+	i.steps++
+	if i.steps > i.maxSteps {
+		panic(runtimeError{msg: "execution budget exceeded (possible infinite loop)"})
+	}
 }
 
 // Run executes a parsed module.
@@ -118,6 +142,7 @@ func (i *Interp) execBlock(b *Block, env *Env) {
 }
 
 func (i *Interp) execStmt(s Stmt, env *Env) {
+	i.tick()
 	switch st := s.(type) {
 	case *VarDecl:
 		i.execVarDecl(st, env)
@@ -270,8 +295,11 @@ func (i *Interp) execLoop(l *Loop, env *Env) {
 	}
 }
 
-// runLoopBody runs one iteration; returns true if an EXIT was hit.
+// runLoopBody runs one iteration; returns true if an EXIT was hit. Each
+// iteration charges the execution budget so an empty-bodied loop (DO ENDLOOP)
+// cannot spin forever without executing a statement.
 func (i *Interp) runLoopBody(body *Block, env *Env) (exit bool) {
+	i.tick()
 	defer func() {
 		if r := recover(); r != nil {
 			switch r.(type) {
@@ -329,6 +357,7 @@ func (i *Interp) assignTo(lhs Expr, val any, env *Env) {
 // ---- Expression evaluation ----
 
 func (i *Interp) eval(e Expr, env *Env) any {
+	i.tick()
 	switch x := e.(type) {
 	case *IntLit:
 		return x.Val
@@ -641,10 +670,29 @@ func (i *Interp) evalAggregate(x *Aggregate, env *Env) any {
 var baseTypeAliases = map[string]string{
 	"INTEGER": "INTEGER", "CARDINAL": "INTEGER", "NAT": "INTEGER",
 	"LONG": "INTEGER", "WORD": "INTEGER", "UNSPECIFIED": "INTEGER",
+	"INT": "INTEGER", "CARD": "INTEGER", "BYTE": "INTEGER",
+	"INT16": "INTEGER", "INT32": "INTEGER", "CARD16": "INTEGER", "CARD32": "INTEGER",
+	"NAT16": "INTEGER", "NAT32": "INTEGER", "WORD16": "INTEGER", "WORD32": "INTEGER",
 	"BOOLEAN": "BOOLEAN", "BOOL": "BOOLEAN",
 	"CHARACTER": "CHARACTER", "CHAR": "CHARACTER",
-	"REAL":   "REAL",
+	"REAL": "REAL", "LONGREAL": "REAL",
 	"STRING": "STRING", "ROPE": "STRING", "TEXT": "STRING",
+}
+
+// qualifiedTypeAliases maps a few well-known imported types onto our primitives.
+// Everything else qualified (Pkg.Type) becomes an opaque handle.
+var qualifiedTypeAliases = map[string]string{
+	"Rope.ROPE": "STRING", "Rope.Text": "STRING", "Rope.Ref": "STRING",
+	"RopeInline.ROPE": "STRING", "Convert.Base": "INTEGER",
+}
+
+// opaqueTypeNames are the reference and collection type keywords the interpreter
+// carries as opaque handles (default NIL). REF/POINTER/LIST/SEQUENCE also record
+// a referent type via resolveType so Step 4's NEW/deref can allocate.
+var opaqueTypeNames = map[string]bool{
+	"REF": true, "POINTER": true, "LIST": true, "SEQUENCE": true,
+	"DESCRIPTOR": true, "ANY": true, "ATOM": true, "PROGRAM": true,
+	"PROCESS": true, "CONDITION": true, "MONITORLOCK": true, "ZONE": true,
 }
 
 func (i *Interp) resolveType(te TypeExpr, env *Env) Type {
@@ -658,7 +706,16 @@ func (i *Interp) resolveType(te TypeExpr, env *Env) Type {
 		if d, ok := i.types[t.Name]; ok {
 			return d
 		}
-		rerr(t.Line, "unknown type %q", t.Name)
+		if opaqueTypeNames[t.Name] {
+			return &OpaqueType{Name: t.Name}
+		}
+		if base, ok := qualifiedTypeAliases[t.Name]; ok {
+			return &BaseType{Name: base}
+		}
+		// An imported (Pkg.Type) or otherwise unresolved type: its definition
+		// lives in an interface we do not model. Carry it as an opaque handle
+		// rather than aborting the whole program.
+		return &OpaqueType{Name: t.Name}
 	case *SubrangeType:
 		lo := toInt(i.evalConst(t.Ival.Lo), 0)
 		hi := toInt(i.evalConst(t.Ival.Hi), 0)

@@ -1386,7 +1386,7 @@ var typeValPrefix = map[string]bool{
 // parseWithSelectExpr consumes a WITH … SELECT used as a value; not executed.
 func (p *Parser) parseWithSelectExpr() Expr {
 	line := p.cur().Line
-	p.advance() // WITH
+	p.advance()                                   // WITH
 	for !p.isKw("FROM") && p.cur().Kind != TEOF { // consume the subject and SELECT
 		p.advance()
 	}

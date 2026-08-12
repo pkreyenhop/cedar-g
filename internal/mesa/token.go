@@ -51,7 +51,7 @@ func (t Token) String() string {
 var keywords = map[string]bool{
 	"PROGRAM": true, "DEFINITIONS": true, "MODULE": true, "MONITOR": true,
 	"DIRECTORY": true,
-	"BEGIN": true, "END": true,
+	"BEGIN":     true, "END": true,
 	"IF": true, "THEN": true, "ELSE": true,
 	"DO": true, "ENDLOOP": true, "FOR": true, "WHILE": true,
 	"UNTIL": true, "THROUGH": true, "IN": true,

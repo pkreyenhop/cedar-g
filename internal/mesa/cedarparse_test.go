@@ -49,14 +49,19 @@ func TestCedarParseRate(t *testing.T) {
 	t.Logf("clean %d/%d (%.0f%%);  parsed incl. recovery %d/%d (%.0f%%);  hard-fail %d",
 		clean, tot, 100*float64(clean)/float64(tot+1),
 		clean+recov, tot, 100*float64(clean+recov)/float64(tot+1), fail)
-	type kv struct{ k string; n int }
+	type kv struct {
+		k string
+		n int
+	}
 	var top []kv
 	for k, n := range errs {
 		top = append(top, kv{k, n})
 	}
 	sort.Slice(top, func(i, j int) bool { return top[i].n > top[j].n })
 	for i, e := range top {
-		if i >= 12 { break }
+		if i >= 12 {
+			break
+		}
 		t.Logf("  %4d  %s", e.n, e.k)
 	}
 	for _, s := range samples {

@@ -106,12 +106,23 @@ type SubrangeTypeDesc struct {
 }
 type ProcTypeDesc struct{ PT *ProcType }
 
+// OpaqueType is a reference or collection type the interpreter treats as an
+// opaque handle: REF/POINTER/LIST/SEQUENCE/DESCRIPTOR/ATOM/ANY and imported
+// types from interfaces we do not model (e.g. IO.STREAM, ViewerClasses.Viewer).
+// Its default value is NIL; values flow through unchanged. Elem, when set,
+// records the referent/element type so NEW and dereference can build one.
+type OpaqueType struct {
+	Name string
+	Elem Type
+}
+
 func (*BaseType) typeDesc()         {}
 func (*EnumTypeDesc) typeDesc()     {}
 func (*RecordTypeDesc) typeDesc()   {}
 func (*ArrayTypeDesc) typeDesc()    {}
 func (*SubrangeTypeDesc) typeDesc() {}
 func (*ProcTypeDesc) typeDesc()     {}
+func (*OpaqueType) typeDesc()       {}
 
 // FormatValue renders a runtime value the way the sample programs expect
 // to see it printed.
