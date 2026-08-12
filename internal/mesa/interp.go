@@ -737,28 +737,51 @@ func (i *Interp) arith(op string, l, r any, line int) any {
 	}
 
 	if lIsI && rIsI {
-		switch op {
-		case "+":
-			return li + ri
-		case "-":
-			return li - ri
-		case "*":
-			return li * ri
-		case "/":
-			if ri == 0 {
-				rerr(line, "division by zero")
+		return intArith(op, li, ri, line)
+	}
+	// Ordinal operands: CHARACTER, enumeration and BOOLEAN behave as integers
+	// (e.g. c + 1 to step a character). A CHARACTER +/- integer stays a CHARACTER.
+	if lo, lok := ordinalOf(l); lok {
+		if ro, rok := ordinalOf(r); rok {
+			res := intArith(op, lo, ro, line)
+			if n, ok := res.(int64); ok {
+				if _, lc := l.(Char); lc && (op == "+" || op == "-") {
+					return Char(n)
+				}
+				if _, rc := r.(Char); rc && (op == "+" || op == "-") {
+					return Char(n)
+				}
 			}
-			return li / ri
-		case "MOD":
-			if ri == 0 {
-				rerr(line, "MOD by zero")
-			}
-			return li % ri
+			return res
 		}
 	}
 	_ = lf
 	_ = rf
 	rerr(line, "operator %q needs numbers, got %s and %s", op, typeName(l), typeName(r))
+	return nil
+}
+
+// intArith performs one integer arithmetic operation.
+func intArith(op string, a, b int64, line int) any {
+	switch op {
+	case "+":
+		return a + b
+	case "-":
+		return a - b
+	case "*":
+		return a * b
+	case "/":
+		if b == 0 {
+			rerr(line, "division by zero")
+		}
+		return a / b
+	case "MOD":
+		if b == 0 {
+			rerr(line, "MOD by zero")
+		}
+		return a % b
+	}
+	rerr(line, "unknown arithmetic operator %q", op)
 	return nil
 }
 
@@ -1285,11 +1308,38 @@ func toInt(v any, line int) int64 {
 		return int64(n)
 	case float64:
 		return int64(n)
+	case EnumVal:
+		return int64(n.Ord)
+	case bool:
+		if n {
+			return 1
+		}
+		return 0
 	case *Opaque:
 		return 0
 	}
 	rerr(line, "expected INTEGER, got %s", typeName(v))
 	return 0
+}
+
+// ordinalOf returns v as an integer ordinal when it is one of the discrete
+// ordinal kinds (INTEGER, CHARACTER, enumeration, BOOLEAN), for mixed-type
+// arithmetic like 'c + 1' or 'ORD-free enum stepping.
+func ordinalOf(v any) (int64, bool) {
+	switch n := v.(type) {
+	case int64:
+		return n, true
+	case Char:
+		return int64(n), true
+	case EnumVal:
+		return int64(n.Ord), true
+	case bool:
+		if n {
+			return 1, true
+		}
+		return 0, true
+	}
+	return 0, false
 }
 
 func asFloat(v any, line int) float64 {
