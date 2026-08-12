@@ -187,6 +187,13 @@ func (i *Interp) execVarDecl(st *VarDecl, env *Env) {
 	t := i.resolveType(st.Type, env)
 	if st.Init != nil {
 		v := i.eval(st.Init, env)
+		// "X: ERROR = CODE" / "X: SIGNAL = CODE": mint a distinct signal per name.
+		if s, ok := v.(*Signal); ok && s.Name == "CODE" {
+			for _, n := range st.Names {
+				env.define(n, &Signal{Name: n})
+			}
+			return
+		}
 		v = i.coerce(v, t)
 		for _, n := range st.Names {
 			env.define(n, v)
@@ -587,6 +594,14 @@ func (i *Interp) arith(op string, l, r any, line int) any {
 }
 
 func (i *Interp) evalApply(x *Apply, env *Env) any {
+	// Language builtins whose argument is a type name (LAST[INTEGER]) or a value
+	// paired with a type (NARROW[x, T]) must be dispatched before evaluating the
+	// function or arguments, since the type operand is not an ordinary value.
+	if id, ok := x.Fun.(*Ident); ok {
+		if v, handled := i.specialApply(id.Name, x.Args, env); handled {
+			return v
+		}
+	}
 	fn := deref(i.eval(x.Fun, env)) // a REF to an array/proc auto-dereferences
 	switch f := fn.(type) {
 	case *Closure:
@@ -811,6 +826,86 @@ func (i *Interp) resolveType(te TypeExpr, env *Env) Type {
 	return nil
 }
 
+// specialApply handles language builtins whose operands are not ordinary
+// values: a type name (LAST[INTEGER], BYTES[T]) or a value paired with a type
+// (NARROW[x, T], LOOPHOLE[x, T]). It returns handled=false for everything else.
+func (i *Interp) specialApply(name string, args []Expr, env *Env) (any, bool) {
+	switch name {
+	case "LAST", "FIRST":
+		if len(args) != 1 {
+			return nil, false
+		}
+		return i.typeBound(args[0], env, name == "FIRST"), true
+	case "BYTES", "WORDS", "BITS", "UNITS", "BITSIZE", "BYTESIZE", "WORDSIZE":
+		return int64(2), true // a nonzero placeholder storage size
+	case "NARROW", "LOOPHOLE":
+		// A checked/unchecked cast: yield the value, ignore the target type.
+		if len(args) == 0 {
+			return nil, true
+		}
+		return i.eval(args[0], env), true
+	case "ISTYPE":
+		return true, true // best-effort: assume the runtime type matches
+	case "ALL":
+		var e any
+		if len(args) > 0 {
+			e = i.eval(args[0], env)
+		}
+		return AllVal{Elem: e}, true
+	}
+	return nil, false
+}
+
+// typeBound returns FIRST[T] or LAST[T] for the type named by arg.
+func (i *Interp) typeBound(arg Expr, env *Env, first bool) any {
+	if id, ok := arg.(*Ident); ok {
+		switch id.Name {
+		case "INTEGER", "INT", "LONG", "WORD", "UNSPECIFIED", "INT16", "INT32", "WORD16", "WORD32":
+			if first {
+				return int64(-2147483648)
+			}
+			return int64(2147483647)
+		case "CARDINAL", "CARD", "NAT", "BYTE", "CARD16", "CARD32", "NAT16", "NAT32":
+			if first {
+				return int64(0)
+			}
+			return int64(2147483647)
+		case "CHARACTER", "CHAR":
+			if first {
+				return Char(0)
+			}
+			return Char(0xFFFF)
+		case "BOOLEAN", "BOOL":
+			return !first // FIRST -> FALSE, LAST -> TRUE
+		}
+		if d, ok := i.types[id.Name]; ok {
+			return typeExtreme(d, first)
+		}
+	}
+	return int64(0)
+}
+
+// typeExtreme returns the first or last value of a resolved type.
+func typeExtreme(d Type, first bool) any {
+	switch t := d.(type) {
+	case *EnumTypeDesc:
+		if len(t.Members) == 0 {
+			return int64(0)
+		}
+		idx := 0
+		if !first {
+			idx = len(t.Members) - 1
+		}
+		return EnumVal{TypeName: t.Name, Ord: idx, Name: t.Members[idx]}
+	case *SubrangeTypeDesc:
+		if first {
+			return t.Lo
+		}
+		return t.Hi
+	}
+	return int64(0)
+}
+
 // evalConst evaluates a compile-time expression (interval bounds) in the
 // global environment.
 func (i *Interp) evalConst(e Expr) any {
@@ -871,6 +966,13 @@ func (i *Interp) coerce(v any, t Type) any {
 		}
 		return v
 	case *ArrayTypeDesc:
+		if all, ok := v.(AllVal); ok { // ALL[x] fills every element with x
+			out := &ArrayVal{Lo: d.Lo}
+			for k := int64(0); k <= d.Hi-d.Lo; k++ {
+				out.Elems = append(out.Elems, i.coerce(all.Elem, d.Elem))
+			}
+			return out
+		}
 		if arr, ok := v.(*ArrayVal); ok {
 			out := &ArrayVal{Lo: d.Lo}
 			for _, e := range arr.Elems {

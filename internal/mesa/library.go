@@ -2,6 +2,7 @@ package mesa
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -15,6 +16,21 @@ func (i *Interp) installLibraries() {
 	i.global.define("Rope", i.ropeInterface())
 	i.global.define("RopeInline", i.ropeInterface())
 	i.global.define("Convert", i.convertInterface())
+	i.global.define("RealFns", i.realFnsInterface())
+	i.global.define("Basics", i.basicsInterface())
+	i.global.define("List", i.listInterface())
+	i.global.define("Atom", i.atomInterface())
+	i.global.define("RefText", i.refTextInterface())
+}
+
+// mkIface builds an interface record from a name→builtin table.
+func mkIface(name string, procs map[string]func(*Interp, []any) any) *RecordVal {
+	r := &RecordVal{TypeName: name, Fields: map[string]any{}}
+	for pn, fn := range procs {
+		r.Names = append(r.Names, pn)
+		r.Fields[pn] = &Builtin{Name: name + "." + pn, Fn: fn}
+	}
+	return r
 }
 
 // ---- string helpers ----
@@ -383,6 +399,135 @@ func (i *Interp) convertInterface() *RecordVal {
 		return f
 	})
 	return r
+}
+
+// ---- RealFns (floating-point math) ----
+
+func (i *Interp) realFnsInterface() *RecordVal {
+	f1 := func(g func(float64) float64) func(*Interp, []any) any {
+		return func(in *Interp, a []any) any { return g(asFloat(deref(arg0(a)), 0)) }
+	}
+	return mkIface("RealFns", map[string]func(*Interp, []any) any{
+		"Sqrt":   f1(math.Sqrt),
+		"SqRt":   f1(math.Sqrt),
+		"Sin":    f1(math.Sin),
+		"Cos":    f1(math.Cos),
+		"Tan":    f1(math.Tan),
+		"ArcTan": f1(math.Atan),
+		"Exp":    f1(math.Exp),
+		"Ln":     f1(math.Log),
+		"Log":    f1(math.Log10),
+		"ArcTans": func(in *Interp, a []any) any {
+			return math.Atan2(asFloat(deref(arg0(a)), 0), asFloat(deref(arg1(a)), 0))
+		},
+		"Power": func(in *Interp, a []any) any {
+			return math.Pow(asFloat(deref(arg0(a)), 0), asFloat(deref(arg1(a)), 0))
+		},
+	})
+}
+
+// ---- Basics (bit and word operations) ----
+
+func (i *Interp) basicsInterface() *RecordVal {
+	return mkIface("Basics", map[string]func(*Interp, []any) any{
+		"BITAND":    func(in *Interp, a []any) any { return toInt(arg0(a), 0) & toInt(arg1(a), 0) },
+		"BITOR":     func(in *Interp, a []any) any { return toInt(arg0(a), 0) | toInt(arg1(a), 0) },
+		"BITXOR":    func(in *Interp, a []any) any { return toInt(arg0(a), 0) ^ toInt(arg1(a), 0) },
+		"BITNOT":    func(in *Interp, a []any) any { return ^toInt(arg0(a), 0) },
+		"BITLSHIFT": func(in *Interp, a []any) any { return toInt(arg0(a), 0) << uint(toInt(arg1(a), 0)) },
+		"BITRSHIFT": func(in *Interp, a []any) any { return toInt(arg0(a), 0) >> uint(toInt(arg1(a), 0)) },
+		"BitAnd":    func(in *Interp, a []any) any { return toInt(arg0(a), 0) & toInt(arg1(a), 0) },
+		"BitOr":     func(in *Interp, a []any) any { return toInt(arg0(a), 0) | toInt(arg1(a), 0) },
+		"BitXor":    func(in *Interp, a []any) any { return toInt(arg0(a), 0) ^ toInt(arg1(a), 0) },
+		"LongMult":  func(in *Interp, a []any) any { return toInt(arg0(a), 0) * toInt(arg1(a), 0) },
+		"LowHalf":   func(in *Interp, a []any) any { return toInt(arg0(a), 0) & 0xFFFF },
+		"HighHalf":  func(in *Interp, a []any) any { return (toInt(arg0(a), 0) >> 16) & 0xFFFF },
+	})
+}
+
+// ---- List (operations on LIST OF T / *Cons) ----
+
+func (i *Interp) listInterface() *RecordVal {
+	toCons := func(v any) *Cons {
+		c, _ := deref(v).(*Cons)
+		return c
+	}
+	return mkIface("List", map[string]func(*Interp, []any) any{
+		"Length": func(in *Interp, a []any) any { return lengthOf(arg0(a)) },
+		"Cons": func(in *Interp, a []any) any {
+			return &Cons{First: arg0(a), Rest: toCons(arg1(a))}
+		},
+		"Nth": func(in *Interp, a []any) any {
+			c := toCons(arg0(a))
+			n := int(toInt(arg1(a), 0))
+			for ; c != nil && n > 1; n-- { // Cedar List.Nth is 1-based
+				c = c.Rest
+			}
+			if c == nil {
+				return nil
+			}
+			return c.First
+		},
+		"Reverse": func(in *Interp, a []any) any {
+			var out *Cons
+			for c := toCons(arg0(a)); c != nil; c = c.Rest {
+				out = &Cons{First: c.First, Rest: out}
+			}
+			if out == nil {
+				return nil
+			}
+			return out
+		},
+		"Append": func(in *Interp, a []any) any {
+			var elems []any
+			for c := toCons(arg0(a)); c != nil; c = c.Rest {
+				elems = append(elems, c.First)
+			}
+			tail := toCons(arg1(a))
+			out := tail
+			for k := len(elems) - 1; k >= 0; k-- {
+				out = &Cons{First: elems[k], Rest: out}
+			}
+			if out == nil {
+				return nil
+			}
+			return out
+		},
+		"Member": func(in *Interp, a []any) any {
+			target := arg0(a)
+			for c := toCons(arg1(a)); c != nil; c = c.Rest {
+				if valueEqual(c.First, target) {
+					return true
+				}
+			}
+			return false
+		},
+	})
+}
+
+// ---- Atom ----
+
+func (i *Interp) atomInterface() *RecordVal {
+	return mkIface("Atom", map[string]func(*Interp, []any) any{
+		// Atoms are modelled by their print name (a rope); MakeAtom/GetPName round-trip.
+		"MakeAtom": func(in *Interp, a []any) any { return ropeStr(arg0(a)) },
+		"GetPName": func(in *Interp, a []any) any { return ropeStr(arg0(a)) },
+		"GetProp":  func(in *Interp, a []any) any { return nil },
+		"PutProp":  func(in *Interp, a []any) any { return nil },
+	})
+}
+
+// ---- RefText (mutable text buffers, modelled as ropes) ----
+
+func (i *Interp) refTextInterface() *RecordVal {
+	return mkIface("RefText", map[string]func(*Interp, []any) any{
+		"New":             func(in *Interp, a []any) any { return "" },
+		"ObtainScratch":   func(in *Interp, a []any) any { return "" },
+		"ReleaseScratch":  func(in *Interp, a []any) any { return nil },
+		"TrustTextAsRope": func(in *Interp, a []any) any { return ropeStr(arg0(a)) },
+		"AppendRope":      func(in *Interp, a []any) any { return ropeStr(arg0(a)) + ropeStr(arg1(a)) },
+		"AppendChar":      func(in *Interp, a []any) any { return ropeStr(arg0(a)) + string(rune(toInt(arg1(a), 0))) },
+	})
 }
 
 func arg1(a []any) any {

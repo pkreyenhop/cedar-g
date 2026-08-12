@@ -63,6 +63,14 @@ func (r *RecordVal) clone() *RecordVal {
 	return &RecordVal{TypeName: r.TypeName, Names: names, Fields: nf}
 }
 
+// Signal is an ERROR or SIGNAL code (declared "X: ERROR = CODE"). Identity
+// distinguishes one signal from another when caught.
+type Signal struct{ Name string }
+
+// AllVal is the result of ALL[x] — every element of a target array set to x.
+// It is resolved to a concrete ArrayVal when coerced to an array type.
+type AllVal struct{ Elem any }
+
 // Stream is an IO.STREAM. When Buf is non-nil the stream captures output into a
 // rope (IO.ROS / PutFR); otherwise it writes to the interpreter's output.
 type Stream struct{ Buf *strings.Builder }
@@ -191,6 +199,8 @@ func FormatValue(v any) string {
 		return FormatValue(x.Elem)
 	case *Stream:
 		return "STREAM"
+	case *Signal:
+		return "SIGNAL " + x.Name
 	case *Cons:
 		parts := []string{}
 		for c := x; c != nil; c = c.Rest {

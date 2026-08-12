@@ -17,6 +17,14 @@ func (i *Interp) installBuiltins() {
 	g.define("TRUE", true)
 	g.define("FALSE", false)
 	g.define("NIL", nil)
+	// CODE seeds an ERROR/SIGNAL declaration ("X: ERROR = CODE"). Each such
+	// binding wants a distinct code; execVarDecl mints a fresh one, so this global
+	// only needs to be a recognisable, non-undefined placeholder.
+	g.define("CODE", &Signal{Name: "CODE"})
+
+	// PRED/SUCC step an enumeration or ordinal value.
+	g.define("PRED", &Builtin{Name: "PRED", Fn: func(in *Interp, a []any) any { return in.ordStep(arg0(a), -1) }})
+	g.define("SUCC", &Builtin{Name: "SUCC", Fn: func(in *Interp, a []any) any { return in.ordStep(arg0(a), +1) }})
 
 	bi := func(name string, fn func(*Interp, []any) any) *Builtin {
 		return &Builtin{Name: name, Fn: fn}
@@ -115,6 +123,26 @@ func (i *Interp) installBuiltins() {
 
 func (i *Interp) printf(format string, a ...any) {
 	fmt.Fprintf(i.out, format, a...)
+}
+
+// ordStep advances an ordinal value (integer, character or enumeration) by
+// delta, used by SUCC (+1) and PRED (-1).
+func (i *Interp) ordStep(v any, delta int) any {
+	switch x := deref(v).(type) {
+	case int64:
+		return x + int64(delta)
+	case Char:
+		return Char(int(x) + delta)
+	case EnumVal:
+		nord := x.Ord + delta
+		name := x.Name
+		if d, ok := i.types[x.TypeName].(*EnumTypeDesc); ok && nord >= 0 && nord < len(d.Members) {
+			name = d.Members[nord]
+		}
+		return EnumVal{TypeName: x.TypeName, Ord: nord, Name: name}
+	}
+	rerr(0, "PRED/SUCC needs an ordinal value")
+	return nil
 }
 
 func arg0(a []any) any {
