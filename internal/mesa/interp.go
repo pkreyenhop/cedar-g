@@ -299,6 +299,16 @@ func isOpaque(v any) bool {
 	return ok
 }
 
+// isTypeName reports whether name denotes a type (a declared type or a base
+// type) — used to read the type attributes T.FIRST/T.LAST.
+func (i *Interp) isTypeName(name string, env *Env) bool {
+	if _, ok := i.types[name]; ok {
+		return true
+	}
+	_, ok := baseTypeAliases[name]
+	return ok
+}
+
 // signalName returns a printable/matchable name for a raised value.
 func signalName(v any) string {
 	switch s := v.(type) {
@@ -559,14 +569,42 @@ func (i *Interp) eval(e Expr, env *Env) any {
 	case *Apply:
 		return i.evalApply(x, env)
 	case *FieldAccess:
+		// Type attributes on a type name: T.FIRST, T.LAST.
+		if id, ok := x.X.(*Ident); ok && (x.Field == "FIRST" || x.Field == "LAST") && i.isTypeName(id.Name, env) {
+			return i.typeBound(id, env, x.Field == "FIRST")
+		}
 		base := deref(i.eval(x.X, env)) // a REF to a record auto-dereferences
+		if rec, ok := base.(*RecordVal); ok {
+			if v, ok := rec.Fields[x.Field]; ok {
+				return v // a real field takes precedence over an attribute name
+			}
+		}
+		// Value attributes: arr.FIRST/arr.LAST index bounds; v.ORD/PRED/SUCC on an
+		// ordinal value (Cedar's postfix attribute syntax).
+		switch x.Field {
+		case "FIRST", "LAST":
+			if arr, ok := base.(*ArrayVal); ok {
+				if x.Field == "FIRST" {
+					return arr.Lo
+				}
+				return arr.Lo + int64(len(arr.Elems)) - 1
+			}
+		case "ORD":
+			if o, ok := ordinalOf(base); ok {
+				return o
+			}
+		case "PRED":
+			if _, ok := ordinalOf(base); ok {
+				return i.ordStep(base, -1)
+			}
+		case "SUCC":
+			if _, ok := ordinalOf(base); ok {
+				return i.ordStep(base, +1)
+			}
+		}
 		switch b := base.(type) {
 		case *RecordVal:
-			v, ok := b.Fields[x.Field]
-			if !ok {
-				rerr(x.Line, "record has no field %q", x.Field)
-			}
-			return v
+			rerr(x.Line, "record has no field %q", x.Field)
 		case *Opaque: // Pkg.member of an unmodeled interface stays opaque
 			return &Opaque{Name: b.Name + "." + x.Field}
 		case *Cons: // LIST OF T: .first is the head, .rest the tail
