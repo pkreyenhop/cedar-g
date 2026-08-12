@@ -7,10 +7,13 @@
 package main
 
 import (
+	"fmt"
 	"image"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"cedarg/internal/tioga"
 
 	"gioui.org/app"
 	"gioui.org/font"
@@ -91,6 +94,13 @@ func (s *gioUI) relPath(path string) string {
 }
 
 func main() {
+	// "tiogaviewer run <file.mesa>" runs a Mesa/Cedar program in the terminal and
+	// prints its output, without opening the GUI.
+	if len(os.Args) > 2 && os.Args[1] == "run" {
+		runFileToStdout(os.Args[2])
+		return
+	}
+
 	s := newUI()
 
 	var start string
@@ -111,6 +121,22 @@ func main() {
 		}
 	}
 
+	runGUI(s)
+}
+
+// runFileToStdout decodes a .mesa file (a Tioga container) and runs it, printing
+// the program's output to stdout — the terminal counterpart of the viewer's Run.
+func runFileToStdout(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cannot read", path+":", err)
+		os.Exit(1)
+	}
+	fmt.Print(runMesa(tioga.Read(data, true).Code))
+	fmt.Println()
+}
+
+func runGUI(s *gioUI) {
 	go func() {
 		w := new(app.Window)
 		w.Option(app.Title("Cedar Viewers (Gio)"), app.Size(unit.Dp(1200), unit.Dp(820)), app.Fullscreen.Option())
