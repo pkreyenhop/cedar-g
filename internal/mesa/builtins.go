@@ -184,6 +184,8 @@ func lengthOf(v any) int64 {
 		return n
 	case nil:
 		return 0 // an empty list / NIL has length 0
+	case *Opaque:
+		return 0 // length of an opaque handle
 	}
 	rerr(0, "LENGTH needs a STRING, ARRAY or LIST")
 	return 0

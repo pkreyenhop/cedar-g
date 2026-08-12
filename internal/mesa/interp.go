@@ -293,6 +293,12 @@ func (i *Interp) handle(rs raisedSignal, handlers []Handler, env *Env) bool {
 	return false
 }
 
+// isOpaque reports whether v is a handle from an unmodeled interface.
+func isOpaque(v any) bool {
+	_, ok := v.(*Opaque)
+	return ok
+}
+
 // signalName returns a printable/matchable name for a raised value.
 func signalName(v any) string {
 	switch s := v.(type) {
@@ -665,6 +671,9 @@ func (i *Interp) evalBinary(x *Binary, env *Env) any {
 	case "#":
 		return !valueEqual(l, r)
 	case "<", "<=", ">", ">=":
+		if isOpaque(l) || isOpaque(r) {
+			return false // an opaque handle is unordered; comparisons read as false
+		}
 		c, ok := valueCompare(l, r)
 		if !ok {
 			rerr(x.Line, "cannot order %s and %s", typeName(l), typeName(r))
@@ -695,6 +704,12 @@ func (i *Interp) evalBinary(x *Binary, env *Env) any {
 }
 
 func (i *Interp) arith(op string, l, r any, line int) any {
+	// An opaque operand (an unmodeled interface value) absorbs arithmetic: the
+	// result is opaque too, so a computation threading such a value through still
+	// completes rather than aborting.
+	if isOpaque(l) || isOpaque(r) {
+		return &Opaque{Name: "value"}
+	}
 	// If either operand is REAL, compute in float.
 	lf, lIsF := l.(float64)
 	rf, rIsF := r.(float64)
