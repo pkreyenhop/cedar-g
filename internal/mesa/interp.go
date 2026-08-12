@@ -527,6 +527,12 @@ func (i *Interp) assignTo(lhs Expr, val any, env *Env) {
 		r.Elem = val
 	case *Apply:
 		base := deref(i.eval(t.Fun, env))
+		for _, a := range t.Args {
+			i.eval(a, env) // evaluate the subscript(s) for effect regardless
+		}
+		if base == nil || isOpaque(base) {
+			return // index-assign into an opaque/NIL container is a no-op
+		}
 		arr, ok := base.(*ArrayVal)
 		if !ok {
 			rerr(t.Line, "cannot index-assign into non-array")
@@ -537,6 +543,9 @@ func (i *Interp) assignTo(lhs Expr, val any, env *Env) {
 		idx := toInt(i.eval(t.Args[0], env), t.Line)
 		k, ok := arr.index(idx)
 		if !ok {
+			if len(arr.Elems) == 0 {
+				return // an opaque-sized (empty) array: ignore the write
+			}
 			rerr(t.Line, "array index %d out of bounds", idx)
 		}
 		arr.Elems[k] = val
@@ -928,6 +937,9 @@ func (i *Interp) evalApplyInner(x *Apply, env *Env) any {
 		idx := toInt(i.eval(x.Args[0], env), x.Line)
 		k, ok := f.index(idx)
 		if !ok {
+			if len(f.Elems) == 0 {
+				return nil // an opaque-sized (empty) array reads as NIL
+			}
 			rerr(x.Line, "array index %d out of bounds", idx)
 		}
 		return f.Elems[k]
