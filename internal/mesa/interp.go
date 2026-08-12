@@ -3,6 +3,7 @@ package mesa
 import (
 	"fmt"
 	"io"
+	"math"
 	"strings"
 )
 
@@ -814,6 +815,8 @@ func (i *Interp) arith(op string, l, r any, line int) any {
 			return a / b
 		case "MOD":
 			rerr(line, "MOD is not defined for REAL")
+		case "**":
+			return math.Pow(a, b)
 		}
 	}
 
@@ -861,6 +864,15 @@ func intArith(op string, a, b int64, line int) any {
 			rerr(line, "MOD by zero")
 		}
 		return a % b
+	case "**": // exponentiation: integer base to a non-negative integer power
+		if b < 0 {
+			return math.Pow(float64(a), float64(b))
+		}
+		result := int64(1)
+		for k := int64(0); k < b; k++ {
+			result *= a
+		}
+		return result
 	}
 	rerr(line, "unknown arithmetic operator %q", op)
 	return nil
