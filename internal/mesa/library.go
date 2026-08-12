@@ -243,8 +243,11 @@ func putFFormat(format string, args []any) string {
 		case '%':
 			sb.WriteByte('%')
 		case 'c':
-			if c, ok := deref(next()).(Char); ok {
-				sb.WriteRune(rune(c))
+			switch v := deref(next()).(type) {
+			case Char:
+				sb.WriteRune(rune(v))
+			case int64:
+				sb.WriteRune(rune(v))
 			}
 		case 'f', 'e':
 			sb.WriteString(formatReal(asFloat(deref(next()), 0)))
