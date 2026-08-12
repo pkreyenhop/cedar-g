@@ -63,7 +63,11 @@ func (l *Lexer) advance() rune {
 	return r
 }
 
-// Tokenize returns all tokens ending with a TEOF sentinel.
+// Tokenize returns all tokens ending with a TEOF sentinel. It stops at the
+// module terminator "END." — the keyword END immediately followed by '.' — since
+// everything after it is trailing free text (change logs, mail headers) the
+// compiler ignores. Lexing that text as code would otherwise fail on stray
+// punctuation like '?' or control bytes.
 func (l *Lexer) Tokenize() ([]Token, error) {
 	var toks []Token
 	for {
@@ -74,6 +78,15 @@ func (l *Lexer) Tokenize() ([]Token, error) {
 		toks = append(toks, t)
 		if t.Kind == TEOF {
 			return toks, nil
+		}
+		if t.Kind == TKeyword && t.Text == "END" {
+			save := *l
+			nt, nerr := l.next()
+			if nerr == nil && nt.Kind == TPunct && nt.Text == "." {
+				toks = append(toks, nt, Token{Kind: TEOF, Line: nt.Line, Col: nt.Col})
+				return toks, nil
+			}
+			*l = save // not a module terminator: rewind and keep lexing
 		}
 	}
 }
@@ -112,18 +125,22 @@ func (l *Lexer) skipSpaceAndComments() error {
 				l.advance()
 			}
 		case r == '-' && l.peek2() == '-':
-			// A '--' comment: at the start of a line it runs to end of line (so a
-			// full-line comment whose text contains '--' stays a comment); after
-			// code it is an inline comment bounded by the next '--'.
-			fullLine := l.lineStart
+			// A '--' comment. After code it is an inline comment bounded by the next
+			// '--'. At the start of a line it normally runs to end of line, so a prose
+			// comment whose text happens to contain '--' stays a comment. The one
+			// exception is a tightly-wrapped commented-out fragment such as
+			// "--BackStop,-- BasicTime, …;": a line-start '--' with no following space
+			// is a bounded comment, so the real code after it (and a trailing ';' that
+			// ends a DIRECTORY clause) stays visible.
 			l.advance()
 			l.advance()
+			bounded := !l.lineStart || (l.peek() != ' ' && l.peek() != '\t')
 			for {
 				c := l.peek()
 				if c == 0 || c == '\n' {
 					break
 				}
-				if !fullLine && c == '-' && l.peek2() == '-' {
+				if bounded && c == '-' && l.peek2() == '-' {
 					l.advance()
 					l.advance()
 					break
@@ -255,27 +272,37 @@ func (l *Lexer) lexNumber(line, col int) (Token, error) {
 		return Token{Kind: TReal, Real: f, Text: text, Line: line, Col: col}, nil
 	}
 
-	// Integer, possibly with a Mesa base/char suffix. Hex digits may follow the
-	// decimal run; the suffix letter (H hex, B octal, C octal char code, D
-	// decimal) is not itself a hex digit except when it is 'H' (which is not).
+	// Integer with an optional Mesa base marker. Gather the maximal run of hex
+	// digits (a letter A–F may be a hex digit, an octal 'B' marker, or a 'C'/'D'
+	// suffix — resolved below), then classify:
+	//   • trailing H/h                       → hex             (0FFH, 36E9H)
+	//   • <octal digits> B [scale digits]    → octal × 8^scale (377B, 144B2)
+	//   • trailing C/c                        → octal char code
+	//   • trailing D/d                        → explicit decimal
+	//   • leading 0 with a hex letter, no marker → hex          (0FF, 0c3d2e1f0)
+	//   • otherwise                           → decimal
 	for isHexDigit(l.peek()) {
 		l.advance()
 	}
 	body := l.src[start:l.pos]
 	base := 10
 	isChar := false
-	if c := l.peek(); c == 'H' || c == 'h' {
+	switch {
+	case l.peek() == 'H' || l.peek() == 'h':
 		l.advance()
 		base = 16
-	} else if n := len(body); n > 0 {
-		switch body[n-1] {
-		case 'B', 'b':
-			body, base = body[:n-1], 8
-		case 'C', 'c':
-			body, base, isChar = body[:n-1], 8, true // octal character code
-		case 'D', 'd':
-			body, base = body[:n-1], 10
+	case len(body) > 0 && octalMarker(body):
+		val, err := octalValue(body)
+		if err != nil {
+			return Token{}, l.errorf("bad octal literal %q", body)
 		}
+		return Token{Kind: TInt, Int: val, Text: body, Line: line, Col: col}, nil
+	case len(body) > 0 && (body[len(body)-1] == 'C' || body[len(body)-1] == 'c'):
+		body, base, isChar = body[:len(body)-1], 8, true // octal character code
+	case len(body) > 0 && (body[len(body)-1] == 'D' || body[len(body)-1] == 'd'):
+		body, base = body[:len(body)-1], 10
+	case len(body) > 1 && body[0] == '0' && hasHexLetter(body):
+		base = 16 // Cedar hex written with a leading 0 and no H, e.g. 0FF
 	}
 	text := l.src[start:l.pos]
 	n, err := strconv.ParseInt(body, base, 64)
@@ -286,6 +313,59 @@ func (l *Lexer) lexNumber(line, col int) (Token, error) {
 		return Token{Kind: TChar, Char: rune(n), Text: text, Line: line, Col: col}, nil
 	}
 	return Token{Kind: TInt, Int: n, Text: text, Line: line, Col: col}, nil
+}
+
+// octalMarker reports whether body has the Mesa octal shape
+// "<octal digits> B [decimal scale]" — octal digits (0–7), the marker B, then an
+// optional decimal scale. It is checked before the suffixless-hex rule so 144B2
+// is octal-with-scale, not a malformed hex value.
+func octalMarker(body string) bool {
+	i := 0
+	for i < len(body) && body[i] >= '0' && body[i] <= '7' {
+		i++
+	}
+	if i == 0 || i >= len(body) || (body[i] != 'B' && body[i] != 'b') {
+		return false
+	}
+	for _, c := range body[i+1:] {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// octalValue evaluates an octalMarker body: the octal part times 8^scale.
+func octalValue(body string) (int64, error) {
+	i := 0
+	for body[i] >= '0' && body[i] <= '7' {
+		i++
+	}
+	v, err := strconv.ParseInt(body[:i], 8, 64)
+	if err != nil {
+		return 0, err
+	}
+	if rest := body[i+1:]; rest != "" {
+		scale, err := strconv.Atoi(rest)
+		if err != nil {
+			return 0, err
+		}
+		for k := 0; k < scale; k++ {
+			v *= 8
+		}
+	}
+	return v, nil
+}
+
+// hasHexLetter reports whether s contains a hexadecimal letter (a–f/A–F),
+// which marks an unsuffixed value as hexadecimal.
+func hasHexLetter(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') {
+			return true
+		}
+	}
+	return false
 }
 
 // charEscape decodes the character after a backslash in a char literal.
@@ -330,10 +410,10 @@ func (l *Lexer) lexString(line, col int) (Token, error) {
 	l.advance() // opening "
 	var sb strings.Builder
 	for {
-		c := l.peek()
-		if c == 0 {
+		if l.pos >= len(l.src) { // true end of input, not a NUL content byte
 			return Token{}, l.errorf("unterminated string literal")
 		}
+		c := l.peek()
 		if c == '"' {
 			l.advance()
 			if l.peek() == '"' { // "" is an escaped quote inside the string

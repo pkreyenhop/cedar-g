@@ -158,9 +158,19 @@ func (p *Parser) skipDirectory() {
 	}
 }
 
+// blockPrefixWords are access/safety qualifiers that may sit directly before a
+// block body: the module body "= PUBLIC {…}" or a "TRUSTED BEGIN …" body.
+var blockPrefixWords = map[string]bool{
+	"PUBLIC": true, "PRIVATE": true,
+	"TRUSTED": true, "CHECKED": true, "UNCHECKED": true,
+}
+
 // parseBlock handles BEGIN..END and {..} bodies.
 func (p *Parser) parseBlock() *Block {
 	line := p.cur().Line
+	for p.cur().Kind == TIdent && blockPrefixWords[p.cur().Text] {
+		p.advance()
+	}
 	var closer string
 	switch {
 	case p.acceptKw("BEGIN"):
