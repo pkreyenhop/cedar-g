@@ -534,8 +534,43 @@ func (i *Interp) assignTo(lhs Expr, val any, env *Env) {
 			rerr(t.Line, "array index %d out of bounds", idx)
 		}
 		arr.Elems[k] = val
+	case *Aggregate:
+		i.assignExtractor(t, val, env)
 	default:
 		rerr(0, "invalid assignment target %T", lhs)
+	}
+}
+
+// assignExtractor implements an extracting assignment "[a, b] ← multiValue" or
+// "[x: a, y: b] ← record": each aggregate element receives the matching
+// component of val — by field name when the element is named, positionally
+// otherwise. A missing element (a skipped "[ , b]" slot) is ignored.
+func (i *Interp) assignExtractor(agg *Aggregate, val any, env *Env) {
+	get := func(k int, name string) any {
+		switch src := deref(val).(type) {
+		case *RecordVal:
+			if name != "" {
+				return src.Fields[name]
+			}
+			if k < len(src.Names) {
+				return src.Fields[src.Names[k]]
+			}
+		case *ArrayVal:
+			if k < len(src.Elems) {
+				return src.Elems[k]
+			}
+		default:
+			if k == 0 && name == "" {
+				return val // a single value into a one-element extractor
+			}
+		}
+		return nil
+	}
+	for k, el := range agg.Elems {
+		if el.Val == nil {
+			continue
+		}
+		i.assignTo(el.Val, get(k, el.Name), env)
 	}
 }
 
