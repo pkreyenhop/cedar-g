@@ -77,6 +77,26 @@ func call(t *testing.T, in *Interp, proc string, args ...any) any {
 	return r
 }
 
+// procCase is one call-and-check of an exported procedure.
+type procCase struct {
+	proc string
+	args []any
+	want string // expected FormatValue of the result
+}
+
+// checkProcs loads a corpus module and verifies each procCase, logging results.
+func checkProcs(t *testing.T, module, iface string, cases []procCase) {
+	t.Helper()
+	in := loadCorpusModule(t, module)
+	for _, c := range cases {
+		got := FormatValue(call(t, in, c.proc, c.args...))
+		if got != c.want {
+			t.Errorf("%s.%s%v -> %s, want %s", iface, c.proc, c.args, got, c.want)
+		}
+		t.Logf("%s.%-16s%v -> %s", iface, c.proc, c.args, got)
+	}
+}
+
 // TestCorpusListImpl loads Cedar's real List implementation (ListImpl.mesa) and
 // exercises its list-algebra procedures.
 func TestCorpusListImpl(t *testing.T) {
@@ -114,4 +134,64 @@ func TestCorpusListImpl(t *testing.T) {
 		}
 		t.Logf("List.%-14s -> %s", c.proc, got)
 	}
+}
+
+// TestCorpusBasics32 loads the corpus's 32-bit Basics implementation and checks
+// its bit operations.
+func TestCorpusBasics32(t *testing.T) {
+	checkProcs(t, "Basics32.mesa", "Basics", []procCase{
+		{"BITAND", []any{int64(12), int64(10)}, "8"},
+		{"BITOR", []any{int64(12), int64(10)}, "14"},
+		{"BITXOR", []any{int64(12), int64(10)}, "6"},
+		{"BITLSHIFT", []any{int64(1), int64(8)}, "256"},
+		{"BITLSHIFT", []any{int64(3), int64(4)}, "48"},
+		{"BITRSHIFT", []any{int64(256), int64(4)}, "16"},
+	})
+}
+
+// TestCorpusOSMiscOps loads the corpus's OS word/unit helpers.
+func TestCorpusOSMiscOps(t *testing.T) {
+	checkProcs(t, "OSMiscOps.mesa", "OSMiscOps", []procCase{
+		{"UnitsToBytes", []any{int64(3)}, "6"},
+		{"BytesToUnits", []any{int64(12)}, "6"},
+		{"WordAnd", []any{int64(12), int64(10)}, "8"},
+		{"WordOr", []any{int64(12), int64(10)}, "14"},
+		{"WordNot", []any{int64(12)}, "-13"},
+	})
+}
+
+// TestCorpusLexer loads the corpus lexer and checks its character predicates.
+func TestCorpusLexer(t *testing.T) {
+	checkProcs(t, "LexerImpl.mesa", "Lexer", []procCase{
+		{"IsDecimalDigit", []any{Char('7')}, "TRUE"},
+		{"IsDecimalDigit", []any{Char('x')}, "FALSE"},
+		{"Is1To9", []any{Char('5')}, "TRUE"},
+		{"Is1To9", []any{Char('0')}, "FALSE"},
+		{"IsOctalDigit", []any{Char('7')}, "TRUE"},
+		{"IsOctalDigit", []any{Char('9')}, "FALSE"},
+		{"IsHexDigit", []any{Char('f')}, "TRUE"},
+		{"IsHexDigit", []any{Char('g')}, "FALSE"},
+		{"IsPunctuation", []any{Char(',')}, "TRUE"},
+	})
+}
+
+// TestCorpusAngles2d loads the corpus 2D angle-geometry implementation.
+func TestCorpusAngles2d(t *testing.T) {
+	checkProcs(t, "Angles2dImpl.mesa", "Angles2d", []procCase{
+		{"Add", []any{float64(1.0), float64(2.0)}, "3.0"},
+		{"Scale", []any{float64(3.0), float64(2.0)}, "6.0"},
+	})
+}
+
+// TestCorpusRealSupport loads the corpus REAL-support implementation and checks
+// its comparisons and binary scaling (value * 2^n).
+func TestCorpusRealSupport(t *testing.T) {
+	checkProcs(t, "RealSupportImpl.mesa", "RealSupport", []procCase{
+		{"Lt", []any{float64(2.0), float64(5.0)}, "TRUE"},
+		{"Lt", []any{float64(5.0), float64(2.0)}, "FALSE"},
+		{"Ne", []any{float64(2.0), float64(2.0)}, "FALSE"},
+		{"Ne", []any{float64(2.0), float64(3.0)}, "TRUE"},
+		{"FScale", []any{float64(1.0), int64(3)}, "8.0"},
+		{"FScale", []any{float64(1.0), int64(10)}, "1024.0"},
+	})
 }
