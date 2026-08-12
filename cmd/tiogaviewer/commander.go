@@ -10,6 +10,8 @@ import (
 	"gioui.org/layout"
 	"gioui.org/widget"
 	"gioui.org/widget/material"
+
+	"cedarg/internal/tioga"
 )
 
 // The Commander is Cedar's CommandTool: a command interpreter (distinct from the
@@ -111,13 +113,18 @@ func (s *gioUI) resolvePath(arg string) string {
 	return arg
 }
 
-// runMesaFile reads and runs a Mesa source file, returning its output.
+// runMesaFile reads and runs a Mesa source file, returning its output. A .mesa
+// file on disk is a Tioga container whose source is encoded with Xerox control
+// codes and special characters (←, ↑, ≠, …); it must be decoded through the
+// Tioga code reader before the lexer sees it, exactly as the .mesa content
+// viewer does. tioga.Read falls back to treating plain text as code, so this is
+// safe whether the file is a Tioga container or already plain source.
 func (s *gioUI) runMesaFile(path string) string {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "cannot read " + path + ": " + err.Error()
 	}
-	return runMesa(string(data))
+	return runMesa(tioga.Read(data, true).Code)
 }
 
 // commanderBody renders the log above a command input line.
