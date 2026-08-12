@@ -202,7 +202,7 @@ func (p *Parser) parseBlock() *Block {
 	default:
 		p.fail("expected BEGIN or '{'")
 	}
-	handlers := p.blockPrologue()
+	opens, handlers := p.blockPrologue()
 	items := p.parseStmtSeq(closer)
 	// A trailing "EXITS label => stmt; …" clause names block-exit handlers.
 	if p.acceptWord("EXITS") {
@@ -230,7 +230,7 @@ func (p *Parser) parseBlock() *Block {
 	if !closed {
 		p.recovered++
 	}
-	return &Block{Items: items, Handlers: handlers, Line: line}
+	return &Block{Items: items, Handlers: handlers, Opens: opens, Line: line}
 }
 
 // atStop reports whether the current token ends the current sequence.
@@ -238,16 +238,15 @@ func (p *Parser) atStop(closer string) bool {
 	return p.isKw(closer) || p.isPunct(closer)
 }
 
-// blockPrologue consumes leading "OPEN interfaces;" clauses (skipped) and
-// "ENABLE handlers;" clauses (captured), which may open a block or loop body,
-// and returns the handlers active over the block.
-func (p *Parser) blockPrologue() []Handler {
+// blockPrologue consumes leading "OPEN namespaces;" and "ENABLE handlers;"
+// clauses (either may open a block or loop body) and returns both, active over
+// the block.
+func (p *Parser) blockPrologue() ([]OpenClause, []Handler) {
+	var opens []OpenClause
 	var handlers []Handler
 	for {
 		if p.acceptWord("OPEN") {
-			for p.cur().Kind != TEOF && !p.isPunct(";") {
-				p.advance()
-			}
+			opens = append(opens, p.parseOpens()...)
 			p.acceptPunct(";")
 			continue
 		}
@@ -264,7 +263,26 @@ func (p *Parser) blockPrologue() []Handler {
 		}
 		break
 	}
-	return handlers
+	return opens, handlers
+}
+
+// parseOpens parses the entries of an OPEN clause: "alias: ns", "alias ~ ns", or
+// a bare namespace, comma-separated, up to the terminating ';'.
+func (p *Parser) parseOpens() []OpenClause {
+	var opens []OpenClause
+	for p.cur().Kind != TEOF && !p.isPunct(";") {
+		var oc OpenClause
+		if p.cur().Kind == TIdent && (p.peek().Text == ":" || p.peek().Text == "~") {
+			oc.Bind = p.advance().Text
+			p.advance() // ':' or '~'
+		}
+		oc.Expr = p.parseValueExpr()
+		opens = append(opens, oc)
+		if !p.acceptPunct(",") {
+			break
+		}
+	}
+	return opens
 }
 
 func (p *Parser) parseStmtSeq(closer string) []Stmt {
@@ -1276,7 +1294,7 @@ func (p *Parser) parseLoop() Stmt {
 		l.Until = p.parseExpr()
 	}
 	p.expectKw("DO")
-	loopHandlers := p.blockPrologue() // a loop body may also open with OPEN/ENABLE
+	loopOpens, loopHandlers := p.blockPrologue() // a loop body may also open with OPEN/ENABLE
 	// The body runs up to ENDLOOP or a REPEAT (loop-exit handler) clause.
 	var items []Stmt
 	for {
@@ -1301,7 +1319,7 @@ func (p *Parser) parseLoop() Stmt {
 			break
 		}
 	}
-	l.Body = &Block{Items: items, Handlers: loopHandlers, Line: line}
+	l.Body = &Block{Items: items, Handlers: loopHandlers, Opens: loopOpens, Line: line}
 	if p.acceptWord("REPEAT") { // exit handlers: label => stmt; …
 		for !p.isKw("ENDLOOP") && p.cur().Kind != TEOF {
 			p.skipToArrow()

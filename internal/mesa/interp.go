@@ -12,6 +12,7 @@ import (
 type Env struct {
 	vars   map[string]any
 	parent *Env
+	opens  []any // namespaces from an OPEN clause, searched for unqualified names
 }
 
 func newEnv(parent *Env) *Env {
@@ -39,6 +40,28 @@ func (e *Env) set(name string, v any) bool {
 }
 
 func (e *Env) define(name string, v any) { e.vars[name] = v }
+
+// lookupOpen resolves a bare name against the namespaces brought into scope by
+// enclosing OPEN clauses (Cedar's "OPEN Iface" makes Iface's members visible
+// unqualified). A member of an opaque or Open interface resolves to an opaque.
+func (e *Env) lookupOpen(name string) (any, bool) {
+	for s := e; s != nil; s = s.parent {
+		for _, ns := range s.opens {
+			switch n := deref(ns).(type) {
+			case *RecordVal:
+				if v, ok := n.Fields[name]; ok {
+					return v, true
+				}
+				if n.Open {
+					return &Opaque{Name: n.TypeName + "." + name}, true
+				}
+			case *Opaque:
+				return &Opaque{Name: n.Name + "." + name}, true
+			}
+		}
+	}
+	return nil, false
+}
 
 // ---- Control-flow signals (implemented with panic/recover) ----
 
@@ -147,6 +170,14 @@ func (i *Interp) bindImports(m *Module) {
 // and procedure declarations first so forward and mutual references work. A
 // block with ENABLE handlers catches conditions raised anywhere within it.
 func (i *Interp) execBlock(b *Block, env *Env) {
+	// Bring any OPEN'd namespaces into scope for unqualified member references.
+	for _, oc := range b.Opens {
+		ns := i.eval(oc.Expr, env)
+		env.opens = append(env.opens, ns)
+		if oc.Bind != "" {
+			env.define(oc.Bind, ns)
+		}
+	}
 	if len(b.Handlers) > 0 {
 		defer func() {
 			if r := recover(); r != nil {
@@ -607,11 +638,13 @@ func (i *Interp) eval(e Expr, env *Env) any {
 	case *NilLit:
 		return nil
 	case *Ident:
-		v, ok := env.lookup(x.Name)
-		if !ok {
-			rerr(x.Line, "undefined identifier %q", x.Name)
+		if v, ok := env.lookup(x.Name); ok {
+			return v
 		}
-		return v
+		if v, ok := env.lookupOpen(x.Name); ok { // an OPEN'd namespace member
+			return v
+		}
+		rerr(x.Line, "undefined identifier %q", x.Name)
 	case *Unary:
 		return i.evalUnary(x, env)
 	case *Binary:

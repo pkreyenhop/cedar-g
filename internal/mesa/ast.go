@@ -216,11 +216,21 @@ type ExprStmt struct {
 }
 
 // Block is BEGIN ... END or a bracketed body; a scope with items. A leading
-// ENABLE clause installs Handlers over the whole block.
+// ENABLE clause installs Handlers over the whole block; a leading OPEN clause
+// brings the members of the named namespaces into scope unqualified.
 type Block struct {
 	Items    []Stmt
 	Handlers []Handler // ENABLE handlers active over this block
+	Opens    []OpenClause
 	Line     int
+}
+
+// OpenClause is one entry of an OPEN clause: an optional alias bound to a
+// namespace value (an interface or record), whose members become visible
+// unqualified within the block.
+type OpenClause struct {
+	Bind string // "" if the entry has no alias
+	Expr Expr   // the namespace expression
 }
 
 // Handler is one arm of an ENABLE or "! …" catch clause: a set of signal guards
