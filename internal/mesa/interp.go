@@ -489,6 +489,11 @@ func (i *Interp) assignTo(lhs Expr, val any, env *Env) {
 		switch b := base.(type) {
 		case *RecordVal:
 			if _, ok := b.Fields[t.Field]; !ok {
+				if b.Open { // assigning an unmodeled interface member: record it loosely
+					b.Names = append(b.Names, t.Field)
+					b.Fields[t.Field] = val
+					return
+				}
 				rerr(t.Line, "record has no field %q", t.Field)
 			}
 			b.Fields[t.Field] = val
@@ -639,6 +644,9 @@ func (i *Interp) eval(e Expr, env *Env) any {
 		}
 		switch b := base.(type) {
 		case *RecordVal:
+			if b.Open { // an unmodeled member of a known interface stays opaque
+				return &Opaque{Name: b.TypeName + "." + x.Field}
+			}
 			rerr(x.Line, "record has no field %q", x.Field)
 		case *Opaque: // Pkg.member of an unmodeled interface stays opaque
 			return &Opaque{Name: b.Name + "." + x.Field}

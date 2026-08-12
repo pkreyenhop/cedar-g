@@ -23,9 +23,10 @@ func (i *Interp) installLibraries() {
 	i.global.define("RefText", i.refTextInterface())
 }
 
-// mkIface builds an interface record from a name→builtin table.
+// mkIface builds an interface record from a name→builtin table. The record is
+// Open: a reference to a member we did not model yields an opaque handle.
 func mkIface(name string, procs map[string]func(*Interp, []any) any) *RecordVal {
-	r := &RecordVal{TypeName: name, Fields: map[string]any{}}
+	r := &RecordVal{TypeName: name, Fields: map[string]any{}, Open: true}
 	for pn, fn := range procs {
 		r.Names = append(r.Names, pn)
 		r.Fields[pn] = &Builtin{Name: name + "." + pn, Fn: fn}
@@ -52,7 +53,7 @@ func ropeStr(v any) string {
 // ---- IO ----
 
 func (i *Interp) ioInterface() *RecordVal {
-	r := &RecordVal{TypeName: "IO", Fields: map[string]any{}}
+	r := &RecordVal{TypeName: "IO", Fields: map[string]any{}, Open: true}
 	add := func(name string, fn func(*Interp, []any) any) {
 		r.Names = append(r.Names, name)
 		r.Fields[name] = &Builtin{Name: "IO." + name, Fn: fn}
@@ -261,7 +262,7 @@ func putFFormat(format string, args []any) string {
 // ---- Rope ----
 
 func (i *Interp) ropeInterface() *RecordVal {
-	r := &RecordVal{TypeName: "Rope", Fields: map[string]any{}}
+	r := &RecordVal{TypeName: "Rope", Fields: map[string]any{}, Open: true}
 	add := func(name string, fn func(*Interp, []any) any) {
 		r.Names = append(r.Names, name)
 		r.Fields[name] = &Builtin{Name: "Rope." + name, Fn: fn}
@@ -363,7 +364,7 @@ func (i *Interp) ropeInterface() *RecordVal {
 // ---- Convert ----
 
 func (i *Interp) convertInterface() *RecordVal {
-	r := &RecordVal{TypeName: "Convert", Fields: map[string]any{}}
+	r := &RecordVal{TypeName: "Convert", Fields: map[string]any{}, Open: true}
 	add := func(name string, fn func(*Interp, []any) any) {
 		r.Names = append(r.Names, name)
 		r.Fields[name] = &Builtin{Name: "Convert." + name, Fn: fn}

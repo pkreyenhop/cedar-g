@@ -47,11 +47,13 @@ func (a *ArrayVal) index(i int64) (int, bool) {
 }
 
 // RecordVal is a record; field order is preserved for constructors and
-// printing.
+// printing. Open marks a modeled interface record (IO, Rope, …): a reference to
+// a member we did not implement yields an opaque handle rather than an error.
 type RecordVal struct {
 	TypeName string
 	Names    []string
 	Fields   map[string]any
+	Open     bool
 }
 
 func (r *RecordVal) clone() *RecordVal {
@@ -60,7 +62,7 @@ func (r *RecordVal) clone() *RecordVal {
 		nf[k] = v
 	}
 	names := append([]string(nil), r.Names...)
-	return &RecordVal{TypeName: r.TypeName, Names: names, Fields: nf}
+	return &RecordVal{TypeName: r.TypeName, Names: names, Fields: nf, Open: r.Open}
 }
 
 // Opaque is a handle from an interface the interpreter does not model (an
