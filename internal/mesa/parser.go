@@ -467,6 +467,11 @@ var typeQualifiers = map[string]bool{
 	"UNCOUNTED": true, "COMPUTED": true, "OVERLAID": true,
 }
 
+// nonTypeFollowers are words that can follow a type name but belong to an
+// enclosing construct (a FOR loop's direction), so the type parser must not
+// absorb them as a variant-bound base type.
+var nonTypeFollowers = map[string]bool{"DECREASING": true, "INCREASING": true}
+
 // bodyQualifiers may sit between a procedure's binding and its block body.
 var bodyQualifiers = map[string]bool{
 	"INLINE": true, "TRUSTED": true, "CHECKED": true, "UNCHECKED": true,
@@ -627,8 +632,9 @@ func (p *Parser) parseType() TypeExpr {
 			p.skipBrackets() // Foo[n] — a dimension/size argument
 		}
 		// A variant-bound type names the variant tag then the base type:
-		// REF Success MS.MaintainreturnObject.
-		if p.cur().Kind == TIdent && !typeQualifiers[p.cur().Text] {
+		// REF Success MS.MaintainreturnObject. But a following DECREASING/INCREASING
+		// belongs to an enclosing FOR loop, not this type.
+		if p.cur().Kind == TIdent && !typeQualifiers[p.cur().Text] && !nonTypeFollowers[p.cur().Text] {
 			return p.parseType()
 		}
 		return nt
@@ -1253,7 +1259,9 @@ func (p *Parser) parseLoop() Stmt {
 		if p.acceptPunct(":") {
 			l.VarType = p.parseType()
 		}
-		if !p.acceptWord("DECREASING") {
+		if p.acceptWord("DECREASING") {
+			l.Down = true
+		} else {
 			p.acceptWord("INCREASING")
 		}
 		if p.acceptKw("IN") {
@@ -1320,13 +1328,17 @@ func (p *Parser) parseLoop() Stmt {
 		}
 	}
 	l.Body = &Block{Items: items, Handlers: loopHandlers, Opens: loopOpens, Line: line}
-	if p.acceptWord("REPEAT") { // exit handlers: label => stmt; …
+	if p.acceptWord("REPEAT") { // exit handlers: label => stmt; … and FINISHED => stmt
 		for !p.isKw("ENDLOOP") && p.cur().Kind != TEOF {
+			isFinished := p.cur().Kind == TIdent && p.cur().Text == "FINISHED"
 			p.skipToArrow()
 			if !p.acceptPunct("=>") {
 				break
 			}
-			p.parseStmt()
+			body := p.parseStmt()
+			if isFinished { // run when the loop completes without an EXIT
+				l.Finished = body
+			}
 			p.acceptPunct(";")
 		}
 	}

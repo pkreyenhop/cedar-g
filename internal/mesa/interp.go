@@ -450,6 +450,7 @@ func (i *Interp) execLoop(l *Loop, env *Env) {
 		return true
 	}
 
+	exited := false // set when the loop leaves via EXIT (skips the FINISHED handler)
 	switch {
 	case l.Interval != nil:
 		lo := toInt(i.eval(l.Interval.Lo, lenv), l.Line)
@@ -460,7 +461,12 @@ func (i *Interp) execLoop(l *Loop, env *Env) {
 		if !l.Interval.IncHi {
 			hi--
 		}
-		for n := lo; n <= hi; n++ {
+		step := int64(1)
+		if l.Down {
+			step = -1
+			lo, hi = hi, lo // DECREASING: iterate from the high bound down to the low
+		}
+		for n := lo; (step > 0 && n <= hi) || (step < 0 && n >= hi); n += step {
 			if l.Var != "" {
 				lenv.define(l.Var, mk(n))
 			}
@@ -468,6 +474,7 @@ func (i *Interp) execLoop(l *Loop, env *Env) {
 				break
 			}
 			if i.runLoopBody(l.Body, lenv) {
+				exited = true
 				break
 			}
 		}
@@ -478,6 +485,7 @@ func (i *Interp) execLoop(l *Loop, env *Env) {
 				break
 			}
 			if i.runLoopBody(l.Body, lenv) {
+				exited = true
 				break
 			}
 			lenv.define(l.Var, i.eval(l.Next, lenv))
@@ -488,9 +496,13 @@ func (i *Interp) execLoop(l *Loop, env *Env) {
 				break
 			}
 			if i.runLoopBody(l.Body, lenv) {
+				exited = true
 				break
 			}
 		}
+	}
+	if !exited && l.Finished != nil {
+		i.execStmt(l.Finished, lenv)
 	}
 }
 

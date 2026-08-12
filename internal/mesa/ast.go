@@ -278,13 +278,17 @@ type Loop struct {
 	Var      string
 	VarType  TypeExpr
 	Interval *Interval // FOR var IN [..] / THROUGH [..]
+	Down     bool      // FOR var DECREASING IN [..] — iterate high to low
 	Start    Expr      // FOR var <- start, next
 	Next     Expr
 	// Guards:
 	While Expr // WHILE cond
 	Until Expr // UNTIL cond
 	Body  *Block
-	Line  int
+	// Finished is the "REPEAT FINISHED => stmt" handler, run when the loop
+	// completes normally (its range is exhausted or its guard fails), not via EXIT.
+	Finished Stmt
+	Line     int
 }
 
 // SelectStmt is SELECT subject FROM arm... ENDCASE => default.
