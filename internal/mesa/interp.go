@@ -101,6 +101,12 @@ type Interp struct {
 	out      io.Writer
 	steps    int64 // executed statements/evaluations, bounded by maxSteps
 	maxSteps int64
+	// tolerantIdents makes an otherwise-undefined bare identifier resolve to an
+	// opaque handle. It is enabled only for modules that import interfaces we
+	// model as opaque: in those, an unresolved name is almost always a member of
+	// an unmodeled namespace (an enum literal or constant), not a typo. A
+	// self-contained program keeps strict "undefined identifier" errors.
+	tolerantIdents bool
 }
 
 // defaultMaxSteps bounds a single run. The interpreter has no cancellation, so a
@@ -163,6 +169,7 @@ func (i *Interp) bindImports(m *Module) {
 			continue // a real interface stub, or already bound
 		}
 		i.global.define(name, &Opaque{Name: name})
+		i.tolerantIdents = true // this module leans on an unmodeled interface
 	}
 }
 
@@ -643,6 +650,11 @@ func (i *Interp) eval(e Expr, env *Env) any {
 		}
 		if v, ok := env.lookupOpen(x.Name); ok { // an OPEN'd namespace member
 			return v
+		}
+		if i.tolerantIdents {
+			// Likely a member of an unmodeled namespace (an enum literal or
+			// constant from an interface we treat as opaque).
+			return &Opaque{Name: x.Name}
 		}
 		rerr(x.Line, "undefined identifier %q", x.Name)
 	case *Unary:
