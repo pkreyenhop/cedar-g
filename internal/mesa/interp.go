@@ -705,7 +705,12 @@ func (i *Interp) eval(e Expr, env *Env) any {
 			}
 			rerr(x.Line, "list has no field %q", x.Field)
 		}
-		rerr(x.Line, "cannot access field .%s of non-record value", x.Field)
+		if base == nil {
+			rerr(x.Line, "cannot access field .%s of NIL", x.Field)
+		}
+		// A field of some other non-record value (an interface modeled as a
+		// builtin/handle, a partially-modeled value): stay opaque rather than abort.
+		return &Opaque{Name: "." + x.Field}
 	case *Aggregate:
 		return i.evalAggregate(x, env)
 	case *IfExpr:
@@ -954,6 +959,13 @@ func (i *Interp) evalApplyInner(x *Apply, env *Env) any {
 		}
 		return &Opaque{Name: op.Name}
 	}
+	if sig, ok := fn.(*Signal); ok {
+		// Invoking an ERROR/SIGNAL raises it; the arguments are its payload.
+		for _, a := range x.Args {
+			i.eval(a, env)
+		}
+		panic(raisedSignal{sig: sig, name: sig.Name})
+	}
 	switch f := fn.(type) {
 	case *Closure:
 		return i.callClosure(f, x.Args, env, x.Line)
@@ -987,8 +999,15 @@ func (i *Interp) evalApplyInner(x *Apply, env *Env) any {
 		}
 		return Char(rs[idx])
 	}
-	rerr(x.Line, "cannot call or index a %s", typeName(fn))
-	return nil
+	if fn == nil {
+		rerr(x.Line, "cannot call or index NIL")
+	}
+	// A call/index of a value we do not model as callable (a record variant, an
+	// opaque-ish handle): evaluate the arguments and stay opaque.
+	for _, a := range x.Args {
+		i.eval(a, env)
+	}
+	return &Opaque{Name: "value"}
 }
 
 // CallProc invokes a top-level (usually exported) procedure by name with the

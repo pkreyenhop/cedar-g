@@ -84,6 +84,13 @@ func (i *Interp) installBuiltins() {
 			return int64(v.Ord)
 		case int64:
 			return v
+		case bool:
+			if v {
+				return int64(1)
+			}
+			return int64(0)
+		case *Opaque:
+			return int64(0)
 		}
 		rerr(0, "ORD needs a CHARACTER or enumeration")
 		return nil
@@ -199,7 +206,7 @@ func reduce(a []any, max bool) any {
 	for _, v := range a[1:] {
 		c, ok := valueCompare(v, best)
 		if !ok {
-			rerr(0, "MAX/MIN arguments are not comparable")
+			continue // an incomparable argument (e.g. an opaque handle) is skipped
 		}
 		if (max && c > 0) || (!max && c < 0) {
 			best = v
