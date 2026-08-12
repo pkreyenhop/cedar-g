@@ -26,6 +26,13 @@ func runMesa(src string) string {
 		return "parse error: " + err.Error()
 	}
 
+	// Surface a safety advisory when the program relies on unsafe features or a
+	// low-level runtime the safe interpreter cannot faithfully reproduce.
+	var prefix string
+	if note := mesa.AnalyzeSafety(src, m).Note(); note != "" {
+		prefix = note + "\n"
+	}
+
 	buf := &boundedBuffer{max: mesaMaxOutput}
 	done := make(chan error, 1)
 	go func() {
@@ -49,13 +56,13 @@ func runMesa(src string) string {
 		if out == "" {
 			out = "(no output)"
 		}
-		return out
+		return prefix + out
 	case <-time.After(mesaRunTimeout):
 		out := buf.String()
 		if out != "" && !strings.HasSuffix(out, "\n") {
 			out += "\n"
 		}
-		return out + fmt.Sprintf("… timed out after %s (possible infinite loop)", mesaRunTimeout)
+		return prefix + out + fmt.Sprintf("… timed out after %s (possible infinite loop)", mesaRunTimeout)
 	}
 }
 
