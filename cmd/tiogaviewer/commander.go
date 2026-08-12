@@ -134,10 +134,14 @@ func (s *gioUI) commanderBody(gtx C, v *viewer) D {
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 		layout.Flexed(1, func(gtx C) D {
 			gtx.Constraints.Min = gtx.Constraints.Max
-			return layout.Inset{Top: 4, Right: 12, Bottom: 4}.Layout(gtx, func(gtx C) D {
-				gtx.Constraints.Min = gtx.Constraints.Max
-				return s.scrollList(gtx, &v.sc, len(v.cmdLog), func(gtx C, i int) D {
-					return s.label(gtx, monoFont, font.Normal, font.Regular, termTextSize-2, v.cmdLog[i], cedarBlack, 1)
+			// The log area is clickable so a click anywhere in the Commander
+			// returns keyboard focus to the input line (handled in processCommander).
+			return v.cmdFocus.Layout(gtx, func(gtx C) D {
+				return layout.Inset{Top: 4, Right: 12, Bottom: 4}.Layout(gtx, func(gtx C) D {
+					gtx.Constraints.Min = gtx.Constraints.Max
+					return s.scrollList(gtx, &v.sc, len(v.cmdLog), func(gtx C, i int) D {
+						return s.label(gtx, monoFont, font.Normal, font.Regular, termTextSize-2, v.cmdLog[i], cedarBlack, 1)
+					})
 				})
 			})
 		}),
@@ -171,8 +175,19 @@ func (s *gioUI) commanderBody(gtx C, v *viewer) D {
 	)
 }
 
-// processCommander runs a command when Enter is pressed in the input line.
+// processCommander runs a command when Enter is pressed in the input line, and
+// keeps the input line focused so the Commander accepts typing.
 func (s *gioUI) processCommander(gtx C, v *viewer) {
+	// Focus the command line the first time the Commander is shown (the window
+	// grabs keyboard focus at startup, so without this the input is dead).
+	if !v.cmdInit {
+		gtx.Execute(key.FocusCmd{Tag: &v.cmdEd})
+		v.cmdInit = true
+	}
+	// Clicking anywhere in the Commander returns focus to the input line.
+	if v.cmdFocus.Clicked(gtx) {
+		gtx.Execute(key.FocusCmd{Tag: &v.cmdEd})
+	}
 	for {
 		ev, ok := v.cmdEd.Update(gtx)
 		if !ok {

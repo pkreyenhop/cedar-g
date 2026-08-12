@@ -119,8 +119,10 @@ type viewer struct {
 	menuPos                                                           f32.Point
 	bmLevels, bmFind, bmRefs, bmEdit, bmPrint, bmArt, bmCopy, bmReset widget.Clickable
 
-	cmdLog []string      // vkCommander: the command/output log
-	cmdEd  widget.Editor // vkCommander: the command input line
+	cmdLog   []string         // vkCommander: the command/output log
+	cmdEd    widget.Editor    // vkCommander: the command input line
+	cmdInit  bool             // vkCommander: input line has been focused once
+	cmdFocus widget.Clickable // vkCommander: click anywhere to focus the input
 
 	// Levels: an outline view that shows only nodes up to a nesting depth.
 	bLevels                                 widget.Clickable // header: reveal the levels bar
