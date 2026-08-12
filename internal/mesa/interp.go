@@ -739,6 +739,10 @@ func (i *Interp) eval(e Expr, env *Env) any {
 			elem = i.defaultValue(t)
 		}
 		return &Ref{Elem: elem}
+	case *AssignExpr:
+		v := i.eval(x.Value, env)
+		i.assignTo(x.Target, v, env)
+		return v
 	case *Deref:
 		v := i.eval(x.X, env)
 		r, ok := v.(*Ref)

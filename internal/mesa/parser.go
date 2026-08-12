@@ -1828,10 +1828,7 @@ func (p *Parser) parsePrimary() Expr {
 		switch t.Text {
 		case "(":
 			p.advance()
-			x := p.parseExpr()
-			for p.acceptPunct("<-") { // (v ← expr): assignment as an expression
-				x = p.parseExpr()
-			}
+			x := p.parseAssignExpr()
 			p.expectPunct(")")
 			return x
 		case "[":
@@ -1844,6 +1841,17 @@ func (p *Parser) parsePrimary() Expr {
 	}
 	p.fail("unexpected token in expression")
 	return nil
+}
+
+// parseAssignExpr parses an expression that may be an assignment
+// "target ← value" (Cedar permits assignment in expression position, e.g.
+// "(l ← l.rest) = NIL"). Chained "a ← b ← c" is right-associative.
+func (p *Parser) parseAssignExpr() Expr {
+	x := p.parseExpr()
+	if line := p.cur().Line; p.acceptPunct("<-") {
+		return &AssignExpr{Target: x, Value: p.parseAssignExpr(), Line: line}
+	}
+	return x
 }
 
 func (p *Parser) parseAggregate() Expr {

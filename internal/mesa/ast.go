@@ -157,6 +157,15 @@ type Deref struct {
 	Line int
 }
 
+// AssignExpr is an assignment used in expression position, "(target ← value)",
+// which performs the assignment and yields the assigned value — as in the common
+// loop idiom "UNTIL (p ← p.rest) = NIL DO …".
+type AssignExpr struct {
+	Target Expr
+	Value  Expr
+	Line   int
+}
+
 func (*IntLit) exprNode()      {}
 func (*RealLit) exprNode()     {}
 func (*CharLit) exprNode()     {}
@@ -173,6 +182,7 @@ func (*IfExpr) exprNode()      {}
 func (*NewExpr) exprNode()     {}
 func (*Deref) exprNode()       {}
 func (*SelectExpr) exprNode()  {}
+func (*AssignExpr) exprNode()  {}
 
 // ---- Statements ----
 
