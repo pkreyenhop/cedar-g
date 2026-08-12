@@ -91,6 +91,16 @@ func (i *Interp) installBuiltins() {
 	def("VAL", func(in *Interp, a []any) any { return Char(rune(toInt(arg0(a), 0))) })
 	def("CHAR", func(in *Interp, a []any) any { return Char(rune(toInt(arg0(a), 0))) })
 
+	// Numeric type names double as conversion functions (CARDINAL[x], INT[x]) and
+	// are otherwise harmless as bare values; seed them so they are not "undefined".
+	toIntCast := func(in *Interp, a []any) any { return toInt(arg0(a), 0) }
+	for _, n := range []string{"INTEGER", "CARDINAL", "INT", "CARD", "NAT", "LONG",
+		"WORD", "BYTE", "INT16", "INT32", "CARD16", "CARD32", "NAT16", "NAT32"} {
+		def(n, toIntCast)
+	}
+	def("REAL", func(in *Interp, a []any) any { return asFloat(arg0(a), 0) })
+	def("LONGREAL", func(in *Interp, a []any) any { return asFloat(arg0(a), 0) })
+
 	// ---- Length of STRING, ARRAY or LIST ----
 	def("LENGTH", func(in *Interp, a []any) any { return lengthOf(arg0(a)) })
 	def("Length", func(in *Interp, a []any) any { return lengthOf(arg0(a)) })

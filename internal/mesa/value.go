@@ -63,6 +63,13 @@ func (r *RecordVal) clone() *RecordVal {
 	return &RecordVal{TypeName: r.TypeName, Names: names, Fields: nf}
 }
 
+// Opaque is a handle from an interface the interpreter does not model (an
+// imported namespace such as Commander or ViewerOps, or a value returned by one
+// of its procedures). It absorbs field access, calls and coercions — yielding
+// further opaques — and reads as NIL, so a library module that merely wires such
+// interfaces together elaborates instead of failing on an undefined identifier.
+type Opaque struct{ Name string }
+
 // Signal is an ERROR or SIGNAL code (declared "X: ERROR = CODE"). Identity
 // distinguishes one signal from another when caught.
 type Signal struct{ Name string }
@@ -199,6 +206,8 @@ func FormatValue(v any) string {
 		return FormatValue(x.Elem)
 	case *Stream:
 		return "STREAM"
+	case *Opaque:
+		return "NIL"
 	case *Signal:
 		return "SIGNAL " + x.Name
 	case *Cons:

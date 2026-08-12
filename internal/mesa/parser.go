@@ -97,19 +97,22 @@ func (p *Parser) ParseModule() (m *Module, err error) {
 	}()
 	m = &Module{}
 	// Cedar files may open with a DIRECTORY clause listing imported interfaces.
-	p.skipDirectory()
+	m.Imports = p.skipDirectory()
 	m.Name = p.expectIdent()
 	p.expectPunct(":")
 	// The head runs up to the binding ('=' or Cedar's '~'). It carries optional
 	// qualifiers (CEDAR, SAFE, ...), the module kind, and IMPORTS/EXPORTS/params;
-	// we record the kind and skip the rest (tracking bracket depth so a '=' in a
-	// default value doesn't end the head early).
+	// we record the kind and the IMPORTS local names, and skip the rest (tracking
+	// bracket depth so a '=' in a default value doesn't end the head early).
 	m.Kind = "MODULE"
 	depth := 0
+	inImports := false
+	expectImportName := false
 	for p.cur().Kind != TEOF {
 		if depth == 0 && (p.isPunct("=") || p.isPunct("~")) {
 			break
 		}
+		t := p.cur()
 		switch {
 		case p.isKw("PROGRAM"):
 			m.Kind = "PROGRAM"
@@ -117,10 +120,19 @@ func (p *Parser) ParseModule() (m *Module, err error) {
 			m.Kind = "DEFINITIONS"
 		case p.isKw("MONITOR"):
 			m.Kind = "MONITOR"
+		case t.Kind == TIdent && t.Text == "IMPORTS":
+			inImports, expectImportName = true, true
+		case t.Kind == TIdent && (t.Text == "EXPORTS" || t.Text == "SHARES" || t.Text == "LOCKS"):
+			inImports = false
 		case p.isPunct("[") || p.isPunct("("):
 			depth++
 		case p.isPunct("]") || p.isPunct(")"):
 			depth--
+		case inImports && depth == 0 && p.isPunct(","):
+			expectImportName = true
+		case inImports && depth == 0 && expectImportName && t.Kind == TIdent:
+			m.Imports = append(m.Imports, t.Text) // the local name of an import
+			expectImportName = false
 		}
 		p.advance()
 	}
@@ -138,13 +150,17 @@ func (p *Parser) acceptBind() bool {
 	return p.acceptPunct("=") || p.acceptPunct("~")
 }
 
-// skipDirectory skips a leading "DIRECTORY … ;" import clause, if present.
-func (p *Parser) skipDirectory() {
+// skipDirectory consumes a leading "DIRECTORY … ;" clause and returns the
+// interface names it lists (the first identifier of each comma-separated entry).
+func (p *Parser) skipDirectory() []string {
 	if !p.acceptKw("DIRECTORY") {
-		return
+		return nil
 	}
+	var names []string
 	depth := 0
+	expectName := true // at the start of a comma-separated entry
 	for p.cur().Kind != TEOF {
+		t := p.cur()
 		switch {
 		case p.isPunct("[") || p.isPunct("("):
 			depth++
@@ -152,10 +168,16 @@ func (p *Parser) skipDirectory() {
 			depth--
 		case depth == 0 && p.isPunct(";"):
 			p.advance()
-			return
+			return names
+		case depth == 0 && p.isPunct(","):
+			expectName = true
+		case depth == 0 && expectName && t.Kind == TIdent:
+			names = append(names, t.Text)
+			expectName = false
 		}
 		p.advance()
 	}
+	return names
 }
 
 // blockPrefixWords are access/safety qualifiers that may sit directly before a

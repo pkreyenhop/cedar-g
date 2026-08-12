@@ -324,6 +324,10 @@ type Module struct {
 	Name string
 	Kind string // "PROGRAM", "DEFINITIONS", "MODULE"
 	Body *Block
+	// Imports lists the interface names the module can reference (from its
+	// DIRECTORY and IMPORTS clauses), so the interpreter can bind them — to a
+	// real stub interface, or to an opaque namespace when we do not model it.
+	Imports []string
 	// Recovered counts statements skipped by error recovery; 0 means a clean
 	// parse, > 0 means some fragments were not understood but were tolerated.
 	Recovered int

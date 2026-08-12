@@ -123,10 +123,23 @@ func (i *Interp) Run(m *Module) (err error) {
 			}
 		}
 	}()
+	i.bindImports(m)
 	// The module body executes directly in the global scope so that its
 	// procedures and types are program-visible.
 	i.execBlock(m.Body, i.global)
 	return nil
+}
+
+// bindImports binds each imported interface name to a value. Names we model
+// (IO, Rope, Convert, …) are already defined; the rest become opaque namespaces
+// so "Pkg.Proc[…]" references elaborate to opaque handles instead of failing.
+func (i *Interp) bindImports(m *Module) {
+	for _, name := range m.Imports {
+		if _, ok := i.global.lookup(name); ok {
+			continue // a real interface stub, or already bound
+		}
+		i.global.define(name, &Opaque{Name: name})
+	}
 }
 
 // execBlock runs a block's items in the given environment, hoisting type
@@ -478,6 +491,8 @@ func (i *Interp) assignTo(lhs Expr, val any, env *Env) {
 			default:
 				rerr(t.Line, "list has no field %q", t.Field)
 			}
+		case *Opaque:
+			// Writing a field of an opaque interface handle is a no-op.
 		default:
 			rerr(t.Line, "cannot assign field .%s of non-record", t.Field)
 		}
@@ -546,6 +561,8 @@ func (i *Interp) eval(e Expr, env *Env) any {
 				rerr(x.Line, "record has no field %q", x.Field)
 			}
 			return v
+		case *Opaque: // Pkg.member of an unmodeled interface stays opaque
+			return &Opaque{Name: b.Name + "." + x.Field}
 		case *Cons: // LIST OF T: .first is the head, .rest the tail
 			switch x.Field {
 			case "first":
@@ -756,6 +773,14 @@ func (i *Interp) evalApplyInner(x *Apply, env *Env) any {
 		}
 	}
 	fn := deref(i.eval(x.Fun, env)) // a REF to an array/proc auto-dereferences
+	if op, ok := fn.(*Opaque); ok {
+		// Calling an opaque interface procedure: evaluate the arguments for their
+		// effects, then yield an opaque result.
+		for _, a := range x.Args {
+			i.eval(a, env)
+		}
+		return &Opaque{Name: op.Name}
+	}
 	switch f := fn.(type) {
 	case *Closure:
 		return i.callClosure(f, x.Args, env, x.Line)
@@ -788,6 +813,66 @@ func (i *Interp) evalApplyInner(x *Apply, env *Env) any {
 	}
 	rerr(x.Line, "cannot call or index a %s", typeName(fn))
 	return nil
+}
+
+// CallProc invokes a top-level (usually exported) procedure by name with the
+// given argument values, returning its result. This is the entry model for
+// library modules, which have no side-effecting main body: run the module to
+// elaborate its declarations, then call one of its procedures. Run must be
+// called first.
+func (i *Interp) CallProc(name string, args ...any) (result any, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			switch e := r.(type) {
+			case runtimeError:
+				err = e
+			case raisedSignal:
+				err = runtimeError{msg: "uncaught " + e.name}
+			default:
+				panic(r)
+			}
+		}
+	}()
+	v, ok := i.global.lookup(name)
+	if !ok {
+		return nil, fmt.Errorf("no such procedure %q", name)
+	}
+	cl, ok := deref(v).(*Closure)
+	if !ok {
+		return nil, fmt.Errorf("%q is not a procedure", name)
+	}
+	return i.callClosureValues(cl, args), nil
+}
+
+// callClosureValues calls a closure with already-evaluated argument values.
+func (i *Interp) callClosureValues(c *Closure, args []any) any {
+	local := newEnv(c.Env)
+	for k, p := range c.Type.Params {
+		var v any
+		if k < len(args) {
+			v = args[k]
+		}
+		local.define(p.Name, i.coerce(v, i.resolveType(p.Type, c.Env)))
+	}
+	for _, res := range c.Type.Results {
+		if res.Name != "" {
+			local.define(res.Name, i.defaultValue(i.resolveType(res.Type, c.Env)))
+		}
+	}
+	var sig *returnSignal
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if rs, ok := r.(returnSignal); ok {
+					sig = &rs
+					return
+				}
+				panic(r)
+			}
+		}()
+		i.execBlock(c.Body, local)
+	}()
+	return i.computeReturn(sig, c.Type.Results, local, c.Env)
 }
 
 func (i *Interp) callClosure(c *Closure, argExprs []Expr, env *Env, line int) any {
@@ -1167,11 +1252,14 @@ func (i *Interp) coerce(v any, t Type) any {
 // ---- Value helpers ----
 
 func toBool(v any, line int) bool {
-	b, ok := v.(bool)
-	if !ok {
-		rerr(line, "expected BOOLEAN, got %s", typeName(v))
+	if b, ok := v.(bool); ok {
+		return b
 	}
-	return b
+	if _, ok := v.(*Opaque); ok {
+		return false // an opaque handle reads as NIL/false
+	}
+	rerr(line, "expected BOOLEAN, got %s", typeName(v))
+	return false
 }
 
 func toInt(v any, line int) int64 {
@@ -1182,6 +1270,8 @@ func toInt(v any, line int) int64 {
 		return int64(n)
 	case float64:
 		return int64(n)
+	case *Opaque:
+		return 0
 	}
 	rerr(line, "expected INTEGER, got %s", typeName(v))
 	return 0
@@ -1193,6 +1283,8 @@ func asFloat(v any, line int) float64 {
 		return n
 	case int64:
 		return float64(n)
+	case *Opaque:
+		return 0
 	}
 	rerr(line, "expected a number, got %s", typeName(v))
 	return 0
@@ -1227,8 +1319,18 @@ func valueEqual(a, b any) bool {
 	case *Cons: // list identity (empty lists are represented by untyped nil)
 		y, ok := b.(*Cons)
 		return ok && x == y
+	case *Opaque: // an opaque handle is NIL-like: equal to NIL or another opaque
+		if b == nil {
+			return true
+		}
+		_, ok := b.(*Opaque)
+		return ok
 	case nil:
-		return b == nil
+		if b == nil {
+			return true
+		}
+		_, ok := b.(*Opaque)
+		return ok
 	}
 	return false
 }
