@@ -45,6 +45,13 @@ type returnSignal struct{ values []any }
 type exitSignal struct{}
 type loopSignal struct{}
 
+// raisedSignal carries a raised ERROR/SIGNAL up the stack until a matching
+// ENABLE or "! …" handler catches it (or it reaches the top and aborts).
+type raisedSignal struct {
+	sig  any
+	name string
+}
+
 // runtimeError carries a source line for reporting.
 type runtimeError struct {
 	line int
@@ -109,6 +116,8 @@ func (i *Interp) Run(m *Module) (err error) {
 				err = e
 			case returnSignal:
 				// a top-level RETURN simply ends the program
+			case raisedSignal:
+				err = runtimeError{msg: "uncaught " + e.name}
 			default:
 				panic(r)
 			}
@@ -121,8 +130,23 @@ func (i *Interp) Run(m *Module) (err error) {
 }
 
 // execBlock runs a block's items in the given environment, hoisting type
-// and procedure declarations first so forward and mutual references work.
+// and procedure declarations first so forward and mutual references work. A
+// block with ENABLE handlers catches conditions raised anywhere within it.
 func (i *Interp) execBlock(b *Block, env *Env) {
+	if len(b.Handlers) > 0 {
+		defer func() {
+			if r := recover(); r != nil {
+				rs, ok := r.(raisedSignal)
+				if !ok || !i.handle(rs, b.Handlers, env) {
+					panic(r)
+				}
+			}
+		}()
+	}
+	i.execBlockItems(b, env)
+}
+
+func (i *Interp) execBlockItems(b *Block, env *Env) {
 	for _, it := range b.Items {
 		switch d := it.(type) {
 		case *TypeDecl:
@@ -178,9 +202,95 @@ func (i *Interp) execStmt(s Stmt, env *Env) {
 		panic(loopSignal{})
 	case *NullStmt:
 		// nothing
+	case *RaiseStmt:
+		i.raise(st.Sig, env)
+	case *Guarded:
+		i.execGuarded(st, env)
 	default:
 		rerr(0, "cannot execute statement %T", s)
 	}
+}
+
+// raise evaluates a condition and throws it up the stack to the nearest handler.
+func (i *Interp) raise(sigExpr Expr, env *Env) {
+	var sig any
+	name := "ERROR"
+	if sigExpr != nil {
+		sig = i.evalRaised(sigExpr, env)
+		name = signalName(sig)
+	}
+	panic(raisedSignal{sig: sig, name: name})
+}
+
+// evalRaised resolves the signal named by a raise/handler operand without
+// calling it (ERROR Foo[args] names Foo; it does not invoke it).
+func (i *Interp) evalRaised(e Expr, env *Env) any {
+	switch x := e.(type) {
+	case *Ident:
+		if v, ok := env.lookup(x.Name); ok {
+			return v
+		}
+		return &Signal{Name: x.Name}
+	case *Apply:
+		return i.evalRaised(x.Fun, env)
+	case *FieldAccess:
+		if rec, ok := deref(i.eval(x.X, env)).(*RecordVal); ok {
+			if f, ok := rec.Fields[x.Field]; ok {
+				return f
+			}
+		}
+		return &Signal{Name: x.Field}
+	}
+	return i.eval(e, env)
+}
+
+// execGuarded runs a statement guarded by "! …" catch clauses.
+func (i *Interp) execGuarded(g *Guarded, env *Env) {
+	defer func() {
+		if r := recover(); r != nil {
+			rs, ok := r.(raisedSignal)
+			if !ok || !i.handle(rs, g.Handlers, env) {
+				panic(r)
+			}
+		}
+	}()
+	i.execStmt(g.Stmt, env)
+}
+
+// handle runs the first handler whose guard matches the raised signal. A guard
+// with no expressions (ANY/UNWIND) matches anything. Returns whether it handled.
+func (i *Interp) handle(rs raisedSignal, handlers []Handler, env *Env) bool {
+	for _, h := range handlers {
+		if len(h.Guards) == 0 {
+			i.execStmt(h.Body, env)
+			return true
+		}
+		for _, g := range h.Guards {
+			if g == nil { // ANY/UNWIND recorded as a nil guard
+				i.execStmt(h.Body, env)
+				return true
+			}
+			gv := i.evalRaised(g, env)
+			if gv == rs.sig || signalName(gv) == rs.name {
+				i.execStmt(h.Body, env)
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// signalName returns a printable/matchable name for a raised value.
+func signalName(v any) string {
+	switch s := v.(type) {
+	case *Signal:
+		return s.Name
+	case *Builtin:
+		return s.Name
+	case nil:
+		return "ERROR"
+	}
+	return FormatValue(v)
 }
 
 func (i *Interp) execVarDecl(st *VarDecl, env *Env) {
@@ -224,7 +334,7 @@ func (i *Interp) execSelect(st *SelectStmt, env *Env) {
 	subj := i.eval(st.Subject, env)
 	for _, arm := range st.Arms {
 		for _, g := range arm.Guards {
-			if valueEqual(subj, i.eval(g, env)) {
+			if i.matchGuard(subj, g, env) {
 				i.execStmt(arm.Body, env)
 				return
 			}
@@ -233,6 +343,20 @@ func (i *Interp) execSelect(st *SelectStmt, env *Env) {
 	if st.Default != nil {
 		i.execStmt(st.Default, env)
 	}
+}
+
+// matchGuard tests one SELECT/WITH arm guard against the subject. A relational
+// guard (< x, IN [a..b]) already evaluates to a boolean and is used directly; a
+// plain guard is an equality test against the subject. When the subject is
+// itself a BOOLEAN, guards are matched by equality (TRUE => / FALSE =>).
+func (i *Interp) matchGuard(subj any, g Expr, env *Env) bool {
+	v := i.eval(g, env)
+	if b, ok := v.(bool); ok {
+		if _, subjBool := subj.(bool); !subjBool {
+			return b
+		}
+	}
+	return valueEqual(subj, v)
 }
 
 func (i *Interp) execLoop(l *Loop, env *Env) {
@@ -461,6 +585,19 @@ func (i *Interp) eval(e Expr, env *Env) any {
 			rerr(x.Line, "attempt to dereference NIL")
 		}
 		return r.Elem
+	case *SelectExpr:
+		subj := i.eval(x.Subject, env)
+		for _, arm := range x.Arms {
+			for _, g := range arm.Guards {
+				if i.matchGuard(subj, g, env) {
+					return i.eval(arm.Val, env)
+				}
+			}
+		}
+		if x.Default != nil {
+			return i.eval(x.Default, env)
+		}
+		return nil
 	}
 	rerr(0, "cannot evaluate expression %T", e)
 	return nil
@@ -593,7 +730,23 @@ func (i *Interp) arith(op string, l, r any, line int) any {
 	return nil
 }
 
-func (i *Interp) evalApply(x *Apply, env *Env) any {
+func (i *Interp) evalApply(x *Apply, env *Env) (result any) {
+	// A call-site "! handler" clause catches conditions raised by the call.
+	if len(x.Catch) > 0 {
+		defer func() {
+			if r := recover(); r != nil {
+				rs, ok := r.(raisedSignal)
+				if !ok || !i.handle(rs, x.Catch, env) {
+					panic(r)
+				}
+				result = nil // the handler ran for effect
+			}
+		}()
+	}
+	return i.evalApplyInner(x, env)
+}
+
+func (i *Interp) evalApplyInner(x *Apply, env *Env) any {
 	// Language builtins whose argument is a type name (LAST[INTEGER]) or a value
 	// paired with a type (NARROW[x, T]) must be dispatched before evaluating the
 	// function or arguments, since the type operand is not an ordinary value.

@@ -180,7 +180,7 @@ func (p *Parser) parseBlock() *Block {
 	default:
 		p.fail("expected BEGIN or '{'")
 	}
-	p.skipBlockPrologue()
+	handlers := p.blockPrologue()
 	items := p.parseStmtSeq(closer)
 	// A trailing "EXITS label => stmt; …" clause names block-exit handlers.
 	if p.acceptWord("EXITS") {
@@ -208,7 +208,7 @@ func (p *Parser) parseBlock() *Block {
 	if !closed {
 		p.recovered++
 	}
-	return &Block{Items: items, Line: line}
+	return &Block{Items: items, Handlers: handlers, Line: line}
 }
 
 // atStop reports whether the current token ends the current sequence.
@@ -216,9 +216,11 @@ func (p *Parser) atStop(closer string) bool {
 	return p.isKw(closer) || p.isPunct(closer)
 }
 
-// skipBlockPrologue skips leading "OPEN interfaces;" and "ENABLE handlers;"
-// clauses that may open a block or loop body.
-func (p *Parser) skipBlockPrologue() {
+// blockPrologue consumes leading "OPEN interfaces;" clauses (skipped) and
+// "ENABLE handlers;" clauses (captured), which may open a block or loop body,
+// and returns the handlers active over the block.
+func (p *Parser) blockPrologue() []Handler {
+	var handlers []Handler
 	for {
 		if p.acceptWord("OPEN") {
 			for p.cur().Kind != TEOF && !p.isPunct(";") {
@@ -229,17 +231,18 @@ func (p *Parser) skipBlockPrologue() {
 		}
 		if p.acceptWord("ENABLE") {
 			if p.isPunct("{") {
-				p.skipBraces()
+				p.advance()
+				handlers = append(handlers, p.parseHandlers("}")...)
+				p.acceptPunct("}")
 			} else {
-				for p.cur().Kind != TEOF && !p.isPunct(";") {
-					p.advance()
-				}
+				handlers = append(handlers, p.parseHandlers(";")...)
 			}
 			p.acceptPunct(";")
 			continue
 		}
 		break
 	}
+	return handlers
 }
 
 func (p *Parser) parseStmtSeq(closer string) []Stmt {
@@ -883,22 +886,34 @@ func (p *Parser) parseStmt() Stmt {
 		return &NullStmt{Line: line}
 	case p.cur().Kind == TIdent && p.cur().Text == "WITH":
 		return p.parseWithSelect()
+	case p.cur().Kind == TIdent && (p.cur().Text == "ERROR" || p.cur().Text == "SIGNAL" || p.cur().Text == "RAISE"):
+		// A raise: ERROR/SIGNAL/RAISE [signal[args]]. A bare ERROR re-raises.
+		p.advance()
+		r := &RaiseStmt{Line: line}
+		if p.startsExprStmt() {
+			r.Sig = p.parseValueExpr()
+		}
+		return r
 	case p.cur().Kind == TIdent && raiseWords[p.cur().Text]:
-		// ERROR / SIGNAL / RAISE / WAIT / NOTIFY / BROADCAST / RESUME [expr].
+		// WAIT / NOTIFY / BROADCAST / RESUME [expr]: monitor/condition ops we do
+		// not model — evaluate any operand for effect, then continue.
 		p.advance()
 		if p.startsExprStmt() {
 			p.parseValueExpr()
 		}
 		return &NullStmt{Line: line}
 	case p.cur().Kind == TIdent && p.cur().Text == "ENABLE":
-		// A statement-level ENABLE handler clause.
+		// A statement-level ENABLE handler clause standing on its own.
 		p.advance()
+		var hs []Handler
 		if p.isPunct("{") {
-			p.skipBraces()
+			p.advance()
+			hs = p.parseHandlers("}")
+			p.acceptPunct("}")
 		} else {
-			p.skipCatch2()
+			hs = p.parseHandlers(";")
 		}
-		return &NullStmt{Line: line}
+		return &Guarded{Stmt: &NullStmt{Line: line}, Handlers: hs, Line: line}
 	case p.cur().Kind == TIdent && p.cur().Text == "GOTO",
 		p.cur().Kind == TIdent && p.cur().Text == "GO" && p.peek().Kind == TIdent && p.peek().Text == "TO":
 		p.advance() // GOTO or GO
@@ -922,11 +937,82 @@ func (p *Parser) parseStmt() Stmt {
 		}
 		stmt = &Assign{Lhs: x, Rhs: rhs, Line: line}
 	}
-	// A trailing "! handler => …" catch clause is skipped (no signal runtime).
+	// A trailing "! handler => …" catch clause wraps the statement.
 	if p.isPunct("!") {
-		p.skipCatch()
+		p.advance()
+		hs := p.parseHandlers(";")
+		stmt = &Guarded{Stmt: stmt, Handlers: hs, Line: line}
 	}
 	return stmt
+}
+
+// parseHandlers parses a sequence of catch arms "guard[, guard] => stmt; …" up
+// to closer (or the end of the statement). A guard of ANY, UNWIND or a bare
+// signal name selects which raised conditions the arm handles.
+func (p *Parser) parseHandlers(closer string) []Handler {
+	var hs []Handler
+	for p.handlerAhead(closer) {
+		var h Handler
+		h.Guards = append(h.Guards, p.parseHandlerGuard())
+		for p.acceptPunct(",") {
+			if p.isPunct("=>") {
+				break
+			}
+			h.Guards = append(h.Guards, p.parseHandlerGuard())
+		}
+		if !p.acceptPunct("=>") {
+			break
+		}
+		h.Body = p.parseStmt()
+		hs = append(hs, h)
+		if !p.acceptPunct(";") {
+			break
+		}
+	}
+	return hs
+}
+
+// handlerAhead reports whether the upcoming tokens form another catch arm — a
+// "guard … => " before the next depth-0 ';', the closer, or a block terminator.
+// This stops a handler list from swallowing the statement that follows it.
+func (p *Parser) handlerAhead(closer string) bool {
+	depth := 0
+	for j := p.pos; j < len(p.toks); j++ {
+		t := p.toks[j]
+		if t.Kind == TEOF {
+			return false
+		}
+		if depth == 0 {
+			if t.Kind == TPunct && t.Text == "=>" {
+				return true
+			}
+			if t.Kind == TPunct && (t.Text == ";" || t.Text == closer) {
+				return false
+			}
+			if t.Kind == TKeyword && (t.Text == closer || t.Text == "END" || t.Text == "ENDLOOP" || t.Text == "ENDCASE") {
+				return false
+			}
+		}
+		switch {
+		case t.Kind == TPunct && (t.Text == "[" || t.Text == "(" || t.Text == "{"):
+			depth++
+		case t.Kind == TPunct && (t.Text == "]" || t.Text == ")" || t.Text == "}"):
+			depth--
+		}
+	}
+	return false
+}
+
+// parseHandlerGuard parses one catch guard: ANY, UNWIND, or a signal expression
+// (a name, possibly with argument bindings "Foo[a, b]" which we consume).
+func (p *Parser) parseHandlerGuard() Expr {
+	line := p.cur().Line
+	if p.acceptWord("ANY") || p.acceptWord("UNWIND") {
+		return nil // matches any condition
+	}
+	x := p.parsePostfix()
+	_ = line
+	return x
 }
 
 // safetyBlockWords prefix a block with a Cedar safety qualifier.
@@ -1168,7 +1254,7 @@ func (p *Parser) parseLoop() Stmt {
 		l.Until = p.parseExpr()
 	}
 	p.expectKw("DO")
-	p.skipBlockPrologue() // a loop body may also open with OPEN/ENABLE
+	loopHandlers := p.blockPrologue() // a loop body may also open with OPEN/ENABLE
 	// The body runs up to ENDLOOP or a REPEAT (loop-exit handler) clause.
 	var items []Stmt
 	for {
@@ -1193,7 +1279,7 @@ func (p *Parser) parseLoop() Stmt {
 			break
 		}
 	}
-	l.Body = &Block{Items: items, Line: line}
+	l.Body = &Block{Items: items, Handlers: loopHandlers, Line: line}
 	if p.acceptWord("REPEAT") { // exit handlers: label => stmt; …
 		for !p.isKw("ENDLOOP") && p.cur().Kind != TEOF {
 			p.skipToArrow()
@@ -1289,6 +1375,36 @@ func (p *Parser) parseSelect() Stmt {
 	p.expectKw("ENDCASE")
 	if p.acceptPunct("=>") {
 		s.Default = p.parseStmt()
+	}
+	return s
+}
+
+// parseSelectExpr parses SELECT used in expression position, where each arm and
+// the ENDCASE default yield a value rather than a statement.
+func (p *Parser) parseSelectExpr() Expr {
+	line := p.cur().Line
+	p.expectKw("SELECT")
+	s := &SelectExpr{Line: line}
+	s.Subject = p.parseValueExpr()
+	p.expectKw("FROM")
+	for !p.isKw("ENDCASE") && p.cur().Kind != TEOF {
+		var arm SelectExprArm
+		arm.Guards = append(arm.Guards, p.parseSelectGuard(s.Subject))
+		for p.acceptPunct(",") {
+			if p.isPunct("=>") {
+				break
+			}
+			arm.Guards = append(arm.Guards, p.parseSelectGuard(s.Subject))
+		}
+		p.expectPunct("=>")
+		arm.Val = p.parseValueExpr()
+		s.Arms = append(s.Arms, arm)
+		p.acceptPunct(",")
+		p.acceptPunct(";")
+	}
+	p.expectKw("ENDCASE")
+	if p.acceptPunct("=>") {
+		s.Default = p.parseValueExpr()
 	}
 	return s
 }
@@ -1419,35 +1535,6 @@ func (p *Parser) parseValueExpr() Expr {
 		x = p.parseExpr()
 	}
 	return x
-}
-
-// parseSelectExpr parses a SELECT used as an expression value. It is not
-// executed, so the whole construct is consumed and a placeholder returned.
-func (p *Parser) parseSelectExpr() Expr {
-	line := p.cur().Line
-	p.expectKw("SELECT")
-	for !p.isKw("FROM") && p.cur().Kind != TEOF {
-		p.advance()
-	}
-	p.expectKw("FROM")
-	depth := 0
-	for p.cur().Kind != TEOF {
-		if p.isKw("ENDCASE") && depth == 0 {
-			p.advance()
-			break
-		}
-		switch {
-		case p.isKw("SELECT"):
-			depth++
-		case p.isKw("ENDCASE"):
-			depth--
-		}
-		p.advance()
-	}
-	if p.acceptPunct("=>") { // ENDCASE => value
-		p.parseExpr()
-	}
-	return &Ident{Name: "NIL", Line: line}
 }
 
 func (p *Parser) parseIfExpr() Expr {
@@ -1618,11 +1705,13 @@ func (p *Parser) parsePostfix() Expr {
 					break
 				}
 			}
+			var catch []Handler
 			if p.isPunct("!") { // a call-site catch clause: proc[args ! handler]
-				p.skipCatchArgs()
+				p.advance()
+				catch = p.parseHandlers("]")
 			}
 			p.expectPunct("]")
-			x = &Apply{Fun: x, Args: args, Line: line}
+			x = &Apply{Fun: x, Args: args, Catch: catch, Line: line}
 		case p.isPunct("."):
 			line := p.advance().Line
 			// The field is usually an identifier, but Cedar allows zone.NEW[…]
@@ -1692,6 +1781,8 @@ func (p *Parser) parsePrimary() Expr {
 			return &NewExpr{Type: p.parseType(), Line: t.Line}
 		case "IF":
 			return p.parseIfExpr()
+		case "SELECT":
+			return p.parseSelectExpr()
 		}
 	case TPunct:
 		switch t.Text {

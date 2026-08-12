@@ -108,11 +108,13 @@ type Binary struct {
 }
 
 // Apply is postfix f[args] — either a procedure call or an array index;
-// resolved at evaluation time from the operand's runtime type.
+// resolved at evaluation time from the operand's runtime type. Catch holds any
+// call-site "! handler => …" clause (proc[args ! sig => stmt]).
 type Apply struct {
-	Fun  Expr
-	Args []Expr
-	Line int
+	Fun   Expr
+	Args  []Expr
+	Catch []Handler
+	Line  int
 }
 
 // FieldAccess is r.field.
@@ -170,6 +172,7 @@ func (*Aggregate) exprNode()   {}
 func (*IfExpr) exprNode()      {}
 func (*NewExpr) exprNode()     {}
 func (*Deref) exprNode()       {}
+func (*SelectExpr) exprNode()  {}
 
 // ---- Statements ----
 
@@ -212,10 +215,34 @@ type ExprStmt struct {
 	Line int
 }
 
-// Block is BEGIN ... END or a bracketed body; a scope with items.
+// Block is BEGIN ... END or a bracketed body; a scope with items. A leading
+// ENABLE clause installs Handlers over the whole block.
 type Block struct {
-	Items []Stmt
-	Line  int
+	Items    []Stmt
+	Handlers []Handler // ENABLE handlers active over this block
+	Line     int
+}
+
+// Handler is one arm of an ENABLE or "! …" catch clause: a set of signal guards
+// and the body to run when one is raised. An empty Guards matches any signal
+// (ANY => …).
+type Handler struct {
+	Guards []Expr
+	Body   Stmt
+}
+
+// RaiseStmt raises a condition: ERROR/SIGNAL/RAISE [signal[args]]. A nil Sig is
+// a bare ERROR (re-raise) or RETURN WITH ERROR.
+type RaiseStmt struct {
+	Sig  Expr
+	Line int
+}
+
+// Guarded wraps a statement with its trailing "! handler => …" catch clauses.
+type Guarded struct {
+	Stmt     Stmt
+	Handlers []Handler
+	Line     int
 }
 
 type IfStmt struct {
@@ -253,6 +280,20 @@ type SelectArm struct {
 	Body   Stmt
 }
 
+// SelectExpr is SELECT subject FROM guard => value, … ENDCASE => value used in
+// expression position (x ← SELECT c FROM …).
+type SelectExpr struct {
+	Subject Expr
+	Arms    []SelectExprArm
+	Default Expr // nil if no ENDCASE arm
+	Line    int
+}
+
+type SelectExprArm struct {
+	Guards []Expr
+	Val    Expr
+}
+
 type ReturnStmt struct {
 	Values []Expr // aggregate of results, may be empty
 	Line   int
@@ -275,6 +316,8 @@ func (*ReturnStmt) stmtNode() {}
 func (*ExitStmt) stmtNode()   {}
 func (*LoopCtl) stmtNode()    {}
 func (*NullStmt) stmtNode()   {}
+func (*RaiseStmt) stmtNode()  {}
+func (*Guarded) stmtNode()    {}
 
 // Module is a top-level PROGRAM/DEFINITIONS/MODULE unit.
 type Module struct {
